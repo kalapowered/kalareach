@@ -12,12 +12,29 @@
 //! The entries are fixed when the session is launched. A later release, grant or configuration
 //! reaches the sessions created after it; the worker establishes a backend only while the package
 //! an entry names still integrates its command with the entry's flags.
+//!
+//! The doctor reports the same reading: each integration an admitted release declares or the
+//! configuration names, what a session created now gets of it and why, the mode its command runs
+//! in, and the executable the daemon's own search path names for the command, with the version a
+//! signed qualification record gives that executable's digest.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_protocol::admission::AdmittedPackage;
-use kr_protocol::session::CommandIntegration;
+use kr_protocol::broker::IntegrationMode;
+use kr_protocol::hostinfo::export::Sentence;
+use kr_protocol::hostinfo::{
+    CommandIntegrationReport, CommandIntegrationState, CommandIntegrationUnavailable, DoctorCheck,
+    DoctorStatus,
+};
+use kr_protocol::scalars::Nullable;
+use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_worker::broker::catalogue::{CheckedPackages, ReadPackage, Reading};
+use kr_worker::broker::connectors::InstalledConnector;
+
+use super::admissions::LeftOut;
 
 /// This daemon's reader of the packages its admissions carry, each package checked once.
 #[derive(Debug, Default)]
@@ -69,6 +86,333 @@ pub fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration>
         .collect();
     entries.sort_by(|left, right| left.command.cmp(&right.command));
     entries
+}
+
+/// What the doctor reads of this host beside its admissions.
+#[derive(Clone, Debug, Default)]
+pub struct Host {
+    /// The directories the daemon's own search path names, in order.
+    pub search_path: Vec<PathBuf>,
+    /// Whether this platform establishes a command backend at all.
+    pub backends: bool,
+    /// Whether a launcher, `kr-hook`, is installed beside this host's worker.
+    pub launcher: bool,
+}
+
+/// What a report is built from: the command, flags and variables a release declares.
+struct Declared {
+    command: String,
+    flags: Vec<String>,
+    variables: Vec<EnvironmentVariable>,
+}
+
+impl Declared {
+    /// What the verified manifest of `connector` declares, whether or not its integration applies.
+    fn of(connector: &InstalledConnector) -> Option<Self> {
+        if let Some(integration) = connector.integration() {
+            return Some(Self {
+                command: integration.command.clone(),
+                flags: integration.flags.clone(),
+                variables: integration.variables.clone(),
+            });
+        }
+        connector
+            .manifest()
+            .command_integration
+            .as_ref()
+            .map(|declared| Self {
+                command: declared.command.clone(),
+                flags: declared.flags.clone(),
+                variables: declared
+                    .variables
+                    .iter()
+                    .map(|variable| EnvironmentVariable {
+                        name: variable.name.clone(),
+                        value: variable.value.clone(),
+                    })
+                    .collect(),
+            })
+    }
+}
+
+/// Every command integration an admitted release declares or the configuration names, as the
+/// doctor reports it, in package order.
+///
+/// `reading` is the admissions in force as a worker reads them, none where they could not be
+/// computed; `left_out` the installations those admissions leave out, and why; `enabled` the
+/// packages the configuration in force turns on. It resolves each command on the daemon's search
+/// path and reads each executable found, so it belongs on a thread that may block.
+#[must_use]
+pub fn report(
+    reading: Option<&Reading>,
+    left_out: &[LeftOut],
+    enabled: &[String],
+    host: &Host,
+) -> Vec<CommandIntegrationReport> {
+    let configured = |plugin: &str| enabled.iter().any(|named| named == plugin);
+    let mut reports: BTreeMap<String, (CommandIntegrationReport, Option<Arc<InstalledConnector>>)> =
+        BTreeMap::new();
+    if let Some(reading) = reading {
+        for (package, read) in &reading.packages {
+            let plugin_id = package.plugin_id.as_str();
+            let version = Some(package.version.as_str());
+            match read {
+                Ok(ReadPackage::Connector(connector)) => {
+                    let applies = connector.integration().is_some_and(|integration| {
+                        reading
+                            .sources
+                            .for_command(&integration.command)
+                            .is_some_and(|resolved| Arc::ptr_eq(&resolved, connector))
+                    });
+                    let state = if applies && configured(plugin_id) {
+                        CommandIntegrationState::On
+                    } else if applies {
+                        CommandIntegrationState::Off
+                    } else if connector.manifest().command_integration.is_some() {
+                        CommandIntegrationState::NotGranted
+                    } else if configured(plugin_id) {
+                        CommandIntegrationState::NoneDeclared
+                    } else {
+                        continue;
+                    };
+                    reports.insert(
+                        plugin_id.to_owned(),
+                        (
+                            described(plugin_id, version, state, Declared::of(connector), None),
+                            Some(Arc::clone(connector)),
+                        ),
+                    );
+                }
+                Ok(ReadPackage::Declarative(manifest)) => {
+                    if manifest.command_integration.is_some() || configured(plugin_id) {
+                        let declares = manifest.command_integration.is_some();
+                        let report = described(
+                            plugin_id,
+                            version,
+                            if declares {
+                                CommandIntegrationState::Unreadable
+                            } else {
+                                CommandIntegrationState::NoneDeclared
+                            },
+                            None,
+                            declares.then(|| {
+                                "its package carries no connector table, and a command \
+                                 integration launches through a connector"
+                                    .to_owned()
+                            }),
+                        );
+                        reports.insert(plugin_id.to_owned(), (report, None));
+                    }
+                }
+                Err(why) => {
+                    let conflicting = reading
+                        .conflicting
+                        .iter()
+                        .find(|connector| connector.package_digest() == package.package_digest);
+                    if let Some(connector) = conflicting {
+                        let report = described(
+                            plugin_id,
+                            version,
+                            CommandIntegrationState::Conflict,
+                            Declared::of(connector),
+                            Some(why.clone()),
+                        );
+                        reports.insert(plugin_id.to_owned(), (report, Some(Arc::clone(connector))));
+                    } else if configured(plugin_id) {
+                        let report = described(
+                            plugin_id,
+                            version,
+                            CommandIntegrationState::Unreadable,
+                            None,
+                            Some(why.clone()),
+                        );
+                        reports.insert(plugin_id.to_owned(), (report, None));
+                    }
+                }
+            }
+        }
+    }
+    for plugin_id in enabled {
+        if reports.contains_key(plugin_id) {
+            continue;
+        }
+        let report = match left_out
+            .iter()
+            .find(|left| left.plugin_id.as_str() == plugin_id)
+        {
+            Some(left) => described(
+                plugin_id,
+                None,
+                CommandIntegrationState::NotAdmitted,
+                None,
+                Some(left.detail.clone()),
+            ),
+            None => described(
+                plugin_id,
+                None,
+                CommandIntegrationState::NotInstalled,
+                None,
+                None,
+            ),
+        };
+        reports.insert(plugin_id.clone(), (report, None));
+    }
+    reports
+        .into_values()
+        .map(|(mut report, connector)| {
+            if report.state == CommandIntegrationState::On {
+                report.unavailable = Nullable(if !host.backends {
+                    Some(CommandIntegrationUnavailable::Platform)
+                } else if !host.launcher {
+                    Some(CommandIntegrationUnavailable::NoLauncher)
+                } else {
+                    None
+                });
+                if report.unavailable.0.is_none() {
+                    // What an integrated launch records as its mode.
+                    report.mode = IntegrationMode::NativeBridge;
+                }
+            }
+            if let Some(command) = report.command.0.as_deref()
+                && let Some(executable) = resolve(command, &host.search_path)
+            {
+                report.executable_version = Nullable(connector.and_then(|connector| {
+                    super::native_bridge::read_executable(&executable)
+                        .ok()
+                        .and_then(|digest| connector.qualified_version(&digest).map(str::to_owned))
+                }));
+                report.executable = Nullable::some(executable.display().to_string());
+            }
+            report
+        })
+        .collect()
+}
+
+/// One report, before the host's own reading: no resolution, and the terminal as its mode.
+fn described(
+    plugin_id: &str,
+    version: Option<&str>,
+    state: CommandIntegrationState,
+    declared: Option<Declared>,
+    reason: Option<String>,
+) -> CommandIntegrationReport {
+    let (command, flags, variables) = declared.map_or((None, Vec::new(), Vec::new()), |declared| {
+        (Some(declared.command), declared.flags, declared.variables)
+    });
+    CommandIntegrationReport {
+        plugin_id: plugin_id.to_owned(),
+        version: Nullable(version.map(str::to_owned)),
+        command: Nullable(command),
+        flags,
+        variables,
+        state,
+        unavailable: Nullable::null(),
+        mode: IntegrationMode::NativeTerminal,
+        executable: Nullable::null(),
+        executable_version: Nullable::null(),
+        reason: Nullable(reason),
+    }
+}
+
+/// The first executable `command` names on `search_path`, as a shell's search finds it.
+fn resolve(command: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
+    let names: Vec<String> = if cfg!(windows) {
+        // A command is found under each of the extensions the platform runs.
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| format!("{command}{}", extension.to_ascii_lowercase()))
+            .collect()
+    } else {
+        vec![command.to_owned()]
+    };
+    search_path
+        .iter()
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .find(|candidate| runnable(candidate))
+}
+
+/// Whether `path` is a file this account may run.
+fn runnable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        #[cfg(unix)]
+        let permitted = {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let permitted = true;
+        metadata.is_file() && permitted
+    })
+}
+
+/// The doctor's check of the command integrations: whether every integration the configuration
+/// turns on is one a session created now can use.
+#[must_use]
+pub fn check(reports: &[CommandIntegrationReport], enabled: &[String]) -> DoctorCheck {
+    const ID: &str = "command-integrations";
+    const TITLE: &str = "The command integrations new sessions apply";
+    if reports.is_empty() {
+        return DoctorCheck::new(
+            ID,
+            TITLE,
+            DoctorStatus::NotApplicable,
+            Sentence::new().stated(
+                "no installed release declares a command integration, and the configuration \
+                 turns on none",
+            ),
+            None,
+        );
+    }
+    let usable = |report: &&CommandIntegrationReport| {
+        report.state == CommandIntegrationState::On && report.unavailable.0.is_none()
+    };
+    let on = reports.iter().filter(usable).count();
+    let off = reports
+        .iter()
+        .filter(|report| report.state == CommandIntegrationState::Off)
+        .count();
+    let blocked = reports
+        .iter()
+        .filter(|report| enabled.contains(&report.plugin_id))
+        .filter(|report| !usable(report))
+        .count();
+    DoctorCheck::new(
+        ID,
+        TITLE,
+        if blocked == 0 {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Warning
+        },
+        Sentence::new()
+            .number(on as u64)
+            .stated(" on for new sessions, ")
+            .number(off as u64)
+            .stated(" off, and ")
+            .number(blocked as u64)
+            .stated(" the configuration turns on that a new session cannot use"),
+        (blocked > 0).then_some(
+            "kr doctor --verbose names each integration and why a new session cannot use it; kr \
+             plugin integration disable takes one out of this host's list.",
+        ),
+    )
+}
+
+/// The check when the installed packages could not be read in time.
+#[must_use]
+pub fn unread_check() -> DoctorCheck {
+    DoctorCheck::new(
+        "command-integrations",
+        "The command integrations new sessions apply",
+        DoctorStatus::Warning,
+        Sentence::new().stated(
+            "the installed packages could not be read in time, so the command integrations are \
+             not reported",
+        ),
+        None,
+    )
 }
 
 #[cfg(test)]

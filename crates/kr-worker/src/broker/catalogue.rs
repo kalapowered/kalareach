@@ -78,6 +78,9 @@ pub enum Applied {
 /// What one admitted hash names, checked: its verified files, or why they failed.
 type Verified = Result<Arc<kr_plugin_sdk::package::Package>, String>;
 
+/// What each admitted hash reads as: a connector, a declarative package, or why it was refused.
+type PackageReads = BTreeMap<Digest256, Result<ReadPackage, String>>;
+
 /// A snapshot whose packages are read and checked, waiting to be applied.
 #[derive(Debug)]
 pub struct Prepared {
@@ -330,7 +333,7 @@ impl Admissions {
         if held.frame.is_some_and(|held| prepared.frame <= held) {
             return Applied::Older;
         }
-        let read = read_packages(
+        let (read, _) = read_packages(
             &prepared.packages,
             &prepared.verified,
             sources,
@@ -547,13 +550,14 @@ pub fn capabilities(names: &[String]) -> BTreeSet<PluginCapability> {
 
 /// What each admitted package reads as under the grants its admissions give it, from its verified
 /// files: a connector, a declarative package, or why it was refused. `sources` is replaced with the
-/// connectors, which leaves out any two that integrate one command, and those are refused too.
+/// connectors, which leaves out any two that integrate one command; those are refused too, and
+/// returned beside the rest.
 fn read_packages(
     packages: &[AdmittedPackage],
     verified: &BTreeMap<Digest256, Verified>,
     sources: &ConnectorSources,
     frame: Option<FrameId>,
-) -> BTreeMap<Digest256, Result<ReadPackage, String>> {
+) -> (PackageReads, Vec<Arc<InstalledConnector>>) {
     let mut read = BTreeMap::new();
     for package in packages {
         let outcome = match verified.get(&package.package_digest) {
@@ -571,10 +575,12 @@ fn read_packages(
         })
         .collect();
     // A refusal of this kind belongs to these admissions alone: the next ones read again.
+    let mut conflicting = Vec::new();
     for (connector, refusal) in sources.replace_read(connectors, frame) {
         read.insert(connector.package_digest(), Err(refusal.detail));
+        conflicting.push(connector);
     }
-    read
+    (read, conflicting)
 }
 
 /// The checks of admitted packages, kept by hash, for a reader of admissions outside a worker.
@@ -593,6 +599,8 @@ pub struct Reading {
     pub packages: Vec<(AdmittedPackage, Result<ReadPackage, String>)>,
     /// The connectors whose command integration applies, by the command each resolves.
     pub sources: ConnectorSources,
+    /// The connectors left out because another admitted package integrates the same command.
+    pub conflicting: Vec<Arc<InstalledConnector>>,
 }
 
 impl CheckedPackages {
@@ -633,7 +641,7 @@ impl CheckedPackages {
             })
             .collect();
         let sources = ConnectorSources::new();
-        let mut read = read_packages(packages, &verified, &sources, None);
+        let (mut read, conflicting) = read_packages(packages, &verified, &sources, None);
         Reading {
             packages: packages
                 .iter()
@@ -645,6 +653,7 @@ impl CheckedPackages {
                 })
                 .collect(),
             sources,
+            conflicting,
         }
     }
 }

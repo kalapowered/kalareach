@@ -166,3 +166,207 @@ fn a_package_is_checked_once_by_its_hash() {
         "a reader that never checked it refuses the copy"
     );
 }
+
+/// A host whose worker can launch through an integration.
+fn able(search_path: Vec<PathBuf>) -> Host {
+    Host {
+        search_path,
+        backends: true,
+        launcher: true,
+    }
+}
+
+/// Writes an executable that is not a script, `name` in `directory`, and returns its path.
+fn executable(directory: &Path, name: &str) -> PathBuf {
+    std::fs::create_dir_all(directory).expect("a directory");
+    let path = directory.join(name);
+    std::fs::write(&path, [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).expect("an executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    }
+    path
+}
+
+/// KR-REQ-07.45: the doctor reports what a session created now gets of each integration and why:
+/// on and off by the configuration, not granted, not installed and left out of the admissions;
+/// the mode an invocation runs in; and the executable the search path names first, with the
+/// version the signed record gives its digest.
+#[test]
+fn the_doctor_reports_each_integration_and_its_resolution() {
+    let store = Store::new("report");
+    let bin = store.0.join("bin");
+    let claude = executable(&bin, "claude");
+    let digest = crate::catalogue::native_bridge::read_executable(&claude).expect("a digest");
+    let packages = vec![
+        store.admitted(&fixture::Shape::claude_code(), |source| {
+            source.qualified = vec![kr_worker::broker::connectors::QualifiedExecutable {
+                digest,
+                version: "2.1.278".to_owned(),
+            }];
+        }),
+        store.admitted(&fixture::Shape::gemini_cli(&[]), |_| {}),
+        store.admitted(&fixture::Shape::qoder_cli(), |source| {
+            source
+                .granted
+                .remove(&PluginCapability::CommandIntegrationLaunch);
+        }),
+    ];
+    let reading = Integrations::new().read(&packages);
+    let left = LeftOut {
+        plugin_id: plugin("left"),
+        reason: kr_protocol::catalogue::PluginLeftOutReason::Disabled,
+        detail: "kalareach/left at 00 is installed and disabled".to_owned(),
+    };
+    let reports = report(
+        Some(&reading),
+        std::slice::from_ref(&left),
+        &enabled(&["claude-code", "qoder-cli", "left", "missing"]),
+        &able(vec![store.0.join("empty"), bin]),
+    );
+    let states: Vec<(String, CommandIntegrationState, IntegrationMode)> = reports
+        .iter()
+        .map(|report| (report.plugin_id.clone(), report.state, report.mode))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (
+                "kalareach/claude-code".to_owned(),
+                CommandIntegrationState::On,
+                IntegrationMode::NativeBridge
+            ),
+            (
+                "kalareach/gemini-cli".to_owned(),
+                CommandIntegrationState::Off,
+                IntegrationMode::NativeTerminal
+            ),
+            (
+                "kalareach/left".to_owned(),
+                CommandIntegrationState::NotAdmitted,
+                IntegrationMode::NativeTerminal
+            ),
+            (
+                "kalareach/missing".to_owned(),
+                CommandIntegrationState::NotInstalled,
+                IntegrationMode::NativeTerminal
+            ),
+            (
+                "kalareach/qoder-cli".to_owned(),
+                CommandIntegrationState::NotGranted,
+                IntegrationMode::NativeTerminal
+            ),
+        ]
+    );
+    let on = &reports[0];
+    assert_eq!(on.command.0.as_deref(), Some("claude"));
+    assert_eq!(on.flags, fixture::FLAGS.map(str::to_owned));
+    assert_eq!(on.version.0.as_deref(), Some("0.3.0"));
+    assert_eq!(on.executable.0, Some(claude.display().to_string()));
+    assert_eq!(on.executable_version.0.as_deref(), Some("2.1.278"));
+    assert!(on.unavailable.0.is_none());
+    let gemini = &reports[1];
+    assert_eq!(gemini.variables.len(), 1, "{:?}", gemini.variables);
+    assert!(
+        gemini.executable.0.is_none(),
+        "gemini is on none of the directories"
+    );
+    assert_eq!(reports[2].reason.0.as_deref(), Some(left.detail.as_str()));
+    assert_eq!(
+        reports[4].flags,
+        fixture::qoder_flags(),
+        "a release not granted says what it declares"
+    );
+}
+
+/// KR-REQ-07.45: an integration the configuration turns on is reported as one a session created
+/// now cannot launch through where the platform establishes no backend or no launcher is
+/// installed, and its command then runs as typed.
+#[test]
+fn an_integration_on_where_no_backend_can_be_established_is_unavailable() {
+    let store = Store::new("unavailable");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    for (host, why) in [
+        (
+            Host {
+                backends: false,
+                ..able(Vec::new())
+            },
+            CommandIntegrationUnavailable::Platform,
+        ),
+        (
+            Host {
+                launcher: false,
+                ..able(Vec::new())
+            },
+            CommandIntegrationUnavailable::NoLauncher,
+        ),
+    ] {
+        let reports = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
+        assert_eq!(reports[0].state, CommandIntegrationState::On);
+        assert_eq!(reports[0].unavailable.0, Some(why));
+        assert_eq!(reports[0].mode, IntegrationMode::NativeTerminal);
+        assert_eq!(
+            check(&reports, &enabled(&["claude-code"])).status,
+            DoctorStatus::Warning
+        );
+    }
+}
+
+/// KR-REQ-07.45: two packages that integrate one command are each reported as a conflict, with
+/// the command and why.
+#[test]
+fn two_packages_integrating_one_command_are_reported_as_a_conflict() {
+    let store = Store::new("conflict");
+    let reading = Integrations::new().read(&[
+        store.admitted(&fixture::Shape::qoder_cli(), |_| {}),
+        store.admitted(
+            &fixture::Shape {
+                plugin_name: "another-qoder",
+                ..fixture::Shape::qoder_cli()
+            },
+            |_| {},
+        ),
+    ]);
+    let reports = report(Some(&reading), &[], &[], &able(Vec::new()));
+    assert_eq!(reports.len(), 2);
+    for reported in &reports {
+        assert_eq!(reported.state, CommandIntegrationState::Conflict);
+        assert_eq!(reported.command.0.as_deref(), Some("qodercli"));
+        assert!(reported.reason.0.is_some());
+    }
+}
+
+/// KR-REQ-07.45: the check is not applicable with no integration anywhere, passes while every
+/// integration the configuration turns on can be used, and warns when one cannot.
+#[test]
+fn the_check_warns_only_for_an_integration_turned_on_that_cannot_be_used() {
+    assert_eq!(check(&[], &[]).status, DoctorStatus::NotApplicable);
+    let store = Store::new("check");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::gemini_cli(&[]), |_| {})]);
+    let off = report(Some(&reading), &[], &[], &able(Vec::new()));
+    assert_eq!(check(&off, &[]).status, DoctorStatus::Ok);
+    let on = report(
+        Some(&reading),
+        &[],
+        &enabled(&["gemini-cli"]),
+        &able(Vec::new()),
+    );
+    assert_eq!(
+        check(&on, &enabled(&["gemini-cli"])).status,
+        DoctorStatus::Ok
+    );
+    let missing = report(
+        Some(&reading),
+        &[],
+        &enabled(&["claude-code"]),
+        &able(Vec::new()),
+    );
+    assert_eq!(
+        check(&missing, &enabled(&["claude-code"])).status,
+        DoctorStatus::Warning
+    );
+}

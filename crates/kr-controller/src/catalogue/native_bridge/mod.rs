@@ -2594,7 +2594,7 @@ fn same(kind: Kind, staged: &Identity, found: &Identity) -> bool {
 
 /// Reads one executable, never running it: a regular file, not a script, read within the size
 /// its file reports and read again when it changed meanwhile.
-fn read_executable(path: &Path) -> std::result::Result<Digest256, String> {
+pub(crate) fn read_executable(path: &Path) -> std::result::Result<Digest256, String> {
     use std::io::Read as _;
     for _ in 0..3 {
         let file = std::fs::File::open(path)

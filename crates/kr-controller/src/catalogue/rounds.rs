@@ -38,7 +38,7 @@ impl Controller {
 
     /// Computes the admissions in force now, within one bounded exchange of `start`, or `None`
     /// with the refusal recorded for the doctor.
-    async fn current_snapshot(&self, start: tokio::time::Instant) -> Option<Snapshot> {
+    pub(super) async fn current_snapshot(&self, start: tokio::time::Instant) -> Option<Snapshot> {
         let live = self.reported_live();
         match self
             .catalogue

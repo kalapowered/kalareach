@@ -177,6 +177,10 @@ const MAX_EVIDENCE_PAGES: usize = 64;
 /// the report goes out without it.
 const WORKER_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the doctor gives the reading of the installed packages and of the executables their
+/// commands name: an agent's executable can be a large file.
+const DOCTOR_READS: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a close waits for the worker that owns the session.
 ///
 /// Section 7's own timing for a closure: five seconds for the processes to stop and two more to
@@ -8293,6 +8297,7 @@ impl Controller {
         let accepted = self.accept_configuration().await;
         let power = self.power_state().await;
         let resolved = accepted.resolver.sleep_inhibition(None);
+        let enabled = accepted.resolver.command_integrations().value;
         checks.push(DoctorCheck::new(
             "sleep-setting",
             "This host's sleep policy is the owner's choice",
@@ -8376,7 +8381,63 @@ impl Controller {
         // about a catalogue this host does not have.
         let evidence = self.catalogue_evidence().await;
         checks.push(crate::config::catalogue::check(Some(&evidence), budgets));
-        Ok(HostDoctorResult::new(checks, effective))
+        // Section 7: the resolved executable, flags, version and integration mode of each command
+        // integration, from the admissions in force and the configuration this reading accepted.
+        let (integrations_check, integrations) = self.command_integration_report(enabled).await;
+        checks.push(integrations_check);
+        Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
+    }
+
+    /// Every command integration an admitted release declares or the configuration names, with
+    /// the doctor's check of them, read from the admissions in force by a worker's own rules.
+    ///
+    /// The executable is looked for on this daemon's own search path, the one the native bridge
+    /// reads, and read to find the version a signed record names for it. None is reported where the
+    /// packages cannot be read in time, and the check says so.
+    async fn command_integration_report(
+        &self,
+        enabled: Vec<String>,
+    ) -> (
+        kr_protocol::hostinfo::DoctorCheck,
+        Vec<kr_protocol::hostinfo::CommandIntegrationReport>,
+    ) {
+        let snapshot = self.current_snapshot(tokio::time::Instant::now()).await;
+        let host = crate::catalogue::integrations::Host {
+            search_path: std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default(),
+            backends: kr_worker::broker::process::ManagedProcess::publishes_credential_file(),
+            // A worker runs an integrated invocation through the launcher beside it.
+            launcher: self.worker_program.parent().is_some_and(|directory| {
+                directory
+                    .join(if cfg!(windows) {
+                        "kr-hook.exe"
+                    } else {
+                        "kr-hook"
+                    })
+                    .is_file()
+            }),
+        };
+        let integrations = Arc::clone(&self.integrations);
+        let reported = {
+            let enabled = enabled.clone();
+            tokio::task::spawn_blocking(move || {
+                let reading = snapshot
+                    .as_ref()
+                    .map(|snapshot| integrations.read(&snapshot.packages));
+                let left_out = snapshot
+                    .as_ref()
+                    .map_or(&[][..], |snapshot| snapshot.left_out.as_slice());
+                crate::catalogue::integrations::report(reading.as_ref(), left_out, &enabled, &host)
+            })
+        };
+        match tokio::time::timeout(DOCTOR_READS, reported).await {
+            Ok(Ok(reports)) => (
+                crate::catalogue::integrations::check(&reports, &enabled),
+                reports,
+            ),
+            Ok(Err(_)) | Err(_) => (crate::catalogue::integrations::unread_check(), Vec::new()),
+        }
     }
 
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
