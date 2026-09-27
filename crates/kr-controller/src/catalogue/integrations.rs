@@ -31,7 +31,10 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::ids::{PluginId, SessionId};
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
+use kr_protocol::session::{
+    CommandIntegration, EnvironmentVariable, MAX_COMMAND_INTEGRATION_ENTRIES,
+    MAX_COMMAND_INTEGRATION_FLAG_BYTES,
+};
 use kr_worker::broker::catalogue::{CheckedPackages, ReadPackage, Reading};
 use kr_worker::broker::connectors::InstalledConnector;
 
@@ -64,26 +67,67 @@ pub struct Fill {
     /// The session's entries, in command order.
     pub entries: Vec<CommandIntegration>,
     /// The packages whose integration the configuration turns on and the session is launched
-    /// without, since their flags are more than one session carries.
+    /// without, since their flags are more than one session carries, the largest first.
     pub omitted: Vec<PluginId>,
 }
 
 /// What a session launched with `reading`'s admissions gets: an entry for each connector whose
-/// integration applies, on where `enabled` names its package.
+/// integration applies, on where `enabled` names its package, within one session's bounds.
+///
+/// Every integration turned on is carried whole while their flags together are within
+/// [`MAX_COMMAND_INTEGRATION_FLAG_BYTES`]; past it the largest are left out, a tie going to the
+/// package named first, and returned. Entries that are off carry no flags, and take the room left
+/// under [`MAX_COMMAND_INTEGRATION_ENTRIES`] in command order: one that finds none only loses the
+/// record that an invocation of its command ran as typed because the integration is off.
 #[must_use]
 pub fn fill(reading: &Reading, enabled: &[String]) -> Fill {
-    Fill {
-        entries: entries(reading, enabled),
-        omitted: Vec::new(),
+    let (mut on, off): (Vec<CommandIntegration>, Vec<CommandIntegration>) =
+        entries(reading, enabled)
+            .into_iter()
+            .partition(|entry| entry.enabled);
+    on.sort_by(|left, right| {
+        flag_bytes(right)
+            .cmp(&flag_bytes(left))
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+    });
+    let mut carried: usize = on.iter().map(flag_bytes).sum();
+    let mut entries = Vec::new();
+    let mut omitted = Vec::new();
+    for entry in on {
+        if carried > MAX_COMMAND_INTEGRATION_FLAG_BYTES
+            || entries.len() == MAX_COMMAND_INTEGRATION_ENTRIES
+        {
+            carried -= flag_bytes(&entry);
+            omitted.push(entry.plugin_id);
+        } else {
+            entries.push(entry);
+        }
     }
+    let room = MAX_COMMAND_INTEGRATION_ENTRIES - entries.len();
+    entries.extend(off.into_iter().take(room));
+    entries.sort_by(|left, right| left.command.cmp(&right.command));
+    Fill { entries, omitted }
+}
+
+/// The bytes of flags `entry` carries.
+fn flag_bytes(entry: &CommandIntegration) -> usize {
+    entry.flags.iter().map(String::len).sum()
 }
 
 /// The note that names every integration the configuration turns on and a launch of `session_id`
-/// left out, or none where it left out none.
+/// left out, or none where it left out none: one note for the launch, whatever it left out, and
+/// bounded as the configuration's list is.
 #[must_use]
 pub fn omission_note(session_id: SessionId, omitted: &[PluginId]) -> Option<String> {
-    let _ = (session_id, omitted);
-    None
+    if omitted.is_empty() {
+        return None;
+    }
+    let named: Vec<&str> = omitted.iter().map(PluginId::as_str).collect();
+    Some(format!(
+        "session {session_id} was launched without the command integrations the configuration \
+         turns on for {}: they are more than one session carries",
+        named.join(", ")
+    ))
 }
 
 /// The entries a session launched with `reading`'s admissions gets: one for each connector whose
@@ -123,16 +167,12 @@ fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration> {
     entries
 }
 
-/// The most bytes of flags the doctor's reports carry together. A report whose flags would pass it
-/// carries none and says so: the doctor's answer is one control frame, and a package may declare
-/// sixteen flags of four kilobytes each.
-pub const MAX_REPORTED_FLAG_BYTES: usize = 256 * 1024;
-
 /// The most command integration reports the doctor's answer carries.
 pub const MAX_REPORTS: usize = 256;
 
-/// The most bytes the doctor's command integration reports take in its answer together, in the
-/// larger of the owner's form and the withheld one.
+/// The most bytes the doctor's command integration reports take in its answer together, each in
+/// the larger of the owner's form and the withheld one. The answer is one control frame, and the
+/// rest of it has the other checks, the configuration and the catalogue's notes to carry.
 pub const MAX_REPORT_BYTES: usize = 384 * 1024;
 
 /// Leaves out of `specification` the command integrations one control frame cannot carry beside
@@ -359,54 +399,84 @@ pub fn report(
         };
         reports.insert(plugin_id.clone(), (report, None));
     }
-    let mut reported_flag_bytes = 0usize;
-    let reports = reports
-        .into_values()
-        .map(|(mut report, connector)| {
-            let flag_bytes: usize = report.flags.iter().map(String::len).sum();
-            if reported_flag_bytes + flag_bytes > MAX_REPORTED_FLAG_BYTES {
-                let said = format!(
-                    "its {} flags, {flag_bytes} bytes, are more than this report carries",
-                    report.flags.len()
-                );
-                report.flags.clear();
-                report.reason = Nullable::some(match report.reason.0.take() {
-                    Some(reason) => format!("{reason}; {said}"),
-                    None => said,
-                });
-            } else {
-                reported_flag_bytes += flag_bytes;
-            }
-            if report.state == CommandIntegrationState::On {
-                report.unavailable = Nullable(if !host.backends {
-                    Some(CommandIntegrationUnavailable::Platform)
-                } else if !host.launcher {
-                    Some(CommandIntegrationUnavailable::NoLauncher)
-                } else {
-                    None
-                });
-                if report.unavailable.0.is_none() {
-                    // What an integrated launch records as its mode.
-                    report.mode = IntegrationMode::NativeBridge;
-                }
-            }
-            if let Some(command) = report.command.0.as_deref()
-                && let Some(executable) = resolve(command, &host.search_path)
-            {
-                report.executable_version = Nullable(connector.and_then(|connector| {
-                    super::native_bridge::read_executable(&executable)
-                        .ok()
-                        .and_then(|digest| connector.qualified_version(&digest).map(str::to_owned))
-                }));
-                report.executable = Nullable::some(executable.display().to_string());
-            }
-            report
-        })
-        .collect();
-    Reported {
-        reports,
-        omitted: 0,
+    // What a session created now is launched without.
+    let too_large = reading.map_or_else(Vec::new, |reading| fill(reading, enabled).omitted);
+    // One answer carries so many reports and so many bytes of them, each whole: the packages the
+    // configuration names first, then the others, each in package order, and the rest counted.
+    let (named, others): (Vec<_>, Vec<_>) = reports
+        .into_iter()
+        .partition(|(plugin_id, _)| configured(plugin_id));
+    let mut carried = Vec::new();
+    let mut bytes = 0usize;
+    let mut omitted = 0usize;
+    for (_, (report, connector)) in named.into_iter().chain(others) {
+        if carried.len() == MAX_REPORTS {
+            omitted += 1;
+            continue;
+        }
+        let report = resolved(report, connector.as_deref(), host, &too_large);
+        let size = encoded_size(&report);
+        if size > MAX_REPORT_BYTES - bytes {
+            omitted += 1;
+            continue;
+        }
+        bytes += size;
+        carried.push(report);
     }
+    carried.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    Reported {
+        reports: carried,
+        omitted,
+    }
+}
+
+/// `report` with what this host reads of it: whether a session created now can launch through it
+/// here, the mode its command then runs in, and the executable the search path names, with the
+/// version a signed record gives that executable's digest.
+fn resolved(
+    mut report: CommandIntegrationReport,
+    connector: Option<&InstalledConnector>,
+    host: &Host,
+    too_large: &[PluginId],
+) -> CommandIntegrationReport {
+    if report.state == CommandIntegrationState::On {
+        report.unavailable = Nullable(if !host.backends {
+            Some(CommandIntegrationUnavailable::Platform)
+        } else if !host.launcher {
+            Some(CommandIntegrationUnavailable::NoLauncher)
+        } else if too_large
+            .iter()
+            .any(|plugin_id| plugin_id.as_str() == report.plugin_id)
+        {
+            Some(CommandIntegrationUnavailable::TooLarge)
+        } else {
+            None
+        });
+        if report.unavailable.0.is_none() {
+            // What an integrated launch records as its mode.
+            report.mode = IntegrationMode::NativeBridge;
+        }
+    }
+    if let Some(command) = report.command.0.as_deref()
+        && let Some(executable) = resolve(command, &host.search_path)
+    {
+        report.executable_version = Nullable(connector.and_then(|connector| {
+            super::native_bridge::read_executable(&executable)
+                .ok()
+                .and_then(|digest| connector.qualified_version(&digest).map(str::to_owned))
+        }));
+        report.executable = Nullable::some(executable.display().to_string());
+    }
+    report
+}
+
+/// The bytes `report` takes in an answer, in the larger of its two forms: the owner's, and the
+/// withheld one anybody else is given.
+fn encoded_size(report: &CommandIntegrationReport) -> usize {
+    let size = |report: &CommandIntegrationReport| {
+        kr_cbor::to_canonical_value(report).map_or(usize::MAX, |value| kr_cbor::encoded_len(&value))
+    };
+    size(report).max(size(&report.withheld_form()))
 }
 
 /// One report, before the host's own reading: no resolution, and the terminal as its mode.
@@ -471,7 +541,7 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
     const ID: &str = "command-integrations";
     const TITLE: &str = "The command integrations new sessions apply";
     let reports = &reported.reports;
-    if reports.is_empty() {
+    if reports.is_empty() && reported.omitted == 0 {
         return DoctorCheck::new(
             ID,
             TITLE,
@@ -496,21 +566,28 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
         .filter(|report| enabled.contains(&report.plugin_id))
         .filter(|report| !usable(report))
         .count();
+    let mut detail = Sentence::new()
+        .number(on as u64)
+        .stated(" on for new sessions, ")
+        .number(off as u64)
+        .stated(" off, and ")
+        .number(blocked as u64)
+        .stated(" the configuration turns on that a new session cannot use");
+    if reported.omitted > 0 {
+        detail = detail.stated("; ").number(reported.omitted as u64).stated(
+            " more are not listed, since one answer carries no more, the packages the \
+                 configuration names first",
+        );
+    }
     DoctorCheck::new(
         ID,
         TITLE,
-        if blocked == 0 {
+        if blocked == 0 && reported.omitted == 0 {
             DoctorStatus::Ok
         } else {
             DoctorStatus::Warning
         },
-        Sentence::new()
-            .number(on as u64)
-            .stated(" on for new sessions, ")
-            .number(off as u64)
-            .stated(" off, and ")
-            .number(blocked as u64)
-            .stated(" the configuration turns on that a new session cannot use"),
+        detail,
         (blocked > 0).then_some(
             "kr doctor --verbose names each integration and why a new session cannot use it; kr \
              plugin integration disable takes one out of this host's list.",

@@ -4228,6 +4228,7 @@ impl Controller {
         // configuration in force now.
         let fill = self.session_integrations(&admissions).await;
         create.launch_profile.command_integrations = fill.entries;
+        let mut omitted = fill.omitted;
         let plugins = admissions
             .first()
             .map(|first| kr_protocol::admission::AdmissionsHeader {
@@ -4249,14 +4250,19 @@ impl Controller {
             release: self.release.clone(),
             plugins,
         };
-        // The specification is one control frame. Integrations it cannot carry are left out, the
-        // largest first, and named for the doctor: the session starts without them.
-        for entry in crate::catalogue::integrations::fit_launch_specification(&mut specification) {
-            self.note_admissions(format!(
-                "session {} was launched without the command integration of {}: the session's \
-                 integrations are more than its launch specification carries",
-                reservation.session_id, entry.plugin_id
-            ));
+        // The specification is one control frame. Beside a create request that leaves too little
+        // room, the largest integrations are left out as well. The session starts without them,
+        // and one note names every integration turned on that it was launched without.
+        omitted.extend(
+            crate::catalogue::integrations::fit_launch_specification(&mut specification)
+                .into_iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.plugin_id),
+        );
+        if let Some(note) =
+            crate::catalogue::integrations::omission_note(reservation.session_id, &omitted)
+        {
+            self.note_admissions(note);
         }
         Ok((specification, admissions))
     }
