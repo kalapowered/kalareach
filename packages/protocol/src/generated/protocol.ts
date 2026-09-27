@@ -7708,15 +7708,16 @@ export interface ForwardedRequest {
    * The history scope of the grant the host decided this read under.
    *
    * Section 10 narrows a grant's history in one place, the shared host-side filter, and the
-   * worker applies that filter to what it retains: an agent's semantic history and an
-   * approval's record. The worker holds no grants, so the scope travels with the read. It is
-   * absent for a caller acting under no grant. Absence never widens what a caller reads: a
-   * worker serves retained history without a scope only to a caller it can see is the local
-   * owner, and refuses anybody else.
+   * worker applies that filter to what it retains: an agent's semantic history, an approval's
+   * record and the session's questions. The worker holds no grants, so the scope travels with
+   * the read. It is absent for a caller acting under no grant. Absence never widens what a
+   * caller reads: a worker serves retained history without a scope only to a caller it can see
+   * is the local owner, and refuses anybody else.
    *
    * It is absent from the wire when it is absent, so a read without one is byte for byte what a
    * worker built before scopes travelled reads. A daemon sends one only to a worker that states
-   * [`FORWARDED_HISTORY_SCOPE`].
+   * [`FORWARDED_HISTORY_SCOPE`], and a question read with one only to a worker that also states
+   * [`FORWARDED_QUESTION_SCOPE`].
    */
   history?: HistoryScope | null
   request: Request1
