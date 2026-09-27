@@ -133,7 +133,8 @@ const MAINTENANCE: Duration = Duration::from_secs(60);
 /// A save is made by a reading, and a reading never waits for the file: on Windows another program
 /// can hold it for a moment, and a reading runs in a request, some under the store's lock. So a
 /// refused save stays unwritten until the next reading, and without a request the next is the
-/// loop's own; this brings it forward.
+/// loop's own: the first refused save wakes the loop, and while anything is unsaved it comes back
+/// this soon.
 const SAVE_RETRY: Duration = Duration::from_secs(5);
 
 /// How long the record of an action is kept, after which a repeat is a new request.
@@ -469,6 +470,9 @@ pub struct AttentionModule {
     /// Held from reading what the time contract must keep to recording it as kept, so one save
     /// never replaces a newer one with an older state.
     time_saving: std::sync::Mutex<()>,
+    /// Set by a save that could not write and cleared by one that did, so only the first failure
+    /// wakes the maintenance loop.
+    save_failing: AtomicBool,
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
@@ -562,6 +566,7 @@ impl AttentionModule {
             time,
             time_file,
             time_saving: std::sync::Mutex::new(()),
+            save_failing: AtomicBool::new(false),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
             automation_pass: std::sync::Mutex::new(()),
@@ -662,8 +667,8 @@ impl AttentionModule {
     /// could write an older state over a newer one and still record the newer as kept. The rename
     /// is made once and never waited for: on Windows another program can hold the file for a
     /// moment, and this runs inside readings, some under the store's lock. A refused save leaves
-    /// the state unsaved, and the next reading writes it, the maintenance loop's within
-    /// [`SAVE_RETRY`].
+    /// the state unsaved and wakes the maintenance loop, whose own reading writes it again within
+    /// [`SAVE_RETRY`] unless another reading does first.
     fn keep_time(&self) {
         #[cfg(test)]
         self.save_entry.wait();
@@ -685,6 +690,12 @@ impl AttentionModule {
             && std::fs::rename(&partial, &self.time_file).is_ok()
         {
             self.time.note_saved(generation);
+            self.save_failing.store(false, Ordering::Relaxed);
+        } else if !self.save_failing.swap(true, Ordering::Relaxed) {
+            // The first save that could not write wakes the maintenance loop, which may be in a
+            // wait it began while nothing was unsaved; it then comes back within SAVE_RETRY. A
+            // save that goes on failing wakes nothing more, so it never keeps its loop spinning.
+            self.wake.notify_one();
         }
     }
 
@@ -4614,6 +4625,89 @@ mod tests {
         assert!(
             !module.time.unsaved(),
             "the loop wrote it again with no request to prompt it"
+        );
+        assert_ne!(std::fs::read(&module.time_file).expect("the record"), kept);
+    }
+
+    /// On Windows a save a request makes while the maintenance loop is already in its long wait,
+    /// and that another program's hold refuses, wakes the loop: once the program lets go, the loop
+    /// writes what the time contract must keep with no other request, rather than at the end of
+    /// the wait it began while nothing was unsaved.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_refused_while_the_loop_waits_wakes_it_to_write_again() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        use kr_worker::action::adapter::{
+            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
+        };
+        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+        const WALL: u64 = 1_700_000_000_000;
+        let temp = kr_ipc::testing::TempHost::create();
+        let continuous = kr_ipc::clock::ManualSharedClock::new();
+        continuous.advance(Duration::from_secs(3_600));
+        let active = ManualActiveClock::new();
+        active.advance(Duration::from_secs(3_600));
+        let wall = ManualWallClock::new(WALL);
+        let adapter = RecordedTimeAdapter::new(classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            UnixTimex {
+                time_state: unix_model::TIME_OK,
+                status: unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500_000,
+            },
+            TimestampMs::new(WALL),
+        ));
+        let module = Arc::new(
+            AttentionModule::open_over(
+                &temp.environment(),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+                TimeSources {
+                    continuous: Arc::new(continuous.clone()),
+                    active: Arc::new(active.clone()),
+                    wall: Arc::new(wall.clone()),
+                    adapter: Arc::new(adapter),
+                    floor: None,
+                },
+            )
+            .expect("the store opens"),
+        );
+        let _ = module.reading();
+        assert!(!module.time.unsaved(), "what it keeps is written");
+        let kept = std::fs::read(&module.time_file).expect("the record");
+
+        // The loop's first reading is seen, and let go; with nothing unsaved it then begins its
+        // long wait.
+        let (entered, go) = module.save_entry.arm();
+        module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the loop takes its first reading");
+        go.send(()).expect("and goes on");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&module.time_file)
+            .expect("the record is held");
+        // A step of a day forward is worth keeping; a request's reading tries to save it.
+        wall.advance(Duration::from_secs(86_400));
+        let _ = module.reading();
+        assert!(module.time.unsaved(), "its save was refused");
+        drop(holding);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while module.time.unsaved() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !module.time.unsaved(),
+            "the loop was woken and wrote it with no other request"
         );
         assert_ne!(std::fs::read(&module.time_file).expect("the record"), kept);
     }
