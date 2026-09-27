@@ -3867,6 +3867,7 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
             "default_keychain": named,
             "worker_profile": own.worker_profile,
             "bound_to_a_desktop": own.bound_to_a_desktop,
+            "show_keychain_info_status": own.keychain_info_status,
         }),
     )
     .append(&result);
