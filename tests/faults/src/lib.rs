@@ -14,6 +14,7 @@
 //!   xterm family does and says every side effect it performs.
 //! * [`time`]: one simulated timeline, and every clock the product takes by injection read from
 //!   it.
+//! * [`session`]: a worker's session in this process, on the clocks a test hands it.
 //! * [`restore`]: a worker's session fed a corpus through its own read-loop entry, and the two
 //!   clients a person attaches with, attached at every point of it and checked against the
 //!   session's own screen.
@@ -23,6 +24,7 @@
 pub mod corpus;
 pub mod restore;
 pub mod screen;
+pub mod session;
 pub mod terminal;
 pub mod time;
 pub mod trace;
