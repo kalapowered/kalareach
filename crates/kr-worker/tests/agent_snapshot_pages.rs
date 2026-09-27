@@ -12,8 +12,8 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-08.72 | `a_history_larger_than_the_frame_is_read_in_parts_that_each_fit`, `an_entry_larger_than_the_frame_is_carried_cut` |
-//! | KR-REQ-23.39 | `a_history_that_fits_one_frame_answers_whole_with_no_continuation`, `a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it` |
+//! | KR-REQ-08.72 | `a_history_larger_than_the_frame_is_read_in_parts_that_each_fit`, `an_entry_larger_than_the_frame_is_carried_cut`, `a_snapshot_whose_parts_pass_the_total_is_cut_at_it` |
+//! | KR-REQ-23.39 | `a_history_that_fits_one_frame_answers_whole_with_no_continuation`, `a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it`, `a_snapshot_under_the_total_is_read_in_parts_that_never_name_it` |
 
 use std::sync::Arc;
 
@@ -255,6 +255,11 @@ fn params(host: &Host, from_node: Option<u64>) -> AgentSnapshotParams {
 /// It is framed with the widest request identifier there is, so what it measures does not depend
 /// on the identifier this read happened to carry.
 fn fits_the_frame(answer: &ParamsValue) {
+    fits(answer, FRAME);
+}
+
+/// Asserts that an answer, framed as the worker frames it, is inside a frame of `frame` bytes.
+fn fits(answer: &ParamsValue, frame: usize) {
     let framed = FrameCodec::new(StreamKind::Control)
         .encode_message(&ControlFrame::Response(Response {
             request_id: RequestId::new(u64::MAX),
@@ -262,8 +267,8 @@ fn fits_the_frame(answer: &ParamsValue) {
         }))
         .expect("the answer frames");
     assert!(
-        framed.len() <= FRAME,
-        "the answer is {} bytes framed, and the peer said it receives {FRAME}",
+        framed.len() <= frame,
+        "the answer is {} bytes framed, and the peer said it receives {frame}",
         framed.len()
     );
 }
@@ -486,4 +491,126 @@ async fn a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it() {
         !narrowed.continuation.is_present(),
         "nothing withheld was spent on the part"
     );
+}
+
+/// What a connection that declared the usual limits receives in one control frame.
+const USUAL_FRAME: usize = kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
+
+/// A text of exactly a million bytes, numbered: one of these fills most of a usual frame, so each
+/// part carries one, and sixteen fit section 8's 16 MiB while seventeen do not.
+fn million(number: usize) -> String {
+    let label = format!("entry {number:>2}: ");
+    format!("{label}{}", "x".repeat(1_000_000 - label.len()))
+}
+
+/// Reads one part on the owner's own connection, and holds it to the usual frame.
+async fn usual_part(
+    client: &mut LocalClient,
+    host: &Host,
+    from_node: Option<u64>,
+) -> AgentSnapshotResult {
+    let answer = within(
+        "the worker's answer",
+        client.request(Method::AgentSnapshot, &params(host, from_node)),
+    )
+    .await
+    .expect("the worker answers")
+    .expect("the snapshot is served");
+    fits(&answer, USUAL_FRAME);
+    answer.to_typed().expect("the snapshot decodes")
+}
+
+/// Records `count` entries of a million bytes each.
+fn converse_millions(host: &Host, count: usize) -> Vec<String> {
+    let said: Vec<String> = (1..=count).map(million).collect();
+    let timed: Vec<(&str, u64)> = said
+        .iter()
+        .zip(1_000_u64..)
+        .map(|(text, at)| (text.as_str(), at))
+        .collect();
+    converse(host, &timed);
+    said
+}
+
+/// KR-REQ-08.72: one snapshot's parts together carry at most section 8's 16 MiB, not 16 MiB each.
+///
+/// Twenty entries of a million bytes are read on a connection whose frame carries one of them at
+/// a time. The parts of the first snapshot carry sixteen, and the part that would have passed the
+/// total ends with a continuation that names it, which is what section 8 asks of a limit that is
+/// passed. Asked from there, the rest is a snapshot of its own, and a reader that follows both
+/// reads every entry once, in the order it was said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_whose_parts_pass_the_total_is_cut_at_it() {
+    let host = host().await;
+    let said = converse_millions(&host, 20);
+    let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
+
+    let mut reader = owner(&host, ReceiveLimits::default()).await;
+    let mut first = Vec::new();
+    let mut from = None;
+    let resume_at = loop {
+        let part = usual_part(&mut reader, &host, from).await;
+        first.extend(part.entries.iter().map(|entry| entry.text.clone()));
+        let carried: usize = first.iter().map(String::len).sum();
+        assert!(
+            u64::try_from(carried).expect("a length") <= total,
+            "the parts of one snapshot carried {carried} bytes of text, and section 8's total is \
+             {total}"
+        );
+        let continuation = part
+            .continuation
+            .0
+            .expect("a history larger than the total continues past the first snapshot");
+        if continuation.limit_value.get() == total {
+            break continuation.from_node.get();
+        }
+        from = Some(continuation.from_node.get());
+    };
+    assert_eq!(
+        first,
+        said[..16],
+        "the first snapshot carries the first sixteen, whole"
+    );
+
+    let mut rest = Vec::new();
+    let mut from = Some(resume_at);
+    while let Some(node) = from {
+        let part = usual_part(&mut reader, &host, Some(node)).await;
+        rest.extend(part.entries.iter().map(|entry| entry.text.clone()));
+        from = part
+            .continuation
+            .as_ref()
+            .map(|continuation| continuation.from_node.get());
+        assert!(
+            from.is_none_or(|next| next > node),
+            "the part that started at {node} continues at {from:?}, which is no further on"
+        );
+    }
+    assert_eq!(rest, said[16..], "and asked from there, the rest, whole");
+}
+
+/// KR-REQ-23.39, the control: a snapshot whose parts together stay under the total is read as it
+/// always was, every part cut to the frame and none naming the total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_under_the_total_is_read_in_parts_that_never_name_it() {
+    let host = host().await;
+    let said = converse_millions(&host, 15);
+    let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
+
+    let mut reader = owner(&host, ReceiveLimits::default()).await;
+    let mut read = Vec::new();
+    let mut from = None;
+    loop {
+        let part = usual_part(&mut reader, &host, from).await;
+        read.extend(part.entries.iter().map(|entry| entry.text.clone()));
+        let Some(continuation) = part.continuation.as_ref() else {
+            break;
+        };
+        assert!(
+            continuation.limit_value.get() < total,
+            "a part of a snapshot under the total is cut by the frame, not by the total"
+        );
+        from = Some(continuation.from_node.get());
+    }
+    assert_eq!(read, said, "every entry once, in the order it was said");
 }

@@ -552,6 +552,21 @@ mod tests {
         assert!(nothing.continuation.is_none());
     }
 
+    /// An entry number is never given twice, at the end of the numbering as anywhere else.
+    #[test]
+    fn an_entry_number_is_never_given_twice_at_the_end_of_the_numbering() {
+        let mut log = SemanticLog::new();
+        log.resume_after(StreamCursor::new(u64::MAX - 2));
+        let numbers: Vec<u64> = (0..3_u64)
+            .map(|index| {
+                log.append("message", format!("entry {index}"), TimestampMs::new(index))
+                    .get()
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<&u64> = numbers.iter().collect();
+        assert_eq!(distinct.len(), numbers.len(), "numbers given: {numbers:?}");
+    }
+
     #[test]
     fn a_filtered_answer_says_how_much_it_withheld() {
         let log = log(5);
