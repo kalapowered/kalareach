@@ -70,10 +70,11 @@ fn a_client_arriving_at_a_switch_through_mode_1049_holds_both_buffers() {
     restored("alternate-1049");
 }
 
-/// KR-REQ-27.06: the same through modes 47 and 1047, with cursors saved around the switches by
-/// DECSC and DECRC and through mode 1048.
+/// KR-REQ-27.06: the same through mode 1047, with cursors saved around the switches by DECSC and
+/// DECRC and through mode 1048, and a request for mode 47, which the profile does not include and
+/// the session consumes without switching.
 #[test]
-fn a_client_arriving_at_a_switch_through_modes_47_and_1047_holds_both_buffers() {
+fn a_client_arriving_at_a_switch_through_mode_1047_holds_both_buffers() {
     restored("alternate-47-1047");
 }
 
@@ -101,9 +102,10 @@ fn a_side_effect_from_before_a_client_arrived_never_reaches_it() {
 /// the sequence ends, and it holds the input lease. The byte that ends the sequence both gives the
 /// client its boundary, at which the session tells it to begin again on the stream, and completes
 /// the side effect it is owed; the session then drops the effect, because it sends nothing to a
-/// subscriber that is beginning again. This shows exactly where that happens and nowhere else: once
-/// the session delivers such an effect, this test fails, and the check above then holds at these
-/// points as at every other.
+/// subscriber that is beginning again. This shows exactly where that happens and nowhere else.
+///
+/// Once the session delivers such an effect this test fails. It is then removed, together with
+/// `Outcome::lost`, and the check above holds at these points as at every other.
 #[test]
 fn a_side_effect_completed_by_the_byte_that_releases_its_held_holder_does_not_reach_it() {
     let corpus = corpus("side-effects");
@@ -170,6 +172,22 @@ fn a_restoration_without_the_other_buffer_fails_the_check_it_is_there_for() {
             .iter()
             .any(|failure| failure.what.contains("other buffer's line")),
         "the missing buffer is caught when the screen is restored: {caught:#?}"
+    );
+}
+
+/// A restoration whose switches into and out of the buffer that is not showing go the other way
+/// puts the shell's lines where the application's belong and the other way round, and the check
+/// taken directly after the restoration says so.
+#[test]
+fn a_restoration_with_its_switches_reversed_fails_the_check_it_is_there_for() {
+    let outcome = run(&corpus("alternate-resets"), Strategy::ReversedSwitch)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let caught = outcome.of(Property::Restored);
+    assert!(
+        caught.iter().any(|failure| {
+            failure.what.contains("showing the") || failure.what.contains("other buffer's line")
+        }),
+        "the buffers painted the wrong way round are caught: {caught:#?}"
     );
 }
 

@@ -10,6 +10,8 @@
 //!   fixture a person can read.
 //! * [`screen`]: a screen read by position, so two screens of the same content compare equal
 //!   whatever row identifiers each was built with, and say where they differ when they do not.
+//! * [`terminal`]: a model of a person's physical terminal, which reads the buffer switches as the
+//!   xterm family does and says every side effect it performs.
 //! * [`restore`]: a worker's session fed a corpus through its own read-loop entry, and the two
 //!   clients a person attaches with, attached at every point of it and checked against the
 //!   session's own screen.
@@ -17,3 +19,4 @@
 pub mod corpus;
 pub mod restore;
 pub mod screen;
+pub mod terminal;

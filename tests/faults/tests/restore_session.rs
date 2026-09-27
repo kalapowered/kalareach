@@ -20,8 +20,8 @@ use std::time::Duration;
 use kr_cli::render::ProjectedDisplay;
 use kr_client::projection::{Applied, Projection};
 use kr_faults::corpus::{self, Corpus};
-use kr_faults::restore::split_the_buffer_not_showing;
 use kr_faults::screen::{Line, Parts, View};
+use kr_faults::terminal::Terminal;
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
@@ -41,8 +41,6 @@ use kr_protocol::projection::{AgentResourceSnapshot, ProjectionEvent};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams, OutputEvent};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
-use kr_term::budget::GridSize;
-use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::SideEffectKind;
 use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
@@ -54,6 +52,10 @@ const LIVENESS: Duration = Duration::from_secs(120);
 
 /// How long a wait sleeps between two looks at what it waits for.
 const LOOK_AGAIN: Duration = Duration::from_millis(10);
+
+/// What the program writes after the corpus: a line a client shows only once it has read
+/// everything the session sent before it, so a client that shows it has missed nothing.
+const BARRIER: &[u8] = b"\r\nkr-end-of-output";
 
 fn build() -> BuildId {
     BuildId::new("kr-faults/0").expect("a build identifier")
@@ -80,8 +82,9 @@ struct Live {
 }
 
 impl Live {
-    /// Starts a session whose program writes `corpus` in pieces that end at `ends`.
-    async fn start(corpus: &Corpus, ends: Vec<usize>) -> Self {
+    /// Starts a session whose program writes `corpus` in pieces that end at `ends`, and then the
+    /// barrier.
+    async fn start(corpus: &Corpus, mut ends: Vec<usize>) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -96,6 +99,8 @@ impl Live {
             start = *end;
         }
         assert_eq!(start, bytes.len(), "the pieces cover the corpus");
+        std::fs::write(pieces.join(ends.len().to_string()), BARRIER).expect("writes the barrier");
+        ends.push(start + BARRIER.len());
         let gate = temp.root().join("gate");
         let made = std::process::Command::new("mkfifo")
             .arg(&gate)
@@ -311,17 +316,9 @@ impl Live {
             session_id: self.session_id,
             attachment_id,
             form,
-            terminal: Engine::new(EngineConfig {
-                size: GridSize {
-                    cols: u32::from(self.columns),
-                    rows: u32::from(self.rows),
-                },
-                ..EngineConfig::DEFAULT
-            })
-            .expect("a terminal"),
+            terminal: Terminal::new(self.columns, self.rows).expect("a terminal"),
             display: ProjectedDisplay::new(),
             projection: Projection::new(),
-            received: Vec::new(),
             performed: Vec::new(),
             replies: 0,
         };
@@ -386,13 +383,11 @@ struct Client {
     attachment_id: AttachmentId,
     form: Form,
     /// The terminal a client of the session's size draws into.
-    terminal: Engine,
+    terminal: Terminal,
     /// The command's painter, for a screen it is shown as a projection.
     display: ProjectedDisplay,
     /// The projection it holds.
     projection: Projection,
-    /// Every byte of output it was sent, in order.
-    received: Vec<u8>,
     /// Every side effect its terminal performed.
     performed: Vec<SideEffectKind>,
     /// How many questions its terminal answered.
@@ -419,11 +414,9 @@ impl Client {
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        self.received.extend_from_slice(bytes);
-        let outcome = self.terminal.feed(bytes, 0);
-        self.replies += outcome.responses;
-        self.performed
-            .extend(outcome.side_effects.into_iter().map(|effect| effect.kind));
+        let performed = self.terminal.feed(bytes);
+        self.replies += performed.replies;
+        self.performed.extend(performed.effects);
     }
 
     /// Reads what the session sends until `done` holds, drawing it as the client would.
@@ -468,23 +461,9 @@ impl Client {
         }
     }
 
-    /// What the terminal shows, with the other buffer as the restoration in what it was sent
-    /// painted it: a terminal of the xterm family switches on mode 47, which the restoration uses
-    /// to paint that buffer.
+    /// What the terminal shows.
     fn terminal_view(&mut self) -> View {
-        let view = View::of_engine(&mut self.terminal, 0).expect("a view");
-        let (_, other) = split_the_buffer_not_showing(&self.received);
-        let Some(other) = other else {
-            return view;
-        };
-        let mut buffer = Engine::new(EngineConfig {
-            size: self.terminal.grid().size(),
-            ..EngineConfig::DEFAULT
-        })
-        .expect("a buffer");
-        let _ = buffer.feed(&other, 0);
-        let lines: Vec<Line> = View::of_engine(&mut buffer, 0).expect("a view").lines;
-        view.with_other(lines)
+        self.terminal.view().expect("a view")
     }
 
     /// Whether the terminal shows `expected` in the parts named.
@@ -533,6 +512,13 @@ async fn a_client_arriving_inside_a_sequence_of_a_live_session_holds_its_screen(
     let mut projected = live.client(Form::Projected).await;
     live.release_all().await;
     let expected = live.canonical().await;
+    assert!(
+        expected
+            .lines
+            .iter()
+            .any(|line| line.text() == "kr-end-of-output"),
+        "the barrier is on the screen the clients are compared with"
+    );
     direct
         .read_until("the terminal shows the session's screen", |client| {
             client.shows(&expected, Parts::Painted)

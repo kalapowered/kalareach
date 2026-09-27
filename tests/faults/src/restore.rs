@@ -50,13 +50,14 @@ use kr_protocol::projection::ProjectionEvent;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_term::budget::GridSize;
-use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
+use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::SideEffectKind;
 use kr_worker::output::{OutputDelivery, OutputStream};
 use kr_worker::session::{Session, SessionConfig};
 
 use crate::corpus::Corpus;
 use crate::screen::{Parts, View};
+use crate::terminal::{Performed, Terminal};
 
 /// The terminal a client of the session's size says it is: one the session hands its stream to.
 const QUALIFIED: &str = "xterm-256color";
@@ -86,6 +87,9 @@ pub enum Strategy {
     /// A terminal drawn the screen where the client arrived and handed the raw output from that
     /// point, as though the stream could begin anywhere.
     RawFromOffset,
+    /// A restoration whose switches into and out of the buffer that is not showing go the other
+    /// way, so that buffer's rows land in the one that shows and the other way round.
+    ReversedSwitch,
 }
 
 /// Which property a failure is of.
@@ -190,12 +194,77 @@ impl Form {
     }
 }
 
-/// One application side effect, known from the corpus alone: what it was and the offset at which
-/// the byte that completed it had been read.
+/// One application side effect, known from the corpus alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Caused {
-    kind: SideEffectKind,
-    completed_at: usize,
+pub struct Caused {
+    /// What it was.
+    pub kind: SideEffectKind,
+    /// The offset its sequence began at, which is the cursor the session delivers it at.
+    pub at: u64,
+    /// The offset at which the byte that completed it had been read.
+    pub completed_at: u64,
+}
+
+/// One side effect a client's terminal performed from the live stream, with the cursor of the
+/// delivery that carried it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivered {
+    /// The cursor of the delivery.
+    pub cursor: u64,
+    /// What the terminal performed.
+    pub kind: SideEffectKind,
+}
+
+/// What following one client's owed side effects found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Account {
+    /// Owed effects the terminal never performed, and effects it performed that nobody owed it.
+    pub failures: Vec<String>,
+    /// Owed effects it never performed that were completed by the very byte at which the session
+    /// told it to begin again: [`Outcome::lost`].
+    pub lost: Vec<String>,
+}
+
+/// Follows each owed side effect to the delivery that performed it.
+///
+/// An occurrence is matched by the cursor it is delivered at, which is where its sequence began, and
+/// by what it is, so two equal effects are never taken for each other. An owed effect with no match
+/// is lost when a resynchronisation was requested at the cursor that completed it, and a failure
+/// otherwise; a delivery that matches no owed effect is a failure.
+#[must_use]
+pub fn account(owed: &[Caused], delivered: &[Delivered], resyncs_at: &[u64]) -> Account {
+    let mut used = vec![false; delivered.len()];
+    let mut found = Account::default();
+    for effect in owed {
+        let matched = delivered.iter().enumerate().position(|(index, got)| {
+            !used[index] && got.cursor == effect.at && same_effect(&got.kind, &effect.kind)
+        });
+        match matched {
+            Some(index) => used[index] = true,
+            None => {
+                let what = format!(
+                    "its terminal never performed {:?}, which the application began at byte {} and \
+                     completed at byte {} while it held the lease",
+                    effect.kind, effect.at, effect.completed_at
+                );
+                if resyncs_at.contains(&effect.completed_at) {
+                    found.lost.push(what);
+                } else {
+                    found.failures.push(what);
+                }
+            }
+        }
+    }
+    for (got, used) in delivered.iter().zip(used) {
+        if !used {
+            found.failures.push(format!(
+                "its terminal performed {:?} from a delivery at byte {}, which the application did \
+                 not cause while it held the lease",
+                got.kind, got.cursor
+            ));
+        }
+    }
+    found
 }
 
 struct Client {
@@ -206,7 +275,7 @@ struct Client {
     until: usize,
     stream: Option<OutputStream>,
     /// The terminal a direct client draws into.
-    terminal: Option<Engine>,
+    terminal: Option<Terminal>,
     /// The command's painter, for a direct client shown a projection.
     display: Option<ProjectedDisplay>,
     /// The projection this client holds, whatever form it is.
@@ -215,122 +284,70 @@ struct Client {
     /// Side effects the terminal performed while being restored or painted.
     restoring: Vec<String>,
     /// Side effects the terminal performed from the live stream.
-    live: Vec<SideEffectKind>,
-    /// The offsets at which the session told this client to begin again.
-    resyncs_at: Vec<usize>,
+    live: Vec<Delivered>,
+    /// The cursors the session named when it told this client to begin again.
+    resyncs_at: Vec<u64>,
     ended: bool,
     /// Where the client left, once it has.
     left_at: Option<usize>,
-    /// The other buffer as the last restoration painted it, for a direct client.
-    ///
-    /// A restoration paints the buffer that is not showing by switching to it with mode 47 and
-    /// back. A terminal of the xterm family, which is what a direct client's terminal is, switches
-    /// on mode 47; the profile's own engine records the mode and stays on the buffer it is on, so
-    /// the model hands those rows to a buffer of their own, as such a terminal would.
-    other: Option<Vec<crate::screen::Line>>,
-    started: std::time::Instant,
 }
 
 impl Client {
-    fn now(&self) -> u64 {
-        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Feeds the terminal a restoration: the bytes that put a terminal into the session's state.
-    ///
-    /// The part that paints the buffer that is not showing is painted into a buffer of its own,
-    /// which is what a terminal that switches on mode 47 does with it.
-    fn restore(&mut self, bytes: &[u8], what: &str) -> Result<(), String> {
-        let (showing, other) = split_the_buffer_not_showing(bytes);
-        if let Some(terminal) = self.terminal.as_ref() {
-            let size = terminal.grid().size();
-            let mut buffer = Engine::new(EngineConfig {
-                size,
-                ..EngineConfig::DEFAULT
-            })
-            .map_err(|error| format!("a buffer for the other rows: {error}"))?;
-            if let Some(rows) = other.as_ref() {
-                let outcome = buffer.feed(rows, 0);
-                for performed in performed(&outcome) {
-                    self.restoring
-                        .push(format!("painting the other buffer performed {performed}"));
-                }
-            }
-            self.other = Some(crate::screen::View::of_engine(&mut buffer, 0)?.lines);
-        }
-        self.paint(&showing, what);
-        Ok(())
-    }
-
-    /// Feeds the terminal bytes that draw a screen rather than continue one.
-    fn paint(&mut self, bytes: &[u8], what: &str) {
+    /// Feeds the terminal bytes that draw a screen rather than continue one: a restoration, or a
+    /// screen the painter drew.
+    fn draw(&mut self, bytes: &[u8], what: &str) {
         for sequence in forbidden_in_a_restoration(bytes) {
             self.restoring.push(format!(
                 "{what} carries {sequence}, which a restoration never sends"
             ));
         }
-        let now = self.now();
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
-        let outcome = terminal.feed(bytes, now);
-        let settled = terminal.quiesce(now);
-        for outcome in [outcome, settled] {
-            for performed in performed(&outcome) {
-                self.restoring
-                    .push(format!("taking {what} performed {performed}"));
-            }
+        let performed = terminal.feed(bytes);
+        for performed in named(&performed) {
+            self.restoring
+                .push(format!("taking {what} performed {performed}"));
         }
     }
 
-    /// What this client's terminal shows, with the other buffer as its restoration painted it.
+    /// What this client's terminal shows.
     fn terminal_view(&mut self) -> Result<Option<View>, String> {
-        let now = self.now();
-        let other = self.other.clone();
-        let Some(terminal) = self.terminal.as_mut() else {
-            return Ok(None);
-        };
-        let view = View::of_engine(terminal, now)?;
-        Ok(Some(match other {
-            Some(other) => view.with_other(other),
-            None => view,
-        }))
+        self.terminal.as_mut().map(Terminal::view).transpose()
     }
 
-    /// Feeds the terminal bytes of the live stream.
-    fn live(&mut self, bytes: &[u8]) {
-        let now = self.now();
+    /// Feeds the terminal a delivery of the live stream at `cursor`.
+    fn live(&mut self, bytes: &[u8], cursor: u64) {
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
-        let outcome = terminal.feed(bytes, now);
-        if outcome.responses > 0 {
+        let performed = terminal.feed(bytes);
+        if performed.replies > 0 {
             self.restoring.push(format!(
                 "the live stream asked this terminal {} question(s), which the session answers \
                  itself",
-                outcome.responses
+                performed.replies
             ));
         }
-        self.live
-            .extend(outcome.side_effects.into_iter().map(|effect| effect.kind));
+        self.live.extend(
+            performed
+                .effects
+                .into_iter()
+                .map(|kind| Delivered { cursor, kind }),
+        );
     }
 }
 
 /// What a terminal performed, as a person would name it.
-fn performed(outcome: &FeedOutcome) -> Vec<String> {
-    let mut found: Vec<String> = outcome
-        .side_effects
+fn named(performed: &Performed) -> Vec<String> {
+    let mut found: Vec<String> = performed
+        .effects
         .iter()
-        .map(|effect| format!("{:?}", effect.kind))
+        .map(|effect| format!("{effect:?}"))
         .collect();
-    found.extend(
-        outcome
-            .refusals
-            .iter()
-            .map(|refusal| format!("a refused side effect ({refusal:?})")),
-    );
-    if outcome.responses > 0 {
-        found.push(format!("{} reply(ies) to a query", outcome.responses));
+    found.extend(performed.refused.iter().cloned());
+    if performed.replies > 0 {
+        found.push(format!("{} reply(ies) to a query", performed.replies));
     }
     found
 }
@@ -378,7 +395,8 @@ fn caused(corpus: &Corpus) -> Result<Vec<Caused>, String> {
         let outcome = engine.feed(std::slice::from_ref(byte), 0);
         found.extend(outcome.side_effects.into_iter().map(|effect| Caused {
             kind: effect.kind,
-            completed_at: offset + 1,
+            at: effect.at,
+            completed_at: offset as u64 + 1,
         }));
     }
     Ok(found)
@@ -405,18 +423,6 @@ fn session_engine(corpus: &Corpus) -> Result<Engine, String> {
         ..EngineConfig::DEFAULT
     })
     .map_err(|error| format!("a terminal engine of {}: {error}", corpus.name))
-}
-
-/// A terminal engine standing in for a person's physical terminal.
-fn terminal(columns: u16, rows: u16) -> Result<Engine, String> {
-    Engine::new(EngineConfig {
-        size: GridSize {
-            cols: u32::from(columns),
-            rows: u32::from(rows),
-        },
-        ..EngineConfig::DEFAULT
-    })
-    .map_err(|error| format!("a terminal of {columns}x{rows}: {error}"))
 }
 
 /// The session a corpus is fed to, and everything a run keeps about it.
@@ -607,7 +613,7 @@ impl<'a> Stage<'a> {
             until,
             stream: None,
             terminal: match form {
-                Form::Direct => Some(terminal(columns, rows)?),
+                Form::Direct => Some(Terminal::new(columns, rows)?),
                 Form::Projected => None,
             },
             display: (form == Form::Direct).then(ProjectedDisplay::new),
@@ -618,8 +624,6 @@ impl<'a> Stage<'a> {
             resyncs_at: Vec::new(),
             ended: false,
             left_at: None,
-            other: None,
-            started: std::time::Instant::now(),
         };
         self.subscribe(&mut client)?;
         self.pump(&mut client)?;
@@ -661,7 +665,7 @@ impl<'a> Stage<'a> {
                     .session
                     .restoration(client.attachment)
                     .map_err(|error| format!("no screen at the point of arrival: {error}"))?;
-                client.restore(&bytes, "the screen at the point of arrival")?;
+                client.draw(&bytes, "the screen at the point of arrival");
                 client.served = Served::Stream;
             }
             return Ok(());
@@ -680,9 +684,10 @@ impl<'a> Stage<'a> {
                     .to_vec()
             }
             Strategy::WithoutInactive => without_the_buffer_not_showing(&joined.bytes),
+            Strategy::ReversedSwitch => with_the_switches_reversed(&joined.bytes),
             Strategy::Product | Strategy::RawFromOffset => joined.bytes,
         };
-        client.restore(&bytes, "the restoration")?;
+        client.draw(&bytes, "the restoration");
         client.served = Served::Stream;
         // The restored screen, checked before anything later is drawn on it. When the session
         // hands this terminal the stream afterwards, the restoration had to carry the whole
@@ -725,7 +730,7 @@ impl<'a> Stage<'a> {
             };
             stream.written(delivery.len());
             match delivery {
-                OutputDelivery::Bytes { bytes, .. } => {
+                OutputDelivery::Bytes { cursor, bytes } => {
                     if client.form == Form::Projected {
                         let at = self.fed;
                         self.fail(
@@ -735,19 +740,19 @@ impl<'a> Stage<'a> {
                             "a terminal of another size was handed raw output".to_owned(),
                         );
                     } else if self.strategy != Strategy::RawFromOffset {
-                        client.live(&bytes);
+                        client.live(&bytes, cursor);
                     }
                 }
                 OutputDelivery::Screen { bytes, .. } => {
                     if self.strategy != Strategy::RawFromOffset {
-                        client.paint(&bytes, "a drawn screen");
+                        client.draw(&bytes, "a drawn screen");
                     }
                 }
                 OutputDelivery::Projection { event, .. } => self.projected(client, *event)?,
-                OutputDelivery::Resync(_) => {
+                OutputDelivery::Resync(marker) => {
                     // As the command does: the screen it held is no longer the session, so it asks
                     // for the session's screen again, on the same attachment, from no cursor.
-                    client.resyncs_at.push(self.fed);
+                    client.resyncs_at.push(marker.cursor.get());
                     self.subscribe(client)?;
                 }
                 OutputDelivery::Detached | OutputDelivery::Closed(_) => {
@@ -771,7 +776,7 @@ impl<'a> Stage<'a> {
             let drawn = display.apply(event);
             again |= drawn.resubscribe;
             if !drawn.bytes.is_empty() {
-                client.paint(&drawn.bytes, "a painted screen");
+                client.draw(&drawn.bytes, "a painted screen");
             }
             if drawn.installed {
                 client.served = Served::Painted;
@@ -794,7 +799,7 @@ impl<'a> Stage<'a> {
                 && self.strategy == Strategy::RawFromOffset
                 && client.served == Served::Stream
             {
-                client.live(&byte);
+                client.live(&byte, point as u64);
             }
             self.pump(client)?;
         }
@@ -894,17 +899,16 @@ impl<'a> Stage<'a> {
                     };
                     if let Some(got) = client.terminal_view()? {
                         let mut differences = got.differences(&expected, parts);
-                        if parts == Parts::Painted {
-                            // A cursor the painter said it could not place is read from its own
-                            // account, not from where it was left.
-                            let losses = client
-                                .display
-                                .as_ref()
-                                .map(ProjectedDisplay::losses)
-                                .unwrap_or_default();
-                            if losses.pending_wrap || losses.cursor_outside {
-                                differences.retain(|line| !line.starts_with("cursor at"));
-                            }
+                        // A painter cannot place a cursor that waits to wrap: no sequence moves one
+                        // there. It says so, and the cursor is then not read from where it was
+                        // left. The screen the client holds now decides that, never an earlier one,
+                        // so a cursor misplaced later is still found.
+                        let waiting_to_wrap = client
+                            .projection
+                            .screen()
+                            .is_some_and(|screen| screen.cursor.pending_wrap);
+                        if parts == Parts::Painted && waiting_to_wrap {
+                            differences.retain(|line| !line.starts_with("cursor at"));
                         }
                         found.extend(
                             differences
@@ -950,10 +954,8 @@ impl<'a> Stage<'a> {
     /// Follows every side effect the application caused to the clients it reached.
     ///
     /// Each one that happened while some direct client held the lease is owed to that client once
-    /// and to no other. Those that happened while no client was attached are owed to nobody. An
-    /// owed effect the client never performed, completed by the very byte at which the session
-    /// told that client to begin again, is counted as lost rather than failed: see
-    /// [`Outcome::lost`].
+    /// and to no other; those that happened while no client was attached are owed to nobody. What
+    /// [`account`] finds lost is kept apart: see [`Outcome::lost`].
     fn settle_effects(&mut self, caused: &[Caused]) {
         let clients = std::mem::take(&mut self.clients);
         for client in &clients {
@@ -961,71 +963,41 @@ impl<'a> Stage<'a> {
                 continue;
             }
             let left = client.left_at.unwrap_or(client.until);
-            let owed: Vec<&Caused> = caused
+            let owed: Vec<Caused> = caused
                 .iter()
                 .filter(|effect| {
-                    effect.completed_at > client.attached_at
-                        && effect.completed_at <= left
+                    effect.completed_at > client.attached_at as u64
+                        && effect.completed_at <= left as u64
                         && self.holder_at(effect.completed_at) == Some(client.attachment)
                         && kr_worker::render::side_effect(&effect.kind).is_some()
                 })
+                .cloned()
                 .collect();
             self.outcome.live_effects += owed.len();
-            // Each owed effect is matched with the next thing the terminal performed; an owed
-            // effect with no match was not delivered.
-            let mut performed = client.live.iter().peekable();
-            let mut missing = Vec::new();
-            for effect in &owed {
-                if performed
-                    .peek()
-                    .is_some_and(|got| same_effect(got, &effect.kind))
-                {
-                    performed.next();
-                } else {
-                    missing.push(*effect);
-                }
-            }
-            let extra: Vec<&SideEffectKind> = performed.collect();
-            for effect in missing {
-                let failure = Failure {
-                    property: Property::LiveEffect,
-                    attached_at: client.attached_at,
-                    checked_at: left,
-                    client: client.form.name(),
-                    what: format!(
-                        "its terminal never performed {:?}, which the application caused at byte {} \
-                         while it held the lease",
-                        effect.kind, effect.completed_at
-                    ),
-                };
-                if client.resyncs_at.contains(&effect.completed_at) {
-                    self.outcome.lost.push(failure);
-                } else {
-                    self.outcome.failures.push(failure);
-                }
-            }
-            if !extra.is_empty() {
-                self.outcome.failures.push(Failure {
-                    property: Property::LiveEffect,
-                    attached_at: client.attached_at,
-                    checked_at: left,
-                    client: client.form.name(),
-                    what: format!(
-                        "its terminal performed {extra:?} from the live stream, which the \
-                         application did not cause while it held the lease"
-                    ),
-                });
-            }
+            let found = account(&owed, &client.live, &client.resyncs_at);
+            let failure = |what: String| Failure {
+                property: Property::LiveEffect,
+                attached_at: client.attached_at,
+                checked_at: left,
+                client: client.form.name(),
+                what,
+            };
+            self.outcome
+                .failures
+                .extend(found.failures.into_iter().map(failure));
+            self.outcome
+                .lost
+                .extend(found.lost.into_iter().map(failure));
         }
         self.clients = clients;
     }
 
     /// The direct client holding the lease once the byte at `offset` had been read.
-    fn holder_at(&self, offset: usize) -> Option<AttachmentId> {
+    fn holder_at(&self, offset: u64) -> Option<AttachmentId> {
         self.holders
             .iter()
             .rev()
-            .find(|(from, _)| *from < offset)
+            .find(|(from, _)| (*from as u64) < offset)
             .map(|(_, attachment)| *attachment)
     }
 }
@@ -1047,41 +1019,37 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
     }
 }
 
-/// A restoration split into what paints the showing buffer and what paints the other one.
-///
-/// The second is the rows between the switch to the other buffer and the switch back, as a
-/// terminal that switches on mode 47 draws them into that buffer; the first is everything else.
-/// With no such part, the other buffer is painted nothing.
+/// A restoration with every mode-47 switch turned the other way.
 #[must_use]
-pub fn split_the_buffer_not_showing(bytes: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-    for (enter, leave) in [
-        (&b"\x1b[?47h"[..], &b"\x1b[?47l"[..]),
-        (&b"\x1b[?47l"[..], &b"\x1b[?47h"[..]),
-    ] {
-        let Some(start) = find(bytes, enter) else {
-            continue;
-        };
-        let Some(length) = find(&bytes[start + enter.len()..], leave) else {
-            continue;
-        };
-        let inner = bytes[start + enter.len()..start + enter.len() + length].to_vec();
-        let mut showing = bytes[..start].to_vec();
-        showing.extend_from_slice(&bytes[start + enter.len() + length + leave.len()..]);
-        return (showing, Some(inner));
+pub fn with_the_switches_reversed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if rest.starts_with(b"\x1b[?47h") {
+            out.extend_from_slice(b"\x1b[?47l");
+            at += 6;
+        } else if rest.starts_with(b"\x1b[?47l") {
+            out.extend_from_slice(b"\x1b[?47h");
+            at += 6;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
     }
-    (bytes.to_vec(), None)
+    out
 }
 
 /// A restoration with the part that paints the buffer that is not showing cut out.
 ///
-/// The session paints that buffer by switching to it with mode 47, clearing it, drawing its rows
-/// and switching back; this removes exactly that, and returns the bytes unchanged when there is no
-/// such part.
+/// The session paints that buffer between a switch to it with mode 47 and the switch back; this
+/// removes both switches and everything between them, and returns the bytes unchanged when there
+/// is no such part.
 #[must_use]
 pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
     for (enter, leave) in [
-        (&b"\x1b[?47h\x1b[H\x1b[2J"[..], &b"\x1b[?47l"[..]),
-        (&b"\x1b[?47l\x1b[H\x1b[2J"[..], &b"\x1b[?47h"[..]),
+        (&b"\x1b[?47h"[..], &b"\x1b[?47l"[..]),
+        (&b"\x1b[?47l"[..], &b"\x1b[?47h"[..]),
     ] {
         let Some(start) = find(bytes, enter) else {
             continue;
@@ -1117,15 +1085,61 @@ mod tests {
     }
 
     #[test]
-    fn splitting_the_other_buffer_gives_its_rows_to_it_and_the_rest_to_the_showing_one() {
-        let restoration = b"\x1b[!p\x1b[?47h\x1b[H\x1b[2Jother\x1b[?47l\x1b[Hshowing";
-        let (showing, other) = split_the_buffer_not_showing(restoration);
-        assert_eq!(showing, b"\x1b[!p\x1b[Hshowing".to_vec());
-        assert_eq!(other, Some(b"\x1b[H\x1b[2Jother".to_vec()));
+    fn reversing_the_switches_turns_each_mode_47_switch_the_other_way() {
         assert_eq!(
-            split_the_buffer_not_showing(b"plain"),
-            (b"plain".to_vec(), None)
+            with_the_switches_reversed(b"a\x1b[?47hb\x1b[?47lc\x1b[?1047h"),
+            b"a\x1b[?47lb\x1b[?47hc\x1b[?1047h".to_vec()
         );
+    }
+
+    fn bell(at: u64, completed_at: u64) -> Caused {
+        Caused {
+            kind: SideEffectKind::Bell,
+            at,
+            completed_at,
+        }
+    }
+
+    #[test]
+    fn an_owed_effect_lost_at_a_resynchronisation_is_kept_apart_and_nothing_else_is() {
+        // Two bells owed; the first completed at the byte the session told the client to begin
+        // again at, the second at another. Neither was performed.
+        let found = account(&[bell(9, 10), bell(19, 20)], &[], &[10]);
+        assert_eq!(found.lost.len(), 1, "{found:?}");
+        assert!(found.lost[0].contains("completed at byte 10"), "{found:?}");
+        assert_eq!(found.failures.len(), 1, "the other one fails: {found:?}");
+        assert!(
+            found.failures[0].contains("completed at byte 20"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_effect_nobody_owed_fails_even_beside_one_that_was_lost() {
+        let delivered = [Delivered {
+            cursor: 30,
+            kind: SideEffectKind::Bell,
+        }];
+        let found = account(&[bell(9, 10)], &delivered, &[10]);
+        assert_eq!(found.lost.len(), 1, "{found:?}");
+        assert_eq!(found.failures.len(), 1, "{found:?}");
+        assert!(
+            found.failures[0].contains("delivery at byte 30"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn two_equal_effects_are_told_apart_by_where_they_were_delivered() {
+        // The second bell arrived; the first did not, and no resynchronisation explains it.
+        let delivered = [Delivered {
+            cursor: 19,
+            kind: SideEffectKind::Bell,
+        }];
+        let found = account(&[bell(9, 10), bell(19, 20)], &delivered, &[]);
+        assert!(found.lost.is_empty(), "{found:?}");
+        assert_eq!(found.failures.len(), 1, "{found:?}");
+        assert!(found.failures[0].contains("began at byte 9"), "{found:?}");
     }
 
     #[test]

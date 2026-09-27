@@ -1,7 +1,7 @@
 {
   "format": "kalareach.restore-corpus/1",
   "name": "alternate-47-1047",
-  "about": "the other buffer entered through modes 47 and 1047, a cursor saved around them with DECSC and DECRC, and one saved and restored through mode 1048",
+  "about": "the other buffer entered through mode 1047 with a cursor saved around it by DECSC and DECRC, a request for mode 47 the profile consumes without switching, and a cursor saved and restored through mode 1048",
   "columns": 20,
   "rows": 4,
   "writes": [
