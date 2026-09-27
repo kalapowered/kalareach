@@ -1164,7 +1164,7 @@ pub fn rendered(descriptor: &WorkerDescriptor, question: &Question) -> Document 
                         .source
                         .executable
                         .as_ref()
-                        .map(|executable| Asked::path(Request::Question, executable)),
+                        .map(|executable| Asked::text(Request::Question, executable)),
                 )
                 .with("pid", question.source.process.pid.get())
                 .with(
@@ -1216,7 +1216,7 @@ pub fn line(descriptor: &WorkerDescriptor, question: &Question) -> Line {
             left(9, &question.state.as_str()),
             left(8, &question.kind.as_str()),
             text,
-            Asked::path(Request::Question, executable),
+            Asked::text(Request::Question, executable),
             pid
         ),
         None => stdout_line!(
@@ -1246,7 +1246,7 @@ pub fn detail(descriptor: &WorkerDescriptor, question: &Question) -> Vec<Line> {
         match question.source.executable.as_ref() {
             Some(executable) => stdout_line!(
                 "asked by  {} ({})  (verified)",
-                Asked::path(Request::Question, executable),
+                Asked::text(Request::Question, executable),
                 pid
             ),
             None => stdout_line!("asked by  process {}  (verified)", pid),

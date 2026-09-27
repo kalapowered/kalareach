@@ -6,7 +6,7 @@
 //! * a number, a switch, an identifier, a digest and a word of a closed set through the protocol's
 //!   own encoding ([`closed`]), which keeps the shape a script reading the protocol expects;
 //! * content the person asked for, such as a repository's path, a workspace's label, a plugin's
-//!   identifier or a change's paths, as [`Asked`] under the command's [`Request`];
+//!   identifier or a change's paths, as [`Asked`] under the command's [`Request`], as it arrived;
 //! * a Git revision, reference or mode and a digest that arrive as text through their grammar,
 //!   said only when they match it;
 //! * a sentence the host wrote, such as a limitation or an operation's detail, as its class and its
@@ -156,7 +156,7 @@ fn file_grant(value: &FileGrant) -> Document {
             value
                 .included_paths
                 .iter()
-                .map(|text| Asked::path(Request::Changesets, text))
+                .map(|text| Asked::text(Request::Changesets, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -164,7 +164,7 @@ fn file_grant(value: &FileGrant) -> Document {
             value
                 .excluded_paths
                 .iter()
-                .map(|text| Asked::path(Request::Changesets, text))
+                .map(|text| Asked::text(Request::Changesets, text))
                 .collect::<Vec<_>>(),
         )
         .with("secret_rules_applied", value.secret_rules_applied)
@@ -194,7 +194,7 @@ fn provenance(value: &Provenance) -> Document {
 /// `CapturedPath`, in the shape the protocol answers it.
 fn captured_path(value: &CapturedPath) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Changesets, &value.path))
+        .with("path", Asked::text(Request::Changesets, &value.path))
         .with("content_digest", closed(&value.content_digest))
         .with("byte_len", closed(&value.byte_len))
         .with("executable", value.executable)
@@ -221,7 +221,7 @@ fn captured_path(value: &CapturedPath) -> Document {
 /// `Exclusion`, in the shape the protocol answers it.
 fn exclusion(value: &Exclusion) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Changesets, &value.path))
+        .with("path", Asked::text(Request::Changesets, &value.path))
         .with("reason", closed(&value.reason))
         .with(
             "detail",
@@ -295,7 +295,7 @@ fn materialisation_record(value: &MaterialisationRecord) -> Document {
         .with("label", Asked::text(Request::Changesets, &value.label))
         .with(
             "directory_path",
-            Asked::path(Request::Changesets, &value.directory_path),
+            Asked::text(Request::Changesets, &value.directory_path),
         )
         .with("filesystem_identity", closed(&value.filesystem_identity))
         .with("paths_written", closed(&value.paths_written))
@@ -304,7 +304,7 @@ fn materialisation_record(value: &MaterialisationRecord) -> Document {
             value
                 .unapplied
                 .iter()
-                .map(|text| Asked::path(Request::Changesets, text))
+                .map(|text| Asked::text(Request::Changesets, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -318,7 +318,7 @@ fn materialisation_record(value: &MaterialisationRecord) -> Document {
 /// `ObservedPath`, in the shape the protocol answers it.
 fn observed_path(value: &ObservedPath) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Changesets, &value.path))
+        .with("path", Asked::text(Request::Changesets, &value.path))
         .with("device", closed(&value.device))
         .with("file_id", closed(&value.file_id))
         .with("byte_len", closed(&value.byte_len))
@@ -478,7 +478,7 @@ pub fn diff_read_result(value: &DiffReadResult) -> Document {
 /// `DiffEntry`, in the shape the protocol answers it.
 fn diff_entry(value: &DiffEntry) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Diff, &value.path))
+        .with("path", Asked::text(Request::Diff, &value.path))
         .with("class", closed(&value.class))
         .with("change", closed(&value.change))
         .with("content", closed(&value.content))
@@ -508,7 +508,7 @@ pub fn diff_apply_result(value: &DiffApplyResult) -> Document {
             value
                 .changed_paths
                 .iter()
-                .map(|text| Asked::path(Request::Diff, text))
+                .map(|text| Asked::text(Request::Diff, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -516,7 +516,7 @@ pub fn diff_apply_result(value: &DiffApplyResult) -> Document {
             value
                 .unresolved_paths
                 .iter()
-                .map(|text| Asked::path(Request::Diff, text))
+                .map(|text| Asked::text(Request::Diff, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -577,7 +577,7 @@ fn reference_outcome(value: &ReferenceOutcome) -> Document {
 /// `PathConflict`, in the shape the protocol answers it.
 fn path_conflict(value: &PathConflict) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Diff, &value.path))
+        .with("path", Asked::text(Request::Diff, &value.path))
         .with(
             "expected_worktree_digest",
             closed(&value.expected_worktree_digest),
@@ -609,7 +609,7 @@ fn path_conflict(value: &PathConflict) -> Document {
 /// `PathProgress`, in the shape the protocol answers it.
 fn path_progress(value: &PathProgress) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Diff, &value.path))
+        .with("path", Asked::text(Request::Diff, &value.path))
         .with("state", closed(&value.state))
         .with("before_digest", closed(&value.before_digest))
         .with("after_digest", closed(&value.after_digest))
@@ -630,14 +630,14 @@ fn recovery_objects(value: &RecoveryObjects) -> Document {
             value
                 .staged_path
                 .as_ref()
-                .map(|text| Asked::path(Request::Diff, text)),
+                .map(|text| Asked::text(Request::Diff, text)),
         )
         .with(
             "staged_leftovers",
             value
                 .staged_leftovers
                 .iter()
-                .map(|text| Asked::path(Request::Diff, text))
+                .map(|text| Asked::text(Request::Diff, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -904,7 +904,7 @@ fn project_summary(value: &ProjectSummary) -> Document {
         .with("filesystem_identity", closed(&value.filesystem_identity))
         .with(
             "display_path",
-            Asked::path(Request::Repositories, &value.display_path),
+            Asked::text(Request::Repositories, &value.display_path),
         )
         .with("remote", value.remote.as_ref().map(remote_specification))
         .with("created_at_ms", closed(&value.created_at_ms))
@@ -957,7 +957,7 @@ fn operation_record(value: &OperationRecord) -> Document {
             value
                 .retained_staging_paths
                 .iter()
-                .map(|text| Asked::path(Request::Repositories, text))
+                .map(|text| Asked::text(Request::Repositories, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -965,7 +965,7 @@ fn operation_record(value: &OperationRecord) -> Document {
             value
                 .removed_staging_paths
                 .iter()
-                .map(|text| Asked::path(Request::Repositories, text))
+                .map(|text| Asked::text(Request::Repositories, text))
                 .collect::<Vec<_>>(),
         )
         .with(
@@ -1034,7 +1034,7 @@ fn workspace_summary(value: &WorkspaceSummary) -> Document {
         .with("filesystem_identity", closed(&value.filesystem_identity))
         .with(
             "display_path",
-            Asked::path(Request::Workspaces, &value.display_path),
+            Asked::text(Request::Workspaces, &value.display_path),
         )
         .with(
             "detail",
@@ -1074,7 +1074,7 @@ pub fn workspace_create_result(value: &WorkspaceCreateResult) -> Document {
             value
                 .unapplied
                 .iter()
-                .map(|text| Asked::path(Request::Workspaces, text))
+                .map(|text| Asked::text(Request::Workspaces, text))
                 .collect::<Vec<_>>(),
         )
         .with("ok", true)
@@ -1123,7 +1123,7 @@ fn inclusion_preview(value: &InclusionPreview) -> Document {
 /// `PreviewEntry`, in the shape the protocol answers it.
 fn preview_entry(value: &PreviewEntry) -> Document {
     Document::new()
-        .with("path", Asked::path(Request::Workspaces, &value.path))
+        .with("path", Asked::text(Request::Workspaces, &value.path))
         .with("class", closed(&value.class))
         .with("change", closed(&value.change))
         .with("content", closed(&value.content))

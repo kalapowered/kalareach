@@ -272,7 +272,7 @@ fn report_created(
             verb,
             Asked::text(Request::Repositories, &project.label),
             output::closed_word(&project.project_repository_id),
-            Asked::path(Request::Repositories, &project.display_path)
+            Asked::text(Request::Repositories, &project.display_path)
         ));
     }
     Ok(())
@@ -289,7 +289,7 @@ fn line(project: &ProjectSummary) -> Line {
         right(2, &count),
         if count == 1 { "" } else { "s" },
         Asked::text(Request::Repositories, &project.label),
-        Asked::path(Request::Repositories, &project.display_path),
+        Asked::text(Request::Repositories, &project.display_path),
     )
 }
 

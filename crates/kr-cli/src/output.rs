@@ -76,7 +76,8 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// Text as it arrived.
+    /// Text as it arrived. A path the host sent is such text, said as the host wrote it: its own
+    /// separators, and a repository's paths with the `/` they always have.
     #[must_use]
     pub fn text(request: Request, text: &str) -> Self {
         Self {
@@ -85,7 +86,8 @@ impl Asked {
         }
     }
 
-    /// A path, spelled as this program spells every path: the platform's own separator throughout.
+    /// A path this program holds, one it composed or read on this host, spelled as this program
+    /// spells every path of its own: the platform's own separator throughout.
     #[must_use]
     pub fn path(request: Request, path: impl AsRef<Path>) -> Self {
         Self {
@@ -96,7 +98,7 @@ impl Asked {
 
     /// A location: a URL as its scheme, host, port and path, a file URL as its path
     /// ([`kr_client::shown::located`]); an SCP-style location (`user@host:path`) as its host and its
-    /// path; anything else as a local path.
+    /// path; anything else as a local path, as it was written.
     ///
     /// Nothing is said of a location but those parts, so user information, a query and a fragment
     /// are never kept. Every reading but the parser's says only text that holds none of the
@@ -121,7 +123,7 @@ impl Asked {
                 withheld(ContentClass::Location, location)
             }
         } else if local_path(location) {
-            kr_client::shown::spelled(Path::new(location))
+            location.to_owned()
         } else {
             withheld(ContentClass::Location, location)
         };
@@ -854,7 +856,6 @@ mod tests {
     /// drive or a local path is a path. User information, a query and a fragment never show.
     #[test]
     fn a_location_is_said_without_user_information_query_or_fragment() {
-        let separator = std::path::MAIN_SEPARATOR;
         for (location, expected) in [
             (
                 format!("https://{MARKER}:{MARKER}@proxy.example:8080/relay/?{MARKER}#{MARKER}"),
@@ -874,7 +875,7 @@ mod tests {
             ),
             (
                 "/srv/repositories/one".to_owned(),
-                format!("{separator}srv{separator}repositories{separator}one"),
+                "/srv/repositories/one".to_owned(),
             ),
         ] {
             let asked = Asked::location(Request::Repositories, &location);
@@ -964,9 +965,11 @@ mod tests {
         }
     }
 
-    /// A path is spelled with the platform's own separator throughout, however it was written.
+    /// A path this program holds is spelled with the platform's own separator throughout, however
+    /// it was joined; a path the host sent is said as it arrived, a repository's `/` and a Windows
+    /// host's `\` alike, on every platform.
     #[test]
-    fn a_path_is_spelled_with_one_separator() {
+    fn a_path_is_spelled_with_one_separator_unless_the_host_sent_it() {
         let separator = std::path::MAIN_SEPARATOR;
         let asked = Asked::path(
             Request::ShellFiles,
@@ -977,6 +980,13 @@ mod tests {
             format!("{separator}home{separator}person{separator}.zshrc")
         );
         assert_eq!(Asked::text(Request::Question, MARKER).text, MARKER);
+        for sent in [
+            "src/output/lines.rs",
+            r"C:\Users\someone\repository",
+            "/usr/bin/zsh",
+        ] {
+            assert_eq!(Asked::text(Request::Diff, sent).text, sent);
+        }
     }
 
     /// A configured location is said piece by piece, at the host's own `, ` join, each by its

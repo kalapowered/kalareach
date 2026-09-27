@@ -129,7 +129,7 @@ async fn read(paths: &HostPaths, arguments: &ChangesetReadArguments, json: bool)
             "materialised {} ({}) at {}",
             output::closed_word(&materialisation.materialisation_id),
             crate::shown::wire_word(materialisation.purpose),
-            Asked::path(Request::Changesets, &materialisation.directory_path)
+            Asked::text(Request::Changesets, &materialisation.directory_path)
         ));
     }
     for evidence in &read.evidence {
@@ -175,13 +175,13 @@ async fn materialize(
         record.version.version.get(),
         output::closed_word(&record.version.change_set_id),
         output::closed_word(&record.materialisation_id),
-        Asked::path(Request::Changesets, &record.directory_path),
+        Asked::text(Request::Changesets, &record.directory_path),
         record.paths_written.get()
     ));
     for path in &record.unapplied {
         output::line(&stdout_line!(
             "not written: {}",
-            Asked::path(Request::Changesets, path)
+            Asked::text(Request::Changesets, path)
         ));
     }
     for limitation in &materialised.limitations {
@@ -246,7 +246,7 @@ fn details(version: &ChangeSetVersionRecord) -> Vec<Line> {
             "  {} {} {}",
             left(16, &change.class.as_str()),
             left(8, &crate::shown::wire_word(change.change)),
-            Asked::path(Request::Changesets, &change.path)
+            Asked::text(Request::Changesets, &change.path)
         ));
     }
     if version.omitted_changes.get() > 0 {
@@ -258,7 +258,7 @@ fn details(version: &ChangeSetVersionRecord) -> Vec<Line> {
     for exclusion in &version.exclusions {
         lines.push(stdout_line!(
             "  left out: {} ({})",
-            Asked::path(Request::Changesets, &exclusion.path),
+            Asked::text(Request::Changesets, &exclusion.path),
             exclusion.reason.as_str()
         ));
     }

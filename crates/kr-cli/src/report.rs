@@ -91,8 +91,8 @@ pub fn session(summary: &SessionSummary) -> Document {
         .with("environment_id", output::said(&summary.environment_id))
         .with("state", summary.state.as_str())
         .with("shell_mode", summary.shell_mode.as_str())
-        .with("shell", Asked::path(Request::Sessions, &summary.shell_path))
-        .with("cwd", Asked::path(Request::Sessions, &summary.cwd))
+        .with("shell", Asked::text(Request::Sessions, &summary.shell_path))
+        .with("cwd", Asked::text(Request::Sessions, &summary.cwd))
         .with("dimensions", dimensions(summary.dimensions))
         .with("attachments", summary.attachment_count.get())
         .with("worker_profile", summary.worker_profile.as_str())
@@ -245,7 +245,7 @@ pub fn session_line(summary: &SessionSummary) -> Line {
         } else {
             "s"
         },
-        Asked::path(Request::Sessions, &summary.shell_path),
+        Asked::text(Request::Sessions, &summary.shell_path),
     )
 }
 
@@ -412,7 +412,7 @@ pub fn capability(record: &CapabilityRecord) -> Document {
                 .identity
                 .binary
                 .as_ref()
-                .map(|binary| Asked::path(Request::Diagnostics, binary)),
+                .map(|binary| Asked::text(Request::Diagnostics, binary)),
         )
         .with(
             "facility_identity",
@@ -568,7 +568,7 @@ pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<Line> {
                     "  {} {} {}",
                     left(26, &capability),
                     left(24, &record.state.as_str()),
-                    Asked::path(Request::Diagnostics, binary)
+                    Asked::text(Request::Diagnostics, binary)
                 ),
                 (None, None) => stdout_line!(
                     "  {} {} no facility named",

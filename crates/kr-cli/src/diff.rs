@@ -328,19 +328,19 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> Vec<Line> {
     for path in &applied.changed_paths {
         lines.push(stdout_line!(
             "changed: {}",
-            Asked::path(Request::Diff, path)
+            Asked::text(Request::Diff, path)
         ));
     }
     for path in &applied.unresolved_paths {
         lines.push(stdout_line!(
             "not established: {}",
-            Asked::path(Request::Diff, path)
+            Asked::text(Request::Diff, path)
         ));
     }
     for conflict in &applied.conflicts {
         lines.push(stdout_line!(
             "conflict: {}: {}",
-            Asked::path(Request::Diff, &conflict.path),
+            Asked::text(Request::Diff, &conflict.path),
             crate::shown::exported("PathConflict", "detail", &conflict.detail)
         ));
     }
@@ -349,13 +349,13 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> Vec<Line> {
             stdout_line!(
                 "{} {}",
                 left(10, &progress.state.as_str()),
-                Asked::path(Request::Diff, &progress.path)
+                Asked::text(Request::Diff, &progress.path)
             )
         } else {
             stdout_line!(
                 "{} {}: {}",
                 left(10, &progress.state.as_str()),
-                Asked::path(Request::Diff, &progress.path),
+                Asked::text(Request::Diff, &progress.path),
                 crate::shown::exported("PathProgress", "detail", &progress.detail)
             )
         });
@@ -377,13 +377,13 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> Vec<Line> {
     if let Some(staged) = recovery.staged_path.as_ref() {
         lines.push(stdout_line!(
             "staged at: {}",
-            Asked::path(Request::Diff, staged)
+            Asked::text(Request::Diff, staged)
         ));
     }
     for leftover in &recovery.staged_leftovers {
         lines.push(stdout_line!(
             "left beside a destination path: {}",
-            Asked::path(Request::Diff, leftover)
+            Asked::text(Request::Diff, leftover)
         ));
     }
     for limitation in &applied.limitations {
@@ -412,7 +412,7 @@ fn entry_line(entry: &DiffEntry) -> Line {
         left(18, &entry.class.as_str()),
         left(8, &crate::shown::wire_word(entry.change)),
         digest,
-        Asked::path(Request::Diff, &entry.path)
+        Asked::text(Request::Diff, &entry.path)
     )
 }
 

@@ -141,7 +141,7 @@ async fn create(paths: &HostPaths, arguments: &WorkspaceCreateArguments, json: b
             "Created workspace {} ({}) at {}.",
             output::closed_word(&workspace.workspace_id),
             crate::shown::wire_word(workspace.kind),
-            Asked::path(Request::Workspaces, &workspace.display_path)
+            Asked::text(Request::Workspaces, &workspace.display_path)
         )),
         None => output::say(&Shown::said(
             "Nothing was created. The workspace would hold:",
@@ -151,7 +151,7 @@ async fn create(paths: &HostPaths, arguments: &WorkspaceCreateArguments, json: b
     for path in &created.unapplied {
         output::line(&stdout_line!(
             "not carried into the workspace: {}",
-            Asked::path(Request::Workspaces, path)
+            Asked::text(Request::Workspaces, path)
         ));
     }
     Ok(())
@@ -263,7 +263,7 @@ fn line(workspace: &WorkspaceSummary) -> Line {
         left(15, &crate::shown::wire_word(workspace.kind)),
         left(15, &crate::shown::wire_word(workspace.state)),
         Asked::text(Request::Workspaces, &workspace.label),
-        Asked::path(Request::Workspaces, &workspace.display_path),
+        Asked::text(Request::Workspaces, &workspace.display_path),
     )
 }
 

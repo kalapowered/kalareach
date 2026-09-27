@@ -264,7 +264,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 ));
                 // The receipt, not the request: what the session was actually created with.
                 output::line(&report::desktop_line(&created.session));
-                let shell = Asked::path(Request::Sessions, &created.session.shell_path);
+                let shell = Asked::text(Request::Sessions, &created.session.shell_path);
                 match created.session.shell_mode {
                     ShellMode::Managed if fenced_launch => output::line(&stdout_line!(
                         "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \

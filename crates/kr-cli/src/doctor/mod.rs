@@ -355,7 +355,7 @@ pub fn integration(report: &CommandIntegrationReport) -> Document {
             report
                 .executable
                 .as_ref()
-                .map(|executable| Asked::path(Request::Diagnostics, executable)),
+                .map(|executable| Asked::text(Request::Diagnostics, executable)),
         )
         .with(
             "executable_version",
@@ -466,14 +466,14 @@ pub fn integration_lines(
                 (Some(executable), Some(version)) => stdout_line!(
                     "{}resolves to {} on the daemon's search path, {} by its signed record",
                     rest,
-                    Asked::path(Request::Diagnostics, executable),
+                    Asked::text(Request::Diagnostics, executable),
                     asked(version)
                 ),
                 (Some(executable), None) => stdout_line!(
                     "{}resolves to {} on the daemon's search path, a build no signed record \
                      names, so its version is not known",
                     rest,
-                    Asked::path(Request::Diagnostics, executable)
+                    Asked::text(Request::Diagnostics, executable)
                 ),
                 (None, _) => stdout_line!(
                     "{}{} is not on the daemon's search path; a session looks for it on its own",

@@ -110,7 +110,7 @@ fn list_lines(rows: &[EnvironmentInventoryRow]) -> Vec<Line> {
             enrolment.access.as_str(),
             asked(&enrolment.target),
             asked(&enrolment.os_user),
-            Asked::path(Request::Bridges, &enrolment.helper_path),
+            Asked::text(Request::Bridges, &enrolment.helper_path),
             row.last_observed_at_ms.get(),
             environments::presence_text(row.status),
         ));
@@ -188,7 +188,7 @@ fn enrolment(enrolment: &EnvironmentEnrolment) -> Document {
         .with("os_user", asked(&enrolment.os_user))
         .with(
             "helper_path",
-            Asked::path(Request::Bridges, &enrolment.helper_path),
+            Asked::text(Request::Bridges, &enrolment.helper_path),
         )
         .with(
             "clipboard_destination",
