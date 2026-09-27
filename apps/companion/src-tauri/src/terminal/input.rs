@@ -31,7 +31,9 @@ use kr_protocol::ids::{InputLeaseEpoch, InputSequence, RequestId};
 use kr_protocol::input::InputAcquireResult;
 use serde::Deserialize;
 
-use super::keys::{KeyAction, KeyName, KeypadCode, Pasted, Scalar, Text, TypedKey};
+use super::keys::{
+    Identity, KeyAction, KeyName, KeypadCode, Pasted, Pressed, Presses, Scalar, Text, TypedKey,
+};
 use super::screen::{ControlState, TerminalControl, Wheel};
 
 /// The terminal profile a view declares when it attaches.
@@ -281,11 +283,13 @@ pub fn wheel_reports(
     Some(report.repeat(turns.count()))
 }
 
-/// The lease a view holds, and the next number of its input stream.
-#[derive(Clone, Copy, Debug)]
+/// The lease a view holds, the next number of its input stream, and the presses written under it,
+/// which go with it.
+#[derive(Debug)]
 struct Held {
     epoch: InputLeaseEpoch,
     next: u64,
+    presses: Presses,
 }
 
 /// A call the lease owes the session.
@@ -390,7 +394,7 @@ impl Lease {
         }
         if let Some(epoch) = self.writes.remove(&request)
             && let Err(refusal) = outcome
-            && self.held.is_some_and(|held| held.epoch == epoch)
+            && self.held.as_ref().is_some_and(|held| held.epoch == epoch)
         {
             // The first refusal of a write ends this epoch, whatever became of its number. A lease
             // lost is not the view's to give back; any other it still holds, and gives back.
@@ -412,6 +416,7 @@ impl Lease {
                     self.held = Some(Held {
                         epoch: result.lease.epoch,
                         next: result.lease.next_sequence.get(),
+                        presses: Presses::default(),
                     });
                     true
                 } else {
@@ -461,6 +466,26 @@ impl Lease {
     #[must_use]
     pub fn controls(&self, take: u64) -> bool {
         self.held.is_some() && self.wanted && take == self.asked
+    }
+
+    /// Records the press `pressed` of the key `identity`, written under the page's take `take`,
+    /// with the lease it went under, so its release finds it. A newer take the same lease serves
+    /// keeps it; the end of control takes it away with the lease.
+    pub fn pressed(&mut self, take: u64, identity: Identity, pressed: Pressed) {
+        if self.controls(take)
+            && let Some(held) = self.held.as_mut()
+        {
+            held.presses.record(identity, pressed);
+        }
+    }
+
+    /// The press a release made under the page's take `take` ends, taken out of the record: only
+    /// while the view controls the program under that take.
+    pub fn released(&mut self, take: u64, identity: &Identity) -> Option<Pressed> {
+        if !self.controls(take) {
+            return None;
+        }
+        self.held.as_mut()?.presses.released(identity)
     }
 
     /// The view wrote `request` under `epoch`.
@@ -558,6 +583,76 @@ mod tests {
         lease.sent(Owed::Acquire, RequestId::new(10));
         assert!(lease.answered(RequestId::new(10), acquired(5)));
         lease
+    }
+
+    /// Control-I, pressed under the page's take 1, as the view records it.
+    fn control_i() -> (Identity, Pressed) {
+        let input: Input = serde_json::from_value(serde_json::json!({
+            "kind": "key", "take": 1, "key": "i", "base": "i", "keypad": null,
+            "shift": false, "alt": false, "control": true, "caps_lock": false,
+            "num_lock": false, "event": "press",
+        }))
+        .expect("a key");
+        let (typed, _) = input.typed_key().expect("a key input");
+        let event = typed
+            .event(kr_client::encoder::KeyEventKind::Press)
+            .expect("a key event");
+        (
+            typed.identity(),
+            Pressed {
+                event,
+                reported: true,
+            },
+        )
+    }
+
+    /// KR-REQ-08.61: the press records go with the lease they were written under, however control
+    /// ends: given back, a refused write, or a program reading a form the view does not produce.
+    #[test]
+    fn the_press_records_go_when_control_ends() {
+        /// One way control ends.
+        type End = fn(&mut Lease);
+        let ends: [(&str, End); 3] = [
+            ("given back", |lease| {
+                assert!(lease.request(2, false));
+            }),
+            ("a refused write", |lease| {
+                let writing = lease.write(1).expect("controls");
+                lease.written(RequestId::new(20), writing.epoch);
+                assert!(lease.answered(RequestId::new(20), refusal(ErrorCode::InvalidArgument)));
+            }),
+            ("an encoding the view does not produce", |lease| {
+                assert!(lease.unsupported());
+            }),
+        ];
+        for (how, end) in ends {
+            let mut lease = holding();
+            let (identity, pressed) = control_i();
+            lease.pressed(1, identity.clone(), pressed);
+            end(&mut lease);
+            assert!(lease.released(1, &identity).is_none(), "{how}");
+        }
+    }
+
+    /// KR-REQ-08.61: a newer take served by the lease the view still holds keeps what was pressed
+    /// under it, so a key held across the take is released to the program, once.
+    #[test]
+    fn a_newer_take_of_the_lease_held_keeps_its_presses() {
+        let mut lease = holding();
+        let (identity, pressed) = control_i();
+        lease.pressed(1, identity.clone(), pressed);
+        assert!(lease.request(2, true));
+        assert_eq!(
+            lease.owed(),
+            None,
+            "the lease it holds serves the newer take"
+        );
+        assert!(
+            lease
+                .released(2, &identity)
+                .is_some_and(|found| found.reported)
+        );
+        assert!(lease.released(2, &identity).is_none(), "once");
     }
 
     #[test]

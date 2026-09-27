@@ -40,7 +40,7 @@ use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
-use super::keys::{self, KeyAction, Keyboard, Pressed, Presses, TypedKey};
+use super::keys::{self, KeyAction, Keyboard, Pressed, TypedKey};
 use super::screen::{TerminalViewState, state_of};
 use super::window::{Answer, WindowReports};
 use super::{Locate, Publish};
@@ -150,7 +150,6 @@ pub(super) async fn run(
         next_request: LOOP_REQUESTS,
         window,
         lease,
-        presses: Presses::default(),
         resubscription: None,
         replaced_stream: false,
         recoveries: 0,
@@ -327,8 +326,6 @@ struct View {
     window: WindowReports,
     /// Whether the view controls the program, and what it owes the session for it.
     lease: Lease,
-    /// The presses written under the newest take, so each release finds the press it ends.
-    presses: Presses,
     /// The resubscription waiting for its answer.
     resubscription: Option<RequestId>,
     /// Whether the stream a resubscription replaced is still being dropped: until the new stream's
@@ -465,7 +462,11 @@ impl View {
                 Outcome::Ok(value) => Ok(value),
                 Outcome::Error(refusal) => Err(refusal),
             };
-            if self.lease.answered(response.request_id, outcome) {
+            let changed = self.lease.answered(response.request_id, outcome);
+            // A take the session granted just before the program changed to a form the view does
+            // not produce ends as its answer arrives, before the page is told it controls anything.
+            let ended = !self.keyboard_supplied() && self.lease.unsupported();
+            if changed || ended {
                 self.control_changed();
             }
             return None;
@@ -717,7 +718,7 @@ impl View {
                 typed.event(kind).and_then(|event| {
                     let bytes = encoder::key(event, keyboard.encoding)?;
                     if kind == KeyEventKind::Press {
-                        self.presses.record(
+                        self.lease.pressed(
                             take,
                             typed.identity(),
                             Pressed {
@@ -729,7 +730,7 @@ impl View {
                     Ok(bytes)
                 })
             }
-            KeyAction::Release => match self.presses.released(take, &typed.identity()) {
+            KeyAction::Release => match self.lease.released(take, &typed.identity()) {
                 Some(pressed) if pressed.reported => encoder::release(
                     pressed.event,
                     typed.modifiers,
@@ -793,13 +794,17 @@ impl View {
     /// key written in an encoding the view only advertised. The session has ended the lease on its
     /// side as the program changed; the view gives back the epoch it held, once.
     fn follow_the_keyboard(&mut self) {
-        let supplied = self
-            .projection
-            .screen()
-            .is_none_or(|screen| Keyboard::of(screen).supplied());
-        if !supplied && self.lease.unsupported() {
+        if !self.keyboard_supplied() && self.lease.unsupported() {
             self.control_changed();
         }
+    }
+
+    /// Whether the view produces the form the program reads keys in, by the screen it holds. With
+    /// no screen nothing says otherwise yet, and the next screen is read as it comes.
+    fn keyboard_supplied(&self) -> bool {
+        self.projection
+            .screen()
+            .is_none_or(|screen| Keyboard::of(screen).supplied())
     }
 
     /// Writes `bytes` to the program under the lease the view holds for the page's take `take`.

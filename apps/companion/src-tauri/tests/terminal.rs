@@ -3216,6 +3216,110 @@ async fn a_program_asking_for_what_the_view_cannot_send_ends_control_at_once() {
     .await;
 }
 
+/// KR-REQ-08.61: a take the session grants just before the program changes to a form the view does
+/// not produce, whose answer reaches the view after the screen that says so, ends as the answer
+/// arrives: the page is never told the view controls the program, the granted epoch goes back once,
+/// and nothing is written under it, a wheel turn included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_granted_just_before_the_program_changed_to_what_the_view_cannot_send_ends_at_once()
+{
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let at = reporting(Mouse::Sgr).keys(Keys::kitty(1));
+    lease.negotiate(Negotiated::Kitty(1));
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, Keys::kitty(5)),
+    )
+    .await;
+    // The session granted the take under Kitty 1, and ends the lease on its side as the program
+    // changes.
+    lease.answer(&mut link, &acquire).await;
+    lease.negotiate(Negotiated::Kitty(5));
+    let ended = page_view
+        .newest(3, |state| control(state) == (1, "watching".to_owned()))
+        .await;
+    assert_eq!(
+        ended["control"]["ended"],
+        "Control ended: the program now reads keys in a form this view cannot send."
+    );
+    assert!(
+        page_view
+            .states(3)
+            .iter()
+            .all(|state| state["control"]["state"] != "controlling"),
+        "the page is never told the view controls the program"
+    );
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 1);
+    lease.answer(&mut link, &release).await;
+    assert_eq!(
+        code(
+            &page_view
+                .input(&view, key(1, "Escape", &[], "press"))
+                .expect_err("control ended")
+        ),
+        "LEASE_LOST"
+    );
+    assert_eq!(
+        code(
+            &page_view
+                .wheel(&view, 1, 0, 0, 1)
+                .expect_err("control ended")
+        ),
+        "LEASE_LOST"
+    );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "nothing more is asked or written"
+    );
+    assert!(lease.written.is_empty());
+}
+
+/// KR-REQ-08.61: a newer take served by the lease the view still holds keeps what was pressed under
+/// it, so a key held across the take is released to the program rather than left down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_held_across_a_newer_take_is_released_to_the_program() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(3), &mut lease).await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(
+            based(key(1, "i", &["control"], "press"), "i"),
+            b"\x1b[105;5u",
+        )],
+    )
+    .await;
+    page_view.take(&view, 2);
+    page_view
+        .newest(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(based(key(2, "i", &[], "release"), "i"), b"\x1b[105;1:3u")],
+    )
+    .await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the lease it holds serves the newer take: nothing is asked"
+    );
+}
+
 /// KR-REQ-08.59: the alternate buffer keeps its own Kitty flags, so a full-screen program's
 /// negotiation is read while its buffer shows, and the shell's once it is gone.
 #[tokio::test(flavor = "multi_thread")]

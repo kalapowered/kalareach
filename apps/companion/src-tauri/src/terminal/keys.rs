@@ -276,34 +276,26 @@ pub struct Pressed {
 /// a bound on what a page that never sends a release can make the view keep.
 const MOST_PRESSES: usize = 256;
 
-/// The presses a view wrote under its newest take, so each release finds the press it ends.
+/// The presses a view wrote under the lease it holds, so each release finds the press it ends.
 ///
-/// The records of an older take go when a newer take writes, so nothing made in one period of
-/// control is answered in another. Past [`MOST_PRESSES`] a press still goes and is not recorded,
-/// and its release is then nothing: a release left out, never one invented.
+/// The lease keeps them, and they go with it: nothing pressed in one period of control is answered
+/// in another. Past [`MOST_PRESSES`] a press still goes and is not recorded, and its release is then
+/// nothing: a release left out, never one invented.
 #[derive(Debug, Default)]
 pub struct Presses {
-    take: u64,
     pressed: BTreeMap<Identity, Pressed>,
 }
 
 impl Presses {
-    /// Records a press written under `take`.
-    pub fn record(&mut self, take: u64, identity: Identity, pressed: Pressed) {
-        if take != self.take {
-            self.pressed.clear();
-            self.take = take;
-        }
+    /// Records a press.
+    pub fn record(&mut self, identity: Identity, pressed: Pressed) {
         if self.pressed.len() < MOST_PRESSES || self.pressed.contains_key(&identity) {
             self.pressed.insert(identity, pressed);
         }
     }
 
-    /// The press a release made under `take` ends, which it takes out of the record.
-    pub fn released(&mut self, take: u64, identity: &Identity) -> Option<Pressed> {
-        if take != self.take {
-            return None;
-        }
+    /// The press a release ends, which it takes out of the record.
+    pub fn released(&mut self, identity: &Identity) -> Option<Pressed> {
         self.pressed.remove(identity)
     }
 }
