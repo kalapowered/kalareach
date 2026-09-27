@@ -385,21 +385,26 @@ path carries their account name to say it.
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not
 choose one, which is what `kr new` without `--desktop` or `--headless` uses. `command_integrations`
-names the installed packages, as `publisher/plugin`, whose command integration a session applies:
-the host fills a session's integrations in when the session is launched, one entry for each
+names the installed packages, as `publisher/plugin`, whose command integration a session applies.
+The host fills a session's integrations in when the session is launched: one entry for each
 admitted package whose integration applies there, on where this list names the package and off
-where it does not, and a create request that names one is refused. An entry that is off carries no
-flags. Where a session's entries are more than one launch message carries, the largest are left out
-and the doctor's catalogue check names each one. A profile's list replaces the host's, and an empty
-list turns every integration off at that level. `kr plugin integration enable` and `disable` edit
-the host's list, and the change reaches the sessions created afterwards. `kr doctor` reports each
-integration an admitted release declares and each package the list names: what a new session gets
-of it and why, the mode its command runs in, the flags and variables it adds, and the executable
-the daemon's own search path resolves the command to, with the version a signed qualification
-record gives that executable. An installation the admissions leave out is reported only where the
-list names it, and where the admissions cannot be computed each listed package is reported as
-unknown. A session whose own search path differs can find another; each launch records the one it
-ran.
+where it does not. A create request that names one is refused, and an entry that is off carries no
+flags. A session carries at most 256 KiB of flags and 128 entries. Past that, and wherever its
+launch message cannot carry them beside the create request, the largest integrations turned on
+are left out, and one note in the doctor's catalogue check names the session and each of them. A
+profile's list replaces the host's, and an empty list turns every integration off at that level.
+`kr plugin integration enable` and `disable` edit the host's list, and the change reaches the
+sessions created afterwards.
+
+`kr doctor` reports each package the list names, with its state, and each integration an admitted
+release declares: what a new session gets of it and why, the mode its command runs in, the flags
+and variables it adds, and the executable the daemon's own search path resolves the command to,
+with the version a signed qualification record gives that executable. An installed release the
+admissions leave out is reported only where the list names it, and where the admissions cannot be
+computed each listed package is reported as `unknown`. An integration a new session would be
+launched without for its size is reported as `too_large`. One answer carries at most 256 reports
+and 384 KiB of them, the listed packages first, and the check counts any it leaves out. A session
+whose own search path differs can find another; each launch records the one it ran.
 
 The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
 configuration is reported by `kr doctor` in one line and ignored.
