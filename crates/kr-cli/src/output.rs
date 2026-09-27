@@ -485,7 +485,7 @@ impl<T: Into<Held>> From<Vec<T>> for Held {
 ///
 /// Such a value is written as the protocol encodes it, which keeps a document's shape what a
 /// script reading the protocol expects. A type is claimed closed only in this file, because the
-/// claim is [`claim::Claimed`], which nothing outside it can name; a test plants text in every leaf
+/// claim is `claim::Claimed`, which nothing outside it can name; a test plants text in every leaf
 /// of each claimed type's schema that could hold it and finds none, and another holds that test to
 /// every claim written here. A type that holds text cannot be written as one:
 ///
