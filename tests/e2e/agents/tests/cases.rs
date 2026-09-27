@@ -2965,6 +2965,48 @@ fn recorded(root: &Path, needle: &str, marker: &str) -> PathBuf {
     }
 }
 
+/// Waits, a while at most, until a line of `conversation` holds every one of `needles`: the agent
+/// writes its record of a reply shortly after the screen shows it.
+fn settled_line(conversation: &Path, needles: &[&str]) {
+    let started = std::time::Instant::now();
+    while first_line_with(conversation, None, needles).is_none()
+        && started.elapsed() < Duration::from_secs(20)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The lines of the part's own conversation from `from`, each by its number, the kind its `type`
+/// member names, and which of `needles` it holds, by their labels: what a failed order check says
+/// of where each thing landed, with none of the lines' text.
+fn outline(conversation: &Path, from: Option<usize>, needles: &[(&str, &str)]) -> String {
+    let text = std::fs::read_to_string(conversation).unwrap_or_default();
+    text.lines()
+        .enumerate()
+        .skip(from.unwrap_or(0))
+        .map(|(index, line)| {
+            let kind = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "?".to_owned());
+            let held: Vec<&str> = needles
+                .iter()
+                .filter(|(_, needle)| line.contains(needle))
+                .map(|(label, _)| *label)
+                .collect();
+            format!(
+                "{index} {kind}{}",
+                if held.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", held.join(","))
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// What says a turn still runs at one moment: the device's view, brought up to date, shows the
 /// agent busy, and the conversation holds no reply with the turn's closing word after its prompt,
 /// which the turn writes only as it finishes.
@@ -3173,6 +3215,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             &account.composer,
             "the composer is back after the queue",
         );
+        // The agent writes its record of a reply as it can; what the screen showed is waited for
+        // there too before the order is read.
+        settled_line(&conversation, &[&queued_sum, &account.reply_line]);
         let second_prompt = first_line_with(
             &conversation,
             None,
@@ -3194,7 +3239,21 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &[&queued_sum, &account.reply_line],
             ),
         };
-        check_queued(&queue).unwrap_or_else(|why| panic!("the prompt waited for the turn: {why}"));
+        check_queued(&queue).unwrap_or_else(|why| {
+            panic!(
+                "the prompt waited for the turn: {why}; the conversation from the first prompt: {}",
+                outline(
+                    &conversation,
+                    first_prompt,
+                    &[
+                        ("q", &format!("{mark}-q")),
+                        ("r", &format!("{mark}-r")),
+                        ("done", &queued_done),
+                        ("sum", &queued_sum)
+                    ]
+                )
+            )
+        });
         // Steering, where the agent's terminal route steers a running turn.
         let mut checker = vec![
             json!({ "check": "queued", "wrong": "entered with no turn running", "rejected": check_queued(&Order { busy_at_submission: false, ..queue }).is_err() }),
@@ -3245,6 +3304,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &account.composer,
                 "the composer is back after steering",
             );
+            settled_line(&steered_conversation, &[&steer_sum, &account.reply_line]);
             let steering_prompt = first_line_with(
                 &steered_conversation,
                 None,
@@ -3266,8 +3326,21 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                     &[&steer_sum, &account.reply_line],
                 ),
             };
-            check_steered(&steer)
-                .unwrap_or_else(|why| panic!("the running turn took the prompt: {why}"));
+            check_steered(&steer).unwrap_or_else(|why| {
+                panic!(
+                    "the running turn took the prompt: {why}; the conversation from its prompt: {}",
+                    outline(
+                        &steered_conversation,
+                        steered_prompt,
+                        &[
+                            ("s", &format!("{mark}-s")),
+                            ("t", &format!("{mark}-t")),
+                            ("done", &steered_done),
+                            ("sum", &steer_sum)
+                        ]
+                    )
+                )
+            });
             checker.push(json!({ "check": "steered", "wrong": "the turn finished its work", "rejected": check_steered(&Order { first_finished: Some(0), ..steer }).is_err() }));
             checker.push(json!({ "check": "steered", "wrong": "entered with no turn running", "rejected": check_steered(&Order { busy_at_submission: false, ..steer }).is_err() }));
             json!({ "steered": true, "order": steer })
