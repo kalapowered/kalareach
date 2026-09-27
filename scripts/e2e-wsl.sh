@@ -106,6 +106,7 @@ inherited_reset='
       index=$((index + 1))
       mkdir -m 0700 "$probe/$index"
       eval "configured_$index=\$value"
+      eval "input_$index=\$name"
       eval "export $name=\"\$probe/\$index\""
     done
     # The value is read as the helper wrote it, with nothing taken out of it. A path the document
@@ -136,6 +137,7 @@ inherited_reset='
       # before it removes anything.
       real=""
       below=""
+      input=""
       mapped=0
       while [ "$mapped" -lt "$index" ]; do
         mapped=$((mapped + 1))
@@ -143,6 +145,7 @@ inherited_reset='
         case "$named" in
           "$mirror" | "$mirror"/*)
             eval "value=\$configured_$mapped"
+            eval "input=\$input_$mapped"
             below="${named#"$mirror"}"
             real="$value$below"
             ;;
@@ -152,6 +155,15 @@ inherited_reset='
         echo "the helper named $named, which is outside every directory this run mirrored" >&2
         exit 1
       }
+      # The product keeps its roots below a home or an XDG directory and is given the whole of a
+      # KR_ directory. A root that is the whole of one of the first three would take everything
+      # else there with it.
+      case "$input:$below" in
+        HOME: | XDG_STATE_HOME: | XDG_RUNTIME_DIR:)
+          echo "the helper named the whole of $input, $real, rather than a directory below it" >&2
+          exit 1
+          ;;
+      esac
       case "$below" in
         *[!A-Za-z0-9._/-]* | */. | */./* | */.. | */../* | *//*)
           echo "the helper named $named, and what lies below the directory this run mirrored is not a plain path" >&2
@@ -314,6 +326,19 @@ self_test_unmirrored_root() {
     [ -f "$d/outside/run/kept" ]
 }
 
+# A root that is the whole of HOME is refused, and nothing in HOME is removed. The product keeps its
+# roots below a home directory, so removing the home itself would take everything else with it.
+self_test_whole_home() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home" || return 1
+  printf x >"$d/home/kept" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    HOME="$d/home" KR_RUNTIME_DIR="$d/run" STAND_IN_STATE_IN_HOME=1; then
+    return 1
+  fi
+  grep -q -F -e "the helper named the whole of HOME" "$d/said" && [ -f "$d/home/kept" ]
+}
+
 # A root that is a link is resolved: what it leads to is removed, and the link is left.
 self_test_link_root() {
   local d="$self_test_work/${FUNCNAME[0]}"
@@ -426,7 +451,8 @@ self_test() {
 #!/bin/sh
 # Stands in for the installed helper. It names the roots the way the product names them on Linux,
 # says where it reads an account token, and publishes an identity the way a first use does. A case
-# can give it a runtime root of its own, as a product that read one from somewhere else would.
+# can give it a runtime root of its own, as a product that read one from somewhere else would, or
+# have it keep its state in the home directory itself.
 if [ -n "${STAND_IN_RUNTIME_ROOT-}" ]; then
   runtime="$STAND_IN_RUNTIME_ROOT"
 elif [ -n "${KR_RUNTIME_DIR-}" ]; then
@@ -436,7 +462,9 @@ elif [ -n "${XDG_RUNTIME_DIR-}" ]; then
 else
   runtime="$HOME/.cache/kalareach/run"
 fi
-if [ -n "${KR_STATE_DIR-}" ]; then
+if [ -n "${STAND_IN_STATE_IN_HOME-}" ]; then
+  state="$HOME"
+elif [ -n "${KR_STATE_DIR-}" ]; then
   state="$KR_STATE_DIR"
 elif [ -n "${XDG_STATE_HOME-}" ]; then
   state="$XDG_STATE_HOME/kalareach"
@@ -472,6 +500,8 @@ STAND_IN
     "a probe directory whose name is not a plain path is refused, and nothing is removed"
   self_test_case self_test_unmirrored_root \
     "a root named outside every mirrored directory is refused, and nothing is removed"
+  self_test_case self_test_whole_home \
+    "a root that is the whole of HOME is refused, and nothing in HOME is removed"
   self_test_case self_test_link_root \
     "a root that is a link is resolved, and what it leads to is removed"
   self_test_case self_test_other_storage \
