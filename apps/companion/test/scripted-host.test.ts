@@ -3,8 +3,8 @@
  *
  * A page that passes against it sends what a real host takes, so its refusals are the codes the
  * session's worker and the daemon answer with, in the order they check: a parameter map the method
- * does not take, an instance the session does not have, a binding revision that moved on, a
- * suspended binding, a capability that is not usable now, and a turn that is not the one running.
+ * does not take, an instance the session does not have, a suspended binding, a binding revision
+ * that moved on, a turn that is not the one running, and a capability that is not usable now.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -74,6 +74,41 @@ describe("the scripted host and the agent's methods", () => {
     expect(facts.binding.rich_mutations_suspended).toBe(true)
   })
 
+  it('checks suspension before the binding revision, and the turn before the capability', async () => {
+    const { port, controls } = fakeHost()
+    // Both a moved binding and a suspension: the suspension is what the worker answers.
+    controls.records.moveBinding(SESSION_BUILD)
+    controls.records.suspend(SESSION_BUILD, 'The conversation changed outside this host.')
+    await expect(
+      port.composerSubmit({ target: target(build, '4'), draft_id: null, text: 'hello' })
+    ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    // Both a turn that is not running and a capability the upstream lacks: the turn comes first.
+    await expect(
+      port.composerSteer({ target: target(main), turn_id: 'turn-1', text: 'stop' })
+    ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    controls.records.setCapability(SESSION_MAIN, 'agent.steer', 'incompatible')
+    await expect(
+      port.composerSteer({ target: target(main), turn_id: 'turn-1', text: 'stop' })
+    ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    await expect(
+      port.composerSteer({ target: target(main), turn_id: 'turn-9', text: 'stop' })
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_CAPABILITY' })
+  })
+
+  it('reads a draft attachment the way native code does, contribution and all', async () => {
+    const { port } = fakeHost()
+    await expect(
+      port.draftAddAttachment(
+        {
+          draft_id: 'draft-8a7b6c50-22bb-4c3d-8e4f-000000000101',
+          transfer_id: '99999999-9999-4999-8999-999999999999',
+          insertion_method: 'typed_submission'
+        },
+        { sessionId: SESSION_MAIN }
+      )
+    ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+  })
+
   it('refuses what the upstream does not offer, and a turn that is not the one running', async () => {
     const { port } = fakeHost()
     await expect(
@@ -111,6 +146,13 @@ describe("the scripted host and the agent's methods", () => {
     await expect(
       port.approvalRespond({ target: target(main), resource_id: APPROVAL, option_id: 'maybe' })
     ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    await expect(
+      port.approvalRespond({
+        target: target(main),
+        resource_id: 'b2b2b2b2-0000-4000-8000-000000000009',
+        option_id: 'approved'
+      })
+    ).rejects.toMatchObject({ code: 'STALE_SESSION' })
     const answered = await port.approvalRespond({
       target: target(main),
       resource_id: APPROVAL,
@@ -178,7 +220,7 @@ describe('the scripted host and attention, review and sharing', () => {
     expect(inbox.items.map((item) => item.key)).not.toContain(failure.key)
   })
 
-  it('marks a change set reviewed only at the version it holds', async () => {
+  it('marks a change set reviewed up to a version it holds, and keeps newer work outstanding', async () => {
     const { port } = fakeHost()
     const change = {
       session_id: SESSION_MAIN,
@@ -186,11 +228,73 @@ describe('the scripted host and attention, review and sharing', () => {
         change_set: { session_id: SESSION_MAIN, change_set_id: 'c3c3c3c3-0000-4000-8000-000000000001' }
       }
     }
-    await expect(port.reviewAcknowledge({ ...change, version: '1' })).rejects.toMatchObject({
-      code: 'INVALID_ARGUMENT'
+    await expect(port.reviewAcknowledge({ ...change, version: '3' })).rejects.toMatchObject({
+      code: 'DRAFT_CONFLICT'
     })
-    const marked = await port.reviewAcknowledge({ ...change, version: '2' })
-    expect(marked.value?.review.outstanding).toBe(false)
+    await expect(
+      port.reviewAcknowledge({ ...change, session_id: SESSION_BUILD, version: '2' })
+    ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    const older = await port.reviewAcknowledge({ ...change, version: '1' })
+    expect(older.value?.review).toMatchObject({ acknowledged_version: '1', outstanding: true })
+    const current = await port.reviewAcknowledge({ ...change, version: '2' })
+    expect(current.value?.review).toMatchObject({ acknowledged_version: '2', outstanding: false })
+    // An older version read again is not a retreat.
+    const again = await port.reviewAcknowledge({ ...change, version: '1' })
+    expect(again.value?.review).toMatchObject({ acknowledged_version: '2', outstanding: false })
+  })
+
+  it('pages the inbox and review state, and refuses a page after something it does not hold', async () => {
+    const { port } = fakeHost()
+    const first = await port.attentionRead({
+      session_id: null,
+      include_acknowledged: false,
+      max_items: '2',
+      after: null
+    })
+    expect(first.items).toHaveLength(2)
+    expect(first.more).toBe(true)
+    const second = await port.attentionRead({
+      session_id: null,
+      include_acknowledged: false,
+      max_items: '2',
+      after: first.items[1]?.key ?? null
+    })
+    expect(second.items.map((item) => item.key)).not.toContain(first.items[0]?.key)
+    await expect(
+      port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: '2',
+        after: 'attention.pending_approval|~ffffffffffffffffffffffffffffffff'
+      })
+    ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+
+    const reviews = await port.reviewRead({
+      session_id: null,
+      subject: null,
+      max_reviews: '1',
+      after: null
+    })
+    expect(reviews.reviews).toHaveLength(1)
+    expect(reviews.more).toBe(true)
+    const rest = await port.reviewRead({
+      session_id: null,
+      subject: null,
+      max_reviews: '1',
+      after: reviews.reviews[0]?.subject ?? null
+    })
+    expect(rest.reviews).toHaveLength(1)
+    expect(rest.more).toBe(false)
+  })
+
+  it('refuses a whole acknowledgement that names a revision an item has not reached', async () => {
+    const { port, controls } = fakeHost()
+    const failure = controls.records.attentionItem('attention.command_failed')
+    await expect(
+      port.attentionAcknowledge({
+        items: [{ key: failure.key, revision: String(Number(failure.revision) + 1) }]
+      })
+    ).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
   })
 
   describe('an invitation', () => {

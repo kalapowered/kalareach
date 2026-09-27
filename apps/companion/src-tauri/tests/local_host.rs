@@ -224,6 +224,62 @@ async fn the_inbox_is_read_and_acknowledged_on_the_host() {
     );
 }
 
+/// KR-REQ-13.09: a page of the inbox or of review state continues only after a key or subject the
+/// host holds, and anything else is a conflict the page reads again from the start; a review
+/// subject the host does not hold cannot be acknowledged. The page's scripted host keeps the same
+/// rules.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_continues_only_after_what_the_host_holds() {
+    let host = Host::start().await;
+    let inbox = host
+        .call(
+            "attention_read",
+            json!({ "params": {
+                "session_id": null,
+                "include_acknowledged": false,
+                "max_items": "50",
+                "after": "attention.review_ready|gone"
+            } }),
+        )
+        .await
+        .expect_err("the host holds no such item to continue after");
+    assert_eq!(inbox["code"], "DRAFT_CONFLICT", "{inbox}");
+
+    let subject = json!({ "change_set": {
+        "session_id": "44444444-4444-4444-8444-444444444444",
+        "change_set_id": "66666666-6666-4666-8666-666666666666"
+    } });
+    let reviews = host
+        .call(
+            "review_read",
+            json!({ "params": {
+                "session_id": null,
+                "subject": null,
+                "max_reviews": "50",
+                "after": subject
+            } }),
+        )
+        .await
+        .expect_err("the host holds no such subject to continue after");
+    assert_eq!(reviews["code"], "DRAFT_CONFLICT", "{reviews}");
+
+    let acknowledged = host
+        .call(
+            "review_acknowledge",
+            json!({
+                "subject": {},
+                "params": {
+                    "session_id": "44444444-4444-4444-8444-444444444444",
+                    "subject": subject,
+                    "version": "1"
+                }
+            }),
+        )
+        .await
+        .expect_err("the host holds no such subject to acknowledge");
+    assert!(refused_by_the_host(&acknowledged), "{acknowledged}");
+}
+
 /// KR-REQ-13.12, change sets: review state is read from the host, and a change set it does not
 /// hold is its refusal rather than the command's.
 #[tokio::test(flavor = "multi_thread")]

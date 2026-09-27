@@ -224,3 +224,18 @@ export const GRANT_LIST_PARAMS = object({ session_id: nullable(uuid), include_re
 export const ENVIRONMENT_PARAMS = object({ environment_id: uuid })
 
 export const HISTORY_PAGE_PARAMS = object({ session_id: uuid, from_cursor: u64, max_bytes: u64 })
+
+export const AGENT_DRAFT_ADD_ATTACHMENT_PARAMS = object({
+  draft_id: uuid,
+  expected_revision: u64,
+  transfer_id: uuid,
+  contribution: object({
+    operation_id: text,
+    accepted_media_types: arrayOf(text),
+    max_byte_len: u64,
+    max_count: u64,
+    insertion_method: oneOf('typed_submission', 'verified_composer_insertion', 'manual_terminal_workflow'),
+    external_destination: nullable(text),
+    model_media_capability: bool
+  })
+})

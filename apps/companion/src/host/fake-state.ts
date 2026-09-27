@@ -4,10 +4,11 @@
  * Each session's agent as its worker would keep it, the attention inbox, review state and change
  * sets, the devices and grants of sharing, the installed packages and enrolled repositories, and
  * each session's retained output. Every answer here is a published type in the form native code
- * hands the page, and every refusal is the code a real host answers with: a parameter map the
- * method does not take is refused before anything else, an instance a session does not have is a
- * stale subject, a binding revision that moved on is stale, a turn that is not the one running is
- * a conflict, and a capability that is not usable now is unsupported.
+ * hands the page, and every refusal is the code a real host answers with, in the order it checks:
+ * a parameter map the method does not take is refused before anything else, an instance a session
+ * does not have is a stale subject, a suspended binding is a conflict, a binding revision that
+ * moved on is stale, a turn that is not the one running is a conflict, and a capability that is not
+ * usable now is unsupported. A page continues only after a key or subject the host holds.
  *
  * It keeps state and changes it: a prompt starts a turn, a cancellation ends it, an answered
  * approval is resolved and is not answered twice. Time is a number the host is told.
@@ -126,8 +127,10 @@ interface ScriptedAgent {
   capabilities: Map<string, InstanceCapabilityRecord>
   commands: AgentCommand[]
   entries: AgentSnapshotEntry[]
-  /** How many entries of the history this host's filter withholds from this device. */
+  /** How many of the oldest entries this host's filter withholds from this device. */
   withheld: number
+  /** Entries the filter withholds wherever they are in the history, by their number. */
+  withheldNodes: Set<string>
   /** The last entry the host let go, or nought while it has kept them all. */
   forgotten: number
   turns: number
@@ -253,6 +256,11 @@ function actionsOf(selection: RoleSelection): ActionRight[] {
   return EVERY_RIGHT.filter((right) => actions.has(right))
 }
 
+/** The session a review subject belongs to. */
+function reviewSession(subject: ReviewState['subject']): string {
+  return 'change_set' in subject ? subject.change_set.session_id : subject.completed_turn.session_id
+}
+
 /** A hexadecimal digest of `seed`, the length of a SHA-256 one. */
 function digestOf(seed: number): string {
   return seed.toString(16).padStart(2, '0').repeat(32).slice(0, 64)
@@ -308,6 +316,7 @@ export class ScriptedRecords {
   readonly #devices: DeviceSummary[]
   readonly #grants: GrantSummary[] = []
   #actions = 0
+  #restarts = 0
 
   constructor(ids: ScriptedIds) {
     this.#ids = ids
@@ -410,6 +419,7 @@ export class ScriptedRecords {
         observed_at: String(now - 600_000 + index * 1_000)
       })),
       withheld: 0,
+      withheldNodes: new Set(),
       forgotten: 0,
       turns: 9
     }
@@ -609,6 +619,7 @@ export class ScriptedRecords {
           commands: [],
           entries: [],
           withheld: 0,
+          withheldNodes: new Set(),
           forgotten: 0,
           turns: 0
         }
@@ -637,27 +648,35 @@ export class ScriptedRecords {
     return agent
   }
 
-  /** Everything the broker checks before it takes a mutation, in the order it checks it. */
-  #admit(target: AgentMutationTarget, capability: string, turn: string | null): ScriptedAgent {
-    const agent = this.#subjectAgent(target.subject)
-    if (target.binding_revision !== agent.binding.binding_revision) {
-      refuse(
-        'STALE_SESSION',
-        `the binding is at revision ${agent.binding.binding_revision}, not ${target.binding_revision}`
-      )
-    }
+  /** Refuses a mutation while the binding's rich mutations are suspended, in the host's words. */
+  #requireUnsuspended(agent: ScriptedAgent): void {
     if (agent.binding.rich_mutations_suspended) {
       refuse(
         'DRAFT_CONFLICT',
         agent.binding.suspension_reason ?? 'rich mutations are suspended until the binding is verified'
       )
     }
-    const record = agent.capabilities.get(capability)
-    if (record?.state !== 'qualified_available') {
-      refuse('UNSUPPORTED_CAPABILITY', record?.disabled_reason ?? `${capability} is not available`)
+  }
+
+  /**
+   * Everything the broker checks before it takes a mutation, in the order it checks it: the
+   * instance, its suspension, the binding revision, the turn, and last the capability.
+   */
+  #admit(target: AgentMutationTarget, capability: string, turn: string | null): ScriptedAgent {
+    const agent = this.#subjectAgent(target.subject)
+    this.#requireUnsuspended(agent)
+    if (target.binding_revision !== agent.binding.binding_revision) {
+      refuse(
+        'STALE_SESSION',
+        `the binding is at revision ${agent.binding.binding_revision}, not ${target.binding_revision}`
+      )
     }
     if (turn !== null && turn !== agent.binding.turn_id) {
       refuse('DRAFT_CONFLICT', 'the turn named is not the one running')
+    }
+    const record = agent.capabilities.get(capability)
+    if (record?.state !== 'qualified_available') {
+      refuse('UNSUPPORTED_CAPABILITY', record?.disabled_reason ?? `${capability} is not available`)
     }
     return agent
   }
@@ -722,7 +741,10 @@ export class ScriptedRecords {
     const first = agent.entries[0] === undefined ? agent.forgotten + 1 : Number(agent.entries[0].node)
     // The filter withholds the oldest entries, as a grant that reaches back only so far does, and
     // what it withholds is not spent on the part.
-    const withheld = new Set(agent.entries.slice(0, agent.withheld).map((entry) => entry.node))
+    const withheld = new Set([
+      ...agent.entries.slice(0, agent.withheld).map((entry) => entry.node),
+      ...agent.withheldNodes
+    ])
     const after = agent.entries.filter((entry) => Number(entry.node) >= from)
     const shown = after.filter((entry) => !withheld.has(entry.node))
     const part = shown.slice(0, SNAPSHOT_PART_ENTRIES)
@@ -805,17 +827,24 @@ export class ScriptedRecords {
 
   respond(params: unknown): Settled<AgentApprovalRespondResult> {
     const read = decodeParams<AgentApprovalRespondParams>(params, AGENT_RESPOND_PARAMS)
-    const agent = this.#admit(read.target, 'agent.approval', null)
+    const agent = this.#subjectAgent(read.target.subject)
+    // The broker checks the resource before anything else about the answer: whose it is, that it
+    // is still open, that it was interpreted, the instance's suspension, and last the decision.
     const resource = agent.resources.find((each) => each.resource_id === read.resource_id)
-    const decoding = agent.ledger.get(read.resource_id)
-    if (resource === undefined || decoding === undefined) {
-      refuse('STALE_SESSION', 'this worker holds no such pending request')
+    if (resource === undefined) refuse('STALE_SESSION', 'this worker holds no such pending request')
+    if (resource.application_instance_id !== read.target.subject.application_instance_id) {
+      refuse('PERMISSION_DENIED', `${read.resource_id} belongs to another application instance`)
     }
     if (resource.state !== 'pending') {
       refuse('QUESTION_RESOLVED', `this pending resource is already ${resource.state}`)
     }
+    const decoding = agent.ledger.get(read.resource_id)
+    if (decoding === undefined) {
+      refuse('DRAFT_CONFLICT', `${read.resource_id} has no recorded interpretation to answer`)
+    }
+    this.#requireUnsuspended(agent)
     if (!decoding.projection.decisions.some((decision) => decision.option_id === read.option_id)) {
-      refuse('DRAFT_CONFLICT', 'that decision is not one the request offered')
+      refuse('DRAFT_CONFLICT', `${read.option_id} is not one of the decisions this request offered`)
     }
     const mutation = this.#performed(agent).value
     if (mutation === null) refuse('RESOURCE_UNAVAILABLE', 'the answer was not recorded')
@@ -869,7 +898,11 @@ export class ScriptedRecords {
         (read.include_acknowledged || !item.acknowledged) &&
         (read.session_id === null || item.session_id === read.session_id)
     )
-    const start = read.after === null ? 0 : shown.findIndex((item) => item.key === read.after) + 1
+    const after = read.after === null ? -1 : shown.findIndex((item) => item.key === read.after)
+    if (read.after !== null && after === -1) {
+      refuse('DRAFT_CONFLICT', `${read.after} is not one this caller holds, so a page cannot continue after it`)
+    }
+    const start = after + 1
     const items = shown.slice(start, start + max)
     return {
       items,
@@ -884,6 +917,12 @@ export class ScriptedRecords {
 
   attentionAcknowledge(params: unknown): Settled<AttentionAcknowledgeResult> {
     const read = decodeParams<AttentionAcknowledgeParams>(params, ATTENTION_ACKNOWLEDGE_PARAMS)
+    for (const { key, revision } of read.items) {
+      const held = this.#attention.find((item) => item.key === key)
+      if (held !== undefined && BigInt(revision) > BigInt(held.revision)) {
+        refuse('DRAFT_CONFLICT', `${key} is at revision ${held.revision}, not ${revision}`)
+      }
+    }
     const acknowledged: string[] = []
     const stale: string[] = []
     for (const { key, revision } of read.items) {
@@ -907,29 +946,49 @@ export class ScriptedRecords {
 
   reviewRead(params: unknown): ReviewReadResult {
     const read = decodeParams<ReviewReadParams>(params, REVIEW_READ_PARAMS)
-    const sessionOf = (review: ReviewState): string =>
-      'change_set' in review.subject
-        ? review.subject.change_set.session_id
-        : review.subject.completed_turn.session_id
-    const reviews = this.#reviews.filter(
-      (review) => read.session_id === null || sessionOf(review) === read.session_id
+    const scoped = this.#reviews.filter(
+      (review) =>
+        (read.session_id === null || reviewSession(review.subject) === read.session_id) &&
+        (read.subject === null || JSON.stringify(review.subject) === JSON.stringify(read.subject))
     )
-    return { actor_id: 'owner:local', reviews, more: false }
+    const after =
+      read.after === null
+        ? -1
+        : scoped.findIndex((review) => JSON.stringify(review.subject) === JSON.stringify(read.after))
+    if (read.after !== null && after === -1) {
+      refuse('DRAFT_CONFLICT', 'that subject is not one this caller holds, so a page cannot continue after it')
+    }
+    const max = Number(read.max_reviews)
+    const reviews = scoped.slice(after + 1, after + 1 + max)
+    return { actor_id: 'owner:local', reviews, more: after + 1 + max < scoped.length }
   }
 
   reviewAcknowledge(params: unknown): Settled<ReviewAcknowledgeResult> {
     const read = decodeParams<ReviewAcknowledgeParams>(params, REVIEW_ACKNOWLEDGE_PARAMS)
+    if (reviewSession(read.subject) !== read.session_id) {
+      refuse('INVALID_ARGUMENT', 'the review subject belongs to another session than the one named')
+    }
     const same = JSON.stringify(read.subject)
     const held = this.#reviews.find((review) => JSON.stringify(review.subject) === same)
     if (held === undefined) refuse('INVALID_ARGUMENT', 'this host holds no such review subject')
-    if (held.current_version !== read.version) {
-      refuse('INVALID_ARGUMENT', `version ${read.version} is not one this host holds`)
+    if (BigInt(read.version) > BigInt(held.current_version)) {
+      refuse(
+        'DRAFT_CONFLICT',
+        `the subject is at version ${held.current_version}, not ${read.version}`
+      )
     }
+    // An older version than one already acknowledged is not a retreat: the furthest version read
+    // is what decides whether work remains.
+    const furthest =
+      held.acknowledged_version !== null &&
+      BigInt(held.acknowledged_version) > BigInt(read.version)
+        ? held.acknowledged_version
+        : read.version
     const review: ReviewState = {
       ...held,
-      acknowledged_version: read.version,
+      acknowledged_version: furthest,
       acknowledged_at_ms: String(this.#ids.nowMs),
-      outstanding: false
+      outstanding: BigInt(furthest) < BigInt(held.current_version)
     }
     this.#reviews = this.#reviews.map((each) => (each === held ? review : each))
     this.#revision += 1
@@ -1295,6 +1354,20 @@ export class ScriptedRecords {
     this.#observe(this.#agentOf(sessionId), kind, text, omitted)
   }
 
+  /**
+   * Ends a session's agent and starts another in its place, as quitting and launching it again
+   * does. The ended one's history goes with it. Answers the new instance's identity.
+   */
+  restartAgent(sessionId: string): string {
+    this.#restarts += 1
+    const instance = idOf('a1a1a1a1', 100 + this.#restarts)
+    this.#agents.set(
+      sessionId,
+      this.#agent(instance, [['thread.started', 'Codex started a new conversation.']], false)
+    )
+    return instance
+  }
+
   /** Lets the oldest `count` of a session's entries go, as a host's retention does. */
   forget(sessionId: string, count: number): void {
     const agent = this.#agentOf(sessionId)
@@ -1344,6 +1417,41 @@ export class ScriptedRecords {
   /** Makes this device's history filter withhold the oldest `count` of a session's entries. */
   withhold(sessionId: string, count: number): void {
     this.#agentOf(sessionId).withheld = count
+  }
+
+  /**
+   * Makes this device's history filter withhold one entry wherever it is, as a filter that reads
+   * each entry's own time does when an entry was observed out of order.
+   */
+  withholdEntry(sessionId: string, node: number): void {
+    this.#agentOf(sessionId).withheldNodes.add(String(node))
+  }
+
+  /** Raises `count` notices an application printed in a session, the newest last. */
+  raiseNotices(sessionId: string, count: number): void {
+    const { nowMs } = this.#ids
+    for (let index = 0; index < count; index += 1) {
+      this.#revision += 1
+      this.#attention.push({
+        key: `attention.application_notice|~${String(index).padStart(32, '0')}`,
+        rule: 'attention.application_notice',
+        source: 'host_events',
+        level: 'informational',
+        session_id: sessionId,
+        summary: `Notice ${index + 1}`,
+        trusted: false,
+        routing: 'lease_holder',
+        occurrences: '1',
+        first_seen_ms: String(nowMs - 60_000 + index),
+        last_seen_ms: String(nowMs - 60_000 + index),
+        notification: 'delivered',
+        awaiting_delivery: false,
+        acknowledged: false,
+        uncertain: false,
+        revision: String(this.#revision),
+        automation: null
+      })
+    }
   }
 
   /** The first item `rule` raised, as the host holds it now. */

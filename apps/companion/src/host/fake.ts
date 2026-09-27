@@ -67,6 +67,7 @@ import type {
 } from './port'
 import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
+import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams } from './fake-decode'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -759,11 +760,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     draftAddAttachment: (params) => {
       requireConnection()
-      const method = (params as { insertion_method?: string }).insertion_method
-      if (!(params as { transfer_id?: string }).transfer_id) {
-        refuse('INVALID_ARGUMENT', 'a draft attachment names the transfer that produced it')
-      }
-      if (method === 'verified_composer_insertion') {
+      // Native code reads the method's own parameters, the integration's contribution included,
+      // before anything reaches a host.
+      const read = decodeParams<{
+        contribution: { insertion_method: string }
+      }>(params, AGENT_DRAFT_ADD_ATTACHMENT_PARAMS)
+      if (read.contribution.insertion_method === 'verified_composer_insertion') {
         // The specification's own rule: a nonempty or unknown buffer returns DRAFT_CONFLICT, the
         // draft is retained, and the person is offered the terminal workflow instead.
         refuse('DRAFT_CONFLICT', 'The agent composer is not at an empty, qualified boundary.')
