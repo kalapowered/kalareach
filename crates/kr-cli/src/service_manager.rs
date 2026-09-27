@@ -2639,6 +2639,26 @@ mod tests {
         assert!(!path.exists() && !aside.exists(), "and nothing keeps it");
     }
 
+    /// On Windows a definition that another program holds without sharing its deletion, as a
+    /// scanner holds a file it has just seen, is moved aside once that program lets go, and is then
+    /// exactly what was there.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_definition_is_moved_aside_once_it_is_let_go() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join(format!("{LABEL}.plist"));
+        let place = Place::Derived(&path);
+        kr_ipc::paths::write_owner_only_file(&path, b"what kr wrote\n").expect("writes");
+        let letting_go = held_for_a_moment(&path);
+        let moved = move_aside(&place);
+        letting_go.join().expect("let go");
+        let Ok(Moved::Aside(aside)) = moved else {
+            panic!("moved aside once it is let go: {moved:?}");
+        };
+        assert!(!path.exists() && moved_is(&aside, "what kr wrote\n"));
+        std::fs::remove_file(&aside).expect("removes it");
+    }
+
     /// Only a regular file is moved aside for a check; it goes back where it was, and never over a
     /// file that took its place meanwhile.
     #[cfg(unix)]

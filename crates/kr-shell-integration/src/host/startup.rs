@@ -1013,6 +1013,8 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
                  written",
             ));
         }
+        #[cfg(test)]
+        tests::before_attempt();
         std::fs::rename(&temporary, &target)
     });
     if prepared.is_err() {
@@ -1096,6 +1098,131 @@ fn read_or_empty(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a test does before an attempt at a startup file's replacement.
+    type AttemptHook = Box<dyn FnMut()>;
+
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs what the test on this thread does before an attempt at a replacement's rename.
+    pub(super) fn before_attempt() {
+        BEFORE_ATTEMPT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
+    /// on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holding);
+        })
+    }
+
+    /// The names a directory holds.
+    #[cfg(windows)]
+    fn names_in(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .expect("lists the directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// On Windows a startup file that another program holds without sharing its deletion, as a
+    /// scanner holds a file it has just seen, is replaced once that program lets go, and nothing
+    /// is left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_startup_file_is_replaced_once_it_is_let_go() {
+        let root = tempfile::tempdir().expect("a directory");
+        let profile = root.path().join("profile.ps1");
+        std::fs::write(&profile, "Set-Alias ll Get-ChildItem\n").expect("writes");
+        let letting_go = held_for_a_moment(&profile);
+        let replaced = replace(
+            &profile,
+            "Set-Alias ll Get-ChildItem\n",
+            "Set-Alias ll Get-ChildItem\n# the entry\n",
+        );
+        letting_go.join().expect("let go");
+        replaced.expect("replaced once it is let go");
+        assert_eq!(
+            std::fs::read_to_string(&profile).expect("reads"),
+            "Set-Alias ll Get-ChildItem\n# the entry\n"
+        );
+        assert_eq!(names_in(root.path()), ["profile.ps1"]);
+    }
+
+    /// On Windows the check a replacement stands on, that the file is still what was read, is
+    /// made again before every attempt: an edit saved while the held replacement waits is kept,
+    /// the replacement says the file changed, and nothing is left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_startup_file_edited_while_its_replacement_waits_is_not_replaced() {
+        let root = tempfile::tempdir().expect("a directory");
+        let profile = root.path().join("profile.ps1");
+        std::fs::write(&profile, "Set-Alias ll Get-ChildItem\n").expect("writes");
+        let letting_go = held_for_a_moment(&profile);
+        let edited = profile.clone();
+        let mut attempts = 0;
+        BEFORE_ATTEMPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                attempts += 1;
+                if attempts == 2 {
+                    use std::io::Write as _;
+
+                    // The person's editor saves while the first attempt is refused.
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&edited)
+                        .and_then(|mut file| file.write_all(b"Set-Alias g git\n"))
+                        .expect("the person saves an edit");
+                }
+            }));
+        });
+        let replaced = replace(
+            &profile,
+            "Set-Alias ll Get-ChildItem\n",
+            "Set-Alias ll Get-ChildItem\n# the entry\n",
+        );
+        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+        letting_go.join().expect("let go");
+        let refused = replaced.expect_err("the file changed while the replacement waited");
+        assert!(
+            refused.to_string().contains("the startup file changed"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&profile).expect("reads"),
+            "Set-Alias ll Get-ChildItem\nSet-Alias g git\n",
+            "the edit is kept"
+        );
+        assert_eq!(names_in(root.path()), ["profile.ps1"]);
+    }
 
     fn layout(root: &Path) -> HomeLayout {
         HomeLayout {

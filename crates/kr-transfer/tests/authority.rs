@@ -345,25 +345,6 @@ fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
         .expect("the directory is held")
 }
 
-/// Holds a file through a handle that shares reading and writing but not its deletion, as a
-/// program that reads each file as it is written does for a moment, and lets go after 300 ms on a
-/// thread of its own.
-#[cfg(windows)]
-fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-    let holding = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(file)
-        .expect("the file is held");
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        drop(holding);
-    })
-}
-
 /// KR-REQ-14.05 on Windows: a staged file that another program holds without sharing its
 /// deletion while it is published, as a scanner holds a file it has just seen written, is given
 /// its name once that program lets go, and the staged name goes as every publication takes it
@@ -379,7 +360,7 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
     let staged = RelativeName::parse("staged.part").expect("a valid relative name");
     let published = RelativeName::parse("published.bin").expect("a valid relative name");
 
-    let letting_go = held_for_a_moment(&root.path().join("staged.part"));
+    let letting_go = support::held_for_a_moment(&root.path().join("staged.part"));
     let publication = authority.publish_into(&staged, &authority, &published, || {
         std::ops::ControlFlow::<std::convert::Infallible>::Continue(())
     });

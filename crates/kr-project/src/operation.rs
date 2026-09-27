@@ -774,6 +774,8 @@ fn rename_no_replace(
             .into(),
         });
     }
+    #[cfg(test)]
+    tests::before_attempt();
     from.rename_into(from_name, to, to_name)?;
     Ok(())
 }
@@ -1038,6 +1040,125 @@ fn random_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a test does before an attempt at a publication's rename.
+    #[cfg(not(unix))]
+    type AttemptHook = Box<dyn FnMut()>;
+
+    #[cfg(not(unix))]
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs what the test on this thread does before an attempt at a publication's rename.
+    #[cfg(not(unix))]
+    pub(super) fn before_attempt() {
+        BEFORE_ATTEMPT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
+    /// on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holding);
+        })
+    }
+
+    /// A staged tree with a file in it, the directory it is staged in and the one it is published
+    /// into, both authorised for one environment, and the file.
+    #[cfg(windows)]
+    fn a_tree_to_publish() -> (
+        tempfile::TempDir,
+        AuthorisedDirectory,
+        AuthorisedDirectory,
+        PathBuf,
+    ) {
+        let root = tempfile::tempdir().expect("a directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let file = root.path().join("staging/tree/objects/pack");
+        std::fs::create_dir_all(root.path().join("staging/tree/objects")).expect("a staged tree");
+        std::fs::write(&file, b"staged\n").expect("a file in it");
+        std::fs::create_dir(root.path().join("parent")).expect("a parent");
+        let staging = AuthorisedDirectory::open_root(environment_id, &root.path().join("staging"))
+            .expect("the staging directory opens");
+        let parent = AuthorisedDirectory::open_root(environment_id, &root.path().join("parent"))
+            .expect("the parent opens");
+        (root, staging, parent, file)
+    }
+
+    #[cfg(windows)]
+    fn name(text: &str) -> RelativeName {
+        RelativeName::parse(text).expect("a valid relative name")
+    }
+
+    /// On Windows a staged tree that holds a file another program holds without sharing its
+    /// deletion, as a scanner holds a file it reads, is published once that program lets go.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_holding_a_held_file_is_published_once_it_is_let_go() {
+        let (root, staging, parent, file) = a_tree_to_publish();
+        let letting_go = held_for_a_moment(&file);
+        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
+        letting_go.join().expect("let go");
+        published.expect("published once it is let go");
+        assert!(root.path().join("parent/published/objects/pack").is_file());
+        assert!(!root.path().join("staging/tree").exists());
+    }
+
+    /// On Windows the check a publication stands on, that the destination's name is free, is made
+    /// again before every attempt: a file put there while the held publication waits is never
+    /// replaced, the publication says the name is taken, and the staged tree stays where it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_taken_while_the_publication_waits_is_not_replaced() {
+        let (root, staging, parent, file) = a_tree_to_publish();
+        let letting_go = held_for_a_moment(&file);
+        let taken = root.path().join("parent/published");
+        let mut attempts = 0;
+        BEFORE_ATTEMPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                attempts += 1;
+                if attempts == 2 {
+                    std::fs::write(&taken, b"somebody's file")
+                        .expect("somebody takes the name meanwhile");
+                }
+            }));
+        });
+        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
+        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+        letting_go.join().expect("let go");
+        let refused = published.expect_err("the name was taken meanwhile");
+        assert!(
+            refused
+                .to_string()
+                .contains("is taken, so nothing was replaced"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("parent/published")).expect("somebody's file"),
+            b"somebody's file"
+        );
+        assert!(root.path().join("staging/tree/objects/pack").is_file());
+    }
 
     #[test]
     fn a_staging_name_is_thirty_two_hexadecimal_characters_and_never_repeats() {

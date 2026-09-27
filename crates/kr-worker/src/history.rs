@@ -1242,6 +1242,54 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// On Windows a boundary file that another program holds without sharing its deletion, as a
+    /// scanner holds a file it has just seen written, is not waited for on the output path. The
+    /// append that needs an eviction returns at once and keeps every segment, since nothing may go
+    /// before the boundary that accounts for it is written, and the first append after that
+    /// program lets go writes the boundary and evicts.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_boundary_leaves_the_eviction_to_a_later_append_without_waiting() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let directory = spool_directory("held-boundary");
+        let mut history = OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 16))
+            .expect("opens a spool");
+        for _ in 0..4 {
+            history.append(&[b'z'; 8]);
+        }
+        let boundary = directory.join(BOUNDARY_FILE);
+        assert!(boundary.is_file(), "an eviction wrote the boundary");
+        let oldest = history.oldest_retained_cursor();
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&boundary)
+            .expect("the boundary is held");
+        let started = std::time::Instant::now();
+        history.append(&[b'z'; 8]);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "the output path does not wait for the boundary: {took:?}"
+        );
+        assert_eq!(
+            history.oldest_retained_cursor(),
+            oldest,
+            "nothing goes while its boundary cannot be written"
+        );
+        drop(holding);
+        history.append(&[b'z'; 8]);
+        assert!(
+            history.oldest_retained_cursor() > oldest,
+            "the next append writes the boundary and evicts"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn the_spool_drops_its_oldest_segments_and_reports_the_gap() {
         let directory = std::env::temp_dir().join(format!("kr-spool-{}", kr_ipc::new_uuid()));

@@ -4517,6 +4517,91 @@ mod tests {
         );
     }
 
+    /// On Windows what the time contract must keep is not waited for by the reading whose save
+    /// found the file held: while another program holds it without sharing its deletion, as a
+    /// scanner holds a file it has just seen written, the reading returns at once with the save
+    /// refused, and the maintenance loop writes it again once that program lets go, with no other
+    /// request to prompt it.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_held_save_left_unwritten_is_written_again_without_another_request() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        use kr_worker::action::adapter::{
+            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
+        };
+        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+        const WALL: u64 = 1_700_000_000_000;
+        let temp = kr_ipc::testing::TempHost::create();
+        let continuous = kr_ipc::clock::ManualSharedClock::new();
+        continuous.advance(Duration::from_secs(3_600));
+        let active = ManualActiveClock::new();
+        active.advance(Duration::from_secs(3_600));
+        let wall = ManualWallClock::new(WALL);
+        let adapter = RecordedTimeAdapter::new(classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            UnixTimex {
+                time_state: unix_model::TIME_OK,
+                status: unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500_000,
+            },
+            TimestampMs::new(WALL),
+        ));
+        let module = Arc::new(
+            AttentionModule::open_over(
+                &temp.environment(),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+                TimeSources {
+                    continuous: Arc::new(continuous.clone()),
+                    active: Arc::new(active.clone()),
+                    wall: Arc::new(wall.clone()),
+                    adapter: Arc::new(adapter),
+                    floor: None,
+                },
+            )
+            .expect("the store opens"),
+        );
+        let _ = module.reading();
+        assert!(!module.time.unsaved(), "what it keeps is written");
+        let kept = std::fs::read(&module.time_file).expect("the record");
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&module.time_file)
+            .expect("the record is held");
+        // A step of a day forward is worth keeping.
+        wall.advance(Duration::from_secs(86_400));
+        let started = std::time::Instant::now();
+        let _ = module.reading();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reading does not wait for the file"
+        );
+        assert!(
+            module.time.unsaved(),
+            "its save was refused while the record was held"
+        );
+
+        module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(holding);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while module.time.unsaved() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !module.time.unsaved(),
+            "the loop wrote it again with no request to prompt it"
+        );
+        assert_ne!(std::fs::read(&module.time_file).expect("the record"), kept);
+    }
+
     /// A request's bound covers the wait for the connection's writer as well as the answer, so a
     /// worker that stops reading holds nothing past it.
     #[tokio::test(flavor = "multi_thread")]

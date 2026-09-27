@@ -2775,6 +2775,24 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// On Windows a file that another program holds without sharing its deletion, as a scanner
+    /// holds a file it has just seen written, is replaced once that program lets go, and nothing is
+    /// left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_for_a_moment_is_replaced_once_it_is_let_go() {
+        let root = temporary_root("held-replacement");
+        let target = root.join("descriptor.kr");
+        write_owner_only_file(&target, b"first").expect("writes");
+        let letting_go = held_for_a_moment(&target, std::time::Duration::from_millis(300));
+        let replaced = write_owner_only_file(&target, b"second");
+        letting_go.join().expect("let go");
+        replaced.expect("replaced once it is let go");
+        assert_eq!(std::fs::read(&target).expect("reads"), b"second");
+        assert_eq!(names_in(&root), vec!["descriptor.kr".to_owned()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn temporary_root(name: &str) -> PathBuf {
         let suffix = crate::new_uuid().to_string();
         let base = std::env::temp_dir().join(format!("kr-{name}-{}", &suffix[..6]));

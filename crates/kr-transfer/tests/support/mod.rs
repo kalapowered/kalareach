@@ -20,6 +20,25 @@ use kr_protocol::transfer::{
 use kr_transfer::store::Limits;
 use kr_transfer::{ManualClock, Result, TransferService};
 
+/// Holds a file through a handle that shares reading and writing but not its deletion, as a
+/// program that reads each file as it is written does for a moment, and lets go after 300 ms on a
+/// thread of its own.
+#[cfg(windows)]
+pub fn held_for_a_moment(file: &std::path::Path) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let holding = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(file)
+        .expect("the file is held");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holding);
+    })
+}
+
 /// Where the clock starts, so an expiry window is easy to read in a test.
 pub const START_MS: u64 = 1_700_000_000_000;
 

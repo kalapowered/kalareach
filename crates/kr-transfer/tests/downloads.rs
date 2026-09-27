@@ -786,6 +786,60 @@ fn a_client_publishes_through_a_temporary_file_and_never_overwrites_by_default()
     );
 }
 
+/// KR-REQ-14.16 on Windows: a destination the user asked to replace that another program holds
+/// without sharing its deletion, as a scanner holds a file it reads, is replaced once that program
+/// lets go, and no temporary file is left.
+#[cfg(windows)]
+#[test]
+fn a_held_destination_is_replaced_once_it_is_let_go() {
+    let harness = Harness::create();
+    let bytes = pattern(2048);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let destination_tree = source_tree();
+    let held = destination_tree.path().join("notes.bin");
+    std::fs::write(&held, b"the user's earlier file").expect("the destination is there");
+    let destination =
+        AuthorisedDirectory::open_root(harness.environment_id(), destination_tree.path())
+            .expect("opens the destination");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let letting_go = support::held_for_a_moment(&held);
+    let published = kr_transfer::publish_transfer(
+        &harness.service,
+        &harness.actor,
+        &destination,
+        &DownloadPlacement {
+            transfer_id: begun.transfer_id,
+            destination_name: "notes.bin".to_owned(),
+            byte_len: U64::new(bytes.len() as u64),
+            content_digest: digest(&bytes),
+            allow_overwrite: true,
+        },
+    );
+    letting_go.join().expect("let go");
+    published.expect("replaced once it is let go");
+    assert_eq!(std::fs::read(&held).expect("reads the destination"), bytes);
+    assert_eq!(
+        std::fs::read_dir(destination_tree.path())
+            .expect("reads the destination")
+            .count(),
+        1,
+        "no temporary file is left behind"
+    );
+}
+
 /// KR-REQ-14.16: a conflicting duplicate chunk fails integrity, and a size or digest that does not
 /// match the transfer stops the publish.
 #[test]

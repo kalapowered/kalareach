@@ -1396,6 +1396,8 @@ impl Installer {
         let [only] = legacy.as_slice() else {
             return Ok(());
         };
+        #[cfg(test)]
+        tests::before_attempt();
         std::fs::rename(only, &path).map_err(storage)?;
         sync_directory(&self.records, NameKind::File)
     }
@@ -1964,6 +1966,115 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// What a test does before an attempt at moving a record onto its new name.
+    type AttemptHook = Box<dyn FnMut()>;
+
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs what the test on this thread does before an attempt at moving a record.
+    pub(super) fn before_attempt() {
+        BEFORE_ATTEMPT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
+    /// on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holding);
+        })
+    }
+
+    /// A user record installed and then given the name an earlier build gave it, with the name
+    /// this build gives it free.
+    #[cfg(windows)]
+    fn record_under_its_earlier_name(
+        installer: &Installer,
+        params: &AgentToolsParams,
+    ) -> (PathBuf, PathBuf) {
+        installer.install(params).expect("installs");
+        let modern = installer.record_path(params);
+        let legacy =
+            installer
+                .records
+                .join(format!("{}-user-{}.json", params.agent, hex(&[0xab, 0xcd])));
+        std::fs::rename(&modern, &legacy).expect("wears the earlier name");
+        (modern, legacy)
+    }
+
+    /// On Windows a record from an earlier build that another program holds without sharing its
+    /// deletion, as a scanner holds a file it reads, is moved onto the name this build gives it
+    /// once that program lets go.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_record_from_an_earlier_build_is_moved_once_it_is_let_go() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
+        let kept = std::fs::read(&legacy).expect("the record");
+        let letting_go = held_for_a_moment(&legacy);
+        let moved = installer.migrate_records(&params);
+        letting_go.join().expect("let go");
+        moved.expect("moved once it is let go");
+        assert!(!legacy.exists(), "the earlier name is gone");
+        assert_eq!(std::fs::read(&modern).expect("the record"), kept);
+    }
+
+    /// On Windows the check a move stands on, that the name this build gives the record is free,
+    /// is made again before every attempt: a record another writer puts there while the held move
+    /// waits is never replaced, and both names are left alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_written_under_the_new_name_while_the_move_waits_is_not_replaced() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
+        let kept = std::fs::read(&legacy).expect("the record");
+        let letting_go = held_for_a_moment(&legacy);
+        let written = modern.clone();
+        let mut attempts = 0;
+        BEFORE_ATTEMPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                attempts += 1;
+                if attempts == 2 {
+                    std::fs::write(&written, b"another writer's record")
+                        .expect("another writer takes the name meanwhile");
+                }
+            }));
+        });
+        let moved = installer.migrate_records(&params);
+        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+        letting_go.join().expect("let go");
+        moved.expect("both are left alone");
+        assert_eq!(std::fs::read(&legacy).expect("the earlier record"), kept);
+        assert_eq!(
+            std::fs::read(&modern).expect("the other writer's record"),
+            b"another writer's record"
+        );
     }
 
     fn params(agent: AgentTarget, scope: InstallScope) -> AgentToolsParams {

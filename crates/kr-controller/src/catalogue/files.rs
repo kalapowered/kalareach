@@ -453,6 +453,8 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> 
     // the effect begins.
     file.sync_all().map_err(storage)?;
     drop(file);
+    #[cfg(test)]
+    tests::before_attempt();
     std::fs::rename(&temporary, path).map_err(storage)?;
     // The rename is not on disk until the directory holding it is. A failure here is reported
     // rather than swallowed: a record that claims durability it does not have is worse than one
@@ -516,6 +518,119 @@ pub(crate) fn another_group(directory: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a test does before an attempt at a replacement's rename.
+    type AttemptHook = Box<dyn FnMut()>;
+
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs what the test on this thread does before an attempt at a replacement's rename.
+    pub(super) fn before_attempt() {
+        BEFORE_ATTEMPT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
+    /// on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holding);
+        })
+    }
+
+    /// The names a directory holds.
+    #[cfg(windows)]
+    fn names_in(directory: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(directory)
+            .expect("lists the directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect()
+    }
+
+    /// On Windows a document that another program holds without sharing its deletion, as a
+    /// scanner holds a file it has just seen written, is replaced once that program lets go, and
+    /// nothing is left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_document_is_replaced_once_it_is_let_go() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let document = directory.path().join("settings.json");
+        write_atomically(&document, b"first", PRIVATE).expect("creates it");
+        let letting_go = held_for_a_moment(&document);
+        let replaced = write_atomically(&document, b"second", PRIVATE);
+        letting_go.join().expect("let go");
+        replaced.expect("replaced once it is let go");
+        assert_eq!(std::fs::read(&document).expect("reads it"), b"second");
+        assert_eq!(names_in(directory.path()), ["settings.json"]);
+    }
+
+    /// On Windows the comparison a replacement stands on is made again before every attempt at
+    /// its rename: a document given an entry of its own while its held replacement waits is not
+    /// replaced. It keeps its bytes and the access it was given, and nothing is left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_document_given_another_access_while_its_replacement_waits_is_not_replaced() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let document = directory.path().join("settings.json");
+        write_atomically(&document, b"first", PRIVATE).expect("creates it");
+        let letting_go = held_for_a_moment(&document);
+        let granted = document.clone();
+        let mut attempts = 0;
+        BEFORE_ATTEMPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                attempts += 1;
+                if attempts == 2 {
+                    // Somebody grants everyone reading while the first attempt is refused.
+                    let output = std::process::Command::new("icacls.exe")
+                        .arg(&granted)
+                        .args(["/grant", "*S-1-1-0:(R)"])
+                        .output()
+                        .expect("icacls starts");
+                    assert!(output.status.success(), "icacls: {output:?}");
+                }
+            }));
+        });
+        let written = write_atomically(&document, b"second", PRIVATE);
+        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+        letting_go.join().expect("let go");
+        let refused = written.expect_err("refused once the document's access changed");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("another owner or access-control list")),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read(&document).expect("reads it"), b"first");
+        let access = kr_ipc::paths::FileAccess::of(&document).expect("reads its access");
+        let copy = directory.path().join("copy.json");
+        std::fs::write(&copy, b"x").expect("a file made beside it");
+        assert_ne!(
+            access,
+            kr_ipc::paths::FileAccess::of(&copy).expect("reads its access"),
+            "the document keeps the entry it was given"
+        );
+        std::fs::remove_file(&copy).expect("removes the file made beside it");
+        assert_eq!(names_in(directory.path()), ["settings.json"]);
+    }
 
     /// A document is replaced whole and nothing is left beside it. Where this host reads access
     /// controls, a copy made in the document's own directory keeps who can read it, so the check
