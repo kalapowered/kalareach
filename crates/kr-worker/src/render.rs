@@ -1428,7 +1428,10 @@ mod tests {
             }
             at = end + 1;
         }
-        assert!(erases >= 4, "the screen, the other buffer and each row: {erases}");
+        assert!(
+            erases >= 4,
+            "the screen, the other buffer and each row: {erases}"
+        );
     }
 
     #[test]
