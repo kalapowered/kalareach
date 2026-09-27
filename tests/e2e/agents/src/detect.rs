@@ -59,9 +59,10 @@ pub const TYPED_CAPABILITIES: [&str; 6] = [
     "agent.attachment",
 ];
 
-/// The file names a command backend leaves in the worker's runtime directory: its registration,
-/// whose name starts with this, and its launch record.
-const BACKEND_FILES: (&str, &str) = ("registration", "launch");
+/// The files a command backend or a gateway leaves in the worker's runtime directory: a
+/// registration, whose name starts with this, a launch record and a credential; its endpoint is a
+/// socket beside them.
+const BACKEND_FILES: (&str, [&str; 2]) = ("registration", ["launch", "credential"]);
 
 /// What a session announced about agents once the host had had time to detect the one a part
 /// launched.
@@ -172,14 +173,18 @@ pub fn capabilities_of(
         .map_err(|error| error.to_string())
 }
 
-/// Every command backend file under `runtime_root`: a registration or a launch record.
+/// Every command backend or gateway file under `runtime_root`: a registration, a launch record or a
+/// credential, and every socket beside one of them, its endpoint.
 ///
 /// # Panics
 ///
 /// Panics when the directory cannot be walked, which would leave the absence unshown.
 #[must_use]
 pub fn backend_files(runtime_root: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
     let mut found = Vec::new();
+    let mut sockets = Vec::new();
+    let mut holding = std::collections::BTreeSet::new();
     let mut pending = vec![runtime_root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let entries = match std::fs::read_dir(&directory) {
@@ -196,11 +201,20 @@ pub fn backend_files(runtime_root: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_string_lossy().into_owned();
             if kind.is_dir() {
                 pending.push(entry.path());
-            } else if name.starts_with(BACKEND_FILES.0) || name == BACKEND_FILES.1 {
+            } else if name.starts_with(BACKEND_FILES.0) || BACKEND_FILES.1.contains(&name.as_str())
+            {
                 found.push(entry.path());
+                holding.insert(directory.clone());
+            } else if kind.is_socket() {
+                sockets.push(entry.path());
             }
         }
     }
+    found.extend(sockets.into_iter().filter(|socket| {
+        socket
+            .parent()
+            .is_some_and(|parent| holding.contains(parent))
+    }));
     found.sort();
     found
 }
@@ -225,13 +239,30 @@ pub struct Shown {
     pub live_bindings: Option<u64>,
 }
 
-/// Check (i): the host detected the launched execution, as section 12 requires of a manual launch.
-/// Returns the instance.
+/// What check (i) established about a detected launch.
+#[derive(Clone, Debug)]
+pub struct Detected {
+    /// The instance the host announced for the launched execution.
+    pub instance: ApplicationInstanceId,
+    /// Whether the host showed which executable and release the instance runs. No read it serves
+    /// does for a launch the integration did not make, so this names that and stays unproven.
+    pub identity: &'static str,
+}
+
+/// What check (i) records about the executable and release of an instance the host announced.
+pub const IDENTITY_UNPROVEN: &str = "unproven: no read the host serves names the executable or the \
+     release an instance it detected runs; the image the launched process maps is under provenance";
+
+/// Check (i): the host detected the launched execution, as section 12 requires of a manual launch:
+/// one live instance while the execution runs, naming the installed package, integrated as a native
+/// terminal with every bridge refused, whose binding a device reads with the announced profile. Its
+/// executable's identity stays unproven ([`IDENTITY_UNPROVEN`]); that the instance is the launched
+/// execution's is shown by its ending with it ([`check_ended`]).
 ///
 /// # Errors
 ///
 /// Returns why the launch was not detected as the launched execution.
-pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<ApplicationInstanceId, String> {
+pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<Detected, String> {
     let instances = &shown.detection.instances;
     if !launched.running {
         return Err(if instances.is_empty() {
@@ -292,7 +323,40 @@ pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<ApplicationI
             shown.live_bindings
         ));
     }
-    Ok(instance.application_instance_id)
+    Ok(Detected {
+        instance: instance.application_instance_id,
+        identity: IDENTITY_UNPROVEN,
+    })
+}
+
+/// Check (i)'s result as evidence: the instance and what stays unproven, or why detection failed.
+#[must_use]
+pub fn detected_evidence(detected: &Result<Detected, String>) -> Value {
+    match detected {
+        Ok(detected) => json!({
+            "detected": true,
+            "instance": detected.instance.to_string(),
+            "identity": detected.identity,
+        }),
+        Err(why) => json!({ "detected": false, "why": why }),
+    }
+}
+
+/// Check (i)'s other half: once the launched execution has ended, the host announces no live
+/// instance for it.
+///
+/// # Errors
+///
+/// Returns the instances still announced live.
+pub fn check_ended(shown: &Shown) -> Result<(), String> {
+    if shown.detection.instances.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} instance(s) are still announced live after the execution ended",
+            shown.detection.instances.len()
+        ))
+    }
 }
 
 /// What a device can reach of the instance's typed surface.
@@ -355,12 +419,18 @@ pub fn check_observation_only(surface: &Surface) -> Result<(), String> {
     {
         return Err(format!("{capability} is advertised as usable"));
     }
+    if let Some(answer) = surface.answers.iter().find(|answer| answer.accepted()) {
+        return Err(format!("{} was accepted: {}", answer.call, answer.detail));
+    }
     if let Some(answer) = surface
         .answers
         .iter()
         .find(|answer| answer.refused.is_none())
     {
-        return Err(format!("{} was accepted: {}", answer.call, answer.detail));
+        return Err(format!(
+            "{} was not answered with a refusal: {}",
+            answer.call, answer.detail
+        ));
     }
     if surface.resources != 0 {
         return Err(format!(
@@ -463,6 +533,18 @@ pub fn checker_controls(launched: &Launched, shown: &Shown, surface: &Surface) -
         )
         .map(|_| ()),
     );
+    let mut retained = shown.clone();
+    if retained.detection.instances.is_empty() {
+        retained
+            .detection
+            .instances
+            .push(stand_in_instance(launched.plugin_id.as_str()));
+    }
+    control(
+        "ended",
+        "an instance is still announced after its execution ended",
+        check_ended(&retained),
+    );
     // (ii): a usable prompt record, an accepted mutation, and a backend's registration.
     let mut usable = surface.clone();
     usable.records.push(("agent.prompt".to_owned(), true));
@@ -475,22 +557,35 @@ pub fn checker_controls(launched: &Launched, shown: &Shown, surface: &Surface) -
     accepted.answers.push(Answer {
         call: "agent.prompt.submit".to_owned(),
         refused: None,
+        error: None,
         detail: "accepted".to_owned(),
     });
+    let mut unanswered = surface.clone();
+    unanswered.answers.push(Answer {
+        call: "agent.prompt.submit".to_owned(),
+        refused: None,
+        error: Some("the connection ended".to_owned()),
+        detail: "the connection ended".to_owned(),
+    });
+    control(
+        "observation_only",
+        "a typed mutation is answered by no refusal",
+        check_observation_only(&unanswered),
+    );
     control(
         "observation_only",
         "a typed mutation is accepted",
         check_observation_only(&accepted),
     );
-    let mut backend = surface.clone();
-    backend
-        .backend_files
-        .push(PathBuf::from("c0/b0/registration.1.1"));
-    control(
-        "observation_only",
-        "a command backend's registration exists",
-        check_observation_only(&backend),
-    );
+    for file in ["c0/b0/registration.1.1", "c0/b0/launch", "c0/b0/credential"] {
+        let mut backend = surface.clone();
+        backend.backend_files.push(PathBuf::from(file));
+        control(
+            "observation_only",
+            &format!("a command backend's {file} exists"),
+            check_observation_only(&backend),
+        );
+    }
     // (iii): the same instance at a later revision.
     let before = Held::of(shown).unwrap_or(Held {
         instance: ApplicationInstanceId::new(kr_ipc::new_uuid()),

@@ -64,8 +64,9 @@
 //! (`outcome::Outcome`). Without them a test says `skipping:` and returns, so an ordinary run of
 //! this workspace stays offline and starts no agent; [`REQUIRE_VARIABLE`] set to `1` turns that
 //! into a failure. `scripts/e2e-agents.sh` in the plugin repository sets all four, and for the parts
-//! with a login the ledger ([`account::TURNS_VARIABLE`]) and the key-scan file
-//! ([`account::KEY_SCAN_VARIABLE`]).
+//! with a login the ledger ([`account::TURNS_VARIABLE`]), the key-scan file
+//! ([`account::KEY_SCAN_VARIABLE`]) and, for a login that is a variable, the descriptor its value
+//! arrives on ([`account::KEY_DESCRIPTOR_VARIABLE`]); it runs this with a cleared environment.
 
 #[cfg(unix)]
 pub mod account;

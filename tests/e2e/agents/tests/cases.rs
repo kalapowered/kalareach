@@ -20,14 +20,14 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
-    Ledger, borrow_login_keychain, changes, conversation_id, files_holding, now_ms,
-    record_key_scan, remove_created, snapshot,
+    Ledger, borrow_login_keychain, changes, conversation_id, files_holding, key_from_descriptor,
+    now_ms, record_key_scan, remove_created, snapshot,
 };
 use kr_e2e_agents::build::{Account, AccountHome, Action, Build, Inputs, Launch, quote};
 use kr_e2e_agents::detect::{
     Detection, Held, Launched, Shown, Surface, all_rejected, announced_now, backend_files,
-    capabilities_of, check_detected, check_observation_only, check_unchanged, checker_controls,
-    wait_for_detection, wait_for_no_instance,
+    capabilities_of, check_detected, check_ended, check_observation_only, check_unchanged,
+    checker_controls, detected_evidence, wait_for_detection, wait_for_no_instance,
 };
 use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::observe::{
@@ -90,10 +90,14 @@ struct Stage<'a, 'r> {
     provenance: &'a Provenance,
     /// The person's login, for a part that needs it.
     login: Option<&'a Login>,
+    /// Text only this part's own prompts and files carry, chosen before the part starts, by which
+    /// what the part left in the person's agent directories is told from what anything else left.
+    mark: &'a str,
 }
 
 /// The person's login as a part that needs it holds it: how the agent runs with it, the budget its
-/// turns are charged to, the variable the login is where it is one, and the person's home.
+/// turns are charged to, the variable the login is where it is one (read from the harness's pipe,
+/// in no environment until the agent's session is given it), and the person's home.
 struct Login {
     account: Account,
     ledger: Ledger,
@@ -115,9 +119,6 @@ struct Ending {
     sessions: Vec<Session>,
     /// A daemon it started in place of one it killed.
     replacement: Option<Replacement>,
-    /// Text only this part's conversations hold, by which what it created in the person's agent
-    /// directories is told from what anything else created there.
-    marks: Vec<String>,
     /// Local terminals it attached besides its sessions' own, which end once the host closes them.
     windows: Vec<Window>,
 }
@@ -128,7 +129,6 @@ impl Ending {
             outcome,
             sessions,
             replacement: None,
-            marks: Vec::new(),
             windows: Vec::new(),
         }
     }
@@ -139,21 +139,42 @@ impl Ending {
 const HASH_LIMIT: u64 = 16 << 20;
 
 /// Runs one part that needs no login on a stage of its own.
-fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
-    staged(part, false, body);
+fn on_stage(part: &str, test: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
+    staged(part, test, false, body);
 }
 
 /// Runs one part that needs the person's login on a stage of its own. The harness runs it only
 /// for a build whose list entry names an approved login.
-fn on_account_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
-    staged(part, true, body);
+fn on_account_stage(part: &str, test: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
+    staged(part, test, true, body);
+}
+
+/// What a panic said, where it said anything.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_else(|| "the part stopped without saying why".to_owned())
 }
 
 /// Runs one part on a stage of its own, closes the stage, and appends the part's outcome once the
-/// closing check has passed. A part that carried a key in its session's environment has the run's
-/// directory searched for the key's bytes and removed, whatever became of the part, and where the
-/// key was found is recorded by path.
-fn staged(part: &str, needs_login: bool, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
+/// closing check has passed.
+///
+/// A part with a login is also cleaned up after, whatever became of it. Every process it started
+/// has ended first: the closing check ended them, or the run ends them now. Then, where the agent
+/// ran with the person's home, what the part created there is compared, its own conversations
+/// removed and every other change reported, and an agent that rewrote a file it had is stopped;
+/// and where the part carried a key in its session's environment, the run's directory is searched
+/// for the key's bytes, which files held it is recorded by path, and the directory is removed and
+/// checked gone. A search that could not read everything, or a directory still there, fails the
+/// part. A part that stopped part way still records what it left and whether its agent stops.
+fn staged(
+    part: &str,
+    test: &str,
+    needs_login: bool,
+    body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
+) {
     let Some(inputs) = Inputs::from_environment(part) else {
         return;
     };
@@ -162,10 +183,9 @@ fn staged(part: &str, needs_login: bool, body: impl FnOnce(&mut Stage<'_, '_>) -
             panic!("part {part} needs a login, and the build list names none for this agent")
         });
         let key = account.variable.as_ref().map(|name| {
-            let value = std::env::var(name).unwrap_or_else(|_| {
-                panic!("{name} is not in this process's environment, and part {part} carries it")
+            let value = key_from_descriptor().unwrap_or_else(|why| {
+                panic!("part {part} carries {name}, and the harness gave no value for it: {why}")
             });
-            assert!(value.len() >= 8, "{name} is too short to be a key");
             (name.clone(), value)
         });
         let person_home =
@@ -186,32 +206,129 @@ fn staged(part: &str, needs_login: bool, body: impl FnOnce(&mut Stage<'_, '_>) -
         }
     };
     let runtime = runtime();
+    let mark = nonce();
+    // The person's agent directories as the part finds them, before anything starts.
+    let person = login
+        .as_ref()
+        .filter(|login| login.account.home == AccountHome::Person)
+        .map(|login| snapshot(&login.person_home, &login.account.directories, HASH_LIMIT));
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
+    let closed = std::sync::atomic::AtomicBool::new(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_part(part, &inputs, login.as_ref(), &shell, &runtime, &run, body)
+        run_part(
+            part,
+            &inputs,
+            login.as_ref(),
+            &mark,
+            &shell,
+            &runtime,
+            &run,
+            &closed,
+            body,
+        )
     }));
-    // A key the part carried goes with the run's directory, whatever became of the part: where it
-    // was is found first, and only its paths are kept.
-    let scan = login
-        .as_ref()
-        .and_then(|login| login.key.as_ref())
-        .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
-    drop(run);
-    if let Some((name, holders)) = scan {
+    // What the part left is read only once nothing it started still runs: after the closing
+    // check, before the run's directory goes; otherwise after the run has ended everything.
+    let left = |login: Option<&Login>| {
+        let home = login
+            .zip(person.as_ref())
+            .map(|(login, before)| person_home_report(login, before, &mark, &root));
+        let scan = login
+            .and_then(|login| login.key.as_ref())
+            .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
+        (home, scan)
+    };
+    let (home, scan) = if closed.load(std::sync::atomic::Ordering::SeqCst) {
+        let found = left(login.as_ref());
+        drop(run);
+        found
+    } else {
+        drop(run);
+        left(login.as_ref())
+    };
+    let mut key_evidence = None;
+    let mut key_failure = None;
+    if let Some((name, scan)) = scan {
         let _ = std::fs::remove_dir_all(&root);
         let gone = !root.exists();
-        record_key_scan(part, &name, &holders, now_ms(), gone);
-        assert!(
-            gone,
-            "the run's directory {} is gone after the part",
-            root.display()
+        record_key_scan(part, &name, &scan, now_ms(), gone);
+        if !scan.complete() || !gone {
+            key_failure = Some(format!(
+                "the run's directory that held {name} was {}searched whole ({} entries unread) \
+                 and is {}gone",
+                if scan.complete() { "" } else { "not " },
+                scan.unread.len(),
+                if gone { "" } else { "not " }
+            ));
+        }
+        key_evidence = Some(json!({
+            "variable": name,
+            "held_by": scan.held_by.iter().map(|holder| &holder.path).collect::<Vec<_>>(),
+            "complete": scan.complete(),
+            "run_gone": gone,
+        }));
+    }
+    let stop = home
+        .as_ref()
+        .and_then(|(_, rewrites)| (!rewrites.is_empty()).then(|| rewrites.join(", ")))
+        .filter(|_| {
+            login
+                .as_ref()
+                .is_some_and(|login| login.account.stop_on_rewrite)
+        });
+    let mut outcome = match result {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            // A part with a login that stopped part way still says what it left, and whether its
+            // agent stops, before its failure goes on.
+            if needs_login {
+                let mut evidence = serde_json::Map::new();
+                if let Some((report, _)) = &home {
+                    evidence.insert("person_home".to_owned(), report.clone());
+                }
+                if let Some(keys) = &key_evidence {
+                    evidence.insert("key".to_owned(), keys.clone());
+                }
+                if stop.is_some() {
+                    evidence.insert("stop_agent".to_owned(), json!(true));
+                }
+                let reason = match &stop {
+                    Some(files) => format!(
+                        "{}; and the agent rewrote files it had before the part, so it stops \
+                         here: {files}",
+                        panic_text(&*panic)
+                    ),
+                    None => panic_text(&*panic),
+                };
+                Outcome::failed(part, test, &reason, serde_json::Value::Object(evidence))
+                    .append(&inputs.result);
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
+    if let Some(evidence) = outcome.evidence.as_object_mut() {
+        if let Some((report, _)) = &home {
+            evidence.insert("person_home".to_owned(), report.clone());
+        }
+        if let Some(keys) = &key_evidence {
+            evidence.insert("key".to_owned(), keys.clone());
+        }
+    }
+    if let Some(files) = stop {
+        if let Some(evidence) = outcome.evidence.as_object_mut() {
+            evidence.insert("stop_agent".to_owned(), json!(true));
+        }
+        outcome = Outcome::failed(
+            part,
+            test,
+            &format!("the agent rewrote files it had before the part, so it stops here: {files}"),
+            outcome.evidence.clone(),
         );
     }
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
+    if let Some(why) = key_failure {
+        outcome = Outcome::failed(part, test, &why, outcome.evidence.clone());
+    }
     let failed = (outcome.outcome == "failed").then(|| outcome.reason.clone().unwrap_or_default());
     outcome.append(&inputs.result);
     if let Some(reason) = failed {
@@ -219,15 +336,63 @@ fn staged(part: &str, needs_login: bool, body: impl FnOnce(&mut Stage<'_, '_>) -
     }
 }
 
+/// What a part changed in the person's agent directories since `before`: its own conversations,
+/// the files it created holding its marker or the run's directory, removed, and every other change
+/// reported; and the files it had that were rewritten or changed and too large to compare.
+fn person_home_report(
+    login: &Login,
+    before: &kr_e2e_agents::account::Snapshot,
+    mark: &str,
+    root: &Path,
+) -> (serde_json::Value, Vec<String>) {
+    let after = snapshot(&login.person_home, &login.account.directories, HASH_LIMIT);
+    let found = changes(before, &after);
+    let root = root.display().to_string();
+    let (removed, left) = remove_created(before, &found, &[mark, &root]);
+    let home = |paths: &[PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&login.person_home).map_or_else(
+                    |_| path.display().to_string(),
+                    |relative| format!("~/{}", relative.display()),
+                )
+            })
+            .collect()
+    };
+    let rewrites: Vec<String> = home(&found.rewritten)
+        .into_iter()
+        .chain(home(&found.changed_uncompared))
+        .collect();
+    (
+        json!({
+            "created_and_removed": home(&removed),
+            "created_and_left": home(&left),
+            "appended": home(&found.appended),
+            "rewritten": home(&found.rewritten),
+            "changed_uncompared": home(&found.changed_uncompared),
+            "removed_by_something_else": home(&found.removed),
+        }),
+        rewrites,
+    )
+}
+
 /// The part itself on its stage: the host, the owner device, the package, the part's steps, the
-/// stage closed, the closing check, and the outcome with what the whole stage observed.
+/// stage closed, the closing check, and the outcome with what the whole stage observed. `closed`
+/// is set once the closing check has found nothing of the part still running.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stage's parts, each of which the part reads"
+)]
 fn run_part(
     part: &str,
     inputs: &Inputs,
     login: Option<&Login>,
+    mark: &str,
     shell: &ManagedShell,
     runtime: &tokio::runtime::Runtime,
     run: &Run,
+    closed: &std::sync::atomic::AtomicBool,
     body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
 ) -> Outcome {
     // Before anything starts in the run's home: a keychain of its own, its default there, or, for
@@ -256,19 +421,10 @@ fn run_part(
         &inputs.generation,
         &inputs.build.package,
     );
-    // The person's agent directories, where the agent runs with the person's home.
-    let person_directories = login
-        .filter(|login| login.account.home == AccountHome::Person)
-        .map(|login| {
-            (
-                login,
-                snapshot(&login.person_home, &login.account.directories, HASH_LIMIT),
-            )
-        });
     // The sessions an agent is launched in are watched from just before the launch until they have
     // ended, by a thread of their own, with one more look when the part's own steps end; the
     // thread stops when the part ends, however it ends.
-    let (outcome, marks) = std::thread::scope(|scope| {
+    let outcome = std::thread::scope(|scope| {
         let _stop = StopSampling(&provenance);
         let _sampler = scope.spawn(|| provenance.sample_until_stopped());
         let ending = {
@@ -282,6 +438,7 @@ fn run_part(
                 installed: &installed,
                 provenance: &provenance,
                 login,
+                mark,
             };
             body(&mut stage)
         };
@@ -305,11 +462,12 @@ fn run_part(
         for mut window in ending.windows {
             let _ = window.exit_code(LIVENESS);
         }
-        (ending.outcome, ending.marks)
+        ending.outcome
     });
     let checked = run
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
+    closed.store(true, std::sync::atomic::Ordering::SeqCst);
     println!("{checked}");
     drop(keychain);
     provenance.finish().unwrap_or_else(|why| panic!("{why}"));
@@ -325,54 +483,6 @@ fn run_part(
                 "grant": installed.grant,
             }),
         );
-    }
-    if let Some((login, before)) = person_directories {
-        let after = snapshot(&login.person_home, &login.account.directories, HASH_LIMIT);
-        let found = changes(&before, &after);
-        let root = run.root().display().to_string();
-        let mut owned: Vec<&str> = marks.iter().map(String::as_str).collect();
-        owned.push(&root);
-        let (removed, left) = remove_created(&before, &found, &owned);
-        let home = |paths: &[PathBuf]| -> Vec<String> {
-            paths
-                .iter()
-                .map(|path| {
-                    path.strip_prefix(&login.person_home).map_or_else(
-                        |_| path.display().to_string(),
-                        |relative| format!("~/{}", relative.display()),
-                    )
-                })
-                .collect()
-        };
-        let report = json!({
-            "created_and_removed": home(&removed),
-            "created_and_left": home(&left),
-            "appended": home(&found.appended),
-            "rewritten": home(&found.rewritten),
-            "changed_uncompared": home(&found.changed_uncompared),
-            "removed_by_something_else": home(&found.removed),
-        });
-        if let Some(evidence) = outcome.evidence.as_object_mut() {
-            evidence.insert("person_home".to_owned(), report.clone());
-        }
-        let rewrites: Vec<String> = home(&found.rewritten)
-            .into_iter()
-            .chain(home(&found.changed_uncompared))
-            .collect();
-        if login.account.stop_on_rewrite && !rewrites.is_empty() {
-            if let Some(evidence) = outcome.evidence.as_object_mut() {
-                evidence.insert("stop_agent".to_owned(), json!(true));
-            }
-            outcome = Outcome::failed(
-                part,
-                &outcome.test,
-                &format!(
-                    "the agent rewrote files it had before the part, so it stops here: {}",
-                    rewrites.join(", ")
-                ),
-                outcome.evidence.clone(),
-            );
-        }
     }
     outcome
 }
@@ -884,7 +994,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "variable": login.account.variable,
         "arguments": login.account.arguments,
         "turns": turns,
-        "budget_spent": login.ledger.spent(),
+        "budget_spent": login.ledger.spent().ok(),
         "budget_limit": login.ledger.limit(),
     })
 }
@@ -1210,7 +1320,7 @@ fn runs_its_build(started: &Started, launch: Launch, mark: &BuildMark) -> Result
 fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
  {
     const TEST: &str = "an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
-    on_stage("2b", |stage| {
+    on_stage("2b", TEST, |stage| {
         let (_installation, variables) = prepare(stage, &stage.build.prefix.clone());
         let agent = start_agent(stage, &variables, "the agent's session");
         let mut screen = watch(stage, &agent.session, &stage.build.ready);
@@ -1257,16 +1367,22 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
         // The live control for (i), which breaks it: the agent ends, and the check must fail.
         let (ended, gone) = end_and_show(stage, &agent);
         let ended_check = check_detected(&ended, &gone);
+        let ended_instance = check_ended(&gone);
         assert!(
             ended_check.is_err(),
             "the detection check fails once the agent has ended: {}",
             gone.detection.evidence()
         );
+        if detected.is_ok() {
+            ended_instance.as_ref().unwrap_or_else(|why| {
+                panic!("the host ends the instance with its execution: {why}")
+            });
+        }
         let evidence = json!({
             "detection": shown.detection.evidence(),
             "binding": shown.binding,
             "live_bindings": shown.live_bindings,
-            "detected": detected.as_ref().map(ToString::to_string).map_err(Clone::clone),
+            "detected": detected_evidence(&detected),
             "surface": offered.evidence(),
             "agent_reads": reads.iter().map(Answer::evidence).collect::<Vec<_>>(),
             "after": after.detection.evidence(),
@@ -1285,6 +1401,7 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
                 "breaks_property": true,
                 "after": gone.detection.evidence(),
                 "check": ended_check.err(),
+                "instance_ended": ended_instance.is_ok(),
             },
         });
         let outcome = match detected {
@@ -1311,7 +1428,7 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
 fn under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused() {
     const TEST: &str =
         "under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused";
-    on_stage("2c", |stage| {
+    on_stage("2c", TEST, |stage| {
         let (_installation, variables) = prepare(stage, &stage.build.prefix.clone());
         let agent = start_agent(stage, &variables, "the agent's session");
         watch(stage, &agent.session, &stage.build.ready).close(stage);
@@ -1418,7 +1535,7 @@ fn under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_ref
         // sent again as a new action, is refused.
         let (ended, gone) = end_and_show(stage, &agent);
         assert!(
-            check_detected(&ended, &gone).is_err(),
+            check_detected(&ended, &gone).is_err() && check_ended(&gone).is_ok(),
             "the agent and its instance have ended: {}",
             gone.detection.evidence()
         );
@@ -1469,7 +1586,7 @@ fn under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_ref
 #[test]
 fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
     const TEST: &str = "a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
-    on_stage("5a", |stage| {
+    on_stage("5a", TEST, |stage| {
         let (_installation, variables) = prepare(stage, &stage.build.prefix.clone());
         let mut agent = start_agent(stage, &variables, "the agent's session");
         watch(stage, &agent.session, &stage.build.ready).close(stage);
@@ -1563,7 +1680,6 @@ fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
             outcome: Outcome::passed("5a", TEST, evidence),
             sessions: agent.sessions(),
             replacement: Some(replacement),
-            marks: Vec::new(),
             windows: Vec::new(),
         }
     });
@@ -1578,7 +1694,7 @@ fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
 fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
 {
     const TEST: &str = "a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
-    on_stage("6a", |stage| {
+    on_stage("6a", TEST, |stage| {
         let Some(newer) = stage.build.newer.clone() else {
             let reason = stage.build.no_newer.clone().unwrap_or_else(|| {
                 "the build list names no newer build of this agent (the build list)".to_owned()
@@ -1863,7 +1979,7 @@ sed '$d' "$out.err.all" >"$out.err"
 fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged() {
     const TEST: &str =
         "forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged";
-    on_stage("8a", |stage| {
+    on_stage("8a", TEST, |stage| {
         let (_installation, variables) = prepare(stage, &stage.build.prefix.clone());
         let agent = start_agent(stage, &variables, "the agent's session");
         let mut screen = watch(stage, &agent.session, &stage.build.ready);
@@ -2172,7 +2288,7 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
 #[test]
 fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
     const TEST: &str = "a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer";
-    on_stage("14.03a", |stage| {
+    on_stage("14.03a", TEST, |stage| {
         let Some(composer) = stage.build.composer.clone() else {
             return Ending::new(
                 Outcome::not_run(
@@ -2245,6 +2361,10 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         let after = shown_now(stage, &agent.session);
         check_unchanged(Held::of(&initial), &after)
             .unwrap_or_else(|why| panic!("the typed path changes nothing the host shows: {why}"));
+        let (offered, _) = surface(stage, &agent.session, &after);
+        check_observation_only(&offered).unwrap_or_else(|why| {
+            panic!("with the path typed, only observation and the terminal are offered: {why}")
+        });
         let resources = events_snapshot(
             &agent.session.remote,
             stage.runtime,
@@ -2261,6 +2381,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
             "composer_row": rows.iter().find(|row| row.contains(SHOT)),
             "detection": initial.detection.evidence(),
             "announced": after.detection.evidence(),
+            "surface": offered.evidence(),
             "control": { "what": "the same input without the lease", "breaks_property": true, "refused": control },
         });
         Ending::new(Outcome::passed("14.03a", TEST, evidence), agent.sessions())
@@ -2277,7 +2398,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
 #[test]
 fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the_same_execution() {
     const TEST: &str = "a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the_same_execution";
-    on_account_stage("1", |stage| {
+    on_account_stage("1", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
         let mut logged = Logged::start(stage, &variables, "the agent's session", "1", &[], None);
@@ -2290,7 +2411,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         logged.submit(stage, &question, "a prompt from the device");
         let _ = logged.wait_for(stage, &sum, "the agent answers the device's prompt");
         // The image, by the agent's own syntax, with a question only the image answers.
-        let mark = nonce();
+        let mark = stage.mark.to_owned();
         let file = stage.run.work().join(format!("{mark}.png"));
         std::fs::write(&file, COLOUR_PNG).expect("writes the image");
         logged.type_text(stage, &image_input(account, &file));
@@ -2316,7 +2437,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
-            "detected": detected.as_ref().map(ToString::to_string).map_err(Clone::clone),
+            "detected": detected_evidence(&detected),
             "device_upload": upload.evidence(),
             "prompt": { "question": question, "answer": sum },
             "image": { "file": file, "syntax": account.image, "answer": COLOUR, "rows": answered_rows.iter().filter(|row| row.contains(COLOUR)).collect::<Vec<_>>() },
@@ -2344,26 +2465,103 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             outcome,
             sessions: logged.agent.sessions(),
             replacement: None,
-            marks: vec![mark],
             windows: Vec::new(),
         }
     });
 }
 
+/// The first line of `file` after line `after`, where one is given, that holds every one of
+/// `needles`, by index.
+fn first_line_with(file: &Path, after: Option<usize>, needles: &[&str]) -> Option<usize> {
+    let bytes = std::fs::read(file).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .enumerate()
+        .skip(after.map_or(0, |line| line + 1))
+        .find(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+        .map(|(index, _)| index)
+}
+
+/// The conversation file under `root` whose prompt lines hold `needle`, where exactly one does.
+fn conversation_of(root: &Path, needle: &str, marker: &str) -> Option<PathBuf> {
+    match conversation_lines(root, needle, marker).as_slice() {
+        [(file, _)] => Some(file.clone()),
+        _ => None,
+    }
+}
+
+/// Where a prompt entered during a running turn landed in the conversation, as the queue and
+/// steering checks read it: the line of the running turn's last reply, of the second prompt, and
+/// of that prompt's answer.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct Order {
+    /// Whether the agent showed a running turn right after the second prompt was submitted.
+    busy_at_submission: bool,
+    /// The running turn's reply that finished its work.
+    first_finished: Option<usize>,
+    /// The second prompt.
+    second_prompt: Option<usize>,
+    /// The second prompt's answer.
+    second_answered: Option<usize>,
+}
+
+/// A prompt entered during a turn waited for it: it was entered while the turn ran, the turn's work
+/// finished before the prompt joined the conversation, and the prompt was answered after that.
+fn check_queued(order: &Order) -> Result<(), String> {
+    match (
+        order.first_finished,
+        order.second_prompt,
+        order.second_answered,
+    ) {
+        _ if !order.busy_at_submission => {
+            Err("the second prompt was not entered while a turn ran".to_owned())
+        }
+        (Some(finished), Some(prompt), Some(answered))
+            if finished < prompt && prompt < answered =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "the conversation does not hold the turn's finished work, then the prompt, then its \
+             answer: {order:?}"
+        )),
+    }
+}
+
+/// A prompt entered during a turn steered it: it was entered while the turn ran, it joined the
+/// conversation before the turn's work finished, which it then never did, and it was answered.
+fn check_steered(order: &Order) -> Result<(), String> {
+    match (
+        order.first_finished,
+        order.second_prompt,
+        order.second_answered,
+    ) {
+        _ if !order.busy_at_submission => {
+            Err("the steering prompt was not entered while a turn ran".to_owned())
+        }
+        (None, Some(prompt), Some(answered)) if prompt < answered => Ok(()),
+        _ => Err(format!(
+            "the running turn did not take the prompt before its work finished: {order:?}"
+        )),
+    }
+}
+
 /// KR-REQ-12.32, case 2, part 2a: with the person's login, each of the agent's own terminal
-/// controls from a paired device, on its own: a slash command that calls no model shows its
-/// screen; a long turn stops at the agent's interrupt key, and the agent says so; a prompt entered
-/// while a turn runs waits for it and then runs; where the agent steers a running turn with a
-/// prompt entered during it, the turn takes it. The typed steer, queue and commands stay refused,
-/// since the launch has only observation and the terminal. The control, which does not break the
-/// property, is the prompt the device submits afterwards on its own, which the agent answers.
+/// controls from a paired device, on its own. A slash command that calls no model shows its screen.
+/// A long turn stops at the agent's interrupt key, and the agent says so. A prompt entered while a
+/// turn runs waits for it: the agent's own conversation holds the turn's finished work, then the
+/// prompt, then its answer. Where the agent steers a running turn with a prompt entered during it,
+/// the turn takes the prompt before its work finishes, which then never does. The typed steer,
+/// queue and commands stay refused, since the launch has only observation and the terminal. The
+/// queue and steering checks are also shown orders made wrong on purpose, which they must reject.
 #[test]
 fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device() {
     const TEST: &str =
         "slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device";
-    on_account_stage("2a", |stage| {
+    on_account_stage("2a", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
+        let conversations = login_home(stage).join(&account.conversations);
         let mut logged = Logged::start(stage, &variables, "the agent's session", "2a", &[], None);
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
@@ -2383,9 +2581,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "the composer is back after the slash command",
         );
         // An interrupt of a long turn.
+        let mark = stage.mark.to_owned();
         logged.submit(
             stage,
-            "Count from 1 to 400, one number per line, and write nothing else.",
+            &format!(
+                "Count from 1 to 400, one number per line, and write nothing else. ({mark}-i)"
+            ),
             "a long turn to interrupt",
         );
         let _ = logged.wait_for(stage, &account.busy, "the turn runs");
@@ -2402,38 +2603,140 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         );
         // A prompt entered while a turn runs, which waits for it.
         let (queued_question, queued_sum) = sum_question();
+        let upper = mark.to_uppercase();
+        let queued_done = format!("DONE-{upper}-Q");
         logged.submit(
             stage,
-            "Count from 1 to 30, one number per line, and write nothing else.",
+            &format!(
+                "Count from 1 to 37, one number per line, then write the word DONE, a hyphen, the \
+                 code {mark} in upper case and -Q, and nothing else. ({mark}-q)"
+            ),
             "a turn to queue behind",
         );
         let _ = logged.wait_for(stage, &account.busy, "the first turn runs");
-        logged.submit(stage, &queued_question, "a prompt entered during the turn");
-        let queued_rows = logged.wait_for(stage, &queued_sum, "the queued prompt is answered");
+        logged.submit(
+            stage,
+            &format!("{queued_question} ({mark}-r)"),
+            "a prompt entered during the turn",
+        );
+        let busy_at_queue = logged
+            .screen
+            .view
+            .rows()
+            .iter()
+            .any(|row| row.contains(&account.busy));
+        let _ = logged.wait_for(stage, &queued_sum, "the queued prompt is answered");
         let _ = logged.wait_for(
             stage,
             &account.composer,
             "the composer is back after the queue",
         );
+        let conversation =
+            conversation_of(&conversations, &format!("{mark}-q"), &account.prompt_line)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "one conversation under {} holds the turn",
+                        conversations.display()
+                    )
+                });
+        let first_prompt = first_line_with(
+            &conversation,
+            None,
+            &[&format!("{mark}-q"), &account.prompt_line],
+        );
+        let second_prompt = first_line_with(
+            &conversation,
+            None,
+            &[&format!("{mark}-r"), &account.prompt_line],
+        );
+        let queue = Order {
+            busy_at_submission: busy_at_queue,
+            first_finished: first_line_with(
+                &conversation,
+                first_prompt,
+                &[&queued_done, &account.reply_line],
+            ),
+            second_prompt,
+            second_answered: first_line_with(
+                &conversation,
+                second_prompt,
+                &[&queued_sum, &account.reply_line],
+            ),
+        };
+        check_queued(&queue).unwrap_or_else(|why| panic!("the prompt waited for the turn: {why}"));
         // Steering, where the agent's terminal route steers a running turn.
+        let mut checker = vec![
+            json!({ "check": "queued", "wrong": "entered with no turn running", "rejected": check_queued(&Order { busy_at_submission: false, ..queue }).is_err() }),
+            json!({ "check": "queued", "wrong": "the prompt joined before the turn finished", "rejected": check_queued(&Order { second_prompt: queue.first_finished.map(|line| line.saturating_sub(1)), ..queue }).is_err() }),
+        ];
         let steering = if account.steers {
             let (steer_question, steer_sum) = sum_question();
+            let steered_done = format!("DONE-{upper}-S");
             logged.submit(
                 stage,
-                "Count from 1 to 400, one number per line, and write nothing else.",
+                &format!(
+                    "Count from 1 to 400, one number per line, then write the word DONE, a \
+                     hyphen, the code {mark} in upper case and -S, and nothing else. ({mark}-s)"
+                ),
                 "a turn to steer",
             );
             let _ = logged.wait_for(stage, &account.busy, "the turn to steer runs");
             logged.submit(
                 stage,
-                &format!("Stop counting. {steer_question}"),
+                &format!("Stop counting. {steer_question} ({mark}-t)"),
                 "a steering prompt",
             );
-            let rows = logged.wait_for(stage, &steer_sum, "the steered turn answers");
-            json!({ "steered": true, "answer": steer_sum, "rows": rows.iter().filter(|row| row.contains(&steer_sum)).collect::<Vec<_>>() })
+            let busy_at_steer = logged
+                .screen
+                .view
+                .rows()
+                .iter()
+                .any(|row| row.contains(&account.busy));
+            let _ = logged.wait_for(stage, &steer_sum, "the steered turn answers");
+            let _ = logged.wait_for(
+                stage,
+                &account.composer,
+                "the composer is back after steering",
+            );
+            let steered_conversation =
+                conversation_of(&conversations, &format!("{mark}-s"), &account.prompt_line)
+                    .unwrap_or_else(|| panic!("one conversation holds the steered turn"));
+            let steered_prompt = first_line_with(
+                &steered_conversation,
+                None,
+                &[&format!("{mark}-s"), &account.prompt_line],
+            );
+            let steering_prompt = first_line_with(
+                &steered_conversation,
+                None,
+                &[&format!("{mark}-t"), &account.prompt_line],
+            );
+            let steer = Order {
+                busy_at_submission: busy_at_steer,
+                first_finished: first_line_with(
+                    &steered_conversation,
+                    steered_prompt,
+                    &[&steered_done, &account.reply_line],
+                ),
+                second_prompt: steering_prompt,
+                second_answered: first_line_with(
+                    &steered_conversation,
+                    steering_prompt,
+                    &[&steer_sum, &account.reply_line],
+                ),
+            };
+            check_steered(&steer)
+                .unwrap_or_else(|why| panic!("the running turn took the prompt: {why}"));
+            checker.push(json!({ "check": "steered", "wrong": "the turn finished its work", "rejected": check_steered(&Order { first_finished: Some(0), ..steer }).is_err() }));
+            checker.push(json!({ "check": "steered", "wrong": "entered with no turn running", "rejected": check_steered(&Order { busy_at_submission: false, ..steer }).is_err() }));
+            json!({ "steered": true, "order": steer })
         } else {
             json!({ "steered": false, "why": "a prompt entered during a turn waits for it, as the queued step shows" })
         };
+        assert!(
+            checker.iter().all(|control| control["rejected"] == true),
+            "the queue and steering checks reject the orders made wrong on purpose: {checker:?}"
+        );
         // The typed forms stay refused.
         let after = shown_now(stage, &logged.agent.session);
         let (offered, reads) = surface(stage, &logged.agent.session, &after);
@@ -2445,42 +2748,66 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
-            "detected": detected.as_ref().map(ToString::to_string).map_err(Clone::clone),
+            "detected": detected_evidence(&detected),
             "slash": { "typed": account.slash.input, "shows": account.slash.shows, "rows": slash.iter().filter(|row| row.contains(&account.slash.shows)).collect::<Vec<_>>() },
             "interrupt": { "key": account.interrupt.input, "shows": account.interrupt.shows, "rows": interrupted.iter().filter(|row| row.contains(&account.interrupt.shows)).collect::<Vec<_>>() },
-            "queued": { "answer": queued_sum, "rows": queued_rows.iter().filter(|row| row.contains(&queued_sum)).collect::<Vec<_>>() },
+            "queued": { "answer": queued_sum, "order": queue },
             "steering": steering,
+            "checker_controls": checker,
             "surface": offered.evidence(),
             "agent_reads": reads.iter().map(Answer::evidence).collect::<Vec<_>>(),
-            "control": { "what": "each prompt the device submitted on its own was answered", "breaks_property": false, "why_not": "the controls are the agent's own terminal keys, which only the agent could refuse" },
+            "control": { "what": "orders made wrong on purpose, which the queue and steering checks reject", "breaks_property": false, "why_not": "the controls are the agent's own terminal keys, which only the agent could refuse, so the checks are shown wrong orders instead" },
         });
-        let outcome = Outcome::passed("2a", TEST, evidence);
-        Ending::new(outcome, logged.agent.sessions())
+        Ending::new(
+            Outcome::passed("2a", TEST, evidence),
+            logged.agent.sessions(),
+        )
     });
 }
 
+/// Whether the loser of an approval race reached nothing: where the holder of the lease allowed
+/// the command and the loser denied it, the command ran exactly once.
+fn loser_reached_nothing(executions: usize) -> Result<(), String> {
+    if executions == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the command ran {executions} time(s), where the lease holder's allowing it runs it once"
+        ))
+    }
+}
+
+/// How many times the approval-gated command ran: the lines holding `mark` in its log.
+fn executions(log: &Path, mark: &str) -> usize {
+    std::fs::read_to_string(log)
+        .map(|text| text.lines().filter(|line| line.trim() == mark).count())
+        .unwrap_or(0)
+}
+
 /// KR-REQ-12.32, case 3, part 3: with the person's login, the agent raises its approval dialog for
-/// a shell command, and the paired device, holding the input lease, and the local terminal answer
-/// it at the same moment. One resolution: the command ran exactly when the device, the lease's
-/// holder, allowed it; the local terminal's input is refused as terminal input and its attachment
-/// ends with the line that says why, which is its receipt; the host announces no resource and no
-/// receipt of an approval; and after the device reconnects nothing it typed is typed again. The
-/// control breaks the property: the local terminal attaches again, takes the lease and types, and
-/// the check that nothing the loser typed reached the agent fails.
+/// a shell command that appends a marker to a log, and the paired device, holding the input lease,
+/// and the local terminal answer it at the same moment: the device allows, the local terminal
+/// denies. One resolution: the command ran exactly once, as the lease holder's answer says, so the
+/// loser's answer reached nothing; the local terminal's input is refused as terminal input and its
+/// attachment ends with the line that says why, which is its receipt; the host announces no
+/// resource; and after the device reconnects, nothing either typed is typed again: the command has
+/// still run once and no approval is pending. The control breaks the property: the local terminal
+/// attaches again and takes the lease, a second approval is raised, the local terminal denies and
+/// the device's allow is refused, and the same check fails on that command, which never ran.
 #[test]
 fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
     const TEST: &str = "a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once";
-    on_account_stage("3", |stage| {
+    on_account_stage("3", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, setup, variables) = prepare_login(stage);
         let mut logged = Logged::start(stage, &variables, "the agent's session", "3", &[], None);
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
-        let mark = nonce();
-        let target = stage.run.work().join(format!("approved-{mark}"));
+        let mark = stage.mark.to_owned();
+        let log = stage.run.work().join("approved.log");
         logged.submit(
             stage,
-            &format!("Use your shell tool to run exactly this command and nothing else: touch approved-{mark}"),
+            &format!("Use your shell tool to run exactly this command and nothing else: echo {mark} >> approved.log"),
             "an approval-gated command",
         );
         let _ = logged.wait_for(
@@ -2489,8 +2816,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "the agent asks for approval",
         );
         // The race: the local terminal denies and, at once, the device, which holds the lease,
-        // allows. The local key is written to its terminal first; which reaches the host first does
-        // not change what the lease decides.
+        // allows. The local key is written to its terminal first; the lease decides.
         logged
             .agent
             .session
@@ -2507,11 +2833,8 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             &account.composer,
             "the agent is back at its composer",
         );
-        assert!(
-            target.exists(),
-            "the command ran, as the device that holds the lease allowed: {}",
-            target.display()
-        );
+        let ran = executions(&log, &mark);
+        loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
         let snapshot = events_snapshot(
             &logged.agent.session.remote,
             stage.runtime,
@@ -2522,27 +2845,23 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
                 && snapshot.agent_resources.continue_after.0.is_none(),
             "the host announces no resource for the approval"
         );
-        // After the device reconnects, nothing it typed is typed again.
+        // After the device reconnects, nothing either typed is typed again.
         logged
             .agent
             .session
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
-        let replayed = fresh_rows(stage, &logged.agent.session);
-        let deny_on_screen = |rows: &[String]| {
-            rows.iter().any(|row| {
-                row.trim_end()
-                    .ends_with(&format!("> {}", account.approval.deny))
-            })
-        };
+        std::thread::sleep(Duration::from_secs(3));
+        let after_reconnect = executions(&log, &mark);
+        let rows = fresh_rows(stage, &logged.agent.session);
         assert!(
-            !deny_on_screen(&replayed),
-            "nothing the local terminal typed reached the agent's composer:\n{}",
-            replayed.join("\n")
+            after_reconnect == ran && !rows.iter().any(|row| row.contains(&account.approval.shows)),
+            "after the device reconnects the command has run {after_reconnect} time(s), as before, \
+             and no approval is pending:\n{}",
+            rows.join("\n")
         );
-        // The control: the local terminal attaches again, takes the lease and types a marker, and
-        // the check that nothing the loser typed reached the agent fails on it.
-        let loser_mark = format!("loser-{mark}");
+        // The control: the local terminal attaches again and holds the lease; a second approval,
+        // the local terminal denies and the device's allow is refused; the same check fails.
         let display = logged.agent.session.display.clone();
         let local = Window::open(
             stage.run,
@@ -2554,128 +2873,183 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         answered(&local, local.answer_capability_queries(0));
         std::thread::sleep(Duration::from_millis(500));
-        local.type_text(loser_mark.as_bytes());
-        let reached = fresh_rows(stage, &logged.agent.session)
-            .iter()
-            .any(|row| row.contains(&loser_mark));
-        local.type_text(account.clear.as_bytes());
+        let second = format!("{mark}-2");
+        let _ = stage
+            .login
+            .expect("a part with a login")
+            .ledger
+            .charge("3", "the control's second approval")
+            .unwrap_or_else(|why| panic!("{why}"));
+        logged.turns += 1;
+        local.type_text(
+            format!("Use your shell tool to run exactly this command and nothing else: echo {second} >> approved.log").as_bytes(),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        local.type_text(account.submit.as_bytes());
+        let _ = local.wait_for_screen(
+            &account.approval.shows,
+            "the agent asks for the second approval",
+        );
+        local.type_text(account.approval.deny.as_bytes());
+        let device_refused = logged
+            .keyboard
+            .type_text(
+                &logged.agent.session.remote,
+                stage.runtime,
+                &account.approval.allow,
+            )
+            .err()
+            .map(|refusal| refusal.detail);
+        let _ = local.wait_for_screen(
+            &account.composer,
+            "the agent is back at its composer after the denial",
+        );
+        let control = loser_reached_nothing(executions(&log, &second));
         assert!(
-            reached,
-            "the loser's input reaches the agent once it holds the lease, so the check can fail"
+            control.is_err() && device_refused.is_some(),
+            "the check fails once the other side holds the lease: {control:?}, the device's answer {device_refused:?}"
         );
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
-            "detected": detected.as_ref().map(ToString::to_string).map_err(Clone::clone),
-            "winner": { "who": "the paired device, which held the input lease", "typed": account.approval.allow, "command_ran": target.exists() },
+            "detected": detected_evidence(&detected),
+            "winner": { "who": "the paired device, which held the input lease", "typed": account.approval.allow },
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": receipt.iter().filter(|row| row.contains("input lease")).collect::<Vec<_>>(), "exit_status": local_status },
+            "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
             "resources": snapshot.agent_resources.resources.len(),
-            "after_reconnect": { "loser_input_on_screen": deny_on_screen(&replayed) },
-            "control": { "what": "the local terminal attached again, took the lease and typed a marker", "breaks_property": true, "marker_reached_the_agent": reached },
+            "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
         });
-        let outcome = Outcome::passed("3", TEST, evidence);
         Ending {
-            outcome,
+            outcome: Outcome::passed("3", TEST, evidence),
             sessions: logged.agent.sessions(),
             replacement: None,
-            marks: vec![mark],
             windows: vec![local],
         }
     });
 }
 
+/// Whether a conversation holds one prompt and one finished reply for it.
+fn once(prompts: usize, replies: usize) -> Result<(), String> {
+    if prompts == 1 && replies == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the conversation holds {prompts} prompt(s) and {replies} finished reply(s)"
+        ))
+    }
+}
+
 /// KR-REQ-12.32, case 4, part 4: with the person's login, the device sends a prompt that asks for a
-/// slow reply, and drops its connection once the agent's own conversation records the prompt and
-/// before the reply is complete. A new connection is drawn one reply; the conversation holds the
-/// prompt once and one reply to it; the old attachment's next input is refused; and the identities
-/// the device reconciles with are recorded. The control breaks the property: the same prompt sent
-/// again, and the count of the work is two.
+/// reply beginning and ending with markers. The moment the agent's own conversation records the
+/// prompt, and while nothing of the reply has reached the device, the device drops both its
+/// connections; the part stops there, before another turn, if the reply had already reached it. The
+/// reply finishes while the device is away. A new connection is drawn the reply; the old
+/// attachment's next input is refused; and the conversation that holds the prompt holds it once
+/// with one finished reply, counted again after reconnecting. The identities the device reconciles
+/// with are recorded. The control breaks the property: the same prompt sent again, and the same
+/// count, read again, is two.
 #[test]
 fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplicate_work() {
     const TEST: &str =
         "a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplicate_work";
-    on_account_stage("4", |stage| {
+    on_account_stage("4", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
         let mut logged = Logged::start(stage, &variables, "the agent's session", "4", &[], None);
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
         let conversations = login_home(stage).join(&account.conversations);
-        let mark = nonce();
-        let (question, sum) = sum_question();
+        let mark = stage.mark.to_owned();
+        let upper = mark.to_uppercase();
+        let (begin, end) = (format!("{upper}-START"), format!("{upper}-END"));
         let prompt = format!(
-            "Count from 1 to 60, one number per line. Then answer this: {question} ({mark})"
+            "Begin your reply with the code {mark} in upper case followed by -START, then count \
+             from 1 to 60, one number per line, then write the same code in upper case followed by \
+             -END, and nothing else."
         );
         logged.submit(stage, &prompt, "a prompt with a slow reply");
         // The agent's own record of the prompt is its admission.
         let admitted_at = std::time::Instant::now();
-        let admitted = loop {
-            let lines = conversation_lines(&conversations, &mark, &account.prompt_line);
-            if !lines.is_empty() {
-                break lines;
+        let conversation = loop {
+            if let Some(file) = conversation_of(&conversations, &mark, &account.prompt_line) {
+                break file;
             }
             assert!(
                 admitted_at.elapsed() < LIVENESS,
                 "the agent's conversation records the prompt under {}",
                 conversations.display()
             );
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         };
-        let replied_before = conversation_lines(&conversations, &sum, &account.reply_line);
+        // Nothing of the reply may have reached the device before it goes.
+        logged.screen.pump(stage, Duration::from_millis(1));
+        let reached = logged
+            .screen
+            .view
+            .rows()
+            .iter()
+            .any(|row| row.contains(&begin));
         let old = (
             logged.keyboard.attachment_id(),
             logged.keyboard.epoch(),
             logged.keyboard.next_sequence(),
         );
-        // The disconnection, once the prompt is the agent's and before its reply is: both of the
-        // device's connections, the one that typed and the one that watched.
         logged.agent.session.remote.close();
         logged.screen.remote.close();
-        // The reply completes while the device is away.
+        let count = |file: &Path| {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let prompts = text
+                .lines()
+                .filter(|line| line.contains(&mark) && line.contains(&account.prompt_line))
+                .count();
+            let replies = text
+                .lines()
+                .filter(|line| line.contains(&end) && line.contains(&account.reply_line))
+                .count();
+            (prompts, replies)
+        };
+        if reached {
+            let evidence = json!({
+                "account": account_evidence(stage, logged.turns),
+                "conversation": conversation_id(&conversation),
+                "boundary": "the reply's first words reached the device before the agent's conversation recorded the prompt",
+            });
+            return Ending::new(
+                Outcome::not_run(
+                    "4",
+                    TEST,
+                    "the reply reached the device before the agent recorded the prompt, so no moment between them was shown",
+                    evidence,
+                ),
+                logged.agent.sessions(),
+            );
+        }
+        // The reply finishes while the device is away.
         let replied_at = std::time::Instant::now();
-        let replies = loop {
-            let lines = conversation_lines(&conversations, &sum, &account.reply_line);
-            if !lines.is_empty() {
-                break lines;
-            }
+        while count(&conversation).1 == 0 {
             assert!(
                 replied_at.elapsed() < LIVENESS,
-                "the agent replies while the device is away"
+                "the agent finishes its reply while the device is away"
             );
             std::thread::sleep(Duration::from_millis(200));
-        };
+        }
         logged
             .agent
             .session
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
         logged.screen = Watch::open(stage, &logged.agent.session);
-        let redrawn = fresh_rows(stage, &logged.agent.session);
-        let prompts = conversation_lines(&conversations, &mark, &account.prompt_line);
-        let count =
-            |lines: &[(PathBuf, usize)]| lines.iter().map(|(_, count)| count).sum::<usize>();
-        assert_eq!(
-            count(&prompts),
-            1,
-            "the conversation holds the prompt once: {prompts:?}"
-        );
-        assert_eq!(
-            count(&replies),
-            1,
-            "the conversation holds one reply to it: {replies:?}"
-        );
-        assert!(
-            redrawn.iter().any(|row| row.contains(&sum)),
-            "the new connection is drawn the reply:\n{}",
-            redrawn.join("\n")
-        );
+        let redrawn = logged.wait_for(stage, &end, "the new connection is drawn the reply");
+        let (prompts, replies) = count(&conversation);
+        once(prompts, replies)
+            .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
         // The old attachment's next input, on the new connection, is refused.
         let stale =
             logged
                 .keyboard
                 .type_text(&logged.agent.session.remote, stage.runtime, &account.clear);
         assert!(stale.is_err(), "the old attachment's next input is refused");
-        // The control: the same prompt sent again, and the work is counted twice.
+        // The control: the same prompt sent again, and the count, read again, is two.
         let mut fresh = keyboard(stage, &logged.agent.session);
         let _ = stage
             .login
@@ -2692,64 +3066,53 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             .type_text(&logged.agent.session.remote, stage.runtime, &account.submit)
             .unwrap_or_else(|why| panic!("{why}"));
         let again_at = std::time::Instant::now();
-        let twice = loop {
-            let lines = conversation_lines(&conversations, &mark, &account.prompt_line);
-            if count(&lines) >= 2 {
-                break lines;
-            }
+        while count(&conversation).1 < 2 {
             assert!(
                 again_at.elapsed() < LIVENESS,
-                "the prompt sent again is recorded"
+                "the prompt sent again is answered"
             );
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        let conversation = admitted.first().map(|(file, _)| conversation_id(file));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (prompts_twice, replies_twice) = count(&conversation);
+        let control = once(prompts_twice, replies_twice);
+        assert!(
+            control.is_err(),
+            "the count fails once the prompt is sent again"
+        );
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
-            "detected": detected.as_ref().map(ToString::to_string).map_err(Clone::clone),
-            "admission": { "conversation": conversation, "prompt_lines": count(&admitted), "reply_lines_before_disconnecting": count(&replied_before) },
+            "detected": detected_evidence(&detected),
+            "conversation": conversation_id(&conversation),
+            "admission": "the agent's conversation held the prompt, and nothing of the reply had reached the device, when it disconnected",
             "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
-            "after_reconnect": { "prompt_lines": count(&prompts), "reply_lines": count(&replies) },
-            "control": { "what": "the same prompt sent again", "breaks_property": true, "prompt_lines": count(&twice) },
+            "after_reconnect": { "prompts": prompts, "finished_replies": replies, "rows": redrawn.iter().filter(|row| row.contains(&end)).collect::<Vec<_>>() },
+            "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
         });
-        let outcome = if count(&replied_before) != 0 {
-            Outcome::not_run(
-                "4",
-                TEST,
-                "the agent's conversation held the reply by the time it held the prompt, so no moment between them was shown",
-                evidence,
-            )
-        } else {
-            Outcome::passed("4", TEST, evidence)
-        };
-        Ending {
-            outcome,
-            sessions: logged.agent.sessions(),
-            replacement: None,
-            marks: vec![mark],
-            windows: Vec::new(),
-        }
+        Ending::new(
+            Outcome::passed("4", TEST, evidence),
+            logged.agent.sessions(),
+        )
     });
 }
 
 /// KR-REQ-12.32, case 7, part 7: with the person's login, session A holds a conversation with a
 /// marker, and session B resumes the same saved conversation with the agent's resume command and
-/// answers from it. The host keeps them apart as two live executions: two instances where it
-/// detects the agent, marked input to one never reaching the other, and A's binding revision as it
-/// was. The record names the conversation and each execution's process. The control breaks the
-/// property: B's marker typed into A's session, and the isolation check fails on it.
+/// answers from it. The host keeps them apart as two live executions: it detects each launch as
+/// its own instance, marked input to one never reaches the other, and A's binding revision stays as
+/// it was. The record names the conversation and each execution's processes. The control breaks
+/// the property: B's marker typed into A's session, and the isolation check fails on it.
 #[test]
 fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged() {
     const TEST: &str =
         "a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged";
-    on_account_stage("7", |stage| {
+    on_account_stage("7", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
         let conversations = login_home(stage).join(&account.conversations);
         let mut first = Logged::start(stage, &variables, "session A", "7", &[], None);
         let shown_first = detect(stage, &first.agent.session);
-        let mark = nonce();
+        let mark = stage.mark.to_owned();
         let (question, sum) = sum_question();
         first.submit(
             stage,
@@ -2762,13 +3125,11 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &account.composer,
             "session A is back at its composer",
         );
-        let held = conversation_lines(&conversations, &mark, &account.prompt_line);
-        let conversation = held
-            .first()
-            .map(|(file, _)| conversation_id(file))
+        let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
+            .map(|file| conversation_id(&file))
             .unwrap_or_else(|| {
                 panic!(
-                    "a conversation under {} holds the code",
+                    "one conversation under {} holds the code",
                     conversations.display()
                 )
             });
@@ -2797,18 +3158,12 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &upper,
             "session B answers from the saved conversation",
         );
-        // Two executions, kept apart.
-        let first_instance = shown_first
-            .detection
-            .only()
-            .map(|instance| instance.application_instance_id);
-        let second_instance = shown_second
-            .detection
-            .only()
-            .map(|instance| instance.application_instance_id);
-        if first_instance.is_some() || second_instance.is_some() {
+        // Two executions, each detected on its own, kept apart.
+        let detected_first = check_detected(&launched(stage, &first.agent), &shown_first);
+        let detected_second = check_detected(&launched(stage, &second.agent), &shown_second);
+        if let (Ok(a), Ok(b)) = (&detected_first, &detected_second) {
             assert_ne!(
-                first_instance, second_instance,
+                a.instance, b.instance,
                 "the two executions are two instances"
             );
         }
@@ -2842,20 +3197,35 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         );
         first.type_text(stage, &account.clear);
         second.type_text(stage, &account.clear);
+        let owners = |logged: &Logged| {
+            logged
+                .agent
+                .every_process()
+                .iter()
+                .map(|process| json!({ "pid": process.identity.pid.get(), "command": process.command }))
+                .collect::<Vec<_>>()
+        };
         let evidence = json!({
             "account": account_evidence(stage, first.turns + second.turns),
             "conversation": conversation,
-            "session_a": { "detection": shown_first.detection.evidence(), "processes": first.agent.every_process().iter().map(|process| json!({"pid": process.identity.pid.get(), "command": process.command})).collect::<Vec<_>>() },
-            "session_b": { "detection": shown_second.detection.evidence(), "processes": second.agent.every_process().iter().map(|process| json!({"pid": process.identity.pid.get(), "command": process.command})).collect::<Vec<_>>(), "resumed_with": resume },
+            "session_a": { "detection": shown_first.detection.evidence(), "detected": detected_evidence(&detected_first), "owners": owners(&first) },
+            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume },
             "control": { "what": "session B's marker typed into session A", "breaks_property": true, "isolated": control },
         });
-        let detected = check_detected(&launched(stage, &first.agent), &shown_first);
-        let outcome = match detected {
-            Ok(_) => Outcome::passed("7", TEST, evidence),
-            Err(why) => Outcome::failed(
+        let outcome = match (&detected_first, &detected_second) {
+            (Ok(_), Ok(_)) => Outcome::passed("7", TEST, evidence),
+            (first_result, second_result) => Outcome::failed(
                 "7",
                 TEST,
-                &format!("the host did not detect the manual launch as section 12 requires: {why}"),
+                &format!(
+                    "the host did not detect each launch as section 12 requires: A {}, B {}",
+                    first_result
+                        .as_ref()
+                        .map_or_else(Clone::clone, |_| "detected".to_owned()),
+                    second_result
+                        .as_ref()
+                        .map_or_else(Clone::clone, |_| "detected".to_owned())
+                ),
                 evidence,
             ),
         };
@@ -2865,7 +3235,6 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             outcome,
             sessions,
             replacement: None,
-            marks: vec![mark],
             windows: Vec::new(),
         }
     });

@@ -3,10 +3,10 @@
 //! login keychain a run's own home searches, and what a part changed in the person's own agent
 //! directories.
 //!
-//! None of it reads a credential into this process except the one variable a login is, which is
-//! taken from this process's environment, given to the agent's session only, and never written or
-//! printed here: where it ended up is found by searching the run's own files for its bytes, and
-//! only the paths are recorded.
+//! None of it reads a credential into this process except the one variable a login is, whose value
+//! the harness hands over on a pipe ([`key_from_descriptor`]); it is given to the agent's session
+//! only, and never written or printed here: where it ended up is found by searching the run's own
+//! files for its bytes, and only the paths are recorded.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -62,9 +62,16 @@ impl Ledger {
     }
 
     /// The turns charged to the budget so far.
-    #[must_use]
-    pub fn spent(&self) -> u64 {
-        u64::try_from(self.entries().len()).unwrap_or(u64::MAX)
+    ///
+    /// # Errors
+    ///
+    /// Returns why the ledger could not be read: an unreadable ledger is not an empty one.
+    pub fn spent(&self) -> Result<u64, String> {
+        let ledger = read_ledger(&self.path)?;
+        let entries = ledger["budgets"][&self.budget]
+            .as_array()
+            .map_or(0, Vec::len);
+        Ok(u64::try_from(entries).unwrap_or(u64::MAX))
     }
 
     /// The most turns the budget allows.
@@ -106,13 +113,6 @@ impl Ledger {
         .and_then(|()| std::fs::rename(&next, &self.path))
         .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
         Ok(spent + 1)
-    }
-
-    fn entries(&self) -> Vec<Value> {
-        read_ledger(&self.path)
-            .ok()
-            .and_then(|ledger| ledger["budgets"][&self.budget].as_array().cloned())
-            .unwrap_or_default()
     }
 }
 
@@ -191,52 +191,90 @@ pub struct KeyHolder {
     pub modified_ms: Option<u64>,
 }
 
-/// Every regular file under `root` that holds `value`, by path relative to `root`. Nothing of the
-/// value is returned or printed.
+/// What a search of a run's directory for a key's bytes found: every regular file that held them,
+/// by path relative to the directory, and every entry the search could not read, which leaves the
+/// search incomplete. Nothing of the value is kept.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct KeyScan {
+    /// The files that held the value.
+    pub held_by: Vec<KeyHolder>,
+    /// The entries that could not be read, with why.
+    pub unread: Vec<String>,
+}
+
+impl KeyScan {
+    /// Whether every entry was read.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.unread.is_empty()
+    }
+}
+
+/// Searches every regular file under `root` for `value`, and returns where it was and what could
+/// not be read. Nothing of the value is returned or printed.
 ///
 /// # Panics
 ///
-/// Panics when `value` is shorter than eight bytes, which would find anything, or the directory
-/// cannot be walked, which would leave a copy unfound.
+/// Panics when `value` is shorter than eight bytes, which would find anything.
 #[must_use]
-pub fn files_holding(root: &Path, value: &[u8]) -> Vec<KeyHolder> {
+pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
     assert!(
         value.len() >= 8,
         "a key shorter than eight bytes cannot be searched for"
     );
-    let mut found = Vec::new();
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    let mut scan = KeyScan::default();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                scan.unread
+                    .push(format!("{}: {error}", relative(&directory)));
                 continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan.unread
+                        .push(format!("{}: {error}", relative(&directory)));
+                    continue;
+                }
             };
             let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    scan.unread.push(format!("{}: {error}", relative(&path)));
+                    continue;
+                }
+            };
             if kind.is_dir() {
                 pending.push(path);
                 continue;
             }
+            // A link, a socket or a pipe holds no bytes of its own to search.
             if !kind.is_file() {
                 continue;
             }
-            let Ok(mut file) = std::fs::File::open(&path) else {
-                continue;
-            };
             let mut bytes = Vec::new();
-            if file.read_to_end(&mut bytes).is_err() {
+            if let Err(error) =
+                std::fs::File::open(&path).and_then(|mut file| file.read_to_end(&mut bytes))
+            {
+                scan.unread.push(format!("{}: {error}", relative(&path)));
                 continue;
             }
             if bytes.windows(value.len()).any(|window| window == value) {
                 let metadata = entry.metadata().ok();
-                found.push(KeyHolder {
-                    path: path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .display()
-                        .to_string(),
+                scan.held_by.push(KeyHolder {
+                    path: relative(&path),
                     bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                     created_ms: metadata.as_ref().and_then(|meta| ms_of(meta.created())),
                     modified_ms: metadata.as_ref().and_then(|meta| ms_of(meta.modified())),
@@ -244,24 +282,19 @@ pub fn files_holding(root: &Path, value: &[u8]) -> Vec<KeyHolder> {
             }
         }
     }
-    found.sort_by(|left, right| left.path.cmp(&right.path));
-    found
+    scan.held_by
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    scan
 }
 
 /// Appends one line to the key-scan file the harness named: the part, the variable by its name,
-/// every file of the run that held its value, when the run's directory was removed, and whether it
-/// is gone. Nothing of the value is written.
+/// every file of the run that held its value and what could not be read, when the run's directory
+/// was removed, and whether it is gone. Nothing of the value is written.
 ///
 /// # Panics
 ///
 /// Panics when the harness named a file that cannot be written.
-pub fn record_key_scan(
-    part: &str,
-    variable: &str,
-    holders: &[KeyHolder],
-    removed_ms: u64,
-    gone: bool,
-) {
+pub fn record_key_scan(part: &str, variable: &str, scan: &KeyScan, removed_ms: u64, gone: bool) {
     let Some(path) = std::env::var_os(KEY_SCAN_VARIABLE)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -271,7 +304,9 @@ pub fn record_key_scan(
     let mut line = serde_json::to_vec(&json!({
         "part": part,
         "variable": variable,
-        "held_by": holders,
+        "held_by": scan.held_by,
+        "unread": scan.unread,
+        "complete": scan.complete(),
         "run_removed_ms": removed_ms,
         "run_gone": gone,
     }))
@@ -283,6 +318,37 @@ pub fn record_key_scan(
         .open(&path)
         .and_then(|mut file| file.write_all(&line))
         .unwrap_or_else(|error| panic!("the key-scan file {}: {error}", path.display()));
+}
+
+/// The variable naming the file descriptor the harness passes a login's value on: a pipe, so the
+/// value is in no file and in no process's environment until the agent's session is given it.
+pub const KEY_DESCRIPTOR_VARIABLE: &str = "KR_AGENTS_KEY_FD";
+
+/// Reads a login's value from the descriptor [`KEY_DESCRIPTOR_VARIABLE`] names, to its end, trimmed
+/// of its line end. The pipe is empty afterwards, so a program that inherits the descriptor reads
+/// nothing from it.
+///
+/// # Errors
+///
+/// Returns why there is no value: no descriptor named, or nothing on it.
+pub fn key_from_descriptor() -> Result<String, String> {
+    let named = std::env::var(KEY_DESCRIPTOR_VARIABLE)
+        .map_err(|_| format!("{KEY_DESCRIPTOR_VARIABLE} names no descriptor"))?;
+    let descriptor: u32 = named
+        .parse()
+        .map_err(|_| format!("{KEY_DESCRIPTOR_VARIABLE} is not a descriptor"))?;
+    let mut value = String::new();
+    std::fs::File::open(format!("/dev/fd/{descriptor}"))
+        .and_then(|mut file| file.read_to_string(&mut value))
+        .map_err(|error| format!("descriptor {descriptor}: {error}"))?;
+    let value = value.trim_end_matches(['\n', '\r']).to_owned();
+    if value.len() < 8 {
+        return Err(format!(
+            "descriptor {descriptor} carried {} bytes, too few for a key",
+            value.len()
+        ));
+    }
+    Ok(value)
 }
 
 /// Makes a run's home search the person's login keychain and name it its default: the same list
@@ -373,6 +439,7 @@ struct Entry {
 pub struct Snapshot {
     roots: Vec<PathBuf>,
     files: BTreeMap<PathBuf, Entry>,
+    directories: std::collections::BTreeSet<PathBuf>,
     hash_limit: u64,
 }
 
@@ -381,6 +448,7 @@ pub struct Snapshot {
 #[must_use]
 pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapshot {
     let mut files = BTreeMap::new();
+    let mut seen_directories = std::collections::BTreeSet::new();
     let roots: Vec<PathBuf> = directories
         .iter()
         .map(|relative| home.join(relative))
@@ -395,6 +463,7 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
                 if let Ok(entries) = std::fs::read_dir(&path) {
                     pending.extend(entries.flatten().map(|entry| entry.path()));
                 }
+                seen_directories.insert(path);
                 continue;
             }
             if !metadata.is_file() {
@@ -418,6 +487,7 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
     Snapshot {
         roots,
         files,
+        directories: seen_directories,
         hash_limit,
     }
 }
@@ -485,26 +555,31 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
     changes
 }
 
-/// Removes each file the part created that holds one of `marks` (the part's own prompt marker, or
-/// the run's own directory, which the agent writes as the working directory), and then each
-/// directory the part created that is left empty; returns what it removed and what it left.
-/// Nothing that existed before the part is touched.
+/// Removes each file the part created, inside the snapshot's roots, that holds one of `marks`
+/// (the part's own marker, or the run's own directory, which the agent writes as the working
+/// directory), and then each directory the part created there that is left empty; returns what it
+/// removed and what it left. Nothing that existed before the part, a file or a directory, is
+/// touched.
 #[must_use]
 pub fn remove_created(
     before: &Snapshot,
     changes: &Changes,
     marks: &[&str],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let inside = |path: &Path| before.roots.iter().any(|root| path.starts_with(root));
     let mut removed = Vec::new();
     let mut left = Vec::new();
     for path in &changes.created {
-        let ours = std::fs::read(path).is_ok_and(|bytes| {
-            marks.iter().any(|mark| {
-                bytes
-                    .windows(mark.len())
-                    .any(|window| window == mark.as_bytes())
-            })
-        });
+        let new =
+            inside(path) && !before.files.contains_key(path) && !before.directories.contains(path);
+        let ours = new
+            && std::fs::read(path).is_ok_and(|bytes| {
+                marks.iter().any(|mark| {
+                    bytes
+                        .windows(mark.len())
+                        .any(|window| window == mark.as_bytes())
+                })
+            });
         if ours && std::fs::remove_file(path).is_ok() {
             removed.push(path.clone());
         } else {
@@ -520,8 +595,7 @@ pub fn remove_created(
                 .map(Path::to_path_buf)
                 .collect::<Vec<_>>()
         })
-        .filter(|directory| before.roots.iter().any(|root| directory.starts_with(root)))
-        .filter(|directory| !before.files.keys().any(|file| file.starts_with(directory)))
+        .filter(|directory| inside(directory) && !before.directories.contains(directory))
         .collect();
     directories.sort();
     directories.dedup();
@@ -601,12 +675,34 @@ mod tests {
             again.charge("1", "third").is_err(),
             "the third passes the limit"
         );
-        assert_eq!(again.spent(), 2, "a refused charge is not recorded");
+        assert_eq!(again.spent(), Ok(2), "a refused charge is not recorded");
         let other = Ledger {
             budget: "another".to_owned(),
             ..again
         };
         assert_eq!(other.charge("2a", "its own budget"), Ok(1));
+    }
+
+    #[test]
+    fn an_unreadable_ledger_is_neither_charged_nor_counted_as_empty() {
+        let scratch = Scratch::new("unreadable");
+        let path = scratch.0.join("turns.json");
+        std::fs::write(&path, "{ not a ledger").expect("a broken ledger");
+        let ledger = Ledger {
+            path: path.clone(),
+            budget: "agent".to_owned(),
+            limit: 2,
+        };
+        assert!(ledger.spent().is_err(), "a broken ledger has no count");
+        assert!(
+            ledger.charge("1", "first").is_err(),
+            "a broken ledger takes no charge"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the ledger"),
+            "{ not a ledger",
+            "a refused charge leaves the ledger as it was"
+        );
     }
 
     #[test]
@@ -639,11 +735,14 @@ mod tests {
         let home = &scratch.0;
         let agent = home.join(".agent");
         std::fs::create_dir_all(agent.join("kept")).expect("the agent's directory");
+        std::fs::create_dir_all(agent.join("empty")).expect("an empty directory");
         std::fs::write(agent.join("kept").join("old"), "the person's").expect("an old file");
         let directories = vec![".agent".to_owned()];
         let before = snapshot(home, &directories, 1 << 20);
         let ours = agent.join("sessions").join("day");
         std::fs::create_dir_all(&ours).expect("a new directory");
+        std::fs::write(agent.join("empty").join("ours"), "kr0123")
+            .expect("ours in an old directory");
         std::fs::write(ours.join("ours.jsonl"), "prompt kr0123").expect("our conversation");
         std::fs::write(agent.join("kept").join("theirs"), "someone else's").expect("another file");
         let after = snapshot(home, &directories, 1 << 20);
@@ -663,8 +762,16 @@ mod tests {
         );
         assert!(agent.join("kept").join("old").exists(), "an old file stays");
         assert!(agent.exists(), "the agent's own directory stays");
+        assert!(
+            agent.join("kept").exists(),
+            "a directory that was there stays"
+        );
         assert_eq!(left, vec![agent.join("kept").join("theirs")]);
         assert!(removed.contains(&ours.join("ours.jsonl")));
+        assert!(
+            agent.join("empty").is_dir() && !agent.join("empty").join("ours").exists(),
+            "an empty directory that was there stays when the file the part put in it goes"
+        );
     }
 
     #[test]
