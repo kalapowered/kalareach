@@ -420,9 +420,21 @@ impl Registration {
     ///
     /// One `name=value` line each, so the `kr-hook` forwarder can read it without a parser. There
     /// is nothing secret in it: the credential line names the file the secret is in.
+    ///
+    /// A worker of an installed release adds a `release` line naming it: an application's own
+    /// settings may start the forwarder an update has made current since this worker started, and
+    /// that forwarder reads which release the session it serves runs.
     #[must_use]
     pub fn to_file(&self) -> String {
-        format!(
+        let release = kr_ipc::install::this_process()
+            .ok()
+            .and_then(kr_ipc::install::Running::release);
+        self.to_file_of(release)
+    }
+
+    /// Renders the registration as [`Self::to_file`] does, for a worker of `release`.
+    fn to_file_of(&self, release: Option<&kr_protocol::update::ReleaseName>) -> String {
+        let mut file = format!(
             "endpoint={}\nprofile={}\ninstance={}\npid={}\nstart={}\ncredential={}\n",
             self.address.for_diagnostics(),
             self.profile_id,
@@ -430,7 +442,11 @@ impl Registration {
             self.expected_process.pid,
             self.expected_process.start_value,
             self.credential.display(),
-        )
+        );
+        if let Some(release) = release {
+            file.push_str(&format!("release={release}\n"));
+        }
+        file
     }
 }
 
@@ -627,6 +643,24 @@ mod tests {
                 .authenticate(&recycled, &endpoint_peer(process(41, 901)), &managed)
                 .is_err()
         );
+    }
+
+    /// A worker of an installed release names it in every registration, on a line of its own, and
+    /// one outside a store names none.
+    #[test]
+    fn a_registration_names_the_release_its_worker_runs() {
+        let release =
+            kr_protocol::update::ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release");
+        let file = registration().to_file_of(Some(&release));
+        assert!(file.contains("\nrelease=0.2.0+4254aa6e62e5\n"), "{file}");
+        assert_eq!(
+            file.lines()
+                .filter(|line| line.starts_with("release="))
+                .count(),
+            1
+        );
+        // The control: this test runs outside any store, so its own registration names none.
+        assert!(!registration().to_file().contains("release="));
     }
 
     #[test]

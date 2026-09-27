@@ -47,11 +47,13 @@ use kr_worker::session::SessionConfig;
 /// What `--version` says: the release, and the protocol package version this build speaks.
 ///
 /// Two builds of one release can speak different protocol versions, and a client refuses a worker
-/// of another one, so the answer names both.
+/// of another one, so the answer names both. A worker of an installed release names that release.
 static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let release = kr_ipc::install::this_process().map_or(env!("CARGO_PKG_VERSION"), |running| {
+        running.stated_release(env!("CARGO_PKG_VERSION"))
+    });
     format!(
-        "{} (protocol {})",
-        env!("CARGO_PKG_VERSION"),
+        "{release} (protocol {})",
         kr_protocol::hello::PACKAGE_VERSION
     )
 });
@@ -87,6 +89,12 @@ struct Arguments {
 }
 
 fn main() -> ExitCode {
+    // First: a worker of an installed release holds that release for as long as it runs, which is
+    // for as long as its session does, and does not start at all once the release is being removed.
+    if let Err(error) = kr_ipc::install::this_process() {
+        eprintln!("kr-worker: {error}");
+        return ExitCode::FAILURE;
+    }
     let arguments = Arguments::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

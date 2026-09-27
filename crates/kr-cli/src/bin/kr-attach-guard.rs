@@ -41,6 +41,12 @@ struct Arguments {
 }
 
 fn main() -> ExitCode {
+    // The guard is started by a `kr` of its own release and holds that release too, as every
+    // program of an installed release does. One whose release is being removed does not start, and
+    // the attach that started it reports the guard it did not get.
+    if kr_ipc::install::this_process().is_err() {
+        return ExitCode::FAILURE;
+    }
     let arguments = Arguments::parse();
     let Ok(saved) = SavedModes::decode(&arguments.modes) else {
         return ExitCode::FAILURE;

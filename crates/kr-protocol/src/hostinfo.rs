@@ -5000,7 +5000,9 @@ pub mod export {
 
     /// Which program is running, and which build of it.
     ///
-    /// `kr-controller/0.1.0` is one. A support bundle names it in full, because which build is
+    /// `kr-controller/0.1.0` is one, and so is `kr-controller/0.1.0+4254aa6e62e5`, the form a
+    /// program of an installed release states: its release's three numbers and the first twelve
+    /// hexadecimal digits of its commit. A support bundle names it in full, because which build is
     /// running is the first thing somebody reading one needs and a length would tell them nothing.
     ///
     /// What the parse establishes is a shape, not a build. The text reaches the command that
@@ -5008,9 +5010,10 @@ pub mod export {
     /// it, and the parse does not change that: `kr-controller/123456.7.8` parses and renders as
     /// itself, so the reply still chooses the three numbers, and a bundle names the build the
     /// daemon reported rather than proving which one is installed. What the shape does establish
-    /// is that nothing else gets in: what is stored is a word out of [`BuildComponent`] and three
-    /// numbers of at most nine digits, and what is rendered is composed from those, with no
-    /// borrowed substring anywhere in it. A version that is anything but three numbers, and a
+    /// is that nothing else gets in: what is stored is a word out of [`BuildComponent`], three
+    /// numbers of at most nine digits and, where there is one, a commit of exactly twelve
+    /// lower-case hexadecimal digits held as a number, and what is rendered is composed from
+    /// those, with no borrowed substring anywhere in it. A version that is anything but three numbers, and a
     /// component that is not one this product builds, fail the parse and leave as their class
     /// and their length like any other name. There is deliberately no accessor returning the text
     /// that was parsed.
@@ -5020,6 +5023,8 @@ pub mod export {
         major: u32,
         minor: u32,
         patch: u32,
+        /// The first twelve hexadecimal digits of the release's commit, as a number.
+        commit: Option<u64>,
     }
 
     impl BuildIdentity {
@@ -5028,6 +5033,10 @@ pub mod export {
         pub fn parse(text: &str) -> Option<Self> {
             let (component, version) = text.split_once('/')?;
             let component = BuildComponent::named(component)?;
+            let (version, commit) = match version.split_once('+') {
+                Some((version, commit)) => (version, Some(commit_part(commit)?)),
+                None => (version, None),
+            };
             let mut parts = version.split('.');
             let major = version_part(parts.next()?)?;
             let minor = version_part(parts.next()?)?;
@@ -5040,6 +5049,7 @@ pub mod export {
                 major,
                 minor,
                 patch,
+                commit,
             })
         }
 
@@ -5048,6 +5058,16 @@ pub mod export {
         pub const fn component(&self) -> BuildComponent {
             self.component
         }
+    }
+
+    /// Reads a release's commit: exactly twelve lower-case hexadecimal digits.
+    fn commit_part(text: &str) -> Option<u64> {
+        (text.len() == 12
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then(|| u64::from_str_radix(text, 16).ok())
+        .flatten()
     }
 
     /// Reads one part of a version: digits, and few enough of them to be a version.
@@ -5069,7 +5089,11 @@ pub mod export {
                 self.major,
                 self.minor,
                 self.patch
-            )
+            )?;
+            match self.commit {
+                Some(commit) => write!(formatter, "+{commit:012x}"),
+                None => Ok(()),
+            }
         }
     }
 
@@ -6321,7 +6345,13 @@ mod tests {
     /// not a build identity and never becomes one by arriving in the field for one.
     #[test]
     fn a_build_identity_is_the_one_shape_that_may_be_named_in_full() {
-        for named in ["kr/0.1.0", "kr-controller/0.1.0", "kr-worker/12.3.456"] {
+        for named in [
+            "kr/0.1.0",
+            "kr-controller/0.1.0",
+            "kr-worker/12.3.456",
+            "kr-worker/0.2.0+4254aa6e62e5",
+            "kr-controller/1.0.0+000000000000",
+        ] {
             let build = export::BuildIdentity::parse(named)
                 .unwrap_or_else(|| panic!("{named} is a build identity"));
             assert_eq!(export::Sentence::new().identifier(&build).render(), named);
@@ -6352,6 +6382,15 @@ mod tests {
             "Bearer aGVsbG8gdGhlcmU",
             "/home/someone/.config/kalareach/config.json",
             "kr/0.1.0+\u{e9}",
+            // A release's commit is exactly twelve lower-case hexadecimal digits, and nothing
+            // spelled around it gets in with it.
+            "kr-worker/0.2.0+4254AA6E62E5",
+            "kr-worker/0.2.0+4254aa6e62e",
+            "kr-worker/0.2.0+4254aa6e62e5a",
+            "kr-worker/0.2.0+4254aa6e62e5+4254aa6e62e5",
+            "kr-worker/0.2.0+4254aa6e62g5",
+            "kr-worker/0.2+4254aa6e62e5",
+            "kr-worker/+4254aa6e62e5",
         ] {
             assert!(
                 export::BuildIdentity::parse(refused).is_none(),

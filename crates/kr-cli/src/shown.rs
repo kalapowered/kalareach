@@ -205,23 +205,30 @@ pub struct BuildName(String);
 const BUILD_NAME_LIMIT: usize = 64;
 
 /// Returns what a build identifier says: the identifier when it is a program's name and a release,
-/// such as `kr-worker/0.1.0`, and that it is not one otherwise. A worker states its own, so any
-/// other text is replaced rather than repeated.
+/// such as `kr-worker/0.1.0` or, for a program of an installed release, `kr-worker/0.1.0+4254aa6e62e5`,
+/// and that it is not one otherwise. A worker states its own, so any other text is replaced rather
+/// than repeated.
 ///
 /// The name is lower-case letters, digits and dashes, starting with a letter; the release is
-/// numbers separated by dots; the whole is at most [`BUILD_NAME_LIMIT`] bytes.
+/// numbers separated by dots, and after a `+` the twelve lower-case hexadecimal digits of a
+/// commit where there is one; the whole is at most [`BUILD_NAME_LIMIT`] bytes.
 #[must_use]
 pub fn build_name(build_id: &kr_protocol::ids::BuildId) -> BuildName {
     let text = build_id.as_str();
     let named = text.len() <= BUILD_NAME_LIMIT
         && text.split_once('/').is_some_and(|(name, release)| {
+            let (numbers, commit) = match release.split_once('+') {
+                Some((numbers, commit)) => (numbers, Some(commit)),
+                None => (release, None),
+            };
             name.starts_with(|first: char| first.is_ascii_lowercase())
                 && name.chars().all(|character| {
                     character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
                 })
-                && release.split('.').all(|number| {
+                && numbers.split('.').all(|number| {
                     !number.is_empty() && number.chars().all(|digit| digit.is_ascii_digit())
                 })
+                && commit.is_none_or(|commit| lower_hex(commit, 12..=12))
         });
     BuildName(if named {
         text.to_owned()
@@ -238,6 +245,13 @@ impl fmt::Display for BuildName {
 
 // A program's name and its release, from the fixed alphabet above, or this program's own words.
 impl Plain for BuildName {}
+
+/// What a release's name says: itself. A [`kr_protocol::update::ReleaseName`] is checked to three
+/// numbers and twelve lower-case hexadecimal digits when it is made, so nothing else is in one.
+#[must_use]
+pub fn release(release: &kr_protocol::update::ReleaseName) -> Shown {
+    shown!("{}", Checked(release.as_str().to_owned()))
+}
 
 /// What a device's platform says: the protocol's own name for it.
 #[must_use]
@@ -1058,5 +1072,32 @@ mod tests {
             platform(kr_protocol::pairing::DevicePlatform::Ios).as_str(),
             "ios"
         );
+    }
+
+    /// A build is named with its release's commit, and a suffix that is anything else is not
+    /// repeated.
+    #[test]
+    fn a_build_is_named_with_its_release_s_commit_and_nothing_else() {
+        let named = |text: &str| {
+            build_name(&kr_protocol::ids::BuildId::new(text).expect("an identifier")).to_string()
+        };
+        for text in [
+            "kr-worker/0.1.0",
+            "kr-worker/0.2.0+4254aa6e62e5",
+            "kr-controller/12.0.3+000000000000",
+        ] {
+            assert_eq!(named(text), text);
+        }
+        for text in [
+            "kr-worker/0.2.0+4254AA6E62E5",
+            "kr-worker/0.2.0+4254aa6e62e",
+            "kr-worker/0.2.0+sk-live-4254aa",
+            "kr-worker/0.2.0+4254aa6e62e5+4254aa6e62e5",
+        ] {
+            assert_eq!(named(text), "[a build this kr does not name]", "{text}");
+        }
+        let release =
+            kr_protocol::update::ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release");
+        assert_eq!(super::release(&release).as_str(), "0.2.0+4254aa6e62e5");
     }
 }

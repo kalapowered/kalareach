@@ -38,6 +38,17 @@ fn main() -> ExitCode {
     let json = std::env::args_os()
         .take_while(|argument| argument != "--")
         .any(|argument| argument == "--json");
+    // Before anything a release could matter to: a command of an installed release holds that
+    // release for as long as it runs, and does not run at all once the release is being removed.
+    if let Err(error) = kr_ipc::install::this_process() {
+        let failure = CliError::Other(kr_cli::update::said(error));
+        if json {
+            output::document(&report::failure(&failure));
+        } else {
+            report::failed(&failure);
+        }
+        return ExitCode::from(failure.exit_code());
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return usage(&error, json),

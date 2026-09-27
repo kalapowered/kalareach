@@ -33,6 +33,7 @@
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`shell`] | `kr shell`: the guarded startup entries and what the integration resolved to |
+//! | [`update`] | `kr host install`, `kr host update` and `kr host versions`: the releases this host keeps side by side |
 //! | [`output`] | Everything written on standard output, and the only writer there |
 //! | [`report`] | Text for people and the `--json` shapes |
 //! | [`error`] | The failures above, each with its own exit code |
@@ -69,6 +70,7 @@ pub mod shown;
 pub mod skill;
 pub mod startup;
 pub mod terminal;
+pub mod update;
 pub mod windows;
 pub mod workspace;
 
@@ -77,7 +79,8 @@ pub use crate::error::{CliError, Result};
 /// The release this build reports.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
-/// Returns the build identifier this client presents.
+/// Returns the build identifier this client presents: `kr/` and its release, which is the name of
+/// the installed release it runs from where it is one (`kr/0.2.0+4254aa6e62e5`).
 ///
 /// # Panics
 ///
@@ -85,9 +88,11 @@ pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 /// rather than a runtime condition.
 #[must_use]
 pub fn build_id() -> kr_protocol::ids::BuildId {
+    let release =
+        kr_ipc::install::this_process().map_or(RELEASE, |running| running.stated_release(RELEASE));
     // What the identifier's check refused is not rendered: the panic says which build fault this
     // is and nothing it read.
-    match kr_protocol::ids::BuildId::new(format!("kr/{RELEASE}")) {
+    match kr_protocol::ids::BuildId::new(format!("kr/{release}")) {
         Ok(build_id) => build_id,
         Err(_) => panic!("the build identifier is not well formed"),
     }
