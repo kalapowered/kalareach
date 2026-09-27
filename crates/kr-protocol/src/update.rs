@@ -187,9 +187,9 @@ pub const MAX_RELEASE_NAME_LEN: usize = 64;
 /// The name of one release: its version and the first twelve hexadecimal digits of its commit,
 /// `<version>+<commit>`, as its tag names it (`0.2.0+4254aa6e62e5`).
 ///
-/// It names the release's directory on a host, so nothing a path could read as something else
-/// gets in: the version is three numbers separated by dots with an optional pre-release of
-/// letters, digits, dots and hyphens, and the commit is twelve lower-case hexadecimal digits.
+/// It names the release's directory on a host and follows the program's name in each of its build
+/// identifiers, so nothing a path or a reader could take for something else gets in: the version is
+/// three numbers separated by dots, and the commit is twelve lower-case hexadecimal digits.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseName(String);
@@ -197,9 +197,8 @@ pub struct ReleaseName(String);
 /// Text that is not a release name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "a release name is `<version>+<commit>`: three numbers separated by dots, an optional \
-     pre-release after a hyphen, a plus sign and twelve lower-case hexadecimal digits, 64 \
-     characters at most"
+    "a release name is `<version>+<commit>`: three numbers separated by dots, a plus sign and \
+     twelve lower-case hexadecimal digits"
 )]
 pub struct ReleaseNameError;
 
@@ -222,27 +221,12 @@ impl ReleaseName {
         if !commit_well_formed {
             return Err(ReleaseNameError);
         }
-        let (numbers, pre_release) = match version.split_once('-') {
-            Some((numbers, pre_release)) => (numbers, Some(pre_release)),
-            None => (version, None),
-        };
-        let mut parts = numbers.split('.');
+        let mut parts = version.split('.');
         for _ in 0..3 {
             number(parts.next().ok_or(ReleaseNameError)?).ok_or(ReleaseNameError)?;
         }
         if parts.next().is_some() {
             return Err(ReleaseNameError);
-        }
-        if let Some(pre_release) = pre_release {
-            let each_well_formed = pre_release.split('.').all(|identifier| {
-                !identifier.is_empty()
-                    && identifier
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            });
-            if !each_well_formed {
-                return Err(ReleaseNameError);
-            }
         }
         Ok(Self(value))
     }
@@ -288,7 +272,7 @@ impl JsonSchema for ReleaseName {
         json_schema!({
             "type": "string",
             "maxLength": MAX_RELEASE_NAME_LEN,
-            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?\\+[0-9a-f]{12}$",
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\+[0-9a-f]{12}$",
             "description": "One release of the host: its version and the first twelve hexadecimal digits of its commit."
         })
     }
@@ -827,8 +811,7 @@ mod tests {
         for text in [
             "0.1.0+4254aa6e62e5",
             "12.0.3+0123456789ab",
-            "0.2.0-rc.1+4254aa6e62e5",
-            "1.0.0-alpha-2.x+ffffffffffff",
+            "1.0.0+ffffffffffff",
         ] {
             let name = ReleaseName::new(text).expect("a release name");
             assert_eq!(name.as_str(), text);
@@ -847,11 +830,10 @@ mod tests {
             "00.1.0+4254aa6e62e5",
             "../0.1.0+4254aa6e62e5",
             "0.1.0/..+4254aa6e62e5",
+            "0.1.0-rc.1+4254aa6e62e5",
             "0.1.0-+4254aa6e62e5",
-            "0.1.0-a..b+4254aa6e62e5",
-            "0.1.0-a/b+4254aa6e62e5",
             "0.1.0+4254aa6e62e5+4254aa6e62e5",
-            "0.1.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+4254aa6e62e5",
+            "999999.0.0+4254aa6e62e5",
         ] {
             assert!(ReleaseName::new(text).is_err(), "{text:?} is not a name");
         }
