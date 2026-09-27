@@ -6,9 +6,10 @@
 //! **Command integration (§12).** For a gateway-capable agent, an explicitly enabled integration
 //! adds the flags that agent needs to an interactive invocation, inside a managed root shell and
 //! nowhere else. The command name and the argument vector the person typed are preserved: the flags
-//! are added, nothing is removed or reordered, and the resolved profile is what diagnostics show.
-//! An absolute-path invocation and a user-disabled integration bypass it, keep their actual
-//! execution, and never get a gateway created for them after the fact.
+//! are added as the one run the integration declares, nothing is removed or reordered, and the
+//! resolved profile is what diagnostics show. An absolute-path invocation, a user-disabled
+//! integration and an invocation that already uses the integration's flags another way bypass it,
+//! keep their actual execution, and never get a gateway created for them after the fact.
 //!
 //! **Command blocks (§25).** The shell adapter reports what a command was, when it started and
 //! ended, what it exited with and where it ran, from the same private hooks the fence rests on. The
@@ -104,8 +105,10 @@ pub struct InvocationContext {
 /// Resolves one invocation against the configured integrations.
 ///
 /// The command name and the argument vector are preserved. What an enabled integration does is add
-/// flags where a command line puts an option the caller did not give: after the options, and in
-/// front of `--` where the caller wrote one, because everything after that separator is an operand.
+/// its flags, as the one run it declares, where a command line puts an option the caller did not
+/// give: after the options, and in front of `--` where the caller wrote one, because everything
+/// after that separator is an operand. An integration that declares no flag adds nothing and still
+/// integrates the invocation, whose backend is what it is for.
 #[must_use]
 pub fn resolve(
     integrations: &[CommandIntegration],
@@ -144,9 +147,6 @@ pub fn resolve(
     if !integration.enabled {
         return bypass(CommandBypassReason::Disabled);
     }
-    if integration.flags.is_empty() {
-        return bypass(CommandBypassReason::NotIntegrated);
-    }
     // The options end at the first `--`. What follows is operands, so a word there that looks
     // like a flag is not one the caller gave, and a flag placed there would reach the agent as an
     // operand.
@@ -156,13 +156,15 @@ pub fn resolve(
         .position(|argument| argument == "--")
         .map_or(argv.len(), |position| position + 1);
     let given = argv.get(1..options_end).unwrap_or_default();
-    // Only flags the caller did not already give. Repeating one would change what the agent sees.
-    let added: Vec<String> = integration
-        .flags
-        .iter()
-        .filter(|flag| !given.contains(flag))
-        .cloned()
-        .collect();
+    // The flags are one run: a value is never added without its option or an option without its
+    // value, and nothing the caller typed is changed. Where the caller gave the run, repeating it
+    // would change what the agent sees; where the caller used its flags any other way, adding the
+    // run would too.
+    let added = match typed_use(given, &integration.flags) {
+        TypedUse::Unused => integration.flags.clone(),
+        TypedUse::WholeRun => Vec::new(),
+        TypedUse::Conflict => return bypass(CommandBypassReason::FlagsConflict),
+    };
     let mut arguments = argv.to_vec();
     arguments.splice(options_end..options_end, added.iter().cloned());
     Resolution::Integrated {
@@ -170,6 +172,50 @@ pub fn resolve(
         arguments,
         added,
     }
+}
+
+/// How the options a caller typed use an integration's run of flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedUse {
+    /// Nothing typed uses any of its flags: the run is added whole.
+    Unused,
+    /// The run is empty, or typed whole once, in its order, with nothing else typed using its
+    /// flags: nothing is added.
+    WholeRun,
+    /// Anything else, which the run cannot be added to without changing what the caller asked for.
+    Conflict,
+}
+
+/// Returns how `given`, the options a caller typed, use `run`.
+fn typed_use(given: &[String], run: &[String]) -> TypedUse {
+    if run.is_empty() {
+        return TypedUse::WholeRun;
+    }
+    let uses = |element: &String| run.iter().any(|flag| uses_flag(element, flag));
+    let whole: Vec<usize> = (0..given.len())
+        .filter(|&at| given.get(at..at + run.len()) == Some(run))
+        .collect();
+    match whole.as_slice() {
+        [] if !given.iter().any(uses) => TypedUse::Unused,
+        [at] if !given
+            .iter()
+            .enumerate()
+            .any(|(index, element)| !(*at..*at + run.len()).contains(&index) && uses(element)) =>
+        {
+            TypedUse::WholeRun
+        }
+        _ => TypedUse::Conflict,
+    }
+}
+
+/// Whether one typed element uses one of a run's flags: it is that element, or, for a long option,
+/// that option with a value attached after `=`.
+fn uses_flag(element: &str, flag: &str) -> bool {
+    element == flag
+        || (flag.starts_with("--")
+            && element
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('=')))
 }
 
 #[cfg(test)]
