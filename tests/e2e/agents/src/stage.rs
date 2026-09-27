@@ -1282,7 +1282,9 @@ impl Keyboard {
     }
 
     /// Types `text` under the lease, and requires the host to acknowledge it at its place in the
-    /// connection's ordered input with every byte forwarded to the terminal.
+    /// connection's ordered input with every byte forwarded to the terminal or held as the start of
+    /// a bracketed-paste delimiter, as a lone Escape is while the terminal takes pastes: the worker
+    /// forwards such a prefix once its short deadline passes.
     ///
     /// # Errors
     ///
@@ -1310,14 +1312,20 @@ impl Keyboard {
                 detail: format!("input.write: {error}"),
             })?;
         let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        if written.sequence.get() != self.next || written.forwarded_bytes.get() != length {
+        let taken = written
+            .forwarded_bytes
+            .get()
+            .saturating_add(written.held_prefix_bytes.get());
+        if written.sequence.get() != self.next || taken < length {
             return Err(InputRefusal {
                 code: None,
                 detail: format!(
-                    "input {} of {length} bytes was acknowledged as {} with {} bytes forwarded",
+                    "input {} of {length} bytes was acknowledged as {} with {} bytes forwarded \
+                     and {} held",
                     self.next,
                     written.sequence.get(),
-                    written.forwarded_bytes.get()
+                    written.forwarded_bytes.get(),
+                    written.held_prefix_bytes.get()
                 ),
             });
         }
