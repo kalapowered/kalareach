@@ -215,9 +215,9 @@ A new member of an existing type takes that bump too, an optional member include
 refuse a member they do not know, those of a session's local path among them, so a build without
 the member cannot read a frame that carries it. The version is compiled into every host process,
 which states it in its answer to a hello, and `kr attach` relies on this rule: it reads a worker's
-screens only when the worker's version has its own minor number below `1.0.0`, or its own major
-number from `1.0.0`, and a patch number never decides. A member released without the bump would let
-it attach to a worker whose frames it cannot read.
+screens only when the worker's version has the same minor number as its own below `1.0.0`, or the
+same major number from `1.0.0`, and a patch number never decides. A member released without the
+bump would let it attach to a worker whose frames it cannot read.
 
 Counting exported names does not establish compatibility: the names can be identical while a union
 or a field beneath them has changed. Read the diff of `packages/protocol/src/generated/protocol.ts`
