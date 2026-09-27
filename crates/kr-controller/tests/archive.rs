@@ -459,15 +459,17 @@ fn a_closed_sessions_output_past_seven_days_and_receipts_past_thirty_are_collect
     let collected = archive
         .collect(&ownership, eight_days_on(), true)
         .expect("collects");
-    assert!(collected.age_permitted);
     assert_eq!(collected.output_bytes, 16, "{collected:?}");
+    assert_eq!(collected.receipts, 1, "{collected:?}");
+    assert_eq!(collected.output_retained, Some(0));
+    assert_eq!(collected.receipts_retained, Some(1));
     assert_eq!(collected.output_left_behind, None);
+    assert_eq!(collected.receipts_left_behind, None);
     assert_eq!(
         collected.recovered.rejected, 2,
         "the recovery rules ran before anything went"
     );
-    assert_eq!(collected.receipts, 1, "{collected:?}");
-    assert_eq!(collected.receipts_left_behind, None);
+    assert!(collected.age_permitted);
 
     let read = archive.archive(session_id).expect("reads the archive");
     assert_eq!(
@@ -511,6 +513,8 @@ fn a_closed_session_inside_its_retention_keeps_everything() {
         .expect("collects");
     assert_eq!(collected.output_bytes, 0);
     assert_eq!(collected.receipts, 0);
+    assert_eq!(collected.output_retained, Some(16));
+    assert_eq!(collected.receipts_retained, Some(2));
     let read = archive.archive(session_id).expect("reads the archive");
     assert_eq!(read.receipts, 2);
     assert_eq!(read.oldest_retained_cursor, 0);
@@ -566,6 +570,54 @@ fn a_session_a_worker_may_still_own_is_not_collected() {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_descriptor_this_host_cannot_read_stops_the_collection() {
+    // A descriptor that is there and cannot be read answers nothing about the worker it names,
+    // and a collection is a write: nothing is collected on nothing.
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    publish_descriptor(&archive, session_id, &ended);
+    let descriptor = archive.paths().descriptor_file(session_id);
+    let mode = std::fs::metadata(&descriptor).expect("reads").permissions();
+    std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o000))
+        .expect("makes the descriptor unreadable");
+    let refused = archive.collect(&ownership, eight_days_on(), true);
+    std::fs::set_permissions(&descriptor, mode).expect("puts the permissions back");
+    let refused = refused.expect_err("an unreadable descriptor stops the collection");
+    assert!(refused.to_string().contains("may still"), "{refused}");
+}
+
+#[test]
+fn a_journal_the_collection_cannot_read_is_reported_and_the_output_is_still_collected() {
+    // The two stores are collected on their own accounts, so a journal this host cannot open is
+    // reported in the receipts' result and does not stop the output's.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    std::fs::write(
+        archive.paths().journal_database(session_id),
+        b"this is not a database",
+    )
+    .expect("a file that is not a journal");
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect("collects");
+    assert!(collected.receipts_left_behind.is_some(), "{collected:?}");
+    assert_eq!(collected.receipts, 0);
+    assert_eq!(collected.receipts_retained, None, "this host cannot say");
+    assert_eq!(collected.output_bytes, 16, "{collected:?}");
+    assert_eq!(collected.output_retained, Some(0));
+}
+
+#[test]
 fn a_segment_the_collection_cannot_remove_is_reported_rather_than_counted_as_gone() {
     let (_temp, archive) = host();
     let session_id = closed_session_with_history(&archive, true);
@@ -591,6 +643,10 @@ fn a_segment_the_collection_cannot_remove_is_reported_rather_than_counted_as_gon
             .as_deref()
             .is_some_and(|why| why.contains("could not be removed")),
         "{collected:?}"
+    );
+    assert!(
+        collected.output_retained.is_some_and(|held| held > 0),
+        "what could not be removed is still counted: {collected:?}"
     );
     assert_eq!(
         collected.receipts, 1,

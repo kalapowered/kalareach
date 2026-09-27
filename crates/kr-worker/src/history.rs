@@ -191,12 +191,13 @@ impl OutputHistory {
         }
     }
 
-    /// Opens an existing spool for reading, without creating or repairing anything.
+    /// Opens an existing spool, without creating or repairing anything.
     ///
     /// The archive reads a session's retained output after the session is gone, and a read is a
     /// read: it does not create the directory it was asked about, and it does not narrow the
-    /// permissions of one that is already there. Repair belongs to the host that owns the
-    /// session, under recovery ownership.
+    /// permissions of one that is already there. The archive also collects a closed session's
+    /// output through it, under recovery ownership: collection removes what is past its bounds,
+    /// and a directory that is not there is not one it makes.
     ///
     /// # Errors
     ///
@@ -397,9 +398,7 @@ impl OutputHistory {
         let from = self.resident_start.max(stopped);
         let offset = usize::try_from(from.saturating_sub(self.resident_start)).unwrap_or(0);
         let pending: Vec<u8> = self.resident.iter().skip(offset).copied().collect();
-        let Some(evicted) = spool.resume(from, &pending) else {
-            return;
-        };
+        let (resumption, evicted) = spool.resume(from, &pending);
         if let Some((from_cursor, to_cursor, gone)) = evicted {
             self.record_eviction(Eviction {
                 limit: RetentionLimit::SessionCap,
@@ -409,12 +408,23 @@ impl OutputHistory {
                 at_ms: kr_ipc::now_ms(),
             });
         }
-        if from > stopped {
+        // Once the spool has written from `from`, whether it then kept going or stopped again
+        // further on, the range before `from` is output neither layer kept.
+        if resumption != Resumption::Stopped && from > stopped {
             self.unretained.push_back((stopped, from));
             while self.unretained.len() > MAX_RECORDED_EVICTIONS {
                 self.unretained.pop_front();
             }
         }
+    }
+
+    /// Returns the most bytes this session's spool has held at once since it was opened.
+    ///
+    /// Room is made before each write, so it never passes the spool's capacity, which is the
+    /// session cap. It is what lets a caller confirm that rather than take it on trust.
+    #[must_use]
+    pub fn spool_peak_bytes(&self) -> u64 {
+        self.spool.as_ref().map_or(0, |spool| spool.peak_bytes)
     }
 
     /// Drops the marks for output the resident window no longer holds.
@@ -661,14 +671,13 @@ impl OutputHistory {
         for eviction in &taken {
             self.record_eviction(*eviction);
         }
-        if let Some(spool) = self.spool.as_mut()
-            && spool.suspended_at().is_some()
-        {
-            // A stopped spool's directory says where the session's output reached, so a reader
-            // of it after the session has gone - the archive - is told the range it did not take
-            // rather than a spool that simply ended where it stopped. Best effort: a directory
-            // that cannot be written is one this pass tries again.
-            let _ = spool.record_boundary();
+        if let Some(spool) = self.spool.as_mut() {
+            // The directory says where the session's output reached, even where the spool did not
+            // take it - privacy mode's output, or a stopped spool's - so a spool reopened over it,
+            // and the archive reading it after the session has gone, continue from there rather
+            // than from where the spool stopped. Best effort: a directory that cannot be written
+            // is one the next pass tries again.
+            let _ = spool.publish_position();
         }
         // A spool that stopped taking output is asked each pass whether it can take it again.
         self.try_resume();
@@ -929,6 +938,17 @@ struct Spool {
     boundary: u64,
     /// Whether a boundary was recorded and could not be read back.
     unreadable_boundary: bool,
+    /// The most bytes this spool has held at once since it was opened.
+    ///
+    /// Room is made before each write, so it never passes the capacity; it is what lets a caller
+    /// see that rather than take it on trust.
+    peak_bytes: u64,
+    /// The boundary this spool last wrote down, or read back when it opened.
+    ///
+    /// A position ahead of both this and the newest segment is one only memory holds, and each
+    /// retention pass writes it down, so a spool reopened after output it did not take - privacy
+    /// mode's, or a stopped spool's - continues the session's cursor rather than reusing it.
+    published: u64,
     /// The segment being written, held open.
     ///
     /// Terminal output arrives in small batches — often one line at a time — and opening and
@@ -942,6 +962,13 @@ struct Spool {
     /// holds: dropping it would take its files out of the account while they were still on the
     /// disk, and out of reach of the passes that collect them.
     suspended: Option<Suspension>,
+    /// A write that stops part way, which a test arranges: the next write lays down this many
+    /// bytes and then fails.
+    #[cfg(test)]
+    short_write: Option<usize>,
+    /// Whether a test has arranged that a file cannot be cut back after a failed write.
+    #[cfg(test)]
+    refuse_cut: bool,
 }
 
 /// Where a spool stopped taking output, and why.
@@ -951,6 +978,45 @@ struct Suspension {
     at: u64,
     /// What stopped it, in words a person can act on.
     reason: String,
+    /// Whether a later pass may let it take output again.
+    ///
+    /// False when a write failed and this host could neither cut the file back to what it counted
+    /// nor read how much the file holds: past that, where the next byte would land in the file is
+    /// not something this host knows, so nothing more is written to this spool.
+    resumable: bool,
+}
+
+/// Why a write into the newest segment failed, and how much of it the segment now holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WriteFailure {
+    /// How many of the bytes the segment is counted as holding.
+    kept: u64,
+    /// What went wrong, in words a person can act on.
+    reason: String,
+    /// Whether a later pass may let the spool take output again.
+    resumable: bool,
+}
+
+/// Where an attempt to let a stopped spool take output again left it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resumption {
+    /// Still stopped where it first stopped: nothing was written.
+    Stopped,
+    /// Taking output again.
+    Taking,
+    /// It wrote from where it was asked to and stopped again, at the first cursor it did not take.
+    StoppedLater,
+}
+
+/// Joins the ranges two steps of one append gave up, the earlier first.
+fn joined(
+    earlier: Option<(u64, u64, u64)>,
+    later: Option<(u64, u64, u64)>,
+) -> Option<(u64, u64, u64)> {
+    match (earlier, later) {
+        (Some((from, _, before)), Some((_, to, gone))) => Some((from, to, before + gone)),
+        (earlier, later) => earlier.or(later),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -972,6 +1038,17 @@ struct Segment {
     /// is what the filesystem already keeps, so it is what this reads. Eviction reads the newest
     /// byte rather than the oldest, which is the direction that cannot delete output too early.
     written_at_ms: u64,
+    /// Whether this segment takes no more bytes.
+    ///
+    /// A segment a write failed on is closed to further writes, whatever the failure left in it:
+    /// the next byte starts a new segment, so no write lands after bytes this host did not count.
+    sealed: bool,
+    /// Bytes a failed write may have left in the file beyond what it counted.
+    ///
+    /// Nought unless a write failed and neither cutting the file back nor reading its length
+    /// answered. They are counted against the cap until the segment goes, because a byte that may
+    /// be on the disk is not one to count as free.
+    uncertain: u64,
 }
 
 impl Segment {
@@ -1028,6 +1105,9 @@ impl Spool {
                 // in it were as new as its newest, which keeps rather than deletes.
                 started_at_ms: written_at_ms,
                 written_at_ms,
+                // The index is the file's own length, so a write may continue it.
+                sealed: false,
+                uncertain: 0,
             });
         }
         segments.sort_by_key(|segment| segment.start);
@@ -1047,8 +1127,17 @@ impl Spool {
             total_bytes,
             boundary,
             unreadable_boundary: recorded == RecordedBoundary::Unreadable,
+            peak_bytes: total_bytes,
+            published: match recorded {
+                RecordedBoundary::At(at) => at,
+                RecordedBoundary::None | RecordedBoundary::Unreadable => 0,
+            },
             open_segment: None,
             suspended: None,
+            #[cfg(test)]
+            short_write: None,
+            #[cfg(test)]
+            refuse_cut: false,
         })
     }
 
@@ -1080,7 +1169,7 @@ impl Spool {
     /// the capacity, so once the older segments have gone the room is there; the segment a piece
     /// is written into is never the one given up for it. A cursor that does not continue the
     /// newest segment starts a new one, because a segment's bytes are the cursors from its start
-    /// in order.
+    /// in order, and so does a segment a write failed on.
     ///
     /// Nothing here stands over the capacity. When the room cannot be made, or a segment cannot be
     /// opened or written, the spool stops at the first cursor it did not take, keeps everything it
@@ -1095,7 +1184,8 @@ impl Spool {
             let cursor = start + written as u64;
             let now_ms = kr_ipc::now_ms().get();
             let rotate = self.segments.back().is_none_or(|segment| {
-                segment.len >= self.layout.segment_bytes
+                segment.sealed
+                    || segment.len >= self.layout.segment_bytes
                     || now_ms.saturating_sub(segment.started_at_ms) >= SEGMENT_ROTATION_MS
                     || segment.end() != cursor
             });
@@ -1111,17 +1201,11 @@ impl Spool {
             let take = usize::try_from(room)
                 .unwrap_or(usize::MAX)
                 .min(bytes.len() - written);
-            match self.make_room(take as u64, !rotate, cursor) {
-                Ok(Some((from, to, gone))) => {
-                    evicted = Some(evicted.map_or((from, to, gone), |(first, _, before)| {
-                        (first, to, before + gone)
-                    }));
-                }
-                Ok(None) => {}
-                Err(reason) => {
-                    self.suspend(cursor, reason);
-                    break;
-                }
+            let (made, failure) = self.make_room(take as u64, !rotate, cursor);
+            evicted = joined(evicted, made);
+            if let Some(reason) = failure {
+                self.suspend(cursor, reason, true);
+                break;
             }
             if rotate {
                 let path = self.directory.join(format!("{cursor:020}.out"));
@@ -1134,6 +1218,8 @@ impl Spool {
                             path,
                             started_at_ms: now_ms,
                             written_at_ms: now_ms,
+                            sealed: false,
+                            uncertain: 0,
                         });
                     }
                     Err(error) => {
@@ -1143,13 +1229,14 @@ impl Spool {
                                 "segment {} could not be opened: {error}",
                                 segment_name(&path)
                             ),
+                            true,
                         );
                         break;
                     }
                 }
             }
-            if let Err(reason) = self.write_newest(&bytes[written..written + take]) {
-                self.suspend(cursor, reason);
+            if let Err(failed) = self.write_newest(&bytes[written..written + take]) {
+                self.suspend(cursor + failed.kept, failed.reason, failed.resumable);
                 break;
             }
             written += take;
@@ -1158,40 +1245,55 @@ impl Spool {
     }
 
     /// Writes bytes at the end of the newest segment, and counts them once they are there.
-    fn write_newest(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+    fn write_newest(&mut self, bytes: &[u8]) -> std::result::Result<(), WriteFailure> {
         let Some(segment) = self.segments.back() else {
-            return Err("no segment was open to write into".to_owned());
+            return Err(WriteFailure {
+                kept: 0,
+                reason: "no segment was open to write into".to_owned(),
+                resumable: true,
+            });
         };
         let path = segment.path.clone();
-        let written_before = segment.len;
+        let counted = segment.len;
         // Borrowed separately from the segment, because the handle lives beside the index rather
         // than inside it: a segment that is evicted takes its entry, not this handle.
         let handle = match self.open_segment.as_mut() {
             Some((open, file)) if *open == path => file,
-            _ => {
-                let file = open_segment(&path).map_err(|error| {
-                    format!(
-                        "segment {} could not be opened: {error}",
-                        segment_name(&path)
-                    )
-                })?;
-                self.open_segment = Some((path.clone(), file));
-                &mut self
-                    .open_segment
-                    .as_mut()
-                    .expect("the handle was just installed")
-                    .1
-            }
+            _ => match open_segment(&path) {
+                Ok(file) => {
+                    self.open_segment = Some((path.clone(), file));
+                    &mut self
+                        .open_segment
+                        .as_mut()
+                        .expect("the handle was just installed")
+                        .1
+                }
+                Err(error) => {
+                    return Err(WriteFailure {
+                        kept: 0,
+                        reason: format!(
+                            "segment {} could not be opened: {error}",
+                            segment_name(&path)
+                        ),
+                        resumable: true,
+                    });
+                }
+            },
         };
-        if let Err(error) = append_open(handle, bytes) {
-            // A write that failed part way leaves bytes the index does not name. They are cut
-            // back where the platform allows, so a reopened spool does not read them as a segment
-            // longer than the one this host counted.
-            let _ = handle.set_len(written_before);
-            return Err(format!(
+        #[cfg(test)]
+        let written = match self.short_write.take() {
+            Some(keep) => append_open(handle, &bytes[..keep.min(bytes.len())])
+                .and_then(|()| Err(std::io::Error::other("the write stopped part way"))),
+            None => append_open(handle, bytes),
+        };
+        #[cfg(not(test))]
+        let written = append_open(handle, bytes);
+        if let Err(error) = written {
+            let reason = format!(
                 "segment {} could not be written: {error}",
                 segment_name(&path)
-            ));
+            );
+            return Err(self.settle_failed_write(counted, bytes.len() as u64, reason));
         }
         let segment = self.segments.back_mut().expect("a segment exists");
         segment.len += bytes.len() as u64;
@@ -1200,52 +1302,133 @@ impl Spool {
         // everything in it is, which is the direction that cannot delete output too early.
         segment.written_at_ms = kr_ipc::now_ms().get();
         self.total_bytes += bytes.len() as u64;
+        self.peak_bytes = self.peak_bytes.max(self.total_bytes);
         Ok(())
+    }
+
+    /// Settles a write that failed part way, so that the index and the file agree again.
+    ///
+    /// The file is cut back to what the index counts, and the cut is checked. Where it cannot be
+    /// made, the file's own length says how many of the bytes it holds, and those are counted: a
+    /// write lays its bytes down in order, so what reached the file is the start of them, at the
+    /// cursors the index expects. Where neither answers, the whole piece is counted as possibly
+    /// there and the spool writes nothing more. Either way the segment takes no further bytes, and
+    /// one that holds none leaves the index.
+    fn settle_failed_write(
+        &mut self,
+        counted: u64,
+        attempted: u64,
+        reason: String,
+    ) -> WriteFailure {
+        #[cfg(test)]
+        let may_cut = !self.refuse_cut;
+        #[cfg(not(test))]
+        let may_cut = true;
+        let (kept, uncertain) = match self.open_segment.as_mut() {
+            Some((_, file))
+                if may_cut
+                    && file.set_len(counted).is_ok()
+                    && file
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() == counted) =>
+            {
+                (0, 0)
+            }
+            Some((_, file)) => match file.metadata() {
+                Ok(metadata) => (metadata.len().saturating_sub(counted).min(attempted), 0),
+                Err(_) => (0, attempted),
+            },
+            None => (0, attempted),
+        };
+        self.open_segment = None;
+        let segment = self.segments.back_mut().expect("the segment being written");
+        segment.sealed = true;
+        segment.len += kept;
+        segment.uncertain += uncertain;
+        let end = segment.end();
+        let empty = segment.len == 0 && segment.uncertain == 0;
+        self.total_bytes += kept + uncertain;
+        self.peak_bytes = self.peak_bytes.max(self.total_bytes);
+        self.boundary = self.boundary.max(end);
+        if empty {
+            // Nothing of it is on the disk, so the next segment to start at this cursor is the only
+            // entry that names its file.
+            if let Some(gone) = self.segments.pop_back() {
+                let _ = std::fs::remove_file(&gone.path);
+            }
+        }
+        let resumable = uncertain == 0;
+        WriteFailure {
+            kept,
+            reason: if resumable {
+                reason
+            } else {
+                format!("{reason}, and how much of it reached the file could not be read back")
+            },
+            resumable,
+        }
     }
 
     /// Gives up the oldest segments until `needed` more bytes fit within the capacity.
     ///
     /// The boundary is published before the first segment goes, as every eviction publishes it.
     /// `keep_newest` keeps the segment the bytes are about to be written into. Returns the range
-    /// that went, or why the room could not be made: a boundary that could not be written, or a
-    /// segment that could not be removed and is still counted.
+    /// that went, and why the room could not be made when it could not: a boundary that could not
+    /// be written, or a segment that could not be removed and is still counted. What went before a
+    /// failure is still returned, so a reader is told which bound took it.
     fn make_room(
         &mut self,
         needed: u64,
         keep_newest: bool,
         cursor: u64,
-    ) -> std::result::Result<Option<(u64, u64, u64)>, String> {
+    ) -> (Option<(u64, u64, u64)>, Option<String>) {
         if self.total_bytes.saturating_add(needed) <= self.layout.capacity_bytes {
-            return Ok(None);
+            return (None, None);
         }
         if !self.record_boundary() {
-            return Err(
-                "this session's spool boundary could not be written, so nothing was removed to \
-                 make room"
-                    .to_owned(),
+            return (
+                None,
+                Some(
+                    "this session's spool boundary could not be written, so nothing was removed \
+                     to make room"
+                        .to_owned(),
+                ),
             );
         }
         let from = self.oldest_cursor().unwrap_or(cursor);
         let mut gone = 0;
+        let mut failure = None;
         while self.total_bytes.saturating_add(needed) > self.layout.capacity_bytes {
             if self.segments.is_empty() || (keep_newest && self.segments.len() == 1) {
-                return Err(format!(
+                failure = Some(format!(
                     "{needed} bytes do not fit within this session's spool capacity of {} bytes",
                     self.layout.capacity_bytes
                 ));
+                break;
             }
-            gone += self.drop_oldest()?;
+            match self.drop_oldest() {
+                Ok(went) => gone += went,
+                Err(reason) => {
+                    failure = Some(reason);
+                    break;
+                }
+            }
         }
-        Ok(Some((from, self.oldest_cursor().unwrap_or(cursor), gone)))
+        let made = (gone > 0).then(|| (from, self.oldest_cursor().unwrap_or(cursor), gone));
+        (made, failure)
     }
 
     /// Stops taking output at `at`, for `reason`, unless it has already stopped.
     ///
     /// The first stop is the one kept, because it is where the output this spool did not take
     /// begins.
-    fn suspend(&mut self, at: u64, reason: String) {
+    fn suspend(&mut self, at: u64, reason: String, resumable: bool) {
         if self.suspended.is_none() {
-            self.suspended = Some(Suspension { at, reason });
+            self.suspended = Some(Suspension {
+                at,
+                reason,
+                resumable,
+            });
         }
     }
 
@@ -1269,27 +1452,30 @@ impl Spool {
     /// Takes output again from `from`, writing `pending` there first, when it can.
     ///
     /// Room is made for what is pending, and for at least one byte, before anything is written,
-    /// so a spool whose oldest segment still cannot be removed stays stopped rather than stopping
-    /// again at the next append. Returns `None` while it still cannot: it stays stopped where it
-    /// first stopped, whatever this attempt ran into. Otherwise returns the range it gave up.
-    fn resume(&mut self, from: u64, pending: &[u8]) -> Option<Option<(u64, u64, u64)>> {
-        let held = self.suspended.take()?;
-        let made = match self.make_room((pending.len() as u64).max(1), false, from) {
-            Ok(made) => made,
-            Err(_) => {
-                self.suspended = Some(held);
-                return None;
-            }
+    /// so a spool whose oldest segment still cannot be removed stays stopped where it first
+    /// stopped rather than stopping again at the next append. A write that stops part way keeps
+    /// what it wrote: the spool stops again at the first cursor it did not take, and the next
+    /// attempt starts there, never before it, so no byte is written twice. Returns where that left
+    /// the spool, and the range it gave up to make room, whatever it came to.
+    fn resume(&mut self, from: u64, pending: &[u8]) -> (Resumption, Option<(u64, u64, u64)>) {
+        let Some(held) = self.suspended.take() else {
+            return (Resumption::Taking, None);
         };
-        let written = self.append(from, pending);
-        if self.suspended.is_some() {
+        if !held.resumable {
             self.suspended = Some(held);
-            return None;
+            return (Resumption::Stopped, None);
         }
-        Some(match (made, written) {
-            (Some((first, _, before)), Some((_, to, gone))) => Some((first, to, before + gone)),
-            (made, written) => made.or(written),
-        })
+        let (made, failure) = self.make_room((pending.len() as u64).max(1), false, from);
+        if failure.is_some() {
+            self.suspended = Some(held);
+            return (Resumption::Stopped, made);
+        }
+        let written = self.append(from, pending);
+        let evicted = joined(made, written);
+        if self.suspended.is_some() {
+            return (Resumption::StoppedLater, evicted);
+        }
+        (Resumption::Taking, evicted)
     }
 
     /// Removes the oldest segment and returns how many bytes went.
@@ -1325,8 +1511,25 @@ impl Spool {
             }
         }
         self.segments.pop_front();
-        self.total_bytes -= segment.len;
-        Ok(segment.len)
+        let went = segment.len + segment.uncertain;
+        self.total_bytes -= went;
+        Ok(went)
+    }
+
+    /// Writes the position down when only memory holds it, and says whether the record is current.
+    ///
+    /// While the spool takes everything its newest segment says where the output reached, so
+    /// nothing is written then. Output the spool did not take - privacy mode's, or a stopped
+    /// spool's - moves the position past it, and the record written here is what lets a spool
+    /// reopened over this directory continue from there.
+    fn publish_position(&mut self) -> bool {
+        let shown = self
+            .published
+            .max(self.segments.back().map_or(0, Segment::end));
+        if self.boundary <= shown {
+            return true;
+        }
+        self.record_boundary()
     }
 
     /// Publishes the boundary before anything that supports it is deleted.
@@ -1340,6 +1543,7 @@ impl Spool {
             return false;
         }
         self.boundary = boundary;
+        self.published = boundary;
         true
     }
 
@@ -1499,29 +1703,32 @@ impl Spool {
             .sum()
     }
 
-    /// Forgets the segments whose files have gone, other than the one being written.
+    /// Forgets the segments whose files have gone.
     ///
     /// A file that went from under the index is a range this host no longer holds, and counting it
     /// would make the session look larger than it is: the next capacity pass would evict output it
     /// did not need to. The range reads as a hole afterwards, as it did to any reader that reached
-    /// it before. The newest segment is left, because its file is open for writing here and what
-    /// became of it is found when a page reaches it.
+    /// it before. The newest segment is no exception: a handle open on a file that has gone writes
+    /// to nothing any reader can reach, so it is dropped, and the next byte starts a new segment.
     fn forget_vanished(&mut self) {
-        let newest = self.segments.len().saturating_sub(1);
-        let mut position = 0;
+        let open = self.open_segment.as_ref().map(|(path, _)| path.clone());
         let mut kept = 0;
+        let mut dropped_open = false;
         self.segments.retain(|segment| {
-            let gone = position < newest
-                && matches!(
-                    std::fs::symlink_metadata(&segment.path),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                );
-            position += 1;
-            if !gone {
-                kept += segment.len;
+            let gone = matches!(
+                std::fs::symlink_metadata(&segment.path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if gone {
+                dropped_open |= open.as_ref() == Some(&segment.path);
+            } else {
+                kept += segment.len + segment.uncertain;
             }
             !gone
         });
+        if dropped_open {
+            self.open_segment = None;
+        }
         self.total_bytes = kept;
     }
 }
@@ -1846,6 +2053,82 @@ mod tests {
             page.gap.0.expect("a gap").cause,
             Some(HistoryGapCause::SessionCapacity)
         );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Reads everything a spool directory holds from `from`, as a reader opening it would.
+    fn read_back(directory: &std::path::Path, from: u64) -> (Option<HistoryGap>, Vec<u8>) {
+        let reopened =
+            OutputHistory::read_spool(directory, SpoolLayout::DEFAULT).expect("reads the spool");
+        let mut cursor = from;
+        let mut gap = None;
+        let mut bytes = Vec::new();
+        while cursor < reopened.next_cursor() {
+            let page = reopened.page(cursor, 64).expect("a page");
+            gap = gap.or(page.gap.0);
+            bytes.extend_from_slice(page.bytes.as_slice());
+            assert!(
+                page.next_cursor.get() > cursor,
+                "every page moves the reader on"
+            );
+            cursor = page.next_cursor.get();
+        }
+        (gap, bytes)
+    }
+
+    #[test]
+    fn a_write_that_stops_part_way_is_cut_back_and_the_spool_goes_on_from_there() {
+        // The file is cut back to what the index counts, so the index and the file agree, and
+        // the next pass writes the rest from the resident window into a new segment.
+        let directory = spool_directory("short-write-cut");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(b"abcd");
+        history.spool.as_mut().expect("a spool").short_write = Some(2);
+        history.append(b"efgh");
+        assert_eq!(history.suspended().map(|(at, _)| at), Some(4));
+        assert_eq!(history.spool.as_ref().expect("a spool").total_bytes, 4);
+        history.apply_retention(OutputRetention::DEFAULT, 8, kr_ipc::now_ms(), true);
+        assert!(
+            history.suspended().is_none(),
+            "the next pass lets it take output again"
+        );
+        history.append(b"ij");
+        let (gap, bytes) = read_back(&directory, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefghij", "every byte once, and in its place");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_write_that_stops_part_way_and_cannot_be_cut_back_counts_what_the_file_holds() {
+        // Where the file cannot be cut back, its own length says how much of the write reached
+        // it: those bytes are the start of the write, at the cursors the index expects, so they
+        // are counted, and the spool goes on after them rather than writing them again.
+        let directory = spool_directory("short-write-kept");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(b"abcd");
+        {
+            let spool = history.spool.as_mut().expect("a spool");
+            spool.short_write = Some(2);
+            spool.refuse_cut = true;
+        }
+        history.append(b"efgh");
+        assert_eq!(
+            history.suspended().map(|(at, _)| at),
+            Some(6),
+            "it stopped after the bytes the file holds"
+        );
+        assert_eq!(history.spool.as_ref().expect("a spool").total_bytes, 6);
+        history.apply_retention(OutputRetention::DEFAULT, 8, kr_ipc::now_ms(), true);
+        assert!(history.suspended().is_none());
+        history.append(b"ij");
+        let (gap, bytes) = read_back(&directory, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefghij", "every byte once, and in its place");
         std::fs::remove_dir_all(&directory).ok();
     }
 

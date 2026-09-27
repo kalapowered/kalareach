@@ -2475,14 +2475,17 @@ started the worker in, named from the reservation and unable to name anything el
 does not stop one yet. So the coverage is incomplete and the record says which part of it this
 host could not account for.
 
-**Retention reaches a closed session too.** A session with no worker has no maintenance tick, so
-the archive applies the bounds that belong to it, under recovery ownership and after section 9's
-recovery rules have settled what the worker left unfinished: output past seven days and receipts
-past thirty, each on its own budget, and only on a clock the caller can prove. It refuses a
-session whose published worker the kernel has not said ended. Output and receipts are reported
-apart, each with what could not be removed: a segment that could not be unlinked is still counted
-and still served until a later pass removes it. The host-wide cap is not part of it, because that
-is decided across the whole environment rather than one session at a time.
+**A closed session can be collected.** A session with no worker has no maintenance tick, so the
+archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging
+to the session, under recovery ownership and after section 9's recovery rules have settled what
+the worker left unfinished: output past seven days and receipts past thirty, each on its own
+budget and only on a clock the caller can prove, and the session's own byte cap on any clock. It
+refuses a session whose published worker the kernel has not said ended, and it opens only stores
+that are there. Output and receipts are reported apart, each with what was removed, what is left
+and what could not be removed: a segment that could not be unlinked is still counted and still
+served until a later pass removes it. The host-wide cap is not part of it, because that is decided
+across the whole environment rather than one session at a time. Nothing runs this collection on a
+cadence: a closed session's output and receipts go when it is called.
 
 The transfer service's one retention question is answered here. Section 14 gives a submitted
 attachment its session's retention rather than the seven-day unused window, and the archive is

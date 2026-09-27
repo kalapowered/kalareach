@@ -238,16 +238,21 @@ pub struct Collected {
     /// Whether this pass collected by age at all.
     ///
     /// It is the caller's clock answer: removing what is old is expiry-based collection, which
-    /// section 9 stops while the wall clock cannot be proved.
+    /// section 9 stops while the wall clock cannot be proved. It governs the two periods, seven
+    /// days of output and thirty of receipts; the session's own byte cap applies either way.
     pub age_permitted: bool,
     /// Bytes of retained output that went.
     pub output_bytes: u64,
+    /// Bytes of retained output still held after the pass, or none where this host could not say.
+    pub output_retained: Option<u64>,
     /// Why output past its retention is still there, when some is.
     pub output_left_behind: Option<String>,
     /// What the recovery rules settled before any receipt was collected.
     pub recovered: Recovered,
     /// Receipts past their retention that went.
     pub receipts: u64,
+    /// Receipts still held after the pass, or none where this host could not say.
+    pub receipts_retained: Option<u64>,
     /// Why receipts past their retention are still there, when some are.
     pub receipts_left_behind: Option<String>,
 }
@@ -637,8 +642,19 @@ impl ArchiveService {
     /// Settles the journal's unfinished actions, then removes the receipts past their period.
     fn collect_receipts(&self, session_id: SessionId, now_ms: TimestampMs, into: &mut Collected) {
         let path = self.paths.journal_database(session_id);
-        if !path.exists() {
-            return;
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                into.receipts_retained = Some(0);
+                return;
+            }
+            // A store this host cannot even look for is not one it may report as empty.
+            Err(error) => {
+                into.receipts_left_behind = Some(format!(
+                    "this session's journal could not be looked for: {error}"
+                ));
+                return;
+            }
         }
         let mut journal = match Journal::open_existing(&path) {
             Ok(journal) => journal,
@@ -656,23 +672,35 @@ impl ArchiveService {
                 return;
             }
         }
-        if !into.age_permitted {
-            return;
+        if into.age_permitted {
+            match journal.prune(now_ms) {
+                Ok(removed) => into.receipts = removed as u64,
+                Err(error) => into.receipts_left_behind = Some(error.to_string()),
+            }
         }
-        match journal.prune(now_ms) {
-            Ok(removed) => into.receipts = removed as u64,
-            Err(error) => into.receipts_left_behind = Some(error.to_string()),
-        }
+        into.receipts_retained = journal.len().ok();
     }
 
-    /// Applies the output bounds that belong to the session: its age and its own cap.
+    /// Applies the output bounds that belong to the session: its age, on a clock the caller can
+    /// prove, and its own cap, on any clock.
     fn collect_output(&self, session_id: SessionId, now_ms: TimestampMs, into: &mut Collected) {
         let directory = self.paths.session_spool(session_id);
-        if !directory.exists() {
-            return;
+        match directory.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                into.output_retained = Some(0);
+                return;
+            }
+            Err(error) => {
+                into.output_left_behind = Some(format!(
+                    "this session's spool could not be looked for: {error}"
+                ));
+                return;
+            }
         }
-        let mut history = match kr_worker::history::OutputHistory::with_spool(
-            0,
+        // The opener that creates and repairs nothing: collection removes what is past its
+        // bounds, and a directory that is not there is not one to make.
+        let mut history = match kr_worker::history::OutputHistory::read_spool(
             &directory,
             kr_worker::history::SpoolLayout::DEFAULT,
         ) {
@@ -692,6 +720,7 @@ impl ArchiveService {
             into.age_permitted,
         );
         into.output_bytes = taken.iter().map(|eviction| eviction.bytes).sum();
+        into.output_retained = Some(history.retained_bytes());
         into.output_left_behind = history.left_behind().map(str::to_owned);
     }
 

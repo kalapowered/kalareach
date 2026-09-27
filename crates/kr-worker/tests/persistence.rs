@@ -1488,6 +1488,11 @@ fn an_append_larger_than_the_room_left_makes_room_first_and_names_the_session_ca
         32,
         "at the cap rather than over it"
     );
+    assert!(
+        history.spool_peak_bytes() <= 32,
+        "the room was made before the write, not after it: {}",
+        history.spool_peak_bytes()
+    );
     assert!(segment_bytes_on_disk(&directory) <= 32);
     assert_eq!(history.oldest_retained_cursor(), 8);
     let (gap, bytes) = read_to_end(&history, 0);
@@ -1505,6 +1510,11 @@ fn an_append_larger_than_the_room_left_makes_room_first_and_names_the_session_ca
     history.append(&[b'c'; 100]);
     let retained = history.retained_bytes();
     assert!(retained <= 32 && retained > 32 - 8, "{retained}");
+    assert!(
+        history.spool_peak_bytes() <= 32,
+        "no piece of it was written before its room was made: {}",
+        history.spool_peak_bytes()
+    );
     assert!(segment_bytes_on_disk(&directory) <= 32);
     assert_eq!(history.oldest_retained_cursor(), 140 - retained);
     let (gap, bytes) = read_to_end(&history, 0);
@@ -1626,6 +1636,200 @@ fn a_segment_that_cannot_be_removed_stops_the_spool_rather_than_standing_over_th
     assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (32, 40));
     assert_eq!(gap.cause, Some(HistoryGapCause::SpoolUnavailable));
     assert_eq!(bytes, [b'c'; 8]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn a_stopped_spool_writes_what_the_window_kept_when_it_takes_output_again() {
+    // A spool that stopped because it could not open a segment still has room, so the resident
+    // window keeps what arrives meanwhile. The next pass that finds the spool can write again
+    // writes that first, so a reader of the directory alone finds nothing missing.
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = std::env::temp_dir().join(format!("kr-persist-resume-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(16, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    history.append(&[b'a'; 8]);
+    let mode = std::fs::metadata(&directory).expect("reads").permissions();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the directory unwritable");
+    history.append(&[b'b'; 8]);
+    std::fs::set_permissions(&directory, mode).expect("puts the permissions back");
+    assert_eq!(history.suspended().map(|(at, _)| at), Some(8));
+
+    history.apply_retention(OutputRetention::DEFAULT, 16, kr_ipc::now_ms(), true);
+    assert!(
+        history.suspended().is_none(),
+        "the spool takes output again"
+    );
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the directory alone");
+    let (gap, bytes) = read_to_end(&reopened, 0);
+    assert!(gap.is_none(), "nothing is missing: {gap:?}");
+    assert_eq!(bytes, [[b'a'; 8], [b'b'; 8]].concat());
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn a_resume_that_stops_again_part_way_keeps_what_it_wrote_and_writes_nothing_twice() {
+    // A resume writes from the point the spool stopped. If it stops again part way, what it wrote
+    // stays written and the next attempt starts after it: a file is never given the same cursors
+    // twice.
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-resume-part-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(32, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    history.append(&[b'a'; 8]);
+    let mode = std::fs::metadata(&directory).expect("reads").permissions();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the directory unwritable");
+    history.append(&[b'b'; 16]);
+    std::fs::set_permissions(&directory, mode).expect("puts the permissions back");
+    assert_eq!(history.suspended().map(|(at, _)| at), Some(8));
+    // Something stands where the second resumed segment's file would go.
+    let obstacle = segment_file(&directory, 16);
+    std::fs::create_dir(&obstacle).expect("puts a directory in its place");
+    std::fs::write(obstacle.join("in-the-way"), b"x").expect("and something in it");
+
+    history.apply_retention(OutputRetention::DEFAULT, 24, kr_ipc::now_ms(), true);
+    assert_eq!(
+        history.suspended().map(|(at, _)| at),
+        Some(16),
+        "it wrote one segment and stopped again past it"
+    );
+    history.apply_retention(OutputRetention::DEFAULT, 24, kr_ipc::now_ms(), true);
+    assert_eq!(
+        history.suspended().map(|(at, _)| at),
+        Some(16),
+        "a second attempt starts where the first stopped, not before it"
+    );
+    std::fs::remove_dir_all(&obstacle).expect("clears the way");
+    history.apply_retention(OutputRetention::DEFAULT, 24, kr_ipc::now_ms(), true);
+    assert!(history.suspended().is_none());
+
+    for start in [0, 8, 16] {
+        assert_eq!(
+            std::fs::metadata(segment_file(&directory, start))
+                .expect("the segment is there")
+                .len(),
+            8,
+            "the segment at {start} holds its eight bytes once"
+        );
+    }
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the directory alone");
+    let (gap, bytes) = read_to_end(&reopened, 0);
+    assert!(gap.is_none(), "{gap:?}");
+    assert_eq!(bytes, [[b'a'; 8], [b'b'; 8], [b'b'; 8]].concat());
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn what_an_append_removed_before_an_unlink_failed_still_names_the_session_cap() {
+    // Making room can remove one segment and fail on the next. The range that did go is the
+    // session cap's and is recorded as that; the range past the stop is the spool's.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-part-evict-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 16))
+            .expect("a spool");
+    // Segments of four, four and eight bytes: output that is not retained between them starts a
+    // new segment each time.
+    history.append(&[b'a'; 4]);
+    history.stop_retaining();
+    history.append(&[b'-'; 4]);
+    history.resume_retaining();
+    history.append(&[b'b'; 4]);
+    history.stop_retaining();
+    history.append(&[b'-'; 4]);
+    history.resume_retaining();
+    history.append(&[b'c'; 8]);
+    assert_eq!(history.retained_bytes(), 16);
+    // The second segment cannot be removed.
+    let second = segment_file(&directory, 8);
+    std::fs::remove_file(&second).expect("removes the second segment's file");
+    std::fs::create_dir(&second).expect("puts a directory in its place");
+    std::fs::write(second.join("in-the-way"), b"x").expect("and something in it");
+
+    // Eight more bytes need both four-byte segments to go.
+    history.append(&[b'd'; 8]);
+    assert_eq!(history.suspended().map(|(at, _)| at), Some(24));
+    let evictions = history.evictions();
+    assert!(
+        evictions
+            .iter()
+            .any(|eviction| eviction.limit == RetentionLimit::SessionCap
+                && eviction.from_cursor == 0
+                && eviction.bytes == 4),
+        "the segment that went is recorded as the session cap's: {evictions:?}"
+    );
+    let past = history.page(24, 64).expect("a page");
+    assert_eq!(
+        past.gap.0.and_then(|gap| gap.cause),
+        Some(HistoryGapCause::SpoolUnavailable)
+    );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_newest_segment_that_goes_under_an_open_index_is_forgotten_and_the_next_byte_starts_a_new_one()
+{
+    // A handle open on a file that has gone writes to nothing any reader can reach. The next pass
+    // forgets the segment and drops the handle, so the session is counted as what it holds and
+    // the next output goes to a new file.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-newest-gone-{}", kr_ipc::new_uuid()));
+    let mut history = four_segments(&directory);
+    std::fs::remove_file(segment_file(&directory, 24)).expect("removes the newest segment");
+    history.apply_retention(OutputRetention::DEFAULT, 32, kr_ipc::now_ms(), true);
+    assert_eq!(
+        history.retained_bytes(),
+        28,
+        "the surviving files and the resident window hold 28 bytes"
+    );
+    assert_eq!(history.holes(), vec![(24, 28)]);
+    history.append(&[b'e'; 8]);
+    assert!(
+        segment_file(&directory, 32).exists(),
+        "the next output went to a new file"
+    );
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the directory alone");
+    let page = reopened.page(24, 64).expect("a page");
+    let gap = page.gap.0.expect("the range that went is a gap");
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (24, 32));
+    assert_eq!(page.bytes.as_slice(), &[b'e'; 8]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_position_past_output_the_spool_did_not_take_is_written_down_by_the_next_pass() {
+    // Privacy mode's output is not retained, and the cursor still moves past it. A spool reopened
+    // over the directory has to continue from there rather than reuse those cursors, so the next
+    // pass writes the position down.
+    let directory = std::env::temp_dir().join(format!(
+        "kr-persist-privacy-boundary-{}",
+        kr_ipc::new_uuid()
+    ));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    history.append(&[b'a'; 8]);
+    history.stop_retaining();
+    assert!(history.discard_retained().left_behind.is_none());
+    history.append(&[b'p'; 8]);
+    history.apply_retention(OutputRetention::DEFAULT, 0, kr_ipc::now_ms(), true);
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the directory alone");
+    assert_eq!(
+        reopened.next_cursor(),
+        16,
+        "the cursor continues past the output that was not kept"
+    );
     std::fs::remove_dir_all(&directory).ok();
 }
 
