@@ -432,7 +432,7 @@ impl Controller {
                 descriptor,
                 endpoint,
             },
-            Some(ready.session.clone()),
+            Some(ready.session.as_ref().clone()),
         )
         .await;
         Ok(())

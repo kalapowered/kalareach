@@ -396,7 +396,7 @@ fn ready_report(
         // package's binary rather than whatever the request named.
         shell_path: session.config().shell.program.clone(),
         dimensions: session.geometry().dimensions,
-        session: session.summary(),
+        session: Box::new(session.summary()),
     })
 }
 

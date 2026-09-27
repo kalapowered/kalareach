@@ -650,7 +650,9 @@ async fn a_report_does_not_wait_for_a_look_at_another_reservation() {
         root_process: process,
         shell_path: "/bin/cat".to_owned(),
         dimensions: kr_protocol::session::Dimensions::new(80, 24),
-        session: super::a_close_a_worker_never_answers::read_result(ready.session_id).session,
+        session: Box::new(
+            super::a_close_a_worker_never_answers::read_result(ready.session_id).session,
+        ),
     };
 
     // The look starts first and is still inside the silent worker's challenge.
@@ -721,7 +723,9 @@ async fn a_report_waits_for_a_look_at_its_own_reservation() {
         root_process: process,
         shell_path: "/bin/cat".to_owned(),
         dimensions: kr_protocol::session::Dimensions::new(80, 24),
-        session: super::a_close_a_worker_never_answers::read_result(reservation.session_id).session,
+        session: Box::new(
+            super::a_close_a_worker_never_answers::read_result(reservation.session_id).session,
+        ),
     };
 
     // The look starts first and is inside this reservation's challenge.

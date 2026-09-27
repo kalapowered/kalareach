@@ -616,7 +616,7 @@ async fn reported_late(script: &Arc<Scripted>) -> Silent {
         root_process: identity.process_start_identity().clone(),
         shell_path: "/bin/zsh".to_owned(),
         dimensions: INVISIBLE_DEFAULT_DIMENSIONS,
-        session: script.answer(session_id).session,
+        session: Box::new(script.answer(session_id).session),
     };
     controller
         .record_ready(reservation.reservation_id, &claim, &report)

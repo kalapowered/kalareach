@@ -344,7 +344,9 @@ pub struct WorkerReady {
     /// The daemon keeps it from the moment it records the worker, so a read that meets the worker
     /// on its way out is answered from the worker's own words, even where the create that started
     /// the worker stopped waiting before this report arrived.
-    pub session: crate::session::SessionSummary,
+    // Boxed so the control frame that carries the report is no larger than the others; the wire
+    // carries the description itself.
+    pub session: Box<crate::session::SessionSummary>,
 }
 
 /// A worker's challenge to a controller that wants to speak for a generation.
