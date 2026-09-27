@@ -6,6 +6,15 @@
 //! release names. Every test works in a directory of its own on the internal disk: an application
 //! directory with somebody's settings in it, a search path holding a stand-in for the application's
 //! executable and for the forwarder, and a package directory holding the recipe's files.
+//!
+//! On Windows this host applies and removes no recipe. The executor refuses every one at its
+//! preflight, before anything is written in an application's directory, because what it stands
+//! on exists on macOS and Linux only: every name is reached from one handle on the application's
+//! directory without following a link, a file is known by the device and inode a rename keeps, and
+//! a copy about to replace a document keeps its permission bits, owners and protection. So every
+//! test of what applying or removing does, and of where a run can stop, is compiled for Unix only,
+//! and on Windows the one test of that refusal runs, with the helpers the others share unused.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -306,6 +315,7 @@ fn refused(settled: &Settled) -> &str {
 
 /// KR-REQ-11.42: installing writes the recipe's three files and its one key and nothing else, and
 /// every other setting keeps its bytes.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_installing_writes_the_three_files_and_the_key_and_nothing_else() {
     let site = Site::new();
@@ -348,6 +358,7 @@ fn kr_req_11_42_installing_writes_the_three_files_and_the_key_and_nothing_else()
 
 /// KR-REQ-11.42: removal takes the key back out and deletes the three files, and the application's
 /// directory is again byte for byte what it was.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_removing_restores_the_tree() {
     for settings in [Some(SETTINGS), None, Some("{}")] {
@@ -385,6 +396,7 @@ fn kr_req_11_42_removing_restores_the_tree() {
 
 /// A second reconciliation of an applied release changes nothing, and a new host reads the same
 /// record back.
+#[cfg(unix)]
 #[test]
 fn an_applied_release_is_read_back_and_left_as_it_is() {
     let site = Site::new();
@@ -412,6 +424,7 @@ fn an_applied_release_is_read_back_and_left_as_it_is() {
 
 /// A release applied in one directory, and wanted again once this host keeps the application's
 /// plugins in another, is taken out of the first and applied in the second.
+#[cfg(unix)]
 #[test]
 fn a_release_follows_the_application_directory_to_another_place() {
     let site = Site::new();
@@ -444,6 +457,7 @@ fn a_release_follows_the_application_directory_to_another_place() {
 
 /// KR-REQ-11.42: a file somebody changed after it was installed is kept by removal and reported;
 /// the rest goes.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_file_somebody_changed_is_kept_and_reported() {
     let site = Site::new();
@@ -495,6 +509,7 @@ fn kr_req_11_42_a_file_somebody_changed_is_kept_and_reported() {
 
 /// KR-REQ-11.42: a key somebody else set is never replaced, whatever its value, and nothing is
 /// written.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_key_somebody_else_set_is_never_replaced() {
     for value in ["true", "false"] {
@@ -520,6 +535,7 @@ fn kr_req_11_42_a_key_somebody_else_set_is_never_replaced() {
 }
 
 /// A key this host added and somebody then changed is kept by removal.
+#[cfg(unix)]
 #[test]
 fn a_key_somebody_changed_after_the_installation_is_kept() {
     let site = Site::new();
@@ -550,6 +566,7 @@ fn a_key_somebody_changed_after_the_installation_is_kept() {
 
 /// KR-REQ-11.42: a file already at a destination that this host did not write stops the
 /// installation before anything is written, even when it holds the same bytes.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_file_this_host_did_not_write_is_refused() {
     let site = Site::new();
@@ -569,6 +586,7 @@ fn kr_req_11_42_a_file_this_host_did_not_write_is_refused() {
 
 /// KR-REQ-11.42: an executable whose signed record places it outside the recipe's range refuses the
 /// recipe before anything is written; one inside it does not.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_version_outside_the_range_is_refused_before_anything_is_written() {
     for (version, applies) in [
@@ -600,6 +618,7 @@ fn kr_req_11_42_a_version_outside_the_range_is_refused_before_anything_is_writte
 
 /// A version is known only from a signed record naming the executable's digest. Without one, and
 /// for a script, the recipe is refused and nothing is written.
+#[cfg(unix)]
 #[test]
 fn a_version_no_signed_record_establishes_is_refused() {
     let unsigned = |site: &Site| BridgeTarget {
@@ -647,6 +666,7 @@ fn a_version_no_signed_record_establishes_is_refused() {
 /// The registration a recipe installs starts the forwarder for its own package's application and
 /// for no other: a package whose registration names another package's application is refused
 /// before anything is written, and the package the registration names is applied.
+#[cfg(unix)]
 #[test]
 fn a_registration_for_another_packages_application_is_refused() {
     let site = Site::new();
@@ -677,6 +697,7 @@ fn a_registration_for_another_packages_application_is_refused() {
 /// A registration a recipe writes as a configuration value is read as a registration too: files
 /// that start the forwarder for the package's own application beside a settings key that starts
 /// it for another's are refused, and nothing is written.
+#[cfg(unix)]
 #[test]
 fn a_configuration_value_that_registers_another_application_is_refused() {
     let site = Site::new();
@@ -716,6 +737,7 @@ fn a_configuration_value_that_registers_another_application_is_refused() {
 }
 
 /// A forwarder the host cannot name, and an application it does not know, refuse the recipe.
+#[cfg(unix)]
 #[test]
 fn a_recipe_the_host_cannot_place_is_refused() {
     let site = Site::new();
@@ -741,6 +763,7 @@ fn a_recipe_the_host_cannot_place_is_refused() {
 }
 
 /// A package whose file is not the bytes its recipe names is refused.
+#[cfg(unix)]
 #[test]
 fn a_package_file_that_is_not_what_the_recipe_names_is_refused() {
     let site = Site::new();
@@ -861,6 +884,7 @@ fn a_removal_is_not_sent_through_a_link_into_another_directory() {
 
 /// A settings document that is a link, repeats a member or is not JSON this host can edit exactly
 /// is refused before anything is written.
+#[cfg(unix)]
 #[test]
 fn a_settings_document_that_cannot_be_edited_exactly_is_refused() {
     let site = Site::with_settings(Some("{\"a\": 1, \"a\": 2}"));
@@ -943,6 +967,7 @@ impl Drop for Restriction {
 
 /// A settings document that changes between the read and the replacement is read again, and the
 /// change somebody made survives.
+#[cfg(unix)]
 #[test]
 fn a_settings_document_edited_meanwhile_is_read_again() {
     let site = Site::new();
@@ -979,6 +1004,7 @@ fn a_settings_document_edited_meanwhile_is_read_again() {
 
 /// A settings document that keeps changing refuses the recipe part way, and the files already put
 /// in place are taken out again: an application finishes or is undone.
+#[cfg(unix)]
 #[test]
 fn a_document_that_keeps_changing_refuses_the_recipe_and_leaves_nothing_of_it() {
     let site = Site::new();
@@ -1026,6 +1052,7 @@ fn a_document_that_keeps_changing_refuses_the_recipe_and_leaves_nothing_of_it() 
 
 /// A refusal whose undo has to leave a file in place, because somebody changed it after this host
 /// placed it, is not reported as clean: the file is named as left.
+#[cfg(unix)]
 #[test]
 fn a_refusal_that_has_to_leave_a_changed_file_is_not_reported_as_clean() {
     let site = Site::new();
@@ -1107,6 +1134,7 @@ fn a_refusal_that_has_to_leave_a_changed_file_is_not_reported_as_clean() {
 
 /// A refusal stopped at any of its steps, and settled by a host started again, is never reported
 /// as clean while a file it placed, and somebody changed, is still there.
+#[cfg(unix)]
 #[test]
 fn a_refusal_stopped_at_each_boundary_is_never_clean_while_a_changed_file_remains() {
     let mut reached = 0;
@@ -1169,6 +1197,7 @@ fn a_refusal_stopped_at_each_boundary_is_never_clean_while_a_changed_file_remain
 
 /// A refusal names the file its undo had to leave even when, in the same run, something an earlier
 /// removal left is found gone.
+#[cfg(unix)]
 #[test]
 fn a_refusal_names_what_it_left_when_an_earlier_leftover_goes_in_the_same_run() {
     let site = Site::new();
@@ -1313,6 +1342,7 @@ fn left_and_named(site: &Site, settled: &Settled, step: usize) {
 /// the next reconciliation finishes it when the release is still wanted and takes it out when it is
 /// not. Something made and not yet recorded is neither taken nor claimed: it is named, and the
 /// bridge is not reported as applied until its owner removes it.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone() {
     let reference = Site::new();
@@ -1396,6 +1426,7 @@ fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone()
 
 /// KR-REQ-11.42: a removal stopped before any of its steps is finished by the next
 /// reconciliation.
+#[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_removal_stopped_at_each_boundary_is_finished() {
     let reference = Site::new();
@@ -1448,6 +1479,7 @@ fn kr_req_11_42_a_removal_stopped_at_each_boundary_is_finished() {
 
 /// An upgrade stopped before any of its steps ends with the new release applied and nothing of the
 /// old one left.
+#[cfg(unix)]
 #[test]
 fn an_upgrade_stopped_at_each_boundary_ends_with_the_new_release() {
     let mut boundaries = 0;
@@ -1511,6 +1543,7 @@ fn an_upgrade_stopped_at_each_boundary_ends_with_the_new_release() {
 
 /// A note is not ownership: what the owner put at a noted place before the change was made is
 /// theirs, and a removal leaves it.
+#[cfg(unix)]
 #[test]
 fn a_change_noted_and_not_made_does_not_claim_what_somebody_put_there() {
     let mut checked = 0;
@@ -1556,6 +1589,7 @@ fn a_change_noted_and_not_made_does_not_claim_what_somebody_put_there() {
 }
 
 /// The key noted before the settings document was replaced is not claimed when the owner sets it.
+#[cfg(unix)]
 #[test]
 fn a_key_noted_and_not_written_is_not_taken_when_the_owner_sets_it() {
     let mut checked = false;
@@ -1592,6 +1626,7 @@ fn a_key_noted_and_not_written_is_not_taken_when_the_owner_sets_it() {
 /// A key published and then carried through a rewrite of the document by somebody else cannot be
 /// shown to be this host's: it is neither taken nor claimed, and the bridge is reported as
 /// unsettled rather than applied. A key recorded as published before the rewrite is this host's.
+#[cfg(unix)]
 #[test]
 fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
     let mut unsettled = 0;
@@ -1652,6 +1687,7 @@ fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
 
 /// Something staged and recorded, then replaced at its temporary name while the run was stopped,
 /// is not the object the host staged: it is left and named, not removed.
+#[cfg(unix)]
 #[test]
 fn a_staged_file_replaced_while_the_run_was_stopped_is_left() {
     let mut checked = 0;
@@ -1699,6 +1735,7 @@ fn a_staged_file_replaced_while_the_run_was_stopped_is_left() {
 
 /// A publication the next run finds renamed into place is recorded only after its directory is
 /// flushed, and so is a removal it finds already done.
+#[cfg(unix)]
 #[test]
 fn what_a_stopped_run_did_is_recorded_only_after_its_directory_is_flushed() {
     // The run that installs, stopped between renaming the settings document into place and
@@ -2233,6 +2270,7 @@ fn a_run_stopped_part_way_is_not_settled_in_a_directory_put_in_its_place() {
 /// An object somebody puts at a temporary name after this host renamed its staged copy from there,
 /// and before it recorded the publication, is named, and does not hide what was published: the
 /// removal still takes out what this host placed.
+#[cfg(unix)]
 #[test]
 fn an_object_at_a_former_temporary_name_does_not_hide_what_was_published() {
     let before = Site::new().tree();
@@ -2315,6 +2353,7 @@ fn an_object_at_a_former_temporary_name_does_not_hide_what_was_published() {
 
 /// A settings document the key would create is held to the size this host reads back, as one it
 /// edits is: a recipe value that would make it larger is refused before anything is written.
+#[cfg(unix)]
 #[test]
 fn a_settings_document_the_key_would_create_past_the_limit_is_refused() {
     let site = Site::with_settings(None);
@@ -2342,6 +2381,7 @@ fn a_settings_document_the_key_would_create_past_the_limit_is_refused() {
 
 /// A staged write that fails takes back the file it made, and never a file somebody put at its
 /// name meanwhile: that one is left and named.
+#[cfg(unix)]
 #[test]
 fn a_staged_write_that_fails_takes_back_only_the_file_it_made() {
     let site = Site::new();
@@ -2402,6 +2442,7 @@ fn a_staged_write_that_fails_takes_back_only_the_file_it_made() {
 
 /// A cleanup a stopped run made, which the next run finds done, is flushed before its record goes:
 /// the staged copy recovery takes back, and the edit a removal withdraws.
+#[cfg(unix)]
 #[test]
 fn a_cleanup_a_stopped_run_made_is_flushed_before_its_record_goes() {
     // Recovery: an installation stopped before renaming the plugin manifest into place, then a
@@ -2414,11 +2455,11 @@ fn a_cleanup_a_stopped_run_made_is_flushed_before_its_record_goes() {
     };
     let apply =
         |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    // Bounded by the run: the search ends at the first step past the last one a run makes.
     let first = (1..)
-        .find(|step| {
-            stopped_at(*step + 1, &|_| {}, &apply)
-                .is_some_and(|stopped| stopped.steps.last() == Some(&before_rename(&stopped.site)))
-        })
+        .map_while(|step| stopped_at(step + 1, &|_| {}, &apply).map(|stopped| (step, stopped)))
+        .find(|(_, stopped)| stopped.steps.last() == Some(&before_rename(&stopped.site)))
+        .map(|(step, _)| step)
         .expect("the rename is a step");
     let prepare = |site: &Site| {
         let bridges = site.bridges();
@@ -2513,6 +2554,7 @@ fn a_cleanup_a_stopped_run_made_is_flushed_before_its_record_goes() {
 
 /// A copy of an installed file with the same bytes is not the file this host installed: a removal
 /// leaves it and names it.
+#[cfg(unix)]
 #[test]
 fn a_copy_of_an_installed_file_is_not_taken_for_it() {
     let site = Site::new();
@@ -2545,6 +2587,7 @@ fn a_copy_of_an_installed_file_is_not_taken_for_it() {
 
 /// A settings document the key would take past the size this host reads back is refused before
 /// anything is written.
+#[cfg(unix)]
 #[test]
 fn a_settings_document_the_key_would_take_past_the_limit_is_refused() {
     let padding = "x".repeat((1 << 20) - 64);
@@ -2707,6 +2750,7 @@ fn an_unreadable_directory_does_not_erase_what_is_not_settled() {
 
 /// A record of something left or not settled goes only once its absence is shown in its own
 /// directory and flushed.
+#[cfg(unix)]
 #[test]
 fn a_record_goes_only_once_its_absence_is_flushed() {
     let apply =
@@ -2914,6 +2958,7 @@ fn a_second_link_at_a_temporary_name_does_not_hide_what_was_published() {
 /// recorded doing so, is still the file this host placed: recovery records it, the removal leaves it
 /// as changed and names it, and a refusal is not reported as clean while it is there. The
 /// directories on the way are there already, so no directory of the host's is left to say so.
+#[cfg(unix)]
 #[test]
 fn a_file_changed_between_its_rename_and_its_record_is_still_the_hosts() {
     use std::io::Write as _;
@@ -2964,6 +3009,7 @@ fn a_file_changed_between_its_rename_and_its_record_is_still_the_hosts() {
 
 /// A key somebody else took out of the document is recorded as gone only once the document as it
 /// is now, and its directory, are durable.
+#[cfg(unix)]
 #[test]
 fn a_key_found_gone_is_recorded_only_after_its_document_is_synced() {
     let site = Site::new();
@@ -3003,6 +3049,7 @@ fn a_key_found_gone_is_recorded_only_after_its_document_is_synced() {
 
 /// A settings document somebody put in the place of the one this host created, with the same
 /// bytes, is not deleted by the removal: it keeps its file, and loses only the key.
+#[cfg(unix)]
 #[test]
 fn a_document_put_in_the_place_of_the_created_one_keeps_its_file() {
     let site = Site::with_settings(None);
