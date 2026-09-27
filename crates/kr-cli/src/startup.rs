@@ -690,10 +690,7 @@ async fn standalone(
         || Shown::said("it is still running"),
         |status| shown!("it has ended ({})", status),
     );
-    let said = log.last_line().map_or_else(
-        || Shown::said("its log holds nothing since it started"),
-        |line| last_line_said(&line),
-    );
+    let said = log.said("its log holds nothing since it started");
     Err(unanswered(shown!(
         "the control daemon this command started for environment {} (process {}) did not \
              answer within {} seconds: {}; {}, and {}; what it writes is in {}",
@@ -782,10 +779,7 @@ async fn managed(
         Ok(client) => return Ok((client, Some(started))),
         Err(last) => last,
     };
-    let said = log.last_line().map_or_else(
-        || Shown::said("its log holds nothing since it started"),
-        |line| last_line_said(&line),
-    );
+    let said = log.said("its log holds nothing since it started");
     let process = asked
         .pid
         .map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
@@ -913,6 +907,14 @@ impl Log {
             path: path.to_path_buf(),
             from,
         })
+    }
+
+    /// What a failure says of this start's part of the log: its last line where that is the
+    /// daemon's own refusal, that it holds a line, or `nothing`, the sentence for a log that holds
+    /// nothing since the start began.
+    fn said(&self, nothing: &'static str) -> Shown {
+        self.last_line()
+            .map_or_else(|| Shown::said(nothing), |line| last_line_said(&line))
     }
 
     /// The last line written since this start began, read through the handle that was checked.
@@ -1754,10 +1756,7 @@ mod windows {
     ) -> CliError {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
-        let said = log.last_line().map_or_else(
-            || Shown::said("its log holds nothing since the request was left"),
-            |line| super::last_line_said(&line),
-        );
+        let said = log.said("its log holds nothing since the request was left");
         match kr_ipc::starter::withdraw_claim(environment, asked.request) {
             Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked),
             Ok(Withdrawal::Taken) => super::unanswered(shown!(
@@ -2078,6 +2077,36 @@ mod tests {
             !environment.state_dir().join(LOG_FILE).exists(),
             "and no daemon was started beside it"
         );
+    }
+
+    /// A log whose part since the start began cannot be read is said to be unreadable, and never
+    /// to hold nothing: the daemon may have written why it stopped there.
+    #[test]
+    fn a_log_that_cannot_be_read_is_said_to_be_unreadable() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join(LOG_FILE);
+        std::fs::write(&path, "kr-controller: why it stopped\n").expect("the daemon's line");
+        // A handle through which the log's contents cannot be read: one that may only write, and
+        // on Windows read the file's attributes, which is what taking its length needs there.
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        options.write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// Reading a file's attributes and writing its data, and not reading its data.
+            const FILE_READ_ATTRIBUTES_AND_WRITE_DATA: u32 = 0x0080 | 0x0002;
+            options.access_mode(FILE_READ_ATTRIBUTES_AND_WRITE_DATA);
+        }
+        let log = Log {
+            file: options.open(&path).expect("opens the log"),
+            path: path.clone(),
+            from: 0,
+        };
+        let said = log.said("its log holds nothing since it started");
+        assert!(said.as_str().contains("could not be read"), "{said}");
+        assert!(!said.as_str().contains("holds nothing"), "{said}");
     }
 
     /// The log is taken only when it is a regular file of this user's that nobody else can read
