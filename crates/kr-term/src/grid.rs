@@ -654,7 +654,7 @@ impl CanonicalGrid {
     /// the other side would not, or the other way round.
     ///
     /// The record it returns carries the actions the adaptation produced, whether or not they were
-    /// applied. [`Self::apply_handing_over_actions`] is the same work without that copy.
+    /// applied. `Self::apply_handing_over_actions` is the same work without that copy.
     pub fn apply(&mut self, event: &Event) -> Adapted {
         let adapted = self.adapt_event(event);
         let mut applying = adapted.clone();
@@ -1961,7 +1961,7 @@ pub const HISTORY_ACCOUNT_MINIMUM_BYTES: u64 =
 /// occupies its slot, and a screen of them is not free.
 ///
 /// A row record is the one part of this model whose size is not the same on every supported host,
-/// so the figure is the largest of them and [`crate::layout`] says why.
+/// so the figure is the largest of them and `crate::layout` says why.
 pub const ROW_SLOT_BYTES: u64 = 2 * ROW_RECORD_BYTES;
 
 /// What one row allocates for itself before anything is on it.

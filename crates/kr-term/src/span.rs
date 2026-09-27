@@ -75,7 +75,7 @@ impl fmt::Debug for ByteSpan {
 
 /// The original bytes of one lexed sequence.
 ///
-/// A control sequence is almost always shorter than [`INLINE`] bytes, so the common case costs no
+/// A control sequence is almost always shorter than `INLINE` bytes, so the common case costs no
 /// allocation; a long text run or a long control string spills to the heap. The distinction is
 /// invisible through [`AsRef`].
 #[derive(Clone, PartialEq, Eq)]
