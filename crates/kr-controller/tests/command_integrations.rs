@@ -90,12 +90,17 @@ struct Daemon {
     rendezvous_endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     launches: std::sync::mpsc::Receiver<WorkerLaunch>,
-    _controller: Arc<Controller>,
+    controller: Arc<Controller>,
 }
 
 /// Starts a daemon whose environment has the package installed, with its configuration turning on
 /// the command integrations of `enabled`, or saying nothing of them where `enabled` is none.
 async fn daemon(enabled: Option<&[&str]>) -> Daemon {
+    daemon_declaring(enabled, &[]).await
+}
+
+/// Starts a daemon as [`daemon`] does, whose package's integration declares `flags`.
+async fn daemon_declaring(enabled: Option<&[&str]>, flags: &[&str]) -> Daemon {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -106,7 +111,7 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
     let source = fixture::package(
         &written,
         &temp.root().join("bin").join("kr-hook"),
-        &fixture::Shape::gemini_cli(&[]),
+        &fixture::Shape::gemini_cli(flags),
     )
     .expect("the package is written");
     let generation_home = tempfile::tempdir().expect("a directory on the internal disk");
@@ -234,7 +239,7 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
         rendezvous_endpoint,
         environment_id,
         launches,
-        _controller: controller,
+        controller,
     }
 }
 
@@ -268,6 +273,15 @@ fn target(environment_id: EnvironmentId) -> ActionTarget {
 /// Creates a session through the daemon, performs the worker's side of its rendezvous, and returns
 /// the launch specification the daemon hands the worker.
 async fn launched(daemon: &Daemon) -> WorkerLaunchSpec {
+    launched_from(
+        daemon,
+        create(daemon.environment_id, LaunchProfile::default()),
+    )
+    .await
+}
+
+/// Creates a session through the daemon from `request`, as [`launched`] does.
+async fn launched_from(daemon: &Daemon, request: SessionCreateParams) -> WorkerLaunchSpec {
     let creating = tokio::spawn({
         let endpoint = daemon.client_endpoint.clone();
         let environment_id = daemon.environment_id;
@@ -280,7 +294,7 @@ async fn launched(daemon: &Daemon) -> WorkerLaunchSpec {
                     Method::SessionCreate,
                     ActionId::new(kr_ipc::new_uuid()),
                     target(environment_id),
-                    &create(environment_id, LaunchProfile::default()),
+                    &request,
                 )
                 .await
         }
@@ -477,4 +491,51 @@ async fn kr_req_07_45_the_doctor_reports_each_integration_and_what_a_new_session
         .find(|check| check.id() == "command-integrations")
         .expect("the command integrations are checked");
     assert_eq!(check.status, DoctorStatus::Warning);
+}
+
+/// Sixteen flags of the most bytes a flag may have: the most a package may declare.
+fn largest_flags() -> Vec<String> {
+    (0..kr_plugin_sdk::integration::MAX_FLAGS)
+        .map(|index| {
+            format!(
+                "--{index}{}",
+                "x".repeat(kr_plugin_sdk::integration::MAX_FLAG_BYTES - 4)
+            )
+        })
+        .collect()
+}
+
+/// KR-REQ-12.07: a session whose integrations its launch specification cannot carry beside the
+/// person's own create request is launched without them rather than not at all, and the doctor's
+/// catalogue check names the session and every integration it was launched without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_doctor() {
+    let flags = largest_flags();
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let daemon = daemon_declaring(Some(&["kalareach/gemini-cli"]), &flags).await;
+    // A create request that one frame carries, with less room beside it than the integration takes.
+    let mut request = create(daemon.environment_id, LaunchProfile::default());
+    request.environment_snapshot = (0..245)
+        .map(|index| kr_protocol::session::EnvironmentVariable {
+            name: format!("FILLER_{index}"),
+            value: "x".repeat(4_000),
+        })
+        .collect();
+    let specification = launched_from(&daemon, request).await;
+    assert!(
+        specification
+            .create
+            .launch_profile
+            .command_integrations
+            .is_empty(),
+        "the integration did not fit"
+    );
+    let warnings = daemon.controller.catalogue_warnings().await;
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains(&specification.session_id.to_string())
+                && warning.contains("kalareach/gemini-cli")
+        }),
+        "{warnings:?}"
+    );
 }

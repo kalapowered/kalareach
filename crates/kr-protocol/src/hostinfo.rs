@@ -391,8 +391,10 @@ pub struct CommandIntegrationReport {
 }
 
 impl CommandIntegrationReport {
-    /// Returns this report with every value of it held to its class.
-    fn withheld_form(&self) -> Self {
+    /// Returns this report with every value of it held to its class: what it is in an answer to
+    /// anybody but the owner, which a host sizing its answer measures as well.
+    #[must_use]
+    pub fn withheld_form(&self) -> Self {
         let class = |field| export::class("CommandIntegrationReport", field);
         Self {
             plugin_id: export::carry(class("plugin_id"), &self.plugin_id),
@@ -487,6 +489,9 @@ pub enum CommandIntegrationUnavailable {
     /// No launcher, `kr-hook`, is installed beside this host's worker: every invocation runs as
     /// typed.
     NoLauncher,
+    /// The integrations the configuration turns on add more flags together than one session
+    /// carries, and this one is among the largest, which a session is launched without.
+    TooLarge,
 }
 
 impl CommandIntegrationUnavailable {
@@ -496,6 +501,7 @@ impl CommandIntegrationUnavailable {
         match self {
             Self::Platform => "platform",
             Self::NoLauncher => "no_launcher",
+            Self::TooLarge => "too_large",
         }
     }
 }

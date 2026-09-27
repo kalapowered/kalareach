@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::admission::AdmittedPackage;
-use kr_protocol::ids::PluginId;
+use kr_protocol::ids::{PluginId, SessionId};
 use kr_worker::broker::catalogue::testing::admitted;
 use kr_worker::broker::connectors::fixture;
 
@@ -64,7 +64,7 @@ fn each_integration_that_applies_gives_an_entry_on_or_off_by_the_configuration()
         store.admitted(&fixture::Shape::qoder_cli(), |_| {}),
     ];
     let reading = Integrations::new().read(&packages);
-    let entries = entries(&reading, &enabled(&["claude-code", "qoder-cli"]));
+    let entries = fill(&reading, &enabled(&["claude-code", "qoder-cli"])).entries;
     let summary: Vec<(PluginId, &str, usize, bool)> = entries
         .iter()
         .map(|entry| {
@@ -135,10 +135,11 @@ fn an_integration_that_does_not_apply_gives_no_entry() {
             .collect::<Vec<_>>()
     );
     assert!(
-        entries(
+        fill(
             &reading,
             &enabled(&["gemini-cli", "silent", "qoder-cli", "another-qoder"])
         )
+        .entries
         .is_empty()
     );
 }
@@ -151,18 +152,24 @@ fn a_package_is_checked_once_by_its_hash() {
     let package = store.admitted(&fixture::Shape::gemini_cli(&[]), |_| {});
     let integrations = Integrations::new();
     assert_eq!(
-        entries(&integrations.read(std::slice::from_ref(&package)), &[]).len(),
+        fill(&integrations.read(std::slice::from_ref(&package)), &[])
+            .entries
+            .len(),
         1
     );
     std::fs::remove_file(Path::new(&package.package_dir).join("presentation.json"))
         .expect("a file of the copy goes");
     assert_eq!(
-        entries(&integrations.read(std::slice::from_ref(&package)), &[]).len(),
+        fill(&integrations.read(std::slice::from_ref(&package)), &[])
+            .entries
+            .len(),
         1,
         "the check this reader kept"
     );
     assert!(
-        entries(&Integrations::new().read(&[package]), &[]).is_empty(),
+        fill(&Integrations::new().read(&[package]), &[])
+            .entries
+            .is_empty(),
         "a reader that never checked it refuses the copy"
     );
 }
@@ -224,7 +231,8 @@ fn the_doctor_reports_each_integration_and_its_resolution() {
         std::slice::from_ref(&left),
         &enabled(&["claude-code", "qoder-cli", "left", "missing"]),
         &able(vec![store.0.join("empty"), bin]),
-    );
+    )
+    .reports;
     let states: Vec<(String, CommandIntegrationState, IntegrationMode)> = reports
         .iter()
         .map(|report| (report.plugin_id.clone(), report.state, report.mode))
@@ -304,12 +312,13 @@ fn an_integration_on_where_no_backend_can_be_established_is_unavailable() {
             CommandIntegrationUnavailable::NoLauncher,
         ),
     ] {
-        let reports = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
+        let reported = report(Some(&reading), &[], &enabled(&["claude-code"]), &host);
+        let reports = &reported.reports;
         assert_eq!(reports[0].state, CommandIntegrationState::On);
         assert_eq!(reports[0].unavailable.0, Some(why));
         assert_eq!(reports[0].mode, IntegrationMode::NativeTerminal);
         assert_eq!(
-            check(&reports, &enabled(&["claude-code"])).status,
+            check(&reported, &enabled(&["claude-code"])).status,
             DoctorStatus::Warning
         );
     }
@@ -330,7 +339,7 @@ fn two_packages_integrating_one_command_are_reported_as_a_conflict() {
             |_| {},
         ),
     ]);
-    let reports = report(Some(&reading), &[], &[], &able(Vec::new()));
+    let reports = report(Some(&reading), &[], &[], &able(Vec::new())).reports;
     assert_eq!(reports.len(), 2);
     for reported in &reports {
         assert_eq!(reported.state, CommandIntegrationState::Conflict);
@@ -343,7 +352,10 @@ fn two_packages_integrating_one_command_are_reported_as_a_conflict() {
 /// integration the configuration turns on can be used, and warns when one cannot.
 #[test]
 fn the_check_warns_only_for_an_integration_turned_on_that_cannot_be_used() {
-    assert_eq!(check(&[], &[]).status, DoctorStatus::NotApplicable);
+    assert_eq!(
+        check(&Reported::default(), &[]).status,
+        DoctorStatus::NotApplicable
+    );
     let store = Store::new("check");
     let reading =
         Integrations::new().read(&[store.admitted(&fixture::Shape::gemini_cli(&[]), |_| {})]);
@@ -377,7 +389,7 @@ fn the_check_warns_only_for_an_integration_turned_on_that_cannot_be_used() {
 fn an_integration_turned_off_carries_no_flags() {
     let store = Store::new("off");
     let reading = Integrations::new().read(&[store.admitted(&fixture::Shape::qoder_cli(), |_| {})]);
-    let entries = entries(&reading, &[]);
+    let entries = fill(&reading, &[]).entries;
     assert_eq!(entries.len(), 1);
     assert!(!entries[0].enabled);
     assert!(entries[0].flags.is_empty(), "{:?}", entries[0].flags);
@@ -445,8 +457,8 @@ fn fits(specification: &kr_protocol::worker::WorkerLaunchSpec) -> bool {
 }
 
 /// KR-REQ-12.07: a session whose command integrations one control frame cannot carry is launched
-/// without the largest of them, which are named, rather than not launched at all; one that fits
-/// loses nothing.
+/// without the largest of them, which are returned, rather than not launched at all; the last one
+/// left out was needed to fit, and a specification that fits loses nothing.
 #[test]
 fn a_launch_specification_leaves_out_the_integrations_a_frame_cannot_carry() {
     let entry = |command: &str, flags: Vec<String>| CommandIntegration {
@@ -466,13 +478,19 @@ fn a_launch_specification_leaves_out_the_integrations_a_frame_cannot_carry() {
     );
     let omitted = fit_launch_specification(&mut specification);
     assert!(fits(&specification), "what is left fits");
-    assert!(!omitted.is_empty());
     let left = &specification.create.launch_profile.command_integrations;
     assert!(
         left.iter().any(|entry| entry.command == "small"),
         "the largest go first"
     );
     assert_eq!(left.len() + omitted.len(), 21, "nothing else goes");
+    let mut again = specification.clone();
+    again
+        .create
+        .launch_profile
+        .command_integrations
+        .push(omitted.last().expect("one is left out").clone());
+    assert!(!fits(&again), "the last one left out did not fit");
 
     let mut small = crate::catalogue::integrations::tests::specification(vec![entry(
         "small",
@@ -482,29 +500,21 @@ fn a_launch_specification_leaves_out_the_integrations_a_frame_cannot_carry() {
     assert_eq!(small.create.launch_profile.command_integrations.len(), 1);
 }
 
-/// The names of the packages a budget test writes, which a shape names for good.
-const BIG: [(&str, &str); 5] = [
-    ("big-a", "biga"),
-    ("big-b", "bigb"),
-    ("big-c", "bigc"),
-    ("big-d", "bigd"),
-    ("big-e", "bige"),
-];
+/// `text` for the life of the test process, as a package shape names it.
+fn lasting(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
 
-/// KR-REQ-07.45: the doctor's reports carry flags up to their budget; a report past it carries none
-/// and says why, so the doctor's answer fits the frame it travels in.
-#[test]
-fn the_doctor_reports_flags_within_their_budget() {
-    let store = Store::new("budget");
-    let flags = largest_flags();
+/// `count` packages named `<prefix>-<index>`, each integrating its own command with `flags`.
+fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<AdmittedPackage> {
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let packages: Vec<AdmittedPackage> = BIG
-        .iter()
-        .map(|(plugin_name, command)| {
+    (0..count)
+        .map(|index| {
+            let command = lasting(format!("{prefix}{index:03}"));
             store.admitted(
                 &fixture::Shape {
-                    plugin_name,
-                    display_name: "A large integration",
+                    plugin_name: lasting(format!("{prefix}-{index:03}")),
+                    display_name: "A test integration",
                     executable: command,
                     directory: &[],
                     integration: Some(fixture::declaration(command, &flags, &[])),
@@ -514,51 +524,266 @@ fn the_doctor_reports_flags_within_their_budget() {
                 |_| {},
             )
         })
-        .collect();
-    let reading = Integrations::new().read(&packages);
-    let reports = report(Some(&reading), &[], &[], &able(Vec::new()));
-    assert_eq!(reports.len(), BIG.len());
-    let carried: usize = reports
+        .collect()
+}
+
+/// The packages [`many`] writes, as the configuration names them.
+fn many_named(prefix: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("kalareach/{prefix}-{index:03}"))
+        .collect()
+}
+
+/// The bytes of flags a session's entries carry together.
+fn flag_bytes(entries: &[CommandIntegration]) -> usize {
+    entries
         .iter()
-        .flat_map(|report| report.flags.iter().map(String::len))
-        .sum();
+        .flat_map(|entry| entry.flags.iter().map(String::len))
+        .sum()
+}
+
+/// KR-REQ-12.07: a session's entries carry the flags of the integrations the configuration turns on
+/// up to one session's bound; past it the largest are left out and named, and the rest are carried
+/// whole.
+#[test]
+fn a_session_carries_the_flags_of_its_integrations_within_a_bound() {
+    let store = Store::new("session-flags");
+    let reading = Integrations::new().read(&many(&store, "big", 21, &largest_flags()));
+    let fill = fill(&reading, &many_named("big", 21));
     assert!(
-        carried <= MAX_REPORTED_FLAG_BYTES,
-        "{carried} bytes of flags in the reports"
+        flag_bytes(&fill.entries) <= kr_protocol::session::MAX_COMMAND_INTEGRATION_FLAG_BYTES,
+        "{} bytes of flags",
+        flag_bytes(&fill.entries)
     );
-    let trimmed: Vec<&CommandIntegrationReport> = reports
-        .iter()
-        .filter(|report| report.flags.is_empty())
-        .collect();
-    assert!(!trimmed.is_empty(), "some report is past the budget");
-    for report in trimmed {
+    assert_eq!(
+        fill.omitted.len(),
+        17,
+        "four integrations with the most flags a package may declare fit"
+    );
+    assert_eq!(fill.entries.len() + fill.omitted.len(), 21);
+    for entry in &fill.entries {
+        assert!(entry.enabled);
+        assert_eq!(entry.flags.len(), 16, "an entry is carried whole");
+        assert!(!fill.omitted.contains(&entry.plugin_id));
+    }
+}
+
+/// KR-REQ-12.07: a session carries at most its number of entries: every integration the
+/// configuration turns on, then as many that are off as there is room for.
+#[test]
+fn a_session_carries_at_most_its_number_of_entries() {
+    let store = Store::new("session-entries");
+    let count = kr_protocol::session::MAX_COMMAND_INTEGRATION_ENTRIES + 2;
+    let reading = Integrations::new().read(&many(&store, "small", count, &["--small".to_owned()]));
+    let enabled = many_named("small", count).split_off(count - 3);
+    let fill = fill(&reading, &enabled);
+    assert_eq!(
+        fill.entries.len(),
+        kr_protocol::session::MAX_COMMAND_INTEGRATION_ENTRIES
+    );
+    assert!(fill.omitted.is_empty(), "an entry that is off adds nothing");
+    for named in &enabled {
         assert!(
-            report
-                .reason
-                .0
-                .as_deref()
-                .is_some_and(|reason| reason.contains("flags")),
-            "{:?}",
-            report.reason
+            fill.entries
+                .iter()
+                .any(|entry| entry.enabled && entry.plugin_id.as_str() == named),
+            "{named} is carried"
         );
     }
+    assert!(
+        fill.entries
+            .windows(2)
+            .all(|pair| pair[0].command < pair[1].command),
+        "in command order"
+    );
+}
+
+/// KR-REQ-12.07: one note names every integration a launch left out, however many there are.
+#[test]
+fn one_note_names_every_integration_a_launch_leaves_out() {
+    let session_id = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+    assert!(omission_note(session_id, &[]).is_none());
+    let omitted: Vec<PluginId> = (0..17)
+        .map(|index| plugin(&format!("big-{index:03}")))
+        .collect();
+    let note = omission_note(session_id, &omitted).expect("a note");
+    assert!(note.contains(&session_id.to_string()), "{note}");
+    for plugin_id in &omitted {
+        assert!(note.contains(plugin_id.as_str()), "{plugin_id} in {note}");
+    }
+}
+
+/// KR-REQ-07.45: the doctor reports an integration a session created now would be launched without
+/// as one it cannot launch through, and the check warns.
+#[test]
+fn the_doctor_marks_an_integration_a_session_is_launched_without() {
+    let store = Store::new("too-large");
+    let reading = Integrations::new().read(&many(&store, "big", 5, &largest_flags()));
+    let enabled = many_named("big", 5);
+    let left_out = fill(&reading, &enabled).omitted;
+    assert_eq!(left_out.len(), 1);
+    let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
+    assert_eq!(reported.reports.len(), 5);
+    for report in &reported.reports {
+        assert_eq!(report.state, CommandIntegrationState::On);
+        assert_eq!(
+            report.unavailable.0 == Some(CommandIntegrationUnavailable::TooLarge),
+            left_out
+                .iter()
+                .any(|plugin_id| plugin_id.as_str() == report.plugin_id),
+            "{}",
+            report.plugin_id
+        );
+    }
+    assert_eq!(check(&reported, &enabled).status, DoctorStatus::Warning);
+}
+
+/// The bytes `value` takes encoded as it travels.
+fn encoded(value: &impl serde::Serialize) -> usize {
+    kr_cbor::encoded_len(&kr_cbor::to_canonical_value(value).expect("a value"))
+}
+
+/// KR-REQ-07.45: the doctor's reports are carried whole within the bytes one answer gives them, in
+/// either of its forms; the rest are left out and counted, and the check says so.
+#[test]
+fn the_doctor_carries_whole_reports_within_its_bytes() {
+    let store = Store::new("report-bytes");
+    let reading = Integrations::new().read(&many(&store, "big", 8, &largest_flags()));
+    let reported = report(Some(&reading), &[], &[], &able(Vec::new()));
+    assert!(reported.omitted > 0, "eight of the largest do not fit");
+    assert_eq!(reported.reports.len() + reported.omitted, 8);
+    let carried: usize = reported
+        .reports
+        .iter()
+        .map(|report| encoded(report).max(encoded(&report.withheld_form())))
+        .sum();
+    assert!(carried <= MAX_REPORT_BYTES, "{carried} bytes");
+    for report in &reported.reports {
+        assert_eq!(report.flags.len(), 16, "a report is carried whole");
+    }
+    let check = check(&reported, &[]);
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check.detail().contains(&reported.omitted.to_string()),
+        "{}",
+        check.detail()
+    );
+}
+
+/// KR-REQ-07.45: the doctor carries at most its number of reports, the packages the configuration
+/// names first, in package order, and counts the rest.
+#[test]
+fn the_doctor_carries_at_most_its_number_of_reports_configured_first() {
+    let store = Store::new("report-count");
+    let count = MAX_REPORTS + 4;
+    let reading = Integrations::new().read(&many(&store, "small", count, &["--small".to_owned()]));
+    let enabled = many_named("small", count).split_off(count - 3);
+    let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
+    assert_eq!(reported.reports.len(), MAX_REPORTS);
+    assert_eq!(reported.omitted, 4);
+    for named in &enabled {
+        assert!(
+            reported
+                .reports
+                .iter()
+                .any(|report| &report.plugin_id == named),
+            "{named} is carried"
+        );
+    }
+    assert!(
+        reported
+            .reports
+            .windows(2)
+            .all(|pair| pair[0].plugin_id < pair[1].plugin_id),
+        "in package order"
+    );
+}
+
+/// KR-REQ-07.45: the doctor's whole answer, with the most its reports may take, fits the one
+/// response frame it travels in, in the owner's form and in the withheld one.
+#[test]
+fn the_doctor_answer_fits_one_response_frame() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+    use kr_protocol::hostinfo::export::ForExport as _;
+
+    let store = Store::new("answer");
+    let mut packages = many(&store, "big", 8, &largest_flags());
+    packages.extend(many(&store, "small", MAX_REPORTS, &["--small".to_owned()]));
+    let reading = Integrations::new().read(&packages);
+    let enabled = many_named("big", 8);
+    let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    environment.create().expect("the environment's directories");
+    let effective = crate::config::effective(
+        &crate::config::Accepted::in_force(
+            crate::config::open(&environment),
+            crate::config::HardLimits::default(),
+        ),
+        crate::config::HardLimits::default(),
+        kr_protocol::identity::WorkerProfile::HeadlessUser,
+    );
+    let checks = vec![check(&reported, &enabled)];
+    let result = kr_protocol::hostinfo::HostDoctorResult::new(checks, effective)
+        .with_command_integrations(reported.reports);
+    let answer = |value: ParamsValue| {
+        ControlFrame::Response(Response {
+            request_id: kr_protocol::ids::RequestId::new(u64::MAX),
+            outcome: Outcome::Ok(value),
+        })
+    };
+    let codec = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
+    codec
+        .encode_message(&answer(
+            ParamsValue::from_typed(&result).expect("the owner's form"),
+        ))
+        .expect("the owner's answer fits");
+    codec
+        .encode_message(&answer(
+            ParamsValue::from_typed(result.for_export().get()).expect("the withheld form"),
+        ))
+        .expect("the withheld answer fits");
 }
 
 /// KR-REQ-07.45: where the admissions in force could not be read, each package the configuration
 /// names is reported as unknown, never as not installed, and the check warns.
 #[test]
 fn a_failed_admissions_read_reports_the_configured_packages_as_unknown() {
-    let reports = report(None, &[], &enabled(&["claude-code"]), &able(Vec::new()));
-    let states: Vec<CommandIntegrationState> = reports.iter().map(|report| report.state).collect();
+    let reported = report(None, &[], &enabled(&["claude-code"]), &able(Vec::new()));
+    let states: Vec<CommandIntegrationState> =
+        reported.reports.iter().map(|report| report.state).collect();
     assert_eq!(states, [CommandIntegrationState::Unknown]);
     assert_eq!(
-        check(&reports, &enabled(&["claude-code"])).status,
+        check(&reported, &enabled(&["claude-code"])).status,
         DoctorStatus::Warning
+    );
+    assert_eq!(unread_check().status, DoctorStatus::Warning);
+}
+
+/// KR-REQ-07.45: admissions read and empty say a configured package is not installed, which
+/// admissions not read cannot say.
+#[test]
+fn an_empty_reading_is_not_an_unread_one() {
+    let reading = Integrations::new().read(&[]);
+    let read = report(
+        Some(&reading),
+        &[],
+        &enabled(&["claude-code"]),
+        &able(Vec::new()),
+    );
+    assert_eq!(read.reports[0].state, CommandIntegrationState::NotInstalled);
+    let unread = report(None, &[], &enabled(&["claude-code"]), &able(Vec::new()));
+    assert_eq!(unread.reports[0].state, CommandIntegrationState::Unknown);
+    assert_eq!(
+        check(&report(Some(&reading), &[], &[], &able(Vec::new())), &[]).status,
+        DoctorStatus::NotApplicable,
+        "nothing admitted and nothing named"
     );
 }
 
 /// KR-REQ-07.45: the search takes each directory in its order and, in each, the platform's
-/// extensions in theirs, as a shell finds a command.
+/// extensions in theirs, as a shell finds a command: a match in an earlier directory wins over an
+/// earlier extension in a later one.
 #[test]
 fn the_search_takes_the_extensions_in_their_order() {
     let store = Store::new("extensions");
@@ -571,13 +796,19 @@ fn the_search_takes_the_extensions_in_their_order() {
         .map(|extension| (*extension).to_owned())
         .collect();
     assert_eq!(
-        resolve_with("claude", &[first, second.clone()], &extensions),
+        resolve_with("claude", &[first.clone(), second.clone()], &extensions),
         Some(exe)
     );
     let reversed: Vec<String> = extensions.iter().rev().cloned().collect();
     assert_eq!(
         resolve_with("claude", std::slice::from_ref(&second), &reversed),
         Some(second.join("claude.cmd"))
+    );
+    let bat = executable(&first, "claude.bat");
+    assert_eq!(
+        resolve_with("claude", &[first, second], &extensions),
+        Some(bat),
+        "the earlier directory wins"
     );
 }
 

@@ -223,6 +223,18 @@ impl ShellStartup {
     }
 }
 
+/// The most command integration entries one session carries: every one the configuration turns on,
+/// then as many that are off as there is room for.
+pub const MAX_COMMAND_INTEGRATION_ENTRIES: usize = 128;
+
+/// The most bytes of flags one session's command integration entries carry together.
+///
+/// A package may declare sixteen flags of four kilobytes each, and a session's entries travel in
+/// its launch specification and in every `session.read` answer, each one control frame beside
+/// the rest of the session. Past this bound the host launches the session without the largest of
+/// the integrations the configuration turns on, and says which.
+pub const MAX_COMMAND_INTEGRATION_FLAG_BYTES: usize = 256 * 1024;
+
 /// One agent's opt-in command integration.
 ///
 /// Section 12: where an agent needs integration flags, an explicitly enabled integration adds them

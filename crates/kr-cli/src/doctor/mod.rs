@@ -333,6 +333,10 @@ pub fn integration_lines(report: &CommandIntegrationReport) -> Vec<String> {
                 CommandIntegrationUnavailable::NoLauncher => {
                     "no kr-hook is installed beside this host's worker"
                 }
+                CommandIntegrationUnavailable::TooLarge => {
+                    "the integrations turned on add more flags than one session carries, and this \
+                     one's are among the largest"
+                }
             }
         ));
     }

@@ -4226,7 +4226,8 @@ impl Controller {
         // The session's command integrations are fixed here, when it is launched: from the
         // admissions its worker is handed first, read by a worker's own rules, and the
         // configuration in force now.
-        create.launch_profile.command_integrations = self.session_integrations(&admissions).await;
+        let fill = self.session_integrations(&admissions).await;
+        create.launch_profile.command_integrations = fill.entries;
         let plugins = admissions
             .first()
             .map(|first| kr_protocol::admission::AdmissionsHeader {
@@ -4250,13 +4251,11 @@ impl Controller {
         };
         // The specification is one control frame. Integrations it cannot carry are left out, the
         // largest first, and named for the doctor: the session starts without them.
-        for plugin_id in
-            crate::catalogue::integrations::fit_launch_specification(&mut specification)
-        {
+        for entry in crate::catalogue::integrations::fit_launch_specification(&mut specification) {
             self.note_admissions(format!(
-                "session {} was launched without the command integration of {plugin_id}: the \
-                 session's integrations are more than its launch specification carries",
-                reservation.session_id
+                "session {} was launched without the command integration of {}: the session's \
+                 integrations are more than its launch specification carries",
+                reservation.session_id, entry.plugin_id
             ));
         }
         Ok((specification, admissions))
@@ -4269,28 +4268,28 @@ impl Controller {
     async fn session_integrations(
         &self,
         admissions: &[kr_protocol::admission::PluginAdmissions],
-    ) -> Vec<kr_protocol::session::CommandIntegration> {
+    ) -> crate::catalogue::integrations::Fill {
         let packages: Vec<kr_protocol::admission::AdmittedPackage> = admissions
             .iter()
             .flat_map(|part| part.packages.iter().cloned())
             .collect();
         if packages.is_empty() {
-            return Vec::new();
+            return crate::catalogue::integrations::Fill::default();
         }
         let enabled = self.in_force().command_integrations;
         let integrations = Arc::clone(&self.integrations);
         let read = tokio::task::spawn_blocking(move || {
-            crate::catalogue::integrations::entries(&integrations.read(&packages), &enabled)
+            crate::catalogue::integrations::fill(&integrations.read(&packages), &enabled)
         });
         match tokio::time::timeout(WORKER_EXCHANGE, read).await {
-            Ok(Ok(entries)) => entries,
+            Ok(Ok(fill)) => fill,
             Ok(Err(_)) | Err(_) => {
                 self.note_admissions(
                     "a session's command integrations could not be read from its admissions in \
                      time, so it was launched with none"
                         .to_owned(),
                 );
-                Vec::new()
+                crate::catalogue::integrations::Fill::default()
             }
         }
     }
@@ -8444,10 +8443,13 @@ impl Controller {
         };
         match tokio::time::timeout(DOCTOR_READS, reported).await {
             // Admissions that could not be computed say nothing of what is installed.
-            Ok(Ok(reports)) if unread => (crate::catalogue::integrations::unread_check(), reports),
-            Ok(Ok(reports)) => (
-                crate::catalogue::integrations::check(&reports, &enabled),
-                reports,
+            Ok(Ok(reported)) if unread => (
+                crate::catalogue::integrations::unread_check(),
+                reported.reports,
+            ),
+            Ok(Ok(reported)) => (
+                crate::catalogue::integrations::check(&reported, &enabled),
+                reported.reports,
             ),
             // With nothing read there is nothing to resolve, so this does not block.
             Ok(Err(_)) | Err(_) => (
@@ -8457,7 +8459,8 @@ impl Controller {
                     &[],
                     &enabled,
                     &crate::catalogue::integrations::Host::default(),
-                ),
+                )
+                .reports,
             ),
         }
     }

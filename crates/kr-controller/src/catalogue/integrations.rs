@@ -29,6 +29,7 @@ use kr_protocol::hostinfo::{
     CommandIntegrationReport, CommandIntegrationState, CommandIntegrationUnavailable, DoctorCheck,
     DoctorStatus,
 };
+use kr_protocol::ids::{PluginId, SessionId};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_worker::broker::catalogue::{CheckedPackages, ReadPackage, Reading};
@@ -57,10 +58,38 @@ impl Integrations {
     }
 }
 
+/// What a session launched with some admissions is given of their command integrations.
+#[derive(Debug, Default)]
+pub struct Fill {
+    /// The session's entries, in command order.
+    pub entries: Vec<CommandIntegration>,
+    /// The packages whose integration the configuration turns on and the session is launched
+    /// without, since their flags are more than one session carries.
+    pub omitted: Vec<PluginId>,
+}
+
+/// What a session launched with `reading`'s admissions gets: an entry for each connector whose
+/// integration applies, on where `enabled` names its package.
+#[must_use]
+pub fn fill(reading: &Reading, enabled: &[String]) -> Fill {
+    Fill {
+        entries: entries(reading, enabled),
+        omitted: Vec::new(),
+    }
+}
+
+/// The note that names every integration the configuration turns on and a launch of `session_id`
+/// left out, or none where it left out none.
+#[must_use]
+pub fn omission_note(session_id: SessionId, omitted: &[PluginId]) -> Option<String> {
+    let _ = (session_id, omitted);
+    None
+}
+
 /// The entries a session launched with `reading`'s admissions gets: one for each connector whose
 /// integration applies, in command order, on where `enabled` names its package.
 #[must_use]
-pub fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration> {
+fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration> {
     let mut entries: Vec<CommandIntegration> = reading
         .packages
         .iter()
@@ -99,13 +128,20 @@ pub fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration>
 /// sixteen flags of four kilobytes each.
 pub const MAX_REPORTED_FLAG_BYTES: usize = 256 * 1024;
 
+/// The most command integration reports the doctor's answer carries.
+pub const MAX_REPORTS: usize = 256;
+
+/// The most bytes the doctor's command integration reports take in its answer together, in the
+/// larger of the owner's form and the withheld one.
+pub const MAX_REPORT_BYTES: usize = 384 * 1024;
+
 /// Leaves out of `specification` the command integrations one control frame cannot carry beside
-/// the rest of it, the largest first, and returns the packages it left out: a session is launched
+/// the rest of it, the largest first, and returns the entries it left out: a session is launched
 /// without an integration rather than not launched at all.
 #[must_use]
 pub fn fit_launch_specification(
     specification: &mut kr_protocol::worker::WorkerLaunchSpec,
-) -> Vec<kr_protocol::ids::PluginId> {
+) -> Vec<CommandIntegration> {
     let codec = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
     let fits = |specification: &kr_protocol::worker::WorkerLaunchSpec| {
         codec
@@ -126,7 +162,7 @@ pub fn fit_launch_specification(
             // What does not fit without any integration is not theirs to make fit.
             break;
         };
-        omitted.push(entries.remove(largest).plugin_id);
+        omitted.push(entries.remove(largest));
     }
     omitted
 }
@@ -178,6 +214,15 @@ impl Declared {
     }
 }
 
+/// The doctor's command integration reports, and how many it leaves out.
+#[derive(Debug, Default)]
+pub struct Reported {
+    /// The reports the answer carries, in package order.
+    pub reports: Vec<CommandIntegrationReport>,
+    /// How many it leaves out, since one answer carries no more.
+    pub omitted: usize,
+}
+
 /// Every command integration an admitted release declares, and every package the configuration
 /// names, as the doctor reports it, in package order. An installation the admissions leave out is
 /// reported where the configuration names it: a new session gets nothing of it either way.
@@ -193,7 +238,7 @@ pub fn report(
     left_out: &[LeftOut],
     enabled: &[String],
     host: &Host,
-) -> Vec<CommandIntegrationReport> {
+) -> Reported {
     let configured = |plugin: &str| enabled.iter().any(|named| named == plugin);
     let mut reports: BTreeMap<String, (CommandIntegrationReport, Option<Arc<InstalledConnector>>)> =
         BTreeMap::new();
@@ -315,7 +360,7 @@ pub fn report(
         reports.insert(plugin_id.clone(), (report, None));
     }
     let mut reported_flag_bytes = 0usize;
-    reports
+    let reports = reports
         .into_values()
         .map(|(mut report, connector)| {
             let flag_bytes: usize = report.flags.iter().map(String::len).sum();
@@ -357,7 +402,11 @@ pub fn report(
             }
             report
         })
-        .collect()
+        .collect();
+    Reported {
+        reports,
+        omitted: 0,
+    }
 }
 
 /// One report, before the host's own reading: no resolution, and the terminal as its mode.
@@ -418,9 +467,10 @@ fn resolve_with(command: &str, search_path: &[PathBuf], extensions: &[String]) -
 /// The doctor's check of the command integrations: whether every integration the configuration
 /// turns on is one a session created now can use.
 #[must_use]
-pub fn check(reports: &[CommandIntegrationReport], enabled: &[String]) -> DoctorCheck {
+pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
     const ID: &str = "command-integrations";
     const TITLE: &str = "The command integrations new sessions apply";
+    let reports = &reported.reports;
     if reports.is_empty() {
         return DoctorCheck::new(
             ID,
