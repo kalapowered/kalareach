@@ -86,6 +86,13 @@ pub struct ConnectionState {
     pub environment_id: Option<String>,
     /// Why there is no connection, in plain words, when there is none.
     pub reason: Option<String>,
+    /// What this connection may do, when it is live.
+    ///
+    /// The connection is to the host on this machine, over its own socket, which authenticated the
+    /// operating-system user this application runs as: the host's owner, whose authority is every
+    /// action. A control whose visibility turns on a right is shown from this, and the host checks
+    /// the right again when the action arrives.
+    pub rights: Option<Vec<kr_protocol::rights::ActionRight>>,
 }
 
 impl ConnectionState {
@@ -96,6 +103,18 @@ impl ConnectionState {
             connected: false,
             environment_id: None,
             reason: Some(reason.into()),
+            rights: None,
+        }
+    }
+
+    /// The state of a live connection to the host on this machine, in `environment_id`.
+    #[must_use]
+    pub fn owner(environment_id: EnvironmentId) -> Self {
+        Self {
+            connected: true,
+            environment_id: Some(environment_id.to_string()),
+            reason: None,
+            rights: Some(kr_protocol::rights::ActionRight::ALL.to_vec()),
         }
     }
 }
@@ -227,6 +246,38 @@ mod tests {
     fn the_declared_build_identity_is_valid() {
         let build = build_id().expect("a valid build identity");
         assert!(build.as_str().starts_with("kalareach-companion/"));
+    }
+
+    /// KR-REQ-11.48: a live connection to the host on this machine says what it may do, in the
+    /// protocol's own names, so a control whose visibility turns on a right is decided from a fact
+    /// rather than a guess; a lost connection says nothing about rights at all.
+    #[test]
+    fn a_live_local_connection_carries_every_right_and_a_lost_one_none() {
+        let environment: EnvironmentId = "3f1a2c40-11aa-4b2c-9d3e-000000000001"
+            .parse()
+            .expect("an environment identity");
+        let live = serde_json::to_value(ConnectionState::owner(environment)).expect("encodes");
+        let rights: Vec<String> = serde_json::from_value(live["rights"].clone()).expect("a list");
+        let every: Vec<String> = kr_protocol::rights::ActionRight::ALL
+            .iter()
+            .map(|right| {
+                serde_json::to_value(right)
+                    .expect("encodes")
+                    .as_str()
+                    .expect("a name")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(rights, every);
+        assert!(rights.contains(&"agent.prompt".to_owned()));
+        assert_eq!(live["connected"], serde_json::Value::Bool(true));
+        assert_eq!(
+            live["environment_id"],
+            serde_json::json!(environment.to_string())
+        );
+
+        let lost = serde_json::to_value(ConnectionState::unreachable("no host")).expect("encodes");
+        assert_eq!(lost["rights"], serde_json::Value::Null);
     }
 
     /// KR-REQ-10.01: what crosses to the WebView is a host event's payload as the native client

@@ -102,11 +102,7 @@ impl AppState {
             .read()
             .expect("the state lock is not poisoned");
         match held.as_ref() {
-            Some(connection) => ConnectionState {
-                connected: true,
-                environment_id: Some(connection.environment_id().to_string()),
-                reason: None,
-            },
+            Some(connection) => ConnectionState::owner(connection.environment_id()),
             None => ConnectionState {
                 connected: false,
                 environment_id: None,
@@ -115,6 +111,7 @@ impl AppState {
                     .read()
                     .expect("the state lock is not poisoned")
                     .clone(),
+                rights: None,
             },
         }
     }
