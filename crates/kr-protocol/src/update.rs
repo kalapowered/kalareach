@@ -605,6 +605,43 @@ struct Envelope {
     signed: ReleaseManifest,
 }
 
+/// A manifest's members held exactly as they were read: what the release keys signed, members
+/// this build does not know included, so a signature is checked over the document its signer
+/// wrote rather than over this build's reading of it.
+///
+/// Serialised, it is those members again; a checker computes their canonical form from this.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SignedMembers(serde_json::Value);
+
+impl SignedMembers {
+    /// The members a manifest serialises to, which is what a signer signs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::Malformed`] when the manifest does not serialise, which a manifest
+    /// of these types always does.
+    pub fn of(manifest: &ReleaseManifest) -> Result<Self, ManifestError> {
+        serde_json::to_value(manifest)
+            .map(Self)
+            .map_err(|error| ManifestError::Malformed(error.to_string()))
+    }
+
+    /// Reads the manifest these members are, past members this build does not know, and checks
+    /// that it can be a release's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError`] when the members are not a release manifest, or list files a
+    /// host cannot install.
+    pub fn manifest(&self) -> Result<ReleaseManifest, ManifestError> {
+        let manifest: ReleaseManifest = serde_json::from_value(self.0.clone())
+            .map_err(|error| ManifestError::Malformed(error.to_string()))?;
+        manifest.check()?;
+        Ok(manifest)
+    }
+}
+
 impl ReleaseManifest {
     /// Reads the manifest out of a release's `release.json`, without looking at its signatures,
     /// and checks that it can be a release's.
@@ -946,6 +983,25 @@ mod tests {
         let mut outside = document;
         outside["signed"]["files"][0]["path"] = serde_json::json!("bin/../../escape");
         assert!(ReleaseManifest::read_document(outside.to_string().as_bytes()).is_err());
+    }
+
+    /// Signed members are what the signer wrote: read back, a member this build does not know is
+    /// still there to be checked, and the manifest they are is read past it.
+    #[test]
+    fn signed_members_keep_what_this_build_does_not_know() {
+        let written = manifest(vec![file("bin/kr")]);
+        let mut value = serde_json::to_value(&written).expect("encodes");
+        value["stores"] = serde_json::json!([]);
+        let members: SignedMembers = serde_json::from_value(value.clone()).expect("reads");
+        assert_eq!(serde_json::to_value(&members).expect("encodes"), value);
+        assert_eq!(members.manifest().expect("a manifest"), written);
+        assert_eq!(
+            SignedMembers::of(&written)
+                .expect("serialises")
+                .manifest()
+                .expect("a manifest"),
+            written
+        );
     }
 
     /// A release retains the levels it names and no others.

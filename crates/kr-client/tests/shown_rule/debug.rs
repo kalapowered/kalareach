@@ -288,7 +288,7 @@ const STD_MODULE_MACROS: [&str; 5] = ["addr_of", "addr_of_mut", "offset_of", "pi
 
 /// Traits from outside the workspace that the two crates implement, each read in its source for
 /// being its crate's own trait and not the `Debug` trait under another name.
-const QUIET_TRAITS: [&str; 7] = [
+const QUIET_TRAITS: [&str; 8] = [
     "rmcp::ServerHandler",
     "rmcp::transport::Transport",
     "serde::Deserialize",
@@ -296,6 +296,7 @@ const QUIET_TRAITS: [&str; 7] = [
     "serde::de::Visitor",
     "tokio::io::AsyncRead",
     "tokio::io::AsyncWrite",
+    "tough::schema::Role",
 ];
 
 /// The derives the prelude gives every file.
