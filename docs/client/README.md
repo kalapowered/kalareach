@@ -163,9 +163,10 @@ line of anything that could put other text in a rendering: a hand-written `Displ
 claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
 types above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that
 prints what it compares, a log line, standard error written outside the reporter, standard output
-written, opened or taken whole outside the command line's writer, a JSON value or a tool result
-built outside it, and source it cannot follow: a renamed import, a macro, a derive it does not
-know, an attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds every
+written or opened outside the command line's writer, serde_json's value API named or a tool result
+made outside it, a raw handle on standard output named anywhere but in the three commands that own
+one, and source it cannot follow: a renamed import, a macro, a derive it does not know, an
+attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds every
 `Debug` of the two crates as well: a derived one only over fields whose own `Debug` prints nothing
 that arrived, found across every crate of the workspace, and one written by hand only formatting
 what a `Shown` may hold. The marker tests plant one marker where input goes (each text leaf, map
@@ -183,14 +184,17 @@ built from those, numbers, switches, lists and other documents; nothing converts
 value into one. `Asked` is content that arrived and that the command was asked for, such as a
 question's text, a repository's path or the name a paired device gave itself, and it names the
 request that asked for it. It has no `Display` and no `Debug` and never becomes a `Shown`, so it
-cannot reach standard error, a failure or a `Debug`. An asked location keeps its scheme, host, port
-and path, and never user information, a query or a fragment.
+cannot reach standard error, a failure or a `Debug`. An asked location is kept as it was written up
+to the end of its path, without user information, a query or a fragment, and text written as a URL
+that does not read as one is said as its class and its length.
 
 The rest of what a command prints is decided by what it is:
 
 - A value from the protocol's closed vocabulary, an identifier, a digest or a number is printed as
-  the protocol encodes it. An answer the host sends whole, such as `kr project list`'s, is printed
-  leaf by leaf in its own shape, each text leaf by one of these rules.
+  the protocol encodes it. Only the writer's own file can claim a type is such a value, and a test
+  holds every claim to the type's schema. An answer the host sends whole, such as
+  `kr project list`'s, is printed leaf by leaf in its own shape, each text leaf by one of these
+  rules.
 - A Git revision, a file mode, a digest or a build identity that arrives as text is printed when it
   matches its grammar, and as a placeholder when it does not.
 - A path goes through the reducers above: `host_path` for this installation's tree, `root` for one
@@ -205,9 +209,10 @@ The rest of what a command prints is decided by what it is:
 
 Three commands own standard output for a protocol or a terminal rather than for lines: the tool
 server, `kr bridge --stdio` and the attach guard. They are the only callers of the writer's two raw
-handles. The marker tests plant the marker in every text leaf of each answer a command prints,
-built from the answer type's schema, and find it only in the fields that hold asked content or the
-host's own sentences.
+handles. The marker tests build values of each type a command prints from that type's schema, with
+the marker in every text leaf and every alternative of every choice built at least once, and find
+the marker only in the fields that hold asked content, element by element, or the host's own
+sentences.
 
 ## Drafts
 
