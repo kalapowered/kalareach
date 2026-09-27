@@ -500,8 +500,14 @@ test.describe('closing a session', () => {
 })
 
 test.describe('settings over a live session', () => {
+  // KR-REQ-13.09: the desktop's navigation has Attention, Sessions and Hosts, and its settings open
+  // over a live session without leaving it: the conversation and the composer stay behind the
+  // sheet, and are there once it goes.
   test('opens over the session and can be dragged away', async ({ page }) => {
     await openSession(page)
+    await expect(
+      page.getByRole('complementary', { name: 'Workspace navigation' }).locator('nav').getByRole('button')
+    ).toContainText(['Attention', 'Sessions', 'Hosts'])
     await page.getByTestId('open-settings').click()
     const sheet = page.getByTestId('sheet')
     // The surface is still arriving when the engine first calls it visible, and it says which of
@@ -524,6 +530,8 @@ test.describe('settings over a live session', () => {
     // The flick is taken at once; the surface then leaves over as many frames as the machine gives
     // it, which is what this waits for.
     await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    await expect(page.getByTestId('conversation')).toBeVisible()
+    await expect(page.getByTestId('composer')).toBeVisible()
   })
 
   test('explains what answering means before a viewer can be given it', async ({ page }) => {
@@ -1657,6 +1665,7 @@ async function onPhone(page: Page, surface: 'ios' | 'android', seen: Seen, addre
 // KR-REQ-13.19: the tab bar names each destination whole at a person's own text size. With text too
 // large for four labels side by side, the tabs take two rows of two, and no label runs into another
 // or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
+// KR-REQ-13.09: the phone's destinations are Attention, Sessions, Hosts and Account, in that order.
 test.describe("the phone's tab bar", () => {
   const SIZES: readonly Seen[] = [
     { width: 320, height: 720, scale: '200%' },
@@ -1694,6 +1703,7 @@ test.describe("the phone's tab bar", () => {
             }
           })
         )
+        expect(placed.map((each) => each.name)).toEqual(['Attention', 'Sessions', 'Hosts', 'Account'])
         const target = surface === 'ios' ? 44 : 48
         for (const [index, each] of placed.entries()) {
           expect.soft(each.cut, `${each.name} is whole`).toBeLessThanOrEqual(1)
