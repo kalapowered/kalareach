@@ -18,6 +18,14 @@
 //! * a `ProtocolError` is built anywhere but the one constructor that takes a `Shown`;
 //! * production code logs, writes standard error outside the command line's reporter, formats a
 //!   panic, asserts on values, or calls `unwrap` or `expect`, whose panic renders what failed;
+//! * the command line's production code, outside its writer (`output.rs`), writes standard output
+//!   (`print!`, `println!`, a `print_json`) or opens it (`stdout()`, the standard library's or
+//!   tokio's), builds a JSON value (`json!`, `Value::String`, `Value::from`, `to_value`, a `Map`
+//!   made or filled; the two files that define what may be shown read a closed value's word
+//!   through `to_value`) or a tool result, or calls one of the writer's raw handles on standard
+//!   output (`output::protocol_stream`, `output::terminal`) anywhere but in the functions that own
+//!   standard output for a protocol or a terminal: the tool server's, `kr bridge --stdio`'s and
+//!   the attach guard's;
 //! * the source is one this reading cannot follow: an `Error` derive not spelled
 //!   `thiserror::Error`, an import of `thiserror`, a renamed import of a trait or a type the rule
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
@@ -1411,6 +1419,44 @@ const REFUSAL_FILE: &str = "crates/kr-client/src/error.rs";
 /// The command line's reporter, the one writer of standard error.
 const REPORTER_FILE: &str = "crates/kr-cli/src/report.rs";
 
+/// The command line's sources, whose standard output is its writer's.
+const COMMAND_LINE: &str = "crates/kr-cli/";
+
+/// The command line's writer: the one place standard output is written, a JSON value built and a
+/// tool result made.
+const WRITER_FILE: &str = "crates/kr-cli/src/output.rs";
+
+/// The writer's raw handles on standard output, by full path.
+const RAW_HANDLES: [&str; 2] = [
+    "kr_cli::output::protocol_stream",
+    "kr_cli::output::terminal",
+];
+
+/// The functions that own standard output for a protocol or a terminal, each with the raw handle
+/// it takes: the tool server's, `kr bridge --stdio`'s and the attach guard's.
+const HANDLE_OWNERS: [(&str, &str, &str); 4] = [
+    (
+        "crates/kr-cli/src/contact/mod.rs",
+        "run_stdio",
+        "kr_cli::output::protocol_stream",
+    ),
+    (
+        "crates/kr-cli/src/bridge/helper.rs",
+        "run",
+        "kr_cli::output::protocol_stream",
+    ),
+    (
+        "crates/kr-cli/src/bin/kr-attach-guard.rs",
+        "give_back_the_keyboard",
+        "kr_cli::output::terminal",
+    ),
+    (
+        "crates/kr-cli/src/bin/kr-attach-guard.rs",
+        "restore",
+        "kr_cli::output::terminal",
+    ),
+];
+
 /// What every rendering may hold, by full path.
 const SHOWN: &str = "kr_client::shown::Shown";
 const IO_FAULT: &str = "kr_client::shown::IoFault";
@@ -1768,6 +1814,77 @@ fn defined_after(tokens: &[Located], at: usize) -> Option<String> {
     None
 }
 
+/// The path written up to and including the identifier at `index`.
+fn path_ending_at(tokens: &[Located], index: usize) -> Vec<String> {
+    let mut segments: Vec<String> = ident(tokens.get(index))
+        .map(ToOwned::to_owned)
+        .into_iter()
+        .collect();
+    let mut at = index;
+    while at >= 3 && punct(tokens.get(at - 1), ':') && punct(tokens.get(at - 2), ':') {
+        let Some(word) = ident(tokens.get(at - 3)) else {
+            break;
+        };
+        segments.insert(0, word.to_owned());
+        at -= 3;
+    }
+    segments
+}
+
+/// Whether the type written up to the identifier at `index` is `serde_json`'s `name`, or one this
+/// reading cannot place and so could be.
+fn json_type(
+    source: &Source,
+    index: usize,
+    name: &str,
+    aliases: &BTreeMap<String, String>,
+) -> bool {
+    let segments = path_ending_at(&source.tokens, index);
+    source
+        .resolve(&segments, source.scope_at(index), aliases)
+        .is_none_or(|path| {
+            path.strip_prefix("serde_json::")
+                .is_some_and(|rest| rest.rsplit("::").next() == Some(name))
+        })
+}
+
+/// The name of the innermost function whose body holds the token at `index`.
+fn enclosing_function(tokens: &[Located], index: usize) -> Option<String> {
+    let mut found: Option<(usize, String)> = None;
+    for (at, located) in tokens.iter().enumerate().take(index) {
+        if ident(Some(located)) != Some("fn") {
+            continue;
+        }
+        let Some(name) = ident(tokens.get(at + 1)) else {
+            continue;
+        };
+        // The body opens at the first brace outside the signature's parentheses and brackets; a
+        // declaration without one ends at a semicolon.
+        let mut depth = 0_i64;
+        let mut open = None;
+        for (offset, token) in tokens.iter().enumerate().skip(at + 2) {
+            match token.token {
+                Token::Punct('(' | '[') => depth += 1,
+                Token::Punct(')' | ']') => depth -= 1,
+                Token::Punct(';') if depth == 0 => break,
+                Token::Punct('{') if depth == 0 => {
+                    open = Some(offset);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let inside = closing(tokens, open).is_some_and(|close| open < index && index < close);
+        if inside && found.as_ref().is_none_or(|(start, _)| open > *start) {
+            found = Some((open, name.to_owned()));
+        }
+    }
+    found.map(|(_, name)| name)
+}
+
 /// Reads the rule over every production file.
 fn check(sources: &[Source]) -> Vec<Finding> {
     let aliases = aliases(sources);
@@ -1799,6 +1916,8 @@ fn check_source(
 ) {
     let tokens = &source.tokens;
     let shown_file = SHOWN_FILES.contains(&source.name.as_str());
+    // The command line's standard output is its writer's, and so are its JSON values.
+    let held_output = source.name.starts_with(COMMAND_LINE) && source.name != WRITER_FILE;
     let mut find = |line: usize, item: &str, what: &str| {
         findings.insert(Finding {
             file: source.name.clone(),
@@ -1927,6 +2046,76 @@ fn check_source(
                 if next_is_bang =>
             {
                 find(line, word, "a log line");
+            }
+            "print" | "println" if next_is_bang && held_output => {
+                find(line, word, "standard output written outside the writer");
+            }
+            "print_json" if held_output => {
+                find(line, word, "standard output written outside the writer");
+            }
+            // A call of `stdout()`, not a method of that name such as a command's.
+            "stdout" if punct(tokens.get(index + 1), '(') && !after_dot && held_output => {
+                find(
+                    line,
+                    "stdout()",
+                    "standard output opened outside the writer",
+                );
+            }
+            "json" if next_is_bang && held_output && !shown_file => {
+                find(line, "json!", "a JSON value built outside the writer");
+            }
+            "to_value" if !after_dot && held_output && !shown_file => {
+                find(line, word, "a JSON value built outside the writer");
+            }
+            "Value"
+                if punct(tokens.get(index + 1), ':')
+                    && matches!(ident(tokens.get(index + 3)), Some("String" | "from"))
+                    && held_output
+                    && !shown_file
+                    && json_type(source, index, "Value", aliases) =>
+            {
+                let item = format!("Value::{}", ident(tokens.get(index + 3)).unwrap_or("?"));
+                find(line, &item, "a JSON value built outside the writer");
+            }
+            "Map"
+                if punct(tokens.get(index + 1), ':')
+                    && held_output
+                    && !shown_file
+                    && json_type(source, index, "Map", aliases) =>
+            {
+                find(line, word, "a JSON value built outside the writer");
+            }
+            "CallToolResult" if punct(tokens.get(index + 1), ':') && held_output => {
+                find(line, word, "a tool result made outside the writer");
+            }
+            // A call of a raw handle, placed through the file's imports; a call this reading
+            // cannot place could be one.
+            "protocol_stream" | "terminal"
+                if punct(tokens.get(index + 1), '(') && !after_dot && held_output =>
+            {
+                let path = source.resolve(
+                    &path_ending_at(tokens, index),
+                    source.scope_at(index),
+                    aliases,
+                );
+                let handle = path.as_deref().map_or(Some(word.as_str()), |path| {
+                    RAW_HANDLES.contains(&path).then_some(path)
+                });
+                if let Some(handle) = handle {
+                    let function = enclosing_function(tokens, index);
+                    let owned = HANDLE_OWNERS.iter().any(|(file, owner, owned)| {
+                        *file == source.name
+                            && function.as_deref() == Some(*owner)
+                            && *owned == handle
+                    });
+                    if !owned {
+                        find(
+                            line,
+                            handle,
+                            "a raw handle on standard output outside the functions that own it",
+                        );
+                    }
+                }
             }
             "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
                 if next_is_bang && !shown_file =>
@@ -2775,6 +2964,90 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             0,
             "whose Debug is not its Display",
         ),
+        (
+            "a line printed outside the writer",
+            "fn f(text: &str) {\n    println!(\"{text}\");\n}\n",
+            2,
+            "standard output written outside the writer",
+        ),
+        (
+            "text printed without a line",
+            "fn f(text: &str) {\n    std::print!(\"{text}\");\n}\n",
+            2,
+            "standard output written outside the writer",
+        ),
+        (
+            "a writer named like the old one",
+            "fn f(value: &kr_protocol::scalars::Uuid) {\n    crate::report::print_json(value);\n}\n",
+            2,
+            "standard output written outside the writer",
+        ),
+        (
+            "standard output opened",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let _ = std::io::stdout().write_all(text.as_bytes());\n}\n",
+            3,
+            "standard output opened outside the writer",
+        ),
+        (
+            "an asynchronous standard output opened",
+            "async fn f(text: &str) {\n    use tokio::io::AsyncWriteExt as _;\n    let _ = tokio::io::stdout().write_all(text.as_bytes()).await;\n}\n",
+            3,
+            "standard output opened outside the writer",
+        ),
+        (
+            "a JSON value written with json!",
+            "fn f(text: &str) -> serde_json::Value {\n    serde_json::json!({ \"text\": text })\n}\n",
+            2,
+            "a JSON value built outside the writer",
+        ),
+        (
+            "a JSON string",
+            "fn f(text: String) -> serde_json::Value {\n    serde_json::Value::String(text)\n}\n",
+            2,
+            "a JSON value built outside the writer",
+        ),
+        (
+            "a JSON value converted from text",
+            "use serde_json::Value;\nfn f(text: &str) -> Value {\n    Value::from(text)\n}\n",
+            3,
+            "a JSON value built outside the writer",
+        ),
+        (
+            "a JSON value serialised from text",
+            "fn f(text: &str) -> serde_json::Value {\n    serde_json::to_value(text).unwrap_or_default()\n}\n",
+            2,
+            "a JSON value built outside the writer",
+        ),
+        (
+            "a JSON object filled with text",
+            "fn f(text: String) -> serde_json::Map<String, serde_json::Value> {\n    let mut map = serde_json::Map::new();\n    map.insert(text, serde_json::Value::Null);\n    map\n}\n",
+            2,
+            "a JSON value built outside the writer",
+        ),
+        (
+            "a tool result made outside the writer",
+            "fn f(value: serde_json::Value) -> rmcp::model::CallToolResult {\n    rmcp::model::CallToolResult::structured(value)\n}\n",
+            2,
+            "a tool result made outside the writer",
+        ),
+        (
+            "a command writing text through a raw handle",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let _ = crate::output::terminal().write_all(text.as_bytes());\n}\n",
+            3,
+            "a raw handle on standard output",
+        ),
+        (
+            "a raw handle taken through an import",
+            "use crate::output::protocol_stream;\nfn f(text: &str) {\n    use std::io::Write as _;\n    let _ = protocol_stream().blocking().write_all(text.as_bytes());\n}\n",
+            4,
+            "a raw handle on standard output",
+        ),
+        (
+            "a raw handle in a function named like an owner in another file",
+            "pub async fn run_stdio() {\n    let _ = crate::output::protocol_stream().asynchronous();\n}\n",
+            2,
+            "a raw handle on standard output",
+        ),
     ];
     for (position, (class, text, line, what)) in cases.iter().enumerate() {
         let findings = if text.contains("mod moved;") || text.contains("mod item;") {
@@ -2834,6 +3107,67 @@ fn what_the_rule_allows_is_not_named() {
                     fn g(a: &str) { assert_eq!(a, \"x\"); eprintln!(\"{a}\"); Some(1).unwrap(); }\n\
                 }\n";
     let findings = findings_in("allowed", text);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// Standard output is written in the writer and taken whole only where a protocol or a terminal
+/// owns it: the tool server, `kr bridge --stdio` and the attach guard. A child process's own
+/// output and the question whether standard output is a terminal are not standard output written.
+#[test]
+fn the_writer_and_the_owners_of_standard_output_are_not_named() {
+    let scratch = Scratch::new(
+        "writer",
+        &[
+            (
+                "lib.rs",
+                "mod bridge;\nmod contact;\nmod control;\nmod error;\nmod output;\nmod shown;\n",
+            ),
+            ("shown.rs", SHOWN_CONTROL),
+            ("error.rs", ERRORS_CONTROL),
+            (
+                "output.rs",
+                "pub fn say(line: &str) {\n    println!(\"{line}\");\n}\n\
+                 pub fn document(values: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {\n    \
+                 let _ = serde_json::json!(null);\n    serde_json::Value::Object(values)\n}\n\
+                 pub fn terminal() -> std::io::Stdout {\n    std::io::stdout()\n}\n",
+            ),
+            (
+                "contact/mod.rs",
+                "pub async fn run_stdio() {\n    let _ = crate::output::protocol_stream().asynchronous();\n}\n",
+            ),
+            ("bridge/mod.rs", "mod helper;\n"),
+            (
+                "bridge/helper.rs",
+                "use crate::output;\npub async fn run() {\n    let _ = output::protocol_stream().blocking();\n}\n",
+            ),
+            (
+                "control.rs",
+                "fn f() -> bool {\n    \
+                 let _ = std::process::Command::new(\"true\").stdout(std::process::Stdio::null());\n    \
+                 let terminal = crate::output::is_terminal();\n    terminal\n}\n",
+            ),
+            (
+                "bin/kr-attach-guard.rs",
+                "fn restore() -> bool {\n    let terminal = kr_cli::output::terminal();\n    \
+                 let _ = terminal.lock();\n    true\n}\n\
+                 fn give_back_the_keyboard() -> bool {\n    \
+                 let mut handle = kr_cli::output::terminal();\n    \
+                 use std::io::Write as _;\n    handle.flush().is_ok()\n}\n",
+            ),
+        ],
+    );
+    let mut sources = scratch.sources().expect("the crate is readable");
+    sources.extend(
+        crate_sources(
+            &scratch.workspace,
+            &scratch
+                .workspace
+                .join("crates/kr-cli/src/bin/kr-attach-guard.rs"),
+            "kr_attach_guard",
+        )
+        .expect("the guard is readable"),
+    );
+    let findings = check(&sources);
     assert!(findings.is_empty(), "{findings:?}");
 }
 
