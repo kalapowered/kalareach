@@ -8,9 +8,8 @@
 //!
 //! Four kinds of script, because the contract has four decision points:
 //!
-//! * A **handshake** script drives [`decide_handshake`](crate::contract::transport::decide_handshake)
-//!   and [`decide_activation`](crate::contract::transport::decide_activation): who is admitted, who
-//!   is refused and with which named reason, and what a shell that inherited nothing does.
+//! * A **handshake** script drives [`decide_handshake`] and [`decide_activation`]: who is admitted,
+//!   who is refused and with which named reason, and what a shell that inherited nothing does.
 //! * A **fence** script drives [`FenceMachine`]: one stimulus per step at a stated clock reading,
 //!   with the state, the fence, the held batches in order and the actions in order.
 //! * A **pre-EOF** script drives [`BridgeFenceView`]: the detach condition, the gesture, the one
