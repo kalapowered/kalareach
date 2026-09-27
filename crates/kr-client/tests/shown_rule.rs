@@ -20,12 +20,13 @@
 //!   panic, asserts on values, or calls `unwrap` or `expect`, whose panic renders what failed;
 //! * the command line's production code, outside its writer (`output.rs`), writes standard output
 //!   (`print!`, `println!`, a `print_json`) or opens it (`stdout()`, the standard library's or
-//!   tokio's), builds a JSON value (`json!`, `Value::String`, `Value::from`, `to_value`, a `Map`
-//!   made or filled; the two files that define what may be shown read a closed value's word
-//!   through `to_value`) or a tool result, or calls one of the writer's raw handles on standard
-//!   output (`output::protocol_stream`, `output::terminal`) anywhere but in the functions that own
-//!   standard output for a protocol or a terminal: the tool server's, `kr bridge --stdio`'s and
-//!   the attach guard's;
+//!   tokio's), names serde_json's value API (its `Value`, `Map` and `Number`, `json!`, `to_value`
+//!   and `from_value`, wherever a path or an import names them; the two files that define what
+//!   may be shown read a closed value's word through `to_value`) or makes a tool result, or names
+//!   one of the writer's raw handles on standard output (`output::protocol_stream`,
+//!   `output::terminal`), in a call, a function value or an import, anywhere but in the functions
+//!   that own standard output for a protocol or a terminal: the tool server's, `kr bridge
+//!   --stdio`'s and the attach guard's;
 //! * the source is one this reading cannot follow: an `Error` derive not spelled
 //!   `thiserror::Error`, an import of `thiserror`, a renamed import of a trait or a type the rule
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
@@ -1814,6 +1815,29 @@ fn defined_after(tokens: &[Located], at: usize) -> Option<String> {
     None
 }
 
+/// serde_json's value API: its value, map and number types and their modules, and what builds a
+/// value or reads one back into a type.
+const JSON_VALUE_PATHS: [&str; 8] = [
+    "serde_json::Value",
+    "serde_json::Map",
+    "serde_json::Number",
+    "serde_json::value",
+    "serde_json::map",
+    "serde_json::json",
+    "serde_json::to_value",
+    "serde_json::from_value",
+];
+
+/// Whether a full path names serde_json's value API or something inside it.
+fn names_json_value(path: &str) -> bool {
+    JSON_VALUE_PATHS.iter().any(|named| {
+        path == *named
+            || path
+                .strip_prefix(named)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
 /// The path written up to and including the identifier at `index`.
 fn path_ending_at(tokens: &[Located], index: usize) -> Vec<String> {
     let mut segments: Vec<String> = ident(tokens.get(index))
@@ -1933,6 +1957,19 @@ fn check_source(
         };
         let next_is_bang = punct(tokens.get(index + 1), '!');
         let after_dot = index > 0 && punct(tokens.get(index - 1), '.');
+        // serde_json's value API, named at the start of any path, an import's included: outside
+        // the writer and the two files that define what may be shown, the command line holds no
+        // JSON value to fill, convert text into or print.
+        let starts_path =
+            !(index >= 2 && punct(tokens.get(index - 1), ':') && punct(tokens.get(index - 2), ':'));
+        if held_output && !shown_file && starts_path && !after_dot {
+            let (segments, _) = written_path(&tokens[index..]);
+            if let Some(path) = source.resolve(&segments, source.scope_at(index), aliases)
+                && names_json_value(&path)
+            {
+                find(line, &path, "a JSON value named outside the writer");
+            }
+        }
         match word.as_str() {
             "Plain" if ident(tokens.get(index + 1)) == Some("for") && !shown_file => {
                 find(
@@ -2088,19 +2125,20 @@ fn check_source(
             "CallToolResult" if punct(tokens.get(index + 1), ':') && held_output => {
                 find(line, word, "a tool result made outside the writer");
             }
-            // A call of a raw handle, placed through the file's imports; a call this reading
-            // cannot place could be one.
-            "protocol_stream" | "terminal"
-                if punct(tokens.get(index + 1), '(') && !after_dot && held_output =>
-            {
+            // A raw handle named anywhere but in a function that owns it: a call, a function value
+            // or an import, placed through the file's imports. A call this reading cannot place
+            // could be one; a name it cannot place that is not called is a local's.
+            "protocol_stream" | "terminal" if !after_dot && held_output => {
+                let called = punct(tokens.get(index + 1), '(');
                 let path = source.resolve(
                     &path_ending_at(tokens, index),
                     source.scope_at(index),
                     aliases,
                 );
-                let handle = path.as_deref().map_or(Some(word.as_str()), |path| {
-                    RAW_HANDLES.contains(&path).then_some(path)
-                });
+                let handle = match path.as_deref() {
+                    Some(path) => RAW_HANDLES.contains(&path).then_some(path),
+                    None => called.then_some(word.as_str()),
+                };
                 if let Some(handle) = handle {
                     let function = enclosing_function(tokens, index);
                     let owned = HANDLE_OWNERS.iter().any(|(file, owner, owned)| {
@@ -3048,6 +3086,42 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             2,
             "a raw handle on standard output",
         ),
+        (
+            "a raw handle taken as a function value",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let open = crate::output::terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            3,
+            "a raw handle on standard output",
+        ),
+        (
+            "a raw handle imported",
+            "use crate::output::terminal;\nfn f() -> bool {\n    true\n}\n",
+            1,
+            "a raw handle on standard output",
+        ),
+        (
+            "a JSON object given and filled with text",
+            "fn f(document: &mut serde_json::Map<String, serde_json::Value>, text: &str) {\n    document.insert(\"field\".to_owned(), text.into());\n}\n",
+            1,
+            "a JSON value named outside the writer",
+        ),
+        (
+            "a JSON value converted from text",
+            "fn f(text: String) -> serde_json::Value {\n    text.into()\n}\n",
+            1,
+            "a JSON value named outside the writer",
+        ),
+        (
+            "a JSON value's type imported",
+            "use serde_json::Value;\nfn f(text: String) -> Value {\n    text.into()\n}\n",
+            1,
+            "a JSON value named outside the writer",
+        ),
+        (
+            "a JSON value read back",
+            "fn f(value: &kr_protocol::scalars::Uuid) {\n    let _ = serde_json::from_value::<kr_protocol::scalars::Uuid>(serde_json::Value::Null);\n    let _ = value;\n}\n",
+            2,
+            "a JSON value named outside the writer",
+        ),
     ];
     for (position, (class, text, line, what)) in cases.iter().enumerate() {
         let findings = if text.contains("mod moved;") || text.contains("mod item;") {
@@ -3144,7 +3218,10 @@ fn the_writer_and_the_owners_of_standard_output_are_not_named() {
                 "control.rs",
                 "fn f() -> bool {\n    \
                  let _ = std::process::Command::new(\"true\").stdout(std::process::Stdio::null());\n    \
-                 let terminal = crate::output::is_terminal();\n    terminal\n}\n",
+                 let terminal = crate::output::is_terminal();\n    terminal\n}\n\
+                 fn g(record: &kr_protocol::scalars::Uuid) -> Option<kr_protocol::scalars::Uuid> {\n    \
+                 let bytes = serde_json::to_vec_pretty(record).ok()?;\n    \
+                 serde_json::from_slice(&bytes).ok()\n}\n",
             ),
             (
                 "bin/kr-attach-guard.rs",
