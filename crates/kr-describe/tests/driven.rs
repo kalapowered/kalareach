@@ -4,10 +4,10 @@
 mod support;
 
 use kr_describe::budget::{Budgets, GIB};
-use kr_describe::context::ContextSignal;
+use kr_describe::context::{ContextRevision, ContextSignal};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::profile::catalogue::MetGates;
-use kr_describe::queue::{Enqueued, Priority};
+use kr_describe::queue::Priority;
 use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
 };
@@ -95,7 +95,8 @@ fn produced(prompt: &str, peak_rss_bytes: u64) -> Answered {
 
 /// KR-REQ-22.16: a change that arrives while its session's job is in the process waits, pending,
 /// until the job has ended, so the job's result is published; the change then becomes the next
-/// revision. The control is the same change with no job in flight, which settles at once.
+/// revision at once, queued with the priority the host last gave. The control is the same change
+/// with no job in flight, which settles when its debounce has passed.
 #[test]
 fn a_change_while_its_job_runs_waits_and_becomes_the_next_revision() {
     let mut service = service();
@@ -105,27 +106,36 @@ fn a_change_while_its_job_runs_waits_and_becomes_the_next_revision() {
     };
     change(&mut service, &session(1), "crates", at(3_100));
     assert_eq!(
-        service.settle(&session(1), Priority::Ordinary, at(10_000)),
+        service.settle(&session(1), Priority::Foreground, at(10_000)),
         None,
         "the revision does not move under a running job"
     );
+    assert_eq!(service.revision(&session(1)), Some(ContextRevision::new(1)));
     assert!(matches!(
         service
             .finished(id, produced(&request.prompt, 0), at(10_500))
             .expect("the answer"),
         Outcome::Published { .. }
     ));
-    assert!(
-        matches!(
-            service.settle(&session(1), Priority::Ordinary, at(10_600)),
-            Some(Enqueued::Admitted)
-        ),
-        "the change that waited becomes the next job"
+    assert_eq!(
+        service.revision(&session(1)),
+        Some(ContextRevision::new(2)),
+        "the change that waited is the next revision"
     );
+    let waiting = service.scheduler().jobs();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].session_id, session(1));
+    assert_eq!(waiting[0].priority, Priority::Foreground);
+    assert_eq!(waiting[0].context.revision(), ContextRevision::new(2));
 
     // The control: with no job in flight a change settles once its debounce has passed.
     queue(&mut service, &session(2), "kalareach", at(20_000));
     change(&mut service, &session(2), "crates", at(22_100));
+    assert_eq!(
+        service.settle(&session(2), Priority::Ordinary, at(24_000)),
+        None,
+        "not before the debounce"
+    );
     assert!(
         service
             .settle(&session(2), Priority::Ordinary, at(24_200))
