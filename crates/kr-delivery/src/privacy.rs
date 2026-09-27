@@ -14,9 +14,11 @@
 //! 3. **Remove** the retained local content: the built request bodies and the encrypted objects a
 //!    preview's excess detail moved into. The records of what happened stay, because a host that
 //!    forgot its own attempts could not tell a person what the device did not see.
-//! 4. **Reconcile** before completion is reported. [`DeliveryOutbox::outstanding`] counts what was
-//!    on the wire and what has an unknown outcome, and privacy mode is not complete while either
-//!    is above nought.
+//! 4. **Reconcile** before completion is reported. [`DeliveryOutbox::outstanding`] counts the
+//!    sends on the wire, whose answers are still coming, and privacy mode is not complete while
+//!    any is. A notification whose outcome nobody knows is not waited for: under the fence
+//!    nothing asks the gateway what became of it, so the wait would never end. It is a copy that
+//!    may have left, shown in the exported list with its local content gone.
 //!
 //! And the part section 24 is most specific about: *already uploaded archives and notifications
 //! and copies held by authorised viewers are not retroactively erased. Show those retained
@@ -30,7 +32,7 @@ use kr_worker::privacy::{
     Unavailable,
 };
 
-use crate::journal::DeliveryJournal;
+use crate::journal::{DeliveryJournal, DeliveryState};
 
 /// The delivery outbox, as privacy mode sees it.
 ///
@@ -60,6 +62,26 @@ fn unavailable(what: &str, error: &crate::DeliveryError) -> Unavailable {
     Unavailable::new(format!("{what}: {error}"))
 }
 
+impl DeliveryOutbox<'_> {
+    /// Returns how many sends are on the wire: claimed by a pass and not yet answered.
+    ///
+    /// Those are the only deliveries whose answer is still coming. One settled as an unknown
+    /// outcome, or marked as the uncertainty an external message leaves, has left this host and
+    /// has no answer to wait for.
+    fn on_the_wire(&self) -> Result<u64, Unavailable> {
+        let unreconciled = self.journal.unreconciled().map_err(|error| {
+            unavailable(
+                "the delivery journal cannot say what is on the wire",
+                &error,
+            )
+        })?;
+        Ok(unreconciled
+            .iter()
+            .filter(|record| record.state == DeliveryState::InFlight)
+            .count() as u64)
+    }
+}
+
 impl PrivacySubsystem for DeliveryOutbox<'_> {
     fn name(&self) -> &'static str {
         "delivery"
@@ -78,13 +100,16 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
         &mut self,
         _generation: PrivacyGeneration,
     ) -> Result<Cancelled, Unavailable> {
-        self.journal
+        let (undispatched, _left) = self
+            .journal
             .cancel_undispatched(self.now_ms)
-            .map(|(undispatched, in_flight)| Cancelled {
-                undispatched,
-                in_flight,
-            })
-            .map_err(|error| unavailable("admitted deliveries could not be taken back", &error))
+            .map_err(|error| unavailable("admitted deliveries could not be taken back", &error))?;
+        // What is in flight is what reconciliation waits for, and nothing else: what had left
+        // earlier is now an uncertain copy, shown rather than waited for.
+        Ok(Cancelled {
+            undispatched,
+            in_flight: self.on_the_wire()?,
+        })
     }
 
     fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
@@ -95,12 +120,7 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
     }
 
     fn outstanding(&self) -> Result<u64, Unavailable> {
-        self.journal.outstanding().map_err(|error| {
-            unavailable(
-                "the delivery journal cannot say what is outstanding",
-                &error,
-            )
-        })
+        self.on_the_wire()
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -347,8 +367,8 @@ mod tests {
             "only what never left is taken back"
         );
         assert_eq!(
-            cancelled.1.in_flight, 1,
-            "what has left is counted rather than claimed back"
+            cancelled.1.in_flight, 0,
+            "nothing is on the wire: what left earlier is an uncertain copy, not a send to wait for"
         );
         assert_eq!(
             journal
@@ -401,12 +421,8 @@ mod tests {
         assert_eq!(PrivacyMode::reconcile(&[&outbox]), Completion::Complete);
     }
 
-    /// A notification the gateway may still deliver keeps the cleanup reconciling: section 24
-    /// reports completion only after what is outstanding has been accounted for, and a paired
-    /// device's receipt is the account.
-    #[test]
-    fn an_unknown_outcome_keeps_the_cleanup_reconciling() {
-        let mut journal = journal_with_work();
+    /// Admits one notification to the paired device, and returns its identifier.
+    fn admit_to_the_phone(journal: &mut DeliveryJournal, byte: u8) -> NotificationId {
         let phone = phone();
         journal
             .configure_destination(&phone)
@@ -415,19 +431,20 @@ mod tests {
             .take_events(
                 &consumer(),
                 &[TakenEvent {
-                    key: EventKey::outbox(&uuid(9)),
-                    source_cursor: 9,
+                    key: EventKey::outbox(&uuid(byte)),
+                    source_cursor: u64::from(byte),
                     session_id: None,
                     recorded_at_ms: TimestampMs::new(1_000),
                     notice: Vec::new(),
                 }],
-                9,
+                u64::from(byte),
             )
             .expect("a page");
+        let notification_id = NotificationId::new(uuid(byte + 20));
         journal
             .admit(&DeliveryRecord {
-                notification_id: NotificationId::new(uuid(21)),
-                event: EventKey::outbox(&uuid(9)),
+                notification_id,
+                event: EventKey::outbox(&uuid(byte)),
                 destination_id: phone.id.clone(),
                 state: DeliveryState::Admitted,
                 privacy_generation: 0,
@@ -443,10 +460,23 @@ mod tests {
                 dispatched: false,
             })
             .expect("admitted");
-        claim(&mut journal, 21, 1_500);
+        notification_id
+    }
+
+    /// A notification whose outcome nobody knows has left this host, and privacy mode's fence
+    /// stops anything asking the gateway what became of it: a fenced sweep asks nothing, and a
+    /// record of an earlier generation is never asked about afterwards. Waiting for it would never
+    /// end, so it is a copy that may have left, shown as a retained artifact with its local content
+    /// gone, and cleanup does not wait for it. A send on the wire is different: its answer is still
+    /// coming, and cleanup waits for that.
+    #[test]
+    fn an_unknown_outcome_is_a_retained_artifact_and_only_a_send_on_the_wire_is_waited_for() {
+        let mut journal = journal_with_work();
+        let unknown = admit_to_the_phone(&mut journal, 9);
+        claim(&mut journal, 9 + 20, 1_500);
         journal
             .record_attempt(&Transition {
-                notification_id: NotificationId::new(uuid(21)),
+                notification_id: unknown,
                 attempt: 1,
                 state: DeliveryState::OutcomeUnknown,
                 started_at_ms: TimestampMs::new(1_500),
@@ -459,11 +489,63 @@ mod tests {
                 reported_by_destination: false,
             })
             .expect("a transition");
+        // And one send is on the wire when privacy mode is enabled.
+        claim(&mut journal, 11, 1_700);
+
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(2_000));
+        let enabling = {
+            let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
+            mode.apply(&mut [&mut outbox], TimestampMs::new(2_000))
+        };
+        assert_eq!(
+            enabling.in_flight(),
+            1,
+            "only the send on the wire is in flight"
+        );
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
-        assert!(matches!(
+        assert_eq!(
             PrivacyMode::reconcile(&[&outbox]),
-            Completion::Reconciling { .. }
-        ));
+            Completion::Reconciling {
+                outstanding: vec![("delivery", 1)]
+            }
+        );
+        let exported = outbox.exported().expect("a list");
+        assert!(
+            exported
+                .iter()
+                .any(|copy| copy.kind == "notification" && !copy.deletable),
+            "the unknown outcome is shown: {exported:?}"
+        );
+        let record = journal
+            .delivery(unknown)
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(
+            record.state,
+            DeliveryState::OutcomeUnknown,
+            "its outcome is kept as it was"
+        );
+        assert_eq!(record.content, None, "its local content is gone");
+
+        // The send's answer arrives, and only then is the cleanup complete.
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(11)),
+                attempt: 1,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(1_700),
+                settled_at_ms: Some(TimestampMs::new(2_500)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("queued".to_owned()),
+                suppression: None,
+                left_this_host: false,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
+        assert_eq!(PrivacyMode::reconcile(&[&outbox]), Completion::Complete);
     }
 
     #[test]
