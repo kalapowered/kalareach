@@ -88,6 +88,27 @@ async function withUnconfirmedAction(page: Page, sessionId: string): Promise<voi
 }
 
 /**
+ * Sets a person's own text size on the page before it loads, so the page lays itself out at that
+ * size from its first frame, as a phone that already had the setting opens it.
+ */
+async function withTextSize(page: Page, size: string): Promise<void> {
+  await page.addInitScript((scale) => {
+    // The document may not have its root element yet: the size goes on it the moment it does.
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      root.style.fontSize = scale
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  }, size)
+}
+
+/**
  * How far `locator`'s element runs outside what a person sees of it: outside the screen, or
  * outside any box around it that clips what it holds. Zero when it is whole in view.
  */
@@ -1235,11 +1256,9 @@ test.describe("the phone's room for its terminal", () => {
         page
       }) => {
         await withUnconfirmedAction(page, SESSION_MAIN)
+        await withTextSize(page, scale)
         await page.setViewportSize({ width: phone.width, height: phone.height })
         await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
-        await page.evaluate((size) => {
-          document.documentElement.style.fontSize = size
-        }, scale)
         await page.getByRole('tab', { name: 'Terminal' }).click()
         await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
         const field = page.getByLabel('Message this session')
@@ -1303,11 +1322,9 @@ interface Seen {
 
 /** Opens the phone's harness on `surface` at `seen`, at `address`'s place. */
 async function onPhone(page: Page, surface: 'ios' | 'android', seen: Seen, address = ''): Promise<void> {
+  await withTextSize(page, seen.scale)
   await page.setViewportSize({ width: seen.width, height: seen.height })
   await page.goto(`/harness.html?surface=${surface}${address}`)
-  await page.evaluate((size) => {
-    document.documentElement.style.fontSize = size
-  }, seen.scale)
 }
 
 // KR-REQ-13.19: the tab bar names each destination whole at a person's own text size. With text too
