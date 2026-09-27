@@ -346,6 +346,12 @@ pub struct Controller {
     /// The environment's voice service: the coordinator and the seams it reads and proposes
     /// through. Built after the daemon exists, because two of its seams hold a weak reference back.
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
+    /// The environment's privacy record: privacy mode's generation, what each session still owes,
+    /// and the root that drives the backup service, delivery and the descriptions through it.
+    pub(crate) privacy: Arc<crate::privacy::EnvironmentPrivacy>,
+    /// The environment's session names and descriptions: the pins people set and the provenance of
+    /// generated descriptions, which outlive a session.
+    pub(crate) descriptions: Arc<crate::describe::DescribeModule>,
     /// The environment's notification delivery service.
     pub delivery: Arc<crate::push::DeliveryModule>,
     /// The loop that drives it: recovery at start, then a pass on every tick.

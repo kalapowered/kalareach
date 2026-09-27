@@ -1367,6 +1367,80 @@ fn write_obligation(
     }
 }
 
+impl crate::service::Controller {
+    /// Performs `privacy.set` under the admission it carries, and answers the report.
+    ///
+    /// The sessions the environment holds content for are every worker the registry records and
+    /// every session whose journal or spool is still on disk, and each owes its own cleanup when
+    /// privacy mode is turned on. The admission is asked again immediately before the change is
+    /// written, after every wait ([`EnvironmentPrivacy::set`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::WindowExpired`] for an action that carries no freshness, and
+    /// otherwise what [`EnvironmentPrivacy::set`] refuses with.
+    pub(crate) async fn privacy_set(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not change privacy mode"
+                    .to_owned(),
+            });
+        }
+        let params: kr_protocol::privacy::PrivacySetParams = mutation
+            .params
+            .to_typed()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let mut sessions: Vec<SessionId> = self
+            .registry_handle()
+            .lock()
+            .await
+            .workers()?
+            .into_iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        sessions.extend(self.archive().sessions_on_disk()?);
+        sessions.sort_unstable();
+        sessions.dedup();
+        let controller = Arc::clone(self);
+        let now_ms = kr_ipc::now_ms();
+        let report = tokio::task::spawn_blocking(move || {
+            controller
+                .privacy
+                .set(params.enabled, &sessions, now_ms, &|| {
+                    controller.check_registration(&carried)
+                })
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the privacy change stopped before it could say what it did".to_owned(),
+        })??;
+        kr_protocol::envelope::ParamsValue::from_typed(&report)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `privacy.status`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the report could not be made.
+    pub(crate) async fn privacy_status(&self) -> Result<kr_protocol::envelope::ParamsValue> {
+        let privacy = Arc::clone(&self.privacy);
+        let now_ms = kr_ipc::now_ms();
+        let report = tokio::task::spawn_blocking(move || privacy.status(now_ms))
+            .await
+            .map_err(|_| ControllerError::RegistryUnavailable {
+                detail: "privacy mode's report could not be made".to_owned(),
+            })?;
+        kr_protocol::envelope::ParamsValue::from_typed(&report)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+}
+
 /// Records that `subsystem` owes `work`.
 ///
 /// The same work failing again waits longer each time. Progress starts the schedule again: work

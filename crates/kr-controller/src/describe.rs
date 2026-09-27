@@ -260,6 +260,109 @@ impl DescribeModule {
     }
 }
 
+/// The metadata a session's deterministic title is built from, as this daemon holds it: the
+/// session's display number and the directory its root shell started in.
+///
+/// This daemon knows neither the repository nor the foreground application's name, so neither is
+/// given, and a title is never guessed from what it does not hold.
+#[must_use]
+pub fn facts_of(summary: &kr_protocol::session::SessionSummary) -> SessionFacts {
+    SessionFacts {
+        display_number: Some(summary.display_number),
+        directory: Path::new(&summary.cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned),
+        repository: None,
+        application: None,
+    }
+}
+
+impl crate::service::Controller {
+    /// Answers `session.describe` for one session, from its summary, to a caller whose history
+    /// reaches `reach` into it, under the environment's privacy state as it stands now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub(crate) async fn session_describe(
+        &self,
+        summary: kr_protocol::session::SessionSummary,
+        reach: HistoryReach,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let descriptions = std::sync::Arc::clone(&self.descriptions);
+        let privacy = self.privacy.state().now();
+        let answer = tokio::task::spawn_blocking(move || {
+            descriptions.describe(summary.session_id, &facts_of(&summary), reach, privacy)
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the session's name could not be read".to_owned(),
+        })??;
+        kr_protocol::envelope::ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Performs `session.rename` for `actor_id` under the admission it carries: pins the title,
+    /// or clears the pin, and answers what the session is shown as afterwards.
+    ///
+    /// The admission is asked again immediately before the store is written, after every wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::WindowExpired`] for an action that carries no freshness,
+    /// [`ControllerError::InvalidArgument`] for a request that names another session than its
+    /// target or a title that is too long or empty, the admission's refusal, and
+    /// [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
+    pub(crate) async fn session_rename(
+        self: &std::sync::Arc<Self>,
+        actor_id: &kr_protocol::ids::ActorId,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        summary: kr_protocol::session::SessionSummary,
+        reach: HistoryReach,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not rename a session"
+                    .to_owned(),
+            });
+        }
+        let params: kr_protocol::describe::SessionRenameParams = mutation
+            .params
+            .to_typed()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if params.session_id != summary.session_id {
+            return Err(ControllerError::InvalidArgument(
+                "a rename names the session it acts on, and this one names another".to_owned(),
+            ));
+        }
+        let controller = std::sync::Arc::clone(self);
+        let pinned_by = actor_id.as_str().to_owned();
+        let privacy = self.privacy.state().now();
+        let now_ms = kr_ipc::now_ms();
+        let answer = tokio::task::spawn_blocking(move || {
+            controller.check_registration(&carried)?;
+            controller.descriptions.rename(
+                params.session_id,
+                params.title.0.as_deref(),
+                &pinned_by,
+                &facts_of(&summary),
+                reach,
+                privacy,
+                now_ms,
+            )
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the rename stopped before it could say what it did".to_owned(),
+        })??;
+        kr_protocol::envelope::ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+}
+
 /// Maps where a title came from onto the protocol's word for it.
 const fn protocol_source(source: LabelSource) -> kr_protocol::describe::LabelSource {
     match source {

@@ -101,6 +101,10 @@ pub(super) enum DeviceRead {
     /// the set its own delegation authority reaches. The registry requires `session.share`; the
     /// issuer this host lists for is the device itself.
     Grants,
+    /// `session.describe`: the session's name from the environment's metadata store, filtered for
+    /// this device. Generated text is answered only when the grant's history reaches back to the
+    /// session's start, because a description can summarise anything the session did.
+    Description,
     /// Refused by name, for the reason [`Unserved::refusal`] gives.
     Refused(Unserved),
 }
@@ -122,7 +126,8 @@ impl DeviceRead {
             | Method::EnvironmentList
             | Method::EnvironmentCapabilities
             | Method::HostDoctor
-            | Method::DeviceList => Self::Daemon,
+            | Method::DeviceList
+            | Method::PrivacyStatus => Self::Daemon,
             Method::ProjectList
             | Method::ProjectRead
             | Method::WorkspaceList
@@ -145,7 +150,7 @@ impl DeviceRead {
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
             Method::PairStatus | Method::OwnerConfirmationPending => Self::Pairing,
             Method::GrantList => Self::Grants,
-            Method::SessionDescribe => Self::Refused(Unserved::Description),
+            Method::SessionDescribe => Self::Description,
             Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
                 Self::Refused(Unserved::Transfer)
             }
@@ -159,9 +164,6 @@ impl DeviceRead {
 /// Why this host refuses a paired device a read the method table admits for one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Unserved {
-    /// `session.describe`. This host runs no description service, so it has no description to
-    /// give anybody; the name, metadata and verified state of a session are `session.read`'s.
-    Description,
     /// `upload.status`, `download.begin` and `download.chunk`. A transfer's chunks travel on an
     /// attachment-chunk stream, a stream kind of its own with its own frame bound, and this host
     /// opens no such stream on a network connection, so no transfer with a device can complete: a
@@ -173,10 +175,6 @@ impl Unserved {
     /// The refusal a device is given, naming the read and saying why.
     fn refusal(self, entry: &MethodEntry) -> ProtocolError {
         let why = match self {
-            Self::Description => {
-                "this host runs no description service, and session.read and session.list carry \
-                 each session's metadata and verified state"
-            }
             Self::Transfer => {
                 "a transfer's chunks travel on an attachment-chunk stream, and this host opens \
                  none on a network connection"
@@ -372,6 +370,27 @@ impl RemoteConnection {
                     .controller
                     .grant_list(self.device.device_id, &request.params)
                 {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(request.request_id, error.to_protocol_error()),
+                }
+            }
+            DeviceRead::Description => {
+                let described = async {
+                    let params: kr_protocol::describe::SessionDescribeParams =
+                        request.params.to_typed().map_err(|error| {
+                            crate::error::ControllerError::InvalidArgument(error.to_string())
+                        })?;
+                    let summary = self.controller.session_summary(params.session_id).await?;
+                    let reach = crate::describe::HistoryReach::of_grant(
+                        self.device.grant.history.lower_bound_ms.0,
+                        Some(summary.created_at_ms),
+                    );
+                    self.controller.session_describe(summary, reach).await
+                };
+                match described.await {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: request.request_id,
                         outcome: Outcome::Ok(value),
@@ -900,6 +919,80 @@ impl RemoteConnection {
                     }),
                     Err(error) => failure(mutation.request_id, error.to_protocol_error()),
                 }
+            }
+            // Privacy mode and a session's pinned name are this daemon's own effects, each once per
+            // actor's action. The route names this host as the owner of the receipt, the action is
+            // claimed in the daemon's store, and the effect runs on a task that outlives this
+            // connection and keeps what it came to under the claim before it is answered, so a
+            // retry is answered from that record.
+            Method::PrivacySet | Method::SessionRename => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let lower_bound = self.device.grant.history.lower_bound_ms.0;
+                let effect = tokio::spawn(async move {
+                    let claimed = kr_protocol::digest::mutation_digest(&mutation, &actor_id)
+                        .map_err(|error| {
+                            crate::error::ControllerError::InvalidArgument(error.to_string())
+                        })
+                        .and_then(|digest| {
+                            controller.sharing.grants().claim_action(
+                                &actor_id,
+                                mutation.action_id,
+                                &digest,
+                                kr_ipc::now_ms().get(),
+                            )
+                        })?;
+                    let hold = match claimed {
+                        crate::grants::ActionClaim::Claimed { hold } => hold,
+                        crate::grants::ActionClaim::Recorded(_) => {
+                            return Err(crate::error::ControllerError::Refused {
+                                code: ErrorCode::ResourceUnavailable,
+                                detail: "another attempt under this action identifier has not \
+                                         finished"
+                                    .to_owned(),
+                            });
+                        }
+                    };
+                    let outcome = if method == Method::PrivacySet {
+                        controller.privacy_set(&mutation, carried).await
+                    } else {
+                        match mutation.target.session_id.as_ref().copied() {
+                            Some(session_id) => {
+                                match controller.session_summary(session_id).await {
+                                    Ok(summary) => {
+                                        let reach = crate::describe::HistoryReach::of_grant(
+                                            lower_bound,
+                                            Some(summary.created_at_ms),
+                                        );
+                                        controller
+                                            .session_rename(
+                                                &actor_id, &mutation, summary, reach, carried,
+                                            )
+                                            .await
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            None => Err(crate::error::ControllerError::InvalidArgument(
+                                "a rename names the session it renames".to_owned(),
+                            )),
+                        }
+                    };
+                    let kept = controller.settle_claim(&hold, &outcome);
+                    drop(hold);
+                    kept.and(outcome)
+                });
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
             Method::DevicePreviewKeyUpdate => {
                 if let Err(refusal) = self.claim_route(mutation, None) {

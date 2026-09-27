@@ -558,6 +558,36 @@ impl Controller {
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
             }
+            // Privacy mode belongs to the environment, not to a session.
+            Method::PrivacySet => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "privacy mode belongs to this environment, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::privacy::PrivacySetParams = parse(&mutation.params)?;
+            }
+            // A rename acts on a session, and the session it acts on is the one its target names.
+            Method::SessionRename => {
+                let named = mutation
+                    .target
+                    .session_id
+                    .as_ref()
+                    .copied()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidArgument(format!(
+                            "{} names the session it renames",
+                            entry.name
+                        ))
+                    })?;
+                let params: kr_protocol::describe::SessionRenameParams = parse(&mutation.params)?;
+                if params.session_id != named {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different sessions"
+                            .to_owned(),
+                    ));
+                }
+            }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;
             }

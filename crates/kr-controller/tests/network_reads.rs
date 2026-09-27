@@ -1,15 +1,15 @@
 //! The reads a paired device makes that the daemon decides itself, over a real paired connection.
 //!
 //! What these demonstrate, for the paired-device ingress: KR-REQ-23.49 for `grant.list`, and
-//! KR-REQ-23.34 and KR-REQ-23.41 for the reads this host refuses a device. The method table admits
-//! a paired device to `grant.list`, `session.describe`, `upload.status`, `download.begin` and
-//! `download.chunk`.
+//! KR-REQ-23.41 for the reads this host refuses a device. The method table admits a paired device
+//! to `grant.list`, `upload.status`, `download.begin` and `download.chunk`, among others.
 //!
 //! A device lists the grants it issued and everything delegated from them, which is what the
 //! sharing service shows any issuer other than this host itself, and it needs `session.share` to
-//! ask. The other four are refused by name, each with the reason this host does not serve it to a
+//! ask. The other three are refused by name, each with the reason this host does not serve it to a
 //! device: a refusal a device can act on rather than one that names no reason. Before either, a
-//! device whose grant does not reach what it asks about is refused as it always was.
+//! device whose grant does not reach what it asks about is refused as it always was, and so is a
+//! description of a session its grant does not reach (KR-REQ-23.34).
 //!
 //! No worker is started here: every answer below is the daemon's own.
 
@@ -194,7 +194,7 @@ async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() 
     host.stop().await;
 }
 
-/// The four reads the method table admits for a paired device that this host does not serve one
+/// The three reads the method table admits for a paired device that this host does not serve one
 /// are each refused by name, as `UNSUPPORTED_CAPABILITY` with the method and the reason in the
 /// message. A device whose grant does not reach the subject or carry the right is refused first,
 /// as it always was.
@@ -225,12 +225,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     };
 
     let refusals = [
-        refused::<_, SessionDescribeResult>(
-            &session,
-            Method::SessionDescribe,
-            &SessionDescribeParams { session_id },
-        )
-        .await,
         refused::<_, UploadStatusResult>(
             &session,
             Method::UploadStatus,
@@ -249,7 +243,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
         .await,
     ];
     for (method, refusal) in [
-        Method::SessionDescribe,
         Method::UploadStatus,
         Method::DownloadBegin,
         Method::DownloadChunk,

@@ -36,6 +36,16 @@ use super::ReadPause;
 /// the next one.
 pub const JOB_SWEEP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How often privacy mode's record retries what it owes and tells each worker it owes a notice.
+pub const PRIVACY_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long one worker is given to take a privacy generation and answer.
+///
+/// A generation that turns privacy mode on waits, in the worker, for the attention store to stop
+/// releasing the session's text and for the text leases already out to end: two seconds and one
+/// lease at most. The rest is the session's own cleanup.
+const PRIVACY_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The file this environment's current boot identity is recorded in.
 ///
 /// It lives in the state directory rather than the runtime one because it has to outlive the boot
@@ -355,6 +365,33 @@ impl Controller {
             crate::push::runtime::Cadence::DEFAULT,
             tokio::runtime::Handle::current(),
         );
+        // Privacy mode's record comes before anything the subsystems it drives do. It is read and
+        // published into the delivery module's send gate here, and whatever it asks for is taken
+        // through the backup service, the delivery journal and the descriptions again, before the
+        // backup service reconciles, before the delivery runtime starts and before any route is
+        // served. A record that cannot be read stops the start: a daemon that cannot say whether
+        // privacy mode is on does not start as though it knew.
+        let (privacy, descriptions) = {
+            let state_dir = setup.paths.state_dir().to_path_buf();
+            let backup = Arc::clone(&backup);
+            let delivery = Arc::clone(&delivery);
+            tokio::task::spawn_blocking(move || {
+                let descriptions = Arc::new(crate::describe::DescribeModule::open(&state_dir)?);
+                let privacy = crate::privacy::EnvironmentPrivacy::open(
+                    &state_dir,
+                    backup,
+                    delivery,
+                    Arc::clone(&descriptions),
+                )?;
+                // Whatever this reports is carried by the tick from here on.
+                let _ = privacy.resume(kr_ipc::now_ms());
+                Ok::<_, ControllerError>((Arc::new(privacy), descriptions))
+            })
+            .await
+            .map_err(|_| ControllerError::RegistryUnavailable {
+                detail: "the privacy record could not be opened".to_owned(),
+            })??
+        };
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -401,6 +438,8 @@ impl Controller {
             catalogue,
             sharing,
             voice: std::sync::OnceLock::new(),
+            privacy,
+            descriptions,
             delivery,
             delivery_runtime,
             devices,
@@ -534,6 +573,9 @@ impl Controller {
         // nobody knows, and what is no longer authorised is taken back, before a pass can claim
         // anything. The loop then drives the outbox until the daemon goes.
         controller.delivery_runtime.start().await;
+        // Privacy mode's tick from here on: what the record owes is retried, and each worker the
+        // environment's generation has not reached yet is told it.
+        controller.start_privacy_tick();
         // A key update that stopped between its two stores is finished here, from the one that
         // took it first. A daemon that cannot write its own device directory does not start as
         // though it had: the next start tries again, and nothing serves a device from a directory
@@ -566,6 +608,102 @@ impl Controller {
         // nothing at all.
         controller.automation.start();
         Ok(controller)
+    }
+
+    /// Starts privacy mode's tick, which runs until the daemon goes.
+    fn start_privacy_tick(self: &Arc<Self>) {
+        let controller = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(PRIVACY_TICK);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let Some(controller) = controller.upgrade() else {
+                    return;
+                };
+                controller.privacy_pass().await;
+            }
+        });
+    }
+
+    /// One pass of privacy mode's tick.
+    ///
+    /// The record learns which workers are running and which have ended, retries what it owes,
+    /// and each worker whose session has not answered for the generation in force is told it, one
+    /// after another, and its answer recorded.
+    async fn privacy_pass(self: &Arc<Self>) {
+        let live: Vec<SessionId> = self
+            .directory
+            .lock()
+            .await
+            .iter()
+            .map(|worker| worker.descriptor.session_id)
+            .collect();
+        // A registry that cannot be read says nothing about which workers have ended, so nothing
+        // is taken for ended on this pass.
+        let recorded: Option<Vec<SessionId>> =
+            self.registry.lock().await.workers().ok().map(|workers| {
+                workers
+                    .into_iter()
+                    .map(|worker| worker.session_id)
+                    .collect()
+            });
+        let privacy = Arc::clone(&self.privacy);
+        let now_ms = kr_ipc::now_ms();
+        let notices = tokio::task::spawn_blocking(move || {
+            if let Some(recorded) = recorded {
+                // An obligation that could not be written is held and written again by the tick.
+                let _ = privacy.sessions_seen(&live, &recorded, now_ms);
+            }
+            let _ = privacy.tick(now_ms);
+            privacy.notices_due(now_ms)
+        })
+        .await
+        .unwrap_or_default();
+        for notice in notices {
+            self.tell_privacy(notice).await;
+        }
+    }
+
+    /// Tells one worker the environment's privacy generation and records its answer.
+    ///
+    /// A worker that cannot be reached, or does not answer in time, is told again on its schedule;
+    /// its connection is retired when an exchange on it failed part way, because nothing knows where
+    /// its stream stands.
+    async fn tell_privacy(&self, notice: crate::privacy::Notice) {
+        let session_id = notice.session_id;
+        let Ok(Ok(mut held)) =
+            tokio::time::timeout(super::WORKER_EXCHANGE, self.worker_client_of(session_id)).await
+        else {
+            return;
+        };
+        let Some(client) = held.as_mut() else {
+            return;
+        };
+        let told = tokio::time::timeout(
+            PRIVACY_EXCHANGE,
+            client.announce_privacy(kr_protocol::privacy::PrivacyGenerationNotice {
+                environment_id: self.paths.environment_id(),
+                generation: kr_protocol::scalars::U64::new(notice.generation.get()),
+                enabled: notice.enabled,
+            }),
+        )
+        .await;
+        let ack = match told {
+            Ok(Ok(ack)) => ack,
+            Ok(Err(_)) | Err(_) => {
+                *held = None;
+                self.lost_control_path(session_id);
+                return;
+            }
+        };
+        drop(held);
+        // An answer is about the session it names, and this connection is that session's alone.
+        if ack.session_id != session_id {
+            return;
+        }
+        let privacy = Arc::clone(&self.privacy);
+        let _ = tokio::task::spawn_blocking(move || privacy.note_answer(&ack)).await;
     }
 
     /// The proxy this host's outbound HTTPS goes through: the configuration document's

@@ -13,7 +13,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
 
-use super::{Controller, encode, error_reply, net, respond, wall_clock_ms};
+use super::{Controller, encode, error_reply, net, parse, respond, wall_clock_ms};
 
 impl Controller {
     /// Performs one project or workspace mutation under the admission its ingress recorded.
@@ -125,6 +125,21 @@ impl Controller {
             .await
     }
 
+    /// Reads one session's summary the way `session.read` answers it: from its worker while it
+    /// runs, and from what this host recorded once it has closed. A session's name is built from
+    /// it, at either door.
+    pub(super) async fn session_summary(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<kr_protocol::session::SessionSummary> {
+        let read = self
+            .session_read(&encode(&kr_protocol::session::SessionReadParams {
+                session_id,
+            })?)
+            .await?;
+        Ok(parse::<kr_protocol::session::SessionReadResult>(&read)?.session)
+    }
+
     pub(super) async fn read_method(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -218,6 +233,23 @@ impl Controller {
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
+            Method::PrivacyStatus => self.privacy_status().await,
+            // A session's name is the environment's metadata, filtered for whoever asks. The owner
+            // at this machine reaches the whole of every session's history.
+            Method::SessionDescribe => {
+                let summary = async {
+                    let params: kr_protocol::describe::SessionDescribeParams =
+                        parse(&request.params)?;
+                    self.session_summary(params.session_id).await
+                };
+                match summary.await {
+                    Ok(summary) => {
+                        self.session_describe(summary, crate::describe::HistoryReach::WholeSession)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
                 method.as_str()
@@ -652,6 +684,65 @@ impl Controller {
                 // A refresh may open a bridge, and what may cross one is decided by this.
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 self.environment_record(&actor, mutation, method).await
+            }
+            // Privacy mode and a session's pinned name are this daemon's own, each changed once per
+            // actor's action: the action is claimed first, and what it came to is kept under the
+            // claim before it is answered, so a retry is answered from that record.
+            Method::PrivacySet | Method::SessionRename => {
+                let claimed = kr_protocol::digest::mutation_digest(mutation, actor_id)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+                    .and_then(|digest| {
+                        self.sharing.grants().claim_action(
+                            actor_id,
+                            mutation.action_id,
+                            &digest,
+                            kr_ipc::now_ms().get(),
+                        )
+                    });
+                match claimed {
+                    Ok(crate::grants::ActionClaim::Claimed { hold }) => {
+                        let outcome = if method == Method::PrivacySet {
+                            self.privacy_set(mutation, carried).await
+                        } else {
+                            let summary = match mutation.target.session_id.as_ref().copied() {
+                                Some(session_id) => self.session_summary(session_id).await,
+                                None => Err(ControllerError::InvalidArgument(
+                                    "a rename names the session it renames".to_owned(),
+                                )),
+                            };
+                            match summary {
+                                Ok(summary) => {
+                                    self.session_rename(
+                                        actor_id,
+                                        mutation,
+                                        summary,
+                                        crate::describe::HistoryReach::WholeSession,
+                                        carried,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            }
+                        };
+                        let kept = self.settle_claim(&hold, &outcome);
+                        drop(hold);
+                        kept.and(outcome)
+                    }
+                    Ok(crate::grants::ActionClaim::Recorded(_)) => {
+                        return self
+                            .retained_authority_answer(actor_id, mutation)
+                            .await
+                            .unwrap_or_else(|| {
+                                error_reply(
+                                    mutation.request_id,
+                                    ErrorCode::ResourceUnavailable,
+                                    "another attempt under this action identifier has not \
+                                     finished",
+                                )
+                            });
+                    }
+                    Err(error) => Err(error),
+                }
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",

@@ -68,6 +68,8 @@ impl Controller {
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
                 | Method::DeliveryDestinationSecretSet
+                | Method::PrivacySet
+                | Method::SessionRename
         ) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
