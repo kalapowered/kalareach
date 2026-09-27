@@ -2965,25 +2965,41 @@ fn recorded(root: &Path, needle: &str, marker: &str) -> PathBuf {
     }
 }
 
-/// Whether the turn whose prompt is at line `prompt` of `conversation` still runs: the device's
-/// view, brought up to date, shows the agent busy, and the conversation holds no reply with `done`
-/// after the prompt, which the turn writes only as it finishes.
+/// What says a turn still runs at one moment: the device's view, brought up to date, shows the
+/// agent busy, and the conversation holds no reply with the turn's closing word after its prompt,
+/// which the turn writes only as it finishes.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct Running {
+    busy: bool,
+    unfinished: bool,
+}
+
+impl Running {
+    const fn holds(self) -> bool {
+        self.busy && self.unfinished
+    }
+}
+
+/// Whether the turn whose prompt is at line `prompt` of `conversation`, and whose reply closes with
+/// `done`, still runs now.
 fn turn_runs(
     stage: &Stage<'_, '_>,
     logged: &mut Logged,
     conversation: &Path,
     prompt: Option<usize>,
     done: &str,
-) -> bool {
+) -> Running {
     let account = stage.login.expect("a part with a login").account();
     logged.screen.pump(stage, Duration::from_millis(50));
-    let busy = logged
-        .screen
-        .view
-        .rows()
-        .iter()
-        .any(|row| row.contains(&account.busy));
-    busy && first_line_with(conversation, prompt, &[done, &account.reply_line]).is_none()
+    Running {
+        busy: logged
+            .screen
+            .view
+            .rows()
+            .iter()
+            .any(|row| row.contains(&account.busy)),
+        unfinished: first_line_with(conversation, prompt, &[done, &account.reply_line]).is_none(),
+    }
 }
 
 /// Where a prompt entered during a running turn landed in the conversation, as the queue and
@@ -2991,8 +3007,13 @@ fn turn_runs(
 /// of that prompt's answer.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 struct Order {
-    /// Whether the agent showed a running turn right after the second prompt was submitted.
+    /// Whether the running turn still ran just before and just after the second prompt was
+    /// submitted: both readings below.
     busy_at_submission: bool,
+    /// The reading just before.
+    before: Running,
+    /// The reading just after.
+    after: Running,
     /// The running turn's reply that finished its work.
     first_finished: Option<usize>,
     /// The second prompt.
@@ -3009,9 +3030,10 @@ fn check_queued(order: &Order) -> Result<(), String> {
         order.second_prompt,
         order.second_answered,
     ) {
-        _ if !order.busy_at_submission => {
-            Err("the second prompt was not entered while a turn ran".to_owned())
-        }
+        _ if !order.busy_at_submission => Err(format!(
+            "the second prompt was not entered while a turn ran: just before {:?}, just after {:?}",
+            order.before, order.after
+        )),
         (Some(finished), Some(prompt), Some(answered))
             if finished < prompt && prompt < answered =>
         {
@@ -3109,7 +3131,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         logged.submit(
             stage,
             &format!(
-                "Count from 1 to 200, one number per line, then write the word DONE, a hyphen, the \
+                "Count from 1 to 400, one number per line, then write the word DONE, a hyphen, the \
                  code {mark} in upper case and -Q, and nothing else. ({mark}-q)"
             ),
             "a turn to queue behind",
@@ -3134,14 +3156,13 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             &format!("{queued_question} ({mark}-r)"),
             "a prompt entered during the turn",
         );
-        let busy_at_queue = before_queue
-            && turn_runs(
-                stage,
-                &mut logged,
-                &conversation,
-                first_prompt,
-                &queued_done,
-            );
+        let after_queue = turn_runs(
+            stage,
+            &mut logged,
+            &conversation,
+            first_prompt,
+            &queued_done,
+        );
         let _ = logged.answered(stage, &queued_sum, "the queued prompt is answered");
         let _ = logged.wait_for(
             stage,
@@ -3154,7 +3175,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             &[&format!("{mark}-r"), &account.prompt_line],
         );
         let queue = Order {
-            busy_at_submission: busy_at_queue,
+            busy_at_submission: before_queue.holds() && after_queue.holds(),
+            before: before_queue,
+            after: after_queue,
             first_finished: first_line_with(
                 &conversation,
                 first_prompt,
@@ -3204,14 +3227,13 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &format!("Stop counting. {steer_question} ({mark}-t)"),
                 "a steering prompt",
             );
-            let busy_at_steer = before_steer
-                && turn_runs(
-                    stage,
-                    &mut logged,
-                    &steered_conversation,
-                    steered_prompt,
-                    &steered_done,
-                );
+            let after_steer = turn_runs(
+                stage,
+                &mut logged,
+                &steered_conversation,
+                steered_prompt,
+                &steered_done,
+            );
             let _ = logged.answered(stage, &steer_sum, "the steered turn answers");
             let _ = logged.wait_for(
                 stage,
@@ -3224,7 +3246,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &[&format!("{mark}-t"), &account.prompt_line],
             );
             let steer = Order {
-                busy_at_submission: busy_at_steer,
+                busy_at_submission: before_steer.holds() && after_steer.holds(),
+                before: before_steer,
+                after: after_steer,
                 first_finished: first_line_with(
                     &steered_conversation,
                     steered_prompt,
