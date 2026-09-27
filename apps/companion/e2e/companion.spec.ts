@@ -209,7 +209,7 @@ test.describe('the attention inbox', () => {
     await expect(approval.getByRole('heading')).toContainText('scripts/release.sh --publish')
     await approval.getByText('What the agent sent').click()
     await expect(approval.getByTestId('approval-source')).toContainText('execCommandApproval')
-    await page.screenshot({ path: shot('approval-11.26'), fullPage: true })
+    await still(page, 'approval-11.26')
   })
 })
 
@@ -562,7 +562,7 @@ test.describe('settings over a live session', () => {
     await page.getByRole('switch', { name: 'Let a viewer or reviewer answer questions' }).click()
     await expect(carries.locator('[data-notice="agent_permissions"]')).toBeVisible()
     await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
-    await page.screenshot({ path: shot('sharing-25.08-invitation'), fullPage: true })
+    await still(page, 'sharing-25.08-invitation')
     await page.getByTestId('invite').click()
     await expect(page.getByText(/Invitation issued to Sam's iPhone\. It is used once/)).toBeVisible()
     await expect(page.getByTestId('issued-grants')).toContainText('Waiting to be used')
@@ -1799,7 +1799,8 @@ test.describe("the phone's conversation", () => {
       }) => {
         await onPhone(page, surface, seen, `&session=${SESSION_MAIN}`)
         const stream = page.getByTestId('mobile-conversation')
-        await expect(stream.locator('.m-node')).toHaveCount(6)
+        // The main session's agent has said five things so far.
+        await expect(stream.locator('.m-node')).toHaveCount(5)
         const pane = page.locator('.m-pane')
         const room = await pane.evaluate((element) => {
           const text = element.querySelector<HTMLElement>('.m-node p:last-child')
@@ -2430,16 +2431,16 @@ test.describe('packages', () => {
     await page.getByTestId('catalogue-search').fill('tmux')
     await expect(page.getByTestId('installed-list')).toContainText('community.tmux-status')
     await expect(page.getByTestId('installed-list')).not.toContainText('openai.codex')
-    await page.screenshot({ path: shot('packages-11.03-installed'), fullPage: true })
+    await still(page, 'packages-11.03-installed')
     await page.getByRole('tab', { name: 'Catalogue' }).click()
     await page.getByTestId('catalogue-search').fill('mirror')
     await expect(page.getByTestId('catalogue-list')).toContainText('community-mirror')
     await expect(page.getByTestId('catalogue-list')).not.toContainText('packages.kala.to')
-    await page.screenshot({ path: shot('packages-11.03'), fullPage: true })
+    await still(page, 'packages-11.03')
     await page.getByRole('tab', { name: 'Repositories' }).click()
     await page.getByTestId('catalogue-search').fill('')
     await expect(page.getByTestId('repository-list')).toContainText('https://packages.kala.to/metadata')
-    await page.screenshot({ path: shot('packages-11.03-repositories'), fullPage: true })
+    await still(page, 'packages-11.03-repositories')
   })
 })
 

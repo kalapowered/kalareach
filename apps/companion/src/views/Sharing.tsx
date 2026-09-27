@@ -255,20 +255,26 @@ export function Sharing({
             ))}
           </ul>
           {(shown?.notices ?? []).map((each) => (
-            <p className="small warning-text" key={each.notice} data-notice={each.notice}>
+            <p
+              className="small warning-text invitation-notice"
+              key={each.notice}
+              data-notice={each.notice}
+            >
               {each.sentence}
             </p>
           ))}
         </div>
       </Card>
 
-      <CommitButton
-        data-testid="invite"
-        disabled={chosen === null || shown === null || issuing}
-        onCommit={issue}
-      >
-        {chosen === null ? 'Choose a device to invite' : `Invite ${chosen.display_name}`}
-      </CommitButton>
+      <div className="sharing-invite">
+        <CommitButton
+          data-testid="invite"
+          disabled={chosen === null || shown === null || issuing}
+          onCommit={issue}
+        >
+          {chosen === null ? 'Choose a device to invite' : `Invite ${chosen.display_name}`}
+        </CommitButton>
+      </div>
 
       {(grants?.grants.length ?? 0) > 0 ? (
         <>

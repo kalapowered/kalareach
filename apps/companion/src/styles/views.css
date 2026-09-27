@@ -817,6 +817,15 @@
   accent-color: var(--accent);
 }
 
+/* The host's own sentence for what an invitation's actions mean, apart from the list above it. */
+.invitation-notice {
+  margin-top: 12px;
+}
+
+.sharing-invite {
+  margin: 16px 0 24px;
+}
+
 .theme-options {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
