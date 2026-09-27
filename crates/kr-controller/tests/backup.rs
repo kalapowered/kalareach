@@ -1640,14 +1640,21 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     assert!(service.privacy_request(1).expect("a read").is_none());
     assert!(service.obligations().expect("a read").is_empty());
 
-    // And the subsystem says it cannot say. A host that cannot say what it owes does not owe
-    // nothing, and privacy mode must never read the first as the second.
-    assert!(privacy(&service).outstanding().is_err());
+    // And the subsystem says it cannot say, with the store's own reason, to any hook built
+    // afterwards as well. A host that cannot say what it owes does not owe nothing, and privacy
+    // mode must never read the first as the second.
+    let reason = privacy(&service)
+        .outstanding()
+        .expect_err("a refused step is in the way");
+    assert!(reason.reason().contains("readonly"), "{reason}");
     let work = service.outstanding_work().expect("reads still work");
     assert!(!work.is_complete());
-    assert_eq!(
-        work.failed_steps,
-        vec!["raise the backup privacy fence for privacy generation 1"]
+    assert_eq!(work.failed_steps.len(), 1);
+    assert!(
+        work.failed_steps[0]
+            .starts_with("raise the backup privacy fence for privacy generation 1 ("),
+        "{:?}",
+        work.failed_steps
     );
 
     // Production is stopped by that guard, and the gates are where it is enforced. The store holds
@@ -1703,9 +1710,11 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
         .raise_fence(PrivacyGeneration::new(3), TimestampMs::new(7_000))
         .expect_err("a store that will not write says so");
     service.set_query_only(false).expect("query_only pragma");
-    assert_eq!(
-        service.outstanding_work().expect("a read").failed_steps,
-        vec!["raise the backup privacy fence for privacy generation 3"]
+    let failed = service.outstanding_work().expect("a read").failed_steps;
+    assert_eq!(failed.len(), 1);
+    assert!(
+        failed[0].starts_with("raise the backup privacy fence for privacy generation 3 ("),
+        "{failed:?}"
     );
 
     // Repeating the older request, which this host already applied, succeeds and establishes
@@ -1715,7 +1724,7 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
         .expect("a repeat of an applied request reads its record back");
     assert_eq!(
         service.outstanding_work().expect("a read").failed_steps,
-        vec!["raise the backup privacy fence for privacy generation 3"],
+        failed,
         "an older success does not establish that the newer failure recovered"
     );
     assert!(service.unready().is_some());

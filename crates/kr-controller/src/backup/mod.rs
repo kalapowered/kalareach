@@ -34,7 +34,7 @@ mod statements;
 pub mod store;
 pub mod uploader;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -117,7 +117,8 @@ impl FailedStep {
 #[derive(Debug, Default)]
 struct Readiness {
     reconciled: bool,
-    failed: BTreeSet<FailedStep>,
+    /// Each step that failed, with the reason the store gave, until that step succeeds.
+    failed: BTreeMap<FailedStep, String>,
 }
 
 impl Readiness {
@@ -128,9 +129,10 @@ impl Readiness {
     /// is not yet ready and is not withholding anything either; a step it was asked to take and
     /// could not is withheld throughout.
     fn withheld(&self) -> Option<String> {
-        self.failed.iter().next().map(|failed| {
+        self.failed.iter().next().map(|(failed, cause)| {
             format!(
-                "this host could not {}, so backup production stays stopped until it can",
+                "this host could not {} ({cause}), so backup production stays stopped until it \
+                 can",
                 failed.describe()
             )
         })
@@ -492,11 +494,22 @@ impl BackupService {
     /// job is the window the store owns nothing in: a request this host could not even accept
     /// leaves no row behind, so without the guard a failed enabling would look like a host with
     /// nothing to do and would go on producing.
-    fn note_step_failed(&self, step: PrivacyStep, privacy_generation: u64) {
-        self.readiness().failed.insert(FailedStep {
-            step,
-            privacy_generation,
-        });
+    ///
+    /// The store's reason is kept with it, so every later account of the step says why, whichever
+    /// caller asks.
+    fn note_step_failed(
+        &self,
+        step: PrivacyStep,
+        privacy_generation: u64,
+        cause: &ControllerError,
+    ) {
+        self.readiness().failed.insert(
+            FailedStep {
+                step,
+                privacy_generation,
+            },
+            cause.to_string(),
+        );
     }
 
     /// Records that one privacy step did, in the end, do what it was asked.
@@ -507,16 +520,16 @@ impl BackupService {
     /// succeeding says nothing about this one at all, and a read that works says nothing about a
     /// write that did not.
     fn note_step_succeeded(&self, step: PrivacyStep, privacy_generation: u64) {
-        self.readiness()
-            .failed
-            .retain(|failed| failed.step != step || failed.privacy_generation > privacy_generation);
+        self.readiness().failed.retain(|failed, _| {
+            failed.step != step || failed.privacy_generation > privacy_generation
+        });
     }
 
     fn failed_steps(&self) -> Vec<String> {
         self.readiness()
             .failed
             .iter()
-            .map(|failed| failed.describe())
+            .map(|(failed, cause)| format!("{} ({cause})", failed.describe()))
             .collect()
     }
 
@@ -606,7 +619,7 @@ impl BackupService {
             Err(error) => {
                 // A request this host could not accept leaves no row behind. Nothing but this
                 // guard stops it producing as though it had never been asked to stop.
-                self.note_step_failed(PrivacyStep::Fence, generation.get());
+                self.note_step_failed(PrivacyStep::Fence, generation.get(), &error);
                 Err(error)
             }
         }
@@ -639,7 +652,7 @@ impl BackupService {
                 // Whichever half failed, this host was asked to stop and did not. That is true of
                 // this call whether the trait made it or a caller did, so the guard is set here
                 // rather than in one wrapper.
-                self.note_step_failed(PrivacyStep::Fence, generation.get());
+                self.note_step_failed(PrivacyStep::Fence, generation.get(), &error);
                 Err(error)
             }
         }
@@ -680,7 +693,7 @@ impl BackupService {
                 })
             }
             Err(error) => {
-                self.note_step_failed(PrivacyStep::Cancel, generation.get());
+                self.note_step_failed(PrivacyStep::Cancel, generation.get(), &error);
                 Err(error)
             }
         }
@@ -715,7 +728,7 @@ impl BackupService {
                 Ok(removed)
             }
             Err(error) => {
-                self.note_step_failed(PrivacyStep::Remove, generation.get());
+                self.note_step_failed(PrivacyStep::Remove, generation.get(), &error);
                 Err(error)
             }
         }
