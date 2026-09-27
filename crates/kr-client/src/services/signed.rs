@@ -45,6 +45,16 @@
 //! answer this client cannot read included, because the service may have received the request and
 //! acted on it.
 //!
+//! # When a request goes once more
+//!
+//! Section 23 lets a client send a request again without being asked only where the request is
+//! safe to repeat. [`Repeat`] is that judgement, made for each request from its method and the body
+//! its signature covers. When the service answers a request that is safe with `SERVICE_UNAVAILABLE`
+//! and a delay no longer than [`crate::retry::MAX_AUTOMATIC_DELAY`], it has not carried the request
+//! out, or has not finished answering it, and either way it asks for the same request again. This
+//! client waits that delay and sends the request once more, signed afresh, and the second answer
+//! is the answer, whatever it is. Never a third send, and never a request that is not safe.
+//!
 //! # What is never rendered
 //!
 //! A request body carries a credential and an answer carries whatever answered, so the types here
@@ -54,7 +64,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use kr_protocol::authority::IdempotencyBehaviour;
@@ -356,10 +366,10 @@ impl SignedService {
             account,
             carriage: Carriage::Body,
         };
-        let answer = self
+        let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer, method).map_err(|error| unanswered(method, answer.status, error))
+        answer_of(&answer, repeat).map_err(|error| unanswered(repeat, answer.status, error))
     }
 
     /// Sends one signed request, signed now, that travels as `carriage` says, and returns what the
@@ -386,10 +396,10 @@ impl SignedService {
             account,
             carriage,
         };
-        let answer = self
+        let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer, method).map_err(|error| unanswered(method, answer.status, error))
+        answer_of(&answer, repeat).map_err(|error| unanswered(repeat, answer.status, error))
     }
 
     /// Sends one signed request, signed now, whose success is content rather than a document, and
@@ -412,15 +422,24 @@ impl SignedService {
             account,
             carriage: Carriage::Body,
         };
-        let answer = self
+        let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
             .await?;
         let status = answer.status;
-        content_of(answer, method).map_err(|error| unanswered(method, status, error))
+        content_of(answer, repeat).map_err(|error| unanswered(repeat, status, error))
     }
 
     /// The one path every request takes: the document, the token, the credential, the bound, and
-    /// then the transport, which is where a request starts to leave this device.
+    /// then the transport, which is where a request starts to leave this device. What comes back
+    /// is the answer, and whether the request is one that may go again, which is how the answer is
+    /// read.
+    ///
+    /// A request that may go again, answered that the service is unavailable with a delay this
+    /// client waits inside a call ([`send_again_after`]), goes once more after that delay: signed
+    /// afresh, with a nonce of its own, at the instant the caller stated or now, with the same body
+    /// and the same token. The second answer is the one returned, whatever it is. A credential that
+    /// can no longer be made, because the stated instant has left the service's window meanwhile,
+    /// leaves the first answer as the answer.
     async fn send<B: Serialize>(
         &self,
         path: &str,
@@ -428,7 +447,7 @@ impl SignedService {
         body: &B,
         request_limit: usize,
         sending: Sending<'_>,
-    ) -> std::result::Result<ServiceHttpAnswer, Unanswered> {
+    ) -> std::result::Result<(ServiceHttpAnswer, Repeat), Unanswered> {
         let Sending {
             signed_at_ms,
             account,
@@ -440,6 +459,7 @@ impl SignedService {
                 Shown::json(&error)
             )))
         })?;
+        let repeat = Repeat::of(method, &document);
         let authorisation = match account {
             Some(account) => {
                 let token = account
@@ -452,7 +472,11 @@ impl SignedService {
             None => None,
         };
         let request = self
-            .signed(method, document, signed_at_ms.unwrap_or_else(now_ms))
+            .signed(
+                method,
+                document.clone(),
+                signed_at_ms.unwrap_or_else(now_ms),
+            )
             .map_err(Unanswered::NotSent)?;
         if request.len() > request_limit {
             return Err(Unanswered::NotSent(malformed(crate::shown!(
@@ -463,22 +487,45 @@ impl SignedService {
             ))));
         }
         let url = format!("{}{path}", self.origin.as_str());
-        let token = authorisation
-            .iter()
-            .map(|value| ("authorization", value.as_str()));
-        // From here the transport holds the request, so whatever goes wrong may have happened after
-        // the service received it.
+        let authorisation = authorisation.as_deref();
+        let first = self.post(&url, &request, carriage, authorisation).await?;
+
+        let Some(delay) = send_again_after(repeat, &first) else {
+            return Ok((first, repeat));
+        };
+        tokio::time::sleep(delay).await;
+        let again = match self.signed(method, document, signed_at_ms.unwrap_or_else(now_ms)) {
+            Ok(again) if again.len() <= request_limit => again,
+            _ => return Ok((first, repeat)),
+        };
+        let second = self.post(&url, &again, carriage, authorisation).await?;
+        Ok((second, repeat))
+    }
+
+    /// Hands one signed request to the transport, travelling as `carriage` says, with the account
+    /// token as its `authorization` header when it has one.
+    ///
+    /// From here the transport holds the request, so whatever goes wrong may have happened after
+    /// the service received it.
+    async fn post(
+        &self,
+        url: &str,
+        request: &[u8],
+        carriage: Carriage<'_>,
+        authorisation: Option<&str>,
+    ) -> std::result::Result<ServiceHttpAnswer, Unanswered> {
+        let token = authorisation.map(|value| ("authorization", value));
         match carriage {
             Carriage::Body => {
-                let headers: Vec<(&str, &str)> = token.collect();
-                self.http.post_json(&url, &request, &headers).await
+                let headers: Vec<(&str, &str)> = token.into_iter().collect();
+                self.http.post_json(url, request, &headers).await
             }
             Carriage::Header { header, content } => {
-                let carried = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&request);
+                let carried = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request);
                 let headers: Vec<(&str, &str)> = std::iter::once((header, carried.as_str()))
                     .chain(token)
                     .collect();
-                self.http.post_bytes(&url, content, &headers).await
+                self.http.post_bytes(url, content, &headers).await
             }
         }
         .map_err(Unanswered::Sent)
@@ -613,8 +660,8 @@ impl Answer {
 /// [`super::json::read`], so an answer that names any member twice, the code's and the ones an
 /// adapter reads among them, is not a refusal this client reads.
 pub(crate) struct Refusal {
-    /// The method of the request it answered.
-    method: Method,
+    /// Whether the request it answered may go again.
+    repeat: Repeat,
     status: u16,
     /// The code the service named, when it is one of [`SERVICE_CODES`]: this client's own
     /// constant, never the text that arrived.
@@ -664,7 +711,7 @@ impl Refusal {
     /// The error the service named, with the delay it asked for when it named one.
     pub(crate) fn into_error(self) -> ClientError {
         let message = plain_message(self.code, &self.message);
-        let (code, action, message) = if leaves_outcome_unknown(self.method, self.code) {
+        let (code, action, message) = if leaves_outcome_unknown(self.repeat, self.code) {
             (
                 ErrorCode::OutcomeUnknown,
                 UserAction::CheckTheOutcome,
@@ -720,7 +767,7 @@ fn plain_message(code: Option<&str>, message: &ServiceMessage) -> Shown {
 /// `error`, and nothing else, so another member beside them, or a success and a refusal at once,
 /// says the answer is not the service's own. Inside `data` and `error` the members are each
 /// adapter's to read, and a member it does not read is one a newer service may add.
-fn answer_of(answer: &ServiceHttpAnswer, method: Method) -> Result<Answer> {
+fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
     /// The two members beside `ok` are each absent (`None`) or present, and a present one may be
     /// `null` (`Some(None)`), so a member that is there with nothing in it is still there.
     #[derive(Deserialize)]
@@ -780,7 +827,7 @@ fn answer_of(answer: &ServiceHttpAnswer, method: Method) -> Result<Answer> {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
     Ok(Answer::Refused(Refusal {
-        method,
+        repeat,
         status: answer.status,
         code: SERVICE_CODES
             .iter()
@@ -799,11 +846,11 @@ fn answer_of(answer: &ServiceHttpAnswer, method: Method) -> Result<Answer> {
 /// content, and nothing here reads them. Anything else is read as an envelope, and a refusal is the
 /// one thing it may be, because a success envelope under a status that says the request failed is
 /// not this service's answer.
-fn content_of(answer: ServiceHttpAnswer, method: Method) -> Result<Content> {
+fn content_of(answer: ServiceHttpAnswer, repeat: Repeat) -> Result<Content> {
     if (200..300).contains(&answer.status) {
         return Ok(Content::Bytes(answer.body));
     }
-    match answer_of(&answer, method)? {
+    match answer_of(&answer, repeat)? {
         Answer::Refused(refusal) => Ok(Content::Refused(refusal)),
         Answer::Data(_) => Err(unreadable(
             answer.status,
@@ -924,9 +971,9 @@ fn classify(code: Option<&str>, status: u16) -> (ErrorCode, UserAction) {
 /// out. A success status with an unreadable body is the dangerous case, because the service acted
 /// and this client cannot see what it did, so it is an unknown outcome and never retried
 /// automatically. A fault or a rate limit is transient. A gateway's 502 or 504 is too, here: it can
-/// follow the service acting on the request, and [`unanswered`] decides by the method whether that
-/// makes the outcome unknown. Anything else without an envelope never reached this service's own
-/// routes, which is a configuration between here and it.
+/// follow the service acting on the request, and [`unanswered`] decides by the request whether
+/// that makes the outcome unknown. Anything else without an envelope never reached this service's
+/// own routes, which is a configuration between here and it.
 fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
@@ -942,14 +989,14 @@ fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     )
 }
 
-/// Why a request that left this device went unanswered, for a request of `method`.
+/// Why a request that left this device went unanswered.
 ///
 /// A gateway in front of the service answers 502 or 504 when the service's answer did not reach it,
 /// which it can do after the service acted on the request. So an answer of either with no envelope
-/// of the service's is an unknown outcome, never sent again, unless a request of `method` is safe
-/// to send again ([`repeat_is_safe`]).
-fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
-    if matches!(status, 502 | 504) && !repeat_is_safe(method) {
+/// of the service's is an unknown outcome, never sent again, unless the request is safe to send
+/// again ([`Repeat`]).
+fn unanswered(repeat: Repeat, status: u16, error: ClientError) -> Unanswered {
+    if matches!(status, 502 | 504) && repeat == Repeat::Unsafe {
         return Unanswered::Sent(ClientError::refusal(
             ErrorCode::OutcomeUnknown,
             crate::shown!(
@@ -962,30 +1009,63 @@ fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
     Unanswered::Sent(error)
 }
 
-/// Whether a refusal the service named leaves the outcome of a request of `method` unknown.
+/// Whether a refusal the service named leaves the outcome of the request it answered unknown.
 ///
 /// `INTERNAL` is the service failing while it handled the request, which it can do after it acted
-/// on it. So for a request that is not safe to send again ([`repeat_is_safe`]) it says nothing
-/// about whether the request ran, as a gateway's lost answer does not ([`unanswered`]), and it is
-/// an unknown outcome, never sent again. For any other request it is the transient failure
+/// on it. So for a request that is not safe to send again ([`Repeat`]) it says nothing about
+/// whether the request ran, as a gateway's lost answer does not ([`unanswered`]), and it is an
+/// unknown outcome, never sent again. For any other request it is the transient failure
 /// [`classify`] names.
-fn leaves_outcome_unknown(method: Method, code: Option<&str>) -> bool {
-    code == Some("INTERNAL") && !repeat_is_safe(method)
+fn leaves_outcome_unknown(repeat: Repeat, code: Option<&str>) -> bool {
+    code == Some("INTERNAL") && repeat == Repeat::Unsafe
 }
 
-/// Whether a request of `method` may be sent again, signed afresh, after its answer was lost.
+/// Whether a request may be sent again, signed afresh, without a second effect or a different
+/// one.
+///
+/// Decided for each request, from its method and the body its signature covers, because two
+/// methods carry requests of both kinds. An authority-feed read is a read, and each of the feed's
+/// changes replaces what the feed holds with nothing to tell a repeat from a later change: a
+/// delegation sent again after a later one would undo it. Every settings-sync request is answered
+/// from the receipt its identity names, except an exchange that names none, which no receipt can
+/// settle and which sent again is a second write. Every other method is as [`repeat_is_safe`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Repeat {
+    /// Sent again, it is answered as a repeat of itself.
+    Safe,
+    /// Sent again, it could act twice or undo a later request. This client never sends it again,
+    /// and an answer that may have followed its effect leaves its outcome unknown.
+    Unsafe,
+}
+
+impl Repeat {
+    /// What one request of `method` that carries `body` is.
+    pub(crate) fn of(method: Method, body: &serde_json::Value) -> Self {
+        let safe = match method {
+            Method::AuthoritySync => body.get("read").is_some(),
+            Method::SyncCompareExchange => body.get("exchange").is_none_or(|exchange| {
+                exchange
+                    .get("request_id")
+                    .is_some_and(|identity| !identity.is_null())
+            }),
+            _ => repeat_is_safe(method),
+        };
+        if safe { Self::Safe } else { Self::Unsafe }
+    }
+}
+
+/// Whether a request of `method` may be sent again, for a method whose requests are all alike.
 ///
 /// A read changes nothing. A write qualifies when every operation its method carries is answered,
 /// on a repeat under a fresh signature, without a second effect or a different one: a delivery by
-/// its envelope identifier, an acknowledgement by its position, a settings-sync request by the
-/// identity it carries and the receipt kept for it, a manifest by its generation and its enrolment
-/// revision, a retention change by its revision, and an upload by its part numbers and its upload
-/// identifier. A creation signed afresh meets the object the first may have made and makes nothing
-/// more while that object is live; after its hold is released, it makes a new upload in place of
-/// the one that lapsed. A deletion does not qualify, because the service keeps a deletion's first
-/// target only for the signature that asked for it and a later object may hold the identity by
-/// then; nor does the authority feed, whose delegation replaces the removal keys with nothing to
-/// tell a repeat from a later change. A method added later does not either, until it is shown to.
+/// its envelope identifier, an acknowledgement by its position, a manifest by its generation and
+/// its enrolment revision, a retention change by its revision, and an upload by its part numbers
+/// and its upload identifier. A creation signed afresh meets the object the first may have made and
+/// makes nothing more while that object is live; after its hold is released, it makes a new upload
+/// in place of the one that lapsed. A deletion does not qualify, because the service keeps a
+/// deletion's first target only for the signature that asked for it and a later object may hold
+/// the identity by then. A method added later does not either, until it is shown to. The authority
+/// feed and settings sync are decided by the request ([`Repeat::of`]).
 fn repeat_is_safe(method: Method) -> bool {
     matches!(
         method.entry().idempotency,
@@ -994,7 +1074,6 @@ fn repeat_is_safe(method: Method) -> bool {
         method,
         Method::MailboxDeliver
             | Method::MailboxAcknowledge
-            | Method::SyncCompareExchange
             | Method::BackupManifest
             | Method::StorageRetentionSet
             | Method::StorageUploadCreate
@@ -1002,6 +1081,28 @@ fn repeat_is_safe(method: Method) -> bool {
             | Method::StorageUploadComplete
             | Method::StorageUploadAbort
     )
+}
+
+/// How long to wait before a request goes once more, when it may.
+///
+/// It may when it is safe to repeat and its first answer is the service's `SERVICE_UNAVAILABLE`,
+/// which says the service did not carry the request out or did not finish answering it and asks
+/// for the same request again after a delay. The delay is the service's, and it is waited only
+/// when it is one this client waits inside a call ([`crate::retry::MAX_AUTOMATIC_DELAY`]); a
+/// longer one is the caller's to schedule. Anything else is answered by what came back: another
+/// refusal, a request that is not safe, a gateway's page and an answer without a delay.
+fn send_again_after(repeat: Repeat, answer: &ServiceHttpAnswer) -> Option<Duration> {
+    if repeat == Repeat::Unsafe || answer.status != 503 {
+        return None;
+    }
+    let Ok(Answer::Refused(refusal)) = answer_of(answer, repeat) else {
+        return None;
+    };
+    if refusal.code != Some("SERVICE_UNAVAILABLE") {
+        return None;
+    }
+    let delay = Duration::from_secs(refusal.retry_after_seconds?);
+    (delay <= crate::retry::MAX_AUTOMATIC_DELAY).then_some(delay)
 }
 
 /// An answer that was read and is not the shape this client expected.
@@ -1093,7 +1194,7 @@ mod tests {
                 r#"{{"ok":false,"error":{{"code":"FORBIDDEN","message":"Only the host issues its own revisions.","detail":"{NEVER_RENDERED}"}}}}"#
             )
             .into_bytes(),
-        }, Method::MailboxRead)
+        }, Repeat::Safe)
         .and_then(Answer::data)
         .expect_err("a refusal");
 
@@ -1119,7 +1220,7 @@ mod tests {
                 status: 200,
                 body: NEVER_RENDERED.as_bytes().to_vec(),
             },
-            Method::MailboxRead,
+            Repeat::Safe,
         )
         .expect_err("that is not this service's envelope");
         for rendering in [
@@ -1146,7 +1247,7 @@ mod tests {
                     status: 409,
                     body: body.as_bytes().to_vec(),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .expect_err("not a refusal this client reads");
             assert!(matches!(error, ClientError::Host(_)), "{body}");
@@ -1163,7 +1264,7 @@ mod tests {
                     status: 409,
                     body: body.as_bytes().to_vec(),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .expect_err("not a refusal this client reads");
             assert!(matches!(error, ClientError::Host(_)), "{body}");
@@ -1183,7 +1284,7 @@ mod tests {
         let answer = answer_of(&ServiceHttpAnswer {
             status: 409,
             body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1"}}"#.to_vec(),
-        }, Method::MailboxRead)
+        }, Repeat::Safe)
         .expect("a refusal");
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
@@ -1215,7 +1316,7 @@ mod tests {
                     status: 200,
                     body: body.clone().into_bytes(),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .expect_err("a member named twice");
             assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{body}");
@@ -1279,7 +1380,7 @@ mod tests {
                     status,
                     body: body.as_bytes().to_vec(),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .expect_err(body);
             assert!(matches!(error, ClientError::Host(_)), "{body}");
@@ -1293,14 +1394,14 @@ mod tests {
                 status: 200,
                 body: br#"{"ok":true,"data":{"note":"x","more":1}}"#.to_vec(),
             },
-            Method::MailboxRead,
+            Repeat::Safe,
         )
         .expect("an answer");
         assert!(matches!(answer, Answer::Data(_)), "{answer:?}");
         let answer = answer_of(&ServiceHttpAnswer {
             status: 409,
             body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","missing":["x"]}}"#.to_vec(),
-        }, Method::MailboxRead)
+        }, Repeat::Safe)
         .expect("a refusal");
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
@@ -1315,7 +1416,7 @@ mod tests {
                 status: 200,
                 body: br#"{"ok":true}"#.to_vec(),
             },
-            Method::MailboxRead,
+            Repeat::Safe,
         )
         .expect_err("an envelope with no data");
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
@@ -1510,9 +1611,13 @@ mod tests {
     }
 
     fn service(wire: &Arc<Wire>) -> SignedService {
+        service_over(Arc::clone(wire) as Arc<dyn ServiceHttp>)
+    }
+
+    fn service_over(http: Arc<dyn ServiceHttp>) -> SignedService {
         SignedService::new(
             origin(),
-            Arc::clone(wire) as Arc<dyn ServiceHttp>,
+            http,
             Arc::new(Key(
                 kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key pair")
             )),
@@ -1812,6 +1917,390 @@ mod tests {
         }
     }
 
+    /* ---------------------------------------------------------------------- */
+    /* Once more, when the service asks for the same request again             */
+    /* ---------------------------------------------------------------------- */
+
+    /// What the service answers a request whose object had not answered by the route's deadline,
+    /// word for word: `SERVICE_UNAVAILABLE`, the outcome not known, and when to send it again.
+    fn unavailable(retry_after_seconds: Option<u64>) -> ServiceHttpAnswer {
+        let delay = retry_after_seconds.map_or_else(String::new, |seconds| {
+            format!(r#","retryAfterSeconds":{seconds}"#)
+        });
+        ServiceHttpAnswer {
+            status: 503,
+            body: format!(
+                r#"{{"ok":false,"error":{{"code":"SERVICE_UNAVAILABLE","message":"The mailbox did not finish answering that request, and what became of it is not known. Send it again shortly."{delay}}}}}"#
+            )
+            .into_bytes(),
+        }
+    }
+
+    /// A refusal with this status, code and delay.
+    fn refusal(status: u16, code: &str, retry_after_seconds: Option<u64>) -> ServiceHttpAnswer {
+        let mut error = serde_json::json!({ "code": code, "message": "Refused." });
+        if let Some(seconds) = retry_after_seconds {
+            error["retryAfterSeconds"] = seconds.into();
+        }
+        ServiceHttpAnswer {
+            status,
+            body: serde_json::to_vec(&serde_json::json!({ "ok": false, "error": error }))
+                .expect("a refusal"),
+        }
+    }
+
+    /// What a delivery the mailbox stored is answered.
+    fn stored() -> ServiceHttpAnswer {
+        ServiceHttpAnswer {
+            status: 200,
+            body: br#"{"ok":true,"data":{"state":"stored","sequence":"1"}}"#.to_vec(),
+        }
+    }
+
+    /// A transport that answers each request with the next answer of its script, and the last one
+    /// again once the script has run out, and notes when each request reached it.
+    struct Script {
+        answers: Mutex<std::collections::VecDeque<ServiceHttpAnswer>>,
+        sent: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
+    }
+
+    impl fmt::Debug for Script {
+        /// How many requests it was given. Never one of them.
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("Script")
+                .field("requests", &self.requests())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Script {
+        fn answering(answers: impl IntoIterator<Item = ServiceHttpAnswer>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(answers.into_iter().collect()),
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> usize {
+            self.sent.lock().expect("the requests").len()
+        }
+
+        /// Each request as it arrived: when, on the test's clock, and its bytes.
+        fn sent(&self) -> Vec<(tokio::time::Instant, Vec<u8>)> {
+            self.sent.lock().expect("the requests").clone()
+        }
+
+        fn take(&self, body: &[u8]) -> ServiceFuture<'static, ServiceHttpAnswer> {
+            self.sent
+                .lock()
+                .expect("the requests")
+                .push((tokio::time::Instant::now(), body.to_vec()));
+            let mut answers = self.answers.lock().expect("the script");
+            let answer = if answers.len() > 1 {
+                answers.pop_front()
+            } else {
+                answers.front().cloned()
+            }
+            .expect("a script with an answer");
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    impl ServiceHttp for Script {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.take(body)
+        }
+
+        fn post_bytes<'a>(
+            &'a self,
+            _url: &'a str,
+            body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.take(body)
+        }
+    }
+
+    /// The credential one sent request carries.
+    fn credential_of(body: &[u8]) -> ServiceRequestSignature {
+        let request: serde_json::Value = serde_json::from_slice(body).expect("a signed request");
+        serde_json::from_value(request["signature"].clone()).expect("a credential")
+    }
+
+    /// Sends one request of `method` carrying `body`, signed at `signed_at_ms` or now, as an
+    /// adapter of that method does.
+    async fn asked(
+        http: &Arc<Script>,
+        method: Method,
+        body: serde_json::Value,
+        signed_at_ms: Option<u64>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        service_over(Arc::clone(http) as Arc<dyn ServiceHttp>)
+            .dispatch(
+                "/api/a-method",
+                method,
+                &body,
+                256 * 1024,
+                signed_at_ms,
+                None,
+            )
+            .await
+    }
+
+    /// A request of each kind the service answers as a repeat of itself, as the adapters build it.
+    fn safe_requests() -> Vec<(Method, serde_json::Value)> {
+        let identity = "0192f6d4-3c1e-7d2a-9b8c-5e4f3a2b1c0d";
+        vec![
+            (
+                Method::MailboxDeliver,
+                serde_json::json!({ "recipient_key": "a key" }),
+            ),
+            (
+                Method::MailboxRead,
+                serde_json::json!({ "recipient_key": "a key" }),
+            ),
+            (
+                Method::MailboxAcknowledge,
+                serde_json::json!({ "through_sequence": "1" }),
+            ),
+            (
+                Method::BackupManifest,
+                serde_json::json!({ "fetch": { "archive_id": "an archive" } }),
+            ),
+            (Method::AuthoritySync, serde_json::json!({ "read": {} })),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "exchange": { "request_id": identity, "collection_id": "c" } }),
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "compare": { "collection_id": "c" } }),
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "status": { "request_id": identity } }),
+            ),
+        ]
+    }
+
+    /// KR-REQ-23.57: a request that is safe to repeat, answered that the service did not finish
+    /// answering it and asked to be sent again shortly, goes once more after the delay the service
+    /// stated, signed afresh, and the second answer is the answer. A mailbox delivery is one: the
+    /// service keys it by its envelope identifier and answers a repeat with the first delivery.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_a_request_safe_to_repeat_goes_once_more_after_the_delay_the_service_stated()
+     {
+        for (method, body) in safe_requests() {
+            let script = Script::answering([unavailable(Some(2)), stored()]);
+            match asked(&script, method, body.clone(), None).await {
+                Ok(Answer::Data(data)) => assert_eq!(data["state"], "stored", "{method:?} {body}"),
+                other => panic!("{method:?} {body}: the second answer: {other:?}"),
+            }
+            let sent = script.sent();
+            assert_eq!(sent.len(), 2, "{method:?} {body}: once more, and once only");
+            assert!(
+                sent[1].0 - sent[0].0 >= Duration::from_secs(2),
+                "{method:?} {body}: after the delay the service stated"
+            );
+            // Signed afresh: the same body, under a nonce of its own.
+            let (first, second) = (credential_of(&sent[0].1), credential_of(&sent[1].1));
+            assert_ne!(
+                first.payload.nonce, second.payload.nonce,
+                "{method:?} {body}"
+            );
+            assert_eq!(
+                first.payload.body_digest, second.payload.body_digest,
+                "{method:?} {body}"
+            );
+        }
+    }
+
+    /// KR-REQ-23.57: the second send is the last. Answered the same way again, the request comes
+    /// back as that second refusal, with the delay it stated, for the caller to act on.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_a_second_answer_that_the_service_is_unavailable_is_the_answer() {
+        let script = Script::answering([unavailable(Some(2)), unavailable(Some(3)), stored()]);
+        let refusal = match asked(
+            &script,
+            Method::MailboxDeliver,
+            serde_json::json!({ "recipient_key": "a key" }),
+            None,
+        )
+        .await
+        {
+            Ok(Answer::Refused(refusal)) => refusal,
+            other => panic!("the second refusal: {other:?}"),
+        };
+        assert_eq!(script.requests(), 2, "never a third send");
+        assert_eq!(refusal.code(), Some("SERVICE_UNAVAILABLE"));
+        match refusal.into_error() {
+            ClientError::Refused {
+                error,
+                retry_after_seconds,
+                ..
+            } => {
+                assert_eq!(error.code, ErrorCode::ServiceCapacity);
+                assert_eq!(retry_after_seconds, Some(3), "the second answer's delay");
+            }
+            other => panic!("a refusal: {other:?}"),
+        }
+    }
+
+    /// KR-REQ-23.57: a request that is not safe to repeat is never sent again, whatever the service
+    /// asked: an authority-feed change, which sent again could undo a later one; a settings-sync
+    /// exchange that names no request identity, which no receipt can settle; and a deletion.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_a_request_not_safe_to_repeat_is_never_sent_again() {
+        for (method, body) in [
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "publish": { "request": {} } }),
+            ),
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "delegate": { "owner_key_ids": [] } }),
+            ),
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "remove": { "host_key_id": "a host" } }),
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "exchange": { "collection_id": "c", "object_id": "o" } }),
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "exchange": { "request_id": null, "collection_id": "c" } }),
+            ),
+            (
+                Method::StorageObjectDelete,
+                serde_json::json!({ "object_id": "an object" }),
+            ),
+        ] {
+            let script = Script::answering([unavailable(Some(2)), stored()]);
+            match asked(&script, method, body.clone(), None).await {
+                Ok(Answer::Refused(refusal)) => {
+                    assert_eq!(
+                        refusal.code(),
+                        Some("SERVICE_UNAVAILABLE"),
+                        "{method:?} {body}"
+                    );
+                }
+                other => panic!("{method:?} {body}: the first refusal: {other:?}"),
+            }
+            assert_eq!(script.requests(), 1, "{method:?} {body}: sent once");
+        }
+    }
+
+    /// KR-REQ-23.57: only the service's own `SERVICE_UNAVAILABLE`, with a delay this client waits
+    /// inside a call, asks for the same request again. Every other answer is the answer at once,
+    /// even for a request that is safe to repeat: a rate limit, a quota, a fault, a gateway's page,
+    /// an unavailable service that states no delay, and one whose delay is longer than a call waits.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_an_answer_that_is_not_the_services_request_to_send_again_is_the_answer() {
+        for answer in [
+            refusal(429, "RATE_LIMITED", Some(2)),
+            refusal(403, "QUOTA_EXHAUSTED", Some(2)),
+            refusal(500, "INTERNAL", Some(2)),
+            refusal(503, "INTERNAL", Some(2)),
+            unavailable(None),
+            unavailable(Some(11)),
+            ServiceHttpAnswer {
+                status: 503,
+                body: b"<html><body>Service Unavailable</body></html>".to_vec(),
+            },
+        ] {
+            let script = Script::answering([answer.clone(), stored()]);
+            let outcome = asked(
+                &script,
+                Method::MailboxDeliver,
+                serde_json::json!({ "recipient_key": "a key" }),
+                None,
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(Answer::Data(_))),
+                "{} {}: the first answer",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_eq!(
+                script.requests(),
+                1,
+                "{} {}: sent once",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
+    }
+
+    /// KR-REQ-23.57: an attempt the caller recorded as signed at one instant goes again under that
+    /// same instant, so a settings-sync attempt stays inside the window its fence names, and under a
+    /// nonce of its own, because the service spends each nonce once.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_a_request_sent_once_more_keeps_the_instant_its_caller_stated() {
+        let stated = now_ms() - 1_000;
+        let script = Script::answering([unavailable(Some(1)), stored()]);
+        let identity = "0192f6d4-3c1e-7d2a-9b8c-5e4f3a2b1c0d";
+        let answer = asked(
+            &script,
+            Method::SyncCompareExchange,
+            serde_json::json!({ "exchange": { "request_id": identity, "collection_id": "c" } }),
+            Some(stated),
+        )
+        .await;
+        assert!(matches!(answer, Ok(Answer::Data(_))), "{answer:?}");
+        let sent = script.sent();
+        let (first, second) = (credential_of(&sent[0].1), credential_of(&sent[1].1));
+        assert_eq!(first.payload.signed_at_ms, TimestampMs::new(stated));
+        assert_eq!(second.payload.signed_at_ms, TimestampMs::new(stated));
+        assert_ne!(first.payload.nonce, second.payload.nonce);
+    }
+
+    /// KR-REQ-23.57: what may go again is decided for each request, and the same rule decides what
+    /// a lost answer means. A gateway's 502 or `INTERNAL` after an authority-feed read is transient,
+    /// because a read is a read; after a settings-sync exchange that names no request identity it
+    /// is an unknown outcome, because nothing can say whether that write ran.
+    #[tokio::test]
+    async fn kr_req_23_57_a_lost_answer_means_what_the_request_allows() {
+        let page = ServiceHttpAnswer {
+            status: 502,
+            body: b"<html><body>Bad Gateway</body></html>".to_vec(),
+        };
+        let internal = refusal(500, "INTERNAL", None);
+        for (method, body, expected) in [
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "read": {} }),
+                ErrorCode::UpstreamUnavailable,
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "exchange": { "collection_id": "c" } }),
+                ErrorCode::OutcomeUnknown,
+            ),
+        ] {
+            let script = Script::answering([page.clone()]);
+            match asked(&script, method, body.clone(), None).await {
+                Err(Unanswered::Sent(error)) => assert_eq!(error.code(), expected, "{body}"),
+                other => panic!("{body}: a lost answer: {other:?}"),
+            }
+            let script = Script::answering([internal.clone()]);
+            match asked(&script, method, body.clone(), None).await {
+                Ok(Answer::Refused(refusal)) => {
+                    assert_eq!(refusal.into_error().code(), expected, "{body}");
+                }
+                other => panic!("{body}: the service's refusal: {other:?}"),
+            }
+        }
+    }
+
     /// From the moment the transport is given a request, whatever goes wrong may have happened
     /// after the service received it: a transport that fails, and an answer this client cannot
     /// read. A refusal the service named is an answer, sent and answered.
@@ -2001,7 +2490,7 @@ mod tests {
                     status: 403,
                     body: serde_json::to_vec(document).expect("an answer"),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .and_then(Answer::data)
             .expect_err("a refusal, or an answer this client cannot read")
@@ -2334,7 +2823,7 @@ mod tests {
                     }))
                     .expect("a refusal"),
                 },
-                Method::MailboxRead,
+                Repeat::Safe,
             )
             .and_then(Answer::data)
             .expect_err("a refusal");
@@ -2373,7 +2862,7 @@ mod tests {
 
         for planted in planted_spellings() {
             let answer = refused_with(&planted, 418);
-            let Ok(Answer::Refused(refusal)) = answer_of(&answer, Method::MailboxRead) else {
+            let Ok(Answer::Refused(refusal)) = answer_of(&answer, Repeat::Safe) else {
                 panic!("a refusal");
             };
             assert_eq!(refusal.code(), None);
@@ -2382,11 +2871,11 @@ mod tests {
                 r#"Refusal{code:"[acodethisclientdoesnotknow]",status:418,..}"#,
             );
             let mut renderings = debug_renderings(&refusal);
-            let Ok(content) = content_of(refused_with(&planted, 418), Method::MailboxRead) else {
+            let Ok(content) = content_of(refused_with(&planted, 418), Repeat::Safe) else {
                 panic!("a refusal of content");
             };
             renderings.extend(debug_renderings(&content));
-            let answered = answer_of(&answer, Method::MailboxRead).expect("a refusal");
+            let answered = answer_of(&answer, Repeat::Safe).expect("a refusal");
             renderings.extend(debug_renderings(&answered));
             assert_unmarked(&planted, &renderings);
             assert_eq!(refusal.into_error().code(), ErrorCode::InvalidArgument);
@@ -2398,17 +2887,17 @@ mod tests {
     #[test]
     fn a_refusal_code_the_contract_names_is_said_as_itself() {
         let answer = refused_with("FORBIDDEN", 403);
-        let Ok(Answer::Refused(refusal)) = answer_of(&answer, Method::MailboxRead) else {
+        let Ok(Answer::Refused(refusal)) = answer_of(&answer, Repeat::Safe) else {
             panic!("a refusal");
         };
         assert_eq!(refusal.code(), Some("FORBIDDEN"));
         renders_only(&refusal, r#"Refusal{code:"FORBIDDEN",status:403,..}"#);
         renders_only(
-            &answer_of(&answer, Method::MailboxRead).expect("a refusal"),
+            &answer_of(&answer, Repeat::Safe).expect("a refusal"),
             r#"Refused(Refusal{code:"FORBIDDEN",status:403,..})"#,
         );
         renders_only(
-            &content_of(refused_with("FORBIDDEN", 403), Method::MailboxRead).expect("a refusal"),
+            &content_of(refused_with("FORBIDDEN", 403), Repeat::Safe).expect("a refusal"),
             r#"Refused(Refusal{code:"FORBIDDEN",status:403,..})"#,
         );
     }
