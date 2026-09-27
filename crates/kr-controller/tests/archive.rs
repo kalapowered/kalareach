@@ -1499,9 +1499,12 @@ impl Drop for Mode {
 #[cfg(unix)]
 #[test]
 fn what_is_left_of_an_ended_worker_that_cannot_be_removed_stops_the_import() {
-    // Death is confirmed, so the descriptor and the endpoint are fenced before the journal is
-    // opened. A path that is already gone is fenced; one that is still there after the attempt
-    // is not, and the journal is left alone rather than opened beside it.
+    // Death is confirmed, so the endpoint and then the descriptor are removed before the journal
+    // is opened. A path that is already gone is fenced; one that is still there after the attempt
+    // is not, and the journal is left alone rather than opened beside it. The descriptor is the
+    // evidence the next import reads, so it stays until the endpoint has gone: an import run again
+    // while the removal is still impossible is refused again, rather than finding nothing to
+    // fence.
     use kr_controller::archive::{ImportOutcome, RefusalCause};
     let ended = kr_ipc::identity::ended_process_identity(1);
     let held_by: [(&str, HeldBy); 2] = [
@@ -1525,17 +1528,28 @@ fn what_is_left_of_an_ended_worker_that_cannot_be_removed_stops_the_import() {
         std::fs::write(endpoint.as_path(), b"a socket").expect("the endpoint's file");
         let imported = {
             let _held = Mode::read_only(directory(&archive));
-            archive
-                .import_journals()
-                .expect("the environment is walked")
+            [
+                archive
+                    .import_journals()
+                    .expect("the environment is walked"),
+                archive
+                    .import_journals()
+                    .expect("the environment is walked again"),
+            ]
         };
-        match outcome_of(&imported, session_id) {
-            ImportOutcome::Refused {
-                cause: RefusalCause::NotFenced,
-                ..
-            } => {}
-            other => panic!("{held} could not be removed, and the import went on: {other:?}"),
+        for (run, imported) in imported.iter().enumerate() {
+            match outcome_of(imported, session_id) {
+                ImportOutcome::Refused {
+                    cause: RefusalCause::NotFenced,
+                    ..
+                } => {}
+                other => panic!("{held} could not be removed, and import {run} went on: {other:?}"),
+            }
         }
+        assert!(
+            archive.paths().descriptor_file(session_id).exists(),
+            "the descriptor stays while what it names is still there"
+        );
         assert_eq!(
             Journal::recorded_schema_version(archive.paths().journal_database(session_id))
                 .expect("reads the version"),

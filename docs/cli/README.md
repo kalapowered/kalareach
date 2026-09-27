@@ -1286,11 +1286,12 @@ It works on the environment's own files, so it runs only while the control daemo
 takes the environment's singleton lock first, which a running daemon holds, and is refused while
 the daemon or another import holds it. A worker can outlive its daemon, so a journal is not opened
 while anything this host can read says its worker may still be there, or while what would say so
-cannot be read: the environment's registry is read as it is, never brought forward or repaired, so
-an environment whose registry is missing, is at another schema version or has lost a table imports
-nothing. Start this build's daemon once and stop it again to bring an older registry forward. What
-is left of a worker whose end is confirmed is removed first, and a journal is not opened while any
-of it is still there. A journal the importer cannot read is refused by name and left exactly as it
+cannot be read: the environment's registry is read as it is, never brought forward, repaired or
+written, so an environment whose registry is missing, is at another schema version, has lost a
+table or still holds writes in its write-ahead log imports nothing. Start this build's daemon once
+and stop it again to bring such a registry up to date. What is left of a worker whose end is
+confirmed is removed first, its endpoint before its descriptor, and a journal is not opened while
+any of it is still there. A journal the importer cannot read is refused by name and left exactly as it
 was, and the command then exits with a failure.
 
 ## `--json` shapes

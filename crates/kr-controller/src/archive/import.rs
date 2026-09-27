@@ -8,8 +8,8 @@
 //! end, and the published descriptor - and a source this host cannot read counts as saying so.
 //! The registry is read as it is, never brought forward or repaired, and an environment without
 //! one has nothing to say about its workers, so nothing below the ladder is imported there. What is
-//! left of a worker whose end is confirmed, its descriptor and its endpoint, is fenced before the
-//! journal is opened, and a path that is still there after that is a refusal.
+//! left of a worker whose end is confirmed, its endpoint and then its descriptor, is removed before
+//! the journal is opened, and a path that is still there after that is a refusal.
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::SessionId;
@@ -100,11 +100,11 @@ impl RefusalCause {
     }
 }
 
-/// Why a session's worker may still be there, or `None` when nothing says so, with what is left
-/// to fence of one whose end is confirmed.
+/// Why a session's worker may still be there, or `None` when nothing says so, with the display
+/// number whose endpoint is left to fence of one whose end is confirmed.
 struct Evidence {
     remains: Option<String>,
-    ended: Option<(DisplayNumber, ProcessStartIdentity)>,
+    ended: Option<DisplayNumber>,
 }
 
 impl ArchiveService {
@@ -174,19 +174,13 @@ impl ArchiveService {
                 reason,
             };
         }
-        if let Some((display_number, identity)) = evidence.ended {
-            if let Err(error) = self.take_ownership(session_id, display_number, &identity) {
-                return ImportOutcome::Refused {
-                    cause: RefusalCause::NotFenced,
-                    reason: error.to_string(),
-                };
-            }
-            if let Some(left) = self.left_after_fencing(session_id, display_number) {
-                return ImportOutcome::Refused {
-                    cause: RefusalCause::NotFenced,
-                    reason: left,
-                };
-            }
+        if let Some(display_number) = evidence.ended
+            && let Some(left) = self.fence_ended(session_id, display_number)
+        {
+            return ImportOutcome::Refused {
+                cause: RefusalCause::NotFenced,
+                reason: left,
+            };
         }
         match import_journal(&path) {
             Ok(Imported::Imported { from, to, receipts }) => {
@@ -200,20 +194,18 @@ impl ArchiveService {
         }
     }
 
-    /// Removes what is left of a worker whose end is confirmed - its descriptor and, where it is a
-    /// file, its endpoint - and says what is still there, or `None` when nothing is.
+    /// Removes what is left of a worker whose end is confirmed - where it is a file, its endpoint,
+    /// and then its descriptor - and says what is still there, or `None` when nothing is.
     ///
-    /// Taking ownership has already tried, and it carries on past a path it could not remove,
-    /// because recovery does. An import does not: a path that is already gone is fenced, and one
-    /// that could not be removed stops the journal being opened. A named pipe is not a file and
-    /// goes with the process that served it, so on Windows there is only the descriptor.
-    fn left_after_fencing(
-        &self,
-        session_id: SessionId,
-        display_number: DisplayNumber,
-    ) -> Option<String> {
+    /// The order is the point. The descriptor is evidence the next import reads: removed first,
+    /// it would take with it the only record that an endpoint is still to be removed, and a later
+    /// import would find nothing to fence and open the journal beside it. So it goes last, once
+    /// the endpoint has gone. A path that is already gone is fenced; one that could not be removed
+    /// stops the journal being opened, and leaves the descriptor where it was. A named pipe is not
+    /// a file and goes with the process that served it, so on Windows there is only the descriptor.
+    fn fence_ended(&self, session_id: SessionId, display_number: DisplayNumber) -> Option<String> {
         #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut paths = vec![self.paths().descriptor_file(session_id)];
+        let mut paths = Vec::new();
         #[cfg(unix)]
         match self.paths().worker_endpoint(display_number) {
             Ok(endpoint) => paths.push(endpoint.as_path().to_path_buf()),
@@ -221,6 +213,7 @@ impl ArchiveService {
         }
         #[cfg(not(unix))]
         let _ = display_number;
+        paths.push(self.paths().descriptor_file(session_id));
         for path in paths {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -262,7 +255,7 @@ impl ArchiveService {
                             ended: None,
                         };
                     }
-                    ended = Some((row.display_number, row.process_identity.clone()));
+                    ended = Some(row.display_number);
                 }
             }
             Err(error) => {
@@ -307,7 +300,7 @@ impl ArchiveService {
                         ended: None,
                     };
                 }
-                ended = Some((descriptor.display_number, descriptor.process_start_identity));
+                ended = Some(descriptor.display_number);
             }
             Err(error) => {
                 return Evidence {
