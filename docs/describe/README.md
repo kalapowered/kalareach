@@ -287,6 +287,11 @@ gone.
 A process loads one model in its life. Unloading a model ends the process, whatever the reason: an
 idle host, a pause, descriptions turned off, or a failure. The next load starts a new one.
 
+The daemon starts the two threads that carry a process's frames before it starts the process, so a
+thread the system will not create leaves no process behind; the load ends as failed, and the next
+start waits out the restart delay. Once the process is running, anything that fails on the way to
+the handshake kills it and collects it.
+
 ## Lifecycle and failure
 
 The model stays loaded while there is work and sessions to justify it, and a host with no sessions

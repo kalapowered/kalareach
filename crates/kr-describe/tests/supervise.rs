@@ -22,10 +22,14 @@ use kr_describe::queue::{PRIORITY_RUN_LIMIT, Priority};
 use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
 };
-use kr_describe::service::{DescriptionService, HostPlacement, Outcome, ProcessEnd, UnloadReason};
+use kr_describe::service::{
+    DescriptionService, HostPlacement, Outcome, ProcessEnd, RESTART_FIRST_MS, UnloadReason,
+};
 use kr_describe::store::DescriptionStore;
-use kr_describe::supervise::{ANSWER_GRACE_MS, CANCEL_MS, Driver, HANDSHAKE_MS, Launch, Report};
-use kr_describe::testing::{Raw, SCRIPT_VARIABLE, Script};
+use kr_describe::supervise::{
+    ANSWER_GRACE_MS, CANCEL_MS, Driver, HANDSHAKE_MS, Launch, READER_THREAD, Report, WRITER_THREAD,
+};
+use kr_describe::testing::{Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, refuse_thread_start};
 use kr_describe::time::Reading;
 use kr_describe::wire::LoadEnd;
 use kr_protocol::ids::{SessionEpoch, SessionId};
@@ -81,6 +85,20 @@ impl Rig {
     /// The directory the service's store is in.
     fn state(&self) -> PathBuf {
         self.placed.directory("state")
+    }
+
+    /// How many processes have marked their start in the runtime directory.
+    fn processes_started(&self) -> usize {
+        std::fs::read_dir(self.placed.directory("runtime"))
+            .expect("the runtime directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STARTED_PREFIX)
+            })
+            .count()
     }
 
     /// Turns at `now` until `done` holds, waiting for the process in real time between turns.
@@ -1335,4 +1353,72 @@ fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
         matches!(outcomes(&reports)[..], [Outcome::Published { .. }]),
         "{reports:?}"
     );
+}
+
+/// A thread that carries a process's frames and cannot start leaves no process behind. Both
+/// threads start before the process does, so the load ends failed with nothing to end, no process
+/// was ever started, and the next start, once the restart delay has passed, runs. The control is
+/// that next start, which starts one process and publishes.
+#[test]
+fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
+    for thread in [WRITER_THREAD, READER_THREAD] {
+        let mut rig = Rig::new(&Script {
+            mark_start: true,
+            ..Script::default()
+        });
+        queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+        refuse_thread_start(thread);
+        let reports = rig.driver.turn(&roomy(), at(3_000)).expect("a turn");
+        assert!(
+            !reports
+                .iter()
+                .any(|report| matches!(report, Report::Started { .. })),
+            "{thread}: {reports:?}"
+        );
+        let ended = outcomes(&reports);
+        assert!(
+            ended.contains(&&Outcome::ProcessEnded {
+                why: ProcessEnd::CouldNotStart
+            }),
+            "{thread}: {reports:?}"
+        );
+        assert!(
+            ended.iter().any(|outcome| matches!(
+                outcome,
+                Outcome::LoadEnded {
+                    why: LoadEnd::Failed,
+                    ..
+                }
+            )),
+            "{thread}: {reports:?}"
+        );
+        assert_eq!(rig.driver.pid(), None, "{thread}");
+        assert_eq!(rig.driver.started(), 0, "{thread}");
+        // Longer than a process takes to leave its mark.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            rig.processes_started(),
+            0,
+            "{thread}: a process was started"
+        );
+
+        // The control: past the restart delay, the next start has both threads and runs.
+        let reports = rig.until(
+            &roomy(),
+            at(3_000 + RESTART_FIRST_MS),
+            "the description",
+            |reports, _| a_job_ended(reports),
+        );
+        assert!(
+            matches!(reports[0], Report::Started { .. }),
+            "{thread}: {reports:?}"
+        );
+        assert!(
+            outcomes(&reports)
+                .iter()
+                .any(|outcome| matches!(outcome, Outcome::Published { .. })),
+            "{thread}: {reports:?}"
+        );
+        assert_eq!(rig.processes_started(), 1, "{thread}");
+    }
 }

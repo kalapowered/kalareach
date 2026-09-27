@@ -34,6 +34,34 @@ pub const CRASH_EXIT: i32 = 9;
 /// How often a stub looks at its token while it waits.
 const LOOK: Duration = Duration::from_millis(2);
 
+/// The start of the name of the file a stub that marks its start leaves in its runtime directory,
+/// followed by its process identifier.
+pub const STARTED_PREFIX: &str = "stub-started-";
+
+thread_local! {
+    /// The frame thread a driver on this thread does not start next, by name.
+    static REFUSED_THREAD: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the next start of the frame thread named `name`, by a driver on this thread, fail as a
+/// thread the operating system would not create. The names are
+/// [`crate::supervise::WRITER_THREAD`] and [`crate::supervise::READER_THREAD`].
+pub fn refuse_thread_start(name: &'static str) {
+    REFUSED_THREAD.with(|refused| refused.set(Some(name)));
+}
+
+/// Returns whether the start of the thread named `name` is to fail, which it does once.
+pub(crate) fn thread_start_refused(name: &str) -> bool {
+    REFUSED_THREAD.with(|refused| {
+        let refuse = refused.get() == Some(name);
+        if refuse {
+            refused.set(None);
+        }
+        refuse
+    })
+}
+
 /// What a stub does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Script {
@@ -63,6 +91,9 @@ pub struct Script {
     pub wedge_output_from: Option<u64>,
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
+    /// Whether the process leaves a file named [`STARTED_PREFIX`] and its identifier in its
+    /// runtime directory as it starts, so a test can tell whether it was ever started.
+    pub mark_start: bool,
 }
 
 /// What a job's answer looks like.
@@ -130,6 +161,7 @@ impl Script {
         flag("memory-ceiling", self.memory_ceiling);
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
+        flag("mark-start", self.mark_start);
         match &self.output {
             Output::WellFormed => {}
             Output::Malformed => parts.push("output=malformed".to_owned()),
@@ -181,6 +213,7 @@ impl Script {
                 "memory-ceiling" => script.memory_ceiling = true,
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
+                "mark-start" => script.mark_start = true,
                 "output" => {
                     script.output = match value {
                         "malformed" => Output::Malformed,
@@ -454,9 +487,6 @@ pub fn stub_main() -> i32 {
             return 64;
         }
     };
-    if let Some(raw) = script.raw {
-        return run_raw(raw, &script);
-    }
     let (runtime_dir, daemon) = match crate::serve::arguments(&arguments) {
         Ok(read) => read,
         Err(error) => {
@@ -464,6 +494,19 @@ pub fn stub_main() -> i32 {
             return 64;
         }
     };
+    if script.mark_start {
+        let mark = runtime_dir.join(format!("{STARTED_PREFIX}{}", std::process::id()));
+        if let Err(error) = std::fs::write(&mark, b"") {
+            eprintln!(
+                "kr-describe-stub: {} could not be written: {error}",
+                mark.display()
+            );
+            return 74;
+        }
+    }
+    if let Some(raw) = script.raw {
+        return run_raw(raw, &script);
+    }
     let catalogue = match Catalogue::builtin() {
         Ok(catalogue) => catalogue,
         Err(error) => {

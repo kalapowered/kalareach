@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,12 @@ pub const REQUESTS_HELD: usize = 4;
 
 /// How long an unload waits for the process to leave on its own once its input is closed.
 const LEAVE_WAIT: Duration = Duration::from_secs(2);
+
+/// The name of the thread that writes a process's requests to its input.
+pub const WRITER_THREAD: &str = "describe-writer";
+
+/// The name of the thread that reads a process's answers from its output.
+pub const READER_THREAD: &str = "describe-reader";
 
 /// How the daemon starts the description process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +382,10 @@ impl Driver {
     }
 
     /// Starts the process when there is none, and says hello.
+    ///
+    /// The two threads that carry its frames start first, each waiting to be handed its end of the
+    /// pipes, so a thread that cannot start leaves no process behind. From the spawn on, nothing
+    /// fails without the process being killed and collected.
     fn start(
         &mut self,
         now: Reading,
@@ -384,6 +394,49 @@ impl Driver {
         if self.process.is_some() {
             return Ok(());
         }
+        let tag = self.tag.wrapping_add(1);
+        let (requests, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(REQUESTS_HELD);
+        let (give_input, take_input) = std::sync::mpsc::sync_channel::<ChildStdin>(1);
+        start_thread(WRITER_THREAD, move || {
+            let Ok(mut input) = take_input.recv() else {
+                return;
+            };
+            // The input is dropped when the frames stop, which is the end of the process's input
+            // and the end of the process.
+            for frame in pending {
+                if input
+                    .write_all(&frame)
+                    .and_then(|()| input.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+        let (give_output, take_output) = std::sync::mpsc::sync_channel::<ChildStdout>(1);
+        let tell = self.tell.clone();
+        start_thread(READER_THREAD, move || {
+            let Ok(mut output) = take_output.recv() else {
+                return;
+            };
+            loop {
+                let event = match read_message::<Answer>(&mut output) {
+                    Ok(Some(answer)) => Event::Answer { tag, answer },
+                    Ok(None) | Err(WireError::Io(_)) => Event::Closed {
+                        tag,
+                        why: ProcessEnd::Exited,
+                    },
+                    Err(WireError::Truncated { .. } | WireError::Frame(_)) => Event::Closed {
+                        tag,
+                        why: ProcessEnd::BrokenWire,
+                    },
+                };
+                let closed = matches!(event, Event::Closed { .. });
+                if tell.send(event).is_err() || closed {
+                    return;
+                }
+            }
+        })?;
         let mut command = Command::new(&self.launch.program);
         command.args(&self.launch.arguments);
         if let Some(identity) = &self.identity {
@@ -409,54 +462,21 @@ impl Driver {
                 );
                 ProcessEnd::CouldNotStart
             })?;
-        let (Some(mut input), Some(mut output)) = (child.stdin.take(), child.stdout.take()) else {
+        // The threads end on their own when what they wait for is dropped, which is what happens
+        // to both on every return below.
+        let handed = match (child.stdin.take(), child.stdout.take()) {
+            (Some(input), Some(output)) => {
+                give_input.send(input).is_ok() && give_output.send(output).is_ok()
+            }
+            _ => false,
+        };
+        if !handed {
             let _ = child.kill();
             let _ = child.wait();
             return Err(ProcessEnd::CouldNotStart);
-        };
-        self.tag = self.tag.wrapping_add(1);
+        }
+        self.tag = tag;
         self.started = self.started.saturating_add(1);
-        let tag = self.tag;
-        let (requests, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(REQUESTS_HELD);
-        std::thread::Builder::new()
-            .name("describe-writer".to_owned())
-            .spawn(move || {
-                // The input is dropped when the frames stop, which is the end of the process's
-                // input and the end of the process.
-                for frame in pending {
-                    if input
-                        .write_all(&frame)
-                        .and_then(|()| input.flush())
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })
-            .map_err(|_| ProcessEnd::CouldNotStart)?;
-        let tell = self.tell.clone();
-        std::thread::Builder::new()
-            .name("describe-reader".to_owned())
-            .spawn(move || {
-                loop {
-                    let event = match read_message::<Answer>(&mut output) {
-                        Ok(Some(answer)) => Event::Answer { tag, answer },
-                        Ok(None) | Err(WireError::Io(_)) => Event::Closed {
-                            tag,
-                            why: ProcessEnd::Exited,
-                        },
-                        Err(WireError::Truncated { .. } | WireError::Frame(_)) => Event::Closed {
-                            tag,
-                            why: ProcessEnd::BrokenWire,
-                        },
-                    };
-                    let closed = matches!(event, Event::Closed { .. });
-                    if tell.send(event).is_err() || closed {
-                        return;
-                    }
-                }
-            })
-            .map_err(|_| ProcessEnd::CouldNotStart)?;
         reports.push(Report::Started { pid: child.id() });
         self.process = Some(Running {
             tag,
@@ -717,4 +737,24 @@ fn resident_bytes(pid: u32) -> Option<u64> {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).map(sysinfo::Process::memory)
+}
+
+/// Starts one of the two threads that carry a process's frames.
+fn start_thread(
+    name: &'static str,
+    work: impl FnOnce() + Send + 'static,
+) -> std::result::Result<(), ProcessEnd> {
+    #[cfg(feature = "testing")]
+    if crate::testing::thread_start_refused(name) {
+        eprintln!("kr-describe: the {name} thread was not started, as a test asked");
+        return Err(ProcessEnd::CouldNotStart);
+    }
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(work)
+        .map(drop)
+        .map_err(|error| {
+            eprintln!("kr-describe: the {name} thread could not be started: {error}");
+            ProcessEnd::CouldNotStart
+        })
 }
