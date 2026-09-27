@@ -503,7 +503,7 @@ pub use crate::apple::AppleAcl;
 /// Windows it is the object's discretionary list, read and written through the handle itself.
 /// A file whose protection is its mode bits alone carries [`AccessControl::None`].
 ///
-/// Every Windows object has a list, so a reading there is always [`AccessControl::Windows`], even
+/// Every Windows object has a list, so a reading there is always `AccessControl::Windows`, even
 /// when every entry in it came from the directory above; [`AccessControl::has_entries`] is what
 /// answers whether the object carries protection of its own. Written to a Windows object,
 /// [`AccessControl::None`] means "take the object's own entries off it", which leaves it with
