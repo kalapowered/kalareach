@@ -7,9 +7,10 @@
 //! and a subscription its own attachment; a page of the resources a snapshot or a subscription
 //! carries is cut to the frame its reader declared, and a reader that follows the continuations
 //! reads every resource once; a subscription from a cursor retention has passed is told the range
-//! and the bound that took it; a paired device's read is held to its grant's present view, beside
-//! the local owner, who is shown everything, and is refused retained history outright; and a
-//! receipt answers only the actor whose action it is.
+//! and the bound that took it; a paired device's snapshot and subscription are held to its grant's
+//! present view on every page, beside the local owner, who is shown everything, and the device is
+//! refused retained history outright; and a receipt answers only the actor whose action it is, only
+//! for this worker's own session, and only in a frame its reader can receive.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
