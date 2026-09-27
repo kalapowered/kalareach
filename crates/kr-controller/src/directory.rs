@@ -6,7 +6,9 @@
 //!
 //! A descriptor whose challenge fails is quarantined: it stays out of the directory and is never
 //! spawned from. It might be stale, or it might have been planted; the daemon cannot tell and does
-//! not need to, because either way it is not a session.
+//! not need to, because either way it is not a session. A descriptor whose reservation this host
+//! fenced is quarantined without a challenge: the fence is the host's word that the worker is not
+//! to be reached again.
 //!
 //! Beside each worker is what it last said about its session: its ready report, its answers to
 //! reads and its acceptance of a close each describe the session. A worker that has finished its
@@ -30,7 +32,7 @@ use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState, S
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
-use crate::registry::Registry;
+use crate::registry::{LaunchPhase, Registry};
 
 /// How long one worker has to answer its challenge and accept a generation during a rebuild, and
 /// then, separately, to describe its session ([`describe`]).
@@ -107,7 +109,8 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// Returns an error when the descriptor directory cannot be listed.
+    /// Returns an error when the descriptor directory cannot be listed or the registry cannot be
+    /// read.
     pub async fn rebuild(
         paths: &EnvironmentPaths,
         registry: &Registry,
@@ -143,6 +146,20 @@ impl Directory {
                     session_id: descriptor.session_id,
                     reason: "the descriptor's key is not the one the rendezvous established"
                         .to_owned(),
+                });
+                continue;
+            }
+            // A fenced reservation is one this host stopped trusting, and its worker is not reached
+            // again: challenging it would hand it this daemon's generation, and admitting it would
+            // undo the fence. Recovery leaves such a worker out of the directory for the same
+            // reason, and so does a start.
+            if registry
+                .reservation_for_session(descriptor.session_id)?
+                .is_some_and(|reservation| reservation.phase == LaunchPhase::Fenced)
+            {
+                directory.quarantined.push(Quarantined {
+                    session_id: descriptor.session_id,
+                    reason: "the reservation this worker was started for is fenced".to_owned(),
                 });
                 continue;
             }
