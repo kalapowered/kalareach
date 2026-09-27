@@ -4276,8 +4276,10 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             "detected": detected_evidence(&detected),
             "device_upload": upload.evidence(),
             "prompt": { "question": question, "answer": sum },
-            "image": { "file": file, "syntax": account.image, "answer": COLOUR, "code": upper, "rows": answered_rows.iter().filter(|row| row.contains(&upper)).collect::<Vec<_>>() },
-            "local_rows": local.iter().filter(|row| row.contains(&upper)).collect::<Vec<_>>(),
+            // What the screens showed is said by the marks looked for; the rows, which could show
+            // anything of the person's, are in the part's log.
+            "image": { "file": file, "syntax": account.image, "answer": COLOUR, "code": upper, "answered": shown_in_log(stage, "the image's answer", &answered_rows, &upper) },
+            "local": { "shows": upper, "seen": shown_in_log(stage, "the local terminal", &local, &upper) },
             "surface": offered.evidence(),
         });
         let mut failures = Vec::new();
@@ -4859,8 +4861,8 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
-            "slash": { "typed": account.slash.input, "shows": account.slash.shows, "rows": slash.iter().filter(|row| row.contains(&account.slash.shows)).collect::<Vec<_>>() },
-            "interrupt": { "key": account.interrupt.input, "shows": account.interrupt.shows, "rows": interrupted.iter().filter(|row| row.contains(&account.interrupt.shows)).collect::<Vec<_>>() },
+            "slash": { "typed": account.slash.input, "shows": account.slash.shows, "seen": shown_in_log(stage, "the slash command", &slash, &account.slash.shows) },
+            "interrupt": { "key": account.interrupt.input, "shows": account.interrupt.shows, "seen": shown_in_log(stage, "the interrupt", &interrupted, &account.interrupt.shows) },
             "queued": { "answer": queued_sum, "order": queue },
             "steering": steering,
             "checker_controls": checker,
@@ -4885,6 +4887,16 @@ fn loser_reached_nothing(executions: usize) -> Result<(), String> {
             "the command ran {executions} time(s), where the lease holder's allowing it runs it once"
         ))
     }
+}
+
+/// Whether any of `rows`, from a screen the part read, shows `mark`; the rows that do go to the
+/// part's log under `what`, not into its record, since a screen can show anything of the person's.
+fn shown_in_log(stage: &Stage<'_, '_>, what: &str, rows: &[String], mark: &str) -> bool {
+    let showing: Vec<&String> = rows.iter().filter(|row| row.contains(mark)).collect();
+    for row in &showing {
+        eprintln!("part's screen, {what} ({}): {row}", stage.mark);
+    }
+    !showing.is_empty()
 }
 
 /// How many requests the part has refused so far.
@@ -5376,7 +5388,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
             "winner": { "who": "the paired device, which held the input lease", "typed": account.approval.allow },
-            "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": receipt.iter().filter(|row| row.contains("input lease")).collect::<Vec<_>>(), "exit_status": local_status },
+            "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": { "shows": "input lease", "seen": shown_in_log(stage, "the local terminal's receipt", &receipt, "input lease") }, "exit_status": local_status },
             "command": command,
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
             "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
@@ -5664,7 +5676,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
             "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
-            "after_reconnect": { "prompts": prompts, "finished_replies": replies, "rows": redrawn.iter().filter(|row| row.contains(&end)).collect::<Vec<_>>() },
+            "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "seen": shown_in_log(stage, "the redrawn reply", &redrawn, &end) },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
         });
         Ending::new(
