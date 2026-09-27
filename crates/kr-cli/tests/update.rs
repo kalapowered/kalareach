@@ -1513,6 +1513,96 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
     );
 }
 
+/// KR-REQ-26.08: a daemon that starts after an update's first look, in an environment the update
+/// did not know, is found once no daemon can start: it records its roots before it takes its
+/// environment, under the install lock, and the update reads them again under that lock and waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    // A daemon part way through its start holds the install lock, shared, as each one does.
+    let starting = host.store.lock_start().expect("the start lock");
+    let update = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "update", "--archive", &archive, "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    // Once the update has looked, and has told this host's daemon to make way, the starting daemon
+    // records its roots and takes its environment, and then lets go of the install lock.
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        let state = std::fs::read(host.store.record())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map(|record| record["update"]["state"].clone());
+        if state == Some(Value::from("handing_over")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update did not reach its handover"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let other = kr_ipc::testing::TempHost::create();
+    host.store
+        .record_roots(other.paths().runtime_root(), other.paths().state_root())
+        .expect("records the roots it serves");
+    let other_lock = kr_controller::singleton::SingletonLock::hold(
+        &other.environment().singleton_lock(),
+        other.environment_id(),
+    )
+    .expect("takes its environment");
+    drop(starting);
+
+    let output = update.wait_with_output().expect("kr ends");
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!(
+                "the update to {} waits: a control daemon holds environment {}",
+                two.name(),
+                other.environment_id()
+            )),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon it stopped was started again from the release still current"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["staged"], two.name().as_str(), "{record}");
+    drop(other_lock);
+}
+
 /// KR-REQ-26.09: an install stopped between putting its release in the store and making it
 /// current is finished by the next install of the same release, and no daemon of the release
 /// starts meanwhile; another release under the same name is refused, and an install waits while
@@ -1594,6 +1684,78 @@ fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
             path.display()
         );
     }
+}
+
+/// KR-REQ-26.09: an install writes the store's record before any program of its release is in the
+/// store, and puts the release in and makes it current under the install lock: while a daemon of
+/// the store is part way through its start, the install has made the directory a store and has
+/// published nothing, and it finishes once the daemon's start has.
+#[test]
+fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
+    let host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.store
+        .create_directories()
+        .expect("the store's directories");
+    let starting = host.store.lock_start().expect("the start lock");
+    let tree = host.scratch("unpacked").join(one.name().as_str());
+    one.write(&tree);
+    let store = host.store.root().display().to_string();
+    let mut install = host
+        .command(
+            &tree.join("bin").join(Program::Kr.file_name()),
+            &["host", "install", "--store", &store, "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    // The release copied, checked and sealed in the staging directory: all that comes before the
+    // install lock.
+    let sealed = || {
+        std::fs::read_dir(host.store.staging())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|run| {
+                std::fs::metadata(run.path().join("release/bin")).is_ok_and(|about| {
+                    std::os::unix::fs::PermissionsExt::mode(&about.permissions()) & 0o777 == 0o555
+                })
+            })
+    };
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    while !sealed() {
+        assert!(
+            matches!(install.try_wait(), Ok(None)),
+            "the install ended before it staged its release"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the install did not stage its release"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(matches!(install.try_wait(), Ok(None)), "the install waits");
+    assert!(host.store.is_store(), "the store's record comes first");
+    assert!(
+        !host.store.release_directory(one.name()).exists(),
+        "nothing is published while a daemon is part way through its start"
+    );
+    assert_eq!(host.store.current().expect("reads"), None);
+
+    drop(starting);
+    let output = install.wait_with_output().expect("kr ends");
+    assert!(
+        output.status.success(),
+        "kr host install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
 }
 
 /// KR-REQ-26.09: a release already in the store is used again only when it is every file its
