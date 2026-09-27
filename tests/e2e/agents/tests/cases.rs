@@ -155,6 +155,24 @@ struct Guards {
     before: Vec<Guarded>,
     guarded: Vec<String>,
     shared: Vec<String>,
+    /// When the files were last read.
+    read_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// How often a part that waits reads the files it watches again.
+const GUARD_EVERY: Duration = Duration::from_millis(500);
+
+/// [`guards_hold`], where the files were not read in the last [`GUARD_EVERY`]: for a part's waits,
+/// which call it on every turn of their loops.
+fn guards_hold_while_waiting(stage: &Stage<'_, '_>) {
+    let due = stage.guards.is_some_and(|guards| {
+        guards.read_at.lock().map_or(true, |read_at| {
+            read_at.is_none_or(|at| at.elapsed() >= GUARD_EVERY)
+        })
+    });
+    if due {
+        guards_hold(stage);
+    }
 }
 
 /// Stops the part at once when a file of the person's that no part may change has changed since the
@@ -167,6 +185,9 @@ fn guards_hold(stage: &Stage<'_, '_>) {
     let root = stage.run.root().display().to_string();
     let now = guarded_files(&guards.home, &guards.files, &[stage.mark, root.as_str()])
         .unwrap_or_else(|why| panic!("{GUARD_CHANGED} {why}"));
+    if let Ok(mut read_at) = guards.read_at.lock() {
+        *read_at = Some(std::time::Instant::now());
+    }
     for (first, second) in guards.before.iter().zip(&now) {
         let changed = first.sha256 != second.sha256;
         if changed && guards.guarded.contains(&first.relative) {
@@ -347,6 +368,7 @@ fn staged(
             before: before.clone(),
             guarded: login.account.guarded.clone(),
             shared: login.account.shared.clone(),
+            read_at: std::sync::Mutex::new(None),
         });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
@@ -1448,6 +1470,26 @@ impl Logged {
         }
     }
 
+    /// Brings the device's view up to date and refuses a permission dialog it shows, as
+    /// [`Logged::refuse`] does; returns whether it refused one. For a part's waits on something
+    /// other than the screen.
+    fn refuse_shown(&mut self, stage: &Stage<'_, '_>) -> bool {
+        let account = stage.login.expect("a part with a login").account();
+        self.screen.pump(stage, Duration::from_millis(100));
+        let rows = self.screen.view.rows();
+        let shown = Self::dialogs(account)
+            .into_iter()
+            .find(|dialog| rows.iter().any(|row| row.contains(dialog)));
+        match shown {
+            Some(dialog) => {
+                let dialog = dialog.to_owned();
+                self.refuse(stage, &dialog, "a request the part did not make");
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Waits for the agent's command dialog asking to run `command` and nothing else, and returns
     /// its screen, taking the dialog as the vendor having answered, since only the model asks for
     /// a tool. Every other request is refused and recorded as it comes; a part that has refused
@@ -1515,13 +1557,14 @@ impl Logged {
     fn wait_for(&mut self, stage: &Stage<'_, '_>, needle: &str, why: &str) -> Vec<String> {
         let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let account = stage.login.expect("a part with a login").account();
-            let mut needles = vec![needle];
-            needles.extend(Self::dialogs(account));
+            // A dialog on the screen is refused before anything else shown is taken.
+            let mut needles = Self::dialogs(account);
+            needles.push(needle);
             loop {
                 let (index, rows) =
                     self.screen
                         .wait_for_any(stage, &self.agent.session, &needles, why);
-                if index == 0 {
+                if index == needles.len() - 1 {
                     guards_hold(stage);
                     return rows;
                 }
@@ -1529,6 +1572,9 @@ impl Logged {
             }
         }));
         waited.unwrap_or_else(|panic| {
+            if panic_text(&*panic).starts_with(GUARD_CHANGED) {
+                std::panic::resume_unwind(panic)
+            }
             let account = stage.login.expect("a part with a login").account();
             let rows = self.screen.view.rows();
             if let Some(shown) = account
@@ -1670,7 +1716,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             Some(stub) => {
                 let tools = stub.finish()?;
                 let text = tools.join("\n");
-                probe.check(&text, &servers, accepted.as_deref())?;
+                let checked = probe.check(&text, &servers, accepted.as_deref());
                 let lacking = probe
                     .lacks
                     .iter()
@@ -1691,7 +1737,8 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
                     .offered
                     .lock()
                     .map_err(|_| "the offered tools' record is poisoned".to_owned())?
-                    .push(json!({ "probe": probe.arguments, "tools": tools, "control": { "added": format!("nested control/{lacking}"), "rejected": rejected } }));
+                    .push(json!({ "probe": probe.arguments, "tools": tools, "check": checked.as_ref().err().cloned().unwrap_or_else(|| "passed".to_owned()), "control": { "added": format!("nested control/{lacking}"), "rejected": rejected } }));
+                checked?;
                 if rejected {
                     Ok(())
                 } else {
@@ -1710,6 +1757,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             }
         }
     };
+    guards_hold(stage);
     if let Some(status) = &account.status {
         answered(status).unwrap_or_else(|why| {
             panic!(
@@ -1720,6 +1768,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         });
     }
     for probe in &account.isolated {
+        guards_hold(stage);
         answered(probe).unwrap_or_else(|why| {
             panic!(
                 "{ISOLATION_UNPROVEN} `{} {}` did not answer as it must: {why}",
@@ -1760,7 +1809,8 @@ fn server_names(stage: &Stage<'_, '_>) -> Vec<String> {
 
 /// The switches the agent and its probes are given: the build list's own, `{work}` made the
 /// working directory as the system resolves it, which is how an agent that keys settings by
-/// directory names it, and those that switch off each server the person's configuration names.
+/// directory names it, and `{run}` the run's own directory; and those that switch off each server
+/// the person's configuration names.
 fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
     let login = stage.login.expect("a part with a login");
     let work = || {
@@ -1776,10 +1826,11 @@ fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
         .switches
         .iter()
         .map(|switch| {
+            let switch = switch.replace("{run}", &stage.run.root().display().to_string());
             if switch.contains("{work}") {
                 switch.replace("{work}", &work())
             } else {
-                switch.clone()
+                switch
             }
         })
         .collect();
@@ -2018,6 +2069,7 @@ impl Watch {
     ) -> (usize, Vec<String>) {
         let deadline = std::time::Instant::now() + LIVENESS;
         loop {
+            guards_hold_while_waiting(stage);
             let rows = self.view.rows();
             if let Some(index) = needles
                 .iter()
@@ -2055,10 +2107,11 @@ impl Watch {
     ) -> Vec<String> {
         let deadline = std::time::Instant::now() + LIVENESS;
         loop {
+            guards_hold_while_waiting(stage);
             match stage.runtime.block_on(self.view.wait_for(
                 &self.remote,
                 needle,
-                Duration::from_secs(5),
+                Duration::from_secs(1),
             )) {
                 Ok(rows) => return rows,
                 Err(error) => {
@@ -3517,9 +3570,10 @@ fn conversation_of(roots: &[PathBuf], needle: &str, marker: &str) -> Option<Path
 
 /// The conversation file under `roots` that records the prompt holding `needle`, once the agent
 /// has written it.
-fn recorded(roots: &[PathBuf], needle: &str, marker: &str) -> PathBuf {
+fn recorded(stage: &Stage<'_, '_>, roots: &[PathBuf], needle: &str, marker: &str) -> PathBuf {
     let started = std::time::Instant::now();
     loop {
+        guards_hold_while_waiting(stage);
         if let Some(file) = conversation_of(roots, needle, marker) {
             return file;
         }
@@ -3534,11 +3588,12 @@ fn recorded(roots: &[PathBuf], needle: &str, marker: &str) -> PathBuf {
 
 /// Waits, a while at most, until a line of `conversation` holds every one of `needles`: the agent
 /// writes its record of a reply shortly after the screen shows it.
-fn settled_line(conversation: &Path, needles: &[&str]) {
+fn settled_line(stage: &Stage<'_, '_>, conversation: &Path, needles: &[&str]) {
     let started = std::time::Instant::now();
     while first_line_with(conversation, None, needles).is_none()
         && started.elapsed() < Duration::from_secs(20)
     {
+        guards_hold_while_waiting(stage);
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -3821,7 +3876,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "a turn to queue behind",
         );
         let _ = logged.wait_for(stage, &account.busy, "the first turn runs");
-        let conversation = recorded(&conversations, &format!("{mark}-q"), &account.prompt_line);
+        let conversation = recorded(
+            stage,
+            &conversations,
+            &format!("{mark}-q"),
+            &account.prompt_line,
+        );
         let first_prompt = first_line_with(
             &conversation,
             None,
@@ -3856,7 +3916,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         let _ = logged.wait_idle(stage, "the composer is back after the queue");
         // The agent writes its record of a reply as it can; what the screen showed is waited for
         // there too before the order is read.
-        settled_line(&conversation, &[&queued_sum, &account.reply_line]);
+        settled_line(stage, &conversation, &[&queued_sum, &account.reply_line]);
         let second_prompt = first_line_with(
             &conversation,
             None,
@@ -3934,8 +3994,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 "a turn to steer",
             );
             let _ = logged.wait_for(stage, &account.busy, "the turn to steer runs");
-            let steered_conversation =
-                recorded(&conversations, &format!("{mark}-s"), &account.prompt_line);
+            let steered_conversation = recorded(
+                stage,
+                &conversations,
+                &format!("{mark}-s"),
+                &account.prompt_line,
+            );
             let steered_prompt = first_line_with(
                 &steered_conversation,
                 None,
@@ -3962,7 +4026,11 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             );
             let _ = logged.answered(stage, &steer_sum, "the steered turn answers");
             let _ = logged.wait_idle(stage, "the composer is back after steering");
-            settled_line(&steered_conversation, &[&steer_sum, &account.reply_line]);
+            settled_line(
+                stage,
+                &steered_conversation,
+                &[&steer_sum, &account.reply_line],
+            );
             let steering_prompt = first_line_with(
                 &steered_conversation,
                 None,
@@ -4081,25 +4149,26 @@ fn one_decision(decisions: usize) -> Result<(), String> {
     }
 }
 
-/// How many lines of `conversation` after the line `after` record an answer to a tool approval,
-/// once the count has held for a second: the agent writes its record of an answer when the
-/// command's result or refusal is back, which can be after its screen has moved on. Where `calls`
-/// names what marks a call that asks for approval, only the answers to such calls after `after`
-/// count, each tied to its call by the call's identifier. Waits until the count reaches `least`.
+/// How many answers to tool approvals `conversation` records after the line `after`, as
+/// [`answers`] counts them, once the count has held for a second: the agent writes its record of an
+/// answer when the command's result or refusal is back, which can be after its screen has moved on.
+/// Waits until the count reaches `least`. A count that cannot be established stops the part.
 fn decisions(
+    stage: &Stage<'_, '_>,
     conversation: &Path,
     after: Option<usize>,
-    marker: &str,
-    calls: &[String],
+    (marker, calls): (&str, &[String]),
     least: usize,
 ) -> usize {
     let count = || {
+        guards_hold_while_waiting(stage);
         answers(
             &std::fs::read_to_string(conversation).unwrap_or_default(),
             after,
             marker,
             calls,
         )
+        .unwrap_or_else(|why| panic!("the answers to the approval cannot be counted: {why}"))
     };
     let started = std::time::Instant::now();
     let mut seen = count();
@@ -4117,18 +4186,105 @@ fn decisions(
     }
 }
 
-/// Waits until the local terminal `window` shows the composer waiting for a prompt: the composer,
-/// and not the text the agent shows while a turn runs.
-fn local_idle(window: &Window, account: &Account, why: &str) -> Vec<String> {
+/// Refuses a permission dialog the local terminal `window` shows, from that terminal, and records
+/// it: a command with the agent's decline key, anything else with the key that leaves the agent no
+/// rule; returns whether it refused one. `except` names a command dialog the part is waiting for,
+/// which is left.
+fn refuse_locally(
+    stage: &Stage<'_, '_>,
+    window: &Window,
+    rows: &[String],
+    except: Option<&str>,
+) -> bool {
+    let account = stage.login.expect("a part with a login").account();
+    let dialogs = Logged::dialogs(account);
+    let Some(index) = dialogs
+        .iter()
+        .position(|dialog| rows.iter().any(|row| row.contains(dialog)))
+    else {
+        return false;
+    };
+    if index == 0
+        && except.is_some_and(|command| account.approval.names_only(rows, command).is_ok())
+    {
+        return false;
+    }
+    let key = if index == 0 {
+        account.approval.deny.clone()
+    } else {
+        account.approval.refusal().to_owned()
+    };
+    window.type_text(key.as_bytes());
+    if let Ok(mut declined) = stage.declined.lock() {
+        declined.push(format!(
+            "a request the part did not make, on the local terminal: a dialog showing {:?}, \
+             refused with {key:?}",
+            dialogs[index]
+        ));
+    }
     let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10)
+        && window
+            .screen()
+            .iter()
+            .any(|row| row.contains(dialogs[index]))
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// Waits until the local terminal `window` shows the agent's command dialog asking to run `command`
+/// and nothing else, and returns its screen; every other dialog it shows meanwhile is refused from
+/// that terminal and recorded, and a part that has refused three stops there.
+fn local_approval(stage: &Stage<'_, '_>, window: &Window, command: &str, why: &str) -> Vec<String> {
+    let account = stage.login.expect("a part with a login").account();
+    let started = std::time::Instant::now();
+    let mut refused = 0;
     loop {
-        let rows = window.wait_for_screen(&account.composer, why);
-        if !rows.iter().any(|row| row.contains(&account.busy)) {
+        guards_hold_while_waiting(stage);
+        let rows = window.screen();
+        if refuse_locally(stage, window, &rows, Some(command)) {
+            refused += 1;
+            assert!(
+                refused < 3,
+                "{why}: the agent asked for {refused} things other than the part's command"
+            );
+            continue;
+        }
+        if rows.iter().any(|row| row.contains(&account.approval.shows)) {
             return rows;
         }
         assert!(
             started.elapsed() < LIVENESS,
-            "{why}: the local terminal still shows {:?} after {LIVENESS:?}:\n{}",
+            "{why}: the local terminal did not show the agent's dialog within {LIVENESS:?}:\n{}",
+            rows.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits until the local terminal `window` shows the composer waiting for a prompt: the composer,
+/// and not the text the agent shows while a turn runs; a permission dialog it shows meanwhile is
+/// refused from that terminal and recorded.
+fn local_idle(stage: &Stage<'_, '_>, window: &Window, why: &str) -> Vec<String> {
+    let account = stage.login.expect("a part with a login").account();
+    let started = std::time::Instant::now();
+    loop {
+        guards_hold_while_waiting(stage);
+        let rows = window.screen();
+        if refuse_locally(stage, window, &rows, None) {
+            continue;
+        }
+        if rows.iter().any(|row| row.contains(&account.composer))
+            && !rows.iter().any(|row| row.contains(&account.busy))
+        {
+            return rows;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "{why}: the local terminal does not show {:?} without {:?} after {LIVENESS:?}:\n{}",
+            account.composer,
             account.busy,
             rows.join("\n")
         );
@@ -4175,11 +4331,24 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
         let mark = stage.mark.to_owned();
-        let log = stage.run.work().join("approved.log");
-        let command = format!("echo {mark} >> approved.log");
+        // The command names its log by its absolute path, so where the agent runs it does not
+        // change what it writes, and it stays on one line of the agent's dialog: its marker is the
+        // part's mark cut short, and the prompt carries the whole mark beside it.
+        let log = stage.run.work().join("a");
+        let tag = format!("kr{}", &mark[mark.len() - 8..]);
+        let command = format!("echo {tag} >> {}", log.display());
+        assert!(
+            account.approval.command_line.as_deref().unwrap_or("").len() + command.len() + 8
+                <= usize::from(kr_e2e_m1b::window::COLUMNS),
+            "the part's command, {} characters, would not fit on one line of the agent's dialog",
+            command.len()
+        );
         logged.submit(
             stage,
-            &format!("Use your shell tool to run exactly this command and nothing else: {command}"),
+            &format!(
+                "({mark}) Use your shell tool to run exactly this command and nothing else: \
+                 {command}"
+            ),
             "an approval-gated command",
         );
         // Only the model asks for a tool, so the dialog says the vendor answered; it is answered
@@ -4199,7 +4368,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         let local_status = logged.agent.session.window.exit_code(LIVENESS);
         let _ = logged.wait_idle(stage, "the agent is back at its composer");
-        let ran = executions(&log, &mark);
+        let ran = executions(&log, &tag);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
         let conversations = conversation_roots(stage);
         let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
@@ -4211,10 +4380,10 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             });
         let prompt_at = first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
         let decided = decisions(
+            stage,
             &conversation,
             prompt_at,
-            &account.decision_line,
-            &account.decision_calls,
+            (&account.decision_line, &account.decision_calls),
             1,
         );
         one_decision(decided).unwrap_or_else(|why| panic!("one resolution: {why}"));
@@ -4238,12 +4407,12 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         logged.screen = Watch::open(stage, &logged.agent.session);
         logged.keyboard = keyboard(stage, &logged.agent.session);
         std::thread::sleep(Duration::from_secs(3));
-        let after_reconnect = executions(&log, &mark);
+        let after_reconnect = executions(&log, &tag);
         let decided_after = decisions(
+            stage,
             &conversation,
             prompt_at,
-            &account.decision_line,
-            &account.decision_calls,
+            (&account.decision_line, &account.decision_calls),
             0,
         );
         let rows = fresh_rows(stage, &logged.agent.session);
@@ -4290,7 +4459,9 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         answered(&local, local.answer_capability_queries(0));
         std::thread::sleep(Duration::from_millis(500));
-        let second = format!("{mark}-2");
+        let second = format!("{tag}-2");
+        let second_command = format!("echo {second} >> {}", log.display());
+        guards_hold(stage);
         let _ = stage
             .login
             .expect("a part with a login")
@@ -4300,12 +4471,18 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         logged.turns += 1;
         local.type_text(
-            format!("Use your shell tool to run exactly this command and nothing else: echo {second} >> approved.log").as_bytes(),
+            format!(
+                "({mark}-2) Use your shell tool to run exactly this command and nothing else: \
+                 {second_command}"
+            )
+            .as_bytes(),
         );
         std::thread::sleep(Duration::from_millis(300));
         local.type_text(account.submit.as_bytes());
-        let _ = local.wait_for_screen(
-            &account.approval.shows,
+        let _ = local_approval(
+            stage,
+            &local,
+            &second_command,
             "the agent asks for the second approval",
         );
         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4320,15 +4497,15 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             .err()
             .map(|refusal| refusal.detail);
         let _ = local_idle(
+            stage,
             &local,
-            account,
             "the agent is back at its composer after the denial",
         );
         let decided_control = decisions(
+            stage,
             &conversation,
             prompt_at,
-            &account.decision_line,
-            &account.decision_calls,
+            (&account.decision_line, &account.decision_calls),
             decided + 1,
         );
         let control = loser_reached_nothing(executions(&log, &second));
@@ -4344,11 +4521,12 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "detected": detected_evidence(&detected),
             "winner": { "who": "the paired device, which held the input lease", "typed": account.approval.allow },
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": receipt.iter().filter(|row| row.contains("input lease")).collect::<Vec<_>>(), "exit_status": local_status },
+            "command": command,
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
             "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
             "replay": { "probe": probe, "typed_again": false, "checker_control_rejected": replay_control.is_err() },
             "resources": snapshot.agent_resources.resources.len(),
-            "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
+            "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "command": second_command, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
         });
         Ending {
             outcome: Outcome::passed("3", TEST, evidence),
@@ -4534,6 +4712,9 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             // whether the vendor answered, once the agent has recorded it.
             let replied_at = std::time::Instant::now();
             while count(&conversation).1 == 0 && replied_at.elapsed() < LIVENESS {
+                guards_hold_while_waiting(stage);
+                let rows = logged.agent.session.window.screen();
+                let _ = refuse_locally(stage, &logged.agent.session.window, &rows, None);
                 std::thread::sleep(Duration::from_millis(200));
             }
             if count(&conversation).1 > 0 {
@@ -4565,6 +4746,11 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 replied_at.elapsed() < LIVENESS,
                 "the agent finishes its reply while the device is away"
             );
+            // A dialog the agent raises while the device is away is refused from the local
+            // terminal, the only one attached then.
+            guards_hold_while_waiting(stage);
+            let rows = logged.agent.session.window.screen();
+            let _ = refuse_locally(stage, &logged.agent.session.window, &rows, None);
             std::thread::sleep(Duration::from_millis(200));
         }
         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4584,30 +4770,20 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 .keyboard
                 .type_text(&logged.agent.session.remote, stage.runtime, &account.clear);
         assert!(stale.is_err(), "the old attachment's next input is refused");
-        // The control: the same prompt sent again, and the count, read again, is two.
-        let mut fresh = keyboard(stage, &logged.agent.session);
-        let _ = stage
-            .login
-            .expect("a part with a login")
-            .ledger
-            .charge("4", "the control's prompt sent again")
-            .unwrap_or_else(|why| panic!("{why}"));
-        stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
-        logged.turns += 1;
-        let _ = fresh
-            .type_text(&logged.agent.session.remote, stage.runtime, &prompt)
-            .unwrap_or_else(|why| panic!("{why}"));
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = fresh
-            .type_text(&logged.agent.session.remote, stage.runtime, &account.submit)
-            .unwrap_or_else(|why| panic!("{why}"));
+        // The control: the same prompt sent again, on a keyboard of the new connection's own, and
+        // the count, read again, is two.
+        logged.keyboard = keyboard(stage, &logged.agent.session);
+        logged.submit(stage, &prompt, "the control's prompt sent again");
         let again_at = std::time::Instant::now();
         while count(&conversation).1 < 2 {
             assert!(
                 again_at.elapsed() < LIVENESS,
                 "the prompt sent again is answered"
             );
-            std::thread::sleep(Duration::from_millis(200));
+            guards_hold_while_waiting(stage);
+            if !logged.refuse_shown(stage) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         let (prompts_twice, replies_twice) = count(&conversation);

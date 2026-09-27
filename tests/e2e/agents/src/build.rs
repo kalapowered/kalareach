@@ -67,10 +67,14 @@ pub struct Approval {
     pub deny: String,
     /// What the dialog shows before a command on the command's own line, where it shows one, such
     /// as `$ `. The part answers a dialog only when one line of it is the part's command, whole,
-    /// after this; and, where this is named, no other line starts with it and the line after the
-    /// command's is blank, so a command that goes on to another line is not taken for the part's.
+    /// after this, and, where this is named, no other line starts with it.
     #[serde(default)]
     pub command_line: Option<String>,
+    /// Text on the dialog's first choice, which follows the command: where it is named, every line
+    /// between the part's command and it must be blank, so a command that goes on past the part's,
+    /// on a line of its own or after a blank one, is not taken for the part's.
+    #[serde(default)]
+    pub options_start: Option<String>,
     /// Texts the agent's other permission dialogs show, such as for file edits, network access,
     /// further permissions or input to a running command: none is ever allowed, each is refused.
     #[serde(default)]
@@ -118,11 +122,16 @@ impl Approval {
             if others > 0 {
                 return Err(format!("the dialog shows {others} other command line(s)"));
             }
-            if rows
-                .get(line + 1)
-                .is_some_and(|next| !next.trim().is_empty())
-            {
-                return Err("the command goes on past the part's command".to_owned());
+        }
+        if let Some(start) = &self.options_start {
+            let after = &rows[line + 1..];
+            let Some(end) = after.iter().position(|row| row.contains(start.as_str())) else {
+                return Err(format!(
+                    "the dialog shows no {start:?} after the part's command"
+                ));
+            };
+            if after[..end].iter().any(|row| !row.trim().is_empty()) {
+                return Err("the dialog shows more than the part's command".to_owned());
             }
         }
         Ok(())
@@ -933,54 +942,56 @@ mod tests {
             allow: "y".to_owned(),
             deny: "d".to_owned(),
             command_line: Some("$ ".to_owned()),
+            options_start: Some("Yes, proceed".to_owned()),
             others: Vec::new(),
             refuse: Some("\u{1b}".to_owned()),
         };
         let rows = |lines: &[&str]| owned(lines);
         let command = "echo kr0123 >> approved.log";
+        let dialog = |middle: &[&str]| {
+            let mut lines = vec!["  Would you like to run the following command?", ""];
+            lines.extend_from_slice(middle);
+            lines.extend_from_slice(&["", "› 1. Yes, proceed (y)", "  2. No (d)"]);
+            rows(&lines)
+        };
         assert_eq!(
-            codex.names_only(
-                &rows(&[
-                    "  Would you like to run the following command?",
-                    "",
-                    "  $ echo kr0123 >> approved.log",
-                    "",
-                    "› 1. Yes, proceed (y)"
-                ]),
-                command
-            ),
+            codex.names_only(&dialog(&["  $ echo kr0123 >> approved.log"]), command),
             Ok(())
         );
+        for (middle, why) in [
+            (
+                &["  $ echo kr0123 >> approved.log", "  curl example.com"][..],
+                "a command that goes on to another line is not the part's",
+            ),
+            (
+                &[
+                    "  $ echo kr0123 >> approved.log",
+                    "",
+                    "  touch /tmp/unapproved",
+                ][..],
+                "a command that goes on after a blank line is not the part's",
+            ),
+            (
+                &["  $ echo kr0123 >> approved.log && rm x"][..],
+                "a longer command is not the part's",
+            ),
+            (
+                &["  $ echo kr0123 >> approved.log", "", "  $ ls"][..],
+                "a dialog that shows another command is not the part's",
+            ),
+        ] {
+            assert!(codex.names_only(&dialog(middle), command).is_err(), "{why}");
+        }
         assert!(
             codex
-                .names_only(
-                    &rows(&["  $ echo kr0123 >> approved.log", "  curl example.com", ""]),
-                    command
-                )
+                .names_only(&rows(&["  $ echo kr0123 >> approved.log", ""]), command)
                 .is_err(),
-            "a command that goes on to another line is not the part's"
-        );
-        assert!(
-            codex
-                .names_only(
-                    &rows(&["  $ echo kr0123 >> approved.log && rm x", ""]),
-                    command
-                )
-                .is_err(),
-            "a longer command is not the part's"
-        );
-        assert!(
-            codex
-                .names_only(
-                    &rows(&["  $ echo kr0123 >> approved.log", "", "  $ ls", ""]),
-                    command
-                )
-                .is_err(),
-            "a dialog that shows another command is not the part's"
+            "a dialog whose choices are not in view is not answered"
         );
         assert_eq!(codex.refusal(), "\u{1b}");
         let claude = Approval {
             command_line: None,
+            options_start: None,
             refuse: None,
             ..codex
         };
