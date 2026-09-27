@@ -209,6 +209,20 @@ and `--json` carries its closure record as `closure` beside `session_id`. A sess
 never held is `UNKNOWN_SESSION`. When no daemon is running for the environment, the command says
 so and exits with 3: what cannot be asked is never reported as a closure.
 
+A worker outlives an upgrade, so `kr attach` can meet a worker of another build. The worker states
+its build in its answer to the hello: its build identifier and the version of the protocol package
+it was built from. `kr attach` reads the worker's screens when that version shares its own
+compatibility level, which below `1.0.0` is the minor number and from `1.0.0` the major number; the
+patch number never decides. Any other worker, and one that states no build because it is of a build
+before the statement, is refused with `UNSUPPORTED_SCHEMA` and exit code 8 before the session is
+asked for anything: nothing is attached, no size is claimed and no input lease is taken. The
+refusal names both builds, both versions and what to do, and `kr-worker --version` names the
+worker's protocol version too:
+
+```text
+kr: UNSUPPORTED_SCHEMA: session 3 runs on kr-worker/0.1.0 with protocol 0.45.0, and this is kr/0.1.0 with protocol 0.46.0: this kr cannot show a session whose worker speaks another protocol version. Close the session with `kr close 3`, or attach with a kr of the worker's build
+```
+
 Direct mode puts the outer terminal into raw mode and writes what the host sends it, in order.
 Nothing is decoded into text and re-encoded, nothing is normalised and no status bar is installed.
 When an application turns mouse reporting on, the outer terminal produces those events and they are

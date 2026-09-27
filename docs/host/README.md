@@ -585,6 +585,16 @@ The worker generates an Ed25519 keypair from the operating system's random gener
 keeps the private half in memory for its whole life. It is never written to disk, placed in an
 argument vector or put in an environment variable.
 
+Every local host process states its build in its answer to a hello: its build identifier, such as
+`kr-worker/0.1.0`, and the version of the protocol package it was built from, which
+`packages/protocol/package.json` sets and the build compiles in. A worker outlives an upgrade, so a
+client can meet one of another build, and the statement is how it tells before it meets a frame it
+cannot read. `kr attach` reads a worker's screens only when the two versions share a compatibility
+level, and refuses any other worker before it asks the session for anything; the
+[`kr attach` reference](../cli/README.md#kr-attach) has the rule and the refusal. A process of a
+build before the statement states none. The daemon still reads its answer, because it goes on
+speaking to the workers that outlived its upgrade, and `kr attach` takes it for an earlier build.
+
 Boot and process-start identities come from the kernel:
 
 | Platform | Boot identity | Process start identity |
