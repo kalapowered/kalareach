@@ -55,6 +55,8 @@ pub struct Script {
     pub output: Output,
     /// Whether the process ends inside a job, as a crashed model would.
     pub crash_in_generate: bool,
+    /// Whether the model panics inside a job.
+    pub panic_in_generate: bool,
     /// After this many whole requests, reading them stops for good.
     pub wedge_input_after: Option<u64>,
     /// From this answer on, counting from one, writing blocks for good.
@@ -127,6 +129,7 @@ impl Script {
         flag("generate-until-cancelled", self.generate_until_cancelled);
         flag("memory-ceiling", self.memory_ceiling);
         flag("crash-in-generate", self.crash_in_generate);
+        flag("panic-in-generate", self.panic_in_generate);
         match &self.output {
             Output::WellFormed => {}
             Output::Malformed => parts.push("output=malformed".to_owned()),
@@ -177,6 +180,7 @@ impl Script {
                 "generate-until-cancelled" => script.generate_until_cancelled = true,
                 "memory-ceiling" => script.memory_ceiling = true,
                 "crash-in-generate" => script.crash_in_generate = true,
+                "panic-in-generate" => script.panic_in_generate = true,
                 "output" => {
                     script.output = match value {
                         "malformed" => Output::Malformed,
@@ -272,6 +276,10 @@ impl Model for StubModel {
             eprintln!("kr-describe-stub: ending inside a job, as its script says");
             std::process::exit(CRASH_EXIT);
         }
+        assert!(
+            !self.script.panic_in_generate,
+            "kr-describe-stub: failing inside a job, as its script says"
+        );
         if self.script.ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.ignore_token_ms));
         }

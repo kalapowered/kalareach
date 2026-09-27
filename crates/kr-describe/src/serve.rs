@@ -175,6 +175,8 @@ pub enum Exit {
     ControlStalled,
     /// A load or a job ran too far past its deadline.
     Overdue,
+    /// The model failed in a way that left no model thread to serve with.
+    ModelFailed,
 }
 
 impl Exit {
@@ -186,6 +188,7 @@ impl Exit {
             Self::WireBroken => 65,
             Self::ControlStalled => 70,
             Self::Overdue => 71,
+            Self::ModelFailed => 72,
             Self::DaemonGone => 74,
         }
     }
@@ -198,6 +201,7 @@ impl Exit {
             65 => Some(Self::WireBroken),
             70 => Some(Self::ControlStalled),
             71 => Some(Self::Overdue),
+            72 => Some(Self::ModelFailed),
             74 => Some(Self::DaemonGone),
             _ => None,
         }
@@ -235,14 +239,23 @@ pub fn run<M: Model>(
         std::thread::Builder::new()
             .name("describe-model".to_owned())
             .spawn(move || {
-                model_thread(
-                    &shared,
-                    model,
-                    &received,
-                    &applied_tell,
-                    &runtime_dir,
-                    &catalogue,
-                )
+                // A model that panics has left no thread to serve with, and a process that goes
+                // on answering without one would only refuse work. So the process ends, and the
+                // daemon restarts inference.
+                let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    model_thread(
+                        &shared,
+                        model,
+                        &received,
+                        &applied_tell,
+                        &runtime_dir,
+                        &catalogue,
+                    );
+                }));
+                if served.is_err() {
+                    eprintln!("kr-describe: the model failed, so this process ends");
+                    std::process::exit(Exit::ModelFailed.code());
+                }
             })
             .expect("the model thread starts");
     }

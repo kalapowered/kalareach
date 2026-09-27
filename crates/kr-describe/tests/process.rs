@@ -344,6 +344,39 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
     assert!(process.exit_within(Duration::from_millis(500)).is_none());
 }
 
+/// A process whose model fails inside a job ends itself, so the daemon restarts inference rather
+/// than sending work to a process with no model thread; the control is the same job succeeding.
+#[test]
+fn a_process_whose_model_fails_ends_itself() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("failing");
+    let script = Script {
+        panic_in_generate: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 30_000));
+    let status = process
+        .exit_within(SOON)
+        .expect("the process ends when its model fails");
+    assert_eq!(status.code(), Some(Exit::ModelFailed.code()));
+
+    let runtime = placed.directory("succeeding");
+    let mut process = Process::start(&placed, &Script::default(), &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 30_000));
+    assert!(matches!(
+        process.expect_answer(SOON, "the job"),
+        Answer::Produced { .. }
+    ));
+    assert!(process.exit_within(Duration::from_millis(300)).is_none());
+}
+
 /// A second process in the same environment loads nothing until the first has gone, and loads at
 /// once when it has; the control is a process in another environment, which loads beside it.
 #[test]
