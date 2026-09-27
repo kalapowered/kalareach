@@ -304,7 +304,7 @@ impl AuthoritySource for HostGrants {
 /// The two change-set kinds are real: they reach the environment's change-set service, and the
 /// version each one produces records the run that asked for it, so the evidence a later node reads
 /// is bound to the execution that made it rather than to a claim about it. The node's grant is
-/// held in force around every transaction that commits the effect ([`HeldGrant`]), the way a
+/// held in force around every transaction that commits the effect (`HeldGrant`), the way a
 /// caller's admission is held around a change-set method's own.
 ///
 /// Every other registered kind is refused by name. A refusal is not an uncertain outcome: nothing

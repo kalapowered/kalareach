@@ -4,9 +4,9 @@
 //!
 //! Section 25 gives four default roles and then says the host never authorises from a role label
 //! alone. [`compile`] is where a role stops being a label: it turns a
-//! [`RoleSelection`](kr_protocol::sharing::RoleSelection) into the explicit actions and history a
+//! [`RoleSelection`] into the explicit actions and history a
 //! grant carries, and after that nothing in this host can see the role again, because
-//! [`Grant`](kr_protocol::grant::Grant) has no field for one.
+//! [`Grant`] has no field for one.
 //!
 //! # Delegation
 //!

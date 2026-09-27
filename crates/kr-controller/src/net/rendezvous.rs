@@ -174,7 +174,7 @@ enum Ended {
 /// The host attaches with its control token, and attaches again [`REATTACH_DELAY`] after the
 /// socket ends while the invitation is still on offer: the room keeps candidates that arrive
 /// meanwhile and tells the host about them when it is back. Every wait on the room, the pause
-/// before attaching again included, goes through one [`Watch`], which watches the owner ending the
+/// before attaching again included, goes through one `Watch`, which watches the owner ending the
 /// invitation through `stop` and asks the host whether the invitation is still on offer: the relay
 /// asks before it first attaches, and the watch asks again no later than one [`EXPIRY_RECHECK`]
 /// after that question and every [`EXPIRY_RECHECK`] from then on, so no room outlives its

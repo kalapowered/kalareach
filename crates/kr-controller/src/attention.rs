@@ -2091,7 +2091,7 @@ impl AttentionModule {
     // ----- The workflow journal's alerts ----------------------------------------------------
 
     /// Reads the workflow journal's attention records for as long as the module is held: one pass
-    /// now, and then one every [`AUTOMATION_EVERY`].
+    /// now, and then one every `AUTOMATION_EVERY`.
     ///
     /// The first pass has run when this returns, so a daemon that waits for it at its start has put
     /// right whatever the last daemon left between the store and the journal before it serves
