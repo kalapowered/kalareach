@@ -114,15 +114,18 @@ pub fn announced_now(
 }
 
 /// Waits up to [`DETECTION_WAIT`] for the session to announce a live instance, and returns what it
-/// announces when one appears or the wait ends.
+/// announces when one appears or the wait ends. `between` is called before each look, for what the
+/// part checks while it waits.
 #[must_use]
 pub fn wait_for_detection(
     remote: &Remote,
     runtime: &tokio::runtime::Runtime,
     session_id: SessionId,
+    between: &dyn Fn(),
 ) -> Detection {
     let started = Instant::now();
     loop {
+        between();
         let instances = announced_now(remote, runtime, session_id);
         if !instances.is_empty() || started.elapsed() >= DETECTION_WAIT {
             return Detection {
@@ -135,15 +138,17 @@ pub fn wait_for_detection(
 }
 
 /// Waits up to [`DETECTION_WAIT`] for the session to announce no live instance, and returns what
-/// it announces when the list is empty or the wait ends.
+/// it announces when the list is empty or the wait ends. `between` is called before each look.
 #[must_use]
 pub fn wait_for_no_instance(
     remote: &Remote,
     runtime: &tokio::runtime::Runtime,
     session_id: SessionId,
+    between: &dyn Fn(),
 ) -> Detection {
     let started = Instant::now();
     loop {
+        between();
         let instances = announced_now(remote, runtime, session_id);
         if instances.is_empty() || started.elapsed() >= DETECTION_WAIT {
             return Detection {
