@@ -59,6 +59,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::backup::BackupService;
 use crate::backup::store::FenceRelease;
+use crate::describe::DescribeModule;
 use crate::error::{ControllerError, Result};
 use crate::push::DeliveryModule;
 
@@ -157,15 +158,17 @@ impl PrivacyState {
 enum Subsystem {
     Backup,
     Delivery,
+    Descriptions,
 }
 
 impl Subsystem {
-    const ALL: [Self; 2] = [Self::Backup, Self::Delivery];
+    const ALL: [Self; 3] = [Self::Backup, Self::Delivery, Self::Descriptions];
 
     const fn name(self) -> &'static str {
         match self {
             Self::Backup => crate::backup::SUBSYSTEM_NAME,
             Self::Delivery => "delivery",
+            Self::Descriptions => "descriptions",
         }
     }
 }
@@ -323,6 +326,7 @@ pub struct EnvironmentPrivacy {
     state: PrivacyState,
     backup: Arc<BackupService>,
     delivery: Arc<DeliveryModule>,
+    descriptions: Arc<DescribeModule>,
 }
 
 #[derive(Debug)]
@@ -350,6 +354,7 @@ impl EnvironmentPrivacy {
         state_dir: &Path,
         backup: Arc<BackupService>,
         delivery: Arc<DeliveryModule>,
+        descriptions: Arc<DescribeModule>,
     ) -> Result<Self> {
         let record = Record::open(state_dir)?;
         let stored = record.read()?;
@@ -372,6 +377,7 @@ impl EnvironmentPrivacy {
             state,
             backup,
             delivery,
+            descriptions,
         })
     }
 
@@ -715,36 +721,59 @@ impl EnvironmentPrivacy {
         which: &[Subsystem],
         now_ms: TimestampMs,
     ) -> std::result::Result<Enabling, Unavailable> {
+        let wants = |subsystem: Subsystem| which.contains(&subsystem);
         let mut backup = self.backup.privacy(now_ms);
-        if !which.contains(&Subsystem::Delivery) {
-            return Ok(mode.apply(&mut [&mut backup], now_ms));
+        let mut descriptions = self.descriptions.privacy();
+        if !wants(Subsystem::Delivery) {
+            let mut hooks: Vec<&mut dyn PrivacySubsystem> = Vec::new();
+            if wants(Subsystem::Backup) {
+                hooks.push(&mut backup);
+            }
+            if wants(Subsystem::Descriptions) {
+                hooks.push(&mut descriptions);
+            }
+            return Ok(mode.apply(&mut hooks, now_ms));
         }
-        let with_delivery = self.delivery.with(|producer| {
+        let mut driven = None;
+        let reached = self.delivery.with(|producer| {
             let mut delivery = DeliveryOutbox::over(producer.journal_mut(), now_ms.get());
             let mut hooks: Vec<&mut dyn PrivacySubsystem> = Vec::new();
-            if which.contains(&Subsystem::Backup) {
+            if wants(Subsystem::Backup) {
                 hooks.push(&mut backup);
             }
             hooks.push(&mut delivery);
-            Ok(mode.apply(&mut hooks, now_ms))
-        });
-        match with_delivery {
-            Ok(enabling) => Ok(enabling),
-            Err(error) => {
-                let unavailable =
-                    Unavailable::new(format!("the delivery outbox could not be reached: {error}"));
-                if !which.contains(&Subsystem::Backup) {
-                    return Err(unavailable);
-                }
-                let mut enabling = mode.apply(&mut [&mut self.backup.privacy(now_ms)], now_ms);
-                enabling.unfinished.push(kr_worker::privacy::Unfinished {
-                    subsystem: Subsystem::Delivery.name(),
-                    step: kr_worker::privacy::Step::Fence,
-                    unavailable,
-                });
-                Ok(enabling)
+            if wants(Subsystem::Descriptions) {
+                hooks.push(&mut descriptions);
             }
+            driven = Some(mode.apply(&mut hooks, now_ms));
+            Ok(())
+        });
+        if let Some(enabling) = driven {
+            return Ok(enabling);
         }
+        let unavailable = Unavailable::new(format!(
+            "the delivery outbox could not be reached: {}",
+            reached
+                .err()
+                .map_or_else(String::new, |error| error.to_string())
+        ));
+        let mut hooks: Vec<&mut dyn PrivacySubsystem> = Vec::new();
+        if wants(Subsystem::Backup) {
+            hooks.push(&mut backup);
+        }
+        if wants(Subsystem::Descriptions) {
+            hooks.push(&mut descriptions);
+        }
+        if hooks.is_empty() {
+            return Err(unavailable);
+        }
+        let mut enabling = mode.apply(&mut hooks, now_ms);
+        enabling.unfinished.push(kr_worker::privacy::Unfinished {
+            subsystem: Subsystem::Delivery.name(),
+            step: kr_worker::privacy::Step::Fence,
+            unavailable,
+        });
+        Ok(enabling)
     }
 
     /// Runs the backup service's cleanup again while it holds obligations and its turn has come.
@@ -938,28 +967,30 @@ impl EnvironmentPrivacy {
 
     /// Asks the named subsystems' hooks whether their in-flight cleanup has finished.
     fn reconcile_hooks(&self, which: &[Subsystem], now_ms: TimestampMs) -> Completion {
+        let wants = |subsystem: Subsystem| which.contains(&subsystem);
         let backup = self.backup.privacy(now_ms);
-        if !which.contains(&Subsystem::Delivery) {
-            if which.contains(&Subsystem::Backup) {
-                return PrivacyMode::reconcile(&[&backup]);
+        let descriptions = self.descriptions.privacy();
+        let others = || {
+            let mut hooks: Vec<&dyn PrivacySubsystem> = Vec::new();
+            if wants(Subsystem::Backup) {
+                hooks.push(&backup);
             }
-            return Completion::Complete;
+            if wants(Subsystem::Descriptions) {
+                hooks.push(&descriptions);
+            }
+            hooks
+        };
+        if !wants(Subsystem::Delivery) {
+            return PrivacyMode::reconcile(&others());
         }
         let answered = self.delivery.with(|producer| {
             let delivery = DeliveryOutbox::over(producer.journal_mut(), now_ms.get());
-            let mut hooks: Vec<&dyn PrivacySubsystem> = Vec::new();
-            if which.contains(&Subsystem::Backup) {
-                hooks.push(&backup);
-            }
+            let mut hooks = others();
             hooks.push(&delivery);
             Ok(PrivacyMode::reconcile(&hooks))
         });
         answered.unwrap_or_else(|error| {
-            let (outstanding, mut unavailable) = if which.contains(&Subsystem::Backup) {
-                PrivacyMode::reconcile(&[&backup]).into_parts()
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (outstanding, mut unavailable) = PrivacyMode::reconcile(&others()).into_parts();
             unavailable.push((
                 Subsystem::Delivery.name(),
                 Unavailable::new(format!("the delivery outbox could not be reached: {error}")),
@@ -1056,12 +1087,19 @@ impl EnvironmentPrivacy {
         Vec<(&'static str, Unavailable)>,
     ) {
         let backup = self.backup.privacy(now_ms);
+        let descriptions = self.descriptions.privacy();
         let mut kept = backup.kept();
+        kept.extend(descriptions.kept());
         let mut exported = Vec::new();
         let mut unlisted = Vec::new();
-        match backup.exported() {
-            Ok(copies) => exported.extend(copies),
-            Err(reason) => unlisted.push((Subsystem::Backup.name(), reason)),
+        for (name, listed) in [
+            (Subsystem::Backup.name(), backup.exported()),
+            (Subsystem::Descriptions.name(), descriptions.exported()),
+        ] {
+            match listed {
+                Ok(copies) => exported.extend(copies),
+                Err(reason) => unlisted.push((name, reason)),
+            }
         }
         let delivery = self.delivery.with(|producer| {
             let outbox = DeliveryOutbox::over(producer.journal_mut(), now_ms.get());
@@ -1408,8 +1446,9 @@ mod tests {
         }
     }
 
-    /// The backup service and the delivery module of one environment, over `state`.
-    fn services(state: &Path) -> (Arc<BackupService>, Arc<DeliveryModule>) {
+    /// The backup service, the delivery module and the session-metadata store of one environment,
+    /// over `state`.
+    fn services(state: &Path) -> (Arc<BackupService>, Arc<DeliveryModule>, Arc<DescribeModule>) {
         let backup = Arc::new(BackupService::open(state).expect("a backup service"));
         let delivery = Arc::new(
             DeliveryModule::open_at(
@@ -1423,7 +1462,8 @@ mod tests {
             )
             .expect("a delivery module"),
         );
-        (backup, delivery)
+        let descriptions = Arc::new(DescribeModule::open(state).expect("a session-metadata store"));
+        (backup, delivery, descriptions)
     }
 
     /// One environment's daemon subsystems and its privacy record, all on the internal disk.
@@ -1434,6 +1474,7 @@ mod tests {
         device: StoredEnvelopeKeyPair,
         backup: Arc<BackupService>,
         delivery: Arc<DeliveryModule>,
+        descriptions: Arc<DescribeModule>,
         privacy: EnvironmentPrivacy,
     }
 
@@ -1450,7 +1491,7 @@ mod tests {
         /// A host whose backup service has opened and not yet reconciled.
         fn unreconciled() -> Self {
             let root = tempfile::tempdir().expect("a directory on the internal disk");
-            let (backup, delivery) = services(root.path());
+            let (backup, delivery, descriptions) = services(root.path());
             let writer = AuthorisationKeyPair::generate().expect("a writer key");
             backup
                 .enrol_writer(writer.key_id(), archive_id(), at(0))
@@ -1467,9 +1508,13 @@ mod tests {
                     Ok(())
                 })
                 .expect("the delivery journal");
-            let privacy =
-                EnvironmentPrivacy::open(root.path(), Arc::clone(&backup), Arc::clone(&delivery))
-                    .expect("the privacy record");
+            let privacy = EnvironmentPrivacy::open(
+                root.path(),
+                Arc::clone(&backup),
+                Arc::clone(&delivery),
+                Arc::clone(&descriptions),
+            )
+            .expect("the privacy record");
             Self {
                 root,
                 writer,
@@ -1477,6 +1522,7 @@ mod tests {
                 device: StoredEnvelopeKeyPair::generate().expect("a device key"),
                 backup,
                 delivery,
+                descriptions,
                 privacy,
             }
         }
@@ -1491,15 +1537,21 @@ mod tests {
                 device,
                 backup,
                 delivery,
+                descriptions,
                 privacy,
             } = self;
             drop(privacy);
             drop(backup);
             drop(delivery);
-            let (backup, delivery) = services(root.path());
-            let privacy =
-                EnvironmentPrivacy::open(root.path(), Arc::clone(&backup), Arc::clone(&delivery))
-                    .expect("the privacy record");
+            drop(descriptions);
+            let (backup, delivery, descriptions) = services(root.path());
+            let privacy = EnvironmentPrivacy::open(
+                root.path(),
+                Arc::clone(&backup),
+                Arc::clone(&delivery),
+                Arc::clone(&descriptions),
+            )
+            .expect("the privacy record");
             Self {
                 root,
                 writer,
@@ -1507,6 +1559,7 @@ mod tests {
                 device,
                 backup,
                 delivery,
+                descriptions,
                 privacy,
             }
         }
@@ -1674,6 +1727,7 @@ mod tests {
                 self.root.path(),
                 Arc::clone(&self.backup),
                 Arc::clone(&self.delivery),
+                Arc::clone(&self.descriptions),
             )
             .expect("the privacy record");
         }
@@ -2667,5 +2721,75 @@ mod tests {
         let report = host.privacy.tick(at(1_000));
         assert!(host.delivery_is_fenced());
         assert!(report.completion.is_complete(), "{:?}", report.completion);
+    }
+
+    /// KR-REQ-22.17 and 24.27: enabling removes every generated description and keeps every pin,
+    /// and from the moment privacy mode is recorded a read answers no generated text.
+    #[test]
+    fn enabling_removes_generated_descriptions_keeps_pins_and_reads_answer_metadata_titles() {
+        let host = Host::open();
+        let other =
+            kr_describe::store::DescriptionStore::open(host.root.path()).expect("the same store");
+        for byte in 1..=2 {
+            other
+                .publish(
+                    &session(byte),
+                    &crate::describe::tests::generated("Pairing check", PrivacyGeneration::INITIAL),
+                    900,
+                )
+                .expect("a description");
+        }
+        let facts = kr_describe::metadata::SessionFacts {
+            directory: Some("kalareach".to_owned()),
+            ..kr_describe::metadata::SessionFacts::default()
+        };
+        let whole = crate::describe::HistoryReach::WholeSession;
+        host.descriptions
+            .rename(
+                session(2),
+                Some("Release prep"),
+                "local:501",
+                &facts,
+                whole,
+                host.privacy.state().now(),
+                at(0),
+            )
+            .expect("a name is pinned");
+        assert_eq!(
+            host.descriptions
+                .describe(session(1), &facts, whole, host.privacy.state().now())
+                .expect("a read")
+                .source,
+            kr_protocol::describe::LabelSource::Generated
+        );
+
+        let report = host
+            .privacy
+            .enable(&[], at(10))
+            .expect("privacy mode is enabled");
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
+        assert_eq!(other.generated_count().expect("a count"), 0);
+        assert_eq!(other.pin_count().expect("a count"), 1);
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|kept| kept.what == "session names people pinned")
+        );
+        let described = host
+            .descriptions
+            .describe(session(1), &facts, whole, host.privacy.state().now())
+            .expect("a read");
+        assert_eq!(
+            described.source,
+            kr_protocol::describe::LabelSource::Metadata
+        );
+        assert_eq!(described.title, "kalareach");
+        assert!(described.activity_text.0.is_none());
+        let pinned = host
+            .descriptions
+            .describe(session(2), &facts, whole, host.privacy.state().now())
+            .expect("a read");
+        assert_eq!(pinned.title, "Release prep");
     }
 }
