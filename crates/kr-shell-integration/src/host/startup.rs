@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::contract::qualification::ShellKind;
 
 /// The line that opens a KalaReach entry.
@@ -514,6 +516,211 @@ pub fn remove(path: &Path) -> std::io::Result<Change> {
         replace(path, &existing, &rebuilt)?;
     }
     Ok(Change::Removed)
+}
+
+/// The name of the record `kr shell install` keeps of the startup files it put an entry in.
+pub const ENTRY_RECORD_NAME: &str = "shell-entries.json";
+
+/// The longest record this build reads: far more than a record of every startup file a home has.
+const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
+
+/// The startup files `kr shell install` has put an entry in, for each shell.
+///
+/// Removal works from this record and from nothing else: not from where an entry would go now,
+/// which moves when a `ZDOTDIR` is set or unset, a login file is created or another PowerShell
+/// answers, and never from the text a report shows. Each file is kept as its path's own bytes, so
+/// a name that is not text is kept exactly and names that file and no other.
+///
+/// It is one owner-only file in the installation's state directory, replaced whole by every change,
+/// and changed only under the same locks as a startup file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryRecord {
+    /// The owner-only directory the record is kept in.
+    directory: PathBuf,
+    /// The record itself.
+    path: PathBuf,
+}
+
+/// Why the record could not be used.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    /// The record, or the directory it is kept in, could not be read or written as this user's
+    /// own.
+    #[error("{0}")]
+    Store(#[from] kr_ipc::IpcError),
+    /// The file there is not a record this build writes.
+    #[error("the file is not a record of startup entries")]
+    NotARecord,
+}
+
+/// What the record holds.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recorded {
+    /// Each file an entry was written to, with the shell the entry is for.
+    entries: Vec<RecordedEntry>,
+}
+
+/// One file an entry was written to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedEntry {
+    /// The shell the entry is for.
+    shell: ShellKind,
+    /// The file's path as its own bytes in hexadecimal ([`encoded`]).
+    path: String,
+}
+
+impl EntryRecord {
+    /// The record kept in an installation's state directory.
+    #[must_use]
+    pub fn in_state_directory(state: &Path) -> Self {
+        Self {
+            directory: state.to_path_buf(),
+            path: state.join(ENTRY_RECORD_NAME),
+        }
+    }
+
+    /// Where the record is kept.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The files the record names for `kind`, in the order they were recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::Store`] when the record cannot be read as this user's own, and
+    /// [`RecordError::NotARecord`] when what is there is not a record.
+    pub fn files(&self, kind: ShellKind) -> Result<Vec<PathBuf>, RecordError> {
+        self.read()?
+            .entries
+            .iter()
+            .filter(|entry| entry.shell == kind)
+            .map(|entry| decoded(&entry.path).ok_or(RecordError::NotARecord))
+            .collect()
+    }
+
+    /// Records `files` for `kind`, beside what the record names already.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::files`] returns, and [`RecordError::Store`] when the record cannot be
+    /// written.
+    pub fn add(&self, kind: ShellKind, files: &[PathBuf]) -> Result<(), RecordError> {
+        self.change(|entries| {
+            for file in files {
+                let entry = RecordedEntry {
+                    shell: kind,
+                    path: encoded(file),
+                };
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        })
+    }
+
+    /// Takes `file` out of what the record names for `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::add`] returns.
+    pub fn forget(&self, kind: ShellKind, file: &Path) -> Result<(), RecordError> {
+        let forgotten = RecordedEntry {
+            shell: kind,
+            path: encoded(file),
+        };
+        self.change(|entries| entries.retain(|entry| *entry != forgotten))
+    }
+
+    /// Reads the record; there being none is a record that names nothing.
+    fn read(&self) -> Result<Recorded, RecordError> {
+        match kr_ipc::paths::read_owner_only_file(&self.path, ENTRY_RECORD_LIMIT)? {
+            None => Ok(Recorded::default()),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| RecordError::NotARecord),
+        }
+    }
+
+    /// Reads the record, changes it and writes it back whole, under the locks a startup file is
+    /// written under, so two `kr` processes changing it at once both keep what they wrote.
+    fn change(&self, edit: impl FnOnce(&mut Vec<RecordedEntry>)) -> Result<(), RecordError> {
+        kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
+        let _writing = writing();
+        let _held = FileLock::take(&self.path)
+            .map_err(|error| kr_ipc::IpcError::io("lock", &self.path, error))?;
+        let mut recorded = self.read()?;
+        edit(&mut recorded.entries);
+        let bytes = serde_json::to_vec(&recorded).map_err(|_| RecordError::NotARecord)?;
+        kr_ipc::paths::write_owner_only_file(&self.path, &bytes)?;
+        Ok(())
+    }
+}
+
+/// A path as the record keeps it: its own bytes in hexadecimal, two digits to a byte.
+#[cfg(unix)]
+fn encoded(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A path as the record keeps it: its UTF-16 units in hexadecimal, four digits to a unit, so an
+/// unpaired surrogate is kept as it is.
+#[cfg(not(unix))]
+fn encoded(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.as_os_str()
+        .encode_wide()
+        .map(|unit| format!("{unit:04x}"))
+        .collect()
+}
+
+/// The path a record entry names, or `None` for text [`encoded`] does not write.
+#[cfg(unix)]
+fn decoded(text: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let bytes = hexadecimal_units(text, 2)?
+        .into_iter()
+        .map(|unit| u8::try_from(unit).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// The path a record entry names, or `None` for text [`encoded`] does not write.
+#[cfg(not(unix))]
+fn decoded(text: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let units = hexadecimal_units(text, 4)?
+        .into_iter()
+        .map(|unit| u16::try_from(unit).ok())
+        .collect::<Option<Vec<u16>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+}
+
+/// Reads text as units of `digits` lower-case hexadecimal digits each; `None` for anything else,
+/// and for no units at all, which names no file.
+fn hexadecimal_units(text: &str, digits: usize) -> Option<Vec<u32>> {
+    if text.is_empty()
+        || !text.len().is_multiple_of(digits)
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(digits)
+        .map(|unit| u32::from_str_radix(std::str::from_utf8(unit).ok()?, 16).ok())
+        .collect()
 }
 
 /// How long a startup write waits for another one to finish before it gives up.
@@ -1564,6 +1771,109 @@ mod tests {
                     "{kind}'s entry contains {forbidden}"
                 );
             }
+        }
+    }
+
+    /// The record keeps each file by its exact name for the shell it is for, keeps a file once
+    /// however often an install writes to it, and forgets one file without the others. It is the
+    /// owner's alone, in a state directory it creates when there is none yet.
+    #[test]
+    fn the_record_keeps_each_file_by_its_exact_name_for_its_shell() {
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        assert!(
+            record.files(ShellKind::Zsh).expect("reads").is_empty(),
+            "no record yet names nothing"
+        );
+        let zshrc = PathBuf::from("/home/the person's home/.zshrc");
+        let bashrc = PathBuf::from("/home/the person's home/.bashrc");
+        let profile = PathBuf::from("/home/the person's home/.bash_profile");
+        record
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
+        record
+            .add(ShellKind::Bash, &[bashrc.clone(), profile.clone()])
+            .expect("records");
+        record
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
+        assert_eq!(
+            record.files(ShellKind::Zsh).expect("reads"),
+            vec![zshrc.clone()]
+        );
+        assert_eq!(
+            record.files(ShellKind::Bash).expect("reads"),
+            vec![bashrc.clone(), profile.clone()]
+        );
+        assert!(record.files(ShellKind::Fish).expect("reads").is_empty());
+        record.forget(ShellKind::Bash, &bashrc).expect("forgets");
+        assert_eq!(record.files(ShellKind::Bash).expect("reads"), vec![profile]);
+        assert_eq!(record.files(ShellKind::Zsh).expect("reads"), vec![zshrc]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = std::fs::metadata(record.path())
+                .expect("the record is there")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "the record is the owner's alone: {mode:o}");
+        }
+    }
+
+    /// A name that is not text is kept byte for byte, and it is not the name its text makes of it,
+    /// which has a replacement character in it and is another file.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_keeps_a_name_that_is_not_text_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        let name = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/h\xffme/.zshrc"));
+        record
+            .add(ShellKind::Zsh, std::slice::from_ref(&name))
+            .expect("records");
+        let kept = record.files(ShellKind::Zsh).expect("reads");
+        assert_eq!(kept, vec![name.clone()]);
+        assert_ne!(kept[0], PathBuf::from(name.to_string_lossy().into_owned()));
+    }
+
+    /// What is not a record is refused rather than read as one that names nothing, which would have
+    /// a removal leave every entry and say nothing about why; so is a record at a link, which could
+    /// name somebody else's files.
+    #[test]
+    fn what_is_not_a_record_is_refused() {
+        let root = tempfile::tempdir().expect("a directory");
+        let state = root.path().join("state");
+        kr_ipc::paths::create_private_tree(&state, &state).expect("an owner-only directory");
+        let record = EntryRecord::in_state_directory(&state);
+        for written in [
+            "not a record",
+            r#"{"entries":[{"shell":"zsh","path":"2F"}]}"#,
+            r#"{"entries":[{"shell":"zsh","path":""}]}"#,
+            r#"{"entries":[{"shell":"zsh","path":"2f7"}]}"#,
+            r#"{"entries":[{"shell":"zsh","path":"+f2f"}]}"#,
+            r#"{"entries":[{"shell":"ksh","path":"2f"}]}"#,
+            r#"{"entries":[],"more":1}"#,
+        ] {
+            kr_ipc::paths::write_owner_only_file(record.path(), written.as_bytes())
+                .expect("writes");
+            assert!(
+                matches!(record.files(ShellKind::Zsh), Err(RecordError::NotARecord)),
+                "{written} is refused"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(record.path()).expect("removes");
+            let elsewhere = root.path().join("elsewhere.json");
+            kr_ipc::paths::write_owner_only_file(&elsewhere, br#"{"entries":[]}"#).expect("writes");
+            std::os::unix::fs::symlink(&elsewhere, record.path()).expect("links");
+            assert!(matches!(
+                record.files(ShellKind::Zsh),
+                Err(RecordError::Store(_))
+            ));
         }
     }
 }

@@ -965,13 +965,18 @@ async fn run(cli: Cli) -> Result<Completion> {
                     HomeLayout::from_environment().launching(powershell)
                 });
             let selector = shell_selector(&arguments);
+            // The record of the files an install wrote an entry to, which removal works from. It is
+            // this installation's own, so it lives in its state directory.
+            let record = kr_shell_integration::host::startup::EntryRecord::in_state_directory(
+                paths.state_root(),
+            );
             let reports = match &arguments.command {
                 // Removal is the one operation that needs no package: it takes out the marked lines
                 // it put in, and an entry whose package was uninstalled is exactly the one somebody
                 // is trying to get rid of.
                 ShellCommand::Remove(remove) => kr_cli::shell::shells(selector)?
                     .into_iter()
-                    .map(|kind| kr_cli::shell::remove(kind, &layout, remove.dry_run))
+                    .map(|kind| kr_cli::shell::remove(kind, &layout, &record, remove.dry_run))
                     .collect::<Result<Vec<_>>>()?,
                 command => {
                     let packages = kr_cli::shell::packages()?;
@@ -987,6 +992,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                                 kr_cli::shell::install(
                                     package,
                                     &layout,
+                                    &record,
                                     install.nsh_bypass,
                                     install.dry_run,
                                 )

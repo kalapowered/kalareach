@@ -26,7 +26,7 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | Root | macOS | Linux | Override | Holds |
 | --- | --- | --- | --- | --- |
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
-| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext, and what a daemon `kr new` started writes (`controller.log`) |
+| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext, what a daemon `kr new` started writes (`controller.log`), and the record of the startup files `kr shell install` put an entry in (`shell-entries.json`) |
 
 Everything above a root is created with the platform's ordinary permissions; `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to

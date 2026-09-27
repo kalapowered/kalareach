@@ -284,7 +284,13 @@ platforms where that file is Bash.
 Whether the integration actually loaded is established at run time by the handshake, never by
 reading a file back.
 
-`kr shell remove` deletes exactly the marked entry. Everything the user wrote stays as they left it.
+`kr shell install` records each startup file it puts an entry in, by the file's exact name, before
+it writes any of them, in `shell-entries.json` in the installation's state directory. `kr shell
+remove` works from that record and from nothing else: it deletes exactly the marked entry from each
+file the record names, wherever an entry would go now that a `ZDOTDIR` or a login file may have
+changed, and takes the file out of the record. A file the record does not name is left as it is; one
+that holds a marked entry all the same is reported as left. Everything the user wrote stays as they
+left it.
 
 Either one writes the file beside itself and renames it over, so a full disk or a crash leaves the
 configuration as it was rather than half of it. The file beside it is created exclusively, under a

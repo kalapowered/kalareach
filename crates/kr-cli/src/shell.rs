@@ -3,9 +3,13 @@
 //!
 //! Three operations, and all three are honest about what they touch. `status` writes nothing.
 //! `install` adds one marked entry per shell to the file that shell actually reads, beside whatever
-//! the user already has there. `remove` deletes exactly those lines. Nothing replaces `.bashrc`,
-//! points a shell at another `ZDOTDIR`, substitutes an `--rcfile` or disables a profile, and the
-//! entry itself is inert in every shell KalaReach did not start.
+//! the user already has there, and records each file it writes to. `remove` deletes exactly those
+//! lines from exactly the files the record names. Nothing replaces `.bashrc`, points a shell at
+//! another `ZDOTDIR`, substitutes an `--rcfile` or disables a profile, and the entry itself is
+//! inert in every shell KalaReach did not start.
+//!
+//! A file is read and written by its exact name throughout, and the text a report shows for it is
+//! never read back as a path.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -13,7 +17,7 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
-use kr_shell_integration::host::startup::{self, Change, HomeLayout};
+use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
 use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
@@ -53,7 +57,10 @@ pub struct PackageReport {
 /// One startup file, and what is in it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EntryReport {
-    /// The file.
+    /// The file, by its exact name: what every read and write of it uses.
+    pub file: std::path::PathBuf,
+    /// The file, as a report shows it. It is never read back as a path: a name that is not text
+    /// shows here with a replacement character in it, and that is another file's name.
     pub path: String,
     /// Why this file rather than another.
     pub reason: &'static str,
@@ -133,6 +140,7 @@ fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
         .map(|target| EntryReport {
             installed: startup::installed(&target.path),
             path: target.path.display().to_string(),
+            file: target.path,
             reason: target.reason,
             change: None,
         })
@@ -144,18 +152,22 @@ fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
     }
 }
 
-/// Adds one package's guarded entry to every file that shell reads.
+/// Adds one package's guarded entry to every file that shell reads, and records each of them.
 ///
 /// Every entry is made before any file is touched, so an entry that cannot be made leaves every
-/// startup file as it was.
+/// startup file as it was. The files are recorded before any of them is written, so a file an
+/// install that stopped part way wrote into is one the removal knows; a file recorded and never
+/// written is one the removal finds nothing in.
 ///
 /// # Errors
 ///
 /// Returns a usage failure naming the package's entry when that path is not text, which no startup
-/// file can name, and a resource failure when a startup file cannot be read or written.
+/// file can name, and a resource failure when the record or a startup file cannot be read or
+/// written.
 pub fn install(
     package: &ShellPackage,
     layout: &HomeLayout,
+    record: &EntryRecord,
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
@@ -175,27 +187,39 @@ pub fn install(
                 Shown::root(&refused.path)
             ))
         })?;
+    if !dry_run {
+        let files = bodies
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>();
+        record
+            .add(package.kind(), &files)
+            .map_err(|error| record_failure(record, &error))?;
+    }
     let mut reported = report(package, layout);
     for entry in &mut reported.entries {
-        let path = std::path::Path::new(&entry.path);
-        let Some((_, body)) = bodies.iter().find(|(target, _)| target == path) else {
+        let Some((_, body)) = bodies.iter().find(|(file, _)| *file == entry.file) else {
             continue;
         };
         let change = if dry_run {
-            if startup::installed(path) {
+            if startup::installed(&entry.file) {
                 Change::Unchanged
             } else {
                 Change::Added
             }
         } else {
-            startup::install(path, body).map_err(|error| {
-                CliError::Other(shown!("{}: {}", Shown::root(path), Shown::io(&error)))
+            startup::install(&entry.file, body).map_err(|error| {
+                CliError::Other(shown!(
+                    "{}: {}",
+                    Shown::root(&entry.file),
+                    Shown::io(&error)
+                ))
             })?
         };
         entry.change = Some(change);
         // A dry run reports what is there; a real one reports what it just wrote.
         entry.installed = if dry_run {
-            startup::installed(path)
+            startup::installed(&entry.file)
         } else {
             true
         };
@@ -229,38 +253,100 @@ pub fn shells(selector: Option<&str>) -> Result<Vec<ShellKind>> {
         })
 }
 
-/// Deletes one shell's guarded entry, and nothing else.
+/// Why a file the record names is in a removal's report when the layout names it no more.
+const RECORDED: &str = "a file kr shell install recorded writing this entry to";
+
+/// Why a file holding an entry the record does not name is in a removal's report.
+const UNRECORDED: &str = "an entry kr shell install has no record of writing, which removal leaves";
+
+/// Deletes one shell's guarded entry from each file `kr shell install` recorded writing it to, and
+/// nothing else.
+///
+/// It works from the record alone: from the files an install wrote, by their exact names, and not
+/// from where the entry would go now, which moves when a `ZDOTDIR` is set or unset or a login file
+/// is created. A file the record does not name is left as it is, and one that holds a marked entry
+/// all the same is reported as left. Each file is taken out of the record once its entry is gone.
 ///
 /// It takes the shell rather than the package, because removal needs neither the executable nor the
-/// manifest: the markers say what to take out, and a person whose package was uninstalled or whose
-/// manifest no longer parses still has entries to remove.
+/// manifest: the record says where to look and the markers say what to take out, and a person whose
+/// package was uninstalled or whose manifest no longer parses still has entries to remove.
 ///
 /// # Errors
 ///
-/// Returns a resource failure when a startup file cannot be read or written.
-pub fn remove(kind: ShellKind, layout: &HomeLayout, dry_run: bool) -> Result<ShellReport> {
-    let mut reported = entries_only(kind, layout);
-    for entry in &mut reported.entries {
-        let path = std::path::Path::new(&entry.path);
+/// Returns a resource failure when the record or a startup file cannot be read or written.
+pub fn remove(
+    kind: ShellKind,
+    layout: &HomeLayout,
+    record: &EntryRecord,
+    dry_run: bool,
+) -> Result<ShellReport> {
+    let recorded = record
+        .files(kind)
+        .map_err(|error| record_failure(record, &error))?;
+    let targets = layout.targets(kind);
+    let mut entries = Vec::new();
+    for file in recorded {
+        let reason = targets
+            .iter()
+            .find(|target| target.path == file)
+            .map_or(RECORDED, |target| target.reason);
         let change = if dry_run {
-            if startup::installed(path) {
+            if startup::installed(&file) {
                 Change::Removed
             } else {
                 Change::Absent
             }
         } else {
-            startup::remove(path).map_err(|error| {
-                CliError::Other(shown!("{}: {}", Shown::root(path), Shown::io(&error)))
-            })?
+            let change = startup::remove(&file).map_err(|error| {
+                CliError::Other(shown!("{}: {}", Shown::root(&file), Shown::io(&error)))
+            })?;
+            record
+                .forget(kind, &file)
+                .map_err(|error| record_failure(record, &error))?;
+            change
         };
-        entry.change = Some(change);
-        entry.installed = if dry_run {
-            startup::installed(path)
-        } else {
-            false
-        };
+        entries.push(EntryReport {
+            installed: dry_run && startup::installed(&file),
+            path: file.display().to_string(),
+            file,
+            reason,
+            change: Some(change),
+        });
     }
-    Ok(reported)
+    for target in targets {
+        if !entries.iter().any(|entry| entry.file == target.path)
+            && startup::installed(&target.path)
+        {
+            entries.push(EntryReport {
+                installed: true,
+                path: target.path.display().to_string(),
+                file: target.path,
+                reason: UNRECORDED,
+                change: None,
+            });
+        }
+    }
+    Ok(ShellReport {
+        kind,
+        package: None,
+        entries,
+    })
+}
+
+/// What a failure of the record says: where it is, and what to do about one that is not a record.
+fn record_failure(record: &EntryRecord, error: &RecordError) -> CliError {
+    match error {
+        RecordError::Store(error) => CliError::Other(shown!(
+            "the record of the startup entries kr shell install wrote, {}: {}",
+            Shown::root(record.path()),
+            Shown::ipc(error)
+        )),
+        RecordError::NotARecord => CliError::Other(shown!(
+            "{} is not a record of startup entries this build reads; move it aside, and kr shell \
+             install records the entries it writes again",
+            Shown::root(record.path())
+        )),
+    }
 }
 
 /// Renders one report for a script.
@@ -393,6 +479,8 @@ mod tests {
         // manifest no longer reads, still has those lines in their own configuration, and they are
         // exactly the ones they are trying to be rid of.
         let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
         let layout = HomeLayout {
             home: home.path().to_path_buf(),
             zdotdir: None,
@@ -412,6 +500,10 @@ mod tests {
             startup::install(&zshrc, &body).expect("installs"),
             Change::Added
         );
+        // The install that wrote it recorded the file.
+        record
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
 
         // No package set is consulted, and none exists.
         assert_eq!(shells(Some("zsh")).expect("a shell"), vec![ShellKind::Zsh]);
@@ -419,7 +511,7 @@ mod tests {
             shells(None).expect("every shell").len(),
             ShellKind::ALL.len()
         );
-        let report = remove(ShellKind::Zsh, &layout, false).expect("removes");
+        let report = remove(ShellKind::Zsh, &layout, &record, false).expect("removes");
         assert_eq!(report.kind, ShellKind::Zsh);
         assert!(
             report
@@ -430,6 +522,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&zshrc).expect("reads"), theirs);
         assert!(!startup::installed(&zshrc));
+        assert!(
+            record.files(ShellKind::Zsh).expect("reads").is_empty(),
+            "a file whose entry is gone is taken out of the record"
+        );
 
         // And a selector KalaReach does not qualify is still a usage failure.
         assert!(matches!(
@@ -451,6 +547,8 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
 
         let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
         let layout = HomeLayout {
             home: home.path().to_path_buf(),
             zdotdir: None,
@@ -483,11 +581,15 @@ mod tests {
             directory,
         };
         for dry_run in [false, true] {
-            let outcome = install(&package, &layout, false, dry_run);
+            let outcome = install(&package, &layout, &record, false, dry_run);
             assert_eq!(
                 std::fs::read_to_string(&zshrc).expect("reads"),
                 theirs,
                 "no startup file changes (dry run: {dry_run})"
+            );
+            assert!(
+                !record.path().exists(),
+                "and nothing is recorded (dry run: {dry_run})"
             );
             let refused = outcome.expect_err("an entry that is not text is refused");
             assert!(matches!(refused, CliError::Usage(_)), "{refused}");
