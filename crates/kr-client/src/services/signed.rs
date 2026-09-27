@@ -2314,6 +2314,47 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.57: the service's `OUTCOME_UNKNOWN` says that nothing can settle whether the
+    /// request took effect, and it is not retryable. It reaches the caller as that outcome, with the
+    /// person asked to check whether the request went through, after one send, whatever the request:
+    /// the two the service answers with it (an authority-feed change and a settings-sync exchange
+    /// that names no request identity) and a request that is safe to repeat. A stated delay, which
+    /// the service never sends with it, does not make it one to send again.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_23_57_an_unknown_outcome_is_sent_once_and_asks_the_person_to_check_it() {
+        for (method, body) in [
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "publish": { "request": {} } }),
+            ),
+            (
+                Method::SyncCompareExchange,
+                serde_json::json!({ "exchange": { "collection_id": "c", "object_id": "o" } }),
+            ),
+            (
+                Method::MailboxDeliver,
+                serde_json::json!({ "recipient_key": "a key" }),
+            ),
+        ] {
+            for delay in [None, Some(2)] {
+                let script = Script::answering([refusal(504, "OUTCOME_UNKNOWN", delay), stored()]);
+                let refused = match asked(&script, method, body.clone(), None).await {
+                    Ok(Answer::Refused(refused)) => refused,
+                    other => panic!("{method:?} {body}: the refusal: {other:?}"),
+                };
+                assert_eq!(script.requests(), 1, "{method:?} {body}: sent once");
+                assert_eq!(refused.code(), Some("OUTCOME_UNKNOWN"), "{method:?} {body}");
+                match refused.into_error() {
+                    ClientError::Refused { error, action, .. } => {
+                        assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{method:?} {body}");
+                        assert_eq!(action, UserAction::CheckTheOutcome, "{method:?} {body}");
+                    }
+                    other => panic!("{method:?} {body}: a refusal: {other:?}"),
+                }
+            }
+        }
+    }
+
     /// From the moment the transport is given a request, whatever goes wrong may have happened
     /// after the service received it: a transport that fails, and an answer this client cannot
     /// read. A refusal the service named is an answer, sent and answered.
