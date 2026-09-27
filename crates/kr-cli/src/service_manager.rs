@@ -601,28 +601,41 @@ impl std::fmt::Debug for Moved {
 /// is exactly what will be replaced or removed.
 ///
 /// On Windows the rename is tried again while another program holds the file, as
-/// [`kr_flush::retry_while_held`] says. The name it is moved to is new and nothing is checked
-/// before the rename, so there is nothing to check again.
+/// [`kr_flush::retry_while_held`] says, and what is at the name is looked at again before every
+/// attempt: something other than a regular file that takes the name while the rename waits is
+/// never moved.
 fn move_aside(place: &Place<'_>) -> std::result::Result<Moved, Shown> {
     let path = place.path();
-    match std::fs::symlink_metadata(path) {
-        Ok(about) if about.file_type().is_file() => {}
-        Ok(_) => return Ok(Moved::NotRegular),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Moved::Nothing),
-        Err(error) => {
-            return Err(shown!(
-                "{} could not be read: {}",
-                place.said(),
-                Shown::io(&error)
-            ));
-        }
-    }
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let aside = path.with_file_name(format!(".{name}.{}.kr-moving", kr_ipc::new_uuid()));
-    match kr_flush::retry_while_held(|| std::fs::rename(path, &aside)) {
+    // What a look before an attempt decided instead of a move, when it decided.
+    let mut looked = None;
+    let moved = kr_flush::retry_while_held(|| match std::fs::symlink_metadata(path) {
+        Ok(about) if about.file_type().is_file() => std::fs::rename(path, &aside),
+        Ok(_) => {
+            looked = Some(Ok(Moved::NotRegular));
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            looked = Some(Ok(Moved::Nothing));
+            Ok(())
+        }
+        Err(error) => {
+            looked = Some(Err(shown!(
+                "{} could not be read: {}",
+                place.said(),
+                Shown::io(&error)
+            )));
+            Ok(())
+        }
+    });
+    if let Some(looked) = looked {
+        return looked;
+    }
+    match moved {
         Ok(()) => Ok(Moved::Aside(aside)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Moved::Nothing),
         Err(error) => Err(shown!(
@@ -640,28 +653,37 @@ fn move_aside(place: &Place<'_>) -> std::result::Result<Moved, Shown> {
 /// replaced: a link elsewhere, and on Windows a rename that does not replace, tried again while
 /// another program holds the file, since a file given its name by a link there can be held by the
 /// system for a minute and more. What was moved is left where it is when it is no longer a regular
-/// file, which is what something replacing it in the moment before it was moved leaves.
+/// file, which is what something replacing it in the moment before it was moved leaves; it is
+/// looked at before every attempt, since on Windows the name it was moved to can be taken while the
+/// publication waits.
 fn put_back(aside: &Path, place: &Place<'_>) -> std::result::Result<(), Shown> {
-    if !std::fs::symlink_metadata(aside).is_ok_and(|about| about.file_type().is_file()) {
+    let mut irregular = false;
+    let put = kr_flush::retry_while_held(|| {
+        if !std::fs::symlink_metadata(aside).is_ok_and(|about| about.file_type().is_file()) {
+            irregular = true;
+            return Ok(());
+        }
+        kr_flush::publish_without_replacing(aside, place.path())
+    });
+    if irregular {
         return Err(shown!(
             "it is at {}, because it is not a regular file and kr puts back only what it can link",
             place.aside(aside)
         ));
     }
-    kr_flush::retry_while_held(|| kr_flush::publish_without_replacing(aside, place.path()))
-        .and_then(|()| match std::fs::remove_file(aside) {
-            // On Windows the publication took the name it was moved to already.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            removed => removed,
-        })
-        .map_err(|error| {
-            shown!(
-                "it is at {}, because it could not be put back at {}: {}",
-                place.aside(aside),
-                place.said(),
-                Shown::io(&error)
-            )
-        })
+    put.and_then(|()| match std::fs::remove_file(aside) {
+        // On Windows the publication took the name it was moved to already.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    })
+    .map_err(|error| {
+        shown!(
+            "it is at {}, because it could not be put back at {}: {}",
+            place.aside(aside),
+            place.said(),
+            Shown::io(&error)
+        )
+    })
 }
 
 /// Whether a file moved aside is exactly `contents`, read as kr writes a definition: owner-only
@@ -2600,25 +2622,42 @@ mod tests {
         Lock::take_within(&environment, Duration::ZERO).expect("free once the first lets go");
     }
 
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
-    /// on a thread of its own.
+    /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written holds it.
     #[cfg(windows)]
-    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+    fn hold(file: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Reading and writing are shared; deleting is not.
         const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
 
-        let holding = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ_WRITE)
             .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            drop(holding);
-        })
+            .expect("the file is held")
+    }
+
+    /// Counts the renames refused as held on this thread while the guard stands. At the first of
+    /// them, `meanwhile` is given the hold, and lets go of it when it drops it.
+    #[cfg(windows)]
+    fn at_the_first_refusal(
+        holding: std::fs::File,
+        meanwhile: impl FnOnce(std::fs::File) + 'static,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        kr_flush::testing::AfterHeldRefusal,
+    ) {
+        let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&refusals);
+        let mut first = Some((holding, meanwhile));
+        let hook = kr_flush::testing::after_held_refusal(move || {
+            counted.set(counted.get() + 1);
+            if let Some((holding, meanwhile)) = first.take() {
+                meanwhile(holding);
+            }
+        });
+        (refusals, hook)
     }
 
     /// On Windows a definition that another program holds without sharing its deletion while it
@@ -2633,14 +2672,41 @@ mod tests {
         let place = Place::Derived(&path);
         let aside = path.with_file_name(format!(".{LABEL}.plist.aside.kr-moving"));
         kr_ipc::paths::write_owner_only_file(&aside, b"what kr wrote\n").expect("writes");
-        let letting_go = held_for_a_moment(&aside);
+        let (refusals, guard) = at_the_first_refusal(hold(&aside), drop);
         let put = put_back(&aside, &place);
-        letting_go.join().expect("let go");
+        drop(guard);
         put.expect("goes back once it is let go");
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert_eq!(std::fs::read(&path).expect("back"), b"what kr wrote\n");
         assert!(!aside.exists(), "the name it was moved to is gone");
         std::fs::remove_file(&path).expect("its own name is removed");
         assert!(!path.exists() && !aside.exists(), "and nothing keeps it");
+    }
+
+    /// On Windows a directory put where a definition was moved to, while its held publication
+    /// waits, is never put back: it is looked at again before the next attempt, and the refusal
+    /// says where it is.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_put_where_a_definition_was_moved_is_not_put_back() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join(format!("{LABEL}.plist"));
+        let place = Place::Derived(&path);
+        let aside = path.with_file_name(format!(".{LABEL}.plist.aside.kr-moving"));
+        kr_ipc::paths::write_owner_only_file(&aside, b"what kr wrote\n").expect("writes");
+        let replaced = aside.clone();
+        let (refusals, guard) = at_the_first_refusal(hold(&aside), move |holding| {
+            drop(holding);
+            std::fs::remove_file(&replaced).expect("the file goes");
+            std::fs::create_dir(&replaced).expect("and a directory takes its name");
+        });
+        let put = put_back(&aside, &place);
+        drop(guard);
+        let left = put.expect_err("a directory is not put back");
+        assert_eq!(refusals.get(), 1);
+        assert!(left.as_str().contains("not a regular file"), "{left}");
+        assert!(aside.is_dir(), "the directory is left where it is");
+        assert!(!path.exists(), "and nothing is at the definition's place");
     }
 
     /// On Windows a definition that another program holds without sharing its deletion, as a
@@ -2653,14 +2719,37 @@ mod tests {
         let path = host.root().join(format!("{LABEL}.plist"));
         let place = Place::Derived(&path);
         kr_ipc::paths::write_owner_only_file(&path, b"what kr wrote\n").expect("writes");
-        let letting_go = held_for_a_moment(&path);
+        let (refusals, guard) = at_the_first_refusal(hold(&path), drop);
         let moved = move_aside(&place);
-        letting_go.join().expect("let go");
+        drop(guard);
         let Ok(Moved::Aside(aside)) = moved else {
             panic!("moved aside once it is let go: {moved:?}");
         };
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert!(!path.exists() && moved_is(&aside, "what kr wrote\n"));
         std::fs::remove_file(&aside).expect("removes it");
+    }
+
+    /// On Windows a directory that takes a definition's name while its held move waits is never
+    /// moved aside: the name is looked at again before the next attempt.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_that_takes_a_definitions_name_while_its_move_waits_is_not_moved() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join(format!("{LABEL}.plist"));
+        let place = Place::Derived(&path);
+        kr_ipc::paths::write_owner_only_file(&path, b"what kr wrote\n").expect("writes");
+        let replaced = path.clone();
+        let (refusals, guard) = at_the_first_refusal(hold(&path), move |holding| {
+            drop(holding);
+            std::fs::remove_file(&replaced).expect("the definition goes");
+            std::fs::create_dir(&replaced).expect("and a directory takes its name");
+        });
+        let moved = move_aside(&place);
+        drop(guard);
+        assert_eq!(moved, Ok(Moved::NotRegular), "a directory is not moved");
+        assert_eq!(refusals.get(), 1);
+        assert!(path.is_dir(), "the directory is left where it is");
     }
 
     /// Only a regular file is moved aside for a check; it goes back where it was, and never over a
