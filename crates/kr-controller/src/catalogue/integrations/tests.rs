@@ -581,8 +581,9 @@ fn the_search_takes_the_extensions_in_their_order() {
     );
 }
 
-/// KR-REQ-07.45: a file this account cannot execute is passed over for the next candidate, and a
-/// launcher it cannot execute is no launcher.
+/// KR-REQ-07.45: a file this account cannot execute is passed over for the next candidate. The
+/// launcher is held to the same rule, `kr_worker::broker::commands::runnable`, which the worker's
+/// own tests cover.
 #[cfg(unix)]
 #[test]
 fn a_candidate_this_account_cannot_execute_is_passed_over() {
