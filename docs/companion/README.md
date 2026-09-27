@@ -87,9 +87,10 @@ keyboard commits goes as text, once, when it is committed, and never as keys mad
 goes as a paste, bracketed when the program asked for that. A chord with Command or the Windows key
 stays the platform's, and so do Control-Shift-C and Control-Shift-V off Apple platforms. A key, text
 or paste that cannot reach the program as it reads keys now, or before the view holds the session's
-screen, does not go: control stays, and the mode's sentence says why until an input does go. The
-page sends each input once native code has answered the one before, so inputs reach the program in
-the order the person made them.
+screen, does not go: control stays, and the view says why until a key, text or paste does go, in the
+mode's sentence on the desktop and above the field on the phone, where it stays in view with a
+software keyboard up. The page sends each input once native code has answered the one before, so
+inputs reach the program in the order the person made them.
 
 On the desktop the program's keyboard is an invisible field at the cursor's cell, where an input
 method opens its candidates, and what the input method composes is drawn there in the session's
@@ -97,7 +98,8 @@ colours until it is committed. The field comes next after the mode button in key
 on the terminal that selects nothing puts the focus in it, and the terminal shows a focus ring while
 it has the focus. Tab and Shift-Tab go to the program. Control-Tab and Control-Shift-Tab move the
 focus to the next control or the one before, and stop at the first and the last. When control ends
-with the focus in the field, the focus goes to the mode button.
+with the focus in the field, the focus goes to the mode button, or to Attach again once the view has
+ended.
 
 A drag belongs to the view it began in: taking control, the view ending or the session changing
 ends it without sending what it had not sent. The page never decides where the window is. Native
@@ -119,11 +121,14 @@ conversation. While the view controls the program, the field is the program's ke
 place and at the same size: the draft waits for control to end, Send goes with it, and the field
 says Type to the program where a placeholder would. A tap on a terminal key is the key's press and
 its release, with the modifiers the row holds for it, and it leaves the focus in the field, so the
-software keyboard stays up; a key typed on a hardware keyboard takes the row's modifiers too. While
-a software keyboard covers part of the session, the bar gives way to the terminal, its keys and the
-field, and the field sits on the keyboard's top edge. The terminal keeps at least four rows at its
-default size in any case: when the composer needs more room than is left, it scrolls from the
-bottom, so the field stays in view. The host is told the grid the terminal's surface shows.
+software keyboard stays up; a key typed on a hardware keyboard takes the row's modifiers too. In the
+field Control-Tab and Control-Shift-Tab move the focus on or back in either mode. When control ends
+with the focus in the field or on a terminal key, the focus goes to the mode button once the bar is
+back, or to Attach again once the view has ended. While a software keyboard covers part of the
+session, the bar gives way to the terminal, its keys and the field, and the field sits on the
+keyboard's top edge. The terminal keeps at least four rows at its default size in any case: when the
+composer needs more room than is left, it scrolls from the bottom, so the field stays in view. The
+host is told the grid the terminal's surface shows.
 
 A selection in either raw view takes the session's own selection colours, except on iOS, which
 draws its own highlight over a page's selection. On the desktop a copy gives the selected pieces as
