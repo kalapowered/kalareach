@@ -1531,7 +1531,7 @@ impl DescriptionService {
         // what it produced is not published: it goes back in the queue. So does a job whose
         // answer arrives after descriptions were turned off, which publish nothing new.
         if stopped(&dispatched).is_some_and(Stop::requeues) || !self.settings.enabled {
-            return Ok(self.requeue(dispatched, false));
+            return Ok(self.requeue_unless_cancelled(dispatched));
         }
         let outcome = self.publish(&dispatched, &bytes, execution_ms, now)?;
         let ceiling = self.policy.budgets().process_memory_ceiling_bytes;
@@ -1672,7 +1672,7 @@ impl DescriptionService {
         match why {
             JobEnd::Cancelled => {
                 if stopped(&dispatched).is_some_and(Stop::requeues) {
-                    return self.requeue(dispatched, false);
+                    return self.requeue_unless_cancelled(dispatched);
                 }
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
@@ -1742,15 +1742,18 @@ impl DescriptionService {
         }
     }
 
-    /// Decides what a job that did not finish comes to: a job being stopped for a pause goes back
-    /// in the queue, a job being stopped for any other reason, or cancelled by anyone, ends
-    /// cancelled, and any other job is queued again once.
+    /// Decides what a job that did not finish comes to: a job a caller cancelled ends cancelled, a
+    /// job being stopped for a pause goes back in the queue, a job being stopped for any other
+    /// reason ends cancelled, and any other job is queued again once.
     ///
-    /// The job's token is read as well as the service's own decision, because a cancellation can
-    /// reach the token before the service has acted on it, and a job queued again would get a new
-    /// token that nothing had cancelled.
+    /// A caller's cancellation is read at the moment of the decision, and it outranks the
+    /// service's own reasons: a job queued again would get a new token that nothing had cancelled.
     fn retry_or_end(&mut self, dispatched: Dispatched, detail: String) -> Outcome {
         let session_id = dispatched.job.session_id;
+        if self.cancelled_by_caller(&dispatched) {
+            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+            return Outcome::Cancelled { session_id };
+        }
         match stopped(&dispatched) {
             Some(stop) if stop.requeues() => self.requeue(dispatched, false),
             Some(_) => {
@@ -1763,6 +1766,27 @@ impl DescriptionService {
             }
             None => self.requeue(dispatched, true),
         }
+    }
+
+    /// Queues a job that was stopped for a pause again, with its place, unless a caller cancelled
+    /// it, which ends it.
+    fn requeue_unless_cancelled(&mut self, dispatched: Dispatched) -> Outcome {
+        if self.cancelled_by_caller(&dispatched) {
+            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+            return Outcome::Cancelled {
+                session_id: dispatched.job.session_id,
+            };
+        }
+        self.requeue(dispatched, false)
+    }
+
+    /// Closes the running job's handle, which is the moment its fate is decided, and says whether a
+    /// caller cancelled it first. A cancellation after this finds nothing running.
+    fn cancelled_by_caller(&self, dispatched: &Dispatched) -> bool {
+        let by_caller = self.running.close(&dispatched.job.session_id);
+        #[cfg(feature = "testing")]
+        crate::testing::decided();
+        by_caller
     }
 
     /// Puts a job back in the queue with its aging position. A job put back after a failure is put

@@ -19,7 +19,7 @@ use kr_describe::service::{
     RESTART_FIRST_MS, RESTART_MOST_MS, UnloadReason, Work,
 };
 use kr_describe::store::DescriptionStore;
-use kr_describe::testing::{Output, answer_of};
+use kr_describe::testing::{Output, answer_of, at_next_decision};
 use kr_describe::time::Reading;
 use kr_describe::wire::{JobEnd, LoadEnd, Phases};
 use kr_protocol::ids::{SessionEpoch, SessionId};
@@ -845,6 +845,182 @@ fn active_turn(job_ms: u64, changing: bool) -> (u32, u32) {
         }
     }
     (published, superseded)
+}
+
+/// KR-REQ-22.21: a cancellation is honoured or refused, never both. The service closes the running
+/// job's handle at the moment it decides what a job that did not finish comes to, so a caller that
+/// cancels after that moment is told nothing was running, and the job it could not reach is queued
+/// again. The control is a caller that cancels before it, which is honoured: the job ends
+/// cancelled and is not queued again.
+#[test]
+fn a_cancellation_is_honoured_or_refused_at_the_moment_a_job_is_decided() {
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        loaded(&mut service, at(3_000)),
+        Instruction::Generate { .. }
+    ));
+    let told = std::rc::Rc::new(std::cell::Cell::new(None));
+    {
+        let told = std::rc::Rc::clone(&told);
+        let running = service.running_job().clone();
+        at_next_decision(move || told.set(Some(running.cancel(&session(1)))));
+    }
+    let ended = service
+        .process_ended(ProcessEnd::Exited, at(3_100))
+        .expect("the end");
+    assert_eq!(
+        told.get(),
+        Some(false),
+        "a cancellation after the decision finds nothing running"
+    );
+    assert_eq!(
+        ended[0],
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(service.scheduler().queued(), 1);
+
+    // The control: a cancellation before the decision is honoured.
+    let mut service = self::service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        loaded(&mut service, at(3_000)),
+        Instruction::Generate { .. }
+    ));
+    assert!(service.cancel_running(&session(1)));
+    assert_eq!(
+        service
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end")[0],
+        Outcome::Cancelled {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(service.scheduler().queued(), 0);
+}
+
+/// KR-REQ-22.21: a caller's cancellation outlasts a pause. A job a pause has already stopped, which
+/// a caller then cancels, ends cancelled rather than going back in the queue, whether its process
+/// answers the cancellation or ends first, and nothing is described when the pause clears. The
+/// control is the same pause with no caller: the job keeps its place and is described after.
+#[test]
+fn a_caller_cancellation_outlasts_a_pause() {
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    for crash in [false, true] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        assert_eq!(
+            service.next(&hot, at(3_050)).expect("an instruction"),
+            Instruction::Cancel {
+                id,
+                work: Work::Job
+            }
+        );
+        assert!(
+            service.cancel_running(&session(1)),
+            "the caller is told it stopped the job"
+        );
+        let outcome = if crash {
+            service
+                .process_ended(ProcessEnd::Exited, at(3_100))
+                .expect("the end")
+                .remove(0)
+        } else {
+            service
+                .finished(
+                    id,
+                    Answered::Ended {
+                        why: JobEnd::Cancelled,
+                        detail: None,
+                    },
+                    at(3_100),
+                )
+                .expect("the answer")
+        };
+        assert_eq!(
+            outcome,
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            "crash {crash}"
+        );
+        assert_eq!(service.scheduler().queued(), 0, "crash {crash}");
+        // The pause clears, and nothing is described.
+        let later = service.next(&roomy(), at(40_000)).expect("an instruction");
+        assert!(
+            !matches!(
+                later,
+                Instruction::Load { .. } | Instruction::Generate { .. }
+            ),
+            "crash {crash}: {later:?}"
+        );
+        assert_eq!(service.counts().published, 0);
+    }
+
+    // The control: a pause alone keeps the job's place, and it is described when the pause clears.
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+        panic!("the job is sent");
+    };
+    assert!(matches!(
+        service.next(&hot, at(3_050)).expect("an instruction"),
+        Instruction::Cancel { .. }
+    ));
+    assert_eq!(
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Cancelled,
+                    detail: None,
+                },
+                at(3_100),
+            )
+            .expect("the answer"),
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    let mut now = at(40_000);
+    let request = loop {
+        match service.next(&roomy(), now).expect("an instruction") {
+            Instruction::Load { id, .. } => {
+                service
+                    .finished(
+                        id,
+                        Answered::Loaded {
+                            load_ms: 0,
+                            rss_bytes: 0,
+                        },
+                        now,
+                    )
+                    .expect("the load");
+            }
+            Instruction::Generate { id, request, .. } => break (id, request),
+            Instruction::Unload { .. } | Instruction::Cancel { .. } => {}
+            Instruction::Wait { .. } => {
+                assert!(now.monotonic_ms() < 400_000, "the job was not sent again");
+                now = now.after_ms(1_000);
+            }
+        }
+    };
+    assert!(matches!(
+        service
+            .finished(request.0, produced(&request.1.prompt, 0), now.after_ms(500))
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
 }
 
 /// Builds a service over a store of the test's own.

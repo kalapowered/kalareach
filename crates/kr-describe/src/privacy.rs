@@ -295,9 +295,24 @@ impl InFlight {
 /// A job runs inside one call, so the only way to stop it from outside is a token somebody else
 /// holds. This is that handle: raising a session's fence cancels its running job through it, and
 /// the runtime checks the token between tokens of output.
+///
+/// A cancellation made through this handle is a caller's, and it outlasts anything the service
+/// decides for reasons of its own: a job a caller cancelled is never queued again, not even one a
+/// pause had already stopped. The service closes the handle at the moment it decides what a job
+/// that did not finish comes to ([`Self::close`]), so a cancellation either arrives first and is
+/// honoured, or arrives after and finds nothing running.
 #[derive(Clone, Debug, Default)]
 pub struct RunningJob {
-    held: Arc<Mutex<Option<(SessionId, Cancellation)>>>,
+    held: Arc<Mutex<Option<Running>>>,
+}
+
+/// The job a [`RunningJob`] holds.
+#[derive(Debug)]
+struct Running {
+    session_id: SessionId,
+    cancellation: Cancellation,
+    /// Whether a caller cancelled it through the handle.
+    by_caller: bool,
 }
 
 impl RunningJob {
@@ -312,7 +327,11 @@ impl RunningJob {
     pub fn started(&self, session_id: SessionId) -> Cancellation {
         let cancellation = Cancellation::new();
         if let Ok(mut held) = self.held.lock() {
-            *held = Some((session_id, cancellation.clone()));
+            *held = Some(Running {
+                session_id,
+                cancellation: cancellation.clone(),
+                by_caller: false,
+            });
         }
         cancellation
     }
@@ -329,7 +348,7 @@ impl RunningJob {
     pub fn is_running(&self, session_id: &SessionId) -> bool {
         self.held.lock().is_ok_and(|held| {
             held.as_ref()
-                .is_some_and(|(running, _)| running == session_id)
+                .is_some_and(|running| running.session_id == *session_id)
         })
     }
 
@@ -340,7 +359,9 @@ impl RunningJob {
             return None;
         };
         match held.as_ref() {
-            Some((running, cancellation)) if running == session_id => Some(cancellation.clone()),
+            Some(running) if running.session_id == *session_id => {
+                Some(running.cancellation.clone())
+            }
             _ => None,
         }
     }
@@ -350,13 +371,31 @@ impl RunningJob {
     /// It is false when no job of this session's is running and false when the job's description
     /// had already reached the store, because in both cases this call took nothing back.
     pub fn cancel(&self, session_id: &SessionId) -> bool {
-        let Ok(held) = self.held.lock() else {
+        let Ok(mut held) = self.held.lock() else {
             return false;
         };
-        match held.as_ref() {
-            Some((running, cancellation)) if running == session_id => cancellation.cancel(),
+        match held.as_mut() {
+            Some(running) if running.session_id == *session_id => {
+                let stopped = running.cancellation.cancel();
+                running.by_caller |= stopped;
+                stopped
+            }
             _ => false,
         }
+    }
+
+    /// Closes this session's running job, and says whether a caller cancelled it first.
+    ///
+    /// The service calls this when it decides what a job that did not finish comes to. From then on
+    /// a cancellation finds nothing running and says so, so no caller is told it stopped a job that
+    /// is then queued again.
+    pub fn close(&self, session_id: &SessionId) -> bool {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.take_if(|running| running.session_id == *session_id)
+            .is_some_and(|running| running.by_caller)
     }
 }
 

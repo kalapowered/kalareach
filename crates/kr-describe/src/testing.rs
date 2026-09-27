@@ -62,6 +62,27 @@ pub(crate) fn thread_start_refused(name: &str) -> bool {
     })
 }
 
+thread_local! {
+    /// What runs the next time the service on this thread decides what a job that did not finish
+    /// comes to.
+    static AT_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` the next time the service on this thread has decided what a job that did not
+/// finish comes to, and before it acts on the decision: where a cancellation from another thread
+/// could arrive.
+pub fn at_next_decision(hook: impl FnOnce() + 'static) {
+    AT_DECISION.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs the hook [`at_next_decision`] set, once.
+pub(crate) fn decided() {
+    if let Some(hook) = AT_DECISION.with(|held| held.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// What a stub does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Script {

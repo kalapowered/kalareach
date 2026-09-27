@@ -312,8 +312,11 @@ A process that exits, breaks the wire or is ended for breaking a bound takes the
 nothing else. The store, the pins, the provenance, every session and every deterministic title
 survive. The job it was running is queued again once, with its aging position, and if the next
 process fails it as well it is not retried. A job somebody cancelled is never queued again, even
-when its process ends before the cancellation is answered: a retry would run it under a new token
-that nobody had cancelled. The next load waits a second after the first failure,
+when its process ends before the cancellation is answered, and even when a pause had already stopped
+it: a retry would run it under a new token that nobody had cancelled. The moment the service decides
+what a job that did not finish comes to is the moment a cancellation stops counting, so a
+cancellation that comes first is honoured, and one that comes after finds nothing running and says
+so. The next load waits a second after the first failure,
 twice as long after each failure that follows, up to five minutes, and a published description
 resets the wait.
 
