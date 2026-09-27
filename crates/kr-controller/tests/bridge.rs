@@ -764,7 +764,15 @@ impl FixtureDaemon {
 impl Drop for FixtureDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Collected once it has gone, and waited for no longer than half a minute: a daemon still
+        // there by then is left to the operating system rather than holding the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
 
