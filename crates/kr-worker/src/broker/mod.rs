@@ -3846,7 +3846,7 @@ impl BrokerState {
                 detail: format!("this binding's rich capabilities are disabled: {reason}"),
             });
         }
-        let pending = self.pending_resource(resource_id)?.resource.clone();
+        let pending = self.resource(resource_id)?;
         if pending.state != PendingState::Pending {
             return Err(BrokerError::Arbitration(
                 kr_protocol::gateway::ArbitrationError::AlreadyResolved {
@@ -4713,39 +4713,45 @@ impl BrokerState {
         GatewayConnectionId::new(self.next_connection)
     }
 
-    /// Returns one resource the live arbitration holds, or says why there is none.
+    /// Returns what one resource a caller names is: the live record while the live arbitration
+    /// holds it, and the ledger's record of how it ended once its settlement is final and it has
+    /// been forgotten ([`Arbitration::forget_resolved`]).
     ///
-    /// A settled resource leaves the live arbitration once its settlement is final, and the
-    /// ledger's record then says how it ended. A caller that names it is told that, as it was
-    /// told while the live record was held, rather than that nothing of the name exists; a
-    /// resource the ledger does not hold as settled is one this broker does not hold.
+    /// A caller that names a forgotten resource is refused for the reason it was refused while the
+    /// live record was held, checked in the same order: the resource's owner, then that it ended.
+    /// A resource the ledger does not hold as ended is one this broker does not hold.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Arbitration`] for a resource that has ended,
-    /// [`BrokerError::UnknownSubject`] for one this broker does not hold, and what the ledger's
-    /// read fails with.
-    fn pending_resource(&self, resource_id: PendingResourceId) -> Result<&Pending> {
+    /// Returns [`BrokerError::UnknownSubject`] for a resource this broker does not hold, and what
+    /// the ledger's read fails with.
+    fn resource(&self, resource_id: PendingResourceId) -> Result<PendingResource> {
         if let Some(pending) = self.arbitration.get(resource_id) {
-            return Ok(pending);
+            return Ok(pending.resource.clone());
         }
         match self.ledger.pending(resource_id)? {
-            Some(recorded) if recorded.state.is_terminal() => Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: recorded.state,
-                },
-            )),
+            Some(recorded) if recorded.state.is_terminal() => Ok(recorded),
             _ => Err(BrokerError::unknown(format!(
                 "no pending resource {resource_id}"
             ))),
         }
     }
 
-    /// Returns the binding whose decoder interpreted one resource, where one did.
-    fn decoder_of(&self, resource_id: PendingResourceId) -> Option<BrokerBindingId> {
-        self.arbitration
-            .get(resource_id)
-            .and_then(|pending| pending.decoder)
+    /// Returns the binding whose decoder interpreted one resource, where one did: the live
+    /// record's, or the ledger's record of the interpretation once the resource has been
+    /// forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the ledger's read fails with.
+    fn decoder_of(&self, resource_id: PendingResourceId) -> Result<Option<BrokerBindingId>> {
+        if let Some(pending) = self.arbitration.get(resource_id) {
+            return Ok(pending.decoder);
+        }
+        Ok(self
+            .ledger
+            .decoding(resource_id)?
+            .map(|entry| entry.binding_id))
     }
 
     /// Checks the component answerable for one dispatch, at admission.
@@ -4870,7 +4876,7 @@ impl BrokerState {
     /// has gone, a connection or channel closing, and a recovery writing the gap. What a settled
     /// resource of a connection that is still open is asked is answered from the live record,
     /// and what one that has been forgotten is asked is answered from the ledger's
-    /// ([`BrokerState::pending_resource`]).
+    /// ([`BrokerState::resource`]).
     fn forget_resolved(&mut self) {
         let gap_open = !self.volatile.writes_are_durable();
         let gateway = &self.gateway;
@@ -5222,7 +5228,10 @@ impl BrokerState {
 
     /// Checks that one pending resource is still one an answer may be dispatched for.
     fn recheck_answerable(&self, resource_id: PendingResourceId) -> Result<()> {
-        let pending = self.pending_resource(resource_id)?;
+        let pending = self
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
         let instance = self
             .instances
             .get(&pending.resource.application_instance_id)

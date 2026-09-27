@@ -1526,7 +1526,7 @@ impl Broker {
                 },
             ));
         }
-        if state.decoder_of(resource_id) != Some(binding_id) {
+        if state.decoder_of(resource_id)? != Some(binding_id) {
             return Err(BrokerError::denied(format!(
                 "{resource_id} was not interpreted by {}, so an answer from it would not carry \
                  the meaning a person was shown",
@@ -1648,9 +1648,9 @@ impl Broker {
         option_id: &str,
         now: TimestampMs,
     ) -> Result<()> {
-        let resource = self
-            .pending(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        // The ledger's record answers for a resource whose settlement is final, so it is refused
+        // as ended, as it was while the live arbitration held it.
+        let resource = self.state().resource(resource_id)?;
         if resource.application_instance_id != target.subject.application_instance_id {
             return Err(BrokerError::denied(format!(
                 "{resource_id} belongs to another application instance"
@@ -1719,9 +1719,9 @@ impl Broker {
         resource_id: kr_protocol::ids::PendingResourceId,
         now: TimestampMs,
     ) -> Result<()> {
-        let resource = self
-            .pending(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        // The ledger's record answers for a resource whose settlement is final, so it is refused
+        // as ended, as it was while the live arbitration held it.
+        let resource = self.state().resource(resource_id)?;
         if resource.application_instance_id != target.subject.application_instance_id {
             return Err(BrokerError::denied(format!(
                 "{resource_id} belongs to another application instance"
@@ -2239,7 +2239,7 @@ impl crate::broker::BrokerState {
         params: &AgentApprovalRespondParams,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
-        let resource = self.pending_resource(params.resource_id)?.resource.clone();
+        let resource = self.resource(params.resource_id)?;
         if resource.application_instance_id != params.target.subject.application_instance_id {
             return Err(BrokerError::denied(format!(
                 "{} belongs to another application instance",
@@ -2271,7 +2271,7 @@ impl crate::broker::BrokerState {
         // one whose meaning the answer carries, and a fault in it disables this dispatch whatever
         // else is bound to the instance.
         let responsible = self
-            .decoder_of(params.resource_id)
+            .decoder_of(params.resource_id)?
             .map_or(Responsible::Transport, Responsible::Binding);
         let capability_id = CapabilityId::new("agent.approval")
             .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;

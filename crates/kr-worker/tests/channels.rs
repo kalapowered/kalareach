@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_protocol::broker::{BrokerGrant, BrokerGrants, IntegrationMode};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{GatewayMode, NativeFraming, PendingResource, PendingState};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -887,6 +888,111 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_before_its_marker_for_what_it_c
     );
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-12.18 and KR-REQ-11.33: once the channel that relayed an answered approval has closed,
+/// the live arbitration no longer holds it, and every way of answering it is refused as it was
+/// while it did: the package that interpreted it is told it ended, before and after its marker,
+/// and another package is refused because it did not interpret it.
+#[tokio::test]
+async fn kr_req_12_18_an_answer_to_an_approval_whose_channel_closed_is_told_it_ended() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::new();
+    package.bind(&broker, 2);
+    register_actions(&broker, &package, 2);
+    let other = kr_protocol::ids::PluginId::new("kalareach/other").expect("valid");
+    broker
+        .bind_descriptor(
+            binding(9),
+            instance(2),
+            other.clone(),
+            PublisherId::new("kalareach").expect("valid"),
+            Digest256::from_bytes([7; 32]),
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            None,
+            TimestampMs::new(1),
+        )
+        .expect("the other package is bound");
+    register_actions(&broker, &package, 9);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.relay("abcde").await;
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let resource = relayed(&broker, 2, "abcde").expect("recorded");
+    let plugin_id = package.connector.plugin_id();
+    let decoders_answer = invoke(
+        plugin_id,
+        2,
+        Some(&resource),
+        &serde_json::json!({ "decision": "deny" }),
+    );
+    let admitted = broker
+        .admit_plugin_answer(&caller(), binding(2), &decoders_answer, TimestampMs::new(6))
+        .expect("the decoder's own answer is admitted");
+    broker
+        .record_approval(&admitted, TimestampMs::new(6))
+        .expect("the marker is written and the answer goes")
+        .settled(TimestampMs::new(6))
+        .await
+        .expect("the answer is written");
+    assert!(channel.next().await.is_some(), "the answer went");
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+    assert!(
+        broker.pending(resource.resource_id).is_none(),
+        "the live arbitration no longer holds it"
+    );
+    assert_eq!(
+        settled_as(&broker, resource.resource_id),
+        Some(PendingState::Resolved)
+    );
+
+    let target = respond(2, &resource, "deny").target;
+    let checked = broker
+        .check_resource_answerable(&target, resource.resource_id, TimestampMs::new(7))
+        .expect_err("an ended approval is not answerable");
+    assert_eq!(checked.code(), ErrorCode::QuestionResolved, "{checked}");
+    let checked = broker
+        .check_answerable(&target, resource.resource_id, "deny", TimestampMs::new(7))
+        .expect_err("with any decision");
+    assert_eq!(checked.code(), ErrorCode::QuestionResolved, "{checked}");
+    let again = broker
+        .admit_plugin_answer(&caller(), binding(2), &decoders_answer, TimestampMs::new(7))
+        .expect_err("the decoder's second answer is refused");
+    assert_eq!(again.code(), ErrorCode::QuestionResolved, "{again}");
+    let responded = broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "deny"),
+            TimestampMs::new(7),
+        )
+        .await
+        .expect_err("and so is a rich answer");
+    assert_eq!(responded.code(), ErrorCode::QuestionResolved, "{responded}");
+    let foreign = broker
+        .admit_plugin_answer(
+            &caller(),
+            binding(9),
+            &invoke(
+                other,
+                2,
+                Some(&resource),
+                &serde_json::json!({ "decision": "allow" }),
+            ),
+            TimestampMs::new(7),
+        )
+        .expect_err("another package's answer is refused");
+    assert!(
+        foreign.to_string().contains("was not interpreted by"),
+        "for the reason it was refused while the approval was held: {foreign}"
+    );
 }
 
 /// KR-REQ-12.18: the right to answer comes from what the installation was granted, not from what

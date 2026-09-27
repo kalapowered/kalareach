@@ -2110,6 +2110,60 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
     );
 }
 
+/// KR-REQ-12.18 and KR-REQ-11.33: an answer that names an approval whose run has ended, which the
+/// live arbitration no longer holds, is refused before its dispatch marker for the reason it was
+/// refused while the approval was held, that it ended, through a plugin action and through
+/// `agent.approval.respond` alike, and each receipt is a rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_an_answer_to_an_approval_whose_run_ended_is_rejected_as_ended() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    register_answer_action(&host);
+    host.service
+        .broker()
+        .native_answer_through(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"option_id":"allow"}}"#,
+            TimestampMs::new(4),
+            |_| Ok(()),
+        )
+        .expect("the native answer is carried");
+    host.service
+        .broker()
+        .close_connection(kr_protocol::ids::GatewayConnectionId::new(1));
+    assert!(
+        host.service.broker().pending(resource_id).is_none(),
+        "the live arbitration no longer holds it"
+    );
+
+    let mut client = cli(&host).await;
+    assert_eq!(
+        plugin_answer(&mut client, &host, 50, Nullable::some(resource_id)).await,
+        (ErrorCode::QuestionResolved, ReceiptState::Rejected)
+    );
+    let mutation = approval_mutation(&client, &host, 51, resource_id);
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("an ended approval takes no answer: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::QuestionResolved);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried to the upstream"
+    );
+}
+
 /// A Claude Code channel served for this suite's instance on the host's own broker: the instance
 /// launched, the connector read from a package laid out as the store extracts it, the package
 /// bound and its actions registered as the installation's binder will, and the channel server's
