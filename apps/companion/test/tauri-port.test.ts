@@ -96,14 +96,31 @@ describe('the desktop port and a raw terminal view', () => {
     shell.answers.set('terminal_view_open', '7')
     const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
     const wheel = { kind: 'wheel', take: 1, column: 3, line: 2, turns: -1, shift: false, alt: true, control: false } as const
+    const escape = {
+      kind: 'key',
+      take: 1,
+      key: 'Escape',
+      base: null,
+      keypad: null,
+      shift: false,
+      alt: false,
+      control: false,
+      caps_lock: false,
+      num_lock: true,
+      event: 'press'
+    } as const
     await view.input({ kind: 'take', number: 1 })
     await view.input(wheel)
-    await view.input({ kind: 'keys', take: 1, keys: '\u001b' })
+    await view.input(escape)
+    await view.input({ kind: 'text', take: 1, text: '日本' })
+    await view.input({ kind: 'paste', take: 1, text: 'one\ntwo' })
     await view.input({ kind: 'release', number: 2 })
     expect(shell.invoked.slice(1)).toEqual([
       { command: 'terminal_view_input', args: { view: '7', input: { kind: 'take', number: 1 } } },
       { command: 'terminal_view_input', args: { view: '7', input: wheel } },
-      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'keys', take: 1, keys: '\u001b' } } },
+      { command: 'terminal_view_input', args: { view: '7', input: escape } },
+      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'text', take: 1, text: '日本' } } },
+      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'paste', take: 1, text: 'one\ntwo' } } },
       { command: 'terminal_view_input', args: { view: '7', input: { kind: 'release', number: 2 } } }
     ])
     // The page names no other way to write to a program.

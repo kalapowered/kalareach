@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen } from '../src/host/fake'
-import type { HostPort, TerminalScreen } from '../src/host/port'
+import type { HostPort, TerminalInput, TerminalScreen } from '../src/host/port'
 import { ATTACHING, SLOW_MS, WAITING } from '../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -543,7 +543,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     await waitFor(() => {
       expect(modeBadge()).toBe('Control')
     })
-    expect(sentence()).toBe('The program gets the wheel.')
+    expect(sentence()).toBe('Your keys go to the program; Control-Tab moves on. The program gets the wheel.')
 
     await person.click(screen.getByRole('button', { name: 'Look around' }))
     expect(controls.terminalViews[0]?.inputs.at(-1)).toEqual({ kind: 'release', number: 2 })
@@ -570,6 +570,8 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       expect(turned.defaultPrevented).toBe(true)
       const up = wheel({ deltaY: -32, clientX: 12 + 1, clientY: 12 + 1, shiftKey: true, altKey: true })
       expect(up.defaultPrevented).toBe(true)
+      // The second turn goes once the first is answered.
+      await settle()
       expect(programInputs(controls)).toEqual([
         { kind: 'wheel', take: 1, column: 8, line: 3, turns: 1, shift: false, alt: false, control: false },
         { kind: 'wheel', take: 1, column: 3, line: 2, turns: -2, shift: true, alt: true, control: false }
@@ -626,6 +628,8 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       wheel({ deltaY: 6, ...at })
       wheel({ deltaY: 2, deltaMode: 1, ...at })
       wheel({ deltaY: 1, deltaMode: 2, ...at })
+      // Each turn goes once the one before is answered.
+      await settle()
       expect(programInputs(controls).map((input) => (input.kind === 'wheel' ? input.turns : 0))).toEqual([
         1, 2, 8
       ])
@@ -638,6 +642,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
         controls.terminalViews[0]?.show({ wheel: 'reaches' })
       })
       wheel({ deltaY: 6, ...at })
+      await settle()
       expect(programInputs(controls)).toHaveLength(3)
     } finally {
       restore()
@@ -655,14 +660,14 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       act(() => {
         controls.terminalViews[0]?.show({ wheel: 'unreported' })
       })
-      expect(sentence()).toBe('The program is not using the wheel. Look around to scroll.')
+      expect(sentence()).toBe('Your keys go to the program; Control-Tab moves on. The program is not using the wheel. Look around to scroll.')
       const ignored = wheel({ deltaY: 48, clientX: 12 + 1, clientY: 12 + 1 })
       expect(ignored.defaultPrevented).toBe(false)
       act(() => {
         controls.terminalViews[0]?.show({ wheel: 'unwritable' })
       })
       expect(sentence()).toBe(
-        'The program asks for the wheel in a form this view cannot send. Look around to scroll.'
+        'Your keys go to the program; Control-Tab moves on. The program asks for the wheel in a form this view cannot send. Look around to scroll.'
       )
       wheel({ deltaY: 48, clientX: 12 + 1, clientY: 12 + 1 })
       expect(programInputs(controls)).toEqual([])
@@ -1129,6 +1134,276 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 })
 
+describe("the desktop's keys reach the program while the view controls it (KR-REQ-13.18, 13.17, 08.59)", () => {
+  /** The program's keyboard, or null while there is none. */
+  const programKeyboard = () => screen.queryByLabelText<HTMLTextAreaElement>('Type to the program')
+
+  /** A key's press or release under take 1, named as the page names it, with nothing held unless told. */
+  function key(
+    name: string,
+    event: 'press' | 'release',
+    over: Record<string, unknown> = {}
+  ): Record<string, unknown> {
+    return {
+      kind: 'key',
+      take: 1,
+      event,
+      key: name,
+      base: [...name].length === 1 ? name : null,
+      keypad: null,
+      shift: false,
+      alt: false,
+      control: false,
+      caps_lock: false,
+      num_lock: false,
+      ...over
+    }
+  }
+
+  it('puts the program keyboard at the cursor, next after the mode button, only while the view controls the program', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalControl()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      expect(programKeyboard()).toBeNull()
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      // Taking control is not yet control: nothing types into the program.
+      expect(programKeyboard()).toBeNull()
+      act(() => {
+        controls.terminalViews[0]?.grantControl()
+      })
+      await waitFor(() => {
+        expect(programKeyboard()).not.toBeNull()
+      })
+      const keyboard = programKeyboard()
+      // The fake session's cursor is at column 2 and line 5, in cells of 8 by 16 pixels.
+      expect(keyboard?.style.left).toBe('16px')
+      expect(keyboard?.style.top).toBe('80px')
+      expect(keyboard).toHaveAttribute('autocapitalize', 'off')
+      expect(keyboard).toHaveAttribute('spellcheck', 'false')
+      expect(keyboard).toHaveAccessibleDescription(
+        'Your keys go to the program; Control-Tab moves on. The program gets the wheel.'
+      )
+      // Tab from the mode button reaches it next.
+      const mode = screen.getByRole('button', { name: 'Look around' })
+      mode.focus()
+      await person.tab()
+      expect(keyboard).toHaveFocus()
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      expect(programKeyboard()).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('sends the keys typed in it under the take, each named, with Tab, and moves on with Control-Tab', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      // A click on the terminal that selects nothing puts the focus in it.
+      await person.click(screen.getByTestId('terminal-surface').firstElementChild as HTMLElement)
+      expect(programKeyboard()).toHaveFocus()
+      await person.keyboard('l{Enter}{Tab}{Shift>}{Tab}{/Shift}')
+      await waitFor(() => {
+        expect(programInputs(controls)).toHaveLength(8)
+      })
+      expect(programInputs(controls)).toEqual([
+        key('l', 'press'),
+        key('l', 'release'),
+        key('Enter', 'press'),
+        key('Enter', 'release'),
+        key('Tab', 'press'),
+        key('Tab', 'release'),
+        key('Tab', 'press', { shift: true }),
+        key('Tab', 'release', { shift: true })
+      ])
+      expect(programKeyboard()).toHaveFocus()
+      // Control-Tab moves on past the controls control mode disables, and Control-Shift-Tab back.
+      await person.keyboard('{Control>}{Tab}{/Control}')
+      expect(screen.getByRole('button', { name: 'Back to the conversation' })).toHaveFocus()
+      programKeyboard()?.focus()
+      await person.keyboard('{Control>}{Shift>}{Tab}{/Shift}{/Control}')
+      expect(screen.getByRole('button', { name: 'Look around' })).toHaveFocus()
+      expect(programInputs(controls)).toHaveLength(8)
+    } finally {
+      restore()
+    }
+  })
+
+  it('draws what an input method composes at the cursor in the session colours, and sends it once', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      const keyboard = programKeyboard()
+      if (keyboard === null) throw new Error('no program keyboard')
+      act(() => {
+        keyboard.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }))
+        keyboard.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: 'にほん' }))
+      })
+      const composing = screen.getByTestId('terminal-composition')
+      expect(composing.textContent).toBe('にほん')
+      expect(composing.style.left).toBe('16px')
+      expect(composing.style.top).toBe('80px')
+      expect(composing.style.color).not.toBe('')
+      expect(composing.style.background).not.toBe('')
+      expect(programInputs(controls)).toEqual([])
+      act(() => {
+        keyboard.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '日本' }))
+      })
+      expect(screen.queryByTestId('terminal-composition')).toBeNull()
+      await waitFor(() => {
+        expect(programInputs(controls)).toEqual([{ kind: 'text', take: 1, text: '日本' }])
+      })
+    } finally {
+      restore()
+    }
+  })
+
+  it('says why a key did not reach the program in the sentence, until one does, and keeps control', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      // Neither an attachment's screen nor a move's: the view holds none.
+      controls.holdTerminalViews()
+      controls.holdTerminalMoves()
+      open(port)
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(1)
+      })
+      act(() => {
+        controls.terminalViews[0]?.attach()
+      })
+      await takeControl(person, controls)
+      // No screen yet: the view cannot say how the program reads keys.
+      await person.click(screen.getByTestId('terminal-surface').firstElementChild as HTMLElement)
+      await person.keyboard('q')
+      await waitFor(() => {
+        expect(sentence()).toBe("That key did not reach the program: the view is waiting for the session's screen.")
+      })
+      expect(modeBadge()).toBe('Control')
+      expect(programInputs(controls)).toEqual([])
+      act(() => {
+        controls.terminalViews[0]?.show()
+      })
+      await person.keyboard('q')
+      await waitFor(() => {
+        expect(sentence()).toBe('Your keys go to the program; Control-Tab moves on. The program gets the wheel.')
+      })
+      expect(programInputs(controls)).toEqual([key('q', 'press'), key('q', 'release')])
+    } finally {
+      restore()
+    }
+  })
+
+  it('moves the focus to the mode button when control ends with the focus in the program keyboard', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      programKeyboard()?.focus()
+      act(() => {
+        controls.terminalViews[0]?.loseControl()
+      })
+      await waitFor(() => {
+        expect(programKeyboard()).toBeNull()
+      })
+      expect(screen.getByRole('button', { name: 'Take control' })).toHaveFocus()
+    } finally {
+      restore()
+    }
+  })
+
+  it('sends every input of an opening one at a time, the next once the last is answered', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      // Each input reaches the scripted host only once the test answers it, in the order made.
+      const made: TerminalInput[] = []
+      const answers: (() => void)[] = []
+      const held: HostPort = {
+        ...port,
+        openTerminalView: async (sessionId, grid, listener) => {
+          const view = await port.openTerminalView(sessionId, grid, listener)
+          return {
+            ...view,
+            input: (input) => {
+              made.push(input)
+              return new Promise((resolve, reject) => {
+                answers.push(() => {
+                  view.input(input).then(resolve, reject)
+                })
+              })
+            }
+          }
+        }
+      }
+      const answer = async (index: number) => {
+        await act(async () => {
+          answers[index]?.()
+          await new Promise((resolve) => {
+            setTimeout(resolve, 0)
+          })
+        })
+      }
+      open(held)
+      await screen.findByTestId('palette-provenance')
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      expect(made).toEqual([{ kind: 'take', number: 1 }])
+      await answer(0)
+      await waitFor(() => {
+        expect(modeBadge()).toBe('Control')
+      })
+      const keyboard = programKeyboard()
+      if (keyboard === null) throw new Error('no program keyboard')
+      fireEvent.keyDown(keyboard, { key: 'a', code: 'KeyA' })
+      fireEvent.keyDown(keyboard, { key: 'b', code: 'KeyB' })
+      fireEvent.click(screen.getByRole('button', { name: 'Look around' }))
+      // One call at a time: the second key waits for the first to be answered, and the release of
+      // control waits for both.
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0)
+        })
+      })
+      expect(made.map((input) => (input.kind === 'key' ? input.key : input.kind))).toEqual(['take', 'a'])
+      await answer(1)
+      expect(made.map((input) => (input.kind === 'key' ? input.key : input.kind))).toEqual(['take', 'a', 'b'])
+      await answer(2)
+      await answer(3)
+      expect(made.map((input) => (input.kind === 'key' ? input.key : input.kind))).toEqual([
+        'take',
+        'a',
+        'b',
+        'release'
+      ])
+      expect(controls.terminalViews[0]?.inputs.map((input) => (input.kind === 'key' ? input.key : input.kind))).toEqual([
+        'take',
+        'a',
+        'b',
+        'release'
+      ])
+    } finally {
+      restore()
+    }
+  })
+})
+
 /** What the mode badge says. */
 function modeBadge(): string | null {
   return screen.getByTestId('terminal-mode').textContent
@@ -1157,10 +1432,10 @@ async function takeControl(
   })
 }
 
-/** Every wheel turn and key the first view took for the program, in order. */
+/** Every wheel turn, key, text and paste the first view took for the program, in order. */
 function programInputs(controls: ReturnType<typeof fakeHost>['controls']) {
   return (controls.terminalViews[0]?.inputs ?? []).filter(
-    (input) => input.kind === 'wheel' || input.kind === 'keys'
+    (input) => input.kind !== 'take' && input.kind !== 'release'
   )
 }
 

@@ -25,8 +25,7 @@ import {
   afterKey,
   describeLatch,
   pressModifier,
-  sequenceFor,
-  sequenceForKeyPress
+  rowKey
 } from '../../src/mobile/model/accessory'
 import {
   MAX_CONTROL_LANE_UPLOAD_LEN,
@@ -130,17 +129,57 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
   })
 })
 
-describe('the accessory row and a hardware keyboard (KR-REQ-13.17)', () => {
+describe('the accessory row (KR-REQ-13.17)', () => {
   const key = (id: string) => {
     const found = ACCESSORY_KEYS.find((each) => each.id === id)
     if (!found) throw new Error(`no key ${id}`)
     return found
   }
+  const NO_LOCKS = { capsLock: false, numLock: false }
 
-  it('sends the escape and arrow sequences a terminal expects', () => {
-    expect(sequenceFor(key('esc'), NO_LATCH)).toBe('\u001b')
-    expect(sequenceFor(key('up'), NO_LATCH)).toBe('\u001b[A')
-    expect(sequenceFor(key('tab'), NO_LATCH)).toBe('\t')
+  it('names each key as a keyboard names it, never as the bytes a terminal reads', () => {
+    expect(ACCESSORY_KEYS.map((each) => each.key ?? each.modifier)).toEqual([
+      'Escape',
+      'Tab',
+      'ctrl',
+      'alt',
+      'ArrowUp',
+      'ArrowDown',
+      'ArrowLeft',
+      'ArrowRight',
+      'Home',
+      'End',
+      '|',
+      '-',
+      '/',
+      '~'
+    ])
+    expect(rowKey(key('esc'), NO_LATCH, NO_LOCKS)).toEqual({
+      key: 'Escape',
+      base: null,
+      keypad: null,
+      shift: false,
+      alt: false,
+      control: false,
+      caps_lock: false,
+      num_lock: false
+    })
+    // A character of the row is the key that makes it with nothing held.
+    expect(rowKey(key('pipe'), NO_LATCH, NO_LOCKS)).toMatchObject({ key: '|', base: '|' })
+  })
+
+  it('sends a key with the modifiers the row holds for it and the locks that are on', () => {
+    const control = pressModifier(NO_LATCH, 'ctrl')
+    expect(rowKey(key('tab'), control, NO_LOCKS)).toMatchObject({ key: 'Tab', control: true, alt: false })
+    expect(rowKey(key('up'), pressModifier(control, 'alt'), { capsLock: true, numLock: true })).toMatchObject({
+      key: 'ArrowUp',
+      control: true,
+      alt: true,
+      caps_lock: true,
+      num_lock: true
+    })
+    // A modifier latches rather than sends.
+    expect(rowKey(key('ctrl'), NO_LATCH, NO_LOCKS)).toBeNull()
   })
 
   it('latches a modifier for one key, then locks it, then lets it go', () => {
@@ -156,25 +195,6 @@ describe('the accessory row and a hardware keyboard (KR-REQ-13.17)', () => {
   it('says which of the three states a modifier is in', () => {
     expect(describeLatch(key('ctrl'), NO_LATCH)).toBe('Control, off')
     expect(describeLatch(key('ctrl'), pressModifier(NO_LATCH, 'ctrl'))).toContain('next key')
-  })
-
-  it('produces the same bytes for a hardware key and for the row', () => {
-    expect(sequenceForKeyPress({ key: 'c', ctrlKey: true, altKey: false, metaKey: false, shiftKey: false })).toBe(
-      '\u0003'
-    )
-    expect(sequenceForKeyPress({ key: 'ArrowUp', ctrlKey: false, altKey: false, metaKey: false, shiftKey: false })).toBe(
-      sequenceFor(key('up'), NO_LATCH)
-    )
-  })
-
-  it('leaves a platform chord to the platform', () => {
-    expect(
-      sequenceForKeyPress({ key: 'c', ctrlKey: false, altKey: false, metaKey: true, shiftKey: false })
-    ).toBeNull()
-  })
-
-  it('sends nothing rather than an unmodified key when a modifier has no meaning', () => {
-    expect(sequenceFor(key('up'), pressModifier(NO_LATCH, 'ctrl'))).toBeNull()
   })
 })
 

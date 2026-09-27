@@ -50,6 +50,7 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  KeypadCode,
   OwnerView,
   PairingView,
   PasteView,
@@ -2163,8 +2164,10 @@ function fakeTerminalView(
         return Promise.resolve()
       },
       // Read as native code reads it: anything that is not the view's input shape is refused before
-      // anything happens, and a wheel turn or keys only go while the view controls the program under
-      // the take they name.
+      // anything happens, and a wheel turn, a key, text or a paste only goes while the view controls
+      // the program under the take it names. A key, text or paste also needs the session's screen,
+      // which says how the program reads keys: before the view holds one it is refused, and the view
+      // keeps control.
       input: (next) => {
         const input = readTerminalInput(next)
         if (typeof input === 'string') return refused('INVALID_ARGUMENT', input)
@@ -2190,9 +2193,18 @@ function fakeTerminalView(
             return Promise.resolve()
           }
           case 'wheel':
-          case 'keys':
+          case 'key':
+          case 'text':
+          case 'paste':
             if (!(wanted && leased && input.take === asked)) {
               return refused('LEASE_LOST', 'This view does not control the program.')
+            }
+            if (input.kind !== 'wheel' && last?.state !== 'showing') {
+              const what = input.kind === 'key' ? 'That key' : input.kind === 'text' ? 'That text' : 'That paste'
+              return refused(
+                'INPUT_INCOMPATIBLE',
+                `${what} did not reach the program: the view is waiting for the session's screen.`
+              )
             }
             inputs.push(input)
             return Promise.resolve()
@@ -2212,8 +2224,36 @@ export const LOST_CONTROL = 'Control ended: another view took it, or the program
 /** The most wheel turns one input carries, as native code reads it. */
 const MAX_TURNS = 1024
 
-/** The most bytes of keys one input carries: one input frame. */
-const MAX_KEYS_BYTES = 64 * 1024
+/** The most bytes of text one input carries: one input frame. */
+const MAX_TEXT_BYTES = 64 * 1024
+
+/** The most bytes of a paste one input carries: one input frame less bracketed paste's delimiters. */
+const MAX_PASTE_BYTES = MAX_TEXT_BYTES - 12
+
+/** The keypad codes native code reads, by the platform's names for them. */
+const KEYPAD: readonly string[] = [
+  ...Array.from({ length: 10 }, (_, digit) => `Numpad${digit}`),
+  'NumpadDecimal',
+  'NumpadComma',
+  'NumpadDivide',
+  'NumpadMultiply',
+  'NumpadSubtract',
+  'NumpadAdd',
+  'NumpadEqual',
+  'NumpadEnter'
+]
+
+/** Whether native code reads `text` as one character: one Unicode scalar, never a control character. */
+function oneScalar(text: string): boolean {
+  const scalars = [...text]
+  const point = scalars.length === 1 ? text.codePointAt(0) : undefined
+  return point !== undefined && !controlCharacter(point)
+}
+
+/** Whether a code point is a control character, as native code's `char::is_control` says. */
+function controlCharacter(point: number): boolean {
+  return point <= 0x1f || (point >= 0x7f && point <= 0x9f)
+}
 
 /** A refusal of a view's handle, as native code rejects with it. */
 function refused(code: string, message: string): Promise<never> {
@@ -2377,8 +2417,9 @@ export function isSessionId(value: unknown): value is string {
 
 /**
  * The page's input read as native code reads it, or why it is not the view's input shape: exactly
- * the fields of its kind, a whole number for each number, and turns and keys within what one input
- * carries.
+ * the fields of its kind, a whole number for each number, a key one character or the name of a key,
+ * text with no control character, and turns, text and a paste within what one input carries. A
+ * key's unshifted character and keypad key may be left out, as none.
  */
 export function readTerminalInput(value: unknown): TerminalInput | string {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'an input is a map'
@@ -2386,7 +2427,7 @@ export function readTerminalInput(value: unknown): TerminalInput | string {
   const exactly = (...names: string[]): string | null => {
     const extra = Object.keys(fields).filter((name) => !names.includes(name))
     if (extra.length > 0) return `unknown field \`${extra[0] ?? ''}\``
-    const missing = names.filter((name) => !(name in fields))
+    const missing = names.filter((name) => !(name in fields) && name !== 'base' && name !== 'keypad')
     return missing.length > 0 ? `missing field \`${missing[0] ?? ''}\`` : null
   }
   // A number is read as native code's decoder reads its field's integer type.
@@ -2433,20 +2474,78 @@ export function readTerminalInput(value: unknown): TerminalInput | string {
         control: control as boolean
       }
     }
-    case 'keys': {
-      const wrong = exactly('kind', 'take', 'keys')
+    case 'key': {
+      const wrong = exactly(
+        'kind',
+        'take',
+        'key',
+        'base',
+        'keypad',
+        'shift',
+        'alt',
+        'control',
+        'caps_lock',
+        'num_lock',
+        'event'
+      )
+      if (wrong !== null) return wrong
+      const take = whole('take')
+      const shift = flag('shift')
+      const alt = flag('alt')
+      const control = flag('control')
+      const capsLock = flag('caps_lock')
+      const numLock = flag('num_lock')
+      for (const read of [take, shift, alt, control, capsLock, numLock]) {
+        if (typeof read === 'string') return read
+      }
+      const key = fields['key']
+      const named = typeof key === 'string' && /^[A-Za-z0-9]{1,32}$/.test(key)
+      if (typeof key !== 'string' || !(oneScalar(key) || named)) {
+        return 'a key is one character or the name of a key'
+      }
+      const base = fields['base'] ?? null
+      if (base !== null && (typeof base !== 'string' || !oneScalar(base))) {
+        return "a key's character is one character, never a control character"
+      }
+      const keypad = fields['keypad'] ?? null
+      if (keypad !== null && (typeof keypad !== 'string' || !KEYPAD.includes(keypad))) {
+        return 'unknown variant: a keypad key is one of the keypad codes'
+      }
+      const event = fields['event']
+      if (event !== 'press' && event !== 'repeat' && event !== 'release') {
+        return 'unknown variant: a key is pressed, repeated or released'
+      }
+      return {
+        kind: 'key',
+        take: take as number,
+        key,
+        base,
+        keypad: keypad as KeypadCode | null,
+        shift: shift as boolean,
+        alt: alt as boolean,
+        control: control as boolean,
+        caps_lock: capsLock as boolean,
+        num_lock: numLock as boolean,
+        event
+      }
+    }
+    case 'text':
+    case 'paste': {
+      const wrong = exactly('kind', 'take', 'text')
       if (wrong !== null) return wrong
       const take = whole('take')
       if (typeof take === 'string') return take
-      const keys = fields['keys']
-      if (typeof keys !== 'string' || keys.length === 0) return 'keys send something'
-      if (new TextEncoder().encode(keys).length > MAX_KEYS_BYTES) {
-        return `keys send at most ${MAX_KEYS_BYTES} bytes at once`
+      const text = fields['text']
+      if (typeof text !== 'string' || text.length === 0) return 'text says something'
+      const most = fields['kind'] === 'text' ? MAX_TEXT_BYTES : MAX_PASTE_BYTES
+      if (new TextEncoder().encode(text).length > most) return `text carries at most ${most} bytes at once`
+      if (fields['kind'] === 'text' && [...text].some((scalar) => controlCharacter(scalar.codePointAt(0) ?? 0))) {
+        return 'text carries no control character: a key is sent as a key'
       }
-      return { kind: 'keys', take, keys }
+      return { kind: fields['kind'], take, text }
     }
     default:
-      return 'unknown variant: an input is a take, a release, a wheel or keys'
+      return 'unknown variant: an input is a take, a release, a wheel, a key, text or a paste'
   }
 }
 

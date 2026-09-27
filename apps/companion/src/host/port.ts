@@ -890,15 +890,19 @@ export type TerminalWheel = 'reaches' | 'unreported' | 'unwritable'
 
 /**
  * What the page tells a view of the person: taking control or giving it back, numbered in the order
- * the page asks, or a turn of the program's wheel at a cell of the session's grid or keys, each made
- * under the page's take `take`. `turns` go towards the person when positive.
+ * the page asks, or a turn of the program's wheel at a cell of the session's grid, a key, text or a
+ * paste, each made under the page's take `take`. `turns` go towards the person when positive.
  */
 export type TerminalInput =
   | { readonly kind: 'take'; readonly number: number }
   | { readonly kind: 'release'; readonly number: number }
   | ({ readonly take: number } & ProgramInput)
 
-/** What reaches the program while a view controls it: its wheel turned at a cell, or keys. */
+/**
+ * What reaches the program while a view controls it: its wheel turned at a cell, a key named as the
+ * platform reported it, text that came with no key, or a paste. The page never spells a byte:
+ * native code spells each in the encoding the program negotiated.
+ */
 export type ProgramInput =
   | {
       readonly kind: 'wheel'
@@ -911,7 +915,57 @@ export type ProgramInput =
       readonly alt: boolean
       readonly control: boolean
     }
-  | { readonly kind: 'keys'; readonly keys: string }
+  | ({ readonly kind: 'key'; readonly event: KeyAction } & TypedKey)
+  /** Text an input method, a software keyboard or dictation committed, with no control character. */
+  | { readonly kind: 'text'; readonly text: string }
+  /** Text the person pasted, as it was on the pasteboard. */
+  | { readonly kind: 'paste'; readonly text: string }
+
+/** Whether a key went down, repeated while held, or came up. */
+export type KeyAction = 'press' | 'repeat' | 'release'
+
+/**
+ * The keys of the numeric keypad native code knows, by the code the platform gives their place on
+ * the keyboard.
+ */
+export const KEYPAD_CODES = [
+  'Numpad0',
+  'Numpad1',
+  'Numpad2',
+  'Numpad3',
+  'Numpad4',
+  'Numpad5',
+  'Numpad6',
+  'Numpad7',
+  'Numpad8',
+  'Numpad9',
+  'NumpadDecimal',
+  'NumpadComma',
+  'NumpadDivide',
+  'NumpadMultiply',
+  'NumpadSubtract',
+  'NumpadAdd',
+  'NumpadEqual',
+  'NumpadEnter'
+] as const
+
+/** A key of the numeric keypad, by its code. */
+export type KeypadCode = (typeof KEYPAD_CODES)[number]
+
+/** One key as its platform reported it, named rather than spelled. */
+export interface TypedKey {
+  /** The character it made, never a control character, or the name of a key that makes none. */
+  readonly key: string
+  /** The character it makes with nothing held, where the platform said; null where it did not. */
+  readonly base: string | null
+  /** The keypad key it is, or null for a key that is not on the keypad. */
+  readonly keypad: KeypadCode | null
+  readonly shift: boolean
+  readonly alt: boolean
+  readonly control: boolean
+  readonly caps_lock: boolean
+  readonly num_lock: boolean
+}
 
 /** The window the host drew for a view: its size in cells, and where it starts. */
 export interface TerminalWindow {
@@ -1032,10 +1086,12 @@ export interface TerminalView {
   /** Moves the view's window. A move native code cannot read is refused, and nothing moves. */
   move(move: TerminalMove): Promise<void>
   /**
-   * Hands the view the person's input. Resolves once native code has taken it; a wheel turn or keys
-   * the view may not write, since it does not control the program under the take they name, is
-   * refused with `LEASE_LOST`, as is any input once the view has ended, and a shape native code
-   * does not read with `INVALID_ARGUMENT`.
+   * Hands the view the person's input. Resolves once native code has taken it; an input the view may
+   * not write, since it does not control the program under the take it names, is refused with
+   * `LEASE_LOST`, as is any input once the view has ended, and a shape native code does not read
+   * with `INVALID_ARGUMENT`. A key, text or paste that cannot reach the program as it reads keys now,
+   * or before the view holds the session's screen, is refused with `INPUT_INCOMPATIBLE` and words
+   * that say why, and the view keeps control.
    */
   input(input: TerminalInput): Promise<void>
   /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */

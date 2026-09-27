@@ -13,6 +13,21 @@ import { cellAt, cellUnder, dragRows, MAX_TURNS, wheelPixels, wheelTurns } from 
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
+/** The q key pressed under the page's take 1. */
+const Q = {
+  kind: 'key',
+  take: 1,
+  key: 'q',
+  base: 'q',
+  keypad: null,
+  shift: false,
+  alt: false,
+  control: false,
+  caps_lock: false,
+  num_lock: false,
+  event: 'press'
+} as const
+
 /** Gives `element` the box a browser would report for it, transforms included. */
 function laidOut(element: HTMLElement, box: { x: number; y: number; width: number; height: number }): HTMLElement {
   Object.defineProperty(element, 'getBoundingClientRect', { value: () => DOMRect.fromRect(box) })
@@ -101,6 +116,24 @@ describe('the wheel counted in turns (KR-REQ-13.18)', () => {
   })
 })
 
+/** A key input named as native code reads one, with anything `over` gives. */
+function keyShape(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: 'key',
+    take: 1,
+    key: 'a',
+    base: 'a',
+    keypad: null,
+    shift: false,
+    alt: false,
+    control: false,
+    caps_lock: false,
+    num_lock: false,
+    event: 'press',
+    ...over
+  }
+}
+
 describe('the scripted host reads input as native code does (KR-REQ-10.01)', () => {
   it("refuses the page's old requests and anything else that is not the view's shape", () => {
     for (const shape of [
@@ -110,9 +143,28 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       { kind: 'take' },
       { kind: 'take', number: -1 },
       { kind: 'take', number: 1.5 },
-      { kind: 'keys', take: 1, keys: 'a', session_id: SESSION_MAIN },
-      { kind: 'keys', take: 1, keys: '' },
-      { kind: 'keys', take: 1, keys: 'x'.repeat(64 * 1024 + 1) },
+      // Bytes the page spells are no input at all.
+      { kind: 'keys', take: 1, keys: 'a' },
+      keyShape({ session_id: SESSION_MAIN }),
+      keyShape({ key: '' }),
+      keyShape({ key: '\u001b' }),
+      keyShape({ key: '\u009b' }),
+      keyShape({ key: 'Arrow Up' }),
+      keyShape({ key: 'x'.repeat(33) }),
+      keyShape({ base: 'ab' }),
+      keyShape({ base: '\t' }),
+      keyShape({ keypad: 'Numpad10' }),
+      keyShape({ event: 'hold' }),
+      keyShape({ shift: 1 }),
+      keyShape({ take: -1 }),
+      { kind: 'key', take: 1, key: 'a', event: 'press' },
+      { kind: 'text', take: 1, text: '' },
+      { kind: 'text', take: 1, text: 'ls\r' },
+      { kind: 'text', take: 1, text: 'a\tb' },
+      { kind: 'text', take: 1, text: 'x'.repeat(64 * 1024 + 1) },
+      { kind: 'text', take: 1, text: 'a', keys: 'a' },
+      { kind: 'paste', take: 1, text: '' },
+      { kind: 'paste', take: 1, text: 'x'.repeat(64 * 1024 - 11) },
       { kind: 'wheel', take: 1, column: 0, line: 0, turns: 0, shift: false, alt: false, control: false },
       { kind: 'wheel', take: 1, column: 0, line: 0, turns: 1025, shift: false, alt: false, control: false },
       { kind: 'wheel', take: 1, column: -1, line: 0, turns: 1, shift: false, alt: false, control: false },
@@ -136,7 +188,31 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     ).toEqual({ kind: 'wheel', take: 1, column: 2, line: 3, turns: -1024, shift: true, alt: false, control: false })
   })
 
-  it('refuses a wheel turn or keys while the view does not control the program, and takes them while it does', async () => {
+  it('reads a key named as one character or a name, text with no control character, and a paste as it is', () => {
+    for (const shape of [
+      keyShape(),
+      keyShape({ key: 'é', base: null }),
+      keyShape({ key: 'End', base: null, keypad: 'Numpad1', event: 'release', num_lock: true }),
+      keyShape({ key: 'F24', base: null, event: 'repeat', control: true, caps_lock: true })
+    ]) {
+      expect(readTerminalInput(shape), JSON.stringify(shape)).toEqual(shape)
+    }
+    // Native code reads a key's unshifted character and keypad key left out as none.
+    const bare = keyShape()
+    delete bare['base']
+    delete bare['keypad']
+    expect(readTerminalInput(bare)).toEqual(keyShape({ base: null }))
+    expect(readTerminalInput({ kind: 'text', take: 2, text: '日本語' })).toEqual({ kind: 'text', take: 2, text: '日本語' })
+    const most = 'x'.repeat(64 * 1024 - 12)
+    expect(readTerminalInput({ kind: 'paste', take: 2, text: most })).toEqual({ kind: 'paste', take: 2, text: most })
+    expect(readTerminalInput({ kind: 'paste', take: 2, text: 'one\ntwo\t\u001b' })).toEqual({
+      kind: 'paste',
+      take: 2,
+      text: 'one\ntwo\t\u001b'
+    })
+  })
+
+  it('refuses a wheel turn or a key while the view does not control the program, and takes them while it does', async () => {
     const { port, controls } = fakeHost()
     const states: TerminalViewState[] = []
     const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, (state) => {
@@ -145,7 +221,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     await new Promise((resolve) => {
       setTimeout(resolve, 0)
     })
-    await expect(view.input({ kind: 'keys', take: 0, keys: 'q' })).rejects.toMatchObject({ code: 'LEASE_LOST' })
+    await expect(view.input({ ...Q, take: 0 })).rejects.toMatchObject({ code: 'LEASE_LOST' })
     await expect(
       // A shape the page used to send, which no type allows now.
       view.input({ session_id: SESSION_MAIN, bytes: 'q' } as never)
@@ -155,11 +231,15 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       setTimeout(resolve, 0)
     })
     expect(controls.terminalViews[0]?.control).toEqual({ number: 1, state: 'controlling', ended: null })
-    await expect(view.input({ kind: 'keys', take: 2, keys: 'q' })).rejects.toMatchObject({ code: 'LEASE_LOST' })
-    await view.input({ kind: 'keys', take: 1, keys: 'q' })
+    await expect(view.input({ ...Q, take: 2 })).rejects.toMatchObject({ code: 'LEASE_LOST' })
+    await view.input(Q)
+    await view.input({ kind: 'text', take: 1, text: 'ls' })
+    await view.input({ kind: 'paste', take: 1, text: 'echo hi\n' })
     expect(controls.terminalViews[0]?.inputs).toEqual([
       { kind: 'take', number: 1 },
-      { kind: 'keys', take: 1, keys: 'q' }
+      Q,
+      { kind: 'text', take: 1, text: 'ls' },
+      { kind: 'paste', take: 1, text: 'echo hi\n' }
     ])
     // The change of control reaches the page once the view has taken the request.
     await new Promise((resolve) => {
@@ -178,7 +258,9 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     })
     await view.close()
     for (const input of [
-      { kind: 'keys', take: 1, keys: 'q' },
+      Q,
+      { kind: 'text', take: 1, text: 'q' },
+      { kind: 'paste', take: 1, text: 'q' },
       { kind: 'wheel', take: 1, column: 0, line: 0, turns: 1, shift: false, alt: false, control: false },
       { kind: 'take', number: 2 },
       { kind: 'release', number: 3 }
@@ -186,6 +268,40 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       await expect(view.input(input), input.kind).rejects.toMatchObject({ code: 'LEASE_LOST' })
     }
     expect(controls.terminalViews[0]?.inputs).toEqual([{ kind: 'take', number: 1 }])
+  })
+
+  it("refuses a key, text or a paste before the view holds the session's screen, as native code does, and keeps control", async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const held = controls.terminalViews[0]
+    held?.attach()
+    await view.input({ kind: 'take', number: 1 })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    expect(held?.control.state).toBe('controlling')
+    await expect(view.input(Q)).rejects.toMatchObject({
+      code: 'INPUT_INCOMPATIBLE',
+      message: "That key did not reach the program: the view is waiting for the session's screen."
+    })
+    await expect(view.input({ kind: 'text', take: 1, text: 'q' })).rejects.toMatchObject({
+      code: 'INPUT_INCOMPATIBLE',
+      message: "That text did not reach the program: the view is waiting for the session's screen."
+    })
+    await expect(view.input({ kind: 'paste', take: 1, text: 'q' })).rejects.toMatchObject({
+      code: 'INPUT_INCOMPATIBLE',
+      message: "That paste did not reach the program: the view is waiting for the session's screen."
+    })
+    expect(held?.control.state).toBe('controlling')
+    // The wheel needs no screen to be taken: it reaches no program without one.
+    await view.input({ kind: 'wheel', take: 1, column: 0, line: 0, turns: 1, shift: false, alt: false, control: false })
+    held?.show()
+    await view.input(Q)
+    // And after the host's reset, until the next screen, again.
+    held?.wait()
+    await expect(view.input(Q)).rejects.toMatchObject({ code: 'INPUT_INCOMPATIBLE' })
+    expect(held?.inputs.filter((input) => input.kind === 'key')).toEqual([Q])
   })
 })
 

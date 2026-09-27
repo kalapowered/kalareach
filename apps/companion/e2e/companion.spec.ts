@@ -56,11 +56,11 @@ async function takeControl(page: Page): Promise<void> {
     .toBe('controlling')
 }
 
-/** Every wheel turn and key the newest raw view took for the program, in order. */
+/** Every wheel turn, key, text and paste the newest raw view took for the program, in order. */
 async function programInputs(page: Page) {
   return page.evaluate(() =>
     (window.krTestHost?.terminalViews.at(-1)?.inputs ?? []).filter(
-      (input) => input.kind === 'wheel' || input.kind === 'keys'
+      (input) => input.kind !== 'take' && input.kind !== 'release'
     )
   )
 }
@@ -788,7 +788,9 @@ test.describe('the raw terminal', () => {
     // The person takes control, and the program gets the wheel at the cell under the pointer.
     await takeControl(page)
     await expect(raw).toHaveAttribute('data-mode', 'control')
-    await expect(page.getByTestId('terminal-mode-sentence')).toHaveText('The program gets the wheel.')
+    await expect(page.getByTestId('terminal-mode-sentence')).toHaveText(
+      'Your keys go to the program; Control-Tab moves on. The program gets the wheel.'
+    )
     const cell = await page.getByTestId('terminal-grid').evaluate((element) => {
       const box = element.getBoundingClientRect()
       const style = (element as HTMLElement).style
@@ -823,6 +825,192 @@ test.describe('the raw terminal', () => {
     expect(await programInputs(page)).toEqual(turned)
     await page.screenshot({ path: shot('terminal-modes-13.18'), fullPage: true })
   })
+})
+
+// KR-REQ-13.18, 13.17, 08.59, 08.56: while a raw view controls the program, the keys typed in it
+// reach the program named, never spelled, Tab included, and Control-Tab moves on; text an input method
+// commits goes as text, and a paste as a paste. On the phone the program's keyboard takes the field's
+// place, and the terminal keys leave the focus in it.
+test.describe("the program's keyboard", () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** A key's press or release under take 1, named as the page names it, with nothing held unless told. */
+  const key = (name: string, event: 'press' | 'release', over: Record<string, unknown> = {}) => ({
+    kind: 'key',
+    take: 1,
+    event,
+    key: name,
+    base: [...name].length === 1 ? name : null,
+    keypad: null,
+    shift: false,
+    alt: false,
+    control: false,
+    caps_lock: false,
+    num_lock: false,
+    ...over
+  })
+
+  /** Which control has the focus, by its label or its words. */
+  const focused = (page: Page) =>
+    page.evaluate(() => {
+      const active = document.activeElement
+      return active?.getAttribute('aria-label') ?? active?.textContent ?? null
+    })
+
+  /** A paste of `text` into the focused control, as the platform's paste command fires it. */
+  const paste = (page: Page, text: string) =>
+    page.evaluate((pasted) => {
+      const data = new DataTransfer()
+      data.setData('text/plain', pasted)
+      const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })
+      document.activeElement?.dispatchEvent(event)
+      return event.defaultPrevented
+    }, text)
+
+  test("the desktop's keys reach the program named, Tab included, and Control-Tab moves on", async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+    await takeControl(page)
+    const keyboard = page.getByLabel('Type to the program')
+    // A click on the terminal that selects nothing puts the focus in the program's keyboard, and the
+    // terminal shows the ring.
+    await page.getByTestId('terminal-grid').click({ position: { x: 4, y: 4 } })
+    await expect(keyboard).toBeFocused()
+    const surface = page.getByTestId('terminal-surface')
+    expect(await surface.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe('solid')
+    await page.keyboard.type('ls')
+    await page.keyboard.press('Enter')
+    await page.keyboard.press('Tab')
+    await page.keyboard.press('Shift+Tab')
+    await expect(keyboard).toBeFocused()
+    await expect.poll(async () => (await programInputs(page)).length).toBe(10)
+    expect(await programInputs(page)).toEqual([
+      key('l', 'press'),
+      key('l', 'release'),
+      key('s', 'press'),
+      key('s', 'release'),
+      key('Enter', 'press'),
+      key('Enter', 'release'),
+      key('Tab', 'press'),
+      key('Tab', 'release'),
+      key('Tab', 'press', { shift: true }),
+      key('Tab', 'release', { shift: true })
+    ])
+    // The keyboard's field shows nothing of what went.
+    expect(await keyboard.inputValue()).toBe('​')
+    await page.screenshot({ path: shot('terminal-keys-13.18'), fullPage: true })
+    // Control-Tab moves on past the controls control mode disables; Control-Shift-Tab goes back.
+    await page.keyboard.press('Control+Tab')
+    await expect(page.getByRole('button', { name: 'Back to the conversation' })).toBeFocused()
+    await keyboard.focus()
+    await page.keyboard.press('Control+Shift+Tab')
+    await expect(page.getByRole('button', { name: 'Look around' })).toBeFocused()
+    await expect(surface).not.toHaveCSS('outline-style', 'solid')
+    expect(await programInputs(page)).toHaveLength(10)
+  })
+
+  test('the desktop sends committed text as text and a paste as a paste, and inserts neither', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+    await takeControl(page)
+    const keyboard = page.getByLabel('Type to the program')
+    await keyboard.focus()
+    // What an input method or dictation commits arrives as an insertion with no key.
+    await page.keyboard.insertText('日本語')
+    expect(await paste(page, 'echo one\necho two')).toBe(true)
+    await expect.poll(async () => (await programInputs(page)).length).toBe(2)
+    expect(await programInputs(page)).toEqual([
+      { kind: 'text', take: 1, text: '日本語' },
+      { kind: 'paste', take: 1, text: 'echo one\necho two' }
+    ])
+    expect(await keyboard.inputValue()).toBe('​')
+    // A paste longer than one input carries says why, and nothing of it goes.
+    expect(await paste(page, 'x'.repeat(64 * 1024))).toBe(true)
+    await expect(page.getByTestId('terminal-mode-sentence')).toHaveText(
+      'That paste did not reach the program: it is longer than one input can carry.'
+    )
+    await page.keyboard.press('q')
+    await expect(page.getByTestId('terminal-mode-sentence')).toHaveText(
+      'Your keys go to the program; Control-Tab moves on. The program gets the wheel.'
+    )
+    expect((await programInputs(page)).filter((input) => input.kind === 'paste')).toHaveLength(1)
+  })
+
+  test("the desktop draws an input method's composition at the cursor and sends what it commits once", async ({
+    page,
+    browserName
+  }) => {
+    // Only Chromium lets a test drive a real input method's composition.
+    test.skip(browserName !== 'chromium', "composition is driven through Chromium's own input method events")
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+    await takeControl(page)
+    await page.getByLabel('Type to the program').focus()
+    const cdp = await page.context().newCDPSession(page)
+    await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 })
+    const composing = page.getByTestId('terminal-composition')
+    await expect(composing).toHaveText('にほん')
+    const cursor = await page.getByTestId('terminal-cursor').boundingBox()
+    const drawn = await composing.boundingBox()
+    expect(drawn?.x).toBeCloseTo(cursor?.x ?? -1, 0)
+    expect(drawn?.y).toBeCloseTo(cursor?.y ?? -1, 0)
+    await page.screenshot({ path: shot('terminal-composition-08.56'), fullPage: true })
+    expect(await programInputs(page)).toEqual([])
+    await cdp.send('Input.insertText', { text: '日本' })
+    await expect(composing).toHaveCount(0)
+    await expect.poll(async () => programInputs(page)).toEqual([{ kind: 'text', take: 1, text: '日本' }])
+    expect(await page.getByLabel('Type to the program').inputValue()).toBe('​')
+  })
+
+  for (const surface of ['ios', 'android'] as const) {
+    test(`the phone's field is the program's keyboard while the view controls it, on ${surface}`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await page.getByLabel('Message this session').fill('a draft')
+      await takeControl(page)
+      const keyboard = page.getByLabel('Type to the program')
+      await expect(keyboard).toBeVisible()
+      await expect(page.getByLabel('Message this session')).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0)
+      await expect(page.locator('.m-program-keyboard-hint')).toHaveText('Type to the program')
+      await keyboard.focus()
+      await page.keyboard.type('l')
+      await page.keyboard.press('Tab')
+      // A tap on a terminal key leaves the focus in the field, so a software keyboard stays up.
+      await page.getByRole('button', { name: 'Escape' }).click()
+      await expect(keyboard).toBeFocused()
+      await page.getByRole('button', { name: 'Control, off' }).click()
+      await page.keyboard.press('c')
+      await expect.poll(async () => (await programInputs(page)).length).toBe(8)
+      expect(await programInputs(page)).toEqual([
+        key('l', 'press'),
+        key('l', 'release'),
+        key('Tab', 'press'),
+        key('Tab', 'release'),
+        key('Escape', 'press'),
+        key('Escape', 'release'),
+        key('c', 'press', { control: true }),
+        key('c', 'release', { control: true })
+      ])
+      await page.screenshot({ path: shot(`terminal-field-${surface}-13.17`), fullPage: true })
+      // Control-Shift-Tab moves back to the last terminal key, sending nothing.
+      await page.keyboard.press('Control+Shift+Tab')
+      await expect(page.getByRole('button', { name: 'Tilde' })).toBeFocused()
+      expect(await focused(page)).toBe('Tilde')
+      // Control ends: the draft comes back as it was.
+      await page.getByRole('button', { name: 'Look around' }).click()
+      await expect(page.getByLabel('Message this session')).toHaveValue('a draft')
+      await expect(page.getByLabel('Type to the program')).toHaveCount(0)
+      expect(await programInputs(page)).toHaveLength(8)
+    })
+  }
 })
 
 test.describe('how the host presents a raw view', () => {
@@ -1776,7 +1964,7 @@ test.describe("moving a raw view's window", () => {
     // The finger crossed each row it turned the wheel for: the lines go up with it.
     const lines = turned.map((input) => (input.kind === 'wheel' ? input.line : -1))
     expect([...lines].sort((one, other) => other - one)).toEqual(lines)
-    expect(turned.some((input) => input.kind === 'keys')).toBe(false)
+    expect(turned.some((input) => input.kind === 'key')).toBe(false)
     expect(await moves(page)).toBe(1)
   })
 })

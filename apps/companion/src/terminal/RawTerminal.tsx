@@ -16,6 +16,13 @@
  * view mode moves the window, so text is selected in control mode. Looking around gives control back
  * at once, and a view whose control the session ends says why.
  *
+ * While the view controls the program, the program's keyboard (`keyboard.ts`) sits at the cursor's
+ * cell, where an input method opens its candidates, next after the mode button in keyboard order. A
+ * click on the terminal that selects nothing puts the focus in it, and the terminal shows a focus
+ * ring while it has it. What an input method composes is drawn at the cursor's cell in the session's
+ * colours until it is committed. When control ends with the focus in it, the focus goes to the mode
+ * button, which takes control again.
+ *
  * The frame is drawn where the moves the page made and native code has not yet settled will put
  * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates. Every change
  * of the view a gesture was made in ends it at the change itself: another opening, mode or life
@@ -58,6 +65,8 @@ import {
   type PlacedCursor
 } from './frame'
 import { cellUnder, wheelPixels, wheelTurns } from './input'
+import { useProgramKeyboard } from './keyboard'
+import { applePlatform, SENTINEL } from './keys'
 import {
   ASKING,
   ATTACHING,
@@ -308,12 +317,35 @@ export function RawTerminal({
     control,
     takeControl,
     lookAround,
-    toProgram
+    toProgram,
+    controlTake,
+    refuse,
+    unsent
   } = useTerminalView(port, sessionId, measure)
   const drawnCell = cell ?? UNMEASURED_CELL
   const ended = state?.state === 'ended'
   const mode = modeOf(control)
   const draggable = mode === 'view' && !ended
+  const controlling = control?.state === 'controlling' && !ended
+  const [apple] = useState(() => applePlatform(navigator.userAgent))
+  const { attach, composing, focus } = useProgramKeyboard({ controlTake, toProgram, refuse, apple })
+  const modeButtonId = useId()
+  const sentenceId = useId()
+
+  // Focus that was in the program's keyboard when control ends goes to the mode button, which takes
+  // control again: a field that has gone is no place to leave it.
+  const lastFocused = useRef<Element | null>(null)
+  const wasControlling = useRef(controlling)
+  useLayoutEffect(() => {
+    if (wasControlling.current && !controlling) {
+      const active = document.activeElement
+      const nowhere = active === null || active === document.body
+      if (nowhere && lastFocused.current?.matches('[data-program-keyboard]') === true) {
+        document.getElementById(modeButtonId)?.focus()
+      }
+    }
+    wasControlling.current = controlling
+  }, [controlling, modeButtonId])
 
   // The drag in progress, a wheel's part of a cell carried to its next move of the window, and a
   // wheel's part of a row carried to its next turn of the program's wheel. The part of the drag not
@@ -503,13 +535,26 @@ export function RawTerminal({
     y: -shift.down * drawnCell.height
   }
 
-  // What the mode does, in the words of its state, or why control last ended.
+  // What the mode does, in the words of its state, or why control last ended; while the view
+  // controls the program, why the last input did not reach it, until one does.
   const sentence =
     control === null || control.state === 'watching'
       ? (control?.ended ?? 'Scroll or drag to move around the session. The program gets nothing.')
       : control.state === 'taking'
         ? ASKING
-        : ((frame === null ? null : wheelHeldBack(frame.wheel)) ?? 'The program gets the wheel.')
+        : (unsent ??
+          `Your keys go to the program; Control-Tab moves on. ${
+            (frame === null ? null : wheelHeldBack(frame.wheel)) ?? 'The program gets the wheel.'
+          }`)
+  // Where the program's keyboard and what an input method composes sit: at the cursor's cell, as
+  // the frame is drawn, or at the first cell while the view has no cursor to show.
+  const cursorAt = frame === null ? null : placedCursor(frame)
+  const keyboardAt: CSSProperties = {
+    left: (cursorAt?.column ?? 0) * drawnCell.width + drawnShift.x,
+    top: (cursorAt?.line ?? 0) * drawnCell.height + drawnShift.y,
+    width: drawnCell.width,
+    height: drawnCell.height
+  }
 
   return (
     <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
@@ -520,6 +565,7 @@ export function RawTerminal({
           </Badge>
           {/* One button whose words change, so the focus stays on it through the take. */}
           <Button
+            id={modeButtonId}
             disabled={control === null}
             onClick={() => {
               if (mode === 'view') takeControl()
@@ -528,7 +574,7 @@ export function RawTerminal({
           >
             {mode === 'view' ? 'Take control' : 'Look around'}
           </Button>
-          <span className="small faint" role="status" data-testid="terminal-mode-sentence">
+          <span className="small faint" role="status" id={sentenceId} data-testid="terminal-mode-sentence">
             {sentence}
           </span>
         </span>
@@ -616,6 +662,16 @@ export function RawTerminal({
           onLostPointerCapture={(event) => {
             if (event.pointerId === dragging.current?.pointer) dropDrag()
           }}
+          onFocus={(event) => {
+            lastFocused.current = event.target
+          }}
+          onClick={() => {
+            // A click that selects nothing is the person turning to the program; one that selects
+            // text leaves the focus where the selection can be copied from.
+            if (!controlling) return
+            const selection = window.getSelection()
+            if (selection === null || selection.isCollapsed) focus()
+          }}
           style={{
             position: 'absolute',
             inset: SURFACE_INSET,
@@ -640,6 +696,40 @@ export function RawTerminal({
               <Grid screen={frame} cell={drawnCell} shift={drawnShift} gridRef={grid} />
             )}
           </div>
+          {controlling ? (
+            <textarea
+              ref={attach}
+              className="terminal-keyboard"
+              data-program-keyboard=""
+              data-testid="terminal-keyboard"
+              aria-label="Type to the program"
+              aria-describedby={sentenceId}
+              rows={1}
+              defaultValue={SENTINEL}
+              autoCapitalize="off"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              style={keyboardAt}
+            />
+          ) : null}
+          {controlling && composing ? (
+            <span
+              className="terminal-composition"
+              data-testid="terminal-composition"
+              aria-hidden="true"
+              style={{
+                ...keyboardAt,
+                width: 'auto',
+                lineHeight: `${drawnCell.height}px`,
+                ...(frame === null
+                  ? {}
+                  : { color: foregroundOf(frame.palette), background: backgroundOf(frame.palette) })
+              }}
+            >
+              {composing}
+            </span>
+          ) : null}
         </div>
       </div>
 

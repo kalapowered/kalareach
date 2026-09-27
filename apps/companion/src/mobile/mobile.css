@@ -710,6 +710,32 @@
   outline-offset: -2px;
 }
 
+/*
+ * The program's keyboard takes the field's place and size while the view controls the program. It
+ * holds only an invisible character, which hides a placeholder, so it says what it is where a
+ * placeholder would, in a placeholder's colour.
+ */
+.m-program-keyboard {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  min-inline-size: 0;
+}
+
+.m-program-keyboard-hint {
+  position: absolute;
+  inset-block: 0;
+  inset-inline: calc(var(--gap-3) + 1px);
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: var(--field-size);
+  line-height: var(--field-leading);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
 .m-composer-actions {
   display: flex;
   flex-wrap: wrap;

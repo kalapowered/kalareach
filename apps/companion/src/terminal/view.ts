@@ -17,19 +17,25 @@
  *
  * And it asks for control of the program and gives it back, numbering each request in the order the
  * person makes them. Until native code has answered the newest, the page shows that request's own
- * state at once: taking control, or watching. It sends the program a wheel turn or keys only while
- * native code says the view controls the program under the newest take, and names that take, so
- * nothing made in one period of control is written in another.
+ * state at once: taking control, or watching. It sends the program a wheel turn, a key, text or a
+ * paste only while native code says the view controls the program under the newest take, and names
+ * that take, so nothing made in one period of control is written in another. Every input of an
+ * opening, its takes and releases included, goes to native code one at a time, the next once the
+ * last is answered: native code takes each call as a task of its own, so two sent together could
+ * reach the view in either order. An input that did not reach the program says why, until the next
+ * one that does.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import {
+  failureCode,
   failureMessage,
   type HostPort,
   type ProgramInput,
   type TerminalControl,
   type TerminalGrid,
+  type TerminalInput,
   type TerminalMove,
   type TerminalRoom,
   type TerminalScreen,
@@ -81,10 +87,25 @@ export interface TerminalViewing {
   /** Gives control back, and sends the program nothing more from this moment. */
   readonly lookAround: () => void
   /**
-   * Sends the program a wheel turn or keys, under the newest take, while the view controls the
-   * program; otherwise sends nothing. Rejects with native code's refusal.
+   * Sends the program a wheel turn, a key, text or a paste, under the newest take, while the view
+   * controls the program; otherwise sends nothing. Rejects with native code's refusal.
    */
   readonly toProgram: (input: ProgramInput) => Promise<void>
+  /**
+   * The take an input would go under now: the newest, while the view controls the program under it.
+   * Null while it does not, when nothing would go.
+   */
+  readonly controlTake: () => number | null
+  /**
+   * Says why an input the page itself held back did not reach the program, as a refusal of native
+   * code's is said.
+   */
+  readonly refuse: (words: string) => void
+  /**
+   * Why the person's last input did not reach the program, while the view still controls it under
+   * the take it was made under and no input has reached the program since; null otherwise.
+   */
+  readonly unsent: string | null
 }
 
 /** The grid a view opens at when its surface cannot be measured yet. */
@@ -109,6 +130,28 @@ interface Opening {
   ended: boolean
   /** The person's newest control request: its number, and whether it takes control. */
   asked: ControlRequest
+  /** How many of its inputs native code has not yet answered. */
+  unanswered: number
+  /** Settles once the last input sent to native code is answered, whatever the answer. */
+  sending: Promise<void>
+}
+
+/**
+ * Sends `input` to `view` once every input the opening sent before it is answered: at once when
+ * none waits, so an input goes as soon as the person makes it.
+ */
+function inTurn(open: Opening, view: TerminalView, input: TerminalInput): Promise<void> {
+  const answer = open.unanswered === 0 ? view.input(input) : open.sending.then(() => view.input(input))
+  open.unanswered += 1
+  open.sending = answer.then(
+    () => {
+      open.unanswered -= 1
+    },
+    () => {
+      open.unanswered -= 1
+    }
+  )
+  return answer
 }
 
 /** One of the person's requests for control, numbered in the order they made them. */
@@ -180,6 +223,14 @@ export function useTerminalView(
     readonly attempt: number
     readonly asked: ControlRequest
   } | null>(null)
+  // Why the person's last input did not reach the program, with the opening and the take it was
+  // made under.
+  const [unsentInput, setUnsentInput] = useState<{
+    readonly sessionId: string
+    readonly attempt: number
+    readonly take: number
+    readonly words: string
+  } | null>(null)
   const ownMoves = waitingMoves?.sessionId === sessionId && waitingMoves.attempt === attempt
   const pending = ownMoves ? waitingMoves.moves : NO_MOVES
   const movingSince = ownMoves ? waitingMoves.since : null
@@ -212,7 +263,9 @@ export function useTerminalView(
       pending: [],
       since: null,
       ended: false,
-      asked: NOTHING_ASKED
+      asked: NOTHING_ASKED,
+      unanswered: 0,
+      sending: Promise.resolve()
     }
     opening.current = open
     port
@@ -264,6 +317,7 @@ export function useTerminalView(
       setHeld(null)
       setWaitingMoves(null)
       setAskedControl(null)
+      setUnsentInput(null)
     }
   }, [port, sessionId, attempt, showing, keepMoves])
 
@@ -324,7 +378,7 @@ export function useTerminalView(
     const asked = { number: open.asked.number + 1, take }
     open.asked = asked
     setAskedControl({ sessionId: open.sessionId, attempt: open.attempt, asked })
-    void open.view.input({ kind: take ? 'take' : 'release', number: asked.number }).catch(() => {
+    void inTurn(open, open.view, { kind: take ? 'take' : 'release', number: asked.number }).catch(() => {
       // A failed call is a view that has gone; its end says so.
     })
   }, [])
@@ -349,13 +403,60 @@ export function useTerminalView(
     controlNow.current = control
   }, [control])
 
-  const toProgram = useCallback((input: ProgramInput): Promise<void> => {
+  const controlTake = useCallback((): number | null => {
     const open = opening.current
     const shown = controlNow.current
-    if (open?.view == null || open.ended || shown?.state !== 'controlling') return Promise.resolve()
-    if (shown.number !== open.asked.number || !open.asked.take) return Promise.resolve()
-    return open.view.input({ ...input, take: open.asked.number })
+    if (open?.view == null || open.ended || shown?.state !== 'controlling') return null
+    return shown.number === open.asked.number && open.asked.take ? open.asked.number : null
   }, [])
+
+  const toProgram = useCallback(
+    (input: ProgramInput): Promise<void> => {
+      const open = opening.current
+      const take = controlTake()
+      if (open?.view == null || take === null) return Promise.resolve()
+      const answer = inTurn(open, open.view, { ...input, take })
+      // An input that reaches the program ends the words of one that did not. A refusal of control
+      // that has just ended is said by the view's own state; any other refusal says why here.
+      answer.then(
+        () => {
+          setUnsentInput((current) =>
+            current?.sessionId === open.sessionId && current.attempt === open.attempt ? null : current
+          )
+        },
+        (failure: unknown) => {
+          if (failureCode(failure) === 'LEASE_LOST') return
+          setUnsentInput({
+            sessionId: open.sessionId,
+            attempt: open.attempt,
+            take,
+            words: failureMessage(failure)
+          })
+        }
+      )
+      return answer
+    },
+    [controlTake]
+  )
+
+  const refuse = useCallback(
+    (words: string) => {
+      const open = opening.current
+      const take = controlTake()
+      if (open === null || take === null) return
+      setUnsentInput({ sessionId: open.sessionId, attempt: open.attempt, take, words })
+    },
+    [controlTake]
+  )
+
+  const unsent =
+    unsentInput !== null &&
+    unsentInput.sessionId === sessionId &&
+    unsentInput.attempt === attempt &&
+    control?.state === 'controlling' &&
+    control.number === unsentInput.take
+      ? unsentInput.words
+      : null
 
   // Moves that wait say so only once they have waited a moment without a break: a state that
   // arrives meanwhile does not start the wait again.
@@ -431,6 +532,9 @@ export function useTerminalView(
     control,
     takeControl,
     lookAround,
-    toProgram
+    toProgram,
+    controlTake,
+    refuse,
+    unsent
   }
 }

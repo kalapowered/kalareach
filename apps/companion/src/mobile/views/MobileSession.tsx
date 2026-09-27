@@ -13,11 +13,13 @@
  * window in the history back to the live screen. Then the program owns the touch, exactly as it owns
  * the wheel on a desktop: a one-finger drag turns its wheel once for each row the finger crosses, at
  * the session's cell under the finger, while it reads the wheel, and the terminal keys and the
- * field's named keys reach it. Only a pinch zooms, because nothing on the wire carries a pinch, so
- * zooming takes nothing from anyone. A finger that is down when the view changes under it, another
- * opening, mode or life, counts for nothing until it lifts. In view mode a press is the view's alone:
- * whatever the page has selected, the browser starts no selection and no native drag of its own, so
- * a drag always moves the window. Control mode leaves the browser its own way with the text.
+ * program's keyboard reach it: while the view controls the program the field is the program's
+ * keyboard (`keyboard.ts`), the draft kept for when control ends. Only a pinch zooms, because
+ * nothing on the wire carries a pinch, so zooming takes nothing from anyone. A finger that is down
+ * when the view changes under it, another opening, mode or life, counts for nothing until it lifts.
+ * In view mode a press is the view's alone: whatever the page has selected, the browser starts no
+ * selection and no native drag of its own, so a drag always moves the window. Control mode leaves
+ * the browser its own way with the text.
  */
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -71,10 +73,12 @@ import {
   type HeldDrag,
   type Point
 } from '../../terminal/pan'
+import { useProgramKeyboard, type Latched } from '../../terminal/keyboard'
+import { SENTINEL } from '../../terminal/keys'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
-import { sequenceForKeyPress, afterKey, pressModifier, sequenceFor, NO_LATCH, type Latch } from '../model/accessory'
+import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
 import { describeMode, routeGesture, type TouchGesture } from '../model/gestures'
 import { admit, describeBytes, type Picked } from '../model/media'
@@ -153,6 +157,7 @@ export function MobileSession({
   const statusId = useId()
   const modeButtonId = useId()
   const sendId = useId()
+  const keysHelpId = useId()
   // Whether a software keyboard hides part of the session.
   const [keyboardUp, setKeyboardUp] = useState(false)
   // Whether the session is too short for the conversation's floor under the whole composer.
@@ -256,10 +261,42 @@ export function MobileSession({
     control,
     takeControl,
     lookAround,
-    toProgram
+    toProgram,
+    controlTake,
+    refuse,
+    unsent
   } = useTerminalView(port, sessionId, measure, pane === 'terminal')
   const mode = modeOf(control)
   const controlling = control?.state === 'controlling'
+  // While the view controls the program, the field's place holds the program's keyboard.
+  const typingToProgram = pane === 'terminal' && controlling
+
+  // What the terminal keys hold for the next key, which that key takes: a modifier held for one key
+  // is let go as it does. Kept at each commit and as each key takes it, so no key reads it stale.
+  const latchNow = useRef(latch)
+  useLayoutEffect(() => {
+    latchNow.current = latch
+  }, [latch])
+  const takeLatch = useCallback((): Latch => {
+    const now = latchNow.current
+    const next = afterKey(now)
+    if (next.ctrl !== now.ctrl || next.alt !== now.alt || next.shift !== now.shift) {
+      latchNow.current = next
+      setLatch(next)
+    }
+    return now
+  }, [])
+  const latched = useCallback((): Latched => {
+    const now = takeLatch()
+    return { control: holds(now, 'ctrl'), alt: holds(now, 'alt') }
+  }, [takeLatch])
+  const { attach, composing } = useProgramKeyboard({
+    controlTake,
+    toProgram,
+    refuse,
+    apple: surface === 'ios',
+    latched
+  })
   const terminalAttachmentSummary =
     terminal !== null && terminal.state !== 'ended' ? terminal.attachment : null
   const presented =
@@ -394,24 +431,15 @@ export function MobileSession({
     [draft, lifecycle, port, say, sessionId]
   )
 
-  // Keys reach the program only while the view controls it, under the take it controls it with. A
-  // refusal of control that has just ended is said by the view's own state; any other is said here.
-  const sendKeys = useCallback(
-    (keys: string) => {
-      toProgram({ kind: 'keys', keys }).catch((failure: unknown) => {
-        if (failureCode(failure) !== 'LEASE_LOST') say(failureMessage(failure), 'danger')
-      })
-    },
-    [say, toProgram]
-  )
-
-  // Focus that was on a terminal key when control ends goes to the mode button, which takes control
-  // again: a key that can no longer be pressed is no place to leave it.
+  // Focus that was on a terminal key or in the program's keyboard when control ends goes to the mode
+  // button, which takes control again: a key that can no longer be pressed, or a field that has
+  // gone, is no place to leave it.
   const lastFocused = useRef<Element | null>(null)
   const wasControlling = useRef(controlling)
   useLayoutEffect(() => {
     if (wasControlling.current && !controlling) {
-      const onKey = (element: Element | null) => element?.closest('.m-accessory') != null
+      const onKey = (element: Element | null) =>
+        element?.closest('.m-accessory') != null || element?.matches('[data-program-keyboard]') === true
       const active = document.activeElement
       if (onKey(active) || ((active === null || active === document.body) && onKey(lastFocused.current))) {
         document.getElementById(modeButtonId)?.focus()
@@ -435,8 +463,9 @@ export function MobileSession({
   // session too short for the whole composer under the conversation's floor.
   const asLine = pane === 'terminal' || short
   // While the composer is its line, a draft that is only empty needs no words: Send stands disabled
-  // beside the field. Every other reason stays.
-  const hint = asLine && waiting.length === 0 && draft.state === 'bound' ? null : blocked
+  // beside the field. Every other reason stays, except while the field is the program's keyboard,
+  // when the draft waits for control to end.
+  const hint = typingToProgram || (asLine && waiting.length === 0 && draft.state === 'bound') ? null : blocked
   const reason = hint ? (
     <p className="m-hint" id={`composer-why-${sessionId}`}>
       {hint}
@@ -466,18 +495,33 @@ export function MobileSession({
       onChange={(event) => {
         setDraft(edit(draft, event.target.value, Date.now()))
       }}
-      onKeyDown={(event) => {
-        // The field sends the program its named keys only while the view controls it.
-        if (pane !== 'terminal' || !controlling) return
-        const bytes = sequenceForKeyPress(event)
-        if (bytes === null) return
-        // A hardware keyboard drives the terminal directly; the field is only where the
-        // person is looking.
-        if (event.key.length === 1 && !event.ctrlKey && !event.altKey) return
-        event.preventDefault()
-        sendKeys(bytes)
-      }}
     />
+  )
+  // The program's keyboard, in the field's place and size. It holds only an invisible character,
+  // which hides a placeholder, so it says what it is beside that character while nothing composes.
+  const programField = (
+    <span className="m-program-keyboard">
+      <textarea
+        ref={attach}
+        data-program-keyboard=""
+        rows={1}
+        aria-label="Type to the program"
+        aria-describedby={keysHelpId}
+        defaultValue={SENTINEL}
+        autoCapitalize="off"
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+      />
+      {composing === null ? (
+        <span className="m-program-keyboard-hint" aria-hidden="true">
+          Type to the program
+        </span>
+      ) : null}
+      <span id={keysHelpId} className="visually-hidden">
+        Tab goes to the program; Control-Tab moves on.
+      </span>
+    </span>
   )
   const sendButton = (
     <Button
@@ -703,7 +747,8 @@ export function MobileSession({
                     ) : null}
                     <p>
                       <span role="status">
-                        {describeMode(control ?? { number: 0, state: 'watching', ended: null }, frame?.wheel ?? null)}
+                        {unsent ??
+                          describeMode(control ?? { number: 0, state: 'watching', ended: null }, frame?.wheel ?? null)}
                       </span>{' '}
                       {terminal === null ? (
                         <span data-testid="terminal-presentation" data-presentation="attaching">
@@ -731,14 +776,23 @@ export function MobileSession({
                 surface={surface}
                 latch={latch}
                 disabled={!controlling}
-                onKey={(key) => {
-                  if (key.modifier) {
-                    setLatch((current) => pressModifier(current, key.modifier as 'ctrl' | 'alt' | 'shift'))
+                onKey={(key, locks) => {
+                  const modifier = key.modifier
+                  if (modifier !== undefined) {
+                    const next = pressModifier(latchNow.current, modifier)
+                    latchNow.current = next
+                    setLatch(next)
                     return
                   }
-                  const bytes = sequenceFor(key, latch)
-                  setLatch((current) => afterKey(current))
-                  if (bytes !== null) sendKeys(bytes)
+                  // A tap is reported once it has ended: its press, then its release, with what the
+                  // row held for it.
+                  const typed = rowKey(key, takeLatch(), locks)
+                  if (typed === null) return
+                  for (const event of ['press', 'release'] as const) {
+                    toProgram({ kind: 'key', event, ...typed }).catch(() => {
+                      // The view says why a key did not reach the program.
+                    })
+                  }
                 }}
               />
             </>
@@ -770,9 +824,11 @@ export function MobileSession({
             </p>
           ) : null}
 
-          <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
-            Message this session
-          </label>
+          {typingToProgram ? null : (
+            <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
+              Message this session
+            </label>
+          )}
           {/*
            * Under the terminal the composer keeps its bottom in view, so the reason sits above the
            * field's line: however long it runs, the line keeps the composer's floor.
@@ -782,11 +838,12 @@ export function MobileSession({
            * The field keeps its place in every form the composer takes, so a change of form never
            * takes it away from under the person typing in it. As the composer's line it is one line
            * with Send beside it, as in a message thread: the rows it would take are the terminal's
-           * or the conversation's.
+           * or the conversation's. While the view controls the program, the program's keyboard
+           * takes the field's place, and Send goes with the draft until control ends.
            */}
           <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
-            {field}
-            {asLine ? (
+            {typingToProgram ? programField : field}
+            {asLine && !typingToProgram ? (
               <>
                 {sendButton}
                 {lastState}

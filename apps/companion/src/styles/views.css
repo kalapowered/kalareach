@@ -498,6 +498,48 @@
 }
 
 /*
+ * While the program's keyboard has the focus, the whole terminal shows the ring: the keys go to what
+ * it shows. The ring is drawn inside the terminal's edge, which cuts what is drawn outside it.
+ */
+.terminal-surface:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * The program's keyboard sits over the cursor's cell, the size of one cell, so an input method opens
+ * its candidates there. It shows nothing of its own: the keys it takes go to the program, and what
+ * an input method composes is drawn beside it in the session's colours. It takes no pointer, so a
+ * press on the cursor's cell still selects the cell's text.
+ */
+.terminal-keyboard {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  resize: none;
+  opacity: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  font: inherit;
+  white-space: pre;
+  pointer-events: none;
+}
+
+.terminal-keyboard:focus-visible {
+  outline: none;
+}
+
+.terminal-composition {
+  position: absolute;
+  white-space: pre;
+  text-decoration: underline;
+  pointer-events: none;
+}
+
+/*
  * The heading's second row holds the badges. In a narrow window they wrap onto more lines, and a
  * badge longer than the terminal is wide wraps its own words, so none runs under the terminal's
  * edge. The footer's controls wrap the same way: the two sizes together, then the way back.

@@ -9,7 +9,7 @@
 
 import { Profiler, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
@@ -541,12 +541,33 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     })
   }
 
-  /** Every wheel turn and key the first view took for the program, in order. */
+  /** Every wheel turn, key, text and paste the first view took for the program, in order. */
   function programInputs(controls: ReturnType<typeof fakeHost>['controls']) {
     return (controls.terminalViews[0]?.inputs ?? []).filter(
-      (input) => input.kind === 'wheel' || input.kind === 'keys'
+      (input) => input.kind !== 'take' && input.kind !== 'release'
     )
   }
+
+  /** A key's press or release under take 1, named as the page names it, with nothing held unless told. */
+  function key(name: string, event: 'press' | 'release', over: Record<string, unknown> = {}) {
+    return {
+      kind: 'key',
+      take: 1,
+      event,
+      key: name,
+      base: [...name].length === 1 ? name : null,
+      keypad: null,
+      shift: false,
+      alt: false,
+      control: false,
+      caps_lock: false,
+      num_lock: false,
+      ...over
+    }
+  }
+
+  /** The program's keyboard, or null while the field is the draft's. */
+  const programKeyboard = () => screen.queryByLabelText<HTMLTextAreaElement>('Type to the program')
 
   /** One finger's `type` at `x`, `y`, or a mouse's when told. */
   function fingerEvent(type: string, pointerId: number, x: number, y: number, pointerType = 'touch'): PointerEvent {
@@ -800,13 +821,16 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       finger('pointermove', 1, 49, 65)
       finger('pointermove', 1, 49, 125)
       finger('pointerup', 1, 49, 125)
-      expect(programInputs(controls)).toEqual([
-        { kind: 'wheel', take: 1, column: 5, line: 5, turns: 1, shift: false, alt: false, control: false },
-        { kind: 'wheel', take: 1, column: 5, line: 3, turns: 1, shift: false, alt: false, control: false },
-        { kind: 'wheel', take: 1, column: 5, line: 7, turns: -3, shift: false, alt: false, control: false }
-      ])
+      // Each turn goes once the one before is answered.
+      await waitFor(() => {
+        expect(programInputs(controls)).toEqual([
+          { kind: 'wheel', take: 1, column: 5, line: 5, turns: 1, shift: false, alt: false, control: false },
+          { kind: 'wheel', take: 1, column: 5, line: 3, turns: 1, shift: false, alt: false, control: false },
+          { kind: 'wheel', take: 1, column: 5, line: 7, turns: -3, shift: false, alt: false, control: false }
+        ])
+      })
       // Nothing of it was an arrow key, and nothing moved the window.
-      expect(programInputs(controls).some((input) => input.kind === 'keys')).toBe(false)
+      expect(programInputs(controls).some((input) => input.kind === 'key')).toBe(false)
       expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
       expect(gridShift()).toEqual({ x: 0, y: 0 })
 
@@ -823,6 +847,11 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       finger('pointermove', 4, 49, 40)
       finger('pointerup', 5, 200, 105)
       finger('pointerup', 4, 49, 40)
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0)
+        })
+      })
       expect(programInputs(controls)).toHaveLength(3)
     } finally {
       restore()
@@ -860,30 +889,158 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
     })
     const escape = () => screen.getByRole('button', { name: 'Escape' })
-    const field = screen.getByLabelText('Message this session')
-    // Watching: the keys wait for control, and the field keeps its own keys.
+    // Watching: the keys wait for control, and the field is the draft's, with keys of its own.
     expect(escape()).toBeDisabled()
-    field.focus()
+    screen.getByLabelText('Message this session').focus()
     await person.keyboard('{ArrowUp}')
     expect(programInputs(controls)).toEqual([])
+    expect(programKeyboard()).toBeNull()
     // Taking: still nothing reaches the program.
     await person.click(screen.getByRole('button', { name: 'Take control' }))
     expect(screen.getByText('Asking the session for control…')).toBeInTheDocument()
     expect(escape()).toBeDisabled()
+    expect(programKeyboard()).toBeNull()
     act(() => {
       controls.terminalViews[0]?.grantControl()
     })
     await waitFor(() => {
       expect(escape()).toBeEnabled()
     })
+    // A tap on a key is its press and its release; a key typed in the field is named the same way.
     await person.click(escape())
-    field.focus()
+    programKeyboard()?.focus()
     await person.keyboard('{ArrowUp}')
-    expect(programInputs(controls)).toEqual([
-      { kind: 'keys', take: 1, keys: '\u001b' },
-      { kind: 'keys', take: 1, keys: '\u001b[A' }
-    ])
+    await waitFor(() => {
+      expect(programInputs(controls)).toEqual([
+        key('Escape', 'press'),
+        key('Escape', 'release'),
+        key('ArrowUp', 'press'),
+        key('ArrowUp', 'release')
+      ])
+    })
     expect(screen.getByText('Control: your keys and drags go to the program in this terminal.')).toBeInTheDocument()
+  })
+
+  it('makes the field the program keyboard while the view controls it, and gives the draft back when control ends', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await person.type(screen.getByLabelText('Message this session'), 'a draft')
+    await takeControl(person, controls)
+    // The field's place holds the program's keyboard, which says what it is where a placeholder
+    // would; Send goes with the draft.
+    const keyboard = programKeyboard()
+    expect(keyboard).not.toBeNull()
+    expect(screen.queryByLabelText('Message this session')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+    expect(keyboard?.parentElement?.textContent).toContain('Type to the program')
+    expect(keyboard).toHaveAttribute('autocapitalize', 'off')
+    expect(keyboard).toHaveAttribute('autocorrect', 'off')
+    expect(keyboard).toHaveAttribute('spellcheck', 'false')
+    expect(keyboard).toHaveAccessibleDescription('Tab goes to the program; Control-Tab moves on.')
+    // Text a software keyboard commits goes as text, and the field stays empty of it.
+    act(() => {
+      if (keyboard === null) return
+      keyboard.value = '\u200bls'
+      keyboard.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'ls' }))
+    })
+    await waitFor(() => {
+      expect(programInputs(controls)).toEqual([{ kind: 'text', take: 1, text: 'ls' }])
+    })
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    expect(programKeyboard()).toBeNull()
+    expect(screen.getByLabelText('Message this session')).toHaveValue('a draft')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+  })
+
+  it("sends the row's keys with what the row holds for them and the locks of the tap, and lets a modifier held for one key go", async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await takeControl(person, controls)
+    const control = () => screen.getByRole('button', { name: /^Control,/ })
+    await person.click(control())
+    expect(control()).toHaveAccessibleName('Control, held for the next key')
+    await person.click(screen.getByRole('button', { name: 'Tab' }))
+    expect(control()).toHaveAccessibleName('Control, off')
+    // A key typed on a keyboard in the field takes what the row holds for it, too.
+    await person.click(control())
+    programKeyboard()?.focus()
+    await person.keyboard('c')
+    expect(control()).toHaveAccessibleName('Control, off')
+    // The lock state comes from the tap itself.
+    fireEvent.click(screen.getByRole('button', { name: 'Vertical bar' }), { modifierCapsLock: true })
+    await waitFor(() => {
+      expect(programInputs(controls)).toEqual([
+        key('Tab', 'press', { control: true }),
+        key('Tab', 'release', { control: true }),
+        key('c', 'press', { control: true }),
+        key('c', 'release', { control: true }),
+        key('|', 'press', { caps_lock: true }),
+        key('|', 'release', { caps_lock: true })
+      ])
+    })
+  })
+
+  it('gives Tab in the field to the program only while the view controls it, and moves on with Control-Tab', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await person.type(screen.getByLabelText('Message this session'), 'ls')
+    // Watching: Tab in the draft's field moves on to Send.
+    await person.tab()
+    expect(screen.getByRole('button', { name: 'Send' })).toHaveFocus()
+    await takeControl(person, controls)
+    const keyboard = programKeyboard()
+    keyboard?.focus()
+    await person.keyboard('{Tab}{Shift>}{Tab}{/Shift}')
+    expect(keyboard).toHaveFocus()
+    await waitFor(() => {
+      expect(programInputs(controls)).toEqual([
+        key('Tab', 'press'),
+        key('Tab', 'release'),
+        key('Tab', 'press', { shift: true }),
+        key('Tab', 'release', { shift: true })
+      ])
+    })
+    // Control-Shift-Tab moves back to the last of the terminal keys, sending nothing.
+    await person.keyboard('{Control>}{Shift>}{Tab}{/Shift}{/Control}')
+    expect(screen.getByRole('button', { name: 'Tilde' })).toHaveFocus()
+    expect(programInputs(controls)).toHaveLength(4)
+  })
+
+  it('says why a key did not reach the program where the mode says what it does, until one does', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    controls.holdTerminalMoves()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    act(() => {
+      controls.terminalViews[0]?.attach()
+    })
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Escape' })).toBeEnabled()
+    })
+    await person.click(screen.getByRole('button', { name: 'Escape' }))
+    const refused = "That key did not reach the program: the view is waiting for the session's screen."
+    expect(await screen.findByText(refused)).toBeInTheDocument()
+    act(() => {
+      controls.terminalViews[0]?.show()
+    })
+    await person.click(screen.getByRole('button', { name: 'Escape' }))
+    await waitFor(() => {
+      expect(screen.queryByText(refused)).toBeNull()
+    })
+    expect(programInputs(controls)).toEqual([key('Escape', 'press'), key('Escape', 'release')])
   })
 
   it('returns to view mode when control ends, says why, and moves focus from a key that can no longer be pressed', async () => {
@@ -909,6 +1066,18 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await waitFor(() => {
       expect(screen.queryByText(LOST_CONTROL)).toBeNull()
     })
+    // And from the program keyboard, which goes with control.
+    await waitFor(() => {
+      expect(programKeyboard()).not.toBeNull()
+    })
+    programKeyboard()?.focus()
+    act(() => {
+      controls.terminalViews[0]?.loseControl()
+    })
+    await waitFor(() => {
+      expect(programKeyboard()).toBeNull()
+    })
+    expect(screen.getByRole('button', { name: 'Take control' })).toHaveFocus()
   })
 
   it('folds the composer to one line with Send beside it while the terminal shows, and leaves the picker to the conversation', async () => {
@@ -1063,17 +1232,17 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(at(watching, 'the field')).toBe(at(watching, 'More') + 1)
     expect(at(watching, 'Send')).toBe(at(watching, 'the field') + 1)
 
-    // Controlling: the mode, the status, the keys and the field.
+    // Controlling: the mode, the status, the keys and the program's keyboard in the field's place,
+    // which keeps Tab for the program: the focus stays in it.
     await takeControl(person, controls)
     const controlling = await tabbing(screen.getByRole('button', { name: 'Look around' }))
     expect(at(controlling, 'More')).toBe(0)
     expect(at(controlling, 'Escape')).toBe(at(controlling, 'More') + 1)
     expect(at(controlling, 'the field')).toBeGreaterThan(at(controlling, 'Escape'))
-    // The field gives Tab to the program while the view controls it, so Send is found as the next
-    // control after the field in the order a keyboard moves through the page.
-    const field = screen.getByLabelText('Message this session')
-    const enabled = Array.from(document.querySelectorAll<HTMLElement>('button:not([disabled]), textarea'))
-    expect(enabled[enabled.indexOf(field) + 1]).toBe(screen.getByRole('button', { name: 'Send' }))
+    expect(controlling.slice(at(controlling, 'the field'))).toEqual(
+      controlling.slice(at(controlling, 'the field')).map(() => 'the field')
+    )
+    expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
   })
 
   it('ends with the host words and attaches again when asked', async () => {
