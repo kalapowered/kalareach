@@ -96,7 +96,12 @@ async fn integration(
         .values
         .iter()
         .find(|value| value.key == COMMAND_INTEGRATIONS.key);
+    let reported = diagnosed
+        .command_integrations
+        .iter()
+        .find(|report| report.plugin_id == plugin.as_str());
     if json {
+        let document = crate::doctor::doctor(&diagnosed);
         report::print_json(&serde_json::json!({
             "ok": true,
             "environment_id": daemon.environment_id().to_string(),
@@ -108,6 +113,14 @@ async fn integration(
                 "source": value.source.as_str(),
                 "origin": value.origin.as_ref().cloned(),
             })),
+            "integration": document["command_integrations"]
+                .as_array()
+                .and_then(|reports| {
+                    reports
+                        .iter()
+                        .find(|report| report["plugin_id"] == plugin.as_str())
+                        .cloned()
+                }),
         }));
         return Ok(());
     }
@@ -126,6 +139,12 @@ async fn integration(
                 "the selected profile's list decides that, over this host's own list; change the \
                  profile in the configuration document to change it"
             );
+        }
+    }
+    // What a session created now gets of this package's integration, as the doctor reports it.
+    if let Some(reported) = reported {
+        for line in crate::doctor::integration_lines(reported) {
+            println!("{line}");
         }
     }
     Ok(())

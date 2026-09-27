@@ -7,7 +7,9 @@
 //!
 //! The default output is a person glancing at a host: the environment, the execution context, the
 //! desktop and its capabilities, the sleep policy, and then each check's verdict, with the
-//! evidence under only the checks that did not pass. `--verbose` prints the evidence under every
+//! evidence under only the checks that did not pass, and each command integration: what a new
+//! session gets of it, what it adds, and the executable the daemon's search path resolves its
+//! command to, with the version a signed record gives it. `--verbose` prints the evidence under every
 //! check, including the ones that passed, which is what a person sending a report needs and what
 //! makes each value's source visible beside it.
 //!
@@ -21,7 +23,8 @@ pub mod configuration;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::hostinfo::{
-    DoctorCheck, DoctorStatus, EffectiveConfiguration, HostDoctorResult, HostInfoResult,
+    CommandIntegrationReport, CommandIntegrationUnavailable, DoctorCheck, DoctorStatus,
+    EffectiveConfiguration, HostDoctorResult, HostInfoResult,
 };
 use serde_json::{Value, json};
 
@@ -280,7 +283,100 @@ pub fn doctor(result: &HostDoctorResult) -> Value {
             "detail": check.detail(),
             "remedy": check.remedy(),
         })).collect::<Vec<_>>(),
+        "command_integrations": result.command_integrations.iter().map(|report| json!({
+            "plugin_id": report.plugin_id,
+            "version": report.version.0,
+            "command": report.command.0,
+            "flags": report.flags,
+            "variables": report.variables.iter().map(|variable| json!({
+                "name": variable.name,
+                "value": variable.value,
+            })).collect::<Vec<_>>(),
+            "state": report.state.as_str(),
+            "unavailable": report.unavailable.0.map(CommandIntegrationUnavailable::as_str),
+            "mode": report.mode.as_str(),
+            "executable": report.executable.0,
+            "executable_version": report.executable_version.0,
+            "reason": report.reason.0,
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// One command integration as the lines a person reads: what a session created now gets of it and
+/// the mode its command runs in, why none could launch through it here where none could, the flags
+/// it adds as the elements they are and the variables it sets, and where the daemon's search path
+/// resolves its command, with the version a signed record gives that executable.
+#[must_use]
+pub fn integration_lines(report: &CommandIntegrationReport) -> Vec<String> {
+    let release = report
+        .version
+        .0
+        .as_deref()
+        .map_or_else(String::new, |version| format!(" {version}"));
+    let named = match report.command.0.as_deref() {
+        Some(command) => format!("{command} ({}{release})", report.plugin_id),
+        None => format!("{}{release}", report.plugin_id),
+    };
+    let mut lines = vec![format!(
+        "{named}: {}, {}",
+        report.state.as_str(),
+        report.mode.as_str()
+    )];
+    if let Some(why) = report.unavailable.0 {
+        lines.push(format!(
+            "a new session cannot launch through it here ({}): {}",
+            why.as_str(),
+            match why {
+                CommandIntegrationUnavailable::Platform => {
+                    "this platform establishes no command backend"
+                }
+                CommandIntegrationUnavailable::NoLauncher => {
+                    "no kr-hook is installed beside this host's worker"
+                }
+            }
+        ));
+    }
+    if let Some(command) = report.command.0.as_deref() {
+        let quoted =
+            |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
+        let flags = if report.flags.is_empty() {
+            "adds no flag".to_owned()
+        } else {
+            let elements: Vec<String> = report.flags.iter().map(|flag| quoted(flag)).collect();
+            format!("adds {}", elements.join(" "))
+        };
+        let variables = if report.variables.is_empty() {
+            "sets no variable".to_owned()
+        } else {
+            let set: Vec<String> = report
+                .variables
+                .iter()
+                .map(|variable| format!("{}={}", variable.name, quoted(&variable.value)))
+                .collect();
+            format!("sets {}", set.join(" "))
+        };
+        lines.push(format!("{flags}; {variables}"));
+        lines.push(match (
+            report.executable.0.as_deref(),
+            report.executable_version.0.as_deref(),
+        ) {
+            (Some(executable), Some(version)) => format!(
+                "resolves to {executable} on the daemon's search path, {version} by its signed \
+                 record"
+            ),
+            (Some(executable), None) => format!(
+                "resolves to {executable} on the daemon's search path, a build no signed record \
+                 names, so its version is not known"
+            ),
+            (None, _) => format!(
+                "{command} is not on the daemon's search path; a session looks for it on its own"
+            ),
+        });
+    }
+    if let Some(reason) = report.reason.0.as_deref() {
+        lines.push(reason.to_owned());
+    }
+    lines
 }
 
 /// Renders this host's effective configuration.
@@ -368,6 +464,15 @@ pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> String {
             for line in check.evidence() {
                 text.push_str(&format!("               {line}\n"));
             }
+        }
+    }
+    for report in &result.command_integrations {
+        let mut lines = integration_lines(report).into_iter();
+        if let Some(head) = lines.next() {
+            text.push_str(&format!("{:<14} {head}\n", "integration"));
+        }
+        for line in lines {
+            text.push_str(&format!("               {line}\n"));
         }
     }
     text.push_str(&summary(result));
