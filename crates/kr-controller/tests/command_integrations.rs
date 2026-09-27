@@ -24,7 +24,8 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
-    CapabilityCeiling, Catalogue, Enrolment, InstallationGrant, RepositoryId, RepositoryKind,
+    CapabilityCeiling, Catalogue, Change, Enrolment, InstallationGrant, Owner, RepositoryId,
+    RepositoryKind,
 };
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
@@ -119,7 +120,7 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
     .await;
 
     // Enrolled, synchronised and installed with every capability it asks for, the integration's
-    // among them, on the owner's own authority.
+    // among them, on the owner's confirmation of this exact installation.
     let mut catalogue = Catalogue::open(
         &environment.state_dir().join("catalogue"),
         Arc::new(RepositoryTransport::local_only(
@@ -152,7 +153,7 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
         .expect("the package")
         .manifest_digest;
     catalogue
-        .install(
+        .install_with(
             &id,
             environment_id,
             &gemini(),
@@ -164,6 +165,8 @@ async fn daemon(enabled: Option<&[&str]>) -> Daemon {
                 PluginCapability::ApprovalRespond,
                 PluginCapability::CommandIntegrationLaunch,
             ]),
+            None,
+            &mut Change::new(&Owner::confirming()),
         )
         .await
         .expect("installed");

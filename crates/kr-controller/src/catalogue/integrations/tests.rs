@@ -21,15 +21,16 @@ impl Store {
         Self(root)
     }
 
-    /// One package of `shape`, as an admission hands it over, with the grants `grant` leaves.
+    /// One package of `shape`, as an admission hands it over, with what `installed` makes of its
+    /// installation.
     fn admitted(
         &self,
         shape: &fixture::Shape,
-        grant: impl FnOnce(&mut std::collections::BTreeSet<PluginCapability>),
+        installed: impl FnOnce(&mut kr_worker::broker::connectors::ConnectorSource),
     ) -> AdmittedPackage {
         let mut source = fixture::package(&self.0, &self.0.join("kr-hook"), shape)
             .expect("the package is written");
-        grant(&mut source.granted);
+        installed(&mut source);
         admitted(&source)
     }
 }
@@ -97,29 +98,46 @@ fn each_integration_that_applies_gives_an_entry_on_or_off_by_the_configuration()
 #[test]
 fn an_integration_that_does_not_apply_gives_no_entry() {
     let store = Store::new("none");
-    let ungranted = store.admitted(&fixture::Shape::gemini_cli(&[]), |granted| {
-        granted.remove(&PluginCapability::CommandIntegrationLaunch);
+    let ungranted = store.admitted(&fixture::Shape::gemini_cli(&[]), |source| {
+        source
+            .granted
+            .remove(&PluginCapability::CommandIntegrationLaunch);
     });
     let undeclared = store.admitted(
         &fixture::Shape {
+            plugin_name: "silent",
             integration: None,
-            ..fixture::Shape::qoder_cli()
-        },
-        |_| {},
-    );
-    let claude = store.admitted(&fixture::Shape::claude_code(), |_| {});
-    let another = store.admitted(
-        &fixture::Shape {
-            plugin_name: "another-claude",
             ..fixture::Shape::claude_code()
         },
         |_| {},
     );
-    let reading = Integrations::new().read(&[ungranted, undeclared, claude, another]);
+    let qoder = store.admitted(&fixture::Shape::qoder_cli(), |_| {});
+    let another = store.admitted(
+        &fixture::Shape {
+            plugin_name: "another-qoder",
+            ..fixture::Shape::qoder_cli()
+        },
+        |_| {},
+    );
+    let reading = Integrations::new().read(&[ungranted, undeclared, qoder, another]);
+    assert!(
+        reading
+            .packages
+            .iter()
+            .filter(|(_, read)| read.is_ok())
+            .count()
+            == 2,
+        "the two that integrate no command are read: {:?}",
+        reading
+            .packages
+            .iter()
+            .map(|(package, read)| (package.plugin_id.clone(), read.as_ref().err().cloned()))
+            .collect::<Vec<_>>()
+    );
     assert!(
         entries(
             &reading,
-            &enabled(&["gemini-cli", "qoder-cli", "claude-code", "another-claude"])
+            &enabled(&["gemini-cli", "silent", "qoder-cli", "another-qoder"])
         )
         .is_empty()
     );
