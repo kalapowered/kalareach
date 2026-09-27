@@ -95,10 +95,11 @@ impl Asked {
     /// path; anything else as a local path.
     ///
     /// Nothing is said of a location but those parts, so user information, a query and a fragment
-    /// are never kept: text written as a URL that the parser does not read, and SCP-style text
-    /// whose host is neither a host name nor an IPv6 address in brackets, or whose path holds an
-    /// `@`, a `?` or a `#`, which is how a URL read the wrong way would look, are said as their
-    /// class and their length.
+    /// are never kept. Every reading but the parser's says only text that holds none of the
+    /// characters that bring them into a URL: an SCP host must be a host name or an IPv6 address in
+    /// brackets and its path, like a local path, hold no `@`, `?` or `#`, and a local path no colon
+    /// but a drive's. Text written as a URL that the parser does not read, and text none of the
+    /// readings takes, is said as its class and its length.
     #[must_use]
     pub fn location(request: Request, location: &str) -> Self {
         use kr_protocol::hostinfo::export::{ContentClass, withheld};
@@ -115,8 +116,10 @@ impl Asked {
             } else {
                 withheld(ContentClass::Location, location)
             }
-        } else {
+        } else if local_path(location) {
             kr_client::shown::spelled(Path::new(location))
+        } else {
+            withheld(ContentClass::Location, location)
         };
         Self { request, text }
     }
@@ -151,6 +154,16 @@ fn scp(location: &str) -> Option<(&str, &str)> {
     let drive =
         user.is_none() && host.len() == 1 && host.bytes().all(|byte| byte.is_ascii_alphabetic());
     (!drive).then_some((host, path))
+}
+
+/// Whether text reads as a local path and nothing else: no `@`, `?` or `#`, and no colon but a
+/// drive's (`C:`).
+fn local_path(location: &str) -> bool {
+    let drive = location.len() >= 2
+        && location.as_bytes()[0].is_ascii_alphabetic()
+        && location.as_bytes()[1] == b':';
+    let rest = if drive { &location[2..] } else { location };
+    !rest.contains([':', '@', '?', '#'])
 }
 
 /// Whether an SCP-style location's host is one: a host name, or an IPv6 address in brackets.
@@ -904,6 +917,21 @@ mod tests {
             (
                 format!("{MARKER}@x:repository.git"),
                 "x:repository.git".to_owned(),
+            ),
+            // Text no reading takes, which is how a location written the wrong way would look.
+            (
+                format!("{MARKER}@git.example/team:repository?token={MARKER}#{MARKER}"),
+                withheld(&format!(
+                    "{MARKER}@git.example/team:repository?token={MARKER}#{MARKER}"
+                )),
+            ),
+            (
+                format!("/srv/{MARKER}@repository"),
+                withheld(&format!("/srv/{MARKER}@repository")),
+            ),
+            (
+                format!("repository#{MARKER}"),
+                withheld(&format!("repository#{MARKER}")),
             ),
         ] {
             let asked = Asked::location(Request::Plugins, &location);

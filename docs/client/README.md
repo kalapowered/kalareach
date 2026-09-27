@@ -178,8 +178,8 @@ of the answer by their types.
 
 ## What the command line prints
 
-Standard output follows the same rule, with one addition: content the person asked a command for
-is shown to them. `kr_cli::output` is the only writer. It writes a `Shown`, a `Line` composed from a
+Standard output follows the same rule, with one addition: content the person asked a command for is
+shown to them. `kr_cli::output` is the only writer. It writes a `Shown`, a `Line` composed from a
 template of the program's own and parts that are each `Plain` or `Asked`, or a `--json` `Document`
 built from those, numbers, switches, lists and other documents; nothing converts a string or a JSON
 value into one. `Asked` is content that arrived and that the command was asked for, such as a
@@ -187,9 +187,9 @@ question's text, a repository's path or the name a paired device gave itself, an
 request that asked for it. It has no `Display` and no `Debug` and never becomes a `Shown`, so it
 cannot reach standard error, a failure or a `Debug`. An asked location says only its scheme, host,
 port and path, as they were written where that text reads back as the same place and as the URL
-parser reads them otherwise, or an SCP host and path that hold nothing a URL would carry; text
-written as a URL that does not parse, and anything else that is not one of those, is said as its
-class and its length.
+parser reads them otherwise; or an SCP host and path, or a local path, whose text holds none of the
+characters that bring user information, a query or a fragment into a URL. Text written as a URL that
+does not parse, and text none of those readings takes, is said as its class and its length.
 
 The rest of what a command prints is decided by what it is:
 
