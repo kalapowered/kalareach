@@ -611,99 +611,24 @@ impl Controller {
     }
 
     /// Starts privacy mode's tick, which runs until the daemon goes.
+    ///
+    /// The tick holds the daemon weakly, and holds it at all only while it reads the directory and
+    /// the registry and while it reaches a worker's connection, which is bounded. The record's own
+    /// work runs on a blocking task that holds only the record, and a worker is told over its
+    /// connection alone, so a pass waiting for a blocking thread or for a worker's answer keeps
+    /// nothing of the daemon, and nothing of its environment's lock.
     fn start_privacy_tick(self: &Arc<Self>) {
-        let controller = Arc::downgrade(self);
+        let daemon = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut ticks = tokio::time::interval(PRIVACY_TICK);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticks.tick().await;
-                let Some(controller) = controller.upgrade() else {
+                if privacy_pass(&daemon).await.is_none() {
                     return;
-                };
-                controller.privacy_pass().await;
+                }
             }
         });
-    }
-
-    /// One pass of privacy mode's tick.
-    ///
-    /// The record learns which workers are running and which have ended, retries what it owes,
-    /// and each worker whose session has not answered for the generation in force is told it, one
-    /// after another, and its answer recorded.
-    async fn privacy_pass(self: &Arc<Self>) {
-        let live: Vec<SessionId> = self
-            .directory
-            .lock()
-            .await
-            .iter()
-            .map(|worker| worker.descriptor.session_id)
-            .collect();
-        // A registry that cannot be read says nothing about which workers have ended, so nothing
-        // is taken for ended on this pass.
-        let recorded: Option<Vec<SessionId>> =
-            self.registry.lock().await.workers().ok().map(|workers| {
-                workers
-                    .into_iter()
-                    .map(|worker| worker.session_id)
-                    .collect()
-            });
-        let privacy = Arc::clone(&self.privacy);
-        let now_ms = kr_ipc::now_ms();
-        let notices = tokio::task::spawn_blocking(move || {
-            if let Some(recorded) = recorded {
-                // An obligation that could not be written is held and written again by the tick.
-                let _ = privacy.sessions_seen(&live, &recorded, now_ms);
-            }
-            let _ = privacy.tick(now_ms);
-            privacy.notices_due(now_ms)
-        })
-        .await
-        .unwrap_or_default();
-        for notice in notices {
-            self.tell_privacy(notice).await;
-        }
-    }
-
-    /// Tells one worker the environment's privacy generation and records its answer.
-    ///
-    /// A worker that cannot be reached, or does not answer in time, is told again on its schedule;
-    /// its connection is retired when an exchange on it failed part way, because nothing knows where
-    /// its stream stands.
-    async fn tell_privacy(&self, notice: crate::privacy::Notice) {
-        let session_id = notice.session_id;
-        let Ok(Ok(mut held)) =
-            tokio::time::timeout(super::WORKER_EXCHANGE, self.worker_client_of(session_id)).await
-        else {
-            return;
-        };
-        let Some(client) = held.as_mut() else {
-            return;
-        };
-        let told = tokio::time::timeout(
-            PRIVACY_EXCHANGE,
-            client.announce_privacy(kr_protocol::privacy::PrivacyGenerationNotice {
-                environment_id: self.paths.environment_id(),
-                generation: kr_protocol::scalars::U64::new(notice.generation.get()),
-                enabled: notice.enabled,
-            }),
-        )
-        .await;
-        let ack = match told {
-            Ok(Ok(ack)) => ack,
-            Ok(Err(_)) | Err(_) => {
-                *held = None;
-                self.lost_control_path(session_id);
-                return;
-            }
-        };
-        drop(held);
-        // An answer is about the session it names, and this connection is that session's alone.
-        if ack.session_id != session_id {
-            return;
-        }
-        let privacy = Arc::clone(&self.privacy);
-        let _ = tokio::task::spawn_blocking(move || privacy.note_answer(&ack)).await;
     }
 
     /// The proxy this host's outbound HTTPS goes through: the configuration document's
@@ -907,6 +832,110 @@ impl Controller {
             }
         })
         .await;
+    }
+}
+
+/// One pass of privacy mode's tick, or `None` once the daemon has gone.
+///
+/// The record learns which workers are running and which have ended, retries what it owes, and
+/// each worker whose session has not answered for the generation in force is told it, one after
+/// another, and its answer recorded.
+async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
+    let (live, recorded, privacy) = {
+        let controller = daemon.upgrade()?;
+        let live: Vec<SessionId> = controller
+            .directory
+            .lock()
+            .await
+            .iter()
+            .map(|worker| worker.descriptor.session_id)
+            .collect();
+        // A registry that cannot be read says nothing about which workers have ended, so nothing
+        // is taken for ended on this pass.
+        let recorded: Option<Vec<SessionId>> =
+            controller
+                .registry
+                .lock()
+                .await
+                .workers()
+                .ok()
+                .map(|workers| {
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.session_id)
+                        .collect()
+                });
+        (live, recorded, Arc::clone(&controller.privacy))
+    };
+    let now_ms = kr_ipc::now_ms();
+    let notices = {
+        let privacy = Arc::clone(&privacy);
+        tokio::task::spawn_blocking(move || {
+            if let Some(recorded) = recorded {
+                // An obligation that could not be written is held and written again by the tick.
+                let _ = privacy.sessions_seen(&live, &recorded, now_ms);
+            }
+            let _ = privacy.tick(now_ms);
+            privacy.notices_due(now_ms)
+        })
+        .await
+        .unwrap_or_default()
+    };
+    for notice in notices {
+        let Some(ack) = tell_privacy(daemon, notice).await? else {
+            continue;
+        };
+        let privacy = Arc::clone(&privacy);
+        let _ = tokio::task::spawn_blocking(move || privacy.note_answer(&ack)).await;
+    }
+    Some(())
+}
+
+/// Tells one worker the environment's privacy generation, and returns its answer; `None` once the
+/// daemon has gone.
+///
+/// The daemon is held only while the worker's connection is reached, which is bounded, and the
+/// exchange runs over that connection alone. A worker that cannot be reached, or does not answer in
+/// time, answers nothing here and is told again on its schedule; its connection is retired when an
+/// exchange on it failed part way, because nothing knows where its stream stands.
+async fn tell_privacy(
+    daemon: &std::sync::Weak<Controller>,
+    notice: crate::privacy::Notice,
+) -> Option<Option<kr_protocol::privacy::PrivacyGenerationAck>> {
+    let session_id = notice.session_id;
+    let (reached, environment_id) = {
+        let controller = daemon.upgrade()?;
+        let reached = tokio::time::timeout(
+            super::WORKER_EXCHANGE,
+            controller.worker_client_of(session_id),
+        )
+        .await;
+        (reached, controller.paths.environment_id())
+    };
+    let Ok(Ok(mut held)) = reached else {
+        return Some(None);
+    };
+    let Some(client) = held.as_mut() else {
+        return Some(None);
+    };
+    let told = tokio::time::timeout(
+        PRIVACY_EXCHANGE,
+        client.announce_privacy(kr_protocol::privacy::PrivacyGenerationNotice {
+            environment_id,
+            generation: kr_protocol::scalars::U64::new(notice.generation.get()),
+            enabled: notice.enabled,
+        }),
+    )
+    .await;
+    match told {
+        // An answer is about the session it names, and this connection is that session's alone.
+        Ok(Ok(ack)) => Some((ack.session_id == session_id).then_some(ack)),
+        Ok(Err(_)) | Err(_) => {
+            *held = None;
+            drop(held);
+            daemon.upgrade()?.lost_control_path(session_id);
+            Some(None)
+        }
     }
 }
 
