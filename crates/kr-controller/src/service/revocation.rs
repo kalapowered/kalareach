@@ -58,7 +58,7 @@ impl Controller {
     ///
     /// `claim` is that mutation's hold on its action, and the rows it withdraws are written beside
     /// the claim in the same transaction, so a repeat of an action whose answer was never recorded
-    /// is told exactly what it withdrew ([`Self::revocation_on_record`]).
+    /// is told exactly what it withdrew (`Self::revocation_on_record`).
     ///
     /// # Errors
     ///

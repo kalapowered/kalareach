@@ -497,7 +497,7 @@ impl Controller {
     }
 
     /// Revokes this host's authority as it stands: one restrictive change of its own, retired by
-    /// the barrier ([`Self::barrier`]) this raises at once.
+    /// the barrier (`Self::barrier`) this raises at once.
     ///
     /// Advancing the revision invalidates every outstanding dispatch lease at once, because a lease
     /// carries the revision it was issued at, and deregisters every connection admitted under the
