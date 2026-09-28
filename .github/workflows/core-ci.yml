@@ -5,6 +5,11 @@ on:
     branches: ["main"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      macos:
+        description: "Run the macOS jobs (macos, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -923,8 +928,10 @@ jobs:
     name: companion
     strategy:
       fail-fast: false
+      # A manual run started with the macOS jobs turned off has no macOS leg at all, rather than a
+      # leg whose steps are skipped and which would then read as passed. Every other run has both.
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && !inputs.macos && '["ubuntu-24.04"]' || '["ubuntu-24.04", "macos-15"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out
@@ -1042,6 +1049,8 @@ jobs:
   # says whether it ran.
   macos:
     name: macos
+    # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
     # hangs is ended and the steps after it still report. This one is under GitHub's six hours.
