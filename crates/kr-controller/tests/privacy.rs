@@ -1840,6 +1840,80 @@ async fn kr_req_24_28_a_repeated_clearing_is_answered_from_its_record_without_ge
     environment.stop().await;
 }
 
+/// KR-REQ-23.34: a device that may rename a session and may not view it renames it, and does not
+/// learn what its action came to by presenting the action again. A retained answer, a name or a
+/// refusal, goes back only under present view authority over the session it names; a device that
+/// may view it is answered from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_over_its_session() {
+    let environment = Environment::start().await;
+    let session_id = environment.worker.session_id;
+    let target = environment.worker.target(environment.environment_id());
+    let pinning = SessionRenameParams {
+        session_id,
+        title: Nullable::some("Release prep".to_owned()),
+    };
+    let too_long = SessionRenameParams {
+        session_id,
+        title: Nullable::some("x".repeat(65)),
+    };
+    for (rights, views) in [
+        (vec![ActionRight::SessionRename], false),
+        (
+            vec![ActionRight::SessionRename, ActionRight::SessionView],
+            true,
+        ),
+    ] {
+        let device = environment.raw_device(proposal(&rights)).await;
+        let named = ActionId::new(kr_ipc::new_uuid());
+        let refused = ActionId::new(kr_ipc::new_uuid());
+
+        // Both are answered the first time: the right to rename is enough to rename.
+        let first = renamed(
+            device
+                .connection
+                .mutate(Method::SessionRename, named, target.clone(), &pinning)
+                .await
+                .expect("a device that may rename renames"),
+        );
+        assert_eq!(first.title, "Release prep");
+        let refusal = device
+            .connection
+            .mutate(Method::SessionRename, refused, target.clone(), &too_long)
+            .await
+            .expect_err("a name that is too long is refused");
+        assert_eq!(refusal.code, ErrorCode::InvalidArgument, "{refusal}");
+
+        // Presented again, the name and the refusal are both a read of what the action came to.
+        let again = device
+            .connection
+            .mutate(Method::SessionRename, named, target.clone(), &pinning)
+            .await;
+        let again_refused = device
+            .connection
+            .mutate(Method::SessionRename, refused, target.clone(), &too_long)
+            .await
+            .expect_err("the refusal comes back as a refusal");
+        if views {
+            assert_eq!(
+                renamed(again.expect("a device that may view is answered from the record")),
+                first
+            );
+            assert_eq!(again_refused.code, ErrorCode::InvalidArgument);
+        } else {
+            let denied = again.expect_err("a device that may not view is not answered");
+            assert_eq!(denied.code, ErrorCode::PermissionDenied, "{denied}");
+            assert_eq!(
+                again_refused.code,
+                ErrorCode::PermissionDenied,
+                "{again_refused}"
+            );
+        }
+        device.connection.close();
+    }
+    environment.stop().await;
+}
+
 /// KR-REQ-24.29 and section 23: a paired device whose grant carries host management reads where
 /// privacy mode stands; one whose grant does not is refused; and no device can turn it on or off,
 /// which only the host itself does.

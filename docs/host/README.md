@@ -3018,7 +3018,10 @@ the answer says inference is paused because no model runs here, and has no queue
 with no title, records who set it, and answers the title it now shows: the pin, or the title built
 from the session's metadata after a clearing. It never answers generated text, which is
 `session.describe`'s, under its own right and filter, so the record a rename's action keeps for a
-retry holds none and the removal privacy mode makes has nothing of it to reach.
+retry holds none and the removal privacy mode makes has nothing of it to reach. The right to rename
+a session is not the right to view it, so a device that may rename and may not view is answered the
+first time and is not answered again from the record: a retry, whether the rename was done or
+refused, goes back only under present view authority over the session it names.
 
 ## What an idle session wakes for
 

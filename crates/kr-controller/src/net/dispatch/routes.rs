@@ -534,9 +534,15 @@ impl RemoteConnection {
             }
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and a create's names the session it made. Section 23 wants present view authority
-            // over that subject before either half of a retained result goes back, and the subject
-            // is in the answer rather than in the request.
-            if let Err(error) = self.may_read_receipts(answered_session(&retained)) {
+            // over that subject before either half of a retained result goes back, and a create's
+            // subject is in the answer rather than in the request. A rename's is the session its
+            // request names, whether what it came to was a name or a refusal.
+            let subject = if entry.method == Method::SessionRename {
+                mutation.target.session_id.as_ref().copied()
+            } else {
+                answered_session(&retained)
+            };
+            if let Err(error) = self.may_read_receipts(subject) {
                 return failure(mutation.request_id, error);
             }
             return retained;
