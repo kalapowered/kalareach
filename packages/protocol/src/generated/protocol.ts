@@ -779,6 +779,10 @@ export type HelloReply =
  */
 export type CommandIntegrationUnavailable = 'platform' | 'no_launcher' | 'too_large'
 /**
+ * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+ */
+export type Uuid = string
+/**
  * One release of the host: its version and the first twelve hexadecimal digits of its commit.
  */
 export type ReleaseName = string
@@ -954,10 +958,6 @@ export type QuestionRevision = string
  * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
  */
 export type Bytes = string
-/**
- * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
- */
-export type Uuid = string
 /**
  * One relay instance. Stable across rotation of the key it signs receipts with.
  */
@@ -14310,6 +14310,11 @@ export interface ProtocolVersion7 {
  */
 export interface HostUpdateHandoverParams {
   /**
+   * The attempt the step is for: what a `stop` must name, and what a `resume` may name. Null
+   * for `prepare`, which begins one, and for a `resume` that ends whichever is open.
+   */
+  attempt: Uuid | null
+  /**
    * The step to take.
    */
   step: 'prepare' | 'stop' | 'resume'
@@ -14320,13 +14325,18 @@ export interface HostUpdateHandoverParams {
 }
 /**
  * `host.update.handover` result: how the daemon was started, which a daemon of the release that
- * replaces it is started like.
+ * replaces it is started like, and the attempt the step was for.
  */
 export interface HostUpdateHandoverResult {
   /**
    * The arguments it was started with, its program's own name left out.
    */
   arguments: string[]
+  /**
+   * The attempt the answer is for: the one `prepare` began, the one `stop` stopped under, and
+   * for `resume` the one it ended, null when none was open.
+   */
+  attempt: Uuid | null
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

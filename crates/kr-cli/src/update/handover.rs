@@ -1,15 +1,17 @@
 //! Handing each environment's control daemon over to the release an update installs, and starting
 //! that release's daemon as the one it replaces was started.
 //!
-//! A daemon is asked through its own door, `host.update.handover`: to prepare, which closes its
-//! gate to new sessions and waits for the creates it has started, and then to stop, or to resume
-//! when the update is not going ahead. Its answer to `prepare` says how it was started, and that
-//! is recorded before it is told to stop. The environment is known to be free once its singleton
-//! lock can be taken, which the kernel gives up only when the daemon's process has gone.
+//! A daemon is asked through its own door, `host.update.handover`: to prepare, which begins an
+//! attempt, closes its gate to new sessions and waits for the creates it has started, and then to
+//! stop under that attempt, or to resume when the update is not going ahead. Its answer to
+//! `prepare` says how it was started and under which attempt, and how is recorded before it is
+//! told to stop. The environment is known to be free once its singleton lock can be taken, which
+//! the kernel gives up only when the daemon's process has gone.
 //!
 //! A daemon found holding an environment whose daemon an update stopped is asked to resume before
-//! it is taken for the environment's daemon: one that resumes goes on serving, and no stop of the
-//! handover can end it after; one told to stop refuses, and is waited for until it has gone.
+//! it is taken for the environment's daemon, naming no attempt, so whichever is open ends: one that
+//! resumes goes on serving, and no stop of any earlier attempt can end it after, since a stop
+//! names its attempt; one told to stop refuses, and is waited for until it has gone.
 
 use std::time::Duration;
 
@@ -23,6 +25,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ActionId;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
+use kr_protocol::scalars::{Nullable, Uuid};
 use kr_protocol::update::{
     HANDOVER_SETTLE_MS, HandoverStep, HostUpdateHandoverParams, HostUpdateHandoverResult,
     ReleaseName,
@@ -40,10 +43,13 @@ const DAEMON_STOP: Duration = Duration::from_secs(30);
 /// How long a daemon of the new release is given to answer once it has been started.
 pub const DAEMON_START: Duration = Duration::from_secs(60);
 
-/// A daemon that has prepared to make way: its gate is closed, and the connection it answered on.
+/// A daemon that has prepared to make way: its gate is closed for an attempt, and the connection
+/// it answered on.
 pub struct Prepared {
     /// What it said about how it was started.
     pub started_as: HostUpdateHandoverResult,
+    /// The attempt it prepared under, which a stop or a resume of this update names.
+    attempt: Uuid,
     client: LocalClient,
 }
 
@@ -86,36 +92,46 @@ pub async fn prepare(environment: &Environment, target: &ReleaseName) -> Result<
         environment,
         target,
         HandoverStep::Prepare,
+        None,
         Duration::from_millis(HANDOVER_SETTLE_MS) + DAEMON_ANSWER,
     )
     .await?;
+    let attempt = answered.attempt.0.ok_or_else(|| {
+        refusal(
+            environment,
+            Shown::said("its answer to prepare names no attempt"),
+        )
+    })?;
     Ok(Some(Prepared {
         started_as: answered,
+        attempt,
         client,
     }))
 }
 
-/// Tells a prepared daemon to stop. Its answer is not waited for: the daemon may end before it
-/// is written, and whether it has stopped is what its lock says.
+/// Tells a prepared daemon to stop, under the attempt it prepared. Its answer is not waited for:
+/// the daemon may end before it is written, and whether it has stopped is what its lock says.
 pub async fn stop(mut prepared: Prepared, environment: &Environment, target: &ReleaseName) {
     let _ = step(
         &mut prepared.client,
         environment,
         target,
         HandoverStep::Stop,
+        Some(prepared.attempt),
         DAEMON_ANSWER,
     )
     .await;
 }
 
-/// Tells a prepared daemon the update is not going ahead, so its gate opens again. A daemon that
-/// does not hear it opens its gate by itself when its hold lapses.
+/// Tells a prepared daemon the update is not going ahead, so its attempt ends and its gate opens
+/// again. A daemon that does not hear it opens its gate by itself when its hold lapses.
 pub async fn resume(mut prepared: Prepared, environment: &Environment, target: &ReleaseName) {
     let _ = step(
         &mut prepared.client,
         environment,
         target,
         HandoverStep::Resume,
+        Some(prepared.attempt),
         DAEMON_ANSWER,
     )
     .await;
@@ -162,9 +178,11 @@ pub async fn resume_holder(environment: &Environment, target: &ReleaseName) -> R
             )));
         }
     };
+    // No attempt is named: whichever is open ends, and it is not this run's to know which.
     let params = HostUpdateHandoverParams {
         step: HandoverStep::Resume,
         target: target.clone(),
+        attempt: Nullable::null(),
     };
     let asked = tokio::time::timeout(
         DAEMON_ANSWER,
@@ -188,6 +206,15 @@ pub async fn resume_holder(environment: &Environment, target: &ReleaseName) -> R
             DAEMON_ANSWER.as_secs()
         ))),
     }
+}
+
+/// The refusal that a daemon that does not make way is met with.
+fn refusal(environment: &Environment, said: Shown) -> CliError {
+    CliError::UpdateDeferred(shown!(
+        "the control daemon of environment {} did not make way: {}",
+        environment.environment_id,
+        said
+    ))
 }
 
 /// Whether a daemon holds an environment.
@@ -233,17 +260,20 @@ pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
     Ok(())
 }
 
-/// Takes one step of the handover on a daemon's connection, bounded by `within`.
+/// Takes one step of the handover on a daemon's connection, for `attempt` where the step names
+/// one, bounded by `within`.
 async fn step(
     client: &mut LocalClient,
     environment: &Environment,
     target: &ReleaseName,
     step: HandoverStep,
+    attempt: Option<Uuid>,
     within: Duration,
 ) -> Result<HostUpdateHandoverResult> {
     let params = HostUpdateHandoverParams {
         step,
         target: target.clone(),
+        attempt: Nullable(attempt),
     };
     let asked = tokio::time::timeout(
         within,
@@ -255,13 +285,7 @@ async fn step(
         ),
     )
     .await;
-    let refused = |said: Shown| {
-        CliError::UpdateDeferred(shown!(
-            "the control daemon of environment {} did not make way: {}",
-            environment.environment_id,
-            said
-        ))
-    };
+    let refused = |said: Shown| refusal(environment, said);
     match asked {
         Ok(Ok(Ok(answer))) => answer.to_typed().map_err(|error| {
             refused(shown!(
