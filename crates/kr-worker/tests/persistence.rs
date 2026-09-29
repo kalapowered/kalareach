@@ -2638,8 +2638,8 @@ struct EarlierHistoryGap {
 /// `IFS= read`. macOS's `/bin/sh` is bash 3.2, which runs the trap for a signal that reaches it
 /// while `read` waits inside that `read`, and frees the `read`'s temporary assignment when the
 /// trap's command ends. The `read` then splits the next line it is given on memory it no longer
-/// owns, and drops the line's last character whenever that memory happens to hold it. An
-/// assignment for the whole script is never freed.
+/// owns, and drops the line's last character when that memory holds it and holds no character
+/// before it in the line. An assignment for the whole script is not freed by the trap.
 #[cfg(unix)]
 const READING_APPLICATION: &str = "stty -echo; IFS=; trap 'printf \"kr-interrupted.\\n\"' INT; \
      printf 'kr-ready.\\n'; \
@@ -2972,11 +2972,12 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
 }
 
 /// The application the test above drives, which KR-REQ-07.57's raw input and interrupt are shown
-/// on, answers a line typed right after an interrupt whole, whatever character ends the line.
+/// on, answers a line typed right after an interrupt whole, whatever printable character ends it.
 ///
-/// Each printable character ends one such line. The last character of a line is the one an
-/// application that splits its input on the wrong set of characters drops, so the one line the test
-/// above types finds a lost character one time in many, and these find it whenever there is one.
+/// Each printable ASCII character but the space ends one such line. The last character of a line is
+/// the one an application that splits its input on the wrong set of characters drops, so the one
+/// line the test above types finds a lost character only now and then, and these look for it at the
+/// end of ninety-four lines.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_character_typed_after_an_interrupt_reaches_the_application() {
@@ -3012,7 +3013,7 @@ async fn every_character_typed_after_an_interrupt_reaches_the_application() {
 
     for (index, character) in (b'!'..=b'~').enumerate() {
         // The interrupt has reached the application, which is what the next line is typed after.
-        interrupt_until_said(&host, &mut client, &attachment, &lease, index + 1).await;
+        interrupt_until_said(&host, &mut client, &attachment, &lease).await;
         let line = format!("L{index:02}{}", char::from(character));
         let _: kr_protocol::input::InputWriteResult = client
             .request(
@@ -3037,20 +3038,24 @@ async fn every_character_typed_after_an_interrupt_reaches_the_application() {
     }
 }
 
-/// Interrupts the application until it has said it was interrupted `times` times in all.
+/// Interrupts the application until it has said it took the interrupt.
 ///
-/// A shell runs a trap for a signal that reaches it while it waits for input, but not for one that
-/// reaches it in the moment between an answer and its next wait: that one is run when the wait ends,
-/// which is when the next line arrives. So an interrupt the application has not said it took within
-/// a moment is sent again, and the count only has to be reached.
+/// A shell runs a trap for a signal that reaches it while it waits for input. A signal that reaches
+/// it just before it starts to wait is held until something wakes the wait: the next line, or
+/// another signal. So an interrupt the application has not said it took within half a second is
+/// sent again. What the application had said before the first interrupt is counted first, so only
+/// what it says after that counts: the count only has to rise by one. The caller has waited for the
+/// answer to the line it typed after the previous interrupt, and a shell runs a trap for a signal
+/// sent before a line arrives before it answers that line, so no reply to an earlier interrupt is
+/// counted here.
 #[cfg(unix)]
 async fn interrupt_until_said(
     host: &Host,
     client: &mut LocalClient,
     attachment: &kr_protocol::attachment::SessionAttachResult,
     lease: &kr_protocol::input::InputAcquireResult,
-    times: usize,
 ) {
+    let said = carried_times(&retained(&host.runtime), b"kr-interrupted.") + 1;
     let started = tokio::time::Instant::now();
     loop {
         let _: kr_protocol::input::InputLeaseResult = client
@@ -3070,14 +3075,14 @@ async fn interrupt_until_said(
             .map(|value| value.to_typed().expect("decodes"))
             .expect("takes the interrupt");
         for _ in 0..25 {
-            if carried_times(&retained(&host.runtime), b"kr-interrupted.") >= times {
+            if carried_times(&retained(&host.runtime), b"kr-interrupted.") >= said {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
             started.elapsed() < LIVENESS_DEADLINE,
-            "waited {:?} for the application to say it was interrupted {times} times",
+            "waited {:?} for the application to say it took an interrupt",
             started.elapsed()
         );
     }
