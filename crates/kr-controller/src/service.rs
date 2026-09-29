@@ -733,10 +733,7 @@ mod one_barrier_for_every_restriction;
 #[cfg(test)]
 mod the_debt_pass;
 
-/// A privacy change and a rename whose admission lapses while they wait for what they write to.
+/// A privacy change and a rename whose admission lapses while they wait for what they write to, and
+/// the tick that takes a session for ended only when the registry shows its launch is over.
 #[cfg(test)]
 mod a_change_that_waits_for_its_store;
-
-/// Which launches the registry shows to be over, as privacy mode's tick asks.
-#[cfg(test)]
-mod a_launch_that_has_not_finished;

@@ -8,6 +8,9 @@
 //! ahead of it, hold what it will wait for from outside, let it go on, let the admission lapse
 //! while it waits, and read back that nothing was written: once because the action's deadline
 //! passed, on a clock the test moves, and once because its connection was withdrawn.
+//!
+//! The tick that decides which sessions have ended is tested here too: it takes a session for ended
+//! only when the registry shows its launch is over.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,17 +22,18 @@ use kr_protocol::describe::SessionRenameParams;
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    ActionId, ActionWindowId, BuildId, ConnectionId, EnvironmentId, RequestId, SessionEpoch,
-    SessionId,
+    ActionId, ActionWindowId, ActorId, BuildId, ConnectionId, EnvironmentId, RequestId,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::privacy::PrivacySetParams;
-use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{DisplayNumber, SessionState, SessionSummary, ShellMode};
 use kr_transport::clock::ManualClock;
 
 use crate::error::ControllerError;
 use crate::privacy::PRIVACY_RECORD;
+use crate::registry::LaunchPhase;
 use crate::service::{Clocks, Controller, ControllerSetup, WallClock};
 use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 
@@ -395,4 +399,159 @@ async fn a_privacy_change_whose_deadline_passes_while_it_waits_for_the_record_ch
 async fn a_privacy_change_whose_connection_is_withdrawn_while_it_waits_for_the_record_changes_nothing()
  {
     a_privacy_change_whose_admission_lapses_while_it_waits(Lapse::Withdrawal).await;
+}
+
+/// Reserves a session, the way a create does before it starts anything, and records the phase its
+/// launch has reached.
+async fn reserved(controller: &Controller, token: u8, phase: LaunchPhase) -> SessionId {
+    let mut registry = controller.registry.lock().await;
+    let reservation = registry
+        .reserve(
+            &ActorId::new("local:501").expect("a principal"),
+            Uuid::from_bytes([token; 16]),
+            Digest256::from_bytes([3; 32]),
+            b"intent",
+            TimestampMs::new(1),
+        )
+        .expect("reserves")
+        .reservation;
+    if phase != LaunchPhase::Reserved {
+        registry
+            .set_phase(reservation.reservation_id, phase)
+            .expect("the phase is recorded");
+    }
+    reservation.session_id
+}
+
+/// Records that the launch of an already reserved session has reached `phase`.
+async fn recorded_as(controller: &Controller, session_id: SessionId, phase: LaunchPhase) {
+    let mut registry = controller.registry.lock().await;
+    let reservation_id = registry
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    registry
+        .set_phase(reservation_id, phase)
+        .expect("the phase is recorded");
+}
+
+/// KR-REQ-24.28: a reservation in any phase before its launch has failed or its session has
+/// closed is a worker that may be starting or running, so its session is not over; a session the
+/// registry holds no reservation for, one whose launch failed and one that closed are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
+    let (_temp, controller, _clock) = daemon().await;
+    let mut asked: Vec<SessionId> = Vec::new();
+    let mut expected: Vec<SessionId> = Vec::new();
+    for (token, (phase, over)) in [
+        (LaunchPhase::Reserved, false),
+        (LaunchPhase::Spawned, false),
+        (LaunchPhase::Claimed, false),
+        (LaunchPhase::Live, false),
+        (LaunchPhase::Fenced, false),
+        (LaunchPhase::Failed, true),
+        (LaunchPhase::Closed, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session_id = reserved(
+            &controller,
+            u8::try_from(token).expect("a small token") + 1,
+            phase,
+        )
+        .await;
+        asked.push(session_id);
+        if over {
+            expected.push(session_id);
+        }
+    }
+    // A session the registry holds nothing for is over too: no launch can come of it.
+    let unknown = SessionId::new(kr_ipc::new_uuid());
+    asked.push(unknown);
+    expected.push(unknown);
+
+    let mut over = super::start::launches_over(&controller, &asked).await;
+    over.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(over, expected);
+    assert!(
+        super::start::launches_over(&controller, &[])
+            .await
+            .is_empty(),
+        "nothing asked, nothing over"
+    );
+}
+
+/// KR-REQ-24.28: privacy mode's tick takes a session for ended only on the registry's evidence.
+/// Two sessions owe their cleanup and have no worker: one whose launch was claimed, one whose
+/// reservation was fenced. Through every pass of the tick each may still have a worker, so turning
+/// privacy mode off is refused; it stays refused while one of them is left, and once the registry
+/// records that both launches failed the next pass takes them for ended and privacy mode is turned
+/// off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over() {
+    let (_temp, controller, _clock) = daemon().await;
+    let claimed = reserved(&controller, 1, LaunchPhase::Claimed).await;
+    let fenced = reserved(&controller, 2, LaunchPhase::Fenced).await;
+    let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
+    controller
+        .privacy
+        .enable(&[claimed, fenced], kr_ipc::now_ms(), &standing)
+        .expect("privacy mode is turned on");
+
+    // The tick passes over both, more than once, and neither is taken for ended.
+    tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
+    let refused = controller
+        .privacy
+        .disable(kr_ipc::now_ms(), &standing)
+        .expect_err("a launch that may still produce a worker holds privacy mode on");
+    for session_id in [claimed, fenced] {
+        assert!(
+            refused.to_string().contains(&session_id.to_string()),
+            "the refusal names the session: {refused}"
+        );
+    }
+
+    // One launch is over, and the other may still produce a worker: it holds the change back.
+    recorded_as(&controller, claimed, LaunchPhase::Failed).await;
+    tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
+    let refused = controller
+        .privacy
+        .disable(kr_ipc::now_ms(), &standing)
+        .expect_err("the fenced launch still holds privacy mode on");
+    assert!(
+        refused.to_string().contains(&fenced.to_string()),
+        "{refused}"
+    );
+
+    // Both are over: the next pass takes them for ended, and privacy mode is turned off.
+    recorded_as(&controller, fenced, LaunchPhase::Failed).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = controller.privacy.status(kr_ipc::now_ms());
+        if [claimed, fenced].iter().all(|session_id| {
+            report.sessions.iter().any(|owed| {
+                owed.session_id == *session_id
+                    && matches!(
+                        owed.standing,
+                        kr_protocol::privacy::PrivacySessionStanding::WorkerEnded
+                    )
+            })
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never took the sessions for ended: {:?}",
+            report.sessions
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let off = controller
+        .privacy
+        .disable(kr_ipc::now_ms(), &standing)
+        .expect("sessions whose launches are over do not hold privacy mode on");
+    assert!(!off.enabled);
 }
