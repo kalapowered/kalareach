@@ -868,12 +868,28 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
         (live, recorded, Arc::clone(&controller.privacy))
     };
     let now_ms = kr_ipc::now_ms();
+    // A session that is neither running nor recorded is not thereby one that has ended: its worker
+    // may not have reported yet. The registry says whether its launch is over.
+    let over = match &recorded {
+        Some(recorded) => {
+            let unreached = {
+                let privacy = Arc::clone(&privacy);
+                let (live, recorded) = (live.clone(), recorded.clone());
+                tokio::task::spawn_blocking(move || privacy.unreached(&live, &recorded))
+                    .await
+                    .unwrap_or_default()
+            };
+            let controller = daemon.upgrade()?;
+            launches_over(&controller, &unreached).await
+        }
+        None => Vec::new(),
+    };
     let notices = {
         let privacy = Arc::clone(&privacy);
         tokio::task::spawn_blocking(move || {
             if let Some(recorded) = recorded {
                 // An obligation that could not be written is held and written again by the tick.
-                let _ = privacy.sessions_seen(&live, &recorded, now_ms);
+                let _ = privacy.sessions_seen(&live, &recorded, &over, now_ms);
             }
             let _ = privacy.tick(now_ms);
             privacy.notices_due(now_ms)
@@ -889,6 +905,33 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
         let _ = tokio::task::spawn_blocking(move || privacy.note_answer(&ack)).await;
     }
     Some(())
+}
+
+/// The sessions among `unreached` whose launch the registry shows to be over: it records no
+/// reservation for them, or one whose launch produced no worker or whose session has closed.
+///
+/// A reservation in any phase before that, reserved, spawned, claimed, live or fenced, is a worker
+/// that may be starting or running and that this host has not reached, so its session is not over.
+/// A registry that cannot be read says nothing about any of them, and none is.
+async fn launches_over(controller: &Controller, unreached: &[SessionId]) -> Vec<SessionId> {
+    if unreached.is_empty() {
+        return Vec::new();
+    }
+    let registry = controller.registry.lock().await;
+    let mut over = Vec::new();
+    for session_id in unreached {
+        match registry.reservation_for_session(*session_id) {
+            Ok(None) => over.push(*session_id),
+            Ok(Some(reservation))
+                if matches!(reservation.phase, LaunchPhase::Failed | LaunchPhase::Closed) =>
+            {
+                over.push(*session_id);
+            }
+            Ok(Some(_)) => {}
+            Err(_) => return Vec::new(),
+        }
+    }
+    over
 }
 
 /// Tells one worker the environment's privacy generation, and returns its answer; `None` once the

@@ -425,9 +425,16 @@ impl Environment {
     /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts a worker on
     /// the tree, and starts the daemon again, which adopts the worker.
     async fn start() -> Self {
+        Self::start_seeded(|_| ()).await
+    }
+
+    /// Starts as [`Self::start`] does, after `seed` has been given the environment's state
+    /// directory while no daemon runs on it.
+    async fn start_seeded(seed: impl FnOnce(&std::path::Path)) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start(&owner).await;
         let stopped = host.shut_down().await;
+        seed(stopped.tree().environment().state_dir());
         let worker = Worker::start(stopped.tree(), 1).await;
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
@@ -1753,6 +1760,71 @@ async fn kr_req_24_14_a_pin_outlives_the_session_closing() {
     assert_eq!(cleared.source, LabelSource::Metadata);
     assert!(!cleared.pinned);
     reader.close();
+    environment.stop().await;
+}
+
+/// KR-REQ-24.28: an obligation for a session that has no worker and no launch does not hold
+/// turning privacy mode off back. The record a daemon that stopped left says privacy mode is on and
+/// that one more session, whose journal is on the disk, owes its cleanup; no worker is recorded for
+/// it and the registry holds no reservation that could still produce one, so the daemon takes it for
+/// ended and says so. Privacy mode is then turned off, and the obligation stays, because what the
+/// session kept is the archive's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_28_an_obligation_with_no_worker_and_no_launch_does_not_hold_privacy_mode_on() {
+    let gone = SessionId::new(kr_ipc::new_uuid());
+    let environment = Environment::start_seeded(|state_dir| {
+        let record =
+            rusqlite::Connection::open(state_dir.join(PRIVACY_RECORD)).expect("the privacy record");
+        record
+            .execute(
+                "UPDATE privacy_record SET generation = 1, enabled = 1, changed_at_ms = ?1
+                  WHERE id = 0",
+                [i64::try_from(now().get()).expect("a time")],
+            )
+            .expect("privacy mode is on in the record");
+        record
+            .execute(
+                "INSERT INTO privacy_obligations (session_id, generation, recorded_at_ms)
+                 VALUES (?1, 1, ?2)",
+                rusqlite::params![
+                    gone.to_string(),
+                    i64::try_from(now().get()).expect("a time")
+                ],
+            )
+            .expect("an obligation for a session that has gone");
+    })
+    .await;
+
+    // The daemon read the record: privacy mode is on. Its live session answers for itself; the
+    // session that has gone is taken for ended.
+    let report = environment
+        .status_until(
+            "the daemon taking the session that has gone for ended",
+            |report| {
+                report.enabled
+                    && report.sessions.iter().any(|owed| {
+                        owed.session_id == gone
+                            && matches!(owed.standing, PrivacySessionStanding::WorkerEnded)
+                    })
+                    && report.sessions.iter().all(|owed| owed.session_id == gone)
+            },
+        )
+        .await;
+    assert!(
+        !matches!(report.completion, PrivacyCompletion::Complete),
+        "what the session that has gone kept is not gone: {:?}",
+        report.completion
+    );
+    let off = environment
+        .set(false)
+        .await
+        .expect("a session that has gone does not hold privacy mode on");
+    assert!(!off.enabled);
+    assert!(
+        off.sessions.iter().any(|owed| owed.session_id == gone),
+        "its obligation stays: {:?}",
+        off.sessions
+    );
     environment.stop().await;
 }
 

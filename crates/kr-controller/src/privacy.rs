@@ -815,13 +815,44 @@ impl EnvironmentPrivacy {
         }
     }
 
+    /// Returns the sessions this record follows or holds an obligation for whose worker it has no
+    /// news of: neither running nor recorded, and not yet taken for ended.
+    ///
+    /// The daemon asks its registry about each one ([`Self::sessions_seen`]), because a worker that
+    /// is not recorded may not have reported yet: a session whose launch is still in progress has a
+    /// journal on the disk and no worker the registry lists, and is one this host has not reached,
+    /// not one that has ended.
+    #[must_use]
+    pub fn unreached(&self, live: &[SessionId], recorded: &[SessionId]) -> Vec<SessionId> {
+        let inner = self.inner();
+        inner
+            .sessions
+            .keys()
+            .chain(inner.obligations.keys())
+            .filter(|session_id| !recorded.contains(session_id) && !live.contains(session_id))
+            .filter(|session_id| {
+                inner
+                    .sessions
+                    .get(session_id)
+                    .is_none_or(|progress| progress.reach != Reach::Ended)
+            })
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Brings what this record knows of the sessions' workers into line with the daemon's: each
-    /// session in `live` has a worker running, and each session this record follows or holds an
-    /// obligation for that neither `live` nor `recorded` lists has ended, because no worker is
-    /// recorded for it that could answer. That covers a session that closed before privacy mode was
-    /// turned on and whose output is still on the disk, and every obligation a restart read back
-    /// before any worker was seen. A session `recorded` lists and `live` does not keeps what was
-    /// known of it, because a worker this daemon has not reached yet is not one that has ended.
+    /// session in `live` has a worker running, and each session in `over` has ended.
+    ///
+    /// `over` is what the daemon's registry shows to be over: a session that is neither running nor
+    /// recorded ([`Self::unreached`]) and whose launch it has no record of, or recorded as failed or
+    /// closed, so no worker is coming for it that could answer. That covers a session that closed
+    /// before privacy mode was turned on and whose output is still on the disk, and every obligation
+    /// a restart read back before any worker was seen. A session that is not in `over` keeps what
+    /// was known of it, and a session `recorded` lists and `live` does not is never taken for
+    /// ended: a worker this daemon has not reached yet, or whose launch has not finished, is not one
+    /// that has ended, and turning privacy mode off waits for it.
     ///
     /// # Errors
     ///
@@ -831,20 +862,13 @@ impl EnvironmentPrivacy {
         &self,
         live: &[SessionId],
         recorded: &[SessionId],
+        over: &[SessionId],
         now_ms: TimestampMs,
     ) -> Result<()> {
-        let ended: BTreeSet<SessionId> = {
-            let inner = self.inner();
-            inner
-                .sessions
-                .keys()
-                .chain(inner.obligations.keys())
-                .filter(|session_id| !recorded.contains(session_id) && !live.contains(session_id))
-                .copied()
-                .collect()
-        };
-        for session_id in ended {
-            self.note_session_ended(session_id);
+        for session_id in over {
+            if !recorded.contains(session_id) && !live.contains(session_id) {
+                self.note_session_ended(*session_id);
+            }
         }
         let mut refused = None;
         for session_id in live {
@@ -3479,10 +3503,10 @@ mod tests {
 
     /// A session that closed before privacy mode was turned on, whose output is still on the
     /// disk, owes its cleanup like every other; but no worker is recorded for it that could
-    /// answer, so once the daemon has looked at its workers the session is taken as ended: its
-    /// obligation stays, reported with the archive named as what holds its output, and it does not
-    /// hold turning privacy mode off back. The same holds after a restart, which reads the
-    /// obligation back before any worker has been seen.
+    /// answer, and once the daemon's registry shows its launch is over the session is taken as
+    /// ended: its obligation stays, reported with the archive named as what holds its output, and
+    /// it does not hold turning privacy mode off back. The same holds after a restart, which reads
+    /// the obligation back before any worker has been seen.
     #[test]
     fn a_session_with_no_worker_recorded_is_ended_and_does_not_hold_disabling_back() {
         let host = Host::open();
@@ -3492,7 +3516,7 @@ mod tests {
         let host = host.restarted();
         host.privacy.resume(at(10));
         host.privacy
-            .sessions_seen(&[], &[], at(20))
+            .sessions_seen(&[], &[], &host.privacy.unreached(&[], &[]), at(20))
             .expect("the workers are seen");
         let report = host.privacy.report_now(at(30));
         assert_eq!(report.obligations.len(), 1);
@@ -3514,6 +3538,58 @@ mod tests {
         );
     }
 
+    /// A session whose launch is still in progress is not one that has ended. Its journal is on
+    /// the disk, so turning privacy mode on obliges it, but its worker has not reported: the
+    /// daemon finds it neither running nor recorded, and the registry shows no evidence that the
+    /// launch is over. Its obligation holds turning privacy mode off back, and so does the worker
+    /// once it is running, until it has been told the generation and answered that its cleanup is
+    /// complete; otherwise it would come up under the generation after and never remove what it
+    /// kept while privacy mode was on.
+    #[test]
+    fn a_session_still_launching_is_not_ended_and_holds_disabling_back() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[session(9)], at(0), &standing)
+            .expect("privacy mode is enabled");
+        // The daemon looks and finds no worker; the registry gives no evidence that it is over,
+        // so the session is not taken as ended, whatever the tick sees next.
+        assert_eq!(host.privacy.unreached(&[], &[]), vec![session(9)]);
+        host.privacy
+            .sessions_seen(&[], &[], &[], at(10))
+            .expect("the workers are seen");
+        assert_eq!(host.privacy.unreached(&[], &[]), vec![session(9)]);
+        let refused = host
+            .privacy
+            .disable(at(20), &standing)
+            .expect_err("a session that may still start holds privacy mode on");
+        assert!(
+            matches!(refused, ControllerError::Refused { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains(&session(9).to_string()),
+            "the refusal names the session: {refused}"
+        );
+
+        // Its worker reports, is told the generation in force and answers that it is complete.
+        host.privacy
+            .sessions_seen(&[session(9)], &[session(9)], &[], at(30))
+            .expect("the worker is seen");
+        let notices = host.privacy.notices_due(at(40));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].session_id, session(9));
+        assert!(notices[0].enabled);
+        host.privacy
+            .note_answer(&ack(session(9), 1, true, PrivacyCompletion::Complete))
+            .expect("the answer is recorded");
+        let report = host
+            .privacy
+            .disable(at(50), &standing)
+            .expect("nothing is owed now");
+        assert!(!report.enabled);
+        assert!(report.obligations.is_empty());
+    }
+
     /// An environment that never turned privacy mode on owes its workers nothing: none is told
     /// anything at the initial generation, so the report is complete with workers running, and
     /// asking to turn it off, once or again after a pass of the tick, answers that it is off and
@@ -3522,7 +3598,12 @@ mod tests {
     fn an_environment_that_never_turned_privacy_mode_on_owes_its_workers_nothing() {
         let host = Host::open();
         host.privacy
-            .sessions_seen(&[session(1), session(2)], &[session(1), session(2)], at(0))
+            .sessions_seen(
+                &[session(1), session(2)],
+                &[session(1), session(2)],
+                &[],
+                at(0),
+            )
             .expect("the workers are seen");
         assert!(host.privacy.notices_due(at(10)).is_empty());
         let report = host.privacy.report_now(at(20));
