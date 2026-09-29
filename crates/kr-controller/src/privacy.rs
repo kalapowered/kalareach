@@ -111,6 +111,24 @@ pub struct SendAdmission<'a> {
     _held: std::sync::RwLockReadGuard<'a, Published>,
 }
 
+/// One reading of [`PrivacyState`], held: a change of state waits until it is dropped.
+///
+/// What is decided under it is decided wholly before a change of privacy mode is published, or
+/// wholly after, so it is held from the reading until the decision is made and never while waiting
+/// for anything else.
+#[derive(Debug)]
+pub struct Reading<'a> {
+    held: std::sync::RwLockReadGuard<'a, Published>,
+}
+
+impl Reading<'_> {
+    /// The state this reading holds.
+    #[must_use]
+    pub fn published(&self) -> Published {
+        *self.held
+    }
+}
+
 /// One reading of [`PrivacyState`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Published {
@@ -121,6 +139,14 @@ pub struct Published {
 }
 
 impl PrivacyState {
+    /// A state that holds `published`, for this crate's own tests of its readers.
+    #[cfg(test)]
+    pub(crate) fn at(published: Published) -> Self {
+        let state = Self::default();
+        state.publish(published);
+        state
+    }
+
     /// Returns the state as it stands now.
     #[must_use]
     pub fn now(&self) -> Published {
@@ -134,6 +160,21 @@ impl PrivacyState {
     #[must_use]
     pub fn is_private(&self) -> bool {
         self.now().private
+    }
+
+    /// Reads the state and holds it, so a change of state waits until the reading is dropped.
+    ///
+    /// A reader that decides something from the state, such as whether generated text may be
+    /// shown, decides it under this rather than from a copy taken earlier: a copy read before a
+    /// wait would still say what the state was before a change published during the wait.
+    #[must_use]
+    pub fn reading(&self) -> Reading<'_> {
+        Reading {
+            held: self
+                .published
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
     }
 
     /// Admits one delivery exchange, a send or a question about one, whose work was admitted under
@@ -3155,7 +3196,7 @@ mod tests {
             .expect("a name is pinned");
         assert_eq!(
             host.descriptions
-                .describe(session(1), &facts, whole, host.privacy.state().now())
+                .describe(session(1), &facts, whole, &host.privacy.state())
                 .expect("a read")
                 .source,
             kr_protocol::describe::LabelSource::Generated
@@ -3176,7 +3217,7 @@ mod tests {
         );
         let described = host
             .descriptions
-            .describe(session(1), &facts, whole, host.privacy.state().now())
+            .describe(session(1), &facts, whole, &host.privacy.state())
             .expect("a read");
         assert_eq!(
             described.source,
@@ -3186,7 +3227,7 @@ mod tests {
         assert!(described.activity_text.0.is_none());
         let pinned = host
             .descriptions
-            .describe(session(2), &facts, whole, host.privacy.state().now())
+            .describe(session(2), &facts, whole, &host.privacy.state())
             .expect("a read");
         assert_eq!(pinned.title, "Release prep");
     }
@@ -3537,5 +3578,143 @@ mod tests {
         assert!(!stored.enabled);
         assert!(!host.privacy.state().is_private());
         assert_eq!(host.backup.fenced_at().expect("a read"), None);
+    }
+
+    /// KR-REQ-22.17: a description read that is deciding when privacy mode is turned on finishes
+    /// before the change is published. The change waits for it, so the generated text it answers
+    /// was decided before the boundary, and a read after the change answers the metadata title.
+    #[test]
+    fn a_description_read_in_progress_is_decided_before_privacy_mode_is_published() {
+        let host = Host::open();
+        let other =
+            kr_describe::store::DescriptionStore::open(host.root.path()).expect("the same store");
+        other
+            .publish(
+                &session(1),
+                &crate::describe::tests::generated("Pairing check", PrivacyGeneration::INITIAL),
+                900,
+            )
+            .expect("a description");
+        let facts = kr_describe::metadata::SessionFacts {
+            directory: Some("kalareach".to_owned()),
+            ..kr_describe::metadata::SessionFacts::default()
+        };
+        let whole = crate::describe::HistoryReach::WholeSession;
+        let state = host.privacy.state();
+        let (arrived, release) = host.descriptions.pauses.before_decision.arm();
+        std::thread::scope(|scope| {
+            let release = release;
+            let reading = scope.spawn(|| {
+                host.descriptions
+                    .describe(session(1), &facts, whole, &state)
+            });
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the read is deciding");
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !enabling.is_finished(),
+                "the change waits for the read that is deciding"
+            );
+            // Read from the file rather than from the state: a reader of the state would queue
+            // behind the change that is waiting, as every new reader does.
+            let recorded: i64 = rusqlite::Connection::open(host.root.path().join(PRIVACY_RECORD))
+                .expect("a second connection to the record")
+                .query_row(
+                    "SELECT generation FROM privacy_record WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the record reads");
+            assert_eq!(recorded, 0, "and nothing is recorded meanwhile");
+            release.send(()).expect("the read goes on");
+            let answered = reading.join().expect("the read ends").expect("an answer");
+            assert_eq!(
+                answered.source,
+                kr_protocol::describe::LabelSource::Generated,
+                "decided before the boundary"
+            );
+            enabling
+                .join()
+                .expect("the change ends")
+                .expect("privacy mode is enabled");
+        });
+        let after = host
+            .descriptions
+            .describe(session(1), &facts, whole, &state)
+            .expect("a read");
+        assert_eq!(after.source, kr_protocol::describe::LabelSource::Metadata);
+        assert!(after.activity_text.0.is_none());
+    }
+
+    /// KR-REQ-22.17: a description read that waited for the store while privacy mode was turned on
+    /// decides under the state as it stands once the store is its own, not under the state it
+    /// found before it waited. The generated description is still in the store, its removal
+    /// waiting behind the read for the store, and the read answers the metadata title.
+    #[test]
+    fn a_description_read_that_waited_across_the_change_answers_the_metadata_title() {
+        let host = Host::open();
+        let other =
+            kr_describe::store::DescriptionStore::open(host.root.path()).expect("the same store");
+        other
+            .publish(
+                &session(1),
+                &crate::describe::tests::generated("Pairing check", PrivacyGeneration::INITIAL),
+                900,
+            )
+            .expect("a description");
+        let facts = kr_describe::metadata::SessionFacts {
+            directory: Some("kalareach".to_owned()),
+            ..kr_describe::metadata::SessionFacts::default()
+        };
+        let whole = crate::describe::HistoryReach::WholeSession;
+        let state = host.privacy.state();
+        // The read holds the store and has not looked at the state yet.
+        let (arrived, release) = host.descriptions.pauses.before_reading.arm();
+        std::thread::scope(|scope| {
+            let release = release;
+            let reading = scope.spawn(|| {
+                host.descriptions
+                    .describe(session(1), &facts, whole, &state)
+            });
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the read holds the store");
+            // Privacy mode is turned on and published while the read waits. The removal of the
+            // generated description that follows needs the store, so it waits behind the read.
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !state.is_private() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "privacy mode was not published"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!enabling.is_finished(), "the removal waits for the store");
+            assert_eq!(
+                other.generated_count().expect("a read"),
+                1,
+                "the generated description is still in the store"
+            );
+            release.send(()).expect("the read goes on");
+            let answered = reading.join().expect("the read ends").expect("an answer");
+            assert_eq!(
+                answered.source,
+                kr_protocol::describe::LabelSource::Metadata,
+                "decided under the state after the wait"
+            );
+            assert!(answered.activity_text.0.is_none());
+            enabling
+                .join()
+                .expect("the change ends")
+                .expect("privacy mode is enabled");
+        });
+        assert_eq!(
+            other.generated_count().expect("a read"),
+            0,
+            "the removal ran once the read was done"
+        );
     }
 }

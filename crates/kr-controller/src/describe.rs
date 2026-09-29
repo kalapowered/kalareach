@@ -14,9 +14,11 @@
 //!   off, only when it was produced under the generation in force, and only to a caller whose
 //!   history reaches the whole session: a description can summarise anything the session did, so a
 //!   grant that reaches back only part of the way is answered the pin or the deterministic title.
-//! * **Privacy mode shows metadata titles from the moment it is recorded.** The caller passes the
-//!   environment's published state with each read, and while it says private no generated text is
-//!   read at all; the privacy hook then removes every generated description and keeps every pin.
+//! * **Privacy mode shows metadata titles from the moment it is published.** Each read decides
+//!   under the environment's published state, held from the reading to the decision, so a change
+//!   of privacy mode waits for a read in progress and no generated text is decided after it; while
+//!   the state says private no generated text is read at all. The privacy hook then removes every
+//!   generated description and keeps every pin.
 //! * **A rename answers the pin, or the deterministic title after a clearing, never generated
 //!   text.** Its answer is kept with the action's claim so a retry is answered from it, where
 //!   privacy mode's removal does not reach, and a caller may rename a session it may not view;
@@ -41,7 +43,7 @@ use kr_worker::privacy::{
 };
 
 use crate::error::{ControllerError, Result};
-use crate::privacy::{Admitted, Published};
+use crate::privacy::{Admitted, PrivacyState, Published};
 
 /// How far back a caller's authority reaches into one session's history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +76,19 @@ impl HistoryReach {
 #[derive(Debug)]
 pub struct DescribeModule {
     store: Mutex<DescriptionStore>,
+    /// Where this crate's own tests stop a read.
+    #[cfg(test)]
+    pub(crate) pauses: Pauses,
+}
+
+/// The two places in a read that this crate's own tests stop it at.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Pauses {
+    /// With the store held, before the privacy state is read.
+    pub(crate) before_reading: crate::attention::Pause,
+    /// With the store and the privacy state held, before the answer is decided.
+    pub(crate) before_decision: crate::attention::Pause,
 }
 
 /// What one session is shown as.
@@ -94,6 +109,8 @@ impl DescribeModule {
             store: Mutex::new(
                 DescriptionStore::open(state_dir).map_err(ControllerError::registry)?,
             ),
+            #[cfg(test)]
+            pauses: Pauses::default(),
         })
     }
 
@@ -105,7 +122,9 @@ impl DescribeModule {
     ///
     /// `facts` are the host's own metadata for the session, which the deterministic title is built
     /// from; `reach` is how far the caller's authority reaches into the session's history; and
-    /// `privacy` is the environment's published state at the time of the read.
+    /// `privacy` is the environment's published state. It is read once the store is held and held
+    /// until the answer is decided, so a change of privacy mode waits for this read: the answer is
+    /// decided wholly before the change is published, or after it.
     ///
     /// # Errors
     ///
@@ -116,9 +135,17 @@ impl DescribeModule {
         session_id: SessionId,
         facts: &SessionFacts,
         reach: HistoryReach,
-        privacy: Published,
+        privacy: &PrivacyState,
     ) -> Result<SessionDescribeResult> {
-        let shown = self.shown(&self.store(), session_id, facts, reach, privacy)?;
+        let shown = {
+            let store = self.store();
+            #[cfg(test)]
+            self.pauses.before_reading.wait();
+            let reading = privacy.reading();
+            #[cfg(test)]
+            self.pauses.before_decision.wait();
+            self.shown(&store, session_id, facts, reach, reading.published())?
+        };
         let generated = shown.generated.as_ref();
         Ok(SessionDescribeResult {
             session_id,
@@ -305,9 +332,9 @@ impl crate::service::Controller {
         reach: HistoryReach,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let descriptions = std::sync::Arc::clone(&self.descriptions);
-        let privacy = self.privacy.state().now();
+        let privacy = self.privacy.state();
         let answer = tokio::task::spawn_blocking(move || {
-            descriptions.describe(summary.session_id, &facts_of(&summary), reach, privacy)
+            descriptions.describe(summary.session_id, &facts_of(&summary), reach, &privacy)
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
@@ -387,9 +414,9 @@ const fn protocol_source(source: LabelSource) -> kr_protocol::describe::LabelSou
 /// The session-metadata store as privacy mode sees it.
 ///
 /// This daemon runs no model, so there is no queue to fence, no job to take back and nothing in
-/// flight; reads stop showing generated text from the moment privacy mode is recorded, because
-/// they are given the published state. What is left is the removal: every generated description
-/// goes, and every pin stays.
+/// flight; reads stop showing generated text from the moment privacy mode is published, because
+/// each decides under the published state. What is left is the removal: every generated
+/// description goes, and every pin stays.
 #[derive(Debug)]
 pub struct DescriptionsPrivacy<'a> {
     module: &'a DescribeModule,
@@ -491,15 +518,15 @@ pub(crate) mod tests {
         }
     }
 
-    fn off() -> Published {
-        Published::default()
+    fn off() -> PrivacyState {
+        PrivacyState::at(Published::default())
     }
 
-    fn private(generation: u64) -> Published {
-        Published {
+    fn private(generation: u64) -> PrivacyState {
+        PrivacyState::at(Published {
             generation: PrivacyGeneration::new(generation),
             private: true,
-        }
+        })
     }
 
     /// An admission that stands: the write runs.
@@ -540,7 +567,7 @@ pub(crate) mod tests {
         drop(module);
         let module = DescribeModule::open(root.path()).expect("the store opens again");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::Partial, off())
+            .describe(session(1), &facts(), HistoryReach::Partial, &off())
             .expect("a read");
         assert_eq!(described.title, "KalaReach pairing");
         assert_eq!(described.source, Shown::Pinned);
@@ -581,7 +608,7 @@ pub(crate) mod tests {
             Recorded::NamePinned
         );
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, off())
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
             .expect("a read");
         assert_eq!(described.title, "Release prep");
         assert_eq!(described.source, Shown::Pinned);
@@ -601,7 +628,7 @@ pub(crate) mod tests {
         assert_eq!(cleared.source, Shown::Metadata);
         assert_eq!(cleared.title, "kalareach (main)");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, off())
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
             .expect("a read");
         assert_eq!(described.source, Shown::Generated);
         assert_eq!(described.title, "Pairing check");
@@ -620,13 +647,18 @@ pub(crate) mod tests {
             )
             .expect("a description");
         let open = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, off())
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
             .expect("a read");
         assert_eq!(open.source, Shown::Generated);
         assert!(open.provenance.0.is_some());
 
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, private(1))
+            .describe(
+                session(1),
+                &facts(),
+                HistoryReach::WholeSession,
+                &private(1),
+            )
             .expect("a read");
         assert_eq!(described.source, Shown::Metadata);
         assert_eq!(described.title, "kalareach (main)");
@@ -649,7 +681,12 @@ pub(crate) mod tests {
             )
             .expect("a description under the private generation");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, private(1))
+            .describe(
+                session(1),
+                &facts(),
+                HistoryReach::WholeSession,
+                &private(1),
+            )
             .expect("a read");
         assert_eq!(described.source, Shown::Metadata);
         assert!(described.activity_text.0.is_none());
@@ -665,7 +702,12 @@ pub(crate) mod tests {
             )
             .expect("a name is pinned while private");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, private(1))
+            .describe(
+                session(1),
+                &facts(),
+                HistoryReach::WholeSession,
+                &private(1),
+            )
             .expect("a read");
         assert_eq!(described.source, Shown::Pinned);
         assert_eq!(described.title, "Release prep");
@@ -708,23 +750,25 @@ pub(crate) mod tests {
                 900,
             )
             .expect("a description");
-        let at = |generation: u64| Published {
-            generation: PrivacyGeneration::new(generation),
-            private: false,
+        let at = |generation: u64| {
+            PrivacyState::at(Published {
+                generation: PrivacyGeneration::new(generation),
+                private: false,
+            })
         };
         let partial = module
-            .describe(session(1), &facts(), HistoryReach::Partial, at(2))
+            .describe(session(1), &facts(), HistoryReach::Partial, &at(2))
             .expect("a read");
         assert_eq!(partial.source, Shown::Metadata);
         assert!(partial.activity_text.0.is_none());
         let whole = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, at(2))
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &at(2))
             .expect("a read");
         assert_eq!(whole.source, Shown::Generated);
         assert_eq!(whole.title, "Pairing check");
         assert_eq!(whole.freshness, DescriptionFreshness::Stale);
         let later = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, at(3))
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &at(3))
             .expect("a read");
         assert_eq!(
             later.source,
@@ -762,7 +806,7 @@ pub(crate) mod tests {
             Err(ControllerError::InvalidArgument(_))
         ));
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, off())
+            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
             .expect("a read");
         assert_eq!(described.title, "Release prep");
     }
