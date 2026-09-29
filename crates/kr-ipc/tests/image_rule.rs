@@ -490,8 +490,8 @@ fn module_directory(file: &Path, roots: &BTreeSet<PathBuf>) -> PathBuf {
     }
 }
 
-/// The root of every target of the workspace's packages, as Cargo lists them.
-fn crate_roots(workspace: &Path) -> BTreeSet<PathBuf> {
+/// What Cargo says of the workspace's packages, without resolving any dependency.
+fn cargo_metadata(workspace: &Path) -> serde_json::Value {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = std::process::Command::new(cargo)
         .args([
@@ -510,22 +510,81 @@ fn crate_roots(workspace: &Path) -> BTreeSet<PathBuf> {
         "cargo metadata: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("cargo metadata's JSON");
+    serde_json::from_slice(&output.stdout).expect("cargo metadata's JSON")
+}
+
+/// A target's root, as a path this reading compares.
+fn root_of(target: &serde_json::Value) -> Option<PathBuf> {
+    let path = target["src_path"].as_str()?;
+    Some(normalise(
+        &Path::new(path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(path)),
+    ))
+}
+
+/// The root of every target of the workspace's packages, as Cargo lists them.
+fn crate_roots(metadata: &serde_json::Value) -> BTreeSet<PathBuf> {
     metadata["packages"]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|package| package["targets"].as_array().into_iter().flatten())
-        .filter_map(|target| target["src_path"].as_str())
-        .map(|path| {
-            normalise(
-                &Path::new(path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(path)),
-            )
-        })
+        .filter_map(root_of)
         .collect()
+}
+
+/// The roots of the library and program targets of the packages under `crates/` that are not under
+/// their package's `src/`, as paths relative to `workspace`.
+///
+/// This reading covers `crates/*/src`, so a program whose root is elsewhere, a `path` in a
+/// `[[bin]]` among them, would go unread: each is named here, and the guard fails on one rather
+/// than pass over it.
+fn roots_outside_src(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
+    const PRODUCTION: [&str; 7] = [
+        "lib",
+        "rlib",
+        "dylib",
+        "cdylib",
+        "staticlib",
+        "proc-macro",
+        "bin",
+    ];
+    let mut outside = Vec::new();
+    for package in metadata["packages"].as_array().into_iter().flatten() {
+        let Some(manifest) = package["manifest_path"].as_str() else {
+            continue;
+        };
+        let directory = normalise(
+            Path::new(manifest)
+                .parent()
+                .unwrap_or_else(|| Path::new("")),
+        );
+        if !directory.starts_with(workspace.join("crates")) {
+            continue;
+        }
+        for target in package["targets"].as_array().into_iter().flatten() {
+            let production = target["kind"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|kind| PRODUCTION.contains(&kind));
+            let Some(root) = root_of(target) else {
+                continue;
+            };
+            if production && !root.starts_with(directory.join("src")) {
+                outside.push(
+                    root.strip_prefix(workspace)
+                        .unwrap_or(&root)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    outside.sort();
+    outside
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -656,8 +715,8 @@ fn production_uses(
 }
 
 /// Every production use of [`NAME`] under `crates/*/src`, as `(file, line)` relative to the
-/// workspace, the number of files read, and the crates' roots.
-fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize, BTreeSet<PathBuf>) {
+/// workspace, and the number of files read, given the crates' `roots`.
+fn uses_in(workspace: &Path, roots: &BTreeSet<PathBuf>) -> (Vec<(String, usize)>, usize) {
     let mut files = Vec::new();
     let crates = workspace.join("crates");
     let mut members: Vec<PathBuf> = std::fs::read_dir(&crates)
@@ -679,8 +738,7 @@ fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize, BTreeSet<PathBuf>)
             )
         })
         .collect();
-    let roots = crate_roots(workspace);
-    let uses = production_uses(&sources, &roots)
+    let uses = production_uses(&sources, roots)
         .into_iter()
         .map(|(file, line)| {
             let relative = file
@@ -691,17 +749,26 @@ fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize, BTreeSet<PathBuf>)
             (relative, line)
         })
         .collect();
-    (uses, files.len(), roots)
+    (uses, files.len())
 }
 
 /// No production code in the host's crates asks where its program is, but the install module.
 #[test]
 fn only_the_install_module_asks_where_its_program_is() {
     let workspace = workspace();
-    let (uses, files, roots) = uses_in(&workspace);
+    let metadata = cargo_metadata(&workspace);
+    let roots = crate_roots(&metadata);
+    let (uses, files) = uses_in(&workspace, &roots);
     assert!(
         files > 500,
         "the whole of crates/*/src was read, and it was: {files} files"
+    );
+    let outside_src = roots_outside_src(&metadata, &workspace);
+    assert!(
+        outside_src.is_empty(),
+        "these library and program roots of the host's crates are not under their crate's src/, \
+         which this reading covers, so nothing of them was read:\n{}",
+        outside_src.join("\n")
     );
     for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
         assert!(
@@ -935,4 +1002,46 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
         ),
         vec!["src/bin/tool.rs"]
     );
+}
+
+/// A library or program whose root is not under its crate's `src/` is named, so the guard cannot
+/// pass over it: only the targets that ship in a program are held to it, and only the crates of
+/// the host.
+#[test]
+fn a_root_outside_the_source_directory_is_named() {
+    let metadata = serde_json::json!({ "packages": [
+        {
+            "manifest_path": "/w/crates/a/Cargo.toml",
+            "targets": [
+                { "kind": ["lib"], "src_path": "/w/crates/a/src/lib.rs" },
+                { "kind": ["bin"], "src_path": "/w/crates/a/src/bin/tool.rs" },
+                { "kind": ["test"], "src_path": "/w/crates/a/tests/checks.rs" },
+                { "kind": ["custom-build"], "src_path": "/w/crates/a/build.rs" },
+            ],
+        },
+        {
+            "manifest_path": "/w/crates/b/Cargo.toml",
+            "targets": [
+                { "kind": ["bin"], "src_path": "/w/crates/b/tools/tool.rs" },
+                { "kind": ["cdylib", "rlib"], "src_path": "/w/crates/b/native/lib.rs" },
+            ],
+        },
+        {
+            "manifest_path": "/w/apps/c/Cargo.toml",
+            "targets": [{ "kind": ["bin"], "src_path": "/w/apps/c/main.rs" }],
+        },
+    ]});
+    assert_eq!(
+        roots_outside_src(&metadata, Path::new("/w")),
+        vec!["crates/b/native/lib.rs", "crates/b/tools/tool.rs"]
+    );
+    // The control: nothing is named when every root is where the reading looks.
+    let inside = serde_json::json!({ "packages": [{
+        "manifest_path": "/w/crates/a/Cargo.toml",
+        "targets": [
+            { "kind": ["lib"], "src_path": "/w/crates/a/src/lib.rs" },
+            { "kind": ["bin"], "src_path": "/w/crates/a/src/bin/tool.rs" },
+        ],
+    }]});
+    assert!(roots_outside_src(&inside, Path::new("/w")).is_empty());
 }
