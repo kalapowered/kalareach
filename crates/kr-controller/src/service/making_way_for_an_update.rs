@@ -195,6 +195,26 @@ fn a_late_stop_of_an_attempt_that_is_over_ends_nothing() {
     assert!(lapsed.stop(Some(attempt)).is_err());
 }
 
+/// A daemon answers a `prepare` as prepared only while its attempt is the gate's: an attempt that
+/// was resumed, superseded or lapsed while the daemon waited for its creates is over.
+#[test]
+fn an_attempt_is_current_only_until_it_is_over() {
+    let handover = Handover::default();
+    let first = begin(&handover, Duration::from_secs(300));
+    assert!(handover.is_current(first));
+    handover.resume(Some(first)).expect("resumes");
+    assert!(!handover.is_current(first), "a resumed attempt is over");
+    let second = begin(&handover, Duration::from_secs(300));
+    let third = begin(&handover, Duration::from_secs(300));
+    assert!(!handover.is_current(second), "a superseded attempt is over");
+    assert!(handover.is_current(third));
+    handover.end(third);
+    assert!(!handover.is_current(third), "an ended attempt is over");
+    // The control: a hold that has lapsed is over as well.
+    let lapsed = begin(&handover, Duration::ZERO);
+    assert!(!handover.is_current(lapsed));
+}
+
 /// The whole handover through the daemon's own door: `prepare` answers how the daemon was
 /// started and closes the gate, a create is refused while it is closed and started after
 /// `resume`, and a second `prepare` and a `stop` end the daemon's service.

@@ -733,6 +733,14 @@ impl Handover {
         Ok(attempt)
     }
 
+    /// Whether `attempt` is still the attempt the gate is closed for, within its hold: whether a
+    /// step that acts for it may still be answered.
+    pub(super) fn is_current(&self, attempt: Uuid) -> bool {
+        self.lock().closed.as_ref().is_some_and(|closed| {
+            closed.attempt == attempt && std::time::Instant::now() < closed.until
+        })
+    }
+
     /// Ends `attempt` and opens the gate, if it is still the attempt the gate is closed for.
     pub(super) fn end(&self, attempt: Uuid) {
         let mut gate = self.lock();
@@ -862,6 +870,17 @@ impl Controller {
                             HANDOVER_SETTLE_MS / 1000,
                             params.target
                         ),
+                    });
+                }
+                // An attempt that ended while the creates settled, resumed or superseded, is not
+                // one this daemon answers as prepared: nothing acts on an attempt that is over.
+                if !self.handover.is_current(attempt) {
+                    return Err(ControllerError::Refused {
+                        code: ErrorCode::ResourceUnavailable,
+                        detail: "the attempt this control daemon was preparing under ended while \
+                                 it waited for the sessions it was creating, so it does not make \
+                                 way; prepare it again"
+                            .to_owned(),
                     });
                 }
                 Some(attempt)
