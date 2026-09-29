@@ -1025,7 +1025,8 @@ pub(crate) fn close_answer_shown<'a>(
         .filter(|(name, _)| name != DESCRIPTION)
         .cloned()
         .collect();
-    // An answer that could not be written again without the description is not written with it.
+    // Taking one entry out of a canonical map leaves it ordered and free of duplicates, so this
+    // does not fail; were it ever to, the answer is not written with the description.
     let outcome = CanonicalMap::from_sorted_entries(kept).map_or_else(
         |error| {
             Outcome::Error(kr_protocol::error::ProtocolError::new(

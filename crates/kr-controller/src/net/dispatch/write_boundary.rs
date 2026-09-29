@@ -1388,21 +1388,33 @@ async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to
         let asked = connection
             .ask(Some(session_id), Method::SessionClose.entry(), false)
             .expect("the grant admits the close");
-        // The acceptance as a worker that added a member to it later would write it.
-        let kr_cbor::CanonicalValue::Map(mut members) =
-            kr_protocol::envelope::ParamsValue::from_typed(&acceptance(session_id))
-                .expect("encodes")
-                .into_value()
-        else {
-            panic!("an acceptance is a map");
+        // The acceptance as a worker that added a member to it later would write it, and as it
+        // goes to a device that may not read the session: the same, without the description.
+        let written_by_a_newer_worker = |answer: &kr_protocol::session::SessionCloseResult| {
+            let kr_cbor::CanonicalValue::Map(mut members) =
+                kr_protocol::envelope::ParamsValue::from_typed(answer)
+                    .expect("encodes")
+                    .into_value()
+            else {
+                panic!("an acceptance is a map");
+            };
+            members
+                .insert(
+                    "added_later".to_owned(),
+                    kr_cbor::CanonicalValue::text("as written"),
+                )
+                .expect("a member the acceptance does not have");
+            members
         };
-        members
-            .insert(
-                "added_later".to_owned(),
-                kr_cbor::CanonicalValue::text("as written"),
-            )
-            .expect("a member the acceptance does not have");
-        let newer = kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(members));
+        let accepted = acceptance(session_id);
+        let whole = written_by_a_newer_worker(&accepted);
+        let without_the_description =
+            written_by_a_newer_worker(&kr_protocol::session::SessionCloseResult {
+                session: None,
+                ..accepted
+            });
+        let newer =
+            kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(whole.clone()));
         assert!(
             newer
                 .to_typed::<kr_protocol::session::SessionCloseResult>()
@@ -1441,13 +1453,14 @@ async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to
             "the description goes only to a device that may read the session"
         );
         assert_eq!(
-            written.get("added_later"),
-            Some(&kr_cbor::CanonicalValue::text("as written")),
-            "the member this build does not know goes as it came"
-        );
-        assert!(
-            written.get("state").is_some() && written.get("durability").is_some(),
-            "and so does the rest of the acceptance: {written:?}"
+            written,
+            if may_read {
+                &whole
+            } else {
+                &without_the_description
+            },
+            "every other member goes exactly as the worker wrote it, the one this build does not \
+             know included"
         );
         drop(controller);
     }
