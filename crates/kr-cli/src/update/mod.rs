@@ -462,7 +462,7 @@ fn ensure_current(store: &Store, release: &ReleaseName) -> Result<()> {
 /// current release, or another install or update of the store is running, and the failure to
 /// write the store otherwise.
 #[cfg(unix)]
-pub fn install(
+pub async fn install(
     tree: Option<&std::path::Path>,
     root: Option<&std::path::Path>,
 ) -> Result<Installed> {
@@ -532,7 +532,7 @@ pub fn install(
     }
     .write(&store)?;
     let staging = store.staging().join(kr_ipc::new_uuid().to_string());
-    let staged = stage_tree(&store, &tree, &staging, &update_lock);
+    let staged = stage_tree(&store, &tree, &staging, &update_lock).await;
     let _ = remove_staging(&staging);
     let (release, has_root) = staged?;
     Ok(Installed {
@@ -547,7 +547,7 @@ pub fn install(
 /// The same release already in `versions/`, as an install stopped before its switch leaves it, is
 /// replaced by the copy checked here ([`replace_kept`]).
 #[cfg(unix)]
-fn stage_tree(
+async fn stage_tree(
     store: &Store,
     tree: &std::path::Path,
     staging: &std::path::Path,
@@ -568,9 +568,7 @@ fn stage_tree(
     release::seal(&staged, &manifest)?;
     // Published and made current under the install lock: a control daemon of the release started
     // in between waits for `current` to name it.
-    let install = store
-        .lock_install()
-        .map_err(|error| CliError::Other(said(&error)))?;
+    let install = handover::install_lock(store, handover::INSTALL_LOCK_WAIT).await?;
     release::admit(&staged, store, &manifest.release)?;
     store
         .switch(&manifest.release, update_lock, &install)
@@ -926,10 +924,11 @@ async fn hand_over(
     for (environment, daemon) in prepared {
         handover::stop(daemon, environment, &target.release).await;
     }
-    // The install lock: no daemon of this store starts until `current` has been decided.
-    let install = match store.lock_install() {
+    // The install lock: no daemon of this store starts until `current` has been decided. A daemon
+    // that is starting holds it, shared, so it is waited for, and only for a bound.
+    let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT).await {
         Ok(install) => install,
-        Err(error) => return Err(undo(store, record, CliError::Other(said(&error))).await),
+        Err(error) => return Err(undo(store, record, error).await),
     };
     // The environments again, now that no daemon can start: one whose daemon started after the
     // first look recorded its roots before it took its environment, and was never asked to make
@@ -1108,7 +1107,7 @@ async fn start_one(
         paths: host.environment(restart.environment),
         host,
     };
-    if handover::held(store, &environment)? {
+    if handover::held(store, &environment, handover::INSTALL_LOCK_WAIT).await? {
         match handover::resume_holder(&environment, target).await? {
             handover::Resumed::Serving | handover::Resumed::NotListening => {
                 return handover::answers_as(store, &environment, current, None)
@@ -1257,7 +1256,7 @@ fn collect(
 
 /// `kr host install` on a platform that keeps no store.
 #[cfg(not(unix))]
-pub fn install(
+pub async fn install(
     _tree: Option<&std::path::Path>,
     _root: Option<&std::path::Path>,
 ) -> Result<Installed> {
@@ -1320,12 +1319,8 @@ mod tests {
         assert_eq!(every, vec![one, two]);
     }
 
-    /// Whether a daemon holds an environment is asked only once no daemon is part way through
-    /// taking one: the look waits while a daemon holds the install lock for its start, so the
-    /// daemon takes its environment, and the look then finds it held.
-    #[test]
-    fn the_look_at_an_environment_refuses_no_daemon_that_is_starting() {
-        let temp = kr_ipc::testing::TempHost::create();
+    /// A store of this test's own, and an environment in it.
+    fn store_and_environment(temp: &kr_ipc::testing::TempHost) -> (Store, inventory::Environment) {
         let store = Store::at(temp.root().join("store"));
         store.create_directories().expect("the store's directories");
         let environment = inventory::Environment {
@@ -1333,27 +1328,72 @@ mod tests {
             paths: temp.environment(),
             host: temp.paths().clone(),
         };
+        (store, environment)
+    }
+
+    /// Whether a daemon holds an environment is asked only once no daemon is part way through
+    /// taking one: the look waits while a daemon holds the install lock for its start, so the
+    /// daemon takes its environment, and the look then finds it held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_look_at_an_environment_refuses_no_daemon_that_is_starting() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (store, environment) = store_and_environment(&temp);
         // A daemon part way through its start holds the install lock, shared.
         let starting = store.lock_start().expect("the start lock");
-        let looked = std::thread::scope(|scope| {
-            let looking = scope.spawn(|| handover::held(&store, &environment));
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(
-                !looking.is_finished(),
-                "the look waits for the daemon's start"
-            );
+        let looking = handover::held(&store, &environment, std::time::Duration::from_secs(30));
+        let starts = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let daemon = kr_controller::singleton::SingletonLock::acquire(
                 &environment.paths.singleton_lock(),
                 environment.environment_id,
             )
             .expect("the starting daemon takes its environment");
             drop(starting);
-            let looked = looking.join().expect("the look ends");
-            drop(daemon);
-            looked
-        });
+            daemon
+        };
+        let (looked, daemon) = tokio::join!(looking, starts);
         assert!(looked.expect("looks"), "the look finds the daemon");
+        drop(daemon);
         // The control: with no daemon there, the environment is free.
-        assert!(!handover::held(&store, &environment).expect("looks"));
+        assert!(
+            !handover::held(&store, &environment, std::time::Duration::from_secs(30))
+                .await
+                .expect("looks")
+        );
+    }
+
+    /// The install lock is waited for only a bound: a daemon that holds it for longer than the
+    /// bound makes the look, and the wait an update or an install makes, end with a refusal that
+    /// says so, and neither takes it while the daemon holds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_install_lock_is_never_waited_for_without_a_bound() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (store, environment) = store_and_environment(&temp);
+        let starting = store.lock_start().expect("the start lock");
+        let bound = std::time::Duration::from_millis(200);
+        let began = std::time::Instant::now();
+        let refused = handover::held(&store, &environment, bound)
+            .await
+            .expect_err("a daemon that never finishes starting holds the look up for a bound");
+        assert_eq!(refused.exit_code(), 9, "the update waits: {refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("is starting and has held its start lock"),
+            "{refused}"
+        );
+        let refused = handover::install_lock(&store, bound)
+            .await
+            .expect_err("nor is the lock taken");
+        assert_eq!(refused.exit_code(), 9, "{refused}");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(20),
+            "each wait ended at its bound"
+        );
+        // The control: once the daemon has started, the lock is taken at once.
+        drop(starting);
+        handover::install_lock(&store, bound)
+            .await
+            .expect("the lock is free");
     }
 }

@@ -512,7 +512,11 @@ impl Host {
             .try_lock_update()
             .expect("the update lock")
             .expect("nothing else updates");
-        let install = self.store.lock_install().expect("the install lock");
+        let install = self
+            .store
+            .try_lock_install()
+            .expect("the install lock")
+            .expect("nothing starts a daemon");
         self.store
             .switch(name, &update, &install)
             .expect("switches");

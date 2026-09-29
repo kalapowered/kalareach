@@ -720,16 +720,20 @@ impl Store {
         )
     }
 
-    /// Takes the install lock exclusively, waiting for it: nothing starts a control daemon of this
-    /// store while it is held, which is what an update switches `current` under.
+    /// Takes the install lock exclusively when nothing holds it, without waiting: nothing starts
+    /// a control daemon of this store while it is held, which is what an update switches `current`
+    /// under. A control daemon holds it, shared, from its look at `current` until it has taken its
+    /// environment, so a caller that has to have it retries for as long as it can afford to wait,
+    /// and there is no call that waits without a bound.
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked.
-    pub fn lock_install(&self) -> Result<StoreLock> {
-        StoreLock::take(
+    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
+    /// but a holder.
+    pub fn try_lock_install(&self) -> Result<Option<StoreLock>> {
+        StoreLock::try_take(
             &self.root.join("install.lock"),
-            rustix::fs::FlockOperation::LockExclusive,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
         )
     }
 
@@ -1327,7 +1331,11 @@ mod tests {
             .try_lock_update()
             .expect("locks")
             .expect("nothing else updates");
-        let held = test.store.lock_install().expect("locks");
+        let held = test
+            .store
+            .try_lock_install()
+            .expect("locks")
+            .expect("nothing starts a daemon");
         test.store.switch(&one, &update, &held).expect("switches");
         assert_eq!(test.store.current().expect("reads"), Some(one.clone()));
         test.store.switch(&two, &update, &held).expect("switches");

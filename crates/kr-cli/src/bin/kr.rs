@@ -945,7 +945,8 @@ async fn run(cli: Cli) -> Result<Completion> {
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
             HostCommand::Install(install) => {
                 let installed =
-                    kr_cli::update::install(install.release.as_deref(), install.store.as_deref())?;
+                    kr_cli::update::install(install.release.as_deref(), install.store.as_deref())
+                        .await?;
                 if cli.json {
                     output::document(&installed.document());
                 } else {
