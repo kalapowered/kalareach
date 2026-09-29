@@ -145,23 +145,14 @@ impl Controller {
             crate::grants::ActionRecord::Unfinished => match mutation.method.method() {
                 Some(Method::GrantRevoke | Method::DeviceRevoke) => None,
                 Some(Method::GrantCreate) => {
-                    let action = mutation.action_id.get();
-                    Some(
-                        self.sharing
-                            .shared(
-                                kr_protocol::ids::GrantId::new(Self::derived_identity(
-                                    action, b"grant",
-                                )),
-                                kr_protocol::ids::InvitationId::new(Self::derived_identity(
-                                    action,
-                                    b"invitation",
-                                )),
-                            )
-                            .and_then(|shared| match shared {
-                                Some(shared) => encode(&shared),
-                                None => Err(unfinished_and_unknown()),
-                            }),
-                    )
+                    let (grant_id, invitation_id) =
+                        Self::share_identities(mutation.action_id.get());
+                    Some(self.sharing.shared(grant_id, invitation_id).and_then(
+                        |shared| match shared {
+                            Some(shared) => encode(&shared),
+                            None => Err(unfinished_and_unknown()),
+                        },
+                    ))
                 }
                 _ => Some(Err(unfinished_and_unknown())),
             },
@@ -567,16 +558,10 @@ impl Controller {
         let named = self
             .named_previews(params.session_id, &params.selection)
             .await?;
-        // The identities are derived from the action the caller named, not minted fresh. An attempt
-        // that ended before it recorded its answer therefore left a grant and an invitation this
-        // host can find by the action alone, and a retry is answered from them.
-        let action = mutation.action_id.get();
+        let (grant_id, invitation_id) = Self::share_identities(mutation.action_id.get());
         let request = crate::sharing::ShareRequest {
-            invitation_id: kr_protocol::ids::InvitationId::new(Self::derived_identity(
-                action,
-                b"invitation",
-            )),
-            grant_id: kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
+            invitation_id,
+            grant_id,
             environment_id: self.paths.environment_id(),
             session_id: params.session_id,
             issuer_device_id: self.host_device_id(),
@@ -901,6 +886,21 @@ impl Controller {
             revision: params.revision,
             notification_preview: params.notification_preview,
         })
+    }
+
+    /// The identities of the grant and of the invitation that carries it, for a share written as
+    /// `action`.
+    ///
+    /// They are derived from the action the caller named, not minted fresh. An attempt that ended
+    /// before it recorded its answer therefore left a grant and an invitation this host can find by
+    /// the action alone, and a retry is answered from them.
+    pub(super) fn share_identities(
+        action: kr_protocol::scalars::Uuid,
+    ) -> (kr_protocol::ids::GrantId, kr_protocol::ids::InvitationId) {
+        (
+            kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
+            kr_protocol::ids::InvitationId::new(Self::derived_identity(action, b"invitation")),
+        )
     }
 
     /// One identity derived from an action identifier and a purpose.

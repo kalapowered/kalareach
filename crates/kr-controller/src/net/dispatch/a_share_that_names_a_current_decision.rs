@@ -613,6 +613,19 @@ fn grants_written(world: &fake::Silent) -> usize {
         .len()
 }
 
+/// Whether the daemon holds the invitation a share written as `action` carries: a share's
+/// invitation takes its identity from its action.
+fn invitation_written(world: &fake::Silent, action: u8) -> bool {
+    let (_, invitation_id) =
+        crate::service::Controller::share_identities(Uuid::from_bytes([action; 16]));
+    world
+        .controller
+        .sharing()
+        .invitation(invitation_id)
+        .expect("the invitations read")
+        .is_some()
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-10.51: what the issuer is shown
 // ---------------------------------------------------------------------------------------------
@@ -856,6 +869,10 @@ async fn kr_req_10_51_a_share_naming_what_is_not_current_is_refused_and_writes_n
             asked,
             "{why}: the worker is not asked again"
         );
+        assert!(
+            !invitation_written(&world, action),
+            "{why}: no invitation is written"
+        );
     }
     for (why, named) in approvals {
         action += 1;
@@ -877,6 +894,10 @@ async fn kr_req_10_51_a_share_naming_what_is_not_current_is_refused_and_writes_n
         );
         let again = refusal_of(shared(&world, &mutation).await);
         assert_eq!(again, refused, "{why}: the refusal is the action's answer");
+        assert!(
+            !invitation_written(&world, action),
+            "{why}: no invitation is written"
+        );
     }
     assert_eq!(grants_written(&world), before, "nothing is written");
     world.serving.abort();
@@ -1016,7 +1037,7 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
     // Thirty-three questions, thirty-three approvals, and a mix: each refused before the worker is
     // asked, and nothing written.
     let before = grants_written(&world);
-    for (action, (named_questions, named_approvals)) in [
+    for (index, (named_questions, named_approvals)) in [
         (questions(33), resources(0)),
         (questions(0), resources(33)),
         (questions(17), resources(16)),
@@ -1025,13 +1046,14 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
     .enumerate()
     {
         assert_eq!(named_questions.len() + named_approvals.len(), limit + 1);
+        let action = 0x31 + u8::try_from(index).expect("small");
         let refused = refusal_of(
             shared(
                 &world,
                 &share(
                     world.environment_id,
                     world.session_id,
-                    0x31 + u8::try_from(action).expect("small"),
+                    action,
                     naming(5_000, &named_questions, &named_approvals),
                 ),
             )
@@ -1039,16 +1061,16 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
         );
         assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
         assert!(refused.message.contains("at most 32"), "{refused:?}");
+        assert!(
+            !invitation_written(&world, action),
+            "no invitation is written for {index}"
+        );
     }
     assert!(
         holding.lock().expect("held").asked.is_empty(),
         "the worker is asked nothing"
     );
-    assert_eq!(
-        grants_written(&world),
-        before,
-        "nothing is written: a grant and its invitation are one commit"
-    );
+    assert_eq!(grants_written(&world), before, "no grant is written");
 
     // Thirty-two, sixteen of each, every text as long as it may be.
     let mutation = share(
@@ -1072,6 +1094,10 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
         "the answer is {} bytes and a control frame carries {}",
         frame.len(),
         kr_protocol::limits::MAX_CONTROL_FRAME_LEN
+    );
+    assert!(
+        invitation_written(&world, 0x35),
+        "the invitation of a share that is written is found by its action"
     );
     let asked = holding.lock().expect("held").asked.len();
     let again = shared(&world, &mutation).await.expect("the answer is kept");
@@ -1334,6 +1360,12 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let again = refusal_of(shared(&world, &elsewhere).await);
     assert_eq!(again, unknown, "the refusal is the action's answer");
     assert_eq!(grants_written(&world), before, "nothing is written");
+    for action in [0x51, 0x52, 0x53] {
+        assert!(
+            !invitation_written(&world, action),
+            "no invitation is written"
+        );
+    }
     world.serving.abort();
 }
 
