@@ -51,6 +51,7 @@ use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, NamedApprovalPreview,
     NamedQuestionPreview, RoleSelection, SessionRole,
 };
+use kr_transport::lease::LeaseRefusal;
 
 use crate::error::ControllerError;
 use crate::service::a_close_a_worker_never_answers as fake;
@@ -81,6 +82,10 @@ struct Holding {
     questions: BTreeMap<QuestionId, Question>,
     /// Whether the worker ends the link when it is asked for an approval's record.
     ends_on_inspect: bool,
+    /// Whether the worker never answers when it is asked for an approval's record.
+    silent_on_inspect: bool,
+    /// How many connections the daemon has opened to the worker.
+    connections: usize,
     /// Every request the daemon made on its own link, in order.
     asked: Vec<Request>,
     /// Every read the daemon forwarded for a device, in order.
@@ -234,6 +239,9 @@ fn reply(holding: &Mutex<Holding>, session_id: SessionId, frame: ControlFrame) -
                 Some(Method::AgentApprovalInspect) if held.ends_on_inspect => {
                     return Reply::EndTheLink;
                 }
+                Some(Method::AgentApprovalInspect) if held.silent_on_inspect => {
+                    return Reply::Nothing;
+                }
                 Some(Method::AgentApprovalInspect) => held.record(&request),
                 Some(Method::QuestionRead) => held.questions(&request),
                 _ => Err(refused()),
@@ -271,6 +279,10 @@ fn serving(
                 let Ok((connection, peer)) = listener.accept().await else {
                     return;
                 };
+                holding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .connections += 1;
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
                 let holding = Arc::clone(&holding);
@@ -1322,6 +1334,388 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let again = refusal_of(shared(&world, &elsewhere).await);
     assert_eq!(again, unknown, "the refusal is the action's answer");
     assert_eq!(grants_written(&world), before, "nothing is written");
+    world.serving.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-10.51: the daemon's link to the worker, and the lease that rests on it
+// ---------------------------------------------------------------------------------------------
+
+/// Why the worker's dispatch lease would not renew now, or `None` when it would.
+fn lease_refusal(world: &fake::Silent) -> Option<LeaseRefusal> {
+    match world.controller.leases.renew(
+        world.session_id,
+        world.controller.generation,
+        &*world.controller.clock,
+    ) {
+        Ok(Ok(_)) => None,
+        Ok(Err(refusal)) => Some(refusal),
+        Err(error) => panic!("no lease could be issued: {error}"),
+    }
+}
+
+/// Whether the daemon keeps a link to the worker in its slot, for whichever operation comes next.
+async fn link_kept(world: &fake::Silent) -> bool {
+    let slot = world
+        .controller
+        .connections
+        .lock()
+        .await
+        .get(&world.session_id)
+        .map(Arc::clone);
+    match slot {
+        Some(slot) => slot.lock().await.is_some(),
+        None => false,
+    }
+}
+
+/// Resolves once the played worker has been asked for an approval's record.
+async fn the_worker_is_asked_for_the_record(holding: &Mutex<Holding>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !holding
+            .lock()
+            .expect("held")
+            .asked
+            .iter()
+            .any(|request| request.method.method() == Some(Method::AgentApprovalInspect))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the worker is asked for the record");
+}
+
+/// A worker that holds `named`, pending, and answers for its record.
+fn holding_approval(named: &PendingResource) -> Holding {
+    Holding {
+        resources: vec![named.clone()],
+        records: BTreeMap::from([(
+            named.resource_id,
+            Ok(record_of(
+                named,
+                PendingState::Pending,
+                "Waiting",
+                relayed_request("g"),
+            )),
+        )]),
+        ..Holding::default()
+    }
+}
+
+/// How a share's exchange with the worker fails to finish.
+#[derive(Clone, Copy)]
+enum Unfinished {
+    /// The worker ends the link when it is asked for the record.
+    LinkEnds,
+    /// The worker never sends the record, and the share runs out of time.
+    RunsOutOfTime,
+    /// The worker never sends the record, and the share is abandoned once it has been asked.
+    Abandoned,
+}
+
+/// A share whose exchange with the worker does not finish, in the way `how` says, gives up the link
+/// it was using and the worker's lease with it: the link is not kept for the next caller, the lease
+/// is refused, and nothing is written. Once the worker acknowledges again and answers, the next
+/// share opens a link of its own, finishes on it, and takes nothing more from the lease.
+async fn an_unfinished_exchange_gives_up_its_link_and_the_lease(how: Unfinished) {
+    let named = approval(0xe8, 1_000);
+    let (world, holding) = world(
+        Holding {
+            ends_on_inspect: matches!(how, Unfinished::LinkEnds),
+            silent_on_inspect: !matches!(how, Unfinished::LinkEnds),
+            ..holding_approval(&named)
+        },
+        holds_question_reads(),
+    )
+    .await;
+    assert_eq!(
+        lease_refusal(&world),
+        None,
+        "the lease renews before the share"
+    );
+    let before = grants_written(&world);
+
+    let unfinished = share(
+        world.environment_id,
+        world.session_id,
+        0x72,
+        naming(5_000, &[], &[named.resource_id]),
+    );
+    match how {
+        Unfinished::LinkEnds | Unfinished::RunsOutOfTime => {
+            let refused = refusal_of(shared(&world, &unfinished).await);
+            assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+        }
+        Unfinished::Abandoned => {
+            tokio::select! {
+                answered = shared(&world, &unfinished) => {
+                    panic!("the share was answered: {answered:?}")
+                }
+                () = the_worker_is_asked_for_the_record(&holding) => {}
+            }
+        }
+    }
+    assert!(
+        holding
+            .lock()
+            .expect("held")
+            .asked
+            .iter()
+            .any(|request| request.method.method() == Some(Method::AgentApprovalInspect)),
+        "the share had the link, and was waiting on the worker's answer"
+    );
+    assert!(
+        !link_kept(&world).await,
+        "the link is not kept for the next caller"
+    );
+    assert!(world.controller.leases.is_fenced(world.session_id));
+    assert_eq!(
+        lease_refusal(&world),
+        Some(LeaseRefusal::RevisionNotAcknowledged),
+        "the lease is refused until the worker acknowledges again"
+    );
+    assert_eq!(grants_written(&world), before, "nothing is written");
+
+    // The worker acknowledges the revision again, and answers: the next share opens a link of its
+    // own, gives it back once its exchange is whole, and leaves the lease as it found it.
+    {
+        let mut held = holding.lock().expect("held");
+        held.ends_on_inspect = false;
+        held.silent_on_inspect = false;
+    }
+    fake::acknowledged(&world.controller, world.session_id);
+    assert_eq!(
+        lease_refusal(&world),
+        None,
+        "the acknowledgement lifts the refusal"
+    );
+    let result = result_of(
+        shared(
+            &world,
+            &share(
+                world.environment_id,
+                world.session_id,
+                0x74,
+                naming(5_000, &[], &[named.resource_id]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result.preview.named_approvals.len(), 1);
+    assert_eq!(
+        holding.lock().expect("held").connections,
+        2,
+        "the share opened a link of its own"
+    );
+    assert!(link_kept(&world).await, "and gave it back");
+    assert_eq!(
+        lease_refusal(&world),
+        None,
+        "a whole exchange takes nothing from the lease"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-10.51: a share whose link to the worker fails part way gives up the link and the
+/// worker's lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_whose_link_ends_gives_up_the_link_and_the_lease() {
+    an_unfinished_exchange_gives_up_its_link_and_the_lease(Unfinished::LinkEnds).await;
+}
+
+/// KR-REQ-10.51: a share that runs out of time waiting for the worker's answer gives up the link
+/// and the lease as one whose link failed does: an answer may still be on its way over the link,
+/// and the lease rests on an acknowledgement made over a link this daemon no longer holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_that_runs_out_of_time_with_the_link_gives_up_the_link_and_the_lease()
+{
+    an_unfinished_exchange_gives_up_its_link_and_the_lease(Unfinished::RunsOutOfTime).await;
+}
+
+/// KR-REQ-10.51: a share abandoned while it waits for the worker's answer, as one is when the
+/// request that asked for it goes away, gives up the link and the lease the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_abandoned_with_the_link_gives_up_the_link_and_the_lease() {
+    an_unfinished_exchange_gives_up_its_link_and_the_lease(Unfinished::Abandoned).await;
+}
+
+/// KR-REQ-10.51: a share that stops waiting for the link, because another operation holds it, or is
+/// abandoned while it waits, takes nothing from that operation: its link stays open, the worker's
+/// lease still renews, and the next share is served over that same link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_that_stops_waiting_for_the_link_leaves_the_link_and_the_lease() {
+    let named = approval(0xe9, 1_000);
+    let (world, holding) = world(holding_approval(&named), holds_question_reads()).await;
+    let held_elsewhere = world
+        .controller
+        .worker_client_of(world.session_id)
+        .await
+        .expect("the link opens");
+
+    // Abandoned while it waits.
+    let abandoned = share(
+        world.environment_id,
+        world.session_id,
+        0x71,
+        naming(5_000, &[], &[named.resource_id]),
+    );
+    tokio::select! {
+        answered = shared(&world, &abandoned) => panic!("the share was answered: {answered:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+    // Out of time, having waited for the whole bound.
+    let waited = refusal_of(
+        shared(
+            &world,
+            &share(
+                world.environment_id,
+                world.session_id,
+                0x72,
+                naming(5_000, &[], &[named.resource_id]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(waited.code, ErrorCode::ResourceUnavailable, "{waited:?}");
+    assert!(
+        held_elsewhere.is_some(),
+        "the other operation keeps its link"
+    );
+    assert!(!world.controller.leases.is_fenced(world.session_id));
+    assert_eq!(lease_refusal(&world), None, "the lease still renews");
+    assert!(
+        holding.lock().expect("held").asked.is_empty(),
+        "the worker was asked nothing"
+    );
+    drop(held_elsewhere);
+
+    // The next share is served over the link the other operation opened.
+    let result = result_of(
+        shared(
+            &world,
+            &share(
+                world.environment_id,
+                world.session_id,
+                0x73,
+                naming(5_000, &[], &[named.resource_id]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result.preview.named_approvals.len(), 1);
+    assert_eq!(holding.lock().expect("held").connections, 1);
+    assert!(link_kept(&world).await);
+    assert_eq!(lease_refusal(&world), None);
+    world.serving.abort();
+}
+
+/// KR-REQ-10.51: a share whose exchange with the worker finishes keeps the link for the next
+/// caller and leaves the worker's lease as it was, whatever the share comes to: written, refused
+/// because what it names is not current, or refused by the worker itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_whose_exchange_finishes_keeps_its_link_and_the_lease() {
+    let named = approval(0xeb, 1_000);
+    let unreadable = approval(0xec, 1_000);
+    let mut worker = holding_approval(&named);
+    worker.resources.push(unreadable.clone());
+    worker.records.insert(
+        unreadable.resource_id,
+        Err(ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            "the approval ledger could not be read",
+        )),
+    );
+    let (world, holding) = world(worker, holds_question_reads()).await;
+
+    let shares: [(&str, RoleSelection, Option<ErrorCode>); 4] = [
+        ("written", naming(5_000, &[], &[named.resource_id]), None),
+        (
+            "no current approval",
+            naming(5_000, &[], &[resource_id(0x68)]),
+            Some(ErrorCode::InvalidArgument),
+        ),
+        (
+            "no open question",
+            naming(5_000, &[question_id(0x77)], &[]),
+            Some(ErrorCode::InvalidArgument),
+        ),
+        (
+            "the worker's own refusal",
+            naming(5_000, &[], &[unreadable.resource_id]),
+            Some(ErrorCode::StorageUnavailable),
+        ),
+    ];
+    for (action, (why, selection, refused)) in (0x91_u8..).zip(shares) {
+        let answer = shared(
+            &world,
+            &share(world.environment_id, world.session_id, action, selection),
+        )
+        .await;
+        match refused {
+            None => {
+                result_of(answer);
+            }
+            Some(code) => assert_eq!(refusal_of(answer).code, code, "{why}"),
+        }
+        assert!(link_kept(&world).await, "{why}: the link is kept");
+        assert!(
+            !world.controller.leases.is_fenced(world.session_id),
+            "{why}"
+        );
+        assert_eq!(lease_refusal(&world), None, "{why}: the lease still renews");
+        assert_eq!(
+            holding.lock().expect("held").connections,
+            1,
+            "{why}: one link has served every share"
+        );
+    }
+    world.serving.abort();
+}
+
+/// KR-REQ-10.51: what a share's failed exchange gives up is the control path it took its link
+/// from. An announcement of an authority revision that began while the share held the link binds
+/// the worker to a new path, and then waits behind the share for the link: when the share loses
+/// its link, the announcement's acknowledgement over the new path is still accepted and the lease
+/// renews, since the loss is news about the path that was replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_share_that_loses_its_link_leaves_a_path_that_replaced_its_own() {
+    let named = approval(0xea, 1_000);
+    let (world, holding) = world(
+        Holding {
+            silent_on_inspect: true,
+            ..holding_approval(&named)
+        },
+        holds_question_reads(),
+    )
+    .await;
+    let unfinished = share(
+        world.environment_id,
+        world.session_id,
+        0x76,
+        naming(5_000, &[], &[named.resource_id]),
+    );
+    let replaced = tokio::select! {
+        answered = shared(&world, &unfinished) => panic!("the share was answered: {answered:?}"),
+        bound = async {
+            the_worker_is_asked_for_the_record(&holding).await;
+            world.controller.leases.bind(world.session_id)
+        } => bound,
+    };
+    assert!(
+        !world.controller.leases.is_fenced(world.session_id),
+        "the path in force was not the one the share's link belonged to"
+    );
+    assert!(
+        world.controller.leases.acknowledge(
+            world.session_id,
+            replaced,
+            world.controller.leases.authority_revision(),
+            None,
+        ),
+        "the acknowledgement over the path in force is accepted"
+    );
+    assert_eq!(lease_refusal(&world), None, "and the lease renews");
     world.serving.abort();
 }
 
