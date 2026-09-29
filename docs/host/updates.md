@@ -88,10 +88,10 @@ writable survives, and nothing outside the store is touched. A release a running
 not removed, and the install waits, exit 9. Another release under the same name is refused.
 
 An install or an update waits for a control daemon that is starting, which holds the install lock
-while it starts, for at most thirty seconds. A daemon that takes longer makes the run exit with 9
-and name it; whatever the run had stopped is started again.
-
-A release's files are read without following a link or waiting for a writer, and a program that
+while it starts, for at most thirty seconds, and an update does so before it stops anything. A
+daemon that takes longer makes the run exit with 9 and name the store, with nothing stopped: every
+control daemon the update had prepared resumes. Every wait of an install or an update has a bound:
+a release's files are read without following a link or waiting for a writer, and a program that
 starts in a release that is being removed or replaced waits for that removal for at most thirty
 seconds.
 
@@ -114,12 +114,14 @@ Only the current release's `kr` updates the host. An update, in order:
    update;
 4. asks each control daemon to prepare, and records how each was started before any is told to
    stop;
-5. once every daemon has stopped, holds the install lock and reads the store's environments again,
-   so an environment whose daemon started after the first look is found; holds every
-   environment's lock, where a daemon the update did not stop holds the update; and reads every
-   environment's registry: a worker at a level the new release does not retain, a worker that does
-   not answer its challenge and has not ended, and a session still being started each hold the
-   update;
+5. takes the install lock, waiting up to thirty seconds for a control daemon that is starting, and
+   only then tells each prepared daemon to stop; one that answers that it does not stop, because
+   its attempt is over, holds the update, and is not waited for. Once every daemon has stopped, it
+   reads the store's environments again, so an environment whose daemon started after the first
+   look is found; holds every environment's lock, where a daemon the update did not stop holds the
+   update; and reads every environment's registry: a worker at a level the new release does not
+   retain, a worker that does not answer its challenge and has not ended, and a session still being
+   started each hold the update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started
    before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
@@ -217,8 +219,10 @@ a daemon that does not start, before the switch or after it, is started by the n
 names. Naming the release the update started from, the switch did not happen: every daemon the
 update recorded is started again from it, and the new release stays staged. Naming the new
 release, the switch happened: every recorded daemon that is not running is started from it, and
-one that runs and does not answer as its daemon is named with how to stop it. A daemon that still
-does not start leaves the update recorded, and the run exits with 1:
+one that runs and does not answer as its daemon is named with how to stop it. Each look at an
+environment, before a daemon is started in it, waits up to thirty seconds for a control daemon
+that is starting; when that runs out, the daemon is not started. A daemon that still does not
+start leaves the update recorded, and the run exits with 1:
 
 ```text
 kr: an update an earlier run left part way is not settled yet: a control daemon it stopped did not start again, and the next kr host update starts it before anything else: the control daemon of environment 7c9e… (process 4242) is still running and does not answer; stop it with `kill 4242` and run kr host update again

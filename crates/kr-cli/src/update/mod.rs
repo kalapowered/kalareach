@@ -18,11 +18,14 @@
 //!    (exit 9) and says why.
 //! 4. Each daemon is asked to prepare, and how each was started is recorded durably before any is
 //!    told to stop. A daemon that does not prepare holds the update: the others resume.
-//! 5. Once every daemon has stopped, the install lock is held and the environments are read
-//!    again, so a daemon that started after the first look is found: it holds the update. Every
-//!    environment's lock is held, and every record of every registry is classed
-//!    ([`inventory::classify`]). Anything that holds the update restarts the daemons it stopped,
-//!    from the release still current, and the update waits.
+//! 5. The install lock is taken, waiting a bound for a control daemon that is starting, and only
+//!    then is any daemon told to stop: a wait that runs out costs the update nothing, since each
+//!    daemon prepared resumes and the update waits. Once every daemon has stopped, the
+//!    environments are read again, so a daemon that started after the first look is found: it
+//!    holds the update. Every environment's lock is held, and every record of every registry is
+//!    classed ([`inventory::classify`]). Anything that holds the update, a daemon that refused to
+//!    stop among it, restarts the daemons it stopped, from the release still current, and the
+//!    update waits.
 //! 6. `current` is switched in one rename, the locks are let go, each daemon is started as it was
 //!    before, from the new release, and each is waited for to answer as a daemon of it.
 //! 7. Releases nothing needs are removed: not the current one, not the previous one, not one
@@ -568,7 +571,7 @@ async fn stage_tree(
     release::seal(&staged, &manifest)?;
     // Published and made current under the install lock: a control daemon of the release started
     // in between waits for `current` to name it.
-    let install = handover::install_lock(store, handover::INSTALL_LOCK_WAIT).await?;
+    let install = handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "install").await?;
     release::admit(&staged, store, &manifest.release)?;
     store
         .switch(&manifest.release, update_lock, &install)
@@ -892,6 +895,10 @@ async fn hand_over(
                 for (environment, daemon) in prepared {
                     handover::resume(daemon, environment, &target.release).await;
                 }
+                // The daemon that did not prepare may have closed its gate all the same, and its
+                // answer been lost: whichever attempt it holds ends, this run being the only one
+                // that can have begun it.
+                let _ = handover::resume_holder(environment, &target.release).await;
                 forget_update(store, record);
                 return Err(refused);
             }
@@ -917,19 +924,44 @@ async fn hand_over(
         forget_update(store, record);
         return Err(error);
     }
+    // The install lock, before anything is stopped: no daemon of this store starts until `current`
+    // has been decided. A daemon that is starting holds it, shared, so it is waited for, and only
+    // for a bound; a daemon that never finishes starting then costs the update no more than a wait,
+    // since nothing has been stopped and each daemon prepared resumes.
+    let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT, "update").await {
+        Ok(install) => install,
+        Err(error) => {
+            for (environment, daemon) in prepared {
+                handover::resume(daemon, environment, &target.release).await;
+            }
+            forget_update(store, record);
+            return Err(error);
+        }
+    };
     let stopped: Vec<EnvironmentId> = prepared
         .iter()
         .map(|(environment, _)| environment.environment_id)
         .collect();
+    let mut refused: Option<Shown> = None;
     for (environment, daemon) in prepared {
-        handover::stop(daemon, environment, &target.release).await;
+        if let handover::Stop::Refused(said) =
+            handover::stop(daemon, environment, &target.release).await
+        {
+            refused.get_or_insert_with(|| {
+                shown!(
+                    "the control daemon of environment {} did not stop: {}",
+                    environment.environment_id,
+                    said
+                )
+            });
+        }
     }
-    // The install lock: no daemon of this store starts until `current` has been decided. A daemon
-    // that is starting holds it, shared, so it is waited for, and only for a bound.
-    let install = match handover::install_lock(store, handover::INSTALL_LOCK_WAIT).await {
-        Ok(install) => install,
-        Err(error) => return Err(undo(store, record, error).await),
-    };
+    // A daemon that answered that it does not stop goes on serving: nothing is waited for, and what
+    // was stopped runs again.
+    if let Some(said) = refused {
+        drop(install);
+        return Err(undo(store, record, deferred(target, said)).await);
+    }
     // The environments again, now that no daemon can start: one whose daemon started after the
     // first look recorded its roots before it took its environment, and was never asked to make
     // way. Each environment's lock, in the order of their identities.
@@ -1382,17 +1414,21 @@ mod tests {
                 .contains("is starting and has held its start lock"),
             "{refused}"
         );
-        let refused = handover::install_lock(&store, bound)
+        let refused = handover::install_lock(&store, bound, "install")
             .await
             .expect_err("nor is the lock taken");
         assert_eq!(refused.exit_code(), 9, "{refused}");
+        assert!(
+            refused.to_string().contains("run kr host install again"),
+            "the message names the command that waited: {refused}"
+        );
         assert!(
             began.elapsed() < std::time::Duration::from_secs(20),
             "each wait ended at its bound"
         );
         // The control: once the daemon has started, the lock is taken at once.
         drop(starting);
-        handover::install_lock(&store, bound)
+        handover::install_lock(&store, bound, "update")
             .await
             .expect("the lock is free");
     }
