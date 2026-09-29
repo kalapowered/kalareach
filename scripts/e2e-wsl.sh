@@ -514,7 +514,7 @@ self_test_nested_roots() {
 
 # A root that was not there when it was measured is not removed if it appears before the removal:
 # it never passed the checks a root passes. A wrapper for find, first on the path of this case,
-# makes the runtime root while the state root is being walked.
+# makes the runtime root, once, while the state root is being walked.
 self_test_late_root() {
   local d="$self_test_work/${FUNCNAME[0]}" real_find
   real_find="$(command -v find)" || return 1
@@ -522,7 +522,8 @@ self_test_late_root() {
   printf x >"$d/state/sessions/one" || return 1
   cat >"$d/bin/find" <<WRAPPER || return 1
 #!/bin/sh
-if [ "\$1" = "$d/state" ] && [ ! -e "$d/run" ]; then
+if [ "\$1" = "$d/state" ] && [ ! -e "$d/bin/fired" ]; then
+  : >"$d/bin/fired"
   mkdir -p "$d/run" && printf x >"$d/run/kept"
 fi
 exec "$real_find" "\$@"
