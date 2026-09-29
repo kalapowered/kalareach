@@ -51,10 +51,12 @@ set -euo pipefail
 # the runtime root) and where it publishes the identity it allocates on a first use (which lies
 # directly in the state root), and each answer is mapped back through the input it came from. What
 # is removed is the exact value that input holds, followed by the plain path the helper named below
-# its mirror. Every root the product derives on Linux lies inside one of those inputs, so an answer
-# outside every mirror, or one whose part below its mirror is not a plain path, stops the run
-# before anything is removed, and so does an input that is not an absolute path. Nothing is read
-# back through a step that could change it unseen: the probe is made in a directory whose name is a
+# its mirror. Every root the product derives on Linux lies inside one of those inputs, and below a
+# home or an XDG directory it lies in a directory named kalareach. So an answer outside every
+# mirror, one whose part below its mirror is not a plain path, and one below a home or an XDG
+# directory that is not in a directory of that name, each stop the run before anything is removed,
+# and so does an input that is set but empty or is not an absolute path. Nothing is read back
+# through a step that could change it unseen: the probe is made in a directory whose name is a
 # plain path, the helper's answer is taken as it wrote it, a listing of names ends each one with a
 # NUL byte, and a name read through a command substitution keeps any newline at its end.
 #
@@ -64,10 +66,11 @@ set -euo pipefail
 # distribution is on. Anything else -- a symbolic link out to storage shared between
 # distributions, a mount of other storage at its top or at any directory inside it -- is not this
 # copy's to remove and not something a copy can be made independent of, so the run stops and says
-# which path it was. Both roots are measured before either is removed, so a refusal for one leaves
-# both alone, and a root that is the image itself, or holds it, is refused. The test is by device,
-# so a bind mount of another directory of the same filesystem is not told apart from the directory
-# it covers.
+# which path it was. A root that is the image itself, or holds it, is refused, and so is one that
+# is, or holds, a home or an XDG directory, however the path to it was reached. A root joins the
+# list of what is removed only once every check has passed for it, and nothing is removed until
+# both have been measured, so a refusal for one leaves both alone. The test is by device, so a bind
+# mount of another directory of the same filesystem is not told apart from the directory it covers.
 #
 # The program runs inside the distribution. Its arguments are the installed helper, the root of the
 # image (`/` inside a distribution) and the directory its probe is made in. The self-test below runs
@@ -78,6 +81,16 @@ inherited_reset='
     # Bytes, not characters: every check below is about the exact bytes of a name.
     LC_ALL=C
     export LC_ALL
+    # A message is printed as it is, whatever the name in it holds: echo in dash would read a
+    # backslash in a name as an escape.
+    say() { printf "%s\n" "$*"; }
+    refuse() { printf "%s\n" "$*" >&2; exit 1; }
+    # Whether the first path is the second one, or lies below it.
+    is_within() { case "$1/" in "${2%/}"/*) return 0 ;; esac; return 1; }
+    # What the argument leads to, followed by an x. A command substitution drops every newline at
+    # the end of what it reads, and a name can end in one, so the caller takes the x off with the
+    # one newline readlink adds and keeps the rest.
+    leads_to() { readlink -m "$1" && printf x; }
     helper="$1"
     image="$2"
     parent="$3"
@@ -86,15 +99,11 @@ inherited_reset='
     # escape what is read back.
     case "$parent" in
       /*) ;;
-      *)
-        echo "the probe directory $parent is not an absolute path" >&2
-        exit 1
-        ;;
+      *) refuse "the probe directory $parent is not an absolute path" ;;
     esac
     case "$parent" in
       *[!A-Za-z0-9._/-]*)
-        echo "the probe directory $parent is not a plain path, so nothing is read back from under it" >&2
-        exit 1
+        refuse "the probe directory $parent is not a plain path, so nothing is read back from under it"
         ;;
     esac
     probe="$(mktemp -d "$parent/kr-acc-probe.XXXXXX")"
@@ -104,19 +113,18 @@ inherited_reset='
     #
     # The real value of each input is held in a shell variable beside its mirror rather than in a
     # file of pairs. A path may carry a space, a tab or a trailing blank, and a line of text read
-    # back as two fields would not return the value the product was given. An input that is not an
-    # absolute path leads wherever the directory this program runs in leads, which is not a place
-    # the product was configured to use, so it stops the run.
+    # back as two fields would not return the value the product was given. An input that is set
+    # but empty, or is not an absolute path, leads wherever the directory this program runs in
+    # leads, which is not a place the product was configured to use, so it stops the run.
     index=0
     for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
-      eval "value=\${$name-}"
-      [ -n "$value" ] || continue
+      eval "present=\${$name+set}"
+      [ -n "$present" ] || continue
+      eval "value=\${$name}"
+      [ -n "$value" ] || refuse "$name is set but empty, so it leads wherever this program runs"
       case "$value" in
         /*) ;;
-        *)
-          echo "$name holds $value, which is not an absolute path" >&2
-          exit 1
-          ;;
+        *) refuse "$name holds $value, which is not an absolute path" ;;
       esac
       index=$((index + 1))
       mkdir -m 0700 "$probe/$index"
@@ -128,10 +136,8 @@ inherited_reset='
     # had to escape keeps its backslash, which the plain-path rule below refuses.
     token="$("$helper" --json account token show |
       sed -n "s/.*\"path\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
-    [ -n "$token" ] || {
-      echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
-      exit 1
-    }
+    [ -n "$token" ] ||
+      refuse "the helper did not say where it reads an account token, so its runtime root is not known"
     # This has no daemon to reach and fails once it has allocated the identity, which is the part
     # being read here.
     "$helper" list >/dev/null 2>&1 || true
@@ -140,14 +146,13 @@ inherited_reset='
     marker="$(find "$probe" -type f -printf "%d %p\0" | sort -z -n | head -z -n 1 |
       cut -z -d" " -f2- | tr -d "\000"; printf x)"
     marker="${marker%x}"
-    [ -n "$marker" ] || {
-      echo "the helper published no identity of its own, so its state root is not known" >&2
-      exit 1
-    }
+    [ -n "$marker" ] ||
+      refuse "the helper published no identity of its own, so its state root is not known"
     image_device="$(stat -c %d "$image")"
-    image_real="$(readlink -m "$image" && printf x)"
+    image_real="$(leads_to "$image")"
     image_real="${image_real%?x}"
-    # Both roots are measured before either is removed, so a refusal for one leaves both alone.
+    # A root joins the list of what is removed only once every check below has passed for it, and
+    # nothing is removed until both have been measured, so a refusal for one leaves both alone.
     count=0
     for named in "${token%/*}" "${marker%/*}"; do
       # What is removed is the exact value an input holds, followed by the plain path the helper
@@ -170,51 +175,57 @@ inherited_reset='
             ;;
         esac
       done
-      [ -n "$real" ] || {
-        echo "the helper named $named, which is outside every directory this run mirrored" >&2
-        exit 1
-      }
-      # The product keeps its roots below a home or an XDG directory and is given the whole of a
-      # KR_ directory. A root that is the whole of one of the first three would take everything
-      # else there with it.
-      case "$input:$below" in
-        HOME: | XDG_STATE_HOME: | XDG_RUNTIME_DIR:)
-          echo "the helper named the whole of $input, $real, rather than a directory below it" >&2
-          exit 1
+      [ -n "$real" ] ||
+        refuse "the helper named $named, which is outside every directory this run mirrored"
+      # The product keeps what it owns below a home or an XDG directory in a directory named
+      # kalareach. The directory the input names, and its other children, belong to somebody else.
+      case "$input" in
+        HOME | XDG_STATE_HOME | XDG_RUNTIME_DIR)
+          case "$below" in
+            */kalareach | */kalareach/*) ;;
+            *)
+              refuse "the helper named $real, which is not in a directory named kalareach below $input"
+              ;;
+          esac
           ;;
       esac
       case "$below" in
         *[!A-Za-z0-9._/-]* | */. | */./* | */.. | */../* | *//*)
-          echo "the helper named $named, and what lies below the directory this run mirrored is not a plain path" >&2
-          exit 1
+          refuse "the helper named $named, and what lies below the directory this run mirrored is not a plain path"
           ;;
       esac
       # What the path leads to, not what it says: a component of it may be a link somewhere else.
-      # A command substitution drops every newline at the end of what it reads, and a name can end
-      # in one, so an x follows the answer and only the newline readlink adds is taken off with it.
-      resolved="$(readlink -m "$real" && printf x)"
+      resolved="$(leads_to "$real")"
       resolved="${resolved%?x}"
-      count=$((count + 1))
-      eval "real_$count=\$real"
-      eval "resolved_$count=\$resolved"
       if [ ! -e "$resolved" ]; then
-        echo "  nothing of the product at $real"
+        say "  nothing of the product at $real"
         continue
       fi
-      # A root that is the image itself, or holds it, would take the image with it.
-      top="${resolved%/}"
-      case "$image_real/" in
-        "$top"/*)
-          echo "$real leads to $resolved, which is the image itself or holds it" >&2
-          exit 1
-          ;;
-      esac
+      # A root that is the image itself, or holds it, would take the image with it. So would one
+      # that is, or holds, a home or an XDG directory, which a link at a root can lead to.
+      if is_within "$image_real" "$resolved"; then
+        refuse "$real leads to $resolved, which is the image itself or holds it"
+      fi
+      k=0
+      kind=""
+      kvalue=""
+      while [ "$k" -lt "$index" ]; do
+        k=$((k + 1))
+        eval "kind=\$input_$k"
+        case "$kind" in
+          HOME | XDG_STATE_HOME | XDG_RUNTIME_DIR)
+            eval "kvalue=\$configured_$k"
+            kreal="$(leads_to "$kvalue")"
+            kreal="${kreal%?x}"
+            if is_within "$kreal" "$resolved"; then
+              refuse "$real leads to $resolved, which is or holds $kind"
+            fi
+            ;;
+        esac
+      done
       device="$(stat -c %d "$resolved")"
-      [ "$device" = "$image_device" ] || {
-        echo "$real leads to $resolved, which is on storage this image does not carry and may be \
-shared with the distribution this one was copied from" >&2
-        exit 1
-      }
+      [ "$device" = "$image_device" ] ||
+        refuse "$real leads to $resolved, which is on storage this image does not carry and may be shared with the distribution this one was copied from"
       # The whole tree, not only its top: a directory inside it can mount storage of its own, and
       # a removal that walked into one would take something this image does not carry with it.
       #
@@ -228,15 +239,16 @@ shared with the distribution this one was copied from" >&2
       find "$resolved" -xdev -fprintf "$probe/devices" "%D\n" -fprintf "$probe/names" "%p\0"
       grep -n -v -x -F -e "$device" "$probe/devices" >"$probe/elsewhere" || [ "$?" -eq 1 ]
       first="$(head -n 1 "$probe/elsewhere" | cut -d: -f1)"
-      [ -z "$first" ] || {
-        crossing="$(head -z -n "$first" "$probe/names" | tail -z -n 1 | tr -d "\000")"
-        echo "$real holds $crossing, which is on storage this image does not carry and may be \
-shared with the distribution this one was copied from" >&2
-        exit 1
-      }
+      if [ -n "$first" ]; then
+        crossing="$(head -z -n "$first" "$probe/names" | tail -z -n 1 | tr -d "\000"; printf x)"
+        crossing="${crossing%x}"
+        refuse "$real holds $crossing, which is on storage this image does not carry and may be shared with the distribution this one was copied from"
+      fi
+      count=$((count + 1))
+      eval "real_$count=\$real"
+      eval "resolved_$count=\$resolved"
     done
-    # Nothing has been removed until here. Each root is removed within the filesystem it was
-    # measured on, so this cannot leave it even if something is mounted after the walk above.
+    # Nothing has been removed until here.
     n=0
     while [ "$n" -lt "$count" ]; do
       n=$((n + 1))
@@ -244,8 +256,12 @@ shared with the distribution this one was copied from" >&2
       eval "resolved=\$resolved_$n"
       # A root inside the one before it was taken with it.
       [ -e "$resolved" ] || continue
+      # Still on the storage it was measured on: storage mounted on it since would go with it,
+      # and the removal below stays on the filesystem it starts on.
+      [ "$(stat -c %d "$resolved")" = "$image_device" ] ||
+        refuse "$real is no longer on the storage this image carries, so it is left"
       find "$resolved" -xdev -depth -delete
-      echo "  removed the inherited $real"
+      say "  removed the inherited $real"
     done
 '
 
@@ -376,7 +392,7 @@ self_test_whole_home() {
     HOME="$d/home" KR_RUNTIME_DIR="$d/run" STAND_IN_STATE_IN_HOME=1; then
     return 1
   fi
-  grep -q -F -e "the helper named the whole of HOME" "$d/said" &&
+  grep -q -F -e "which is not in a directory named kalareach below HOME" "$d/said" &&
     [ -f "$d/home/kept" ] && [ -f "$d/run/kept" ]
 }
 
@@ -404,6 +420,118 @@ self_test_image_root() {
   fi
   grep -q -F -e "which is the image itself or holds it" "$d/said" &&
     [ -f "$d/image/sessions/one" ]
+}
+
+# A root below HOME that is not in a directory named kalareach is refused, and what shares the
+# directory it names is left alone. The product keeps what it owns in a directory of that name.
+self_test_state_outside_kalareach() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state/other" || return 1
+  printf x >"$d/home/.local/state/other/kept" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    HOME="$d/home" KR_RUNTIME_DIR="$d/run" STAND_IN_STATE_BELOW=/.local/state; then
+    return 1
+  fi
+  grep -q -F -e "which is not in a directory named kalareach below HOME" "$d/said" &&
+    [ -f "$d/home/.local/state/other/kept" ]
+}
+
+# A name below a mirror that is not a plain path is refused, and nothing beside it is removed: a
+# component of `..` leads out of the directory the helper named, and a backslash or a newline is
+# what a document or a listing would split or escape a name with. The first goes through the path
+# the helper prints for its token, the other two through the file it makes.
+self_test_unplain_root() {
+  local d="$self_test_work/${FUNCNAME[0]}" variant below kept
+  for variant in dotdot backslash newline; do
+    mkdir -p "$d/$variant/home/.local/state/kalareach" "$d/$variant/home/.cache/kalareach/run" ||
+      return 1
+    case "$variant" in
+      dotdot)
+        kept="$d/$variant/home/.cache/other/kept"
+        mkdir -p "${kept%/*}" || return 1
+        printf x >"$kept" || return 1
+        self_test_reset "$d/$variant" "$self_test_work" "$d/$variant/tmp" \
+          HOME="$d/$variant/home" KR_STATE_DIR="$d/$variant/state" \
+          STAND_IN_RUNTIME_BELOW=/.cache/kalareach/run/../.. && return 1
+        ;;
+      backslash | newline)
+        if [ "$variant" = backslash ]; then
+          below='/.local/state/kalareach/od\d'
+        else
+          below=$'/.local/state/kalareach/od\nd'
+        fi
+        kept="$d/$variant/home$below/kept"
+        mkdir -p "${kept%/*}" || return 1
+        printf x >"$kept" || return 1
+        self_test_reset "$d/$variant" "$self_test_work" "$d/$variant/tmp" \
+          HOME="$d/$variant/home" KR_RUNTIME_DIR="$d/$variant/run" \
+          STAND_IN_STATE_BELOW="$below" && return 1
+        ;;
+    esac
+    grep -q -F -e "is not a plain path" "$d/$variant/said" && [ -f "$kept" ] || return 1
+  done
+}
+
+# A root that is a link to the home directory is refused, because what it leads to is the home,
+# which holds much that is not the product's, and nothing in the home is removed.
+self_test_link_to_home() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state" || return 1
+  printf x >"$d/home/kept" || return 1
+  ln -s "$d/home" "$d/home/.local/state/kalareach" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "which is or holds HOME" "$d/said" && [ -f "$d/home/kept" ]
+}
+
+# An input that is set but empty is refused, and nothing is removed. The product reads it as a
+# relative path, which leads wherever the directory the program runs in leads.
+self_test_empty_input() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state/kalareach" || return 1
+  printf x >"$d/home/.local/state/kalareach/registry" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    HOME="$d/home" XDG_RUNTIME_DIR= KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "XDG_RUNTIME_DIR is set but empty" "$d/said" &&
+    [ -f "$d/home/.local/state/kalareach/registry" ]
+}
+
+# A root inside the other one is taken with it, and the removal that follows finds nothing left of
+# it and goes on. What lies beside them is left.
+self_test_nested_roots() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/x/kalareach/state/sessions" "$d/x/beside" || return 1
+  printf x >"$d/x/kalareach/state/sessions/one" || return 1
+  printf x >"$d/x/kalareach/other" || return 1
+  printf x >"$d/x/beside/kept" || return 1
+  self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    XDG_RUNTIME_DIR="$d/x" KR_STATE_DIR="$d/x/kalareach/state" || return 1
+  [ ! -e "$d/x/kalareach" ] && [ -f "$d/x/beside/kept" ]
+}
+
+# A root that was not there when it was measured is not removed if it appears before the removal:
+# it never passed the checks a root passes. A wrapper for find, first on the path of this case,
+# makes the runtime root while the state root is being walked.
+self_test_late_root() {
+  local d="$self_test_work/${FUNCNAME[0]}" real_find
+  real_find="$(command -v find)" || return 1
+  mkdir -p "$d/bin" "$d/state/sessions" || return 1
+  printf x >"$d/state/sessions/one" || return 1
+  cat >"$d/bin/find" <<WRAPPER || return 1
+#!/bin/sh
+if [ "\$1" = "$d/state" ] && [ ! -e "$d/run" ]; then
+  mkdir -p "$d/run" && printf x >"$d/run/kept"
+fi
+exec "$real_find" "\$@"
+WRAPPER
+  chmod 0755 "$d/bin/find" || return 1
+  self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    PATH="$d/bin:$PATH" HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" ||
+    return 1
+  [ ! -e "$d/state" ] && [ -f "$d/run/kept" ]
 }
 
 # A root that is a link is resolved: what it leads to is removed, and the link is left.
@@ -518,10 +646,12 @@ self_test() {
 #!/bin/sh
 # Stands in for the installed helper. It names the roots the way the product names them on Linux,
 # says where it reads an account token, and publishes an identity the way a first use does. A case
-# can give it a runtime root of its own, as a product that read one from somewhere else would, or
-# have it keep its state in the home directory itself.
+# can give it a runtime root of its own, as a product that read one from somewhere else would, name
+# a root below the home directory, or have it keep its state in the home directory itself.
 if [ -n "${STAND_IN_RUNTIME_ROOT-}" ]; then
   runtime="$STAND_IN_RUNTIME_ROOT"
+elif [ -n "${STAND_IN_RUNTIME_BELOW-}" ]; then
+  runtime="$HOME$STAND_IN_RUNTIME_BELOW"
 elif [ -n "${KR_RUNTIME_DIR-}" ]; then
   runtime="$KR_RUNTIME_DIR"
 elif [ -n "${XDG_RUNTIME_DIR-}" ]; then
@@ -531,6 +661,8 @@ else
 fi
 if [ -n "${STAND_IN_STATE_IN_HOME-}" ]; then
   state="$HOME"
+elif [ -n "${STAND_IN_STATE_BELOW-}" ]; then
+  state="$HOME$STAND_IN_STATE_BELOW"
 elif [ -n "${KR_STATE_DIR-}" ]; then
   state="$KR_STATE_DIR"
 elif [ -n "${XDG_STATE_HOME-}" ]; then
@@ -573,6 +705,18 @@ STAND_IN
     "an input that is not an absolute path is refused, and nothing is removed"
   self_test_case self_test_image_root \
     "a root that is the image itself is refused, and nothing is removed"
+  self_test_case self_test_state_outside_kalareach \
+    "a root below HOME outside a directory named kalareach is refused, and what shares it is left"
+  self_test_case self_test_unplain_root \
+    "a name below a mirror with a parent component, a backslash or a newline is refused"
+  self_test_case self_test_link_to_home \
+    "a root that is a link to the home directory is refused, and nothing in the home is removed"
+  self_test_case self_test_empty_input \
+    "an input that is set but empty is refused, and nothing is removed"
+  self_test_case self_test_nested_roots \
+    "a root inside the other is taken with it, and the removal that follows goes on"
+  self_test_case self_test_late_root \
+    "a root that appears after it was measured is not removed"
   self_test_case self_test_link_root \
     "a root that is a link is resolved, and what it leads to is removed"
   self_test_case self_test_other_storage \
