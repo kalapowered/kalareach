@@ -14,7 +14,7 @@
 //! a file is a program when the manifest says it is.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
@@ -210,17 +210,10 @@ pub fn read_manifest(document: &[u8]) -> Result<ReleaseManifest> {
     })
 }
 
-/// Reads a file whole, refusing one longer than `limit`.
+/// Reads a file of a release whole, refusing one longer than `limit`, a link and a pipe: it is
+/// never followed and never waited for.
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other(
-            "the file is larger than any this host reads here",
-        ));
-    }
-    Ok(bytes)
+    kr_ipc::install::read_regular_file(path, limit)
 }
 
 /// Checks that this host runs what a release is built for: its target, and an operating system at
@@ -255,6 +248,39 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
     }
 }
 
+/// How long the system's own tool that says its version is given.
+const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `program` and returns what it printed, or nothing when it does not end within `within`,
+/// in which case it is ended. What it prints is short: a tool that fills its pipe is given up on.
+fn run_bounded(
+    program: &str,
+    arguments: &[&str],
+    within: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// This host's version of what a floor is a version of, where it can be read.
 fn host_version(system: FloorSystem) -> Option<FloorVersion> {
     let (program, arguments): (&str, &[&str]) = match system {
@@ -265,12 +291,7 @@ fn host_version(system: FloorSystem) -> Option<FloorVersion> {
         FloorSystem::Glibc if cfg!(target_os = "linux") => ("getconf", &["GNU_LIBC_VERSION"]),
         _ => return None,
     };
-    let output = std::process::Command::new(program)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let output = run_bounded(program, arguments, TOOL_WAIT)?;
     if !output.status.success() {
         return None;
     }
@@ -725,5 +746,52 @@ mod tests {
     #[test]
     fn this_build_names_a_release_target() {
         assert_ne!(this_target(), "unsupported");
+    }
+
+    /// A tool that does not end is given a bound and ended, and one that ends is read.
+    #[test]
+    fn the_system_s_tool_is_given_a_bound_and_no_more() {
+        let began = std::time::Instant::now();
+        assert!(run_bounded("sleep", &["30"], std::time::Duration::from_millis(200)).is_none());
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(20),
+            "the wait ended at its bound"
+        );
+        // The control: a tool that ends is read.
+        let output = run_bounded("echo", &["hello"], std::time::Duration::from_secs(20))
+            .expect("echo ends and says something");
+        assert_eq!(output.stdout, b"hello\n");
+    }
+
+    /// A release's manifest that is a pipe is refused at once, and one that is a link is not
+    /// followed, where the update reads it.
+    #[test]
+    fn a_manifest_that_is_a_pipe_or_a_link_is_refused_at_once() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let release = directory.path().join("release");
+        std::fs::create_dir(&release).expect("a release");
+        let began = std::time::Instant::now();
+        let made = std::process::Command::new("mkfifo")
+            .arg(release.join(MANIFEST_FILE))
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe is made");
+        assert!(manifest_document(&release).is_err());
+        std::fs::remove_file(release.join(MANIFEST_FILE)).expect("the pipe goes");
+        std::fs::write(directory.path().join("elsewhere.json"), b"{}").expect("a file elsewhere");
+        std::os::unix::fs::symlink(
+            directory.path().join("elsewhere.json"),
+            release.join(MANIFEST_FILE),
+        )
+        .expect("a link");
+        assert!(manifest_document(&release).is_err());
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(20),
+            "neither was waited for"
+        );
+        // The control: a regular file is read.
+        std::fs::remove_file(release.join(MANIFEST_FILE)).expect("the link goes");
+        std::fs::write(release.join(MANIFEST_FILE), b"{}").expect("a manifest");
+        assert_eq!(manifest_document(&release).expect("reads"), b"{}");
     }
 }

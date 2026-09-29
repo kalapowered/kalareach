@@ -52,6 +52,8 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use kr_protocol::update::{MANIFEST_FILE, ReleaseManifest, ReleaseName};
 
@@ -417,12 +419,74 @@ impl Placed {
     }
 }
 
+/// How long a starting program waits for a removal or replacement of its release, which holds the
+/// release's manifest exclusively while it moves the release, before it refuses to start.
+#[cfg(unix)]
+const HOLD_WAIT: Duration = Duration::from_secs(30);
+
+/// Opens a file of a release for reading without following a link or waiting for a writer, and
+/// checks that it is a regular file: a link or a pipe planted under a release's name would
+/// otherwise turn a read into a read of something else, or a wait that never ends.
+///
+/// # Errors
+///
+/// Returns the operating system's error, [`std::io::ErrorKind::NotFound`] among them, and an error
+/// of kind `InvalidData` for a link and for anything but a regular file.
+#[cfg(unix)]
+pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let file = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::MLINK => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it is a link, and no file of a release is",
+        ),
+        other => std::io::Error::from(other),
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Reads a file of a release whole, refusing what [`open_regular_file`] refuses and one longer
+/// than `limit`.
+///
+/// # Errors
+///
+/// Returns the failure to open or read it, and `InvalidData` for a file longer than `limit`.
+#[cfg(unix)]
+pub fn read_regular_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    open_regular_file(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the file is larger than any this host reads here",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Opens a release's manifest, takes the shared hold on it, and checks that the file locked is
 /// still the release's manifest.
 #[cfg(unix)]
 fn hold(store: &Store, release: &ReleaseName) -> Result<(File, ReleaseManifest)> {
     let path = store.manifest(release);
-    let file = File::open(&path).map_err(|error| {
+    let file = open_regular_file(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             InstallError::Replaced {
                 path: path.clone(),
@@ -448,10 +512,33 @@ fn hold_opened(
     path: PathBuf,
     release: &ReleaseName,
 ) -> Result<(File, ReleaseManifest)> {
+    hold_opened_within(file, path, release, HOLD_WAIT)
+}
+
+/// [`hold_opened`], waiting up to `within` for a removal or replacement of the release to let go
+/// of its manifest.
+#[cfg(unix)]
+fn hold_opened_within(
+    file: File,
+    path: PathBuf,
+    release: &ReleaseName,
+    within: Duration,
+) -> Result<(File, ReleaseManifest)> {
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
 
-    lock(&file, &path, rustix::fs::FlockOperation::LockShared)?;
+    if !lock_within(
+        &file,
+        &path,
+        rustix::fs::FlockOperation::NonBlockingLockShared,
+        within,
+    )? {
+        return Err(InstallError::Replaced {
+            path,
+            reason: "is being removed or replaced, and that has not finished: this program of it \
+                     does not start",
+        });
+    }
     let held = file
         .metadata()
         .map_err(|error| InstallError::io("read", &path, error))?;
@@ -496,7 +583,35 @@ fn hold(_store: &Store, _release: &ReleaseName) -> Result<(File, ReleaseManifest
     Err(InstallError::Unsupported)
 }
 
+/// Takes a lock on an open file without blocking, trying again for as long as `within` and when a
+/// signal interrupts it, and says whether it was taken. `operation` is a non-blocking one.
+#[cfg(unix)]
+fn lock_within(
+    file: &File,
+    path: &Path,
+    operation: rustix::fs::FlockOperation,
+    within: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + within;
+    loop {
+        match rustix::fs::flock(file, operation) {
+            Ok(()) => return Ok(true),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
+            Err(error) => {
+                return Err(InstallError::io("lock", path, std::io::Error::from(error)));
+            }
+        }
+    }
+}
+
 /// Takes a lock on an open file, waiting for it, and again if a signal interrupts the wait.
+///
+/// Only what waits for a bounded section of an update takes a lock this way, a control daemon's
+/// start lock; a release's manifest is locked by [`lock_within`].
 #[cfg(unix)]
 fn lock(file: &File, path: &Path, operation: rustix::fs::FlockOperation) -> Result<()> {
     loop {
@@ -723,8 +838,9 @@ impl Store {
     /// Takes the install lock exclusively when nothing holds it, without waiting: nothing starts
     /// a control daemon of this store while it is held, which is what an update switches `current`
     /// under. A control daemon holds it, shared, from its look at `current` until it has taken its
-    /// environment, so a caller that has to have it retries for as long as it can afford to wait,
-    /// and there is no call that waits without a bound.
+    /// environment, so a caller that has to have it retries for as long as it can afford to wait:
+    /// no call takes it exclusively without a bound. A starting daemon, for its part, waits for
+    /// [`Self::lock_start`] for as long as an update's own bounded section lasts.
     ///
     /// # Errors
     ///
@@ -793,7 +909,8 @@ impl Store {
     /// but a holder.
     pub fn held(&self, release: &ReleaseName) -> Result<bool> {
         let path = self.manifest(release);
-        let file = File::open(&path).map_err(|error| InstallError::io("open", &path, error))?;
+        let file =
+            open_regular_file(&path).map_err(|error| InstallError::io("open", &path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(false),
             Err(rustix::io::Errno::WOULDBLOCK) => Ok(true),
@@ -827,7 +944,8 @@ impl Store {
             return Ok(true);
         }
         let path = self.manifest(release);
-        let file = File::open(&path).map_err(|error| InstallError::io("open", &path, error))?;
+        let file =
+            open_regular_file(&path).map_err(|error| InstallError::io("open", &path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {}
             Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
@@ -1081,6 +1199,15 @@ mod tests {
         ReleaseName::new(name).expect("a release name")
     }
 
+    /// Makes a named pipe at `path`, which nothing writes to.
+    fn make_pipe(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe is made at {}", path.display());
+    }
+
     fn manifest_of(release: &ReleaseName) -> String {
         let manifest = ReleaseManifest {
             kind: ManifestKind::Release,
@@ -1266,6 +1393,83 @@ mod tests {
             b"shared contents"
         );
         assert_eq!(mode_of(&outside.join("shared")), 0o444, "its mode is kept");
+    }
+
+    /// A release's file that is a link or a pipe is refused at once, never followed or waited for,
+    /// and a program whose release is being removed or replaced waits for that a bound only.
+    #[test]
+    fn a_link_or_a_pipe_is_refused_and_a_removal_that_never_ends_is_waited_for_a_bound() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let image = install(&test.store, &one);
+        let path = test.store.manifest(&one);
+        let kind_of = |error: Option<std::io::Error>| error.map(|error| error.kind());
+
+        // The control: the regular file opens and reads whole, and a limit is kept.
+        assert!(open_regular_file(&path).is_ok());
+        assert_eq!(
+            read_regular_file(&path, 1 << 20).expect("reads"),
+            manifest_of(&one).into_bytes()
+        );
+        assert_eq!(
+            kind_of(read_regular_file(&path, 4).err()),
+            Some(std::io::ErrorKind::InvalidData),
+            "a file longer than its limit is refused"
+        );
+
+        // A link, and a pipe nothing writes to: refused, not followed and not waited for.
+        let elsewhere = test.store.root().join("elsewhere.json");
+        std::fs::write(&elsewhere, manifest_of(&one)).expect("a file elsewhere");
+        let link = test.store.root().join("link.json");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("a link");
+        assert_eq!(
+            kind_of(open_regular_file(&link).err()),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+        let pipe = test.store.root().join("pipe.json");
+        make_pipe(&pipe);
+        let began = Instant::now();
+        assert_eq!(
+            kind_of(open_regular_file(&pipe).err()),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+        assert!(
+            kind_of(read_regular_file(&pipe, 1 << 20).err()).is_some(),
+            "a pipe is not read"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "and not waited for"
+        );
+        // A program whose release has a pipe for its manifest does not start, and does not wait.
+        std::fs::remove_file(&path).expect("the manifest goes");
+        make_pipe(&path);
+        assert!(Running::of_image(&image).is_err());
+        assert!(test.store.held(&one).is_err(), "nor is a pipe locked");
+        std::fs::remove_file(&path).expect("the pipe goes");
+        std::fs::write(&path, manifest_of(&one)).expect("the manifest is back");
+
+        // A removal that holds the manifest and never ends: a start waits its bound and refuses,
+        // and once the removal lets go it holds.
+        let removal = File::open(&path).expect("the removal opens the manifest");
+        rustix::fs::flock(
+            &removal,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("the removal holds it");
+        let opened = File::open(&path).expect("a program opens its manifest");
+        let began = Instant::now();
+        assert!(matches!(
+            hold_opened_within(opened, path.clone(), &one, Duration::from_millis(200)),
+            Err(InstallError::Replaced { .. })
+        ));
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "a bound, and no more"
+        );
+        drop(removal);
+        let opened = File::open(&path).expect("a program opens its manifest");
+        assert!(hold_opened_within(opened, path, &one, Duration::from_millis(200)).is_ok());
     }
 
     /// A program that opened its manifest while its release was being removed does not run: once

@@ -91,6 +91,10 @@ An install or an update waits for a control daemon that is starting, which holds
 while it starts, for at most thirty seconds. A daemon that takes longer makes the run exit with 9
 and name it; whatever the run had stopped is started again.
 
+A release's files are read without following a link or waiting for a writer, and a program that
+starts in a release that is being removed or replaced waits for that removal for at most thirty
+seconds.
+
 ## Updating
 
 ```sh
