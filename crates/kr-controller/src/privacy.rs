@@ -3516,7 +3516,8 @@ mod tests {
 
     /// An environment that never turned privacy mode on owes its workers nothing: none is told
     /// anything at the initial generation, so the report is complete with workers running, and
-    /// asking to turn it off answers that it is off and complete.
+    /// asking to turn it off, once or again after a pass of the tick, answers that it is off and
+    /// complete.
     #[test]
     fn an_environment_that_never_turned_privacy_mode_on_owes_its_workers_nothing() {
         let host = Host::open();
@@ -3530,6 +3531,15 @@ mod tests {
             .privacy
             .disable(at(30), &standing)
             .expect("privacy mode is already off");
+        assert!(!report.enabled);
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
+        // A pass of the tick and a repeat of the request change nothing about that.
+        let report = host.privacy.tick(at(40));
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
+        let report = host
+            .privacy
+            .disable(at(50), &standing)
+            .expect("privacy mode is still off");
         assert!(!report.enabled);
         assert!(report.completion.is_complete(), "{:?}", report.completion);
     }
