@@ -5,7 +5,8 @@
 //! as, which after an update can resolve to another release's directory. So the host's crates ask
 //! `kr_ipc::install` instead, which reads the kernel's record of the image, and this test reads
 //! every source file under `crates/*/src` and fails, naming the file and the line, wherever
-//! production code names `current_exe` outside `crates/kr-ipc/src/install.rs`.
+//! production code names `current_exe`, or macOS's `_NSGetExecutablePath`, outside
+//! `crates/kr-ipc/src/install.rs`.
 //!
 //! Test code is not held to the rule: a test finds its own binary to start copies of it. An item
 //! whose `cfg` cannot hold without `test` or without the `testing` feature, which only this
@@ -19,6 +20,11 @@
 //! `mod` inside an inline module names its file under that module's directory, as the compiler
 //! places it.
 //!
+//! What this reading cannot follow fails it rather than passing over the code: a production `mod`
+//! whose file it does not hold (a `#[path]` out of `crates/*/src` among them), a `cfg_attr` that
+//! names a module's path, an `include!` of source, and a library or program root that is not under
+//! its crate's `src/`.
+//!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
 
@@ -28,8 +34,9 @@ use std::path::{Path, PathBuf};
 /// The one file that may ask.
 const ALLOWED: &str = "crates/kr-ipc/src/install.rs";
 
-/// The name nothing else may use.
-const NAME: &str = "current_exe";
+/// The names nothing else may use: the standard library's path of the running program, and macOS's
+/// own call for it. The kernel's record of the image is `kr_ipc::install`'s to read.
+const NAMES: [&str; 2] = ["current_exe", "_NSGetExecutablePath"];
 
 /// One token of a source, as far as this reading needs to tell them apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,8 +249,10 @@ struct Declaration {
 /// What reading one file found.
 #[derive(Debug, Default)]
 struct Reading {
-    /// The lines production code names [`NAME`] on.
+    /// The lines production code names one of [`NAMES`] on.
     uses: Vec<usize>,
+    /// What production code does that this reading cannot follow, by line.
+    unfollowed: Vec<(usize, &'static str)>,
     /// The modules the file declares out of line.
     declarations: Vec<Declaration>,
 }
@@ -292,8 +301,9 @@ fn needs_a_test(tokens: &[&Token], at: usize) -> (bool, usize) {
 }
 
 /// Whether the attribute starting at `at` (just past `#[`) is a `cfg` that cannot hold without a
-/// test, the path it names when it is a `#[path]`, and where it ends.
-fn attribute(tokens: &[Located], at: usize) -> (bool, Option<String>, usize) {
+/// test, the path it names when it is a `#[path]`, whether it is a `cfg_attr` that names a path,
+/// which puts a module's file where this reading does not follow, and where it ends.
+fn attribute(tokens: &[Located], at: usize) -> (bool, Option<String>, bool, usize) {
     // Past the attribute's closing bracket, whatever is inside.
     let mut depth = 1;
     let mut end = at;
@@ -318,10 +328,17 @@ fn attribute(tokens: &[Located], at: usize) -> (bool, Option<String>, usize) {
         (true, Some(Token::Literal(text))) => Some(text.clone()),
         _ => None,
     };
-    (only_test, path, end)
+    let via_cfg_attr = ident(0, "cfg_attr")
+        && inside.windows(3).any(|window| {
+            matches!(
+                window,
+                [Token::Ident(word), Token::Punct('='), Token::Literal(_)] if word == "path"
+            )
+        });
+    (only_test, path, via_cfg_attr, end)
 }
 
-/// Reads one source: every production use of [`NAME`], and every module it declares out of line.
+/// Reads one source: every production use of [`NAMES`], and every module it declares out of line.
 fn read(text: &str) -> Reading {
     let tokens = lex(text);
     let mut reading = Reading::default();
@@ -356,14 +373,25 @@ fn block(
         let mut item_test_only = test_only;
         let mut path = None;
         let mut attributed = false;
+        let mut cfg_attr_paths = Vec::new();
         while starts_attribute(at) {
-            let (only_test, named_path, after) = attribute(tokens, at + 2);
+            let (only_test, named_path, via_cfg_attr, after) = attribute(tokens, at + 2);
             item_test_only |= only_test;
             if named_path.is_some() {
                 path = named_path;
             }
+            if via_cfg_attr {
+                cfg_attr_paths.push(tokens[at].line);
+            }
             attributed = true;
             at = after;
+        }
+        if !item_test_only {
+            for line in cfg_attr_paths {
+                reading
+                    .unfollowed
+                    .push((line, "a cfg_attr names a module's path"));
+            }
         }
         if let Some((name, after_name)) = module_item(tokens, at, end) {
             match tokens.get(after_name).map(|located| &located.token) {
@@ -400,8 +428,19 @@ fn block(
             continue;
         }
         if at < end {
-            if !test_only && tokens[at].token == Token::Ident(NAME.to_owned()) {
-                reading.uses.push(tokens[at].line);
+            if !test_only {
+                if matches!(&tokens[at].token, Token::Ident(word) if NAMES.contains(&word.as_str()))
+                {
+                    reading.uses.push(tokens[at].line);
+                }
+                if tokens[at].token == Token::Ident("include".to_owned())
+                    && tokens.get(at + 1).map(|next| &next.token) == Some(&Token::Punct('!'))
+                {
+                    reading.unfollowed.push((
+                        tokens[at].line,
+                        "an include! brings in source where this reading does not follow",
+                    ));
+                }
             }
             at += 1;
         }
@@ -534,13 +573,19 @@ fn crate_roots(metadata: &serde_json::Value) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-/// The roots of the library and program targets of the packages under `crates/` that are not under
-/// their package's `src/`, as paths relative to `workspace`.
+/// The library and program roots of the packages under `crates/`, as paths relative to
+/// `workspace`, and those of them that are not under their package's `src/`.
 ///
 /// This reading covers `crates/*/src`, so a program whose root is elsewhere, a `path` in a
-/// `[[bin]]` among them, would go unread: each is named here, and the guard fails on one rather
-/// than pass over it.
-fn roots_outside_src(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
+/// `[[bin]]` among them, would go unread: each is named in `outside`, and the guard fails on one
+/// rather than pass over it. `examined` says which roots were looked at, so a reading that looked
+/// at none cannot pass.
+struct Roots {
+    examined: Vec<String>,
+    outside: Vec<String>,
+}
+
+fn production_roots(metadata: &serde_json::Value, workspace: &Path) -> Roots {
     const PRODUCTION: [&str; 7] = [
         "lib",
         "rlib",
@@ -550,7 +595,10 @@ fn roots_outside_src(metadata: &serde_json::Value, workspace: &Path) -> Vec<Stri
         "proc-macro",
         "bin",
     ];
-    let mut outside = Vec::new();
+    let mut roots = Roots {
+        examined: Vec::new(),
+        outside: Vec::new(),
+    };
     for package in metadata["packages"].as_array().into_iter().flatten() {
         let Some(manifest) = package["manifest_path"].as_str() else {
             continue;
@@ -573,18 +621,23 @@ fn roots_outside_src(metadata: &serde_json::Value, workspace: &Path) -> Vec<Stri
             let Some(root) = root_of(target) else {
                 continue;
             };
-            if production && !root.starts_with(directory.join("src")) {
-                outside.push(
-                    root.strip_prefix(workspace)
-                        .unwrap_or(&root)
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                );
+            if !production {
+                continue;
             }
+            let relative = root
+                .strip_prefix(workspace)
+                .unwrap_or(&root)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !root.starts_with(directory.join("src")) {
+                roots.outside.push(relative.clone());
+            }
+            roots.examined.push(relative);
         }
     }
-    outside.sort();
-    outside
+    roots.examined.sort();
+    roots.outside.sort();
+    roots
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -663,15 +716,21 @@ fn normalise(path: &Path) -> PathBuf {
     normal
 }
 
-/// Every production use of [`NAME`] in `sources`, each `(file, text)`, as `(file, line)`, where
-/// `roots` are the crates' roots.
+/// What reading the sources found.
+struct Found {
+    /// Every production use of [`NAMES`], as `(file, line)`.
+    uses: Vec<(PathBuf, usize)>,
+    /// What this reading cannot follow in production code, as `(file, what)`.
+    unfollowed: Vec<(PathBuf, String)>,
+}
+
+/// Reads `sources`, each `(file, text)`, where `roots` are the crates' roots.
 ///
 /// A file is production code when it is a crate's root, when no `mod` names it, or when a `mod`
-/// that is not test code names it from a file that is production code; the rest is test code.
-fn production_uses(
-    sources: &[(PathBuf, String)],
-    roots: &BTreeSet<PathBuf>,
-) -> Vec<(PathBuf, usize)> {
+/// that is not test code names it from a file that is production code; the rest is test code. A
+/// production `mod` none of whose files is among the sources, a `cfg_attr` that names a path and an
+/// `include!` are what this reading cannot follow, and are returned rather than passed over.
+fn read_sources(sources: &[(PathBuf, String)], roots: &BTreeSet<PathBuf>) -> Found {
     let readings: BTreeMap<PathBuf, Reading> = sources
         .iter()
         .map(|(file, text)| (normalise(file), read(text)))
@@ -708,15 +767,47 @@ fn production_uses(
         }
         production.extend(found);
     }
-    production
-        .iter()
-        .flat_map(|file| readings[file].uses.iter().map(|line| (file.clone(), *line)))
-        .collect()
+    let mut unfollowed = Vec::new();
+    for file in &production {
+        let reading = &readings[file];
+        for declaration in reading
+            .declarations
+            .iter()
+            .filter(|declaration| !declaration.test_only)
+        {
+            let held = declared_files(file, declaration, roots)
+                .iter()
+                .any(|candidate| readings.contains_key(candidate));
+            if !held {
+                unfollowed.push((
+                    file.clone(),
+                    format!(
+                        "mod {} names a file this reading does not hold",
+                        declaration.name
+                    ),
+                ));
+            }
+        }
+        for (line, what) in &reading.unfollowed {
+            unfollowed.push((file.clone(), format!("line {line}: {what}")));
+        }
+    }
+    Found {
+        uses: production
+            .iter()
+            .flat_map(|file| readings[file].uses.iter().map(|line| (file.clone(), *line)))
+            .collect(),
+        unfollowed,
+    }
 }
 
-/// Every production use of [`NAME`] under `crates/*/src`, as `(file, line)` relative to the
-/// workspace, and the number of files read, given the crates' `roots`.
-fn uses_in(workspace: &Path, roots: &BTreeSet<PathBuf>) -> (Vec<(String, usize)>, usize) {
+/// Every production use of [`NAMES`] under `crates/*/src`, as `(file, line)` relative to the
+/// workspace, what the reading could not follow, as `file: what`, and the number of files read,
+/// given the crates' `roots`.
+fn uses_in(
+    workspace: &Path,
+    roots: &BTreeSet<PathBuf>,
+) -> (Vec<(String, usize)>, Vec<String>, usize) {
     let mut files = Vec::new();
     let crates = workspace.join("crates");
     let mut members: Vec<PathBuf> = std::fs::read_dir(&crates)
@@ -738,18 +829,24 @@ fn uses_in(workspace: &Path, roots: &BTreeSet<PathBuf>) -> (Vec<(String, usize)>
             )
         })
         .collect();
-    let uses = production_uses(&sources, roots)
-        .into_iter()
-        .map(|(file, line)| {
-            let relative = file
-                .strip_prefix(workspace)
-                .expect("inside the workspace")
-                .to_string_lossy()
-                .replace('\\', "/");
-            (relative, line)
-        })
+    let relative = |file: &Path| {
+        file.strip_prefix(workspace)
+            .expect("inside the workspace")
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let found = read_sources(&sources, roots);
+    let uses = found
+        .uses
+        .iter()
+        .map(|(file, line)| (relative(file), *line))
         .collect();
-    (uses, files.len())
+    let unfollowed = found
+        .unfollowed
+        .iter()
+        .map(|(file, what)| format!("{}: {what}", relative(file)))
+        .collect();
+    (uses, unfollowed, files.len())
 }
 
 /// No production code in the host's crates asks where its program is, but the install module.
@@ -758,17 +855,31 @@ fn only_the_install_module_asks_where_its_program_is() {
     let workspace = workspace();
     let metadata = cargo_metadata(&workspace);
     let roots = crate_roots(&metadata);
-    let (uses, files) = uses_in(&workspace, &roots);
+    let (uses, unfollowed, files) = uses_in(&workspace, &roots);
     assert!(
         files > 500,
         "the whole of crates/*/src was read, and it was: {files} files"
     );
-    let outside_src = roots_outside_src(&metadata, &workspace);
+    let production = production_roots(&metadata, &workspace);
     assert!(
-        outside_src.is_empty(),
+        production.outside.is_empty(),
         "these library and program roots of the host's crates are not under their crate's src/, \
          which this reading covers, so nothing of them was read:\n{}",
-        outside_src.join("\n")
+        production.outside.join("\n")
+    );
+    // The control on the real tree: the roots were looked at, the host's own among them.
+    for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
+        assert!(
+            production.examined.iter().any(|examined| examined == root),
+            "the reading examined {root} as a production root, and found only {} roots",
+            production.examined.len()
+        );
+    }
+    assert!(
+        unfollowed.is_empty(),
+        "production code this reading cannot follow, which could hide a use of a name it looks \
+         for; either declare it where the reading follows or teach the reading:\n{}",
+        unfollowed.join("\n")
     );
     for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
         assert!(
@@ -783,7 +894,7 @@ fn only_the_install_module_asks_where_its_program_is() {
         .collect();
     assert!(
         outside.is_empty(),
-        "these name `{NAME}` outside {ALLOWED}; ask kr_ipc::install for this process's own \
+        "these name {NAMES:?} outside {ALLOWED}; ask kr_ipc::install for this process's own \
          release's program (`own`) or for the one an update replaces (`stable`) instead:\n{}",
         outside.join("\n")
     );
@@ -807,6 +918,7 @@ fn the_reading_tells_code_from_tests_and_from_words() {
         "use std::env::current_exe;",
         "fn f() -> &'static str { let _ = current_exe(); \"x\" }",
         "fn f() { let _ = ('\\'', 'a', b'\\\\'); let _ = current_exe(); }",
+        "fn f() { let _ = _NSGetExecutablePath(); }",
     ] {
         assert_eq!(read(source).uses.len(), 1, "{source}");
     }
@@ -914,9 +1026,25 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
             .map(|(path, text)| (PathBuf::from(path), (*text).to_owned()))
             .collect();
         let roots: BTreeSet<PathBuf> = roots.iter().map(PathBuf::from).collect();
-        let mut found: Vec<String> = production_uses(&sources, &roots)
+        let mut found: Vec<String> = read_sources(&sources, &roots)
+            .uses
             .into_iter()
             .map(|(file, _)| file.to_string_lossy().replace('\\', "/"))
+            .collect();
+        found.sort();
+        found
+    };
+    // What the reading could not follow, as `file: what`.
+    let unfollowed = |files: &[(&str, &str)]| {
+        let sources: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), (*text).to_owned()))
+            .collect();
+        let roots: BTreeSet<PathBuf> = [PathBuf::from("src/lib.rs")].into_iter().collect();
+        let mut found: Vec<String> = read_sources(&sources, &roots)
+            .unfollowed
+            .into_iter()
+            .map(|(file, what)| format!("{}: {what}", file.to_string_lossy().replace('\\', "/")))
             .collect();
         found.sort();
         found
@@ -1002,6 +1130,45 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
         ),
         vec!["src/bin/tool.rs"]
     );
+
+    // What the reading cannot follow is named, not passed over: a production module whose file it
+    // does not hold, a `cfg_attr` that names a path, and an `include!` of source.
+    assert_eq!(
+        unfollowed(&[("src/lib.rs", "#[path = \"../tools/extra.rs\"]\nmod extra;")]),
+        vec!["src/lib.rs: mod extra names a file this reading does not hold"]
+    );
+    assert_eq!(
+        unfollowed(&[
+            (
+                "src/lib.rs",
+                "#[cfg_attr(unix, path = \"other.rs\")]\nmod x;\n#[cfg(test)]\nmod tests;",
+            ),
+            ("src/x.rs", "")
+        ]),
+        vec!["src/lib.rs: line 1: a cfg_attr names a module's path"]
+    );
+    assert_eq!(
+        unfollowed(&[("src/lib.rs", "fn f() {}\ninclude!(\"generated.rs\");")]),
+        vec!["src/lib.rs: line 2: an include! brings in source where this reading does not follow"]
+    );
+    // The controls: the same declarations are followed when their files are held, in test code
+    // nothing is named, and `include_str!` is data, not source.
+    assert!(
+        unfollowed(&[
+            ("src/lib.rs", "#[path = \"../tools/extra.rs\"]\nmod extra;"),
+            ("tools/extra.rs", ""),
+        ])
+        .is_empty()
+    );
+    assert!(
+        unfollowed(&[(
+            "src/lib.rs",
+            "#[cfg(test)]\nmod tests { include!(\"x.rs\"); #[cfg_attr(unix, path = \"a.rs\")] mod a; }\n\
+             #[cfg(test)]\n#[path = \"../tests/x.rs\"]\nmod x;\n\
+             const P: &str = include_str!(\"../package.json\");",
+        )])
+        .is_empty()
+    );
 }
 
 /// A library or program whose root is not under its crate's `src/` is named, so the guard cannot
@@ -1031,9 +1198,20 @@ fn a_root_outside_the_source_directory_is_named() {
             "targets": [{ "kind": ["bin"], "src_path": "/w/apps/c/main.rs" }],
         },
     ]});
+    let roots = production_roots(&metadata, Path::new("/w"));
     assert_eq!(
-        roots_outside_src(&metadata, Path::new("/w")),
+        roots.outside,
         vec!["crates/b/native/lib.rs", "crates/b/tools/tool.rs"]
+    );
+    assert_eq!(
+        roots.examined,
+        vec![
+            "crates/a/src/bin/tool.rs",
+            "crates/a/src/lib.rs",
+            "crates/b/native/lib.rs",
+            "crates/b/tools/tool.rs",
+        ],
+        "only what ships in a program is looked at, and only in the host's crates"
     );
     // The control: nothing is named when every root is where the reading looks.
     let inside = serde_json::json!({ "packages": [{
@@ -1043,5 +1221,9 @@ fn a_root_outside_the_source_directory_is_named() {
             { "kind": ["bin"], "src_path": "/w/crates/a/src/bin/tool.rs" },
         ],
     }]});
-    assert!(roots_outside_src(&inside, Path::new("/w")).is_empty());
+    assert!(
+        production_roots(&inside, Path::new("/w"))
+            .outside
+            .is_empty()
+    );
 }
