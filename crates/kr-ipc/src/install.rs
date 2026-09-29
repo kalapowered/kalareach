@@ -797,7 +797,8 @@ impl Store {
         }
     }
 
-    /// Removes a release no running process holds, and says whether it did.
+    /// Removes a release no running process holds, and says whether it did. Whatever else is at
+    /// the release's name, a link or a file, is removed as a name only.
     ///
     /// The release's manifest is locked exclusively, which fails while any process holds the
     /// release, and the release is renamed into `trash/` while that lock is held: from then on no
@@ -810,6 +811,17 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the release cannot be locked, moved or deleted.
     pub fn retire(&self, release: &ReleaseName, _held: &StoreLock) -> Result<bool> {
+        let directory = self.release_directory(release);
+        // A release is a directory. Anything else under its name, a link above all, is not one:
+        // the name is taken away and whatever it pointed at is left as it was, never followed.
+        let about = std::fs::symlink_metadata(&directory)
+            .map_err(|error| InstallError::io("read", &directory, error))?;
+        if !about.file_type().is_dir() {
+            std::fs::remove_file(&directory)
+                .map_err(|error| InstallError::io("remove", &directory, error))?;
+            sync_directory(&self.versions())?;
+            return Ok(true);
+        }
         let path = self.manifest(release);
         let file = File::open(&path).map_err(|error| InstallError::io("open", &path, error))?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
@@ -829,7 +841,6 @@ impl Store {
         let removed = self
             .trash()
             .join(format!("{release}-{}", crate::new_uuid()));
-        let directory = self.release_directory(release);
         // A release is installed read-only, and on some systems a directory moves to another
         // parent only while its own entries can be written.
         {
@@ -1184,6 +1195,73 @@ mod tests {
             0,
             "nothing of it is left in the trash"
         );
+    }
+
+    /// Removing a release follows no link: a name that is a link is taken away and what it pointed
+    /// at is left as it was, and a release whose files are hard links to files elsewhere goes as
+    /// names only, those files keeping their contents and their modes.
+    #[test]
+    fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let test = test_store();
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let outside = test
+            .store
+            .root()
+            .parent()
+            .expect("the test's own directory")
+            .join("outside");
+        std::fs::create_dir_all(outside.join("release/bin")).expect("a directory elsewhere");
+        let mode_of =
+            |path: &Path| std::fs::metadata(path).expect("there").permissions().mode() & 0o777;
+
+        // A name that is a link to a whole release elsewhere.
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        std::fs::write(outside.join("release/release.json"), manifest_of(&one)).expect("written");
+        std::fs::write(outside.join("release/bin/kr"), b"#!/bin/sh\n").expect("written");
+        std::fs::set_permissions(
+            outside.join("release"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("read-only");
+        std::os::unix::fs::symlink(outside.join("release"), test.store.release_directory(&one))
+            .expect("a link under the release's name");
+        assert!(test.store.retire(&one, &update).expect("removes the name"));
+        assert!(
+            std::fs::symlink_metadata(test.store.release_directory(&one)).is_err(),
+            "the name is gone"
+        );
+        assert_eq!(mode_of(&outside.join("release")), 0o555, "not followed");
+        assert!(outside.join("release/bin/kr").is_file(), "nothing removed");
+        std::fs::set_permissions(
+            outside.join("release"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("writable again");
+
+        // A release whose program is a hard link to a file elsewhere.
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        let program = install(&test.store, &two);
+        std::fs::write(outside.join("shared"), b"shared contents").expect("written");
+        std::fs::set_permissions(
+            outside.join("shared"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .expect("read-only");
+        std::fs::remove_file(&program).expect("the copy goes");
+        std::fs::hard_link(outside.join("shared"), &program).expect("a hard link");
+        assert!(test.store.retire(&two, &update).expect("removes"));
+        assert!(!test.store.release_directory(&two).exists());
+        assert_eq!(
+            std::fs::read(outside.join("shared")).expect("still there"),
+            b"shared contents"
+        );
+        assert_eq!(mode_of(&outside.join("shared")), 0o444, "its mode is kept");
     }
 
     /// A program that opened its manifest while its release was being removed does not run: once
