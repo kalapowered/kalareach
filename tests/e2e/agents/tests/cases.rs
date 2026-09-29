@@ -39,7 +39,7 @@ use kr_e2e_agents::observe::{
     AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
     typed_actions,
 };
-use kr_e2e_agents::outcome::Outcome;
+use kr_e2e_agents::outcome::{Failure, Outcome};
 use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling, beneath_parent};
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
@@ -607,6 +607,26 @@ fn on_account_stage(part: &str, test: &str, body: impl FnOnce(&mut Stage<'_, '_>
     staged(part, test, true, body);
 }
 
+/// The texts of why an agent stops, joined.
+fn stop_text(stop: &[(&'static str, String)]) -> String {
+    stop.iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The classes of why an agent stops, each once, as the failures a record publishes.
+fn stop_failures(stop: &[(&'static str, String)]) -> Vec<Failure> {
+    let mut failures: Vec<Failure> = Vec::new();
+    for (class, _) in stop {
+        let failure = Failure::AgentStops(class);
+        if !failures.contains(&failure) {
+            failures.push(failure);
+        }
+    }
+    failures
+}
+
 /// What a panic said, where it said anything.
 fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
     panic
@@ -864,7 +884,7 @@ fn staged(
     // The person's watched files as the part leaves them: a guarded one changed, or a shared one
     // changed and naming the run's directory or the part's mark, stops the agent.
     let mut watched_evidence = None;
-    let mut watched_stop = Vec::new();
+    let mut watched_stop: Vec<(&'static str, String)> = Vec::new();
     if let (Some(login), Some((files, before, item, lines))) = (login.as_ref(), watched.as_ref()) {
         let root_text = root.display().to_string();
         match guarded_files(
@@ -882,7 +902,10 @@ fn staged(
                     // The digest and the search are of the same bytes.
                     let names_run = changed && second.holds;
                     if changed && !recorded && (!shared || names_run) {
-                        watched_stop.push(format!("~/{} changed", first.relative));
+                        watched_stop.push((
+                            "guarded_file_changed",
+                            format!("~/{} changed", first.relative),
+                        ));
                     }
                     entries.push(json!({ "file": format!("~/{}", first.relative), "changed": changed, "shared": shared, "recorded_only": recorded, "names_run": names_run }));
                 }
@@ -934,16 +957,22 @@ fn staged(
                                 })
                             }
                             Ok(None) => {
-                                watched_stop.push(format!(
-                                    "~/{}: a line that was there before the part changed or went",
-                                    file.relative
+                                watched_stop.push((
+                                    "appended_file_changed",
+                                    format!(
+                                        "~/{}: a line that was there before the part changed or went",
+                                        file.relative
+                                    ),
                                 ));
                                 json!({ "file": format!("~/{}", file.relative), "earlier_lines_intact": false })
                             }
                             Err(error) => {
-                                watched_stop.push(format!(
-                                    "~/{} cannot be read after the part: {error}",
-                                    file.relative
+                                watched_stop.push((
+                                    "person_file_unreadable",
+                                    format!(
+                                        "~/{} cannot be read after the part: {error}",
+                                        file.relative
+                                    ),
                                 ));
                                 json!({ "file": format!("~/{}", file.relative), "error": error.to_string() })
                             }
@@ -965,8 +994,11 @@ fn staged(
                             ) {
                                 Ok(count) => json!({ "file": format!("~/{relative}"), "removed": count }),
                                 Err(why) => {
-                                    watched_stop.push(format!(
-                                        "the part's lines could not be removed from ~/{relative}: {why}"
+                                    watched_stop.push((
+                                        "lines_not_removed",
+                                        format!(
+                                            "the part's lines could not be removed from ~/{relative}: {why}"
+                                        ),
                                     ));
                                     json!({ "file": format!("~/{relative}"), "error": why })
                                 }
@@ -985,43 +1017,55 @@ fn staged(
                     "config_directory_removed": config_gone,
                 }));
             }
-            Err(why) => watched_stop.push(format!(
-                "a file of the person's that must not change cannot be read after the part: {why}"
+            Err(why) => watched_stop.push((
+                "person_file_unreadable",
+                format!(
+                    "a file of the person's that must not change cannot be read after the part: {why}"
+                ),
             )),
         }
     }
     if config_gone == Some(false) {
-        watched_stop
-            .push("the run's configuration directory is still there after its removal".to_owned());
+        watched_stop.push((
+            "configuration_directory_left",
+            "the run's configuration directory is still there after its removal".to_owned(),
+        ));
     }
     // Why the agent stops here, if it does: something the part started outlived it, the person's
     // directories could not be read whole afterwards, the agent rewrote a file it had there, or a
     // file of the person's that must not change did.
     let mut stop = watched_stop;
     if let Some(what) = &guard_change {
-        stop.push(format!(
-            "{GUARD_CHANGED} {what}; the part then sent nothing more and tried to stop and kill \
-             every process it could reach (the probe that ran, the run's recorded processes, the \
-             sessions' shells, the agent's processes, those the provenance sampler had taken and \
-             every process beneath them), and recorded {}",
-            guard_stop
-                .as_ref()
-                .map_or_else(|| "nothing".to_owned(), ToString::to_string)
+        stop.push((
+            "guarded_file_changed",
+            format!(
+                "{GUARD_CHANGED} {what}; the part then sent nothing more and tried to stop and kill \
+                 every process it could reach (the probe that ran, the run's recorded processes, the \
+                 sessions' shells, the agent's processes, those the provenance sampler had taken and \
+                 every process beneath them), and recorded {}",
+                guard_stop
+                    .as_ref()
+                    .map_or_else(|| "nothing".to_owned(), ToString::to_string)
+            ),
         ));
     }
     if let Err(left) = &writers {
-        stop.push(format!(
-            "something the part started still ran after the run ended everything, so what it \
-             left is not final: {left}"
+        stop.push((
+            "process_outlived_the_run",
+            format!(
+                "something the part started still ran after the run ended everything, so what it \
+                 left is not final: {left}"
+            ),
         ));
     }
     if let Some((_, rewrites, whole, _)) = &home {
         if !whole {
-            stop.push(
+            stop.push((
+                "agent_directories_unread",
                 "the person's agent directories could not be read whole after the part, so \
                  nothing was removed and no edit can be ruled out"
                     .to_owned(),
-            );
+            ));
         }
         // Counted by directory: a file's own name can be the person's, and this text goes into
         // the record; the part's evidence lists what it may name.
@@ -1030,16 +1074,19 @@ fn staged(
                 .as_ref()
                 .is_some_and(|login| login.account.stop_on_rewrite)
         {
-            stop.push(format!(
-                "the agent rewrote files it had before the part, by directory: {}",
-                rewrites
-                    .iter()
-                    .map(|(root, count)| match root {
-                        Some(root) => format!("{} ({count})", root.display()),
-                        None => format!("outside the listed directories ({count})"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            stop.push((
+                "agent_rewrote_files",
+                format!(
+                    "the agent rewrote files it had before the part, by directory: {}",
+                    rewrites
+                        .iter()
+                        .map(|(root, count)| match root {
+                            Some(root) => format!("{} ({count})", root.display()),
+                            None => format!("outside the listed directories ({count})"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ));
         }
     }
@@ -1050,11 +1097,17 @@ fn staged(
             // numbers its sessions ran, and whether its agent stops, before its failure goes on.
             if needs_login {
                 let said = panic_text(&*panic);
-                if said.starts_with(LOGIN_UNPROVEN)
-                    || said.starts_with(ISOLATION_UNPROVEN)
-                    || (said.starts_with(GUARD_CHANGED) && guard_change.is_none())
-                {
-                    stop.push(said.clone());
+                let class = if said.starts_with(LOGIN_UNPROVEN) {
+                    Some("login_not_established")
+                } else if said.starts_with(ISOLATION_UNPROVEN) {
+                    Some("isolation_not_established")
+                } else if said.starts_with(GUARD_CHANGED) && guard_change.is_none() {
+                    Some("guarded_file_changed")
+                } else {
+                    None
+                };
+                if let Some(class) = class {
+                    stop.push((class, said.clone()));
                 }
                 let mut evidence = serde_json::Map::new();
                 evidence.insert("provenance".to_owned(), provenance.evidence());
@@ -1090,19 +1143,30 @@ fn staged(
                     evidence.insert("stop_agent".to_owned(), json!(true));
                 }
                 let evidence = serde_json::Value::Object(evidence);
-                let outcome = match said.find(NOT_PINNED) {
-                    // The session ran something other than the build, so the part did not test
-                    // it: not run, as the harness records such a part.
-                    Some(at) if stop.is_empty() => {
+                // The session ran something other than the build, so the part did not test it:
+                // not run, as the harness records such a part.
+                let not_run = said.find(NOT_PINNED).map(|at| (at, Failure::NotPinned));
+                let mut failures = if class.is_none() {
+                    vec![Failure::PartFailed]
+                } else {
+                    Vec::new()
+                };
+                failures.extend(stop_failures(&stop));
+                let outcome = match not_run {
+                    Some((at, failure)) if stop.is_empty() => {
                         Outcome::not_run(part, test, &said[at..], evidence)
+                            .with_failures(&[failure])
                     }
-                    _ if stop.is_empty() => Outcome::failed(part, test, &said, evidence),
+                    _ if stop.is_empty() => {
+                        Outcome::failed(part, test, &said, evidence).with_failures(&failures)
+                    }
                     _ => Outcome::failed(
                         part,
                         test,
-                        &format!("{said}; and the agent stops here: {}", stop.join("; ")),
+                        &format!("{said}; and the agent stops here: {}", stop_text(&stop)),
                         evidence,
-                    ),
+                    )
+                    .with_failures(&failures),
                 };
                 outcome.append(&inputs.result);
             }
@@ -1130,12 +1194,14 @@ fn staged(
         outcome = Outcome::failed(
             part,
             test,
-            &format!("the agent stops here: {}", stop.join("; ")),
+            &format!("the agent stops here: {}", stop_text(&stop)),
             outcome.evidence.clone(),
-        );
+        )
+        .with_failures(&stop_failures(&stop));
     }
     if let Some(why) = key_failure {
-        outcome = Outcome::failed(part, test, &why, outcome.evidence.clone());
+        outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
+            .with_failures(&[Failure::KeyScanIncomplete]);
     }
     let failed = (outcome.outcome == "failed").then(|| outcome.reason.clone().unwrap_or_default());
     outcome.append(&inputs.result);
@@ -4283,22 +4349,30 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             "surface": offered.evidence(),
         });
         let mut failures = Vec::new();
+        let mut codes = Vec::new();
         if let Some(code) = &upload.refused {
             failures.push(format!(
                 "a paired device's upload.begin is refused on this host ({code}), so the image is \
                  not the device's transfer"
             ));
+            codes.push(Failure::UploadRefused(code.clone()));
         } else {
             failures.push(
                 "a paired device's upload.begin was accepted, and the image given was not the one \
                  it transferred"
                     .to_owned(),
             );
+            codes.push(Failure::UploadTransferredAnotherImage);
         }
         if let Err(why) = &detected {
             failures.push(format!("the host did not detect the manual launch: {why}"));
+            codes.push(Failure::LaunchNotDetected {
+                session: None,
+                announced: shown.detection.instances.len(),
+            });
         }
-        let outcome = Outcome::failed("1", TEST, &failures.join("; "), evidence);
+        let outcome =
+            Outcome::failed("1", TEST, &failures.join("; "), evidence).with_failures(&codes);
         Ending {
             outcome,
             sessions: logged.agent.sessions(),
@@ -5609,7 +5683,8 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                     TEST,
                     "the reply reached the device before the agent recorded the prompt, or whether it had could not be told, so no moment between them was shown",
                     evidence,
-                ),
+                )
+                .with_failures(&[Failure::ReplyBeforeRecord]),
                 logged.agent.sessions(),
             );
         }
@@ -5820,8 +5895,20 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         // Where the agent forks a saved conversation for a second process, the part shows two
         // executions from one saved history, not two on one conversation's identifier.
         let mut failures = Vec::new();
+        let mut codes = Vec::new();
         if let (Ok(_), Ok(_)) = (&detected_first, &detected_second) {
         } else {
+            for (session, detected, shown) in [
+                ("A", &detected_first, &shown_first),
+                ("B", &detected_second, &shown_second),
+            ] {
+                if detected.is_err() {
+                    codes.push(Failure::LaunchNotDetected {
+                        session: Some(session),
+                        announced: shown.detection.instances.len(),
+                    });
+                }
+            }
             failures.push(format!(
                 "the host did not detect each launch as section 12 requires: A {}, B {}",
                 detected_first
@@ -5839,11 +5926,12 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
                  one conversation's identifier were not shown"
                     .to_owned(),
             );
+            codes.push(Failure::ResumeForks);
         }
         let outcome = if failures.is_empty() {
             Outcome::passed("7", TEST, evidence)
         } else {
-            Outcome::failed("7", TEST, &failures.join("; "), evidence)
+            Outcome::failed("7", TEST, &failures.join("; "), evidence).with_failures(&codes)
         };
         let mut sessions = first.agent.sessions();
         sessions.extend(second.agent.sessions());
