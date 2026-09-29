@@ -17,6 +17,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::{
     MAX_NAMED_RESOURCES, NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
 };
+use kr_transport::lease::WorkerBinding;
 
 use crate::error::{ControllerError, Result};
 
@@ -626,9 +627,12 @@ impl Controller {
     /// claimed ([`read_previews`]). A share naming nothing asks nothing.
     ///
     /// The link is taken out of its slot for the exchange and put back only once the exchange is
-    /// whole, and the whole of it, the wait for the link included, is bounded by
-    /// [`super::workers::WORKER_EXCHANGE`]: a link given back part way through a request would be
-    /// read by the next caller as its own answer.
+    /// whole ([`OutOfItsSlot`]); one that fails, runs out of time or is abandoned is closed
+    /// instead, and the worker's lease stops renewing with it, since a link given back part way
+    /// through a request would be read by the next caller as its own answer. The whole of the
+    /// exchange, the wait for the link included, is bounded by
+    /// [`super::workers::WORKER_EXCHANGE`]; running out of time while another operation holds the
+    /// link leaves that operation's link, and the lease, as they were.
     ///
     /// # Errors
     ///
@@ -654,29 +658,26 @@ impl Controller {
             )));
         }
         let exchange = async {
-            let mut held =
-                self.worker_client_of(session_id)
-                    .await
-                    .map_err(|error| match error {
-                        ControllerError::UnknownSession { .. } => error,
-                        other => unreachable_worker(other),
-                    })?;
-            let mut client = held.take().expect("the connection is open");
-            match read_previews(&mut client, session_id, selection).await {
+            let held = self
+                .worker_client_of(session_id)
+                .await
+                .map_err(|error| match error {
+                    ControllerError::UnknownSession { .. } => error,
+                    other => unreachable_worker(other),
+                })?;
+            let mut link = OutOfItsSlot::take(self, session_id, held);
+            match read_previews(link.client(), session_id, selection).await {
                 Ok(previews) => {
-                    *held = Some(client);
+                    link.give_back();
                     Ok(previews)
                 }
                 Err(PreviewFailure::Refused(error)) => {
-                    *held = Some(client);
+                    link.give_back();
                     Err(error)
                 }
-                // A link that failed part way is not given back: the next caller opens a new one,
-                // and presents the generation again, and renewal stops with the path.
-                Err(PreviewFailure::Link(error)) => {
-                    self.lost_control_path(session_id);
-                    Err(unreachable_worker(error))
-                }
+                // A link that failed part way is not given back, and is given up when it goes out
+                // of scope here, as it is when this exchange runs out of time or is abandoned.
+                Err(PreviewFailure::Link(error)) => Err(unreachable_worker(error)),
             }
         };
         tokio::time::timeout(super::workers::WORKER_EXCHANGE, exchange)
@@ -969,6 +970,65 @@ fn unfinished_and_unknown() -> ControllerError {
 struct NamedPreviews {
     questions: Vec<NamedQuestionPreview>,
     approvals: Vec<NamedApprovalPreview>,
+}
+
+/// This daemon's link to one worker, out of its slot for one exchange.
+///
+/// It goes back into the slot only when the exchange was whole ([`Self::give_back`]). Dropped any
+/// other way, because the link failed, the exchange ran out of time or the request that asked for
+/// it was abandoned part way, the link is closed instead: an answer may still be on its way over
+/// it, and the next caller would read that as its own. Closing it gives up the control path the
+/// worker's lease rests on, so renewal stops, as wherever else this daemon gives up a worker's
+/// link. That happens while the slot is still held, so the next caller finds the path given up
+/// already. It is the path the link was taken from that is given up: a path bound since, by an
+/// announcement of an authority revision waiting for the slot, is not this link's to lose.
+struct OutOfItsSlot<'a> {
+    controller: &'a Controller,
+    session_id: SessionId,
+    /// The control path the worker was on when the link was taken.
+    binding: WorkerBinding,
+    /// The link, out of the slot. It is declared before `slot`, so it is closed before the slot
+    /// is released.
+    client: Option<LocalClient>,
+    /// The slot, held from taking the link until it is given back or given up.
+    slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+}
+
+impl<'a> OutOfItsSlot<'a> {
+    /// Takes the link out of the slot the caller holds.
+    fn take(
+        controller: &'a Controller,
+        session_id: SessionId,
+        mut slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+    ) -> Self {
+        Self {
+            controller,
+            session_id,
+            binding: controller.leases.binding(session_id),
+            client: slot.take(),
+            slot,
+        }
+    }
+
+    /// The link, for the exchange.
+    fn client(&mut self) -> &mut LocalClient {
+        self.client.as_mut().expect("the link is out of its slot")
+    }
+
+    /// Puts the link back into the slot, once its exchange is whole.
+    fn give_back(mut self) {
+        *self.slot = self.client.take();
+    }
+}
+
+impl Drop for OutOfItsSlot<'_> {
+    fn drop(&mut self) {
+        if self.client.is_some() {
+            self.controller
+                .leases
+                .stop_renewal(self.session_id, self.binding);
+        }
+    }
 }
 
 /// Why the session's worker could not say what a share names.
