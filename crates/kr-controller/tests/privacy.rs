@@ -128,10 +128,12 @@ const EXECUTOR: &str = "the test transport";
 /// The directory the session's shell runs in. Its name is the session's deterministic title.
 const PROJECT: &str = "privacy-project";
 
-/// The session's shell: it prints the file `mark` in its directory twenty times a second, so the
-/// session has output arriving whenever the test has written one, for at most ten minutes.
-const MARKING: &str = "i=0; while [ $i -lt 12000 ]; do cat mark 2>/dev/null; sleep 0.05; \
-                       i=$((i + 1)); done";
+/// The session's shell: it prints the file `mark` in its directory about twenty times a second, so
+/// the session has output arriving whenever the test has written one, for at most ten minutes. It
+/// keeps every byte it printed in the file `said`, and the number of the last pass it finished in
+/// the file `pass`, so that a test can tell when the worker has read everything the shell printed.
+const MARKING: &str = "i=0; while [ $i -lt 12000 ]; do cat mark 2>/dev/null | tee -a said; \
+                       i=$((i + 1)); echo $i > pass.tmp; mv pass.tmp pass; sleep 0.05; done";
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -316,9 +318,45 @@ impl Worker {
         String::from_utf8_lossy(page.bytes.as_slice()).into_owned()
     }
 
-    /// Sets what the session's shell prints from now on.
+    /// Sets what the session's shell prints from now on. A mark has no line ends, which a terminal
+    /// would print as two bytes, so that what the shell recorded is what the worker counts.
     fn mark(&self, text: &str) {
+        assert!(!text.contains('\n'), "a mark has no line end: {text:?}");
         std::fs::write(self.project.join("mark"), text).expect("the mark is written");
+    }
+
+    /// Everything the shell has printed so far, as it recorded it.
+    fn said(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(self.project.join("said")).unwrap_or_default())
+            .into_owned()
+    }
+
+    /// The number of the last pass the shell finished over the mark.
+    fn pass(&self) -> u64 {
+        std::fs::read_to_string(self.project.join("pass"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Waits until the worker has read every byte the shell printed, once the mark is empty.
+    ///
+    /// The shell finishes two passes after the mark was emptied: the second read the mark as it
+    /// stands, and printed nothing, so the shell has said all it will say. What it recorded is then
+    /// the whole of what it wrote to the terminal, and the worker has read it all when its cursor
+    /// stands at the last byte of it. Nothing here is a delay: a worker that has not read what was
+    /// written waits the test out.
+    async fn has_read_all_that_was_said(&self) {
+        let emptied_at = self.pass();
+        until("the shell finishing two passes over the empty mark", || {
+            self.pass() >= emptied_at + 2
+        })
+        .await;
+        let written = self.said().len() as u64;
+        until("the worker reading all that the shell wrote", || {
+            self.runtime.session().output_cursor() == written
+        })
+        .await;
     }
 
     /// The action target of this session.
@@ -935,7 +973,7 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
  {
     let environment = Environment::start().await;
     let worker = &environment.worker;
-    worker.mark("what the session said\n");
+    worker.mark("what the session said");
     until("the session retaining its output", || worker.retained() > 0).await;
     let producer = Producer::generate();
     let publication = environment.publication_on_the_wire(&producer, 1);
@@ -1025,8 +1063,13 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
     // still arriving not kept.
     environment.worker_holds(1, true).await;
     assert_eq!(worker.retained(), 0, "the retained output is removed");
-    worker.mark("what the session said while private\n");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    worker.mark("what the session said while private");
+    until("the shell printing it", || {
+        worker.said().contains("while private")
+    })
+    .await;
+    worker.mark("");
+    worker.has_read_all_that_was_said().await;
     assert_eq!(
         worker.retained(),
         0,
@@ -1056,7 +1099,7 @@ async fn kr_req_24_27_turning_privacy_on_records_the_generation_and_takes_every_
 async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_is_listed() {
     let environment = Environment::start().await;
     let worker = &environment.worker;
-    worker.mark("before\n");
+    worker.mark("before");
     until("the session retaining its output", || worker.retained() > 0).await;
     let producer = Producer::generate();
     let publication = environment.publication_on_the_wire(&producer, 1);
@@ -1153,12 +1196,16 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     assert!(!report.kept.is_empty(), "what is kept is named");
 
     // While it is on, the session says something that is never kept. It falls silent before
-    // privacy mode is turned off, so all it said is read while privacy mode is still on.
-    worker.mark("while private\n");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(worker.retained(), 0);
+    // privacy mode is turned off, and the worker has read everything it wrote by then, so all it
+    // said is read while privacy mode is still on.
+    worker.mark("while private");
+    until("the shell printing it", || {
+        worker.said().contains("while private")
+    })
+    .await;
     worker.mark("");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    worker.has_read_all_that_was_said().await;
+    assert_eq!(worker.retained(), 0);
 
     // Turning it off: the next generation, recorded, and the worker told.
     let report = environment
@@ -1180,7 +1227,7 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     );
 
     // Retention starts again from here, and nothing omitted comes back.
-    worker.mark("after\n");
+    worker.mark("after");
     until("the session retaining its output again", || {
         worker.history().contains("after")
     })
