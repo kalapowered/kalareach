@@ -3918,10 +3918,15 @@ or where the decoder gave none, as the Claude Code channel's table gives none, t
 upstream wrote it, when that is text of at most 4,096 bytes; an approval with neither cannot be
 named, because a preview cut short would show its issuer less than the recipient will read. An
 invitation names at most 32 questions and approvals together. One that names anything the worker
-holds no current record of is refused with one reason per kind, and nothing is written. The request
-is refused when the notices the issuer states it accepted are not the ones the grant carries. A
-shared live screen can hold text printed long before the invitation, so the preview carries the text
-rather than a description of it. A new recipient receives no historical attachment keys.
+holds no current record of is refused with one reason per kind, and nothing is written. A worker
+that cannot be asked, or does not answer within five seconds, leaves the share unfinished: nothing
+is written, and the request is told the worker could not be reached. The daemon closes its link to
+that worker, and the worker's dispatch lease is not renewed until it acknowledges the authority
+revision again; a share that only waited for another operation's use of the link leaves that link,
+and the lease, as they were. The request is refused when the notices the issuer states it accepted
+are not the ones the grant carries. A shared live screen can hold text printed long before the
+invitation, so the preview carries the text rather than a description of it. A new recipient
+receives no historical attachment keys.
 
 **Invitations are single use and they expire.** The default is `session.view` for one hour, from the
 moment the invitation is issued: the recipient sees the selected live screen and what happens next,

@@ -978,10 +978,10 @@ struct NamedPreviews {
 /// other way, because the link failed, the exchange ran out of time or the request that asked for
 /// it was abandoned part way, the link is closed instead: an answer may still be on its way over
 /// it, and the next caller would read that as its own. Closing it gives up the control path the
-/// worker's lease rests on, so renewal stops, as wherever else this daemon gives up a worker's
-/// link. That happens while the slot is still held, so the next caller finds the path given up
-/// already. It is the path the link was taken from that is given up: a path bound since, by an
-/// announcement of an authority revision waiting for the slot, is not this link's to lose.
+/// worker's lease rests on, so renewal stops with it. That happens while the slot is still held, so
+/// the next caller finds the path given up already. It is the path the link was taken from that is
+/// given up: a path bound since, by an announcement of an authority revision waiting for the slot,
+/// is not this link's to lose.
 struct OutOfItsSlot<'a> {
     controller: &'a Controller,
     session_id: SessionId,
