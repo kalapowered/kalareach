@@ -67,10 +67,13 @@ set -euo pipefail
 # distributions, a mount of other storage at its top or at any directory inside it -- is not this
 # copy's to remove and not something a copy can be made independent of, so the run stops and says
 # which path it was. A root that is the image itself, or holds it, is refused, and so is one that
-# is, or holds, a home or an XDG directory, however the path to it was reached. A root joins the
-# list of what is removed only once every check has passed for it, and nothing is removed until
-# both have been measured, so a refusal for one leaves both alone. The test is by device, so a bind
-# mount of another directory of the same filesystem is not told apart from the directory it covers.
+# is, or holds, the home directory or a base directory the product derives its roots below (the
+# XDG directories the environment names, and `.local/state` and `.cache` in the home), however the
+# path to it was reached. A root joins the list of what is removed only once every check has passed
+# for it, and nothing is removed until both have been measured, so a refusal while measuring leaves
+# both alone. A root that is not the directory it was when measured is left, and a root removed
+# before it stays removed. The tests are by device and inode, so a bind mount of another directory
+# of the same filesystem is not told apart from the directory it covers.
 #
 # The program runs inside the distribution. Its arguments are the installed helper, the root of the
 # image (`/` inside a distribution) and the directory its probe is made in. The self-test below runs
@@ -202,7 +205,9 @@ inherited_reset='
         continue
       fi
       # A root that is the image itself, or holds it, would take the image with it. So would one
-      # that is, or holds, a home or an XDG directory, which a link at a root can lead to.
+      # that is, or holds, the home directory or a base directory the product derives its roots
+      # below: the ones the environment names, and the two the product falls back to in the home.
+      # A link at a root can lead to any of them.
       if is_within "$image_real" "$resolved"; then
         refuse "$real leads to $resolved, which is the image itself or holds it"
       fi
@@ -220,10 +225,20 @@ inherited_reset='
             if is_within "$kreal" "$resolved"; then
               refuse "$real leads to $resolved, which is or holds $kind"
             fi
+            if [ "$kind" = HOME ]; then
+              for under in .local/state .cache; do
+                base="$(leads_to "$kreal/$under")"
+                base="${base%?x}"
+                if is_within "$base" "$resolved"; then
+                  refuse "$real leads to $resolved, which is or holds $base"
+                fi
+              done
+            fi
             ;;
         esac
       done
-      device="$(stat -c %d "$resolved")"
+      identity="$(stat -c %d:%i "$resolved")"
+      device="${identity%%:*}"
       [ "$device" = "$image_device" ] ||
         refuse "$real leads to $resolved, which is on storage this image does not carry and may be shared with the distribution this one was copied from"
       # The whole tree, not only its top: a directory inside it can mount storage of its own, and
@@ -247,19 +262,23 @@ inherited_reset='
       count=$((count + 1))
       eval "real_$count=\$real"
       eval "resolved_$count=\$resolved"
+      eval "identity_$count=\$identity"
     done
     # Nothing has been removed until here.
     n=0
+    identity=""
     while [ "$n" -lt "$count" ]; do
       n=$((n + 1))
       eval "real=\$real_$n"
       eval "resolved=\$resolved_$n"
+      eval "identity=\$identity_$n"
       # A root inside the one before it was taken with it.
       [ -e "$resolved" ] || continue
-      # Still on the storage it was measured on: storage mounted on it since would go with it,
-      # and the removal below stays on the filesystem it starts on.
-      [ "$(stat -c %d "$resolved")" = "$image_device" ] ||
-        refuse "$real is no longer on the storage this image carries, so it is left"
+      # Still the directory that was measured, on the device and at the inode it had then: one put
+      # in its place since, or storage mounted on it, was never checked, and the removal below
+      # stays on the filesystem it starts on.
+      [ "$(stat -c %d:%i "$resolved")" = "$identity" ] ||
+        refuse "$real is no longer the directory that was measured, so it is left"
       find "$resolved" -xdev -depth -delete
       say "  removed the inherited $real"
     done
@@ -439,38 +458,38 @@ self_test_state_outside_kalareach() {
 # A name below a mirror that is not a plain path is refused, and nothing beside it is removed: a
 # component of `..` leads out of the directory the helper named, and a backslash or a newline is
 # what a document or a listing would split or escape a name with. The first goes through the path
-# the helper prints for its token, the other two through the file it makes.
+# the helper prints for its token, the other two through the file it makes. Each is a case of its
+# own, so that each is shown to depend on the rule.
 self_test_unplain_root() {
-  local d="$self_test_work/${FUNCNAME[0]}" variant below kept
-  for variant in dotdot backslash newline; do
-    mkdir -p "$d/$variant/home/.local/state/kalareach" "$d/$variant/home/.cache/kalareach/run" ||
-      return 1
-    case "$variant" in
-      dotdot)
-        kept="$d/$variant/home/.cache/other/kept"
-        mkdir -p "${kept%/*}" || return 1
-        printf x >"$kept" || return 1
-        self_test_reset "$d/$variant" "$self_test_work" "$d/$variant/tmp" \
-          HOME="$d/$variant/home" KR_STATE_DIR="$d/$variant/state" \
-          STAND_IN_RUNTIME_BELOW=/.cache/kalareach/run/../.. && return 1
-        ;;
-      backslash | newline)
-        if [ "$variant" = backslash ]; then
-          below='/.local/state/kalareach/od\d'
-        else
-          below=$'/.local/state/kalareach/od\nd'
-        fi
-        kept="$d/$variant/home$below/kept"
-        mkdir -p "${kept%/*}" || return 1
-        printf x >"$kept" || return 1
-        self_test_reset "$d/$variant" "$self_test_work" "$d/$variant/tmp" \
-          HOME="$d/$variant/home" KR_RUNTIME_DIR="$d/$variant/run" \
-          STAND_IN_STATE_BELOW="$below" && return 1
-        ;;
-    esac
-    grep -q -F -e "is not a plain path" "$d/$variant/said" && [ -f "$kept" ] || return 1
-  done
+  local d="$self_test_work/${FUNCNAME[1]}" variant="$1" below kept
+  mkdir -p "$d/home/.local/state/kalareach" "$d/home/.cache/kalareach/run" || return 1
+  case "$variant" in
+    dotdot)
+      kept="$d/home/.cache/other/kept"
+      mkdir -p "${kept%/*}" || return 1
+      printf x >"$kept" || return 1
+      self_test_reset "$d" "$self_test_work" "$d/tmp" \
+        HOME="$d/home" KR_STATE_DIR="$d/state" \
+        STAND_IN_RUNTIME_BELOW=/.cache/kalareach/run/../.. && return 1
+      ;;
+    backslash | newline)
+      if [ "$variant" = backslash ]; then
+        below='/.local/state/kalareach/od\d'
+      else
+        below=$'/.local/state/kalareach/od\nd'
+      fi
+      kept="$d/home$below/kept"
+      mkdir -p "${kept%/*}" || return 1
+      printf x >"$kept" || return 1
+      self_test_reset "$d" "$self_test_work" "$d/tmp" \
+        HOME="$d/home" KR_RUNTIME_DIR="$d/run" STAND_IN_STATE_BELOW="$below" && return 1
+      ;;
+  esac
+  grep -q -F -e "is not a plain path" "$d/said" && [ -f "$kept" ]
 }
+self_test_unplain_dotdot() { self_test_unplain_root dotdot; }
+self_test_unplain_backslash() { self_test_unplain_root backslash; }
+self_test_unplain_newline() { self_test_unplain_root newline; }
 
 # A root that is a link to the home directory is refused, because what it leads to is the home,
 # which holds much that is not the product's, and nothing in the home is removed.
@@ -512,27 +531,78 @@ self_test_nested_roots() {
   [ ! -e "$d/x/kalareach" ] && [ -f "$d/x/beside/kept" ]
 }
 
-# A root that was not there when it was measured is not removed if it appears before the removal:
-# it never passed the checks a root passes. A wrapper for find, first on the path of this case,
-# makes the runtime root, once, while the state root is being walked.
-self_test_late_root() {
-  local d="$self_test_work/${FUNCNAME[0]}" real_find
+# Puts a wrapper for find first on the path of one case. The first time find is asked to walk the
+# state root, which is after the runtime root was measured, the wrapper runs the action it is given,
+# and then find goes on as it was asked. The action is what happens to the runtime root meanwhile.
+self_test_find_wrapper() {
+  local d="$1" action="$2" real_find
   real_find="$(command -v find)" || return 1
-  mkdir -p "$d/bin" "$d/state/sessions" || return 1
-  printf x >"$d/state/sessions/one" || return 1
+  mkdir -p "$d/bin" || return 1
   cat >"$d/bin/find" <<WRAPPER || return 1
 #!/bin/sh
 if [ "\$1" = "$d/state" ] && [ ! -e "$d/bin/fired" ]; then
   : >"$d/bin/fired"
-  mkdir -p "$d/run" && printf x >"$d/run/kept"
+  $action
 fi
 exec "$real_find" "\$@"
 WRAPPER
-  chmod 0755 "$d/bin/find" || return 1
+  chmod 0755 "$d/bin/find"
+}
+
+# A root that was not there when it was measured is not removed if it appears before the removal:
+# it never passed the checks a root passes.
+self_test_late_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/state/sessions" || return 1
+  printf x >"$d/state/sessions/one" || return 1
+  self_test_find_wrapper "$d" "mkdir -p \"$d/run\" && printf x >\"$d/run/kept\"" || return 1
   self_test_reset "$d" "$self_test_work" "$d/tmp" \
     PATH="$d/bin:$PATH" HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" ||
     return 1
   [ ! -e "$d/state" ] && [ -f "$d/run/kept" ]
+}
+
+# A root that is another directory when the removal comes to it than it was when it was measured is
+# left, and so is the root measured after it: this one is put in its place while the state root is
+# being walked, the way a link put in place of one of its parents would lead somewhere else.
+self_test_swapped_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/state/sessions" "$d/run" || return 1
+  printf x >"$d/state/sessions/one" || return 1
+  printf x >"$d/run/inherited" || return 1
+  self_test_find_wrapper "$d" \
+    "mv \"$d/run\" \"$d/run.moved\" && mkdir \"$d/run\" && printf x >\"$d/run/kept\"" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    PATH="$d/bin:$PATH" HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "is no longer the directory that was measured" "$d/said" &&
+    [ -f "$d/run/kept" ] && [ -f "$d/state/sessions/one" ]
+}
+
+# A root that is a link to the directory the product falls back to for its state in the home, or
+# that is that directory, is refused: it holds what other programs keep there as well.
+self_test_link_to_state_base() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state/other" || return 1
+  printf x >"$d/home/.local/state/other/kept" || return 1
+  ln -s "$d/home/.local/state" "$d/home/.local/state/kalareach" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e ".local/state" "$d/said" && grep -q -F -e "which is or holds" "$d/said" &&
+    [ -f "$d/home/.local/state/other/kept" ]
+}
+
+self_test_state_base_input() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state/other" || return 1
+  printf x >"$d/home/.local/state/other/kept" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    HOME="$d/home" KR_STATE_DIR="$d/home/.local/state" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "which is or holds" "$d/said" && [ -f "$d/home/.local/state/other/kept" ]
 }
 
 # A root that is a link is resolved: what it leads to is removed, and the link is left.
@@ -708,8 +778,12 @@ STAND_IN
     "a root that is the image itself is refused, and nothing is removed"
   self_test_case self_test_state_outside_kalareach \
     "a root below HOME outside a directory named kalareach is refused, and what shares it is left"
-  self_test_case self_test_unplain_root \
-    "a name below a mirror with a parent component, a backslash or a newline is refused"
+  self_test_case self_test_unplain_dotdot \
+    "a name below a mirror with a parent component is refused, and what lies beside it is left"
+  self_test_case self_test_unplain_backslash \
+    "a name below a mirror with a backslash is refused, and what lies beside it is left"
+  self_test_case self_test_unplain_newline \
+    "a name below a mirror with a newline is refused, and what lies beside it is left"
   self_test_case self_test_link_to_home \
     "a root that is a link to the home directory is refused, and nothing in the home is removed"
   self_test_case self_test_empty_input \
@@ -718,6 +792,12 @@ STAND_IN
     "a root inside the other is taken with it, and the removal that follows goes on"
   self_test_case self_test_late_root \
     "a root that appears after it was measured is not removed"
+  self_test_case self_test_swapped_root \
+    "a root that is another directory when the removal comes to it is left, with the other root"
+  self_test_case self_test_link_to_state_base \
+    "a root that is a link to the home's state directory is refused, and what shares it is left"
+  self_test_case self_test_state_base_input \
+    "a root that is the home's state directory is refused, and what shares it is left"
   self_test_case self_test_link_root \
     "a root that is a link is resolved, and what it leads to is removed"
   self_test_case self_test_other_storage \

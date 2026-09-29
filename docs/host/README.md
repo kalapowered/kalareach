@@ -1478,14 +1478,16 @@ them.
 `scripts/e2e-wsl.sh --self-test` checks that removal on any Linux host, against trees of its own.
 An installation is removed whole and nothing beside it is touched, and a name that holds a newline,
 or a root whose own name ends in one, is handled as the name it is. A root is removed only after
-every check has passed for it and both roots have been measured, so a refusal for one leaves both
-alone. The removal is refused when an input is set but empty or is not an absolute path; when the
-helper names a root outside the directories the run mirrored, a name that is not a plain path, or a
-root below a home or XDG directory that is not in a directory named kalareach; when a root is the
-image itself, or is or holds a home or XDG directory, by a link or otherwise; when a root leads to
-storage the image does not carry; and when a root holds a mount of such storage. The mount needs a
-namespace of the self-test's own, which root has and a user namespace gives. Where the host allows
-neither, the self-test says that case was not run rather than passing it.
+every check has passed for it and both roots have been measured, so a refusal while measuring leaves
+both alone; a root that is no longer the directory that was measured is left, and one removed before
+it stays removed. The removal is refused when an input is set but empty or is not an absolute path;
+when the helper names a root outside the directories the run mirrored, a name that is not a plain
+path, or a root below a home or XDG directory that is not in a directory named kalareach; when a
+root is the image itself, or is or holds the home, an XDG directory or the home's `.local/state` or
+`.cache`, by a link or otherwise; when a root leads to storage the image does not carry; and when a
+root holds a mount of such storage. The mount needs a namespace of the self-test's own, which root
+has and a user namespace gives. Where the host allows neither, the self-test says that case was not
+run rather than passing it.
 
 ## Who may type
 
