@@ -714,7 +714,7 @@ bound to the session this process is running in. Outside a session every tool an
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
-| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, or a control daemon of the store has been starting for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, or a release an earlier install or update left in the store is held by a running program. Nothing was replaced, and whatever the update stopped runs again |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the

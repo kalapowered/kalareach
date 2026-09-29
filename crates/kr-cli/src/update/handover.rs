@@ -116,10 +116,19 @@ pub async fn prepare(environment: &Environment, target: &ReleaseName) -> Result<
     }))
 }
 
-/// Tells a prepared daemon to stop, under the attempt it prepared. Its answer is not waited for:
-/// the daemon may end before it is written, and whether it has stopped is what its lock says.
-pub async fn stop(mut prepared: Prepared, environment: &Environment, target: &ReleaseName) {
-    let _ = step(
+/// What a daemon told to stop answers.
+pub enum Stop {
+    /// It was told, and whether it stops is what its lock says: it may end before its answer is
+    /// written, so a lost answer is not a refusal.
+    Told,
+    /// It answered that it does not stop, and why: its attempt is over, its hold lapsed, or it
+    /// was not prepared. It goes on serving, so nothing is waited for.
+    Refused(Shown),
+}
+
+/// Tells a prepared daemon to stop, under the attempt it prepared.
+pub async fn stop(mut prepared: Prepared, environment: &Environment, target: &ReleaseName) -> Stop {
+    match ask(
         &mut prepared.client,
         environment,
         target,
@@ -127,7 +136,11 @@ pub async fn stop(mut prepared: Prepared, environment: &Environment, target: &Re
         Some(prepared.attempt),
         DAEMON_ANSWER,
     )
-    .await;
+    .await
+    {
+        Asked::Refused(error) => Stop::Refused(Shown::protocol(&error)),
+        Asked::Answered(_) | Asked::Lost(_) => Stop::Told,
+    }
 }
 
 /// Tells a prepared daemon the update is not going ahead, so its attempt ends and its gate opens
@@ -228,12 +241,17 @@ fn refusal(environment: &Environment, said: Shown) -> CliError {
 /// that hold it while they start.
 ///
 /// This is the only way an update or an install takes the lock: it never waits without a bound.
+/// `command` is the one to run again, `install` or `update`, when the wait runs out.
 ///
 /// # Errors
 ///
 /// Returns a refusal saying a control daemon is starting and holds the lock when `within` has
 /// passed, and the failure to take it for any other reason.
-pub async fn install_lock(store: &Store, within: Duration) -> Result<kr_ipc::install::StoreLock> {
+pub async fn install_lock(
+    store: &Store,
+    within: Duration,
+    command: &'static str,
+) -> Result<kr_ipc::install::StoreLock> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         match store.try_lock_install() {
@@ -244,10 +262,11 @@ pub async fn install_lock(store: &Store, within: Duration) -> Result<kr_ipc::ins
             Ok(None) => {
                 return Err(CliError::UpdateDeferred(shown!(
                     "a control daemon of the store at {} is starting and has held its start lock \
-                     for more than {} seconds; run kr host update again once it has started or \
+                     for more than {} seconds; run kr host {} again once it has started or \
                      stopped",
                     Shown::root(store.root()),
-                    within.as_secs()
+                    within.as_secs(),
+                    command
                 )));
             }
             Err(error) => return Err(CliError::Other(super::said(&error))),
@@ -267,7 +286,7 @@ pub async fn install_lock(store: &Store, within: Duration) -> Result<kr_ipc::ins
 /// Returns the refusal of [`install_lock`], and the failure to take the environment's lock for any
 /// reason but a holder.
 pub async fn held(store: &Store, environment: &Environment, within: Duration) -> Result<bool> {
-    let _install = install_lock(store, within).await?;
+    let _install = install_lock(store, within, "update").await?;
     match SingletonLock::hold(
         &environment.paths.singleton_lock(),
         environment.environment_id,
@@ -298,16 +317,26 @@ pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
     Ok(())
 }
 
-/// Takes one step of the handover on a daemon's connection, for `attempt` where the step names
-/// one, bounded by `within`.
-async fn step(
+/// What a daemon answers to one step of the handover.
+enum Asked {
+    /// It took the step.
+    Answered(HostUpdateHandoverResult),
+    /// It refused the step, which is definite: it did not take it.
+    Refused(kr_protocol::error::ProtocolError),
+    /// No answer arrived, or one that is not a handover's: whether it took the step is not known.
+    Lost(Shown),
+}
+
+/// Asks one step of the handover on a daemon's connection, for `attempt` where the step names one,
+/// bounded by `within`.
+async fn ask(
     client: &mut LocalClient,
     environment: &Environment,
     target: &ReleaseName,
     step: HandoverStep,
     attempt: Option<Uuid>,
     within: Duration,
-) -> Result<HostUpdateHandoverResult> {
+) -> Asked {
     let params = HostUpdateHandoverParams {
         step,
         target: target.clone(),
@@ -323,20 +352,36 @@ async fn step(
         ),
     )
     .await;
-    let refused = |said: Shown| refusal(environment, said);
     match asked {
-        Ok(Ok(Ok(answer))) => answer.to_typed().map_err(|error| {
-            refused(shown!(
+        Ok(Ok(Ok(answer))) => match answer.to_typed() {
+            Ok(answer) => Asked::Answered(answer),
+            Err(error) => Asked::Lost(shown!(
                 "its answer is not a handover's: {}",
                 Shown::cbor(&error)
-            ))
-        }),
-        Ok(Ok(Err(error))) => Err(refused(Shown::protocol(&error))),
-        Ok(Err(error)) => Err(refused(Shown::ipc(&error))),
-        Err(_) => Err(refused(shown!(
+            )),
+        },
+        Ok(Ok(Err(error))) => Asked::Refused(error),
+        Ok(Err(error)) => Asked::Lost(Shown::ipc(&error)),
+        Err(_) => Asked::Lost(shown!(
             "it did not answer within {} seconds",
             within.as_secs()
-        ))),
+        )),
+    }
+}
+
+/// Takes one step of the handover, and refuses the update, for now, when the daemon does not.
+async fn step(
+    client: &mut LocalClient,
+    environment: &Environment,
+    target: &ReleaseName,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    within: Duration,
+) -> Result<HostUpdateHandoverResult> {
+    match ask(client, environment, target, step, attempt, within).await {
+        Asked::Answered(answer) => Ok(answer),
+        Asked::Refused(error) => Err(refusal(environment, Shown::protocol(&error))),
+        Asked::Lost(said) => Err(refusal(environment, said)),
     }
 }
 

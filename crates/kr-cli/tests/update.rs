@@ -1652,6 +1652,170 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
     drop(other_lock);
 }
 
+/// KR-REQ-26.08: the install lock is waited for before any daemon is stopped, for a bound. A daemon
+/// that never finishes starting, holding the start lock past the bound, makes the update exit 9,
+/// naming the store, with nothing stopped: every daemon it prepared is resumed and serves, its gate
+/// open again, and the release stays staged; once the daemon has started, the next update goes
+/// through.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    // A daemon that never finishes starting holds the install lock, shared, past the update's bound.
+    let starting = host.store.lock_start().expect("the start lock");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("is starting and has held its start lock for more than 30 seconds")
+            && message.contains("run kr host update again"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert!(
+        host.daemons
+            .iter_mut()
+            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+        "the daemon this test started was never stopped"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["staged"], two.name().as_str(), "{record}");
+    // Its gate is open again: a session is created.
+    let kr = host.store.stable(Program::Kr);
+    let (display, _) = host.new_session(&kr);
+    host.close(&kr, &display);
+
+    // The control: once the daemon has started, the next update goes through.
+    drop(starting);
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+}
+
+/// KR-REQ-26.09: a daemon that answers that it does not stop, because its attempt is over, goes on
+/// serving: the update says which daemon and why, exits 9 without waiting for it to go, and starts
+/// again what it did stop; nobody is told to kill a daemon that is healthy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    // The update prepares the daemon, records how to start it again, and then waits for the install
+    // lock a starting daemon holds; meanwhile another attempt begins on the daemon, which ends the
+    // update's.
+    let starting = host.store.lock_start().expect("the start lock");
+    let update = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "update", "--archive", &archive, "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        let state = std::fs::read(host.store.record())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map(|record| record["update"]["state"].clone());
+        if state == Some(Value::from("handing_over")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update did not reach its handover"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    handover_step(&host, &mut client, HandoverStep::Prepare, None, two.name())
+        .await
+        .expect("the daemon begins another attempt");
+    drop(starting);
+
+    let output = update.wait_with_output().expect("kr ends");
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("did not stop:") && !message.contains("kill"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon goes on serving"
+    );
+    assert!(
+        host.daemons
+            .iter_mut()
+            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+        "the daemon this test started was never stopped"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["staged"], two.name().as_str(), "{record}");
+    // Both attempts are over, and its gate is open: a session is created.
+    let kr = host.store.stable(Program::Kr);
+    let (display, _) = host.new_session(&kr);
+    host.close(&kr, &display);
+}
+
 /// KR-REQ-26.09: an install stopped between putting its release in the store and making it
 /// current is finished by the next install of the same release, and no daemon of the release
 /// starts meanwhile; another release under the same name is refused, and an install waits while
