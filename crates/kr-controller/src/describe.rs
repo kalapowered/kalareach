@@ -17,6 +17,10 @@
 //! * **Privacy mode shows metadata titles from the moment it is recorded.** The caller passes the
 //!   environment's published state with each read, and while it says private no generated text is
 //!   read at all; the privacy hook then removes every generated description and keeps every pin.
+//! * **A rename answers the pin, or the deterministic title after a clearing, never generated
+//!   text.** Its answer is kept with the action's claim so a retry is answered from it, where
+//!   privacy mode's removal does not reach, and a caller may rename a session it may not view;
+//!   generated text is `session.describe`'s, under its own right and filter.
 //! * **A pin outlives its session.** It is in the environment's store, not the session's journal,
 //!   so a session's closure and a daemon's restart leave it where it is.
 
@@ -37,7 +41,7 @@ use kr_worker::privacy::{
 };
 
 use crate::error::{ControllerError, Result};
-use crate::privacy::Published;
+use crate::privacy::{Admitted, Published};
 
 /// How far back a caller's authority reaches into one session's history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +80,6 @@ pub struct DescribeModule {
 struct Shown {
     title: Title,
     source: LabelSource,
-    pinned: bool,
     generated: Option<GeneratedRecord>,
 }
 
@@ -148,30 +151,35 @@ impl DescribeModule {
     }
 
     /// Answers `session.rename`: pins `title`, or clears the pin when it is `None`, and says what
-    /// the session is shown as afterwards.
+    /// the session is shown as afterwards: the pin, or the deterministic title.
     ///
     /// A title is checked before anything is written: at most
     /// [`MAX_SESSION_TITLE_CODEPOINTS`] codepoints as given, rather than cut short, and something
-    /// to show once control characters and runs of spaces are removed. A pin is kept while privacy
-    /// mode is on: it is a name somebody chose, and it is theirs until they clear it.
+    /// to show once control characters and runs of spaces are removed. The store is written under
+    /// `admitted` once it is held, so the admission is asked after every wait and stands until the
+    /// write is done. A pin is kept while privacy mode is on: it is a name somebody chose, and it
+    /// is theirs until they clear it.
+    ///
+    /// The answer never carries generated text. It is kept with the action's claim so that a
+    /// retry is answered from it, where privacy mode's removal does not reach, and the right to
+    /// rename a session is not the right to view it; generated text is read with
+    /// [`Self::describe`], filtered for whoever asks.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] for a title that is too long or empty, and
-    /// [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns [`ControllerError::InvalidArgument`] for a title that is too long or empty, the
+    /// admission's refusal, and [`ControllerError::RegistryUnavailable`] when the store cannot be
+    /// read or written.
     pub fn rename(
         &self,
         session_id: SessionId,
         title: Option<&str>,
         pinned_by: &str,
         facts: &SessionFacts,
-        reach: HistoryReach,
-        privacy: Published,
         now_ms: TimestampMs,
+        admitted: Admitted<'_>,
     ) -> Result<SessionRenameResult> {
-        let store = self.store();
-        match title {
+        let pinned = match title {
             Some(text) => {
                 let codepoints = text.chars().count();
                 if codepoints > MAX_SESSION_TITLE_CODEPOINTS as usize {
@@ -180,29 +188,38 @@ impl DescribeModule {
                          this one has {codepoints}"
                     )));
                 }
-                let pinned = Title::new(text).ok_or_else(|| {
+                Some(Title::new(text).ok_or_else(|| {
                     ControllerError::InvalidArgument(
                         "a session name has something to show once control characters and extra \
                          spaces are removed"
                             .to_owned(),
                     )
-                })?;
-                store
-                    .pin(&session_id, &pinned, pinned_by, now_ms.get())
-                    .map_err(ControllerError::registry)?;
+                })?)
             }
-            None => {
-                store
-                    .clear_pin(&session_id)
-                    .map_err(ControllerError::registry)?;
-            }
-        }
-        let shown = self.shown(&store, session_id, facts, reach, privacy)?;
+            None => None,
+        };
+        let store = self.store();
+        admitted(&mut || match &pinned {
+            Some(title) => store
+                .pin(&session_id, title, pinned_by, now_ms.get())
+                .map_err(ControllerError::registry),
+            None => store
+                .clear_pin(&session_id)
+                .map(|_| ())
+                .map_err(ControllerError::registry),
+        })?;
+        let shown = match store
+            .pinned(&session_id)
+            .map_err(ControllerError::registry)?
+        {
+            Some(pin) => (pin.title, LabelSource::Pinned, true),
+            None => (deterministic_title(facts), LabelSource::Metadata, false),
+        };
         Ok(SessionRenameResult {
             session_id,
-            title: shown.title.as_str().to_owned(),
-            source: protocol_source(shown.source),
-            pinned: shown.pinned,
+            title: shown.0.as_str().to_owned(),
+            source: protocol_source(shown.1),
+            pinned: shown.2,
         })
     }
 
@@ -223,7 +240,6 @@ impl DescribeModule {
             return Ok(Shown {
                 title: pin.title,
                 source: LabelSource::Pinned,
-                pinned: true,
                 generated: None,
             });
         }
@@ -241,13 +257,11 @@ impl DescribeModule {
             Some(record) => Shown {
                 title: record.title.clone(),
                 source: LabelSource::Generated,
-                pinned: false,
                 generated: Some(record),
             },
             None => Shown {
                 title: deterministic_title(facts),
                 source: LabelSource::Metadata,
-                pinned: false,
                 generated: None,
             },
         })
@@ -304,9 +318,11 @@ impl crate::service::Controller {
     }
 
     /// Performs `session.rename` for `actor_id` under the admission it carries: pins the title,
-    /// or clears the pin, and answers what the session is shown as afterwards.
+    /// or clears the pin, and answers what the session is shown as afterwards, the pin or the
+    /// deterministic title ([`DescribeModule::rename`]).
     ///
-    /// The admission is asked again immediately before the store is written, after every wait.
+    /// The store is written under the admission once it is held: the admission is asked after
+    /// every wait and held standing until the write is done.
     ///
     /// # Errors
     ///
@@ -319,7 +335,6 @@ impl crate::service::Controller {
         actor_id: &kr_protocol::ids::ActorId,
         mutation: &kr_protocol::envelope::MutationRequest,
         summary: kr_protocol::session::SessionSummary,
-        reach: HistoryReach,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         if carried.deadline.is_none() {
@@ -340,18 +355,15 @@ impl crate::service::Controller {
         }
         let controller = std::sync::Arc::clone(self);
         let pinned_by = actor_id.as_str().to_owned();
-        let privacy = self.privacy.state().now();
         let now_ms = kr_ipc::now_ms();
         let answer = tokio::task::spawn_blocking(move || {
-            controller.check_registration(&carried)?;
             controller.descriptions.rename(
                 params.session_id,
                 params.title.0.as_deref(),
                 &pinned_by,
                 &facts_of(&summary),
-                reach,
-                privacy,
                 now_ms,
+                &|write| controller.under_registration(&carried, write)?,
             )
         })
         .await
@@ -490,6 +502,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// An admission that stands: the write runs.
+    fn standing(write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        write()
+    }
+
     /// The module over a store on the internal disk, and a second handle on the same store that
     /// stands in for whatever records generated text in it.
     fn module() -> (tempfile::TempDir, DescribeModule, DescriptionStore) {
@@ -510,9 +527,8 @@ pub(crate) mod tests {
                 Some("KalaReach pairing"),
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                off(),
                 TimestampMs::new(1_000),
+                &standing,
             )
             .expect("the name is pinned");
         assert_eq!(renamed.title, "KalaReach pairing");
@@ -532,7 +548,8 @@ pub(crate) mod tests {
     }
 
     /// KR-REQ-22.19: generated text never replaces a pin: not one recorded before the pin, and
-    /// not one offered after it. Clearing the pin is the only thing that shows it again.
+    /// not one offered after it. Clearing the pin is the only thing that shows it again, and it is
+    /// shown by describe: the rename's own answer is the deterministic title, never generated text.
     #[test]
     fn generated_text_never_replaces_a_pin() {
         let (_root, module, other) = module();
@@ -549,9 +566,8 @@ pub(crate) mod tests {
                 Some("Release prep"),
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                off(),
                 TimestampMs::new(1_000),
+                &standing,
             )
             .expect("the name is pinned");
         assert_eq!(
@@ -577,14 +593,18 @@ pub(crate) mod tests {
                 None,
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                off(),
                 TimestampMs::new(1_200),
+                &standing,
             )
             .expect("the pin is cleared");
         assert!(!cleared.pinned);
-        assert_eq!(cleared.source, Shown::Generated);
-        assert_eq!(cleared.title, "Pairing check");
+        assert_eq!(cleared.source, Shown::Metadata);
+        assert_eq!(cleared.title, "kalareach (main)");
+        let described = module
+            .describe(session(1), &facts(), HistoryReach::WholeSession, off())
+            .expect("a read");
+        assert_eq!(described.source, Shown::Generated);
+        assert_eq!(described.title, "Pairing check");
     }
 
     /// KR-REQ-22.17: while privacy mode is on, describe answers the metadata title and no
@@ -640,9 +660,8 @@ pub(crate) mod tests {
                 Some("Release prep"),
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                private(1),
                 TimestampMs::new(1_000),
+                &standing,
             )
             .expect("a name is pinned while private");
         let described = module
@@ -725,9 +744,8 @@ pub(crate) mod tests {
                 Some(title),
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                off(),
                 TimestampMs::new(1_000),
+                &standing,
             )
         };
         rename("Release prep").expect("a name is pinned");
@@ -768,9 +786,8 @@ pub(crate) mod tests {
                 Some("Release prep"),
                 "local:501",
                 &facts(),
-                HistoryReach::WholeSession,
-                off(),
                 TimestampMs::new(1_000),
+                &standing,
             )
             .expect("a name is pinned");
         let removed = module
@@ -782,5 +799,61 @@ pub(crate) mod tests {
         assert_eq!(other.pin_count().expect("a count"), 1);
         assert_eq!(module.privacy().outstanding(), Ok(0));
         assert!(!module.privacy().kept().is_empty());
+    }
+
+    /// The store is written under the admission once it is held: a rename whose admission lapses
+    /// while it waits for the store writes nothing, and leaves the pin it found.
+    #[test]
+    fn a_rename_whose_admission_lapses_while_it_waits_for_the_store_writes_nothing() {
+        let (_root, module, other) = module();
+        module
+            .rename(
+                session(1),
+                Some("Release prep"),
+                "local:501",
+                &facts(),
+                TimestampMs::new(1_000),
+                &standing,
+            )
+            .expect("a name is pinned");
+        let lapsed = std::sync::atomic::AtomicBool::new(false);
+        let admitted = |write: &mut dyn FnMut() -> Result<()>| {
+            if lapsed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ControllerError::WindowExpired {
+                    detail: "the action's deadline passed".to_owned(),
+                });
+            }
+            write()
+        };
+        let held = module.store();
+        std::thread::scope(|scope| {
+            let renaming = scope.spawn(|| {
+                module.rename(
+                    session(1),
+                    None,
+                    "device:phone",
+                    &facts(),
+                    TimestampMs::new(2_000),
+                    &admitted,
+                )
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!renaming.is_finished(), "the rename waits for the store");
+            lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(held);
+            let refused = renaming.join().expect("the rename ends");
+            assert!(
+                matches!(refused, Err(ControllerError::WindowExpired { .. })),
+                "{refused:?}"
+            );
+        });
+        assert_eq!(
+            other
+                .pinned(&session(1))
+                .expect("a read")
+                .map(|pin| pin.title.as_str().to_owned()),
+            Some("Release prep".to_owned()),
+            "the pin it found is still there"
+        );
     }
 }

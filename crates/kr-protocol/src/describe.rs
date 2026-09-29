@@ -175,7 +175,8 @@ pub struct SessionRenameResult {
     /// The title now shown.
     pub title: String,
     /// Where it came from. After a pin this is [`LabelSource::Pinned`]; after a clearing it is
-    /// whatever the host has instead, which is a generated description or the deterministic title.
+    /// [`LabelSource::Metadata`], the deterministic title. A generated description is read with
+    /// `session.describe`, which filters it for whoever asks.
     pub source: LabelSource,
     /// Whether a pin is in force.
     pub pinned: bool,

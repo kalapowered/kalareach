@@ -35,6 +35,7 @@ use kr_controller::privacy::{EnvironmentPrivacy, PRIVACY_RECORD};
 use kr_controller::push::DeliveryModule;
 use kr_controller::registry::{Registry, WorkerRecord};
 use kr_controller::service::Controller;
+use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, KeyRotation, ObjectSource, seal_archive,
     stage_object,
@@ -117,7 +118,7 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
-use net_support::{Device, Host, connect, pair_with, proposal};
+use net_support::{Device, Host, RawDevice, connect, pair_with, proposal};
 
 /// How long a test waits for something the daemon's own tick or the worker has to do.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -631,6 +632,19 @@ impl Environment {
         }
     }
 
+    /// Pairs a device under `proposal` and connects it as one that submits the action identifiers
+    /// it is given, and presents one again on a later connection.
+    async fn raw_device(&self, proposal: kr_protocol::pairing::ProposedGrant) -> RawPaired {
+        let device = Device::create().await;
+        let record = pair_with(&self.host, &device, &self.owner, proposal).await;
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        RawPaired {
+            device,
+            record,
+            connection,
+        }
+    }
+
     /// Reads the privacy record's generation and state, and each session obligation, from its
     /// file.
     fn record(&self) -> ((i64, i64), Vec<(String, i64)>) {
@@ -827,6 +841,14 @@ impl std::ops::Deref for Paired {
     fn deref(&self) -> &DeviceSession {
         &self.session
     }
+}
+
+/// A paired device that submits the action identifiers it is given: its keys and its record, with
+/// which it connects again to a daemon that restarted, and its connection.
+struct RawPaired {
+    device: Device,
+    record: DeviceRecord,
+    connection: RawDevice,
 }
 
 /// The state a delivery journal records for one notification.
@@ -1659,6 +1681,162 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
         (local.title.as_str(), local.source),
         ("Release prep", LabelSource::Pinned)
     );
+    environment.stop().await;
+}
+
+/// A rename's answer, decoded.
+fn renamed(answer: ParamsValue) -> SessionRenameResult {
+    answer.to_typed().expect("a rename's answer decodes")
+}
+
+/// One clearing of a session's name at each door, each under an action identifier of its own, for
+/// presenting again as a caller does whose answer never arrived.
+struct Clearings {
+    owners: kr_protocol::envelope::MutationRequest,
+    devices: ActionId,
+    window: kr_protocol::ids::ActionWindowId,
+    target: ActionTarget,
+    params: SessionRenameParams,
+}
+
+impl Clearings {
+    /// Presents both again, the owner's on a connection of its own, and returns what each is told.
+    async fn presented(
+        &self,
+        environment: &Environment,
+        device: &RawDevice,
+    ) -> (SessionRenameResult, SessionRenameResult) {
+        let owners = environment
+            .host
+            .client()
+            .await
+            .repeat(&self.owners)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner's clearing is answered from its record");
+        let devices = device
+            .mutate_in(
+                self.window.clone(),
+                Method::SessionRename,
+                self.devices,
+                self.target.clone(),
+                &self.params,
+            )
+            .await
+            .expect("the device's clearing is answered from its record");
+        (renamed(owners), renamed(devices))
+    }
+}
+
+/// What a retained clearing must be: what the action first came to, which is the deterministic
+/// title, and none of the generated text the store held.
+fn holds_no_generated_text(answer: &SessionRenameResult, first: &SessionRenameResult) {
+    assert_eq!(
+        answer, first,
+        "a retry is answered with what the action came to"
+    );
+    assert_eq!(answer.source, LabelSource::Metadata, "{answer:?}");
+    assert!(!answer.pinned, "{answer:?}");
+    assert!(answer.title.contains(PROJECT), "{}", answer.title);
+    assert!(
+        !answer.title.contains("Checks the release"),
+        "generated text is in the answer: {}",
+        answer.title
+    );
+}
+
+/// KR-REQ-24.28 and KR-REQ-24.14: a rename that clears a pin answers with the deterministic title,
+/// never with generated text, so the record its action keeps for a retry holds none. A retry
+/// answered from that record at either door, once privacy mode has removed the generated
+/// description and once the daemon has restarted, is the answer the action first came to, and no
+/// generated text is in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_28_a_repeated_clearing_is_answered_from_its_record_without_generated_text() {
+    let environment = Environment::start().await;
+    let session_id = environment.worker.session_id;
+    let store = environment.descriptions();
+    store
+        .publish(
+            &session_id,
+            &generated("Checks the release", 0),
+            now().get(),
+        )
+        .expect("a generated description");
+
+    // One clearing at each door before privacy mode: the owner's at this machine, and a device's
+    // that may rename and view the session.
+    let target = environment.worker.target(environment.environment_id());
+    let params = SessionRenameParams {
+        session_id,
+        title: Nullable::null(),
+    };
+    let mut owner = environment.host.client().await;
+    let device = environment
+        .raw_device(proposal(&[
+            ActionRight::SessionRename,
+            ActionRight::SessionView,
+        ]))
+        .await;
+    let clearings = Clearings {
+        owners: owner
+            .compose(
+                Method::SessionRename,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &params,
+            )
+            .await
+            .expect("the owner's clearing is composed"),
+        devices: ActionId::new(kr_ipc::new_uuid()),
+        window: device.connection.action_window_id(),
+        target,
+        params,
+    };
+    let first_owner = renamed(
+        owner
+            .repeat(&clearings.owners)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner clears the name"),
+    );
+    let first_device = renamed(
+        device
+            .connection
+            .mutate_in(
+                clearings.window.clone(),
+                Method::SessionRename,
+                clearings.devices,
+                clearings.target.clone(),
+                &clearings.params,
+            )
+            .await
+            .expect("the device clears the name"),
+    );
+
+    // Privacy mode removes the generated description, and a retry at either door is answered from
+    // the record its action kept.
+    environment
+        .set(true)
+        .await
+        .expect("privacy mode is turned on");
+    assert_eq!(
+        store.generated_count().expect("a read"),
+        0,
+        "privacy mode removed the generated description"
+    );
+    let (again_owner, again_device) = clearings.presented(&environment, &device.connection).await;
+    holds_no_generated_text(&again_owner, &first_owner);
+    holds_no_generated_text(&again_device, &first_device);
+
+    // A daemon that restarted answers the same.
+    drop(owner);
+    device.connection.close();
+    let environment = environment.restart().await;
+    let connection = RawDevice::connect(&environment.host, &device.device, &device.record).await;
+    let (again_owner, again_device) = clearings.presented(&environment, &connection).await;
+    holds_no_generated_text(&again_owner, &first_owner);
+    holds_no_generated_text(&again_device, &first_device);
+    connection.close();
     environment.stop().await;
 }
 

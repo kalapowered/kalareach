@@ -937,7 +937,6 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                let lower_bound = self.device.grant.history.lower_bound_ms.0;
                 let effect = tokio::spawn(async move {
                     let claimed = kr_protocol::digest::mutation_digest(&mutation, &actor_id)
                         .map_err(|error| {
@@ -965,12 +964,8 @@ impl RemoteConnection {
                     let outcome = match mutation.target.session_id.as_ref().copied() {
                         Some(session_id) => match controller.session_summary(session_id).await {
                             Ok(summary) => {
-                                let reach = crate::describe::HistoryReach::of_grant(
-                                    lower_bound,
-                                    Some(summary.created_at_ms),
-                                );
                                 controller
-                                    .session_rename(&actor_id, &mutation, summary, reach, carried)
+                                    .session_rename(&actor_id, &mutation, summary, carried)
                                     .await
                             }
                             Err(error) => Err(error),

@@ -3015,7 +3015,10 @@ history bound is at or before the session's start. A grant with no history bound
 so its device is shown the pin or the metadata title. This daemon runs no description process, so
 the answer says inference is paused because no model runs here, and has no queue age.
 `session.rename` needs `session.rename`: it pins a title of at most 64 codepoints, or clears the pin
-with no title, records who set it, and answers what the session is shown as afterwards.
+with no title, records who set it, and answers the title it now shows: the pin, or the title built
+from the session's metadata after a clearing. It never answers generated text, which is
+`session.describe`'s, under its own right and filter, so the record a rename's action keeps for a
+retry holds none and the removal privacy mode makes has nothing of it to reach.
 
 ## What an idle session wakes for
 

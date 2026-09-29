@@ -3149,9 +3149,8 @@ mod tests {
                 Some("Release prep"),
                 "local:501",
                 &facts,
-                whole,
-                host.privacy.state().now(),
                 at(0),
+                &standing,
             )
             .expect("a name is pinned");
         assert_eq!(

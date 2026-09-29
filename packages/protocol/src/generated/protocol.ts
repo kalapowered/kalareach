@@ -24245,7 +24245,8 @@ export interface SessionRenameResult {
   session_id: string
   /**
    * Where it came from. After a pin this is [`LabelSource::Pinned`]; after a clearing it is
-   * whatever the host has instead, which is a generated description or the deterministic title.
+   * [`LabelSource::Metadata`], the deterministic title. A generated description is read with
+   * `session.describe`, which filters it for whoever asks.
    */
   source: 'pinned' | 'metadata' | 'generated'
   /**

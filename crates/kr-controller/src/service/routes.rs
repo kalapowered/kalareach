@@ -712,14 +712,8 @@ impl Controller {
                             };
                             match summary {
                                 Ok(summary) => {
-                                    self.session_rename(
-                                        actor_id,
-                                        mutation,
-                                        summary,
-                                        crate::describe::HistoryReach::WholeSession,
-                                        carried,
-                                    )
-                                    .await
+                                    self.session_rename(actor_id, mutation, summary, carried)
+                                        .await
                                 }
                                 Err(error) => Err(error),
                             }
