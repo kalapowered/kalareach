@@ -1181,6 +1181,37 @@ async fn a_worker_recorded_from_a_late_report_that_accepts_a_close_and_goes_is_a
     world.serving.abort();
 }
 
+/// KR-REQ-23.34: a worker recorded from a ready report that already says its session is closing,
+/// as the report of a worker whose root shell ended at once does, is answered for from that report
+/// once it stops answering, though no close passed through the daemon and nothing has read the
+/// worker: the report is the daemon's word of the end, and a list includes the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_recorded_from_a_report_that_already_says_it_is_closing_is_answered_closing_when_it_goes()
+ {
+    let script = Scripted::new();
+    script.set(SessionState::Closing);
+    let world = reported_late(&script).await;
+    assert_eq!(script.reads(), 0, "nothing has read the worker");
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("a closing session is answered from its worker's report");
+    assert_eq!(
+        answer.session,
+        script.answer(world.session_id).session,
+        "the session as its worker described it in the report"
+    );
+    assert_eq!(answer.session.state, SessionState::Closing);
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    assert!(!recorded(&world).await);
+    world.serving.abort();
+}
+
 /// KR-REQ-23.34: the same for a worker a daemon finds at its start and admits without a
 /// description, which accepts a close and goes before anything reads it: its acceptance carries
 /// what the start did not hear.
