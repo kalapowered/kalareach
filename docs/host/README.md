@@ -2769,14 +2769,15 @@ does anything, takes every subsystem through the steps again, which each can do 
 at one generation, and only then reconciles the backup service, starts delivery and serves anything.
 A record it cannot read stops the start rather than leaving the daemon to guess.
 
-Turning it off is refused while a daemon subsystem or a live session still owes cleanup, and the
-refusal names what is owed. A session whose worker has ended does not hold it back, because nothing
-resumes in its store, and its obligation stays recorded. A session counts as ended only when the
-registry shows its launch is over: it has no reservation, or one whose launch produced no worker or
-whose session has closed. A session whose worker has not reported yet is one this host has not
-reached, and it holds turning privacy mode off back until its worker has been told the generation
-and has answered. Otherwise the next generation is recorded first, the backup fence is released
-under it, the delivery fence is lifted, and each live session is told until it answers.
+Turning it off is refused while a daemon subsystem, or a session whose worker is running or may
+still start, owes cleanup, and the refusal names what is owed. A session whose worker has ended does
+not hold it back, because nothing resumes in its store, and its obligation stays recorded. A session
+counts as ended only when the registry shows its launch is over: it has no reservation, or one whose
+launch produced no worker or whose session has closed. A session whose worker has not reported yet
+is one this host has not reached, and it holds turning privacy mode off back until its worker
+answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the next
+generation is recorded first, the backup fence is released under it, the delivery fence is lifted,
+and each live session is told until it answers.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
 about an earlier one, is admitted under the privacy state the record publishes: only while privacy
@@ -2942,6 +2943,13 @@ reason to keep output.
 
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
+
+* **A fenced launch holds turning privacy mode off back for good.** A second claim on a
+  reservation that a worker has already claimed fences it, and the first worker's ready report is
+  then refused; that worker goes on with its session and is never recorded. A launch does not
+  claim twice in the ordinary way. Nothing settles a fenced reservation that has no worker row,
+  and the registry says something may still run there, so this host does not take its session for
+  ended: if it owes cleanup, `kr privacy off` stays refused while it stands, also after a restart.
 
 * **A session created while privacy mode is on learns the generation from the tick.** Its worker
   is told on a tick after it starts rather than before its shell runs, and its obligation is

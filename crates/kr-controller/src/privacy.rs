@@ -30,8 +30,9 @@
 //!   worker says its cleanup is complete. A session whose worker has ended keeps its obligation,
 //!   reported as unavailable, because what it retained is the archive's and nothing here removes
 //!   it.
-//! * **Disabling is two phases.** It is refused while a daemon step or a live session still owes
-//!   cleanup. Otherwise the new generation is recorded first and then each fence is released; a
+//! * **Disabling is two phases.** It is refused while a daemon step, or a session whose worker is
+//!   running or may still start, owes cleanup. Otherwise the new generation is recorded first and
+//!   then each fence is released; a
 //!   release that is still pending, or that a store refused, is owed and retried, and the report
 //!   says privacy mode is still being turned off until every release has landed.
 //!
@@ -208,7 +209,8 @@ impl PrivacyState {
     /// to end, and while the change is held nothing is admitted and nothing is read.
     ///
     /// It is taken only by a thread that holds the record's own mutex ([`EnvironmentPrivacy`]'s
-    /// `inner`), and nothing that holds a reader's guard takes that mutex. That is what keeps the
+    /// `inner`), once [`EnvironmentPrivacy::open`] has published the state it starts with, and
+    /// nothing that holds a reader's guard takes that mutex. That is what keeps the
     /// queue of a read-write lock, in which a waiting writer stops new readers, from turning a
     /// reader that waits for something a writer holds into a stall; a new taker of this side goes
     /// under the same rule.
@@ -654,11 +656,13 @@ impl EnvironmentPrivacy {
 
     /// Turns privacy mode off.
     ///
-    /// Refused while a daemon subsystem or a live session still owes cleanup: resuming retention
-    /// beside an unfinished purge would mix new content into what is still being removed. A
-    /// session whose worker has ended does not hold it back, because nothing resumes in its store;
-    /// its obligation stays recorded and reported. Otherwise the next generation is recorded first
-    /// and every fence is then released. Privacy mode already off is answered with where it stands.
+    /// Refused while a daemon subsystem, or a session whose worker is running or may still start,
+    /// owes cleanup: resuming retention beside an unfinished purge would mix new content into what
+    /// is still being removed. A session whose worker has ended, which is one the registry shows
+    /// its launch to be over for ([`Self::sessions_seen`]), does not hold it back, because nothing
+    /// resumes in its store; its obligation stays recorded and reported. Otherwise the next
+    /// generation is recorded first and every fence is then released. Privacy mode already off is
+    /// answered with where it stands.
     ///
     /// # Errors
     ///
