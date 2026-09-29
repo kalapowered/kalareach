@@ -1800,70 +1800,163 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
     );
 }
 
-/// KR-REQ-26.09: a release already in the store is used again only when it is every file its
-/// manifest lists and nothing else, files and directories only, and it is sealed read-only as it is
-/// used.
-#[test]
-fn a_release_kept_in_the_store_is_used_again_only_when_whole() {
+/// What is under `root`, as a comparison shows it: each entry's path, kind, mode and length, the
+/// links as links.
+fn what_is_under(root: &Path) -> Vec<(String, &'static str, u32, u64)> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let (manifest, files, document) = small_release(&keys().targets);
-    let kept = |change: &dyn Fn(&Path)| {
-        let directory = tempfile::tempdir().expect("a directory");
-        let store = Store::at(directory.path().join("host"));
-        store.create_directories().expect("the store's directories");
-        let release = store.release_directory(&manifest.release);
-        for (path, contents) in &files {
-            let file = release.join(path);
-            std::fs::create_dir_all(file.parent().expect("a directory")).expect("the tree");
-            std::fs::write(&file, contents).expect("a file");
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("reads").flatten() {
+            let about = std::fs::symlink_metadata(entry.path()).expect("there");
+            let kind = if about.file_type().is_symlink() {
+                "link"
+            } else if about.is_dir() {
+                pending.push(entry.path());
+                "directory"
+            } else {
+                "file"
+            };
+            found.push((
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("under the root")
+                    .display()
+                    .to_string(),
+                kind,
+                about.permissions().mode() & 0o7777,
+                about.len(),
+            ));
         }
-        std::fs::write(release.join(kr_protocol::update::MANIFEST_FILE), &document)
-            .expect("the manifest");
-        change(&release);
-        let used = kr_cli::update::release::readmit(&store, &manifest);
-        (directory, store, used)
-    };
-    // The control: whole, and writable as an install that stopped before sealing it leaves it.
-    let (directory, store, used) = kept(&|_| {});
-    used.unwrap_or_else(|error| panic!("a whole release is used again: {error}"));
-    let release = store.release_directory(&manifest.release);
-    for (path, mode) in [
-        ("", 0o555),
-        ("bin", 0o555),
-        ("bin/kr", 0o555),
-        ("share/update-root.json", 0o444),
-        (kr_protocol::update::MANIFEST_FILE, 0o444),
-    ] {
-        let found = std::fs::metadata(release.join(path))
-            .expect("there")
-            .permissions()
-            .mode();
-        assert_eq!(found & 0o777, mode, "{path} is sealed");
     }
-    writable(directory.path());
-    /// What is done to a kept release before it is offered again.
-    type Change = fn(&Path);
-    let changes: [(&str, Change); 4] = [
-        ("a missing file", |release: &Path| {
-            std::fs::remove_file(release.join("bin/kr")).expect("removed");
+    found.sort();
+    found
+}
+
+/// KR-REQ-26.09: a release an earlier install left in the store is never used as it is: the copy
+/// this install checked takes its place, so nothing the kept one was short of, changed in, linked
+/// to or left writable survives, and nothing outside the store is touched; a release a running
+/// program holds is not replaced, and the install waits.
+#[test]
+fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    // What is done to the kept release, given its directory and a directory outside the store.
+    type Tampering = fn(&Path, &Path);
+    let tamperings: [(&str, Tampering); 5] = [
+        ("a missing file", |kept, _| {
+            std::fs::remove_file(kept.join("bin/kr")).expect("removed");
         }),
-        ("a changed file", |release: &Path| {
-            std::fs::write(release.join("bin/kr"), b"#!/bin/zsh\n").expect("changed");
+        ("a changed file", |kept, _| {
+            std::fs::write(kept.join("bin/kr"), b"#!/bin/zsh\n").expect("changed");
         }),
-        ("a link", |release: &Path| {
-            std::fs::remove_file(release.join("bin/kr")).expect("removed");
-            std::os::unix::fs::symlink("/bin/sh", release.join("bin/kr")).expect("linked");
+        ("a file it does not list", |kept, _| {
+            std::fs::write(kept.join("share/extra"), b"x").expect("written");
         }),
-        ("a file it does not list", |release: &Path| {
-            std::fs::write(release.join("share/extra"), b"x").expect("written");
-        }),
+        (
+            "a file that is a hard link to one elsewhere",
+            |kept, outside| {
+                let file = kept.join(kr_cli::update::release::CHANNEL_ROOT);
+                let elsewhere = outside.join("root.json");
+                std::fs::copy(&file, &elsewhere).expect("copied");
+                std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o444))
+                    .expect("read-only");
+                std::fs::remove_file(&file).expect("removed");
+                std::fs::hard_link(&elsewhere, &file).expect("linked");
+            },
+        ),
+        (
+            "a name that is a link to a whole release elsewhere",
+            |kept, outside| {
+                std::fs::rename(kept, outside.join("release")).expect("moved");
+                std::os::unix::fs::symlink(outside.join("release"), kept).expect("linked");
+            },
+        ),
     ];
-    for (what, change) in changes {
-        let (directory, _, used) = kept(&change);
-        assert!(used.is_err(), "a release with {what} is not used again");
-        writable(directory.path());
+    for (what, tamper) in tamperings {
+        let host = Host::bare();
+        host.store
+            .create_directories()
+            .expect("the store's directories");
+        std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+        let kept = host.store.release_directory(one.name());
+        one.write(&kept);
+        let outside = host.scratch("outside");
+        tamper(&kept, &outside);
+        let elsewhere = what_is_under(&outside);
+
+        host.install(&one);
+
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(one.name().clone()),
+            "{what}"
+        );
+        // A directory of the store's own, holding every file the manifest lists as it lists it,
+        // each read-only and its own, and nothing else.
+        let release = host.store.release_directory(one.name());
+        let about = std::fs::symlink_metadata(&release).expect("there");
+        assert!(about.is_dir() && !about.file_type().is_symlink(), "{what}");
+        assert_eq!(about.permissions().mode() & 0o777, 0o555, "{what}");
+        for file in &one.manifest.files {
+            let path = release.join(file.path.as_str());
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("{what}: {}: {error}", path.display()));
+            assert_eq!(
+                Digest256::from_bytes(kr_cbor::sha256(&bytes)),
+                file.sha256,
+                "{what}: {}",
+                path.display()
+            );
+            let about = std::fs::symlink_metadata(&path).expect("there");
+            assert!(about.permissions().readonly(), "{what}: {}", path.display());
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::nlink(&about),
+                1,
+                "{what}: {} is a file of its own",
+                path.display()
+            );
+        }
+        assert!(!release.join("share/extra").exists(), "{what}");
+        // Nothing outside the store was changed, or removed: the hard link's other name and the
+        // release a link led to are as they were, modes included.
+        assert_eq!(what_is_under(&outside), elsewhere, "{what}");
     }
+
+    // A release a running program holds is not replaced: the install waits, exit 9, and once the
+    // program has gone, replaces it.
+    let host = Host::bare();
+    host.store
+        .create_directories()
+        .expect("the store's directories");
+    std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+    let kept = host.store.release_directory(one.name());
+    one.write(&kept);
+    let store = host.store.root().display().to_string();
+    let unpacked = host.scratch("unpacked").join(one.name().as_str());
+    one.write(&unpacked);
+    let program = unpacked.join("bin").join(Program::Kr.file_name());
+    let running = std::fs::File::open(host.store.manifest(one.name())).expect("the manifest");
+    running
+        .lock_shared()
+        .expect("held as a running program holds it");
+    let waited = host.run(&program, &["host", "install", "--store", &store]);
+    assert_eq!(waited.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("a running program holds it"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(host.store.current().expect("reads"), None);
+    drop(running);
+    host.install(&one);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
 }
 
 /// KR-REQ-26.06: a program of a release still being staged does not start once it is runnable,

@@ -545,8 +545,7 @@ pub fn install(
 /// Copies, checks, seals and admits the release at `tree`, and makes it current.
 ///
 /// The same release already in `versions/`, as an install stopped before its switch leaves it, is
-/// made current as it is once it checks as whole: its manifest, signatures and all, is the one
-/// just checked, and every file it holds is what that manifest lists.
+/// replaced by the copy checked here ([`replace_kept`]).
 #[cfg(unix)]
 fn stage_tree(
     store: &Store,
@@ -565,32 +564,61 @@ fn stage_tree(
     };
     release::check_files(&manifest, &written)?;
     release::check_system(&manifest)?;
-    let kept = store.release_directory(&manifest.release).exists();
-    if kept {
-        let document_kept =
-            release::manifest_document(&store.release_directory(&manifest.release))?;
-        if document_kept != document {
-            return Err(CliError::Other(shown!(
-                "the store already holds a release named {} that is not this one",
-                crate::shown::release(&manifest.release)
-            )));
-        }
-        release::readmit(store, &manifest)?;
-    } else {
-        release::seal(&staged, &manifest)?;
-    }
+    replace_kept(store, &manifest, &document, update_lock, "install")?;
+    release::seal(&staged, &manifest)?;
     // Published and made current under the install lock: a control daemon of the release started
     // in between waits for `current` to name it.
     let install = store
         .lock_install()
         .map_err(|error| CliError::Other(said(&error)))?;
-    if !kept {
-        release::admit(&staged, store, &manifest.release)?;
-    }
+    release::admit(&staged, store, &manifest.release)?;
     store
         .switch(&manifest.release, update_lock, &install)
         .map_err(|error| CliError::Other(said(&error)))?;
     Ok((manifest.release, root.is_some()))
+}
+
+/// Makes room in `versions/` for the release just checked, when an earlier install or update left
+/// one of the same name there. `command` says which command to run again when it cannot.
+///
+/// What is there is never trusted in place: an interrupted run may have left it short of a file,
+/// changed in one, linked to files elsewhere or still writable, and no reading of a tree in place
+/// rules out every such thing. It is the same release when its manifest is, byte for byte, the one
+/// just checked, and then it is removed, and the copy written and digested by this run takes its
+/// place, whole by construction. Another release under the name is refused. A name that is not a
+/// directory is not a release, and is removed as a name only; a release that a running program
+/// holds is not removed.
+#[cfg(unix)]
+fn replace_kept(
+    store: &Store,
+    manifest: &kr_protocol::update::ReleaseManifest,
+    document: &[u8],
+    update_lock: &kr_ipc::install::StoreLock,
+    command: &'static str,
+) -> Result<()> {
+    let directory = store.release_directory(&manifest.release);
+    let Ok(about) = std::fs::symlink_metadata(&directory) else {
+        return Ok(());
+    };
+    if about.file_type().is_dir() && release::manifest_document(&directory)? != document {
+        return Err(CliError::Other(shown!(
+            "the store already holds a release named {} that is not this one",
+            crate::shown::release(&manifest.release)
+        )));
+    }
+    let removed = store
+        .retire(&manifest.release, update_lock)
+        .map_err(|error| CliError::Other(said(&error)))?;
+    if removed {
+        return Ok(());
+    }
+    Err(CliError::UpdateDeferred(shown!(
+        "release {} was left in the store by an earlier {} and a running program holds it, so it \
+         cannot be replaced; stop that program and run kr host {} again",
+        crate::shown::release(&manifest.release),
+        command,
+        command
+    )))
 }
 
 /// Removes a staging directory and whatever an interrupted run left in it.
@@ -707,6 +735,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
     let staging = store.staging().join(kr_ipc::new_uuid().to_string());
     let staged = stage_archive(
         &store,
+        &update_lock,
         &trusted,
         &current_manifest,
         archive,
@@ -789,6 +818,7 @@ fn installed_manifest(
 #[cfg(unix)]
 fn stage_archive(
     store: &Store,
+    update_lock: &kr_ipc::install::StoreLock,
     trusted: &release::ChannelRoot,
     current: &kr_protocol::update::ReleaseManifest,
     archive: &std::path::Path,
@@ -824,19 +854,9 @@ fn stage_archive(
     if check {
         return Ok(manifest);
     }
-    if store.release_directory(&manifest.release).exists() {
-        // Staged by an update that waited: it is used again when it is the same release, which
-        // its manifest says, signatures and all, and it is still whole.
-        let kept = release::manifest_document(&store.release_directory(&manifest.release))?;
-        if kept != document {
-            return Err(CliError::Other(shown!(
-                "the store already holds a release named {} that is not this one",
-                crate::shown::release(&manifest.release)
-            )));
-        }
-        release::readmit(store, &manifest)?;
-        return Ok(manifest);
-    }
+    // Staged by an update that waited: it is the same release when its manifest is, signatures and
+    // all, and the copy checked here takes its place.
+    replace_kept(store, &manifest, &document, update_lock, "update")?;
     release::seal(&staged, &manifest)?;
     release::admit(&staged, store, &manifest.release)?;
     Ok(manifest)

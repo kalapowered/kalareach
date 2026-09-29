@@ -81,9 +81,11 @@ of the store runs. It writes the store's record before any program of the releas
 so each program started from there holds its release from its first moment, and it puts the
 release in `versions/` and makes it current under the install lock, so a control daemon of it
 started meanwhile waits for `current` to name it. An install that stopped between the two is
-finished by installing the same release again: the release it left is checked file by file, as a
-staged release is, and made read-only before it is made current. Another release under the same
-name, or one that has lost, gained or changed a file, is refused.
+finished by installing the same release again. What the stopped install left is never trusted in
+place: when its manifest is, byte for byte, the one just checked, it is removed and the copy this
+install checked takes its place, so nothing it was short of, changed in, linked to or left
+writable survives, and nothing outside the store is touched. A release a running program holds is
+not removed, and the install waits, exit 9. Another release under the same name is refused.
 
 ## Updating
 
@@ -116,9 +118,9 @@ Only the current release's `kr` updates the host. An update, in order:
    for a later update, and not one a running program holds.
 
 An update that is held waits. It starts again every daemon it stopped, from the release still
-current, keeps the new release staged for the next attempt, which checks it file by file again
-before it uses it, and exits with 9. When a daemon it stopped does not start again, it exits with 1
-instead, says which, and keeps the update recorded, as below:
+current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
+then, and exits with 9. When a daemon it stopped does not start again, it exits with 1 instead,
+says which, and keeps the update recorded, as below:
 
 ```text
 kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254aa6e62e5 with protocol 0.45.0, which the control daemon of 0.3.0+9f1c2b3a4d5e does not speak; run kr host update again once that has changed
