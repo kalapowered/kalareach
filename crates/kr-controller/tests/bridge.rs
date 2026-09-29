@@ -1109,7 +1109,9 @@ async fn held_across(
 /// it, whether it then answers or is refused, and the replacement keeps its own channel. The daemon
 /// is this build's program, reaching the stand-in for `wsl.exe` through its own path with the
 /// argument vector section 3 writes out, so every frame the destination sends crosses a real
-/// process bridge.
+/// process bridge. The second client has to finish inside the twenty seconds the daemon waits for
+/// the destination's first frame, which one forgetting, or one approval and one refresh, does in
+/// milliseconds.
 ///
 /// This proves the scoped-channel half of the first row for a WSL distribution, and the daemon's
 /// side of the second for a refresh. SSH registration, and create and attach over the bridge, are
