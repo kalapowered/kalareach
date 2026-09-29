@@ -1102,13 +1102,18 @@ async fn held_across(
     }
 }
 
-/// KR-REQ-25.26, through KR-REQ-03.15's bridge. The scoped channel a helper registers belongs to
-/// the record the bridge was opened for, and the answer to a refresh is that one record's: a
-/// bridge held open while a second client forgets the record, or approves a replacement and
-/// establishes the replacement's own channel, answers for the record it was opened for and claims
-/// neither half of the integration for it, whether it then answers or is refused, and the
-/// replacement keeps its own channel. The daemon is this build's program, reaching the stand-in
-/// for `wsl.exe` through its own path with the argument vector section 3 writes out.
+/// KR-REQ-25.26, 03.15: the scoped channel a helper registers belongs to the record the bridge was
+/// opened for, and the answer to a refresh is that one record's. A bridge held open while a second
+/// client forgets the record, or approves a replacement and establishes the replacement's own
+/// channel, answers for the record it was opened for and claims neither half of the integration for
+/// it, whether it then answers or is refused, and the replacement keeps its own channel. The daemon
+/// is this build's program, reaching the stand-in for `wsl.exe` through its own path with the
+/// argument vector section 3 writes out, so every frame the destination sends crosses a real
+/// process bridge.
+///
+/// This proves the scoped-channel half of the first row for a WSL distribution, and the daemon's
+/// side of the second for a refresh. SSH registration, and create and attach over the bridge, are
+/// other tests' work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_its_own_record() {
     let daemon = FixtureDaemon::start();
