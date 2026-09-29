@@ -3777,10 +3777,11 @@ worker records nothing: not reaching a process is not evidence that it died.
 
 A worker that has finished its closure stops answering a moment before the kernel says its process
 has ended. A `session.read` or `session.list` that meets it then is answered from what the daemon
-holds: the session as the worker last described it, `closing`, with no endpoint and none of the
-session's content. The worker describes its session in its ready report, in its answer to each
-read and in its acceptance of a close, and the daemon keeps the description furthest along the
-lifecycle, so a close it passed on, the first time or as a retry, leaves it one to answer with.
+holds: the session as the worker last described it, `closing`, or `closed` where that was its last
+word, with no endpoint and none of the session's content; a list shows a closed one only when it
+asks for closed sessions. The worker describes its session in its ready report, in its answer to
+each read and in its acceptance of a close, and the daemon keeps the description furthest along
+the lifecycle, so a close it passed on, the first time or as a retry, leaves it one to answer with.
 Where the daemon holds no word of an end, the read is refused with `RESOURCE_UNAVAILABLE` to be
 tried again, and a list leaves the session out. A paired device's close answer carries the
 worker's description only when the decision it is written under lets the device read the session
