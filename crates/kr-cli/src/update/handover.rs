@@ -12,6 +12,10 @@
 //! it is taken for the environment's daemon, naming no attempt, so whichever is open ends: one that
 //! resumes goes on serving, and no stop of any earlier attempt can end it after, since a stop
 //! names its attempt; one told to stop refuses, and is waited for until it has gone.
+//!
+//! The store's install lock is only ever waited for a bounded time ([`install_lock`]): a control
+//! daemon holds it, shared, while it starts, and one that never finishes starting must not hold
+//! an update, or a recovery, for ever.
 
 use std::time::Duration;
 
@@ -42,6 +46,9 @@ const DAEMON_STOP: Duration = Duration::from_secs(30);
 
 /// How long a daemon of the new release is given to answer once it has been started.
 pub const DAEMON_START: Duration = Duration::from_secs(60);
+
+/// How long the install lock is waited for, which a control daemon holds, shared, while it starts.
+pub const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// A daemon that has prepared to make way: its gate is closed for an attempt, and the connection
 /// it answered on.
@@ -217,19 +224,50 @@ fn refusal(environment: &Environment, said: Shown) -> CliError {
     ))
 }
 
+/// Takes the store's install lock, exclusively, waiting up to `within` for the control daemons
+/// that hold it while they start.
+///
+/// This is the only way an update or an install takes the lock: it never waits without a bound.
+///
+/// # Errors
+///
+/// Returns a refusal saying a control daemon is starting and holds the lock when `within` has
+/// passed, and the failure to take it for any other reason.
+pub async fn install_lock(store: &Store, within: Duration) -> Result<kr_ipc::install::StoreLock> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match store.try_lock_install() {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(None) => {
+                return Err(CliError::UpdateDeferred(shown!(
+                    "a control daemon of the store at {} is starting and has held its start lock \
+                     for more than {} seconds; run kr host update again once it has started or \
+                     stopped",
+                    Shown::root(store.root()),
+                    within.as_secs()
+                )));
+            }
+            Err(error) => return Err(CliError::Other(super::said(&error))),
+        }
+    }
+}
+
 /// Whether a daemon holds an environment.
 ///
 /// Asked under the store's install lock: a starting daemon holds that lock, shared, from its look
 /// at `current` until it has taken its environment, so no daemon is part way through taking it
-/// while this takes the environment's lock for a moment to see.
+/// while this takes the environment's lock for a moment to see. The lock is waited for up to
+/// `within`.
 ///
 /// # Errors
 ///
-/// Returns the failure to take either lock for any reason but a holder.
-pub fn held(store: &Store, environment: &Environment) -> Result<bool> {
-    let _install = store
-        .lock_install()
-        .map_err(|error| CliError::Other(super::said(&error)))?;
+/// Returns the refusal of [`install_lock`], and the failure to take the environment's lock for any
+/// reason but a holder.
+pub async fn held(store: &Store, environment: &Environment, within: Duration) -> Result<bool> {
+    let _install = install_lock(store, within).await?;
     match SingletonLock::hold(
         &environment.paths.singleton_lock(),
         environment.environment_id,
@@ -251,7 +289,7 @@ pub fn held(store: &Store, environment: &Environment) -> Result<bool> {
 /// Returns a failure naming the process the lock names when it has not gone by then.
 pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
     let deadline = tokio::time::Instant::now() + DAEMON_STOP;
-    while held(store, environment)? {
+    while held(store, environment, INSTALL_LOCK_WAIT).await? {
         if tokio::time::Instant::now() >= deadline {
             return Err(CliError::Other(still_running(environment)));
         }
@@ -417,7 +455,7 @@ pub async fn answers_as(
         if let Some(child) = started.as_deref_mut()
             && let Ok(Some(status)) = child.try_wait()
         {
-            if !held(store, environment)? {
+            if !held(store, environment, INSTALL_LOCK_WAIT).await? {
                 let how = match (
                     status.code(),
                     std::os::unix::process::ExitStatusExt::signal(&status),

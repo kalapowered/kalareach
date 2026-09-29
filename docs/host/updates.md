@@ -87,6 +87,10 @@ install checked takes its place, so nothing it was short of, changed in, linked 
 writable survives, and nothing outside the store is touched. A release a running program holds is
 not removed, and the install waits, exit 9. Another release under the same name is refused.
 
+An install or an update waits for a control daemon that is starting, which holds the install lock
+while it starts, for at most thirty seconds. A daemon that takes longer makes the run exit with 9
+and name it; whatever the run had stopped is started again.
+
 ## Updating
 
 ```sh
