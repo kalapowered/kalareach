@@ -1355,6 +1355,104 @@ async fn a_close_answer_carries_the_description_only_to_a_device_that_may_read_t
     }
 }
 
+/// KR-REQ-23.34: the description is taken out of a `session.close` answer whatever else the answer
+/// holds. An answer this build cannot decode, as one from a worker built after this daemon may
+/// be, goes to a device that may not read the session without its `session` member, and every
+/// other member of it goes as the worker wrote it. With `session.view` it goes whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to_a_device_that_may_not_read_the_session()
+ {
+    for may_read in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (mut grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        grant.actions = if may_read {
+            [ActionRight::SessionView, ActionRight::SessionClose]
+                .into_iter()
+                .collect()
+        } else {
+            [ActionRight::SessionClose].into_iter().collect()
+        };
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device,
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = connection
+            .ask(Some(session_id), Method::SessionClose.entry(), false)
+            .expect("the grant admits the close");
+        // The acceptance as a worker that added a member to it later would write it.
+        let kr_cbor::CanonicalValue::Map(mut members) =
+            kr_protocol::envelope::ParamsValue::from_typed(&acceptance(session_id))
+                .expect("encodes")
+                .into_value()
+        else {
+            panic!("an acceptance is a map");
+        };
+        members
+            .insert(
+                "added_later".to_owned(),
+                kr_cbor::CanonicalValue::text("as written"),
+            )
+            .expect("a member the acceptance does not have");
+        let newer = kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(members));
+        assert!(
+            newer
+                .to_typed::<kr_protocol::session::SessionCloseResult>()
+                .is_err(),
+            "this build cannot decode it"
+        );
+        let answer = ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: kr_protocol::envelope::Outcome::Ok(newer),
+        });
+
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame: answer,
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let frames = recording.frames();
+        assert_eq!(frames.len(), 1, "one answer: {frames:?}");
+        let ControlFrame::Response(kr_protocol::envelope::Response {
+            outcome: kr_protocol::envelope::Outcome::Ok(written),
+            ..
+        }) = &frames[0]
+        else {
+            panic!("not the close's answer: {:?}", frames[0]);
+        };
+        let kr_cbor::CanonicalValue::Map(written) = written.as_value() else {
+            panic!("an answer is a map");
+        };
+        assert_eq!(
+            written.get("session").is_some(),
+            may_read,
+            "the description goes only to a device that may read the session"
+        );
+        assert_eq!(
+            written.get("added_later"),
+            Some(&kr_cbor::CanonicalValue::text("as written")),
+            "the member this build does not know goes as it came"
+        );
+        assert!(
+            written.get("state").is_some() && written.get("durability").is_some(),
+            "and so does the rest of the acceptance: {written:?}"
+        );
+        drop(controller);
+    }
+}
+
 /// KR-REQ-23.34: a close answer decided under a lease that has ended is written under the
 /// decision taken again as things stand, and that decision decides what it shows. A replacement
 /// lease installed after the end that keeps `session.close` and drops `session.view` lets the
