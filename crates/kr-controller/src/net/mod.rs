@@ -986,13 +986,20 @@ async fn keep_the_record(
 /// `session.read` shows, and `session.read` needs `session.view` over the session a close names.
 /// So the answer to a `session.close`, fresh or retained, goes whole only under a decision that
 /// holds `session.view`; under one that does not, the acceptance goes without the description.
-/// Every other answer goes as it came.
+/// The description is taken out of the answer's map as the worker wrote it, without decoding the
+/// answer: one this build cannot decode, as a worker built after it may write, loses the
+/// description as well, and every other member goes as it came. Every other answer goes as it
+/// came.
 pub(crate) fn close_answer_shown<'a>(
     frame: &'a kr_protocol::envelope::ControlFrame,
     method: kr_protocol::method::Method,
     rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
 ) -> std::borrow::Cow<'a, kr_protocol::envelope::ControlFrame> {
-    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+
+    /// The member of a close answer that holds the worker's description of the session.
+    const DESCRIPTION: &str = "session";
 
     if method != kr_protocol::method::Method::SessionClose
         || rights.contains(&kr_protocol::rights::ActionRight::SessionView)
@@ -1006,21 +1013,27 @@ pub(crate) fn close_answer_shown<'a>(
     else {
         return std::borrow::Cow::Borrowed(frame);
     };
-    let Ok(mut answer) = value.to_typed::<kr_protocol::session::SessionCloseResult>() else {
+    let CanonicalValue::Map(answer) = value.as_value() else {
         return std::borrow::Cow::Borrowed(frame);
     };
-    if answer.session.take().is_none() {
+    if answer.get(DESCRIPTION).is_none() {
         return std::borrow::Cow::Borrowed(frame);
     }
+    let kept = answer
+        .entries()
+        .iter()
+        .filter(|(name, _)| name != DESCRIPTION)
+        .cloned()
+        .collect();
     // An answer that could not be written again without the description is not written with it.
-    let outcome = kr_protocol::envelope::ParamsValue::from_typed(&answer).map_or_else(
+    let outcome = CanonicalMap::from_sorted_entries(kept).map_or_else(
         |error| {
             Outcome::Error(kr_protocol::error::ProtocolError::new(
                 kr_protocol::error::ErrorCode::InvalidArgument,
                 error.to_string(),
             ))
         },
-        Outcome::Ok,
+        |members| Outcome::Ok(ParamsValue::new(CanonicalValue::Map(members))),
     );
     std::borrow::Cow::Owned(ControlFrame::Response(Response {
         request_id: *request_id,
