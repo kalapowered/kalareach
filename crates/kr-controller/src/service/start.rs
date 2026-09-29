@@ -913,7 +913,10 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
 /// A reservation in any phase before that, reserved, spawned, claimed, live or fenced, is a worker
 /// that may be starting or running and that this host has not reached, so its session is not over.
 /// A registry that cannot be read says nothing about any of them, and none is.
-async fn launches_over(controller: &Controller, unreached: &[SessionId]) -> Vec<SessionId> {
+pub(super) async fn launches_over(
+    controller: &Controller,
+    unreached: &[SessionId],
+) -> Vec<SessionId> {
     if unreached.is_empty() {
         return Vec::new();
     }

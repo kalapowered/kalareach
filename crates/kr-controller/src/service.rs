@@ -736,3 +736,7 @@ mod the_debt_pass;
 /// A privacy change and a rename whose admission lapses while they wait for what they write to.
 #[cfg(test)]
 mod a_change_that_waits_for_its_store;
+
+/// Which launches the registry shows to be over, as privacy mode's tick asks.
+#[cfg(test)]
+mod a_launch_that_has_not_finished;
