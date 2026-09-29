@@ -206,6 +206,12 @@ impl PrivacyState {
 
     /// Takes the write side for a change of state: it waits for every admission taken before it
     /// to end, and while the change is held nothing is admitted and nothing is read.
+    ///
+    /// It is taken only by a thread that holds the record's own mutex ([`EnvironmentPrivacy`]'s
+    /// `inner`), and nothing that holds a reader's guard takes that mutex. That is what keeps the
+    /// queue of a read-write lock, in which a waiting writer stops new readers, from turning a
+    /// reader that waits for something a writer holds into a stall; a new taker of this side goes
+    /// under the same rule.
     fn change(&self) -> Change<'_> {
         Change {
             held: self
@@ -466,6 +472,10 @@ pub struct EnvironmentPrivacy {
     /// store's hold, before the backup fence goes up.
     #[cfg(test)]
     after_record: crate::attention::Pause,
+    /// Where this crate's own tests stop an enabling: holding the record's own mutex, about to
+    /// take the state's write side, so every wait it has after that is still ahead of it.
+    #[cfg(test)]
+    pub(crate) before_change: crate::attention::Pause,
 }
 
 #[derive(Debug)]
@@ -525,6 +535,8 @@ impl EnvironmentPrivacy {
             descriptions,
             #[cfg(test)]
             after_record: crate::attention::Pause::default(),
+            #[cfg(test)]
+            before_change: crate::attention::Pause::default(),
         })
     }
 
@@ -597,6 +609,8 @@ impl EnvironmentPrivacy {
         );
         owing.sort_unstable();
         owing.dedup();
+        #[cfg(test)]
+        self.before_change.wait();
         // The state's write side is taken before the record is written and held until the new
         // state is published. Taking it waits for every delivery exchange already admitted, and
         // holding it admits none, so a send checked under the generation before the boundary has
@@ -3633,9 +3647,6 @@ mod tests {
         let host = Host::open();
         let holder = rusqlite::Connection::open(host.root.path().join(PRIVACY_RECORD))
             .expect("a second connection to the record");
-        holder
-            .execute_batch("BEGIN IMMEDIATE;")
-            .expect("the record's write lock is held");
         let lapsed = std::sync::atomic::AtomicBool::new(false);
         let admitted = |write: &mut dyn FnMut() -> Result<()>| {
             if lapsed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3645,8 +3656,18 @@ mod tests {
             }
             write()
         };
+        let (arrived, release) = host.privacy.before_change.arm();
         std::thread::scope(|scope| {
             let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &admitted));
+            // The enabling is running, and every wait it has is still ahead of it. Another writer
+            // takes the record's write lock, and the enabling goes on to wait for it.
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the enabling arrives");
+            holder
+                .execute_batch("BEGIN IMMEDIATE;")
+                .expect("the record's write lock is held");
+            release.send(()).expect("the enabling goes on");
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(!enabling.is_finished(), "the record's transaction waits");
             lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3702,7 +3723,14 @@ mod tests {
             arrived
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the read is deciding");
+            // The change is running and about to take the state's write side, which the read
+            // holds a read guard of; it goes on and waits for that.
+            let (enabling_arrived, enabling_release) = host.privacy.before_change.arm();
             let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
+            enabling_arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the change arrives");
+            enabling_release.send(()).expect("the change goes on");
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(
                 !enabling.is_finished(),

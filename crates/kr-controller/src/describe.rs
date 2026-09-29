@@ -81,10 +81,12 @@ pub struct DescribeModule {
     pub(crate) pauses: Pauses,
 }
 
-/// The two places in a read that this crate's own tests stop it at.
+/// The places in a read or a rename that this crate's own tests stop it at.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct Pauses {
+    /// A rename, about to take the store: everything it waits for is still ahead of it.
+    pub(crate) before_store: crate::attention::Pause,
     /// With the store held, before the privacy state is read.
     pub(crate) before_reading: crate::attention::Pause,
     /// With the store and the privacy state held, before the answer is decided.
@@ -115,6 +117,12 @@ impl DescribeModule {
     }
 
     /// The store, held: everything that reads or writes it takes this first.
+    ///
+    /// A rename writes to it under an admission while holding the connection table, so a write
+    /// that waits on the file's own lock waits with every other admission behind it. Only this
+    /// daemon opens the file, behind this lock, so nothing contends for it; a second process that
+    /// wrote to it would need the record's shape, taking its write lock before the admission and
+    /// writing inside it.
     pub(crate) fn store(&self) -> MutexGuard<'_, DescriptionStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -226,6 +234,8 @@ impl DescribeModule {
             }
             None => None,
         };
+        #[cfg(test)]
+        self.pauses.before_store.wait();
         let store = self.store();
         admitted(&mut || match &pinned {
             Some(title) => store
@@ -870,7 +880,7 @@ pub(crate) mod tests {
             }
             write()
         };
-        let held = module.store();
+        let (arrived, release) = module.pauses.before_store.arm();
         std::thread::scope(|scope| {
             let renaming = scope.spawn(|| {
                 module.rename(
@@ -882,6 +892,13 @@ pub(crate) mod tests {
                     &admitted,
                 )
             });
+            // The rename is running and about to take the store, which somebody else then holds:
+            // the wait it goes on to is entered by a thread that has been seen to arrive.
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the rename arrives at the store");
+            let held = module.store();
+            release.send(()).expect("the rename goes on");
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(!renaming.is_finished(), "the rename waits for the store");
             lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
