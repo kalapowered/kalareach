@@ -979,9 +979,11 @@ struct NamedPreviews {
 /// it was abandoned part way, the link is closed instead: an answer may still be on its way over
 /// it, and the next caller would read that as its own. Closing it gives up the control path the
 /// worker's lease rests on, so renewal stops with it. That happens while the slot is still held, so
-/// the next caller finds the path given up already. It is the path the link was taken from that is
-/// given up: a path bound since, by an announcement of an authority revision waiting for the slot,
-/// is not this link's to lose.
+/// the next caller finds the path given up already. It is the path in force when the link was taken
+/// that is given up: a path bound since, by an announcement of an authority revision waiting for
+/// the slot, is not this link's to lose. One bound before, by an announcement that queued for the
+/// slot behind the share, is given up with the link, and that announcement's acknowledgement is then
+/// refused, so the worker stays pending until the next announcement.
 struct OutOfItsSlot<'a> {
     controller: &'a Controller,
     session_id: SessionId,
