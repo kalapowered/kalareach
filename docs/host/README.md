@@ -2771,9 +2771,12 @@ A record it cannot read stops the start rather than leaving the daemon to guess.
 
 Turning it off is refused while a daemon subsystem or a live session still owes cleanup, and the
 refusal names what is owed. A session whose worker has ended does not hold it back, because nothing
-resumes in its store, and its obligation stays recorded. Otherwise the next generation is recorded
-first, the backup fence is released under it, the delivery fence is lifted, and each live session is
-told until it answers.
+resumes in its store, and its obligation stays recorded. A session counts as ended only when the
+registry shows its launch is over: it has no reservation, or one whose launch produced no worker or
+whose session has closed. A session whose worker has not reported yet is one this host has not
+reached, and it holds turning privacy mode off back until its worker has been told the generation
+and has answered. Otherwise the next generation is recorded first, the backup fence is released
+under it, the delivery fence is lifted, and each live session is told until it answers.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
 about an earlier one, is admitted under the privacy state the record publishes: only while privacy
@@ -2946,7 +2949,10 @@ what it removes is exactly the thing a person cannot check for themselves.
   another, each exchange with a timeout of its own, and a worker that does not answer is told again
   on a schedule that doubles from one second to a minute. Output the session prints before its
   worker has applied the generation may therefore be retained for as long as that takes, and is
-  removed when the worker applies it.
+  removed when the worker applies it. Until the tick first sees it running, the session has no
+  obligation on record, so turning privacy mode off in that gap does not wait for it: its worker is
+  then never told the generation it started under, and what it printed while privacy mode was on
+  stays.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps. No description process runs on this host, so there is no

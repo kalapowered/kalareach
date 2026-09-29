@@ -1257,10 +1257,10 @@ whether that has finished. Until it has, `kr privacy on` prints what is still ow
 and `RESOURCE_UNAVAILABLE`, as a revocation still pending does, and `kr privacy status` reports how
 far it has got: work that had already left this host and has not been answered, and each session
 whose worker has not yet said its own cleanup is complete. `kr privacy off` is refused while a
-service of this host or a session with a running worker still owes cleanup, and says what. A session
-whose worker has ended does not hold it back, because nothing resumes in its store; its obligation
-stays recorded and `kr privacy status` keeps reporting it. Nothing privacy mode removed comes back
-when it is turned off.
+service of this host or a session whose worker is running or still starting owes cleanup, and says
+what. A session whose worker has ended does not hold it back, because nothing resumes in its store;
+its obligation stays recorded and `kr privacy status` keeps reporting it. Nothing privacy mode
+removed comes back when it is turned off.
 
 `kr privacy status` also names what this host keeps while privacy mode is on, and why, and lists
 what had already left it before privacy mode was turned on: backup archives and notifications, each
