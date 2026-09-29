@@ -46,6 +46,8 @@ pub enum Failure {
     ReplyBeforeRecord,
     /// The session ran something other than the pinned build.
     NotPinned,
+    /// The session's environment held a variable the build list clears.
+    EnvironmentNotClear,
     /// The directory that held the login's key was not searched whole, or is not gone.
     KeyScanIncomplete,
     /// The part stopped on a check whose text is in its log.
@@ -69,6 +71,7 @@ impl Failure {
             Self::ResumeForks => json!({ "code": "resume_forks" }),
             Self::ReplyBeforeRecord => json!({ "code": "reply_before_record" }),
             Self::NotPinned => json!({ "code": "not_pinned" }),
+            Self::EnvironmentNotClear => json!({ "code": "environment_not_clear" }),
             Self::KeyScanIncomplete => json!({ "code": "key_scan_incomplete" }),
             Self::PartFailed => json!({ "code": "part_failed" }),
             Self::AgentStops(class) => json!({ "code": "agent_stops", "class": class }),

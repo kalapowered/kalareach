@@ -34,18 +34,21 @@ use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-use crate::provenance::{Expected, PATH_FILE, Provenance};
+use crate::provenance::{EXPORTED_FILE, Expected, PATH_FILE, Provenance};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
 pub const PROMPT: &str = "kr-agents$ ";
 
 /// The run's own startup file for the session's shell: a prompt, a hook that writes the PATH the
-/// shell searches to the run's home before each prompt, and nothing of anybody's own. `kr shell
-/// install` adds the marked entry that loads the package's integration after it.
-fn startup_file() -> String {
+/// shell searches, and the names of the variables it exports, to the run's home before each prompt,
+/// and nothing of anybody's own. `kr shell install` adds the marked entry that loads the package's
+/// integration after it.
+#[must_use]
+pub fn startup_file() -> String {
     format!(
         "PROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\nunsetopt prompt_sp\n\
-         kr_agents_path() {{ print -r -- \"$PATH\" >| \"$ZDOTDIR/{PATH_FILE}\" }}\n\
+         kr_agents_path() {{ print -r -- \"$PATH\" >| \"$ZDOTDIR/{PATH_FILE}\"; \
+         print -rl -- ${{(k)parameters[(R)*export*]}} >| \"$ZDOTDIR/{EXPORTED_FILE}\" }}\n\
          precmd_functions+=(kr_agents_path)\n"
     )
 }
@@ -817,8 +820,9 @@ pub struct AgentProcess {
 /// # Panics
 ///
 /// Panics when the screen already shows `ready`, the agent does not draw it, nothing of the build
-/// runs beneath the shell, or the session searched or ran anything but the build under test, its
-/// runtime, the run's own and the system's; and where `between` panics.
+/// runs beneath the shell, the session searched or ran anything but the build under test, its
+/// runtime, the run's own and the system's, or its shell exports a variable the build list clears;
+/// and where `between` panics.
 #[must_use]
 pub fn launch(
     run: &Run,
@@ -839,6 +843,9 @@ pub fn launch(
     let command = line.split_whitespace().next().expect("a command");
     provenance
         .check_path(command)
+        .unwrap_or_else(|why| panic!("{why}"));
+    provenance
+        .check_cleared()
         .unwrap_or_else(|why| panic!("{why}"));
     provenance.watch(session.root_shell.clone());
     // The last look before the agent's command is typed, once the session is set up.
@@ -1387,5 +1394,72 @@ pub struct InputRefusal {
 impl std::fmt::Display for InputRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::exported_clear;
+
+    /// The startup file's hook writes the names a session's shell exports and never a value: a
+    /// variable the shell was started with is named, one it only set is not, and the check the
+    /// launch makes refuses the first and passes the second.
+    #[test]
+    fn the_startup_files_hook_writes_the_names_a_shell_exports_and_never_a_value() {
+        let shell = match kr_e2e_m1b::shells::managed_zsh() {
+            Ok(shell) => shell,
+            Err(why) if kr_e2e_m1b::shells::required() => {
+                panic!("the startup file's hook needs the managed shell: {why}")
+            }
+            Err(why) => {
+                eprintln!("skipping: the startup file's hook: {why}");
+                return;
+            }
+        };
+        let unique: String = kr_ipc::new_uuid()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let directory = std::env::temp_dir().join(format!("kr-startup-{unique}"));
+        std::fs::create_dir(&directory).expect("a directory of the test's own");
+        std::fs::write(directory.join(".zshrc"), startup_file()).expect("writes the startup file");
+        let value = "a-value-that-must-not-be-written";
+        let output = std::process::Command::new(&shell.executable)
+            .args([
+                "-f",
+                "-c",
+                ". \"$ZDOTDIR/.zshrc\"; KR_SET_ONLY=1; kr_agents_path",
+            ])
+            .env_clear()
+            .env("ZDOTDIR", &directory)
+            .env("PATH", "/usr/bin:/bin")
+            .env("KR_CLEARED_HERE", value)
+            .output()
+            .expect("the managed shell runs");
+        assert!(output.status.success(), "the hook runs: {output:?}");
+        let written = std::fs::read_to_string(directory.join(EXPORTED_FILE))
+            .expect("the hook wrote the exported names");
+        let path =
+            std::fs::read_to_string(directory.join(PATH_FILE)).expect("the hook wrote the PATH");
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+        assert!(
+            written.lines().any(|line| line == "KR_CLEARED_HERE"),
+            "an exported variable is named: {written}"
+        );
+        assert!(
+            !written.lines().any(|line| line == "KR_SET_ONLY"),
+            "a variable that is set and not exported is not: {written}"
+        );
+        assert!(
+            !written.contains(value),
+            "no value is written with the names: {written}"
+        );
+        assert_eq!(path.trim_end(), "/usr/bin:/bin");
+        let cleared = ["KR_CLEARED_HERE".to_owned(), "KR_SET_ONLY".to_owned()];
+        let refused = exported_clear(&written, &cleared).expect_err("the exported name is refused");
+        assert!(refused.contains("KR_CLEARED_HERE") && !refused.contains("KR_SET_ONLY"));
+        assert_eq!(exported_clear(&written, &cleared[1..]), Ok(()));
     }
 }

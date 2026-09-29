@@ -42,8 +42,40 @@ use crate::stage::AgentProcess;
 /// The harness records such a part as not run, with the rest of the line as its reason.
 pub const NOT_PINNED: &str = "not the pinned build:";
 
+/// How a part's failure begins when its session exports a variable the build list clears. The
+/// agent was not started, so the harness records the part as not run, with the rest of the line as
+/// its reason.
+pub const ENVIRONMENT_NOT_CLEAR: &str = "the session's environment is not clear:";
+
 /// The file the session's shell writes its PATH to before each prompt, in the run's home.
 pub const PATH_FILE: &str = ".kr-agents-path";
+
+/// The file the session's shell writes the names of its exported variables to before each prompt,
+/// one on each line and never a value, in the run's home.
+pub const EXPORTED_FILE: &str = ".kr-agents-exported";
+
+/// Checks the names a session's shell wrote to [`EXPORTED_FILE`] against the variables `cleared`
+/// names: the agent inherits what the shell exports, so none of them may be there.
+///
+/// # Errors
+///
+/// Returns why, beginning with [`ENVIRONMENT_NOT_CLEAR`], naming the cleared variables that are
+/// exported, and never a value.
+pub fn exported_clear(exported: &str, cleared: &[String]) -> Result<(), String> {
+    let present: Vec<&str> = cleared
+        .iter()
+        .map(String::as_str)
+        .filter(|name| exported.lines().any(|line| line == *name))
+        .collect();
+    if present.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ENVIRONMENT_NOT_CLEAR} the session's shell exports {}, which the build list clears",
+            present.join(", ")
+        ))
+    }
+}
 
 /// How often the processes beneath a watched session are looked at.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -174,6 +206,8 @@ pub struct Provenance {
     run_resolved: PathBuf,
     link: PathBuf,
     path_file: PathBuf,
+    exported_file: PathBuf,
+    cleared: Vec<String>,
     seen_path: Mutex<Option<String>>,
     seen: Mutex<Seen>,
     roots: Mutex<Vec<ProcessStartIdentity>>,
@@ -219,6 +253,12 @@ impl Provenance {
             run_resolved,
             link: run.root().join("agent").join("current").join("bin"),
             path_file: run.home().join(PATH_FILE),
+            exported_file: run.home().join(EXPORTED_FILE),
+            cleared: build
+                .account
+                .as_ref()
+                .map(|account| account.cleared.clone())
+                .unwrap_or_default(),
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
             roots: Mutex::new(Vec::new()),
@@ -282,6 +322,26 @@ impl Provenance {
                 "{NOT_PINNED} `{command}` is not found on the session's PATH {seen}"
             )),
         }
+    }
+
+    /// Checks the variables the session's shell exports, as it wrote their names before its last
+    /// prompt, against those the build list clears: the agent is started from that shell.
+    ///
+    /// # Errors
+    ///
+    /// Returns why, beginning with [`ENVIRONMENT_NOT_CLEAR`], when the shell wrote no names or
+    /// exports one that is cleared.
+    pub fn check_cleared(&self) -> Result<(), String> {
+        if self.cleared.is_empty() {
+            return Ok(());
+        }
+        let exported = std::fs::read_to_string(&self.exported_file).map_err(|error| {
+            format!(
+                "{ENVIRONMENT_NOT_CLEAR} the session's shell wrote no exported names to {}: {error}",
+                self.exported_file.display()
+            )
+        })?;
+        exported_clear(&exported, &self.cleared)
     }
 
     /// Records the image each of `processes` maps and checks where it lies.
@@ -1085,6 +1145,32 @@ mod tests {
         let mapping = parse_mappings(text).remove(&7).expect("the process");
         assert_eq!(mapping.image, Some(PathBuf::from("/bin/zsh")));
         assert_eq!((mapping.device, mapping.inode), (None, None));
+    }
+
+    /// A cleared variable the shell exports fails the check by name, and no other name does.
+    #[test]
+    fn a_cleared_variable_the_shell_exports_fails_the_check_by_name() {
+        let exported = "HOME\nPATH\nCLAUDE_CODE_SUBAGENT_MODEL\nTERM\n";
+        let cleared = [
+            "CLAUDE_CODE_SUBAGENT_MODEL".to_owned(),
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE".to_owned(),
+        ];
+        let refused = exported_clear(exported, &cleared).expect_err("an exported cleared name");
+        assert!(refused.starts_with(ENVIRONMENT_NOT_CLEAR), "{refused}");
+        assert!(refused.ends_with("CLAUDE_CODE_SUBAGENT_MODEL, which the build list clears"));
+        assert!(
+            !refused.contains("_FORCE"),
+            "only the exported name is said: {refused}"
+        );
+        assert_eq!(exported_clear("HOME\nPATH\n", &cleared), Ok(()));
+        // A name that merely starts with a cleared one, or holds it, is another variable.
+        assert_eq!(
+            exported_clear(
+                "CLAUDE_CODE_SUBAGENT_MODEL_X\nX_CLAUDE_CODE_SUBAGENT_MODEL\n",
+                &cleared
+            ),
+            Ok(())
+        );
     }
 
     /// Each process's files are its own, and each begins at its `f`.

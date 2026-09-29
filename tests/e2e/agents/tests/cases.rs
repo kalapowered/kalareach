@@ -40,7 +40,9 @@ use kr_e2e_agents::observe::{
     typed_actions,
 };
 use kr_e2e_agents::outcome::{Failure, Outcome};
-use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling, beneath_parent};
+use kr_e2e_agents::provenance::{
+    ENVIRONMENT_NOT_CLEAR, Expected, NOT_PINNED, Provenance, StopSampling, beneath_parent,
+};
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
@@ -1143,9 +1145,16 @@ fn staged(
                     evidence.insert("stop_agent".to_owned(), json!(true));
                 }
                 let evidence = serde_json::Value::Object(evidence);
-                // The session ran something other than the build, so the part did not test it:
-                // not run, as the harness records such a part.
-                let not_run = said.find(NOT_PINNED).map(|at| (at, Failure::NotPinned));
+                // The session ran something other than the build, or held a variable the build
+                // list clears, so the part did not test it: not run, as the harness records such
+                // a part.
+                let not_run = said
+                    .find(NOT_PINNED)
+                    .map(|at| (at, Failure::NotPinned))
+                    .or_else(|| {
+                        said.find(ENVIRONMENT_NOT_CLEAR)
+                            .map(|at| (at, Failure::EnvironmentNotClear))
+                    });
                 let mut failures = if class.is_none() {
                     vec![Failure::PartFailed]
                 } else {
@@ -2818,6 +2827,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "home": login.account.home,
         "variable": login.account.variable,
         "arguments": login.account.arguments,
+        "variables_absent": login.account.cleared,
         "turns": turns,
         "declined_requests": stage.declined.lock().map(|declined| declined.clone()).unwrap_or_default(),
         "budget_spent": login.ledger.spent().ok(),
