@@ -114,7 +114,8 @@ impl DescribeModule {
         })
     }
 
-    fn store(&self) -> MutexGuard<'_, DescriptionStore> {
+    /// The store, held: everything that reads or writes it takes this first.
+    pub(crate) fn store(&self) -> MutexGuard<'_, DescriptionStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

@@ -732,3 +732,7 @@ mod one_barrier_for_every_restriction;
 
 #[cfg(test)]
 mod the_debt_pass;
+
+/// A privacy change and a rename whose admission lapses while they wait for what they write to.
+#[cfg(test)]
+mod a_change_that_waits_for_its_store;

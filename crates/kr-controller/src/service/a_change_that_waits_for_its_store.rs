@@ -1,0 +1,369 @@
+//! A change to privacy mode or to a session's name is written under the admission it carries, once
+//! every wait it has is behind it.
+//!
+//! Each change waits for something the caller cannot see: a rename for the description store, and
+//! privacy mode for the record's own transaction. What the admission said when the change was
+//! accepted says nothing about what it says after such a wait, so it is asked again once the
+//! change holds what it writes to. These tests hold that thing from outside, let the admission
+//! lapse while the change waits for it, and read back that nothing was written: once because the
+//! action's deadline passed, and once because its connection was withdrawn.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use kr_crypto::store::MemoryStore;
+use kr_describe::store::DescriptionStore;
+use kr_ipc::peer::PeerIdentity;
+use kr_protocol::describe::SessionRenameParams;
+use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{
+    ActionId, ActionWindowId, BuildId, ConnectionId, EnvironmentId, RequestId, SessionEpoch,
+    SessionId,
+};
+use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::privacy::PrivacySetParams;
+use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::session::{DisplayNumber, SessionState, SessionSummary, ShellMode};
+
+use crate::error::ControllerError;
+use crate::privacy::PRIVACY_RECORD;
+use crate::service::{Controller, ControllerSetup};
+use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+
+/// A supervisor that starts nothing: these tests run no worker.
+#[derive(Debug)]
+struct NoWorkers;
+
+impl WorkerSupervisor for NoWorkers {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that starts nothing"
+    }
+}
+
+/// How the admission a change carries stops standing while the change waits.
+#[derive(Clone, Copy, Debug)]
+enum Lapse {
+    /// The action's deadline passes.
+    Deadline,
+    /// The connection the action arrived on is withdrawn.
+    Withdrawal,
+}
+
+impl Lapse {
+    /// How long the action's deadline is, from the moment it is accepted.
+    const fn deadline(self) -> Duration {
+        match self {
+            Self::Deadline => Duration::from_millis(300),
+            Self::Withdrawal => STANDING,
+        }
+    }
+
+    /// Whether the error is what this lapse is refused with.
+    fn is_refused_by(self, error: &ControllerError) -> bool {
+        match self {
+            Self::Deadline => matches!(error, ControllerError::WindowExpired { .. }),
+            Self::Withdrawal => matches!(error, ControllerError::PermissionDenied { .. }),
+        }
+    }
+}
+
+/// How long a change is left waiting before its admission lapses, which is long enough for the
+/// change to have reached the thing it waits for and for a deadline of [`Lapse::Deadline`] to pass.
+const WAITING: Duration = Duration::from_millis(600);
+
+async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let controller =
+        Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    &MemoryStore::new(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(NoWorkers),
+            worker_program: temp.root().join("kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(crate::supervision::NoTerminal),
+        })
+        .await
+        .expect("the daemon starts");
+    (temp, controller)
+}
+
+/// A deadline that nothing in these tests reaches.
+const STANDING: Duration = Duration::from_secs(60);
+
+/// Registers one connection, the way a caller's handshake does, and returns the admission an
+/// action arriving on it carries, with a deadline `deadline` from now.
+async fn admitted(
+    controller: &Controller,
+    deadline: Duration,
+) -> (
+    kr_protocol::ids::ActorId,
+    crate::authority::AdmittedMutation,
+) {
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    controller
+        .admit_connection(
+            connection_id,
+            &actor_id,
+            &PeerIdentity {
+                uid: kr_ipc::paths::current_uid(),
+                gid: 0,
+                pid: None,
+            },
+        )
+        .await
+        .expect("the connection is registered");
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller.leases.authority_revision(),
+        deadline: controller.clock.now().checked_add(deadline),
+    };
+    (actor_id, carried)
+}
+
+fn session_id() -> SessionId {
+    SessionId::new(Uuid::from_bytes([0xa1; 16]))
+}
+
+fn summary(environment_id: EnvironmentId) -> SessionSummary {
+    SessionSummary {
+        session_id: session_id(),
+        session_epoch: SessionEpoch::new(1),
+        environment_id,
+        display_number: DisplayNumber::new(3),
+        state: SessionState::Live,
+        shell_mode: ShellMode::Managed,
+        shell_path: "/bin/zsh".to_owned(),
+        cwd: "/work/kalareach".to_owned(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        created_at_ms: TimestampMs::new(1_000),
+        dimensions: kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS,
+        attachment_count: U64::ZERO,
+        application_state: Nullable::null(),
+        root_process: Nullable::null(),
+        closure: Nullable::null(),
+    }
+}
+
+fn request<P: serde::Serialize>(
+    method: Method,
+    environment_id: EnvironmentId,
+    params: &P,
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(1),
+        method: method.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(environment_id),
+        expected: ParamsValue::empty(),
+        action_window_id: ActionWindowId::new("local:test").expect("a window"),
+        requested_ttl_ms: DurationMs::new(30_000),
+        params: ParamsValue::from_typed(params).expect("encodes"),
+    }
+}
+
+fn rename(environment_id: EnvironmentId, title: &str) -> MutationRequest {
+    request(
+        Method::SessionRename,
+        environment_id,
+        &SessionRenameParams {
+            session_id: session_id(),
+            title: Nullable::some(title.to_owned()),
+        },
+    )
+}
+
+/// Holds the description store's own lock, as a slow reader or another rename would.
+///
+/// The lock is a synchronous one, so it is held on a blocking thread rather than across an await.
+struct HeldStore {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HeldStore {
+    fn hold(controller: &Arc<Controller>) -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = std::sync::mpsc::channel::<()>();
+        let controller = Arc::clone(controller);
+        let task = tokio::task::spawn_blocking(move || {
+            let _store = controller.descriptions.store();
+            held.send(()).expect("the test is waiting");
+            // The receiver ends when the sender is dropped, so a test that panics does not leave
+            // the store locked.
+            let _ = wait.recv();
+        });
+        confirmed.recv().expect("the description store is held");
+        Self {
+            release: Some(release),
+            task: Some(task),
+        }
+    }
+
+    async fn release(mut self) {
+        drop(self.release.take());
+        if let Some(task) = self.task.take() {
+            task.await.expect("the holding thread finishes");
+        }
+    }
+}
+
+/// A rename that waits for the description store while its admission lapses writes nothing, and
+/// is refused as the lapse is; the same rename under an admission that stands then writes.
+async fn a_rename_whose_admission_lapses_while_it_waits(lapse: Lapse) {
+    let (temp, controller) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (actor_id, carried) = admitted(&controller, lapse.deadline()).await;
+    let connection_id = carried.connection_id;
+    let mutation = rename(environment_id, "Release prep");
+
+    let held = HeldStore::hold(&controller);
+    let renaming = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        async move {
+            controller
+                .session_rename(&actor_id, &mutation, summary(environment_id), carried)
+                .await
+        }
+    });
+    tokio::time::sleep(WAITING).await;
+    if matches!(lapse, Lapse::Withdrawal) {
+        controller.deregister(connection_id);
+    }
+    held.release().await;
+
+    let refused = renaming
+        .await
+        .expect("the rename finishes")
+        .expect_err("a rename whose admission lapsed while it waited writes nothing");
+    assert!(lapse.is_refused_by(&refused), "{lapse:?}: {refused}");
+    let store = DescriptionStore::open(temp.environment().state_dir()).expect("the store opens");
+    assert!(
+        store.pinned(&session_id()).expect("a read").is_none(),
+        "{lapse:?}: nothing was pinned"
+    );
+
+    // The same rename under an admission that stands is written.
+    let (actor_id, carried) = admitted(&controller, STANDING).await;
+    controller
+        .session_rename(
+            &actor_id,
+            &rename(environment_id, "Release prep"),
+            summary(environment_id),
+            carried,
+        )
+        .await
+        .expect("a rename under a standing admission is written");
+    assert!(store.pinned(&session_id()).expect("a read").is_some());
+}
+
+/// KR-REQ-24.14: a rename's deadline passes while it waits for the description store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_whose_deadline_passes_while_it_waits_for_the_store_writes_nothing() {
+    a_rename_whose_admission_lapses_while_it_waits(Lapse::Deadline).await;
+}
+
+/// KR-REQ-24.14: the connection a rename arrived on is withdrawn while it waits for the
+/// description store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_whose_connection_is_withdrawn_while_it_waits_for_the_store_writes_nothing() {
+    a_rename_whose_admission_lapses_while_it_waits(Lapse::Withdrawal).await;
+}
+
+/// A privacy change that waits for the record's own transaction while its admission lapses
+/// records nothing, publishes nothing and fences nothing, and is refused as the lapse is.
+async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
+    let (temp, controller) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (_actor, carried) = admitted(&controller, lapse.deadline()).await;
+    let connection_id = carried.connection_id;
+    let mutation = request(
+        Method::PrivacySet,
+        environment_id,
+        &PrivacySetParams { enabled: true },
+    );
+
+    // Another writer holds the record's write lock, so the change waits for its transaction.
+    let holder = rusqlite::Connection::open(temp.environment().state_dir().join(PRIVACY_RECORD))
+        .expect("a second connection to the record");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("the record's write lock is held");
+    let changing = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { controller.privacy_set(&mutation, carried).await }
+    });
+    tokio::time::sleep(WAITING).await;
+    if matches!(lapse, Lapse::Withdrawal) {
+        controller.deregister(connection_id);
+    }
+    holder
+        .execute_batch("ROLLBACK;")
+        .expect("the write lock is let go");
+
+    let refused = changing
+        .await
+        .expect("the change finishes")
+        .expect_err("a change whose admission lapsed while it waited changes nothing");
+    assert!(lapse.is_refused_by(&refused), "{lapse:?}: {refused}");
+    let report = controller.privacy.status(kr_ipc::now_ms());
+    assert!(!report.enabled, "{lapse:?}: privacy mode is still off");
+    assert!(!controller.privacy.state().is_private());
+    assert_eq!(
+        controller.backup().fenced_at().expect("a read"),
+        None,
+        "{lapse:?}: the backup service is not fenced"
+    );
+
+    // The same change under an admission that stands is recorded.
+    let (_actor, carried) = admitted(&controller, STANDING).await;
+    let mutation = request(
+        Method::PrivacySet,
+        environment_id,
+        &PrivacySetParams { enabled: true },
+    );
+    controller
+        .privacy_set(&mutation, carried)
+        .await
+        .expect("a change under a standing admission is recorded");
+    assert!(controller.privacy.state().is_private());
+}
+
+/// KR-REQ-24.27: a privacy change's deadline passes while it waits for the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_privacy_change_whose_deadline_passes_while_it_waits_for_the_record_changes_nothing() {
+    a_privacy_change_whose_admission_lapses_while_it_waits(Lapse::Deadline).await;
+}
+
+/// KR-REQ-24.27: the connection a privacy change arrived on is withdrawn while it waits for the
+/// record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_privacy_change_whose_connection_is_withdrawn_while_it_waits_for_the_record_changes_nothing()
+ {
+    a_privacy_change_whose_admission_lapses_while_it_waits(Lapse::Withdrawal).await;
+}
