@@ -168,6 +168,14 @@ jobs:
 
       # A clean image of each distribution, so what starts is the executable against that
       # distribution's own libraries and nothing the runner image added.
+      #
+      # The registry limits anonymous pulls by the second and by the address, and a hosted runner
+      # shares its address with others, so a pull is refused now and then for no fault of the
+      # release (`toomanyrequests: Rate exceeded`, on the nightly runs of 2026-09-27 and 09-28,
+      # after one to four of the four images). Each pull is therefore its own command, tried up to
+      # five times with a wait that doubles from ten seconds, and only a pull that still fails
+      # fails the job, with the registry's own message. `docker run` then pulls nothing: it starts
+      # the image that was pulled.
       - name: Start each on the Linux distributions the release supports
         if: runner.os == 'Linux'
         run: |
@@ -176,9 +184,24 @@ jobs:
           for executable in $EXECUTABLES; do
             names+=("${executable#*/}")
           done
+          pull() {
+            local image="$1" attempt=1 wait=10
+            until docker pull --quiet "$image" > /dev/null; do
+              if [ "$attempt" -ge 5 ]; then
+                echo "::error::$image could not be pulled in $attempt attempts"
+                return 1
+              fi
+              echo "::warning::pulling $image failed (attempt $attempt of 5); trying again in $wait seconds"
+              sleep "$wait"
+              attempt=$((attempt + 1))
+              wait=$((wait * 2))
+            done
+          }
           for image in ubuntu:22.04 ubuntu:24.04 debian:12 debian:13; do
             echo "== $image"
-            docker run --rm --volume "$release:/kr:ro" "public.ecr.aws/docker/library/$image" \
+            reference="public.ecr.aws/docker/library/$image"
+            pull "$reference"
+            docker run --rm --pull=never --volume "$release:/kr:ro" "$reference" \
               sh -c 'set -e; grep PRETTY_NAME /etc/os-release; for name in "$@"; do /kr/"$name" --version; done' \
               sh "${names[@]}"
             echo "- $TARGET starts on $image" >> "$GITHUB_STEP_SUMMARY"
