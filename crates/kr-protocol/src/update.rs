@@ -39,7 +39,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::hello::{PACKAGE_VERSION, PackageVersion};
-use crate::scalars::{Digest256, Nullable, U64};
+use crate::scalars::{Digest256, Nullable, U64, Uuid};
 
 /* -------------------------------------------------------------------------------------------- */
 /* Compatibility levels                                                                         */
@@ -825,18 +825,26 @@ pub const HANDOVER_HOLD_MS: u64 = 300_000;
 pub const HANDOVER_SETTLE_MS: u64 = 45_000;
 
 /// One step of `host.update.handover`.
+///
+/// A handover is an attempt: `prepare` begins one and answers its identity, and only a `stop` that
+/// names that identity stops the daemon. An attempt ends at its first `stop` or `resume`, when its
+/// hold lapses, or when a later `prepare` begins another; nothing can act on an attempt that has
+/// ended, so a `stop` that arrives late, after the update it belonged to gave up, ends nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoverStep {
-    /// Close the gate to new sessions, wait for the creates already started to settle, and say how
-    /// this daemon was started. The gate stays closed for [`HANDOVER_HOLD_MS`], until a `stop` or
-    /// a `resume`.
+    /// Begin an attempt: close the gate to new sessions, wait for the creates already started to
+    /// settle, and say how this daemon was started and under which attempt. The gate stays closed
+    /// for [`HANDOVER_HOLD_MS`], until a `stop` or a `resume`, or until a later `prepare`.
     Prepare,
-    /// Stop, having prepared. Refused when the gate is open, so a daemon whose preparation lapsed
-    /// is never stopped with its gate open.
+    /// Stop, having prepared, under the attempt `prepare` answered. Refused for any other
+    /// attempt, and when the gate is open or its hold has lapsed, so a daemon is never stopped by
+    /// a handover that is over or with its gate open.
     Stop,
-    /// Open the gate again: the update is not going ahead now. Refused once the daemon has been
-    /// told to stop, so a daemon that resumes is one no stop of this handover ends.
+    /// End the attempt named, or whichever is open when none is named: the update is not going
+    /// ahead now, and the gate opens again. Refused once the daemon has been told to stop, so a
+    /// daemon that resumes is one no stop of an attempt can end. An attempt that is not open is
+    /// already over, and resuming it changes nothing.
     Resume,
 }
 
@@ -848,13 +856,19 @@ pub struct HostUpdateHandoverParams {
     pub step: HandoverStep,
     /// The release the host is being updated to, which a create refused meanwhile is told.
     pub target: ReleaseName,
+    /// The attempt the step is for: what a `stop` must name, and what a `resume` may name. Null
+    /// for `prepare`, which begins one, and for a `resume` that ends whichever is open.
+    pub attempt: Nullable<Uuid>,
 }
 
 /// `host.update.handover` result: how the daemon was started, which a daemon of the release that
-/// replaces it is started like.
+/// replaces it is started like, and the attempt the step was for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostUpdateHandoverResult {
+    /// The attempt the answer is for: the one `prepare` began, the one `stop` stopped under, and
+    /// for `resume` the one it ended, null when none was open.
+    pub attempt: Nullable<Uuid>,
     /// The release this daemon runs, where it runs an installed one.
     pub release: Nullable<ReleaseName>,
     /// Its process identifier.
@@ -1156,15 +1170,20 @@ mod tests {
     /// canonical encoding.
     #[test]
     fn the_handover_round_trips_and_refuses_what_it_does_not_define() {
-        let params = HostUpdateHandoverParams {
-            step: HandoverStep::Prepare,
-            target: ReleaseName::new("0.2.0+4254aa6e62e5").expect("a name"),
-        };
-        let bytes = kr_cbor::to_canonical_vec(&params).expect("encodes");
-        let back: HostUpdateHandoverParams =
-            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
-        assert_eq!(back, params);
+        let attempt = Uuid::from_bytes([7; 16]);
+        for named in [Nullable::null(), Nullable::some(attempt)] {
+            let params = HostUpdateHandoverParams {
+                step: HandoverStep::Stop,
+                target: ReleaseName::new("0.2.0+4254aa6e62e5").expect("a name"),
+                attempt: named,
+            };
+            let bytes = kr_cbor::to_canonical_vec(&params).expect("encodes");
+            let back: HostUpdateHandoverParams =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(back, params);
+        }
         let result = HostUpdateHandoverResult {
+            attempt: Nullable::some(attempt),
             release: Nullable::null(),
             pid: U64::new(42),
             arguments: vec!["--runtime-dir".to_owned(), "/r".to_owned()],
@@ -1177,8 +1196,13 @@ mod tests {
         let unknown = serde_json::json!({
             "step": "stop",
             "target": "0.2.0+4254aa6e62e5",
+            "attempt": null,
             "force": true,
         });
         assert!(serde_json::from_value::<HostUpdateHandoverParams>(unknown).is_err());
+        // The attempt is stated, as null where there is none: a request that leaves it out is
+        // refused rather than read as one that names none.
+        let unstated = serde_json::json!({ "step": "stop", "target": "0.2.0+4254aa6e62e5" });
+        assert!(serde_json::from_value::<HostUpdateHandoverParams>(unstated).is_err());
     }
 }

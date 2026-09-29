@@ -162,13 +162,21 @@ check any other release against: `kr host update` refuses every archive there, a
 ## The handover
 
 A control daemon is replaced by the release that updates the host, through
-`host.update.handover`, which only the owner's own socket may call. It takes one of three steps:
+`host.update.handover`, which only the owner's own socket may call. A handover is an attempt: it
+takes one of three steps, and only `prepare` begins one.
 
 | Step | What the daemon does |
 | --- | --- |
-| `prepare` | Closes its gate to new sessions, waits up to 45 seconds for the creates it has already started to settle, and answers with its process, the arguments it was started with and the directory it was started in. The gate stays closed for five minutes unless a `stop` or a `resume` comes first. |
-| `stop` | Stops. It is refused when the gate is open, so a daemon whose preparation lapsed is never stopped while it is starting sessions. |
-| `resume` | Opens the gate again. The update is not going ahead now. Refused, `ENVIRONMENT_UNAVAILABLE`, once the daemon has been told to stop: a stop and a resume are decided in the order they arrive, so a daemon that resumes is one no stop of the handover ends. |
+| `prepare` | Begins an attempt under a new identity. Closes its gate to new sessions, waits up to 45 seconds for the creates it has already started to settle, and answers with the attempt, its process, the arguments it was started with and the directory it was started in. The gate stays closed for five minutes unless the attempt ends first. An attempt already open is over. |
+| `stop` | Stops, when it names the attempt `prepare` answered and that attempt is the one the gate is closed for, within its five minutes. Refused for any other, so a daemon that was never prepared, one whose preparation lapsed and one whose attempt was ended or superseded are never stopped by it. |
+| `resume` | Ends the attempt it names, or whichever is open when it names none, and opens the gate: the update is not going ahead. Naming an attempt that is already over changes nothing. Refused, `ENVIRONMENT_UNAVAILABLE`, once the daemon has been told to stop. |
+
+An attempt ends at its first stop or resume, when its five minutes lapse, and when a later
+`prepare` begins another. Every decision is made under the lock the gate is under, and a stop
+names its attempt, so a stop that arrives late, after the update it belonged to gave up and
+whatever came after, finds its attempt over and ends nothing. A daemon told to stop takes no other
+step: it refuses to resume and to prepare, and one that has resumed refuses a stop, so an updater
+that sees a daemon resume knows no stop of any earlier attempt will end it.
 
 A create that arrives while the gate is closed is refused with `RESOURCE_UNAVAILABLE`, naming the
 release the host is being updated to; the caller creates the session again once the new daemon is
@@ -179,10 +187,10 @@ Nothing a session is doing stops at any step: a worker belongs to the service ma
 daemon finds it again.
 
 An update that starts a stopped daemon again, or settles one an earlier run left, and finds a
-daemon already holding the environment asks it to resume before it takes it for the environment's
-daemon. One that resumes goes on serving, from then on whatever stop of the handover arrives; one
-that has been told to stop is waited for until it has gone, and then the daemon is started again
-as it was recorded.
+daemon already holding the environment asks it to resume, naming no attempt, before it takes it
+for the environment's daemon. One that resumes goes on serving, and no stop of any earlier attempt
+can end it; one that has been told to stop is waited for until it has gone, and then the daemon is
+started again as it was recorded.
 
 A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
 worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says

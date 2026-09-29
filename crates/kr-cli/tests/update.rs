@@ -31,7 +31,7 @@ use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
 use kr_protocol::ids::{ActionId, BuildId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Digest256, U64};
+use kr_protocol::scalars::{Digest256, Nullable, U64, Uuid};
 use kr_protocol::update::{
     CommitId, CompatibilityLevel, FileMode, FloorSystem, FloorVersion, HandoverStep,
     HostUpdateHandoverParams, ManifestKind, OsFloor, ReleaseFile, ReleaseManifest, ReleaseName,
@@ -643,17 +643,25 @@ impl Host {
         };
         if let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
         {
-            for step in [HandoverStep::Prepare, HandoverStep::Stop] {
+            let target = release("0.0.0+000000000000");
+            let prepared = tokio::time::timeout(
+                Duration::from_secs(60),
+                handover_step(self, &mut client, HandoverStep::Prepare, None, &target),
+            )
+            .await;
+            // The stop names the attempt the daemon began, which is the only one it stops under.
+            if let Ok(Ok(answered)) = prepared
+                && let Ok(answer) =
+                    answered.to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
+            {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(60),
-                    client.mutate(
-                        Method::HostUpdateHandover,
-                        ActionId::new(kr_ipc::new_uuid()),
-                        ActionTarget::environment(self.tree.environment_id()),
-                        &HostUpdateHandoverParams {
-                            step,
-                            target: release("0.0.0+000000000000"),
-                        },
+                    handover_step(
+                        self,
+                        &mut client,
+                        HandoverStep::Stop,
+                        answer.attempt.0,
+                        &target,
                     ),
                 )
                 .await;
@@ -1408,11 +1416,13 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
 }
 
-/// Sends one step of the handover to this host's daemon on `client`, targeting `target`.
+/// Sends one step of the handover to this host's daemon on `client`, targeting `target`, for
+/// `attempt` where the step names one.
 async fn handover_step(
     host: &Host,
     client: &mut LocalClient,
     step: HandoverStep,
+    attempt: Option<Uuid>,
     target: &ReleaseName,
 ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
     client
@@ -1423,6 +1433,7 @@ async fn handover_step(
             &HostUpdateHandoverParams {
                 step,
                 target: target.clone(),
+                attempt: Nullable(attempt),
             },
         )
         .await
@@ -1430,8 +1441,9 @@ async fn handover_step(
 }
 
 /// KR-REQ-26.09: a daemon an update prepared, and may have told to stop, is taken back for the
-/// environment's daemon only once it has resumed, so no stop of that handover still on its way can
-/// end it afterwards: the stop is refused, and the daemon goes on serving.
+/// environment's daemon only once it has resumed, so no stop of that attempt still on its way can
+/// end it afterwards, however the daemon is prepared again meanwhile: the stop names the attempt it
+/// belongs to, finds it over, and is refused, and the daemon goes on serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_end_it() {
     let mut host = Host::bare();
@@ -1450,9 +1462,14 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
         .expect("reaches the daemon");
-    handover_step(&host, &mut client, HandoverStep::Prepare, &two)
+    let attempt = handover_step(&host, &mut client, HandoverStep::Prepare, None, &two)
         .await
-        .expect("the daemon prepares");
+        .expect("the daemon prepares")
+        .to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("it answers the attempt it began");
     let restart = serde_json::json!({
         "environment": host.tree.environment_id(),
         "runtime_root": host.tree.paths().runtime_root(),
@@ -1494,17 +1511,42 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
 
     // The stop still on its way arrives, and is refused: the daemon resumed before it was taken
     // back.
-    let refused = handover_step(&host, &mut client, HandoverStep::Stop, &two)
+    let refused = handover_step(&host, &mut client, HandoverStep::Stop, Some(attempt), &two)
         .await
         .expect_err("a daemon that resumed is not stopped");
     assert_eq!(
         refused.code,
         kr_protocol::error::ErrorCode::ResourceUnavailable
     );
+    // The same stop, arriving after another update has begun its own attempt on the daemon, is
+    // refused as well: the daemon is closed to new sessions for that attempt, and this stop
+    // belongs to another.
+    let later = handover_step(&host, &mut client, HandoverStep::Prepare, None, &two)
+        .await
+        .expect("the daemon prepares again")
+        .to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("it answers the attempt it began");
+    assert_ne!(attempt, later, "each attempt has an identity of its own");
+    let refused = handover_step(&host, &mut client, HandoverStep::Stop, Some(attempt), &two)
+        .await
+        .expect_err("a stop of an earlier attempt ends nothing while a later one is open");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
     assert_eq!(
         host.daemon_build().await,
-        format!("kr-controller/{}", one.name())
+        format!("kr-controller/{}", one.name()),
+        "the daemon serves"
     );
+    // The control: the attempt that is open ends as its own update ends it, and the daemon goes on
+    // serving as it did.
+    handover_step(&host, &mut client, HandoverStep::Resume, Some(later), &two)
+        .await
+        .expect("the open attempt ends");
     assert!(
         host.daemons
             .iter_mut()

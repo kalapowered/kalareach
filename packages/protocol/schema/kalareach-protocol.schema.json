@@ -14390,21 +14390,21 @@
       "type": "object"
     },
     "HandoverStep": {
-      "description": "One step of `host.update.handover`.",
+      "description": "One step of `host.update.handover`.\n\nA handover is an attempt: `prepare` begins one and answers its identity, and only a `stop` that\nnames that identity stops the daemon. An attempt ends at its first `stop` or `resume`, when its\nhold lapses, or when a later `prepare` begins another; nothing can act on an attempt that has\nended, so a `stop` that arrives late, after the update it belonged to gave up, ends nothing.",
       "oneOf": [
         {
           "const": "prepare",
-          "description": "Close the gate to new sessions, wait for the creates already started to settle, and say how\nthis daemon was started. The gate stays closed for [`HANDOVER_HOLD_MS`], until a `stop` or\na `resume`.",
+          "description": "Begin an attempt: close the gate to new sessions, wait for the creates already started to\nsettle, and say how this daemon was started and under which attempt. The gate stays closed\nfor [`HANDOVER_HOLD_MS`], until a `stop` or a `resume`, or until a later `prepare`.",
           "type": "string"
         },
         {
           "const": "stop",
-          "description": "Stop, having prepared. Refused when the gate is open, so a daemon whose preparation lapsed\nis never stopped with its gate open.",
+          "description": "Stop, having prepared, under the attempt `prepare` answered. Refused for any other\nattempt, and when the gate is open or its hold has lapsed, so a daemon is never stopped by\na handover that is over or with its gate open.",
           "type": "string"
         },
         {
           "const": "resume",
-          "description": "Open the gate again: the update is not going ahead now. Refused once the daemon has been\ntold to stop, so a daemon that resumes is one no stop of this handover ends.",
+          "description": "End the attempt named, or whichever is open when none is named: the update is not going\nahead now, and the gate opens again. Refused once the daemon has been told to stop, so a\ndaemon that resumes is one no stop of an attempt can end. An attempt that is not open is\nalready over, and resuming it changes nothing.",
           "type": "string"
         }
       ]
@@ -14854,6 +14854,17 @@
       "additionalProperties": false,
       "description": "`host.update.handover` parameters.",
       "properties": {
+        "attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Uuid"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attempt the step is for: what a `stop` must name, and what a `resume` may name. Null\nfor `prepare`, which begins one, and for a `resume` that ends whichever is open."
+        },
         "step": {
           "$ref": "#/$defs/HandoverStep",
           "description": "The step to take."
@@ -14865,13 +14876,14 @@
       },
       "required": [
         "step",
-        "target"
+        "target",
+        "attempt"
       ],
       "type": "object"
     },
     "HostUpdateHandoverResult": {
       "additionalProperties": false,
-      "description": "`host.update.handover` result: how the daemon was started, which a daemon of the release that\nreplaces it is started like.",
+      "description": "`host.update.handover` result: how the daemon was started, which a daemon of the release that\nreplaces it is started like, and the attempt the step was for.",
       "properties": {
         "arguments": {
           "description": "The arguments it was started with, its program's own name left out.",
@@ -14879,6 +14891,17 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Uuid"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attempt the answer is for: the one `prepare` began, the one `stop` stopped under, and\nfor `resume` the one it ended, null when none was open."
         },
         "pid": {
           "$ref": "#/$defs/U64",
@@ -14901,6 +14924,7 @@
         }
       },
       "required": [
+        "attempt",
         "release",
         "pid",
         "arguments",

@@ -9,7 +9,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Nullable, Uuid};
 use kr_protocol::session::{LaunchProfile, Presentation, SessionCreateParams, ShellMode};
 use kr_protocol::update::{
     HandoverStep, HostUpdateHandoverParams, HostUpdateHandoverResult, ReleaseName,
@@ -49,26 +49,31 @@ fn target() -> ReleaseName {
     ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release")
 }
 
+/// Begins an attempt on `handover` that holds for `hold`.
+fn begin(handover: &Handover, hold: Duration) -> Uuid {
+    handover.close(&target(), hold).expect("an attempt begins")
+}
+
 /// A create passes an open gate, is refused by a closed one with the release the host is being
-/// updated to, and passes again once the gate is opened, or once its hold has lapsed.
+/// updated to, and passes again once the attempt is ended, or once its hold has lapsed.
 #[test]
 fn a_create_passes_an_open_gate_and_is_refused_by_a_closed_one() {
     let handover = Handover::default();
     drop(handover.admit().expect("the gate is open"));
-    handover.close(&target(), Duration::from_secs(300));
+    let attempt = begin(&handover, Duration::from_secs(300));
     let refused = handover.admit().err().expect("the gate is closed");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
     assert!(
         refused.to_string().contains("0.2.0+4254aa6e62e5"),
         "{refused}"
     );
-    handover.open();
+    assert_eq!(handover.resume(None).expect("resumes"), Some(attempt));
     drop(handover.admit().expect("the gate is open again"));
 
     // A hold that lapses opens the gate by itself, and then nothing stops the daemon.
-    handover.close(&target(), Duration::ZERO);
+    let lapsed = begin(&handover, Duration::ZERO);
     drop(handover.admit().expect("a lapsed gate is open"));
-    assert!(handover.stop().is_err());
+    assert!(handover.stop(Some(lapsed)).is_err());
 }
 
 /// A handover waits for the creates under way, and says how many did not settle in time.
@@ -76,7 +81,7 @@ fn a_create_passes_an_open_gate_and_is_refused_by_a_closed_one() {
 async fn a_handover_waits_for_the_creates_under_way() {
     let handover = Arc::new(Handover::default());
     let under_way = handover.admit().expect("admitted");
-    handover.close(&target(), Duration::from_secs(300));
+    begin(&handover, Duration::from_secs(300));
     assert_eq!(
         handover.settle(Duration::from_millis(50)).await,
         1,
@@ -96,37 +101,98 @@ async fn a_handover_waits_for_the_creates_under_way() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_prepared_daemon_is_told_to_stop() {
     let handover = Arc::new(Handover::default());
-    assert!(handover.stop().is_err(), "an open gate is never stopped");
+    assert!(
+        handover.stop(Some(Uuid::from_bytes([1; 16]))).is_err(),
+        "an open gate is never stopped"
+    );
     let waiting = {
         let handover = Arc::clone(&handover);
         tokio::spawn(async move { handover.stopped().await })
     };
-    handover.close(&target(), Duration::from_secs(300));
-    handover.stop().expect("a prepared daemon stops");
+    let attempt = begin(&handover, Duration::from_secs(300));
+    assert_eq!(
+        handover.stop(None).err().map(|error| error.code()),
+        Some(ErrorCode::InvalidArgument),
+        "a stop names its attempt"
+    );
+    handover
+        .stop(Some(attempt))
+        .expect("a prepared daemon stops");
     tokio::time::timeout(LIVENESS_DEADLINE, waiting)
         .await
         .expect("the stop is seen")
         .expect("the waiter ends");
 }
 
-/// A daemon told to stop does not resume, and one that has resumed is not stopped: whichever comes
-/// first decides, so an updater that sees a daemon resume knows no stop of the handover will end it.
+/// A daemon told to stop does not resume or prepare again, and one that has resumed is not
+/// stopped: whichever comes first decides, so an updater that sees a daemon resume knows no stop of
+/// the attempt will end it.
 #[test]
 fn a_stopping_daemon_does_not_resume_and_a_resumed_one_does_not_stop() {
     let stopped = Handover::default();
-    stopped.close(&target(), Duration::from_secs(300));
-    stopped.stop().expect("a prepared daemon stops");
+    let attempt = begin(&stopped, Duration::from_secs(300));
+    stopped
+        .stop(Some(attempt))
+        .expect("a prepared daemon stops");
+    // Asked again for the same attempt, it stops still: an updater that lost the answer asks again.
+    stopped
+        .stop(Some(attempt))
+        .expect("the same stop is repeated");
     let refused = stopped
-        .resume()
+        .resume(None)
         .expect_err("a stopping daemon does not resume");
+    assert_eq!(refused.code(), ErrorCode::EnvironmentUnavailable);
+    let refused = stopped
+        .close(&target(), Duration::from_secs(300))
+        .expect_err("a stopping daemon does not prepare");
     assert_eq!(refused.code(), ErrorCode::EnvironmentUnavailable);
 
     // The control: resumed first, it is not stopped, and its gate is open.
     let resumed = Handover::default();
-    resumed.close(&target(), Duration::from_secs(300));
-    resumed.resume().expect("a prepared daemon resumes");
-    assert!(resumed.stop().is_err(), "a resumed daemon is not stopped");
+    let attempt = begin(&resumed, Duration::from_secs(300));
+    resumed
+        .resume(Some(attempt))
+        .expect("a prepared daemon resumes");
+    assert!(
+        resumed.stop(Some(attempt)).is_err(),
+        "a resumed daemon is not stopped"
+    );
     drop(resumed.admit().expect("its gate is open"));
+}
+
+/// A stop belongs to the attempt it names: after its update gave up, whatever came next, a late
+/// stop finds its attempt over and ends nothing, while the attempt that is open stops the daemon.
+#[test]
+fn a_late_stop_of_an_attempt_that_is_over_ends_nothing() {
+    let handover = Handover::default();
+    let first = begin(&handover, Duration::from_secs(300));
+    // The update gave up, and the next one, of the same release, began.
+    assert_eq!(handover.resume(None).expect("resumes"), Some(first));
+    let second = begin(&handover, Duration::from_secs(300));
+    assert_ne!(first, second, "each attempt has an identity of its own");
+    let refused = handover
+        .stop(Some(first))
+        .expect_err("the first attempt is over");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    assert!(
+        handover.admit().is_err(),
+        "the second attempt's gate stays closed"
+    );
+    // A resume of the first attempt, sent late as well, does not end the second.
+    assert_eq!(handover.resume(Some(first)).expect("changes nothing"), None);
+    assert!(
+        handover.admit().is_err(),
+        "the second attempt's gate is still closed"
+    );
+    // Beginning another supersedes an attempt that never ended, too.
+    let third = begin(&handover, Duration::from_secs(300));
+    assert!(handover.stop(Some(second)).is_err(), "the second is over");
+    handover.stop(Some(third)).expect("the open attempt stops");
+
+    // The control: an attempt whose hold has lapsed is over as well.
+    let lapsed = Handover::default();
+    let attempt = begin(&lapsed, Duration::ZERO);
+    assert!(lapsed.stop(Some(attempt)).is_err());
 }
 
 /// The whole handover through the daemon's own door: `prepare` answers how the daemon was
@@ -175,9 +241,10 @@ async fn a_daemon_makes_way_through_its_own_door() {
     .await
     .expect("reaches the daemon");
 
-    let step = |step: HandoverStep| HostUpdateHandoverParams {
+    let step = |step: HandoverStep, attempt: Option<Uuid>| HostUpdateHandoverParams {
         step,
         target: target(),
+        attempt: Nullable(attempt),
     };
     let create = SessionCreateParams {
         environment_id,
@@ -199,13 +266,14 @@ async fn a_daemon_makes_way_through_its_own_door() {
             Method::HostUpdateHandover,
             ActionId::new(kr_ipc::new_uuid()),
             target_of.clone(),
-            &step(HandoverStep::Prepare),
+            &step(HandoverStep::Prepare, None),
         )
         .await
         .expect("the call reaches the daemon")
         .expect("the daemon prepares")
         .to_typed()
         .expect("decodes");
+    let first = answered.attempt.0.expect("it answers the attempt it began");
     assert_eq!(answered.pid.get(), u64::from(std::process::id()));
     assert_eq!(
         answered.release,
@@ -248,16 +316,19 @@ async fn a_daemon_makes_way_through_its_own_door() {
     );
 
     // The control: once the update is not going ahead, a create is started again.
-    client
+    let resumed: HostUpdateHandoverResult = client
         .mutate(
             Method::HostUpdateHandover,
             ActionId::new(kr_ipc::new_uuid()),
             target_of.clone(),
-            &step(HandoverStep::Resume),
+            &step(HandoverStep::Resume, Some(first)),
         )
         .await
         .expect("the call reaches the daemon")
-        .expect("the daemon resumes");
+        .expect("the daemon resumes")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(resumed.attempt.0, Some(first), "it ended the attempt named");
     let _ = client
         .mutate(
             Method::SessionCreate,
@@ -273,47 +344,89 @@ async fn a_daemon_makes_way_through_its_own_door() {
         "the create passed the open gate and asked for a launch"
     );
 
-    // A stop before a prepare is refused, and after one ends the daemon's service.
+    // A stop with no attempt open is refused; a stop that names none is refused as well.
     let refused = client
         .mutate(
             Method::HostUpdateHandover,
             ActionId::new(kr_ipc::new_uuid()),
             target_of.clone(),
-            &step(HandoverStep::Stop),
+            &step(HandoverStep::Stop, Some(first)),
         )
         .await
         .expect("the call reaches the daemon")
-        .expect_err("an open gate is never stopped");
+        .expect_err("an attempt that is over never stops the daemon");
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
-    for (step_now, expected) in [
-        (HandoverStep::Prepare, "prepares"),
-        (HandoverStep::Stop, "stops"),
-    ] {
-        client
+    let prepared: HostUpdateHandoverResult = client
+        .mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            target_of.clone(),
+            &step(HandoverStep::Prepare, None),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon prepares again")
+        .to_typed()
+        .expect("decodes");
+    let second = prepared.attempt.0.expect("it answers the attempt it began");
+    assert_ne!(first, second, "each attempt has an identity of its own");
+    // The first attempt's stop, arriving late over its own connection, ends nothing now that the
+    // second has begun; nor does a stop that names none.
+    for late in [Some(first), None] {
+        let refused = client
             .mutate(
                 Method::HostUpdateHandover,
                 ActionId::new(kr_ipc::new_uuid()),
                 target_of.clone(),
-                &step(step_now),
+                &step(HandoverStep::Stop, late),
             )
             .await
             .expect("the call reaches the daemon")
-            .unwrap_or_else(|error| panic!("the daemon {expected}: {error:?}"));
+            .expect_err("only the open attempt stops the daemon");
+        assert!(
+            matches!(
+                refused.code,
+                ErrorCode::ResourceUnavailable | ErrorCode::InvalidArgument
+            ),
+            "{refused:?}"
+        );
     }
-    tokio::time::timeout(LIVENESS_DEADLINE, controller.handed_over())
-        .await
-        .expect("the daemon is told to stop");
-    // Still serving while it goes, it answers, and does not resume.
-    let refused = client
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), controller.handed_over())
+            .await
+            .is_err(),
+        "the daemon still serves"
+    );
+    client
         .mutate(
             Method::HostUpdateHandover,
             ActionId::new(kr_ipc::new_uuid()),
             target_of.clone(),
-            &step(HandoverStep::Resume),
+            &step(HandoverStep::Stop, Some(second)),
         )
         .await
         .expect("the call reaches the daemon")
-        .expect_err("a stopping daemon does not resume");
-    assert_eq!(refused.code, ErrorCode::EnvironmentUnavailable);
+        .expect("the attempt that is open stops the daemon");
+    tokio::time::timeout(LIVENESS_DEADLINE, controller.handed_over())
+        .await
+        .expect("the daemon is told to stop");
+    // Still serving while it goes, it answers, and does not resume or prepare.
+    for (again, attempt) in [
+        (HandoverStep::Resume, None),
+        (HandoverStep::Prepare, None),
+        (HandoverStep::Resume, Some(second)),
+    ] {
+        let refused = client
+            .mutate(
+                Method::HostUpdateHandover,
+                ActionId::new(kr_ipc::new_uuid()),
+                target_of.clone(),
+                &step(again, attempt),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect_err("a stopping daemon takes no other step");
+        assert_eq!(refused.code, ErrorCode::EnvironmentUnavailable);
+    }
     serving.abort();
 }

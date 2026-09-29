@@ -15,7 +15,7 @@ use kr_protocol::hostinfo::{
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::update::{
     HANDOVER_HOLD_MS, HANDOVER_SETTLE_MS, HandoverStep, HostUpdateHandoverParams,
     HostUpdateHandoverResult, ReleaseName,
@@ -604,12 +604,15 @@ fn whoami() -> String {
 /// reported itself or is known not to, so every worker this daemon launched holds its own release
 /// by the time the daemon answers that it has made way.
 ///
-/// A closed gate opens again by itself after [`HANDOVER_HOLD_MS`], so a daemon whose updater
-/// stopped between asking it to prepare and telling it to stop goes on starting sessions; a stop
-/// that comes after that is refused, so a daemon is never stopped with its gate open. A stop and a
-/// resume are decided under the lock the gate is under: a daemon told to stop refuses to resume,
-/// and one that has resumed refuses a stop, so an updater that sees a daemon resume knows no stop
-/// of the handover will end it.
+/// A closed gate is an attempt: it is closed for the attempt `prepare` began, and nothing but that
+/// attempt can stop the daemon. An attempt ends at its first stop or resume, when its hold of
+/// [`HANDOVER_HOLD_MS`] lapses (the gate then opens again by itself, so a daemon whose updater
+/// gave up between asking it to prepare and telling it to stop goes on starting sessions), or
+/// when a later `prepare` begins another. A stop names its attempt, and every decision is made
+/// under the lock the gate is under, so a stop that arrives late, after its update gave up and
+/// whatever came after, finds its attempt over and ends nothing; a daemon told to stop refuses to
+/// resume or to prepare, and one that has resumed refuses a stop, so an updater that sees a
+/// daemon resume knows no stop of any earlier attempt will end it.
 #[derive(Debug)]
 pub(super) struct Handover {
     gate: std::sync::Mutex<Gate>,
@@ -628,13 +631,26 @@ struct Gate {
     closed: Option<Closed>,
 }
 
-/// A closed gate.
+/// A closed gate, and the attempt it is closed for.
 #[derive(Debug)]
 struct Closed {
+    /// The identity of the attempt, made when it began: what a stop must name.
+    attempt: Uuid,
     /// The release the host is being updated to.
     target: ReleaseName,
-    /// When the gate opens again by itself.
+    /// When the attempt's hold lapses and the gate opens again by itself.
     until: std::time::Instant,
+}
+
+/// What a daemon that has been told to stop says to a step that would keep it.
+fn stopping() -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::EnvironmentUnavailable,
+        detail: "this control daemon has been told to stop for an update of this host, and is \
+                 stopping; the environment is served again once a daemon of the current release \
+                 starts"
+            .to_owned(),
+    }
 }
 
 impl Default for Handover {
@@ -697,39 +713,59 @@ impl Handover {
         Ok(UnderWay { handover: self })
     }
 
-    /// Closes the gate for `hold`, naming the release the host is being updated to.
-    pub(super) fn close(&self, target: &ReleaseName, hold: std::time::Duration) {
-        self.lock().closed = Some(Closed {
+    /// Begins an attempt: closes the gate for `hold` under a new identity, naming the release the
+    /// host is being updated to, and returns the identity. An attempt already open is over.
+    ///
+    /// # Errors
+    ///
+    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop.
+    pub(super) fn close(&self, target: &ReleaseName, hold: std::time::Duration) -> Result<Uuid> {
+        let mut gate = self.lock();
+        if *self.stopping.borrow() {
+            return Err(stopping());
+        }
+        let attempt = kr_ipc::new_uuid();
+        gate.closed = Some(Closed {
+            attempt,
             target: target.clone(),
             until: std::time::Instant::now() + hold,
         });
+        Ok(attempt)
     }
 
-    /// Opens the gate.
-    pub(super) fn open(&self) {
-        self.lock().closed = None;
+    /// Ends `attempt` and opens the gate, if it is still the attempt the gate is closed for.
+    pub(super) fn end(&self, attempt: Uuid) {
+        let mut gate = self.lock();
+        if gate
+            .closed
+            .as_ref()
+            .is_some_and(|closed| closed.attempt == attempt)
+        {
+            gate.closed = None;
+        }
     }
 
-    /// Opens the gate for an update that is not going ahead, unless this daemon has been told to
-    /// stop.
+    /// Ends the attempt named, or the open one when none is named, and opens the gate: the update
+    /// is not going ahead. Returns the attempt it ended, none when the one named is already over
+    /// or none was open.
     ///
     /// # Errors
     ///
     /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop: it is going, and the
     /// environment is served again by the daemon that starts after it.
-    pub(super) fn resume(&self) -> Result<()> {
+    pub(super) fn resume(&self, attempt: Option<Uuid>) -> Result<Option<Uuid>> {
         let mut gate = self.lock();
         if *self.stopping.borrow() {
-            return Err(ControllerError::Refused {
-                code: ErrorCode::EnvironmentUnavailable,
-                detail: "this control daemon has been told to stop for an update of this host, \
-                         and is stopping; the environment is served again once a daemon of the \
-                         current release starts"
-                    .to_owned(),
-            });
+            return Err(stopping());
         }
-        gate.closed = None;
-        Ok(())
+        match &gate.closed {
+            Some(closed) if attempt.is_none_or(|named| named == closed.attempt) => {
+                let ended = closed.attempt;
+                gate.closed = None;
+                Ok(Some(ended))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Waits up to `within` for every create under way to settle, and says how many have not.
@@ -749,23 +785,33 @@ impl Handover {
         }
     }
 
-    /// Tells this daemon to stop, when its gate is closed and has not lapsed.
+    /// Tells this daemon to stop, under the attempt it was prepared for, while that attempt is
+    /// the gate's and its hold has not lapsed. Asked again for the same attempt, it stops still.
     ///
     /// # Errors
     ///
-    /// `RESOURCE_UNAVAILABLE` when the gate is open: this daemon was not prepared, or its
-    /// preparation lapsed and it may have started sessions since.
-    pub(super) fn stop(&self) -> Result<()> {
+    /// `INVALID_ARGUMENT` when no attempt is named, and `RESOURCE_UNAVAILABLE` when the attempt
+    /// is not the one the gate is closed for: this daemon was not prepared, the preparation
+    /// lapsed and it may have started sessions since, or another attempt began or this one
+    /// ended.
+    pub(super) fn stop(&self, attempt: Option<Uuid>) -> Result<Uuid> {
+        let Some(attempt) = attempt else {
+            return Err(ControllerError::InvalidArgument(
+                "a stop names the attempt that prepare answered".to_owned(),
+            ));
+        };
         let gate = self.lock();
         match &gate.closed {
-            Some(closed) if std::time::Instant::now() < closed.until => {
+            Some(closed)
+                if closed.attempt == attempt && std::time::Instant::now() < closed.until =>
+            {
                 self.stopping.send_replace(true);
-                Ok(())
+                Ok(attempt)
             }
             _ => Err(ControllerError::Refused {
                 code: ErrorCode::ResourceUnavailable,
-                detail: "this control daemon's gate to new sessions is open: it was not \
-                         prepared for a handover, or the preparation lapsed; prepare it again"
+                detail: "this control daemon was not prepared for this handover, or the \
+                         preparation lapsed, or it is over; prepare it again"
                     .to_owned(),
             }),
         }
@@ -781,30 +827,32 @@ impl Handover {
 impl Controller {
     /// `host.update.handover`: makes way for another installed release, one step at a time.
     ///
-    /// `prepare` closes the gate to new sessions, waits for the creates under way to settle and
-    /// answers how this daemon was started; `stop` then tells the daemon to stop, and `resume`
-    /// opens the gate again instead. Every step answers the same way, so an updater that lost an
-    /// answer asks again rather than guessing.
+    /// `prepare` begins an attempt: it closes the gate to new sessions, waits for the creates
+    /// under way to settle and answers how this daemon was started and under which attempt;
+    /// `stop` then tells the daemon to stop under that attempt, and `resume` ends it instead. A
+    /// step for an attempt that is over changes nothing, so an updater that lost an answer asks
+    /// again rather than guessing.
     ///
     /// # Errors
     ///
     /// `RESOURCE_UNAVAILABLE` when the creates under way do not settle within
-    /// [`HANDOVER_SETTLE_MS`] (the gate opens again), or when `stop` finds the gate open;
-    /// `ENVIRONMENT_UNAVAILABLE` when `resume` comes after a `stop`.
+    /// [`HANDOVER_SETTLE_MS`] (the attempt ends and the gate opens again), or when `stop` names an
+    /// attempt that is not the gate's; `INVALID_ARGUMENT` when `stop` names none;
+    /// `ENVIRONMENT_UNAVAILABLE` when `prepare` or `resume` comes after a `stop`.
     pub(super) async fn update_handover(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let params: HostUpdateHandoverParams = parse(&mutation.params)?;
-        match params.step {
+        let attempt = match params.step {
             HandoverStep::Prepare => {
-                self.handover.close(
+                let attempt = self.handover.close(
                     &params.target,
                     std::time::Duration::from_millis(HANDOVER_HOLD_MS),
-                );
+                )?;
                 let unsettled = self
                     .handover
                     .settle(std::time::Duration::from_millis(HANDOVER_SETTLE_MS))
                     .await;
                 if unsettled > 0 {
-                    self.handover.open();
+                    self.handover.end(attempt);
                     return Err(ControllerError::Refused {
                         code: ErrorCode::ResourceUnavailable,
                         detail: format!(
@@ -816,11 +864,12 @@ impl Controller {
                         ),
                     });
                 }
+                Some(attempt)
             }
-            HandoverStep::Stop => self.handover.stop()?,
-            HandoverStep::Resume => self.handover.resume()?,
-        }
-        encode(&self.started_as()?)
+            HandoverStep::Stop => Some(self.handover.stop(params.attempt.0)?),
+            HandoverStep::Resume => self.handover.resume(params.attempt.0)?,
+        };
+        encode(&self.started_as(attempt)?)
     }
 
     /// Waits until a prepared handover has told this daemon to stop, which is when the process
@@ -829,8 +878,9 @@ impl Controller {
         self.handover.stopped().await;
     }
 
-    /// How this daemon was started: what a daemon of the release that replaces it is started with.
-    fn started_as(&self) -> Result<HostUpdateHandoverResult> {
+    /// How this daemon was started: what a daemon of the release that replaces it is started with,
+    /// and the attempt the answer is for.
+    fn started_as(&self, attempt: Option<Uuid>) -> Result<HostUpdateHandoverResult> {
         let arguments = std::env::args_os()
             .skip(1)
             .map(std::ffi::OsString::into_string)
@@ -853,6 +903,7 @@ impl Controller {
                 )
             })?;
         Ok(HostUpdateHandoverResult {
+            attempt: Nullable(attempt),
             release: Nullable(ReleaseName::new(self.release.clone()).ok()),
             pid: U64::new(u64::from(std::process::id())),
             arguments,
