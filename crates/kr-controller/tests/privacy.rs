@@ -1684,6 +1684,78 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
     environment.stop().await;
 }
 
+/// KR-REQ-24.14: a pin outlives the session it names. The session is closed through the daemon,
+/// and once the daemon reports it closed both doors still answer the pin; a rename of the closed
+/// session still clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_14_a_pin_outlives_the_session_closing() {
+    let environment = Environment::start().await;
+    let session_id = environment.worker.session_id;
+    let reader = environment
+        .device(reaching(&[ActionRight::SessionView]))
+        .await;
+    let pinned = environment.rename(Some("Release prep")).await;
+    assert_eq!(pinned.source, LabelSource::Pinned);
+
+    let mut client = environment.host.client().await;
+    let _: kr_protocol::session::SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            environment.worker.target(environment.environment_id()),
+            &kr_protocol::session::SessionCloseParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the session closes")
+        .to_typed()
+        .expect("decodes");
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let read: kr_protocol::session::SessionReadResult = client
+            .request(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the closed session is read")
+            .to_typed()
+            .expect("decodes");
+        if read.session.state == SessionState::Closed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never reported the session closed: {:?}",
+            read.session.state
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let local = environment.describe(session_id).await;
+    assert_eq!(
+        (local.title.as_str(), local.source),
+        ("Release prep", LabelSource::Pinned)
+    );
+    let described: SessionDescribeResult = reader
+        .read(
+            Method::SessionDescribe,
+            &SessionDescribeParams { session_id },
+        )
+        .await
+        .expect("described to a device");
+    assert_eq!(
+        (described.title.as_str(), described.source),
+        ("Release prep", LabelSource::Pinned)
+    );
+    let cleared = environment.rename(None).await;
+    assert_eq!(cleared.source, LabelSource::Metadata);
+    assert!(!cleared.pinned);
+    reader.close();
+    environment.stop().await;
+}
+
 /// A rename's answer, decoded.
 fn renamed(answer: ParamsValue) -> SessionRenameResult {
     answer.to_typed().expect("a rename's answer decodes")
