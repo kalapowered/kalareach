@@ -40,10 +40,10 @@ use crate::service::Controller;
 /// It answers a read with the state a test has put its session in, live to begin with, and
 /// accepts a close by saying the session is closing, as a worker does before it stops
 /// anything, with its own description of the session in the acceptance. It keeps the answer to
-/// each close as a worker's journal does, answers an exact retry from it and says so, and
-/// answers `action.read` from it. Told to go, it goes the way a worker that has finished its
-/// closure goes: at the next read it is sent, its endpoint stops accepting, and then the
-/// connection that read is waiting on ends unanswered.
+/// each close as a worker's journal does and answers an exact retry from it, saying so on a link
+/// that declared itself a proxy, as a worker does, and answers `action.read` from it. Told to go,
+/// it goes the way a worker that has finished its closure goes: at the next read it is sent, its
+/// endpoint stops accepting, and then the connection that read is waiting on ends unanswered.
 pub(super) struct Scripted {
     /// The state its session is in.
     state: std::sync::Mutex<SessionState>,
@@ -346,7 +346,12 @@ fn serve_scripted(
             tokio::spawn(async move {
                 let (mut reader, mut writer) = split(connection, StreamKind::Control);
                 let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                // Whether this connection declared itself a proxy for somebody else's actions.
+                let mut proxy = false;
                 while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                    if let ControlFrame::ControllerRole(role) = &frame {
+                        proxy = *role == kr_protocol::local::ControllerConnectionRole::Proxy;
+                    }
                     if let ControlFrame::GenerationToken(token) = &frame {
                         script
                             .generations
@@ -405,9 +410,10 @@ fn serve_scripted(
                                 outcome: Outcome::Ok(answer),
                             };
                             // A forwarded action this worker has answered before is answered
-                            // from what it kept, and the frame says so, as a journal's answer
-                            // does.
-                            vec![if kept {
+                            // from what it kept. The frame says so to a proxy, which forwards for
+                            // somebody whose receipts are not its own; the daemon's own link is
+                            // answered as a local caller's action always is.
+                            vec![if kept && proxy {
                                 ControlFrame::RetainedResponse(Box::new(response))
                             } else {
                                 ControlFrame::Response(response)
@@ -1173,6 +1179,58 @@ async fn a_worker_recorded_from_a_late_report_that_accepts_a_close_and_goes_is_a
     );
     assert!(answer.endpoint.0.is_none());
     assert!(answer.last_command_block.0.is_none());
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    assert!(!recorded(&world).await);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: a daemon that replaced the one a close went through, and admitted the session's
+/// worker without a description, settles the same close sent again at its own door as it settles
+/// one given now. The worker answers it from what it kept, on the daemon's own link, with the plain
+/// response it gives a local caller's action; once it stops answering, a read is answered closing
+/// from the description that answer carried, and a list includes the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_daemon_settles_a_close_sent_again_at_its_own_door_from_what_the_worker_kept()
+{
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.refuse_reads(true);
+    let world = restarted(world).await;
+    // The close went through the daemon this one replaced, and the worker kept the acceptance it
+    // gave.
+    let request = fake::close_request(world.environment_id, world.session_id);
+    let accepted = script.acceptance(world.session_id);
+    script.kept(
+        request.action_id,
+        ParamsValue::from_typed(&accepted).expect("encodes"),
+    );
+
+    let answered: SessionCloseResult = world
+        .controller
+        .session_close(
+            &request,
+            &world.actor,
+            Some(world.accepted),
+            fake::admission(&world.controller, world.accepted).await,
+        )
+        .await
+        .expect("the close sent again is answered")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        answered, accepted,
+        "the worker's kept acceptance goes on as it is"
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance the worker kept");
+    assert_eq!(Some(answer.session), accepted.session);
     assert_eq!(
         list(&world, false).await,
         vec![(world.session_id, SessionState::Closing)]
