@@ -2941,9 +2941,12 @@ Stated here rather than left to be discovered, because the gap between what a mo
 what it removes is exactly the thing a person cannot check for themselves.
 
 * **A session created while privacy mode is on learns the generation from the tick.** Its worker
-  is told about a second after it starts rather than before its shell runs, and its obligation is
-  written when the tick first sees it running, so output in that second may be retained until the
-  worker applies the generation and removes it.
+  is told on a tick after it starts rather than before its shell runs, and its obligation is
+  written when the tick first sees it running. A tick tells the workers that are due one after
+  another, each exchange with a timeout of its own, and a worker that does not answer is told again
+  on a schedule that doubles from one second to a minute. Output the session prints before its
+  worker has applied the generation may therefore be retained for as long as that takes, and is
+  removed when the worker applies it.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps. No description process runs on this host, so there is no
