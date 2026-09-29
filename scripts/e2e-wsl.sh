@@ -53,19 +53,21 @@ set -euo pipefail
 # is removed is the exact value that input holds, followed by the plain path the helper named below
 # its mirror. Every root the product derives on Linux lies inside one of those inputs, so an answer
 # outside every mirror, or one whose part below its mirror is not a plain path, stops the run
-# before anything is removed. Nothing is read back through a step that could change it unseen: the
-# probe is made in a directory whose name is a plain path, the helper's answer is taken as it
-# wrote it, a listing of names ends each one with a NUL byte, and a name read through a command
-# substitution keeps any newline at its end.
+# before anything is removed, and so does an input that is not an absolute path. Nothing is read
+# back through a step that could change it unseen: the probe is made in a directory whose name is a
+# plain path, the helper's answer is taken as it wrote it, a listing of names ends each one with a
+# NUL byte, and a name read through a command substitution keeps any newline at its end.
 #
 # **Which storage.** A directory that is not there was not inherited, and is left alone. A
 # directory that is there is removed only when the whole of it -- the directory and everything
 # under it -- is on the filesystem the image carries, which is the one the root of this
 # distribution is on. Anything else -- a symbolic link out to storage shared between
 # distributions, a mount of other storage at its top or at any directory inside it -- is not this
-# copy's to remove and not something a copy can be made independent of, so the run stops before it
-# removes anything and says which path it was. The test is by device, so a bind mount of another
-# directory of the same filesystem is not told apart from the directory it covers.
+# copy's to remove and not something a copy can be made independent of, so the run stops and says
+# which path it was. Both roots are measured before either is removed, so a refusal for one leaves
+# both alone, and a root that is the image itself, or holds it, is refused. The test is by device,
+# so a bind mount of another directory of the same filesystem is not told apart from the directory
+# it covers.
 #
 # The program runs inside the distribution. Its arguments are the installed helper, the root of the
 # image (`/` inside a distribution) and the directory its probe is made in. The self-test below runs
@@ -73,6 +75,9 @@ set -euo pipefail
 # shellcheck disable=SC2016  # the program is expanded where it runs, not here
 inherited_reset='
     set -e
+    # Bytes, not characters: every check below is about the exact bytes of a name.
+    LC_ALL=C
+    export LC_ALL
     helper="$1"
     image="$2"
     parent="$3"
@@ -93,16 +98,26 @@ inherited_reset='
         ;;
     esac
     probe="$(mktemp -d "$parent/kr-acc-probe.XXXXXX")"
+    trap "rm -rf \"\${probe:?}\"" EXIT
     # Each mirror is owner-only, because a mirror can become a root the product creates its files
     # in directly, and the product refuses a root anyone else can read.
     #
     # The real value of each input is held in a shell variable beside its mirror rather than in a
     # file of pairs. A path may carry a space, a tab or a trailing blank, and a line of text read
-    # back as two fields would not return the value the product was given.
+    # back as two fields would not return the value the product was given. An input that is not an
+    # absolute path leads wherever the directory this program runs in leads, which is not a place
+    # the product was configured to use, so it stops the run.
     index=0
     for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
       eval "value=\${$name-}"
       [ -n "$value" ] || continue
+      case "$value" in
+        /*) ;;
+        *)
+          echo "$name holds $value, which is not an absolute path" >&2
+          exit 1
+          ;;
+      esac
       index=$((index + 1))
       mkdir -m 0700 "$probe/$index"
       eval "configured_$index=\$value"
@@ -130,6 +145,10 @@ inherited_reset='
       exit 1
     }
     image_device="$(stat -c %d "$image")"
+    image_real="$(readlink -m "$image" && printf x)"
+    image_real="${image_real%?x}"
+    # Both roots are measured before either is removed, so a refusal for one leaves both alone.
+    count=0
     for named in "${token%/*}" "${marker%/*}"; do
       # What is removed is the exact value an input holds, followed by the plain path the helper
       # named below the mirror of that input. A path outside every mirror, or one whose part below
@@ -175,10 +194,21 @@ inherited_reset='
       # in one, so an x follows the answer and only the newline readlink adds is taken off with it.
       resolved="$(readlink -m "$real" && printf x)"
       resolved="${resolved%?x}"
+      count=$((count + 1))
+      eval "real_$count=\$real"
+      eval "resolved_$count=\$resolved"
       if [ ! -e "$resolved" ]; then
         echo "  nothing of the product at $real"
         continue
       fi
+      # A root that is the image itself, or holds it, would take the image with it.
+      top="${resolved%/}"
+      case "$image_real/" in
+        "$top"/*)
+          echo "$real leads to $resolved, which is the image itself or holds it" >&2
+          exit 1
+          ;;
+      esac
       device="$(stat -c %d "$resolved")"
       [ "$device" = "$image_device" ] || {
         echo "$real leads to $resolved, which is on storage this image does not carry and may be \
@@ -187,7 +217,6 @@ shared with the distribution this one was copied from" >&2
       }
       # The whole tree, not only its top: a directory inside it can mount storage of its own, and
       # a removal that walked into one would take something this image does not carry with it.
-      # Nothing is removed until the walk below has found none.
       #
       # One walk writes two listings in the same order: the device of each entry on a line of its
       # own, which holds only digits, and the name of each entry ended by a NUL byte, which no
@@ -205,12 +234,19 @@ shared with the distribution this one was copied from" >&2
 shared with the distribution this one was copied from" >&2
         exit 1
       }
-      # The same boundary again while removing, so this cannot leave the filesystem it measured
-      # even if something is mounted between the two walks.
+    done
+    # Nothing has been removed until here. Each root is removed within the filesystem it was
+    # measured on, so this cannot leave it even if something is mounted after the walk above.
+    n=0
+    while [ "$n" -lt "$count" ]; do
+      n=$((n + 1))
+      eval "real=\$real_$n"
+      eval "resolved=\$resolved_$n"
+      # A root inside the one before it was taken with it.
+      [ -e "$resolved" ] || continue
       find "$resolved" -xdev -depth -delete
       echo "  removed the inherited $real"
     done
-    rm -rf "${probe:?}"
 '
 
 # The self-test runs the program above on this host, against trees of its own, and checks what it
@@ -230,15 +266,16 @@ self_test_cleanup() {
   fi
 }
 
-# Runs the removal for one case, with the image and the probe directory it names and the environment
-# it gives. TMPDIR names the probe directory too, so whatever the helper or a tool makes in a
-# temporary directory stays in the case's tree.
+# Runs the removal for one case, from the case's own directory, with the image and the probe
+# directory it names and the environment it gives. TMPDIR names the probe directory too, so
+# whatever the helper or a tool makes in a temporary directory stays in the case's tree, and a path
+# that is not absolute can only lead into it.
 self_test_reset() {
   local directory="$1" image="$2" parent="$3"
   shift 3
   mkdir -p "$directory" "$parent" &&
-    env -i PATH="$PATH" TMPDIR="$parent" "$@" \
-      /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$image" "$parent" \
+    (cd "$directory" && env -i PATH="$PATH" TMPDIR="$parent" "$@" \
+      /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$image" "$parent") \
       >"$directory/said" 2>&1
 }
 
@@ -327,16 +364,46 @@ self_test_unmirrored_root() {
 }
 
 # A root that is the whole of HOME is refused, and nothing in HOME is removed. The product keeps its
-# roots below a home directory, so removing the home itself would take everything else with it.
+# roots below a home directory, so removing the home itself would take everything else with it. The
+# runtime root beside it is an ordinary one that exists, and it is left alone too: both roots are
+# measured before either is removed, so a refusal for one removes nothing for the other.
 self_test_whole_home() {
   local d="$self_test_work/${FUNCNAME[0]}"
-  mkdir -p "$d/home" || return 1
+  mkdir -p "$d/home" "$d/run" || return 1
   printf x >"$d/home/kept" || return 1
+  printf x >"$d/run/kept" || return 1
   if self_test_reset "$d" "$self_test_work" "$d/tmp" \
     HOME="$d/home" KR_RUNTIME_DIR="$d/run" STAND_IN_STATE_IN_HOME=1; then
     return 1
   fi
-  grep -q -F -e "the helper named the whole of HOME" "$d/said" && [ -f "$d/home/kept" ]
+  grep -q -F -e "the helper named the whole of HOME" "$d/said" &&
+    [ -f "$d/home/kept" ] && [ -f "$d/run/kept" ]
+}
+
+# An input that is not an absolute path is refused, and nothing is removed. Read from where the
+# removal runs, the path would lead into a directory the product was never configured to use.
+self_test_relative_input() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/home/.local/state/kalareach" || return 1
+  printf x >"$d/home/.local/state/kalareach/registry" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" HOME=home KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "HOME holds home, which is not an absolute path" "$d/said" &&
+    [ -f "$d/home/.local/state/kalareach/registry" ]
+}
+
+# A root that is the image itself is refused, and nothing is removed. This case has an image of its
+# own, so that the removal it must not make would take nothing but this case with it.
+self_test_image_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/image/sessions" || return 1
+  printf x >"$d/image/sessions/one" || return 1
+  if self_test_reset "$d" "$d/image" "$d/tmp" KR_STATE_DIR="$d/image" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "which is the image itself or holds it" "$d/said" &&
+    [ -f "$d/image/sessions/one" ]
 }
 
 # A root that is a link is resolved: what it leads to is removed, and the link is left.
@@ -501,7 +568,11 @@ STAND_IN
   self_test_case self_test_unmirrored_root \
     "a root named outside every mirrored directory is refused, and nothing is removed"
   self_test_case self_test_whole_home \
-    "a root that is the whole of HOME is refused, and nothing in HOME is removed"
+    "a root that is the whole of HOME is refused, and a refusal for one root removes nothing for the other"
+  self_test_case self_test_relative_input \
+    "an input that is not an absolute path is refused, and nothing is removed"
+  self_test_case self_test_image_root \
+    "a root that is the image itself is refused, and nothing is removed"
   self_test_case self_test_link_root \
     "a root that is a link is resolved, and what it leads to is removed"
   self_test_case self_test_other_storage \

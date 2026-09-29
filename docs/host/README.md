@@ -1477,11 +1477,13 @@ them.
 
 `scripts/e2e-wsl.sh --self-test` checks that removal on any Linux host, against trees of its own.
 An installation is removed whole and nothing beside it is touched, and a name that holds a newline,
-or a root whose own name ends in one, is handled as the name it is. The removal is refused before
-anything goes when the helper names a root outside the directories the run mirrored, when a root
-leads to storage the image does not carry, and when a root holds a mount of such storage. The mount
-needs a namespace of the self-test's own, which root has and a user namespace gives. Where the host
-allows neither, the self-test says that case was not run rather than passing it.
+or a root whose own name ends in one, is handled as the name it is. Both roots are measured before
+either is removed, so a refusal for one leaves both alone. The removal is refused when an input is
+not an absolute path, when the helper names a root outside the directories the run mirrored or the
+whole of a home or XDG directory, when a root is the image itself or holds it, when a root leads to
+storage the image does not carry, and when a root holds a mount of such storage. The mount needs a
+namespace of the self-test's own, which root has and a user namespace gives. Where the host allows
+neither, the self-test says that case was not run rather than passing it.
 
 ## Who may type
 
