@@ -38,7 +38,7 @@ use kr_protocol::limits::{
     MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN, MAX_MUTATION_TTL, MAX_OUTSTANDING_MUTATIONS,
     MAX_REMOTE_DISPATCH_LEASE, MAX_SEND_QUEUE_BYTES,
 };
-use kr_protocol::local::LocalClientKind;
+use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{ReceiptState, RejectionReason};
 use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, U64, Uuid};
@@ -200,9 +200,29 @@ async fn cli(host: &Host) -> LocalClient {
 }
 
 async fn controller_client(host: &Host) -> LocalClient {
+    controller_client_declaring(host, None).await
+}
+
+/// A connection of the control daemon's that declares `role` before it presents its generation, or
+/// declares none, as the daemon's own authority connection does.
+async fn controller_client_declaring(
+    host: &Host,
+    role: Option<ControllerConnectionRole>,
+) -> LocalClient {
     let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
         .await
         .expect("connects");
+    if let Some(role) = role {
+        client
+            .writer()
+            .write_message(&ControlFrame::ControllerRole(role))
+            .await
+            .expect("declares the role");
+        match client.recv().await.expect("the worker answers") {
+            ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
     let identity = Arc::clone(&host.controller);
     let boot = host.boot.clone();
     client
@@ -274,6 +294,24 @@ async fn send_frame(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
     loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) => return response.outcome,
+            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
+}
+
+/// The frame that answers `frame`, whichever kind of response it is.
+async fn answer_to(client: &mut LocalClient, frame: ControlFrame) -> ControlFrame {
+    client
+        .writer()
+        .write_message(&frame)
+        .await
+        .expect("writes the frame");
+    loop {
+        match client.recv().await.expect("the worker answers") {
+            answer @ (ControlFrame::Response(_) | ControlFrame::RetainedResponse(_)) => {
+                return answer;
+            }
             ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
             other => panic!("the worker answered {other:?}"),
         }
@@ -1023,6 +1061,68 @@ async fn a_close_is_accepted_with_the_sessions_own_description_and_a_retry_retur
         again, accepted,
         "an exact retry is answered with the acceptance the journal kept, its description included"
     );
+}
+
+/// KR-REQ-23.24: an action a worker answers from its journal is marked as retained only on a link
+/// that declared itself a proxy. A proxy forwards for somebody whose receipts are not its own, and
+/// the daemon's own link carries a local caller's action, which is answered the way it always was:
+/// with the plain response, whether the answer is fresh or from the journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_declared_itself_a_proxy()
+ {
+    let host = host().await;
+    let mut authority = controller_client(&host).await;
+    let mut proxy = controller_client_declaring(&host, Some(ControllerConnectionRole::Proxy)).await;
+    let mutation = close_mutation(
+        &authority,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let forwarded = || {
+        ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+            mutation: mutation.clone(),
+            actor: kr_protocol::actor::ActorEnvelope {
+                actor_id: actor("local:501"),
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: Nullable::null(),
+                grant_id: Nullable::null(),
+                grant_revision: Nullable::null(),
+                controller_generation: ControllerGeneration::new(1),
+                connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+            },
+            // A local caller acts under no grant, so there are no rights to narrow it by.
+            grant_rights: kr_protocol::scalars::CanonicalSet::new(),
+            accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
+        }))
+    };
+
+    let ControlFrame::Response(fresh) = answer_to(&mut authority, forwarded()).await else {
+        panic!("a fresh answer is a plain response");
+    };
+    let Outcome::Ok(accepted) = fresh.outcome else {
+        panic!("the close is accepted");
+    };
+    let ControlFrame::Response(again) = answer_to(&mut authority, forwarded()).await else {
+        panic!("the daemon's own link is answered with the plain response from the journal too");
+    };
+    assert_eq!(again.outcome, Outcome::Ok(accepted.clone()));
+    let ControlFrame::RetainedResponse(retained) = answer_to(&mut proxy, forwarded()).await else {
+        panic!("a proxy is told that the answer came from the journal");
+    };
+    assert_eq!(retained.outcome, Outcome::Ok(accepted));
+
+    // The acceptance is delivered and the closure runs to its end, so the host stops cleanly.
+    authority
+        .confirm_delivery(mutation.action_id)
+        .await
+        .expect("the delivery is confirmed");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        host.service.runtime().wait_closed(),
+    )
+    .await
+    .expect("the closure finishes");
 }
 
 /// The member `name` of a map-shaped answer, where it has one.
