@@ -151,8 +151,10 @@ shell packages, and every file with its length, SHA-256 digest and whether it is
 
 A release is taken in only whole and checked:
 
-- The archive is refused at the first entry that is a link, a device or anything but a file or a
-  directory, whose path is absolute or climbs out of the top directory, or that repeats a file.
+- The archive is refused at the first entry that is a link, a device, a sparse file or anything
+  but a file or a directory, whose path is absolute or climbs out of the top directory, or that
+  repeats a file. A file is written whole: an archiver that leaves the holes of a sparse file out
+  writes an archive this host does not take.
 - The manifest is signed by a threshold of the release keys the update channel's root names for its
   targets role. The root the host trusts is the one the current release carries, at
   `share/update-root.json`; a release carries that root or the one that follows it, the next

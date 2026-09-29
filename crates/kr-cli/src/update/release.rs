@@ -334,11 +334,24 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
         if kind.is_pax_global_extensions() {
             continue;
         }
-        if !kind.is_file() && !kind.is_dir() {
+        // A sparse entry is a file written with its holes left out, which the tar crate's builder
+        // does of a file that has some, on the systems that say so. It is refused, and said to
+        // be, rather than read as the link or device it is not: a release archive has every file
+        // whole.
+        if kind.is_gnu_sparse() {
             return Err(refused_archive(
                 archive,
-                "has an entry that is neither a file nor a directory, such as a link or a device",
+                "has a sparse entry, which a release's archive does not use: write every file \
+                 whole",
             ));
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(CliError::Other(shown!(
+                "the archive {} is not a release this host installs: it has an entry of type {} \
+                 that is neither a file nor a directory, such as a link or a device",
+                Shown::root(archive),
+                u32::from(kind.as_byte())
+            )));
         }
         let path = entry.path().map_err(|error| unreadable(&error))?;
         let (entry_top, relative) = split_entry(&path).ok_or_else(|| {

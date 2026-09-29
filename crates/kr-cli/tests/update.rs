@@ -379,6 +379,9 @@ fn pack(tree: &Path, top: &str, archive: &Path) {
     let file = std::fs::File::create(archive).expect("an archive");
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);
+    // Every file whole, as a release archive has them: the builder writes a file that has holes as
+    // a sparse entry, which some file systems make of a copied program, and which is refused.
+    builder.sparse(false);
     builder.append_dir_all(top, tree).expect("packs the tree");
     builder
         .into_inner()
@@ -2394,6 +2397,78 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
             "nothing was written outside the staging directory"
         );
     }
+    // The refusal says what the entry was.
+    let archive = scratch.path().join("link.tar.gz");
+    let said = kr_cli::update::release::unpack(&archive, &staging("link-said"))
+        .expect_err("a link is refused")
+        .to_string();
+    assert!(said.contains("an entry of type"), "{said}");
+}
+
+/// KR-REQ-26.09: a file with holes, which the tar crate's builder writes as a sparse entry on the
+/// systems that report holes, is refused, and said to be a sparse entry, not taken for a link or a
+/// device; the same tree written with every file whole is taken.
+#[test]
+fn a_sparse_entry_is_refused_as_one() {
+    use std::os::unix::fs::{DirBuilderExt as _, FileExt as _};
+
+    let scratch = tempfile::tempdir().expect("a directory");
+    let tree = scratch.path().join("release");
+    std::fs::create_dir_all(tree.join("bin")).expect("a tree");
+    let file = std::fs::File::create(tree.join("bin/kr")).expect("a file");
+    file.set_len(4 << 20).expect("a file with a hole in it");
+    file.write_all_at(b"data", 2 << 20)
+        .expect("data in the middle");
+    drop(file);
+    let write = |name: &str, sparse: bool| {
+        let path = scratch.path().join(name);
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).expect("an archive"),
+            flate2::Compression::fast(),
+        ));
+        builder.sparse(sparse);
+        builder.append_dir_all("release", &tree).expect("packs");
+        builder
+            .into_inner()
+            .and_then(flate2::write::GzEncoder::finish)
+            .expect("written");
+        path
+    };
+    let staging = |name: &str| {
+        let path = scratch.path().join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("a staging directory");
+        path
+    };
+    // The control: written whole, it unpacks, holes and all.
+    let whole = write("whole.tar.gz", false);
+    let (unpacked, written) = kr_cli::update::release::unpack(&whole, &staging("whole"))
+        .unwrap_or_else(|error| panic!("a whole file unpacks: {error}"));
+    assert!(unpacked.join("bin/kr").is_file());
+    assert_eq!(
+        written.get("bin/kr").map(|(length, _)| *length),
+        Some(4 << 20)
+    );
+    // Written the way the builder does by default, it is a sparse entry where the system reports
+    // holes, and is refused as one; where it does not, there is nothing sparse to refuse.
+    let sparse = write("sparse.tar.gz", true);
+    let is_sparse = tar::Archive::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(&sparse).expect("reads"),
+    ))
+    .entries()
+    .expect("entries")
+    .flatten()
+    .any(|entry| entry.header().entry_type().is_gnu_sparse());
+    if !is_sparse {
+        eprintln!("this system reports no holes in a file, so the builder wrote none");
+        return;
+    }
+    let said = kr_cli::update::release::unpack(&sparse, &staging("sparse"))
+        .expect_err("a sparse entry is refused")
+        .to_string();
+    assert!(said.contains("a sparse entry"), "{said}");
 }
 
 /// KR-REQ-26.09: what was written is checked against the manifest: every listed file with its
