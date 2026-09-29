@@ -42,7 +42,7 @@ use kr_worker::session::{Session, SessionConfig};
 mod common;
 
 #[cfg(unix)]
-use common::{carries, produced, retained};
+use common::{LIVENESS_DEADLINE, carried_times, carries, produced, retained};
 
 // ---------------------------------------------------------------------------------------------
 // The harness
@@ -2631,6 +2631,20 @@ struct EarlierHistoryGap {
 // KR-ACC-028: a full journal during native traffic
 // ---------------------------------------------------------------------------------------------
 
+/// The application these tests drive: it answers each line it reads with `kr-got:` and the line,
+/// and says `kr-interrupted.` when the interrupt reaches it.
+///
+/// It empties its field separator once, for the whole script, and not for each `read` with
+/// `IFS= read`. macOS's `/bin/sh` is bash 3.2, which runs the trap for a signal that reaches it
+/// while `read` waits inside that `read`, and frees the `read`'s temporary assignment when the
+/// trap's command ends. The `read` then splits the next line it is given on memory it no longer
+/// owns, and drops the line's last character whenever that memory happens to hold it. An
+/// assignment for the whole script is never freed.
+#[cfg(unix)]
+const READING_APPLICATION: &str = "stty -echo; IFS=; trap 'printf \"kr-interrupted.\\n\"' INT; \
+     printf 'kr-ready.\\n'; \
+     while :; do if read -r line; then printf 'kr-got:%s\\n' \"$line\"; fi; done";
+
 /// KR-REQ-07.57: with the journal full, raw input and the interrupt under the live lease keep
 /// working, while a typed mutation and an approval are refused with `STORAGE_UNAVAILABLE` before
 /// anything is dispatched, leaving nothing behind to be retried.
@@ -2651,11 +2665,7 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // decision are refused before anything is dispatched, and nothing is left behind for a replay
     // to find. Then the store is given room again and recovers, and nothing the fence refused is
     // dispatched afterwards: what was refused stays refused until it is asked for again.
-    let host = host_running(
-        "stty -echo; trap 'printf \"kr-interrupted.\\n\"' INT; printf 'kr-ready.\\n'; \
-         while :; do if IFS= read -r line; then printf 'kr-got:%s\\n' \"$line\"; fi; done",
-    )
-    .await;
+    let host = host_running(READING_APPLICATION).await;
     produced(&host.runtime, b"kr-ready.").await;
     let mut client = cli(&host).await;
     // A decision is pending, asked by an agent in this session while the store was working.
@@ -2959,6 +2969,140 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .expect("the terminal takes input after the recovery");
     assert_eq!(written.sequence.get(), 4);
     produced(&host.runtime, b"kr-got:kr-typed-4").await;
+}
+
+/// The application the test above drives, which KR-REQ-07.57's raw input and interrupt are shown
+/// on, answers a line typed right after an interrupt whole, whatever character ends the line.
+///
+/// Each printable character ends one such line. The last character of a line is the one an
+/// application that splits its input on the wrong set of characters drops, so the one line the test
+/// above types finds a lost character one time in many, and these find it whenever there is one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_character_typed_after_an_interrupt_reaches_the_application() {
+    let host = host_running(READING_APPLICATION).await;
+    produced(&host.runtime, b"kr-ready.").await;
+    let mut client = cli(&host).await;
+    let attachment: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("attaches");
+    let lease: kr_protocol::input::InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("acquires the lease");
+
+    for (index, character) in (b'!'..=b'~').enumerate() {
+        // The interrupt has reached the application, which is what the next line is typed after.
+        interrupt_until_said(&host, &mut client, &attachment, &lease, index + 1).await;
+        let line = format!("L{index:02}{}", char::from(character));
+        let _: kr_protocol::input::InputWriteResult = client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: host.session_id,
+                    attachment_id: attachment.attachment.attachment_id,
+                    epoch: lease.lease.epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(index as u64),
+                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .map(|value| value.to_typed().expect("decodes"))
+            .expect("the terminal takes input after an interrupt");
+        assert_eq!(
+            answer_beginning(&host.runtime, &format!("kr-got:L{index:02}")).await,
+            format!("kr-got:{line}"),
+            "the application got the line typed after interrupt {index} whole"
+        );
+    }
+}
+
+/// Interrupts the application until it has said it was interrupted `times` times in all.
+///
+/// A shell runs a trap for a signal that reaches it while it waits for input, but not for one that
+/// reaches it in the moment between an answer and its next wait: that one is run when the wait ends,
+/// which is when the next line arrives. So an interrupt the application has not said it took within
+/// a moment is sent again, and the count only has to be reached.
+#[cfg(unix)]
+async fn interrupt_until_said(
+    host: &Host,
+    client: &mut LocalClient,
+    attachment: &kr_protocol::attachment::SessionAttachResult,
+    lease: &kr_protocol::input::InputAcquireResult,
+    times: usize,
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let _: kr_protocol::input::InputLeaseResult = client
+            .mutate(
+                Method::InputInterrupt,
+                ActionId::new(kr_ipc::new_uuid()),
+                target(host),
+                &kr_protocol::input::InputInterruptParams {
+                    session_id: host.session_id,
+                    attachment_id: attachment.attachment.attachment_id,
+                    epoch: lease.lease.epoch,
+                    action: kr_protocol::input::InterruptAction::NativeInterrupt,
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .map(|value| value.to_typed().expect("decodes"))
+            .expect("takes the interrupt");
+        for _ in 0..25 {
+            if carried_times(&retained(&host.runtime), b"kr-interrupted.") >= times {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the application to say it was interrupted {times} times",
+            started.elapsed()
+        );
+    }
+}
+
+/// Waits until the session's retained output carries a whole line that begins with `prefix`, and
+/// returns that line without its ending.
+#[cfg(unix)]
+async fn answer_beginning(runtime: &SessionRuntime, prefix: &str) -> String {
+    let started = tokio::time::Instant::now();
+    loop {
+        let seen = retained(runtime);
+        let text = String::from_utf8_lossy(&seen);
+        if let Some(start) = text.find(prefix)
+            && let Some(length) = text[start..].find("\r\n")
+        {
+            return text[start..start + length].to_owned();
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for a line beginning {prefix:?} in the session's retained output",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// KR-REQ-07.57: with the journal unreadable, the interrupt and the close still work, the close
