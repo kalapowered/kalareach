@@ -13,11 +13,17 @@
  * three together is what a fence rests on.
  */
 
+/* The lookup of a loaded module's file is behind this on glibc. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include "zle.mdh"
 
 #include "kr_bridge.h"
 #include "kr_bridge_zle.h"
 
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
@@ -373,6 +379,124 @@ kr_shell_unexport(const char *name)
 {
     /* The shell's own parameter goes with the environment entry, so a child inherits neither. */
     unsetparam((char *)name);
+}
+
+/* The name a module states its setup function under. Configure decides it: some platforms prefix
+ * every symbol, and some cannot give two modules the same names for their entry points. */
+static char *
+kr_setup_symbol(const char *module_name)
+{
+    size_t room = strlen(module_name) * 2 + 16;
+    char *symbol = malloc(room);
+    char *q;
+    const char *p;
+
+    if (symbol == NULL) {
+        return NULL;
+    }
+    q = symbol;
+#ifdef DLSYM_NEEDS_UNDERSCORE
+    *q++ = '_';
+#endif
+    memcpy(q, "setup_", 6);
+    q += 6;
+#ifndef DYNAMIC_NAME_CLASH_OK
+    for (p = module_name; *p; p++) {
+        if (*p == '/') {
+            *q++ = 'Q';
+            *q++ = 's';
+        } else if (*p == '_') {
+            *q++ = 'Q';
+            *q++ = 'u';
+        } else if (*p == 'Q') {
+            *q++ = 'Q';
+            *q++ = 'q';
+        } else {
+            *q++ = *p;
+        }
+    }
+#else
+    (void)p;
+#endif
+    *q = '\0';
+    return symbol;
+}
+
+void
+kr_shell_free_modules(kr_loaded_module *modules, size_t count)
+{
+    size_t i;
+
+    for (i = 0; modules != NULL && i < count; i++) {
+        free(modules[i].name);
+        free(modules[i].path);
+    }
+    free(modules);
+}
+
+int
+kr_shell_loaded_modules(kr_loaded_module **out, size_t *count)
+{
+    kr_loaded_module *list;
+    size_t capacity = 0;
+    size_t made = 0;
+    int slot;
+
+    *out = NULL;
+    *count = 0;
+    if (modulestab == NULL) {
+        return 1;
+    }
+    for (slot = 0; slot < modulestab->hsize; slot++) {
+        Module module;
+
+        for (module = (Module)modulestab->nodes[slot]; module != NULL;
+             module = (Module)module->node.next) {
+            capacity++;
+        }
+    }
+    list = calloc(capacity > 0 ? capacity : 1, sizeof(*list));
+    if (list == NULL) {
+        return 0;
+    }
+    for (slot = 0; slot < modulestab->hsize; slot++) {
+        Module module;
+
+        for (module = (Module)modulestab->nodes[slot]; module != NULL;
+             module = (Module)module->node.next) {
+            char *symbol;
+            void *setup;
+            Dl_info where;
+
+            /* An alias and a module linked into the shell have no file. */
+            if ((module->node.flags & (MOD_ALIAS | MOD_LINKED)) || module->u.handle == NULL) {
+                continue;
+            }
+            symbol = kr_setup_symbol(module->node.nam);
+            setup = symbol != NULL ? dlsym(module->u.handle, symbol) : NULL;
+            free(symbol);
+            list[made].handle = module->u.handle;
+            list[made].name = strdup(unmeta(module->node.nam));
+            if (list[made].name == NULL) {
+                kr_shell_free_modules(list, made);
+                return 0;
+            }
+            /* The address of that function says which file the loader took the module from. */
+            if (setup != NULL && dladdr(setup, &where) && where.dli_fname != NULL) {
+                list[made].path = strdup(where.dli_fname);
+                list[made].header = where.dli_fbase;
+                if (list[made].path == NULL) {
+                    free(list[made].name);
+                    kr_shell_free_modules(list, made);
+                    return 0;
+                }
+            }
+            made++;
+        }
+    }
+    *out = list;
+    *count = made;
+    return 1;
 }
 
 /*
