@@ -1368,6 +1368,137 @@ async fn the_default_context_is_the_hosts_own_and_the_receipt_records_what_was_u
     daemon.stop().await;
 }
 
+/// KR-REQ-08.41: a session the daemon creates through a real worker reads the worker's private
+/// terminfo database, keeps the creator's own directories behind it, and the worker's diagnostics
+/// say which database it selected and what it kept.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says_so() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+
+    // A shell that says what its terminfo library reads, once, and then waits.
+    let seen = host.temp.root().join("terminfo-seen.txt");
+    let shell = host.temp.root().join("terminfo-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n\
+             {{\n\
+             echo \"TERMINFO=$TERMINFO\"\n\
+             echo \"TERMINFO_DIRS=$TERMINFO_DIRS\"\n\
+             echo \"file=$(infocmp -x xterm-256color | head -n 1)\"\n\
+             if tput -T xterm-256color Tc >/dev/null 2>&1; then echo tc=yes; else echo tc=no; fi\n\
+             }} > '{seen}.part' && mv '{seen}.part' '{seen}'\n\
+             exec cat\n",
+            seen = seen.display()
+        ),
+    )
+    .expect("a shell script");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700))
+        .expect("an executable shell");
+
+    let mut params = create_params(
+        host.environment_id,
+        host.temp.root(),
+        Presentation::Invisible,
+        WorkerProfile::HeadlessUser,
+    );
+    params.shell = Nullable::some(shell.display().to_string());
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "TERMINFO".to_owned(),
+            value: "/creators/own/terminfo".to_owned(),
+        });
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "TERMINFO_DIRS".to_owned(),
+            value: "/creators/more".to_owned(),
+        });
+    let created: SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .unwrap_or_else(|error| panic!("the create failed: {error}"))
+        .to_typed()
+        .expect("decodes");
+
+    // The shell writes its file once, when it starts: waiting for it is waiting for a condition.
+    let started = std::time::Instant::now();
+    let text = loop {
+        if let Ok(text) = std::fs::read_to_string(&seen) {
+            break text;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "waited {:?} for the shell to say what it reads",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {text:?}"))
+            .to_owned()
+    };
+    let private_root = host.paths().state_dir().join("terminfo");
+    let private = value("TERMINFO=");
+    assert!(
+        Path::new(&private).starts_with(&private_root),
+        "TERMINFO names a directory in the worker's state directory: {private}"
+    );
+    assert_eq!(
+        value("TERMINFO_DIRS="),
+        "/creators/own/terminfo:/creators/more",
+        "the creator's own directories follow the private one, in the order they had"
+    );
+    assert!(
+        value("file=").contains(&format!("from file: {private}/")),
+        "the library read xterm-256color from the private database: {text:?}"
+    );
+    assert_eq!(
+        value("tc="),
+        "yes",
+        "the private entry has the truecolour flag"
+    );
+
+    // The worker's own log, which is the job's diagnostics file, says the same.
+    let diagnostics = std::fs::read_dir(host.paths().jobs_dir())
+        .expect("the jobs directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "diagnostics")
+        })
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line = diagnostics
+        .lines()
+        .find(|line| line.contains("terminfo: private database"))
+        .unwrap_or_else(|| {
+            panic!("the worker's diagnostics say nothing of terminfo: {diagnostics:?}")
+        });
+    assert!(line.contains(&private), "{line}");
+    assert!(line.contains("TERMINFO=/creators/own/terminfo"), "{line}");
+    assert!(line.contains("TERMINFO_DIRS=/creators/more"), "{line}");
+    assert!(line.contains("follow it"), "{line}");
+
+    close(&mut client, &host, created.session.session_id).await;
+    daemon.stop().await;
+}
+
 /// Returns whether one entry of a method's authority is the automation right.
 fn requires_automation(required: &kr_protocol::authority::RequiredRight) -> bool {
     matches!(
