@@ -174,6 +174,15 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
         return Ok(Vec::new());
     }
     let database = environment.paths.registry_database();
+    // What a daemon that ended by a signal left in its log is taken into the file first, as its own
+    // clean stop would have: the environment's lock is held, so nothing writes meanwhile.
+    Registry::take_in_its_log(&database).map_err(|error| {
+        CliError::Other(shown!(
+            "environment {}'s registry could not be read: {}",
+            environment.environment_id,
+            Shown::protocol(&error.to_protocol_error())
+        ))
+    })?;
     let (spawned, running, workers) = {
         let registry =
             Registry::open_to_read(&database, environment.environment_id).map_err(|error| {
@@ -259,7 +268,8 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
 ///
 /// Only its being there is looked at: the reader ([`Registry::open_to_read`]) refuses one that is
 /// not a regular file, and one that is a link, before it opens anything, so a pipe there holds
-/// nothing up, and reads it as it is, with nothing made beside it.
+/// nothing up, and reads it as it is, with nothing made beside it, once a log that a daemon ended
+/// by a signal left has been taken in ([`Registry::take_in_its_log`]).
 ///
 /// # Errors
 ///
