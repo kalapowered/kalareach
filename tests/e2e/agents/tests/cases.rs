@@ -1163,10 +1163,11 @@ fn staged(
                         said.starts_with(ENVIRONMENT_NOT_READ)
                             .then_some((0, Failure::EnvironmentNotRead))
                     });
-                let mut failures = if class.is_none() {
-                    vec![Failure::PartFailed]
-                } else {
-                    Vec::new()
+                // The part's own code goes with the classes of what stopped the agent.
+                let mut failures = match (&not_run, class) {
+                    (Some((_, failure)), _) => vec![failure.clone()],
+                    (None, None) => vec![Failure::PartFailed],
+                    (None, Some(_)) => Vec::new(),
                 };
                 failures.extend(stop_failures(&stop));
                 let outcome = match not_run {
@@ -1944,12 +1945,20 @@ impl Logged {
             Self::reach_composer(stage, variables, what, part, extra, ready)
         }))
         .unwrap_or_else(|panic| {
-            // A session that ran something other than the build, or whose exported names refuse
-            // or could not be read, says so and is not a login that cannot be established.
+            // A session that ran something other than the build, whose exported names refuse or
+            // could not be read, or in which a file of the person's changed or the agent's
+            // isolation could not be shown, says so, and is not a login that cannot be
+            // established.
             let said = panic_text(&*panic);
-            if [NOT_PINNED, ENVIRONMENT_NOT_CLEAR, ENVIRONMENT_NOT_READ]
-                .iter()
-                .any(|prefix| said.starts_with(prefix))
+            if [
+                NOT_PINNED,
+                ENVIRONMENT_NOT_CLEAR,
+                ENVIRONMENT_NOT_READ,
+                GUARD_CHANGED,
+                ISOLATION_UNPROVEN,
+            ]
+            .iter()
+            .any(|prefix| said.starts_with(prefix))
             {
                 std::panic::resume_unwind(panic);
             }

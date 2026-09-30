@@ -43,8 +43,8 @@ use crate::stage::AgentProcess;
 pub const NOT_PINNED: &str = "not the pinned build:";
 
 /// How a part's failure begins when its session exports a variable the build list clears. The
-/// agent was not started with it, so the harness records the part as not run, with the rest of
-/// the line as its reason.
+/// agent was not started, or was ended before anything was typed to it, so the harness records the
+/// part as not run, with the rest of the line as its reason.
 pub const ENVIRONMENT_NOT_CLEAR: &str = "the session's environment is not clear:";
 
 /// How a part's failure begins when the names its session's shell exports could not be read, so
@@ -67,8 +67,12 @@ pub const STARTED_FILE: &str = ".kr-agents-started";
 /// list to be one: a list without it was not written.
 const EXPORTED_WITNESS: &str = "PATH";
 
+/// The last line of every list the shell writes, after the names: a list that does not end with it
+/// was read while it was being written, or not written whole.
+pub const LIST_END: &str = "KR_AGENTS_END";
+
 /// Whether `name` is one `pattern` names: a name, or a prefix when the pattern ends in `*`.
-fn names(pattern: &str, name: &str) -> bool {
+fn names_of(pattern: &str, name: &str) -> bool {
     pattern
         .strip_suffix('*')
         .map_or(pattern == name, |prefix| name.starts_with(prefix))
@@ -80,24 +84,32 @@ fn names(pattern: &str, name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns why: beginning with [`ENVIRONMENT_NOT_READ`] when `exported` holds no `PATH`, since a
-/// list without it was not written; beginning with [`ENVIRONMENT_NOT_CLEAR`], naming the
-/// variables that are exported, and never a value, when it holds a cleared one.
+/// Returns why: beginning with [`ENVIRONMENT_NOT_READ`] when `exported` does not end with
+/// [`LIST_END`] or holds no `PATH`, since a list like that was not written whole; beginning with
+/// [`ENVIRONMENT_NOT_CLEAR`], naming the variables that are exported, and never a value, when it
+/// holds a cleared one.
 pub fn exported_clear(
     exported: &str,
     cleared: &[String],
     allowed: &[String],
 ) -> Result<(), String> {
-    if !exported.lines().any(|line| line == EXPORTED_WITNESS) {
+    let lines: Vec<&str> = exported.lines().collect();
+    let Some((last, names)) = lines.split_last() else {
         return Err(format!(
-            "{ENVIRONMENT_NOT_READ} the names the session's shell exports do not include \
-             {EXPORTED_WITNESS}, so they were not written"
+            "{ENVIRONMENT_NOT_READ} the shell wrote no names it exports"
+        ));
+    };
+    if *last != LIST_END || !names.contains(&EXPORTED_WITNESS) {
+        return Err(format!(
+            "{ENVIRONMENT_NOT_READ} the names the session's shell exports were not written whole: \
+             the list does not end with its end mark and hold {EXPORTED_WITNESS}"
         ));
     }
-    let present: Vec<&str> = exported
-        .lines()
+    let present: Vec<&str> = names
+        .iter()
+        .copied()
         .filter(|name| !allowed.iter().any(|allowed| allowed == name))
-        .filter(|name| cleared.iter().any(|pattern| names(pattern, name)))
+        .filter(|name| cleared.iter().any(|pattern| names_of(pattern, name)))
         .collect();
     if present.is_empty() {
         Ok(())
@@ -106,6 +118,60 @@ pub fn exported_clear(
             "{ENVIRONMENT_NOT_CLEAR} the session's shell exports {}, which the build list clears",
             present.join(", ")
         ))
+    }
+}
+
+/// Removes `file`, where a list of an earlier command line may be, so that only the next line's
+/// can be read. A file that is not there is what is wanted; any other error leaves a list that
+/// could pass as the next one.
+///
+/// # Errors
+///
+/// Returns why, beginning with [`ENVIRONMENT_NOT_READ`], when the file could not be removed.
+pub fn forget_names(file: &Path) -> Result<(), String> {
+    match std::fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!(
+            "{ENVIRONMENT_NOT_READ} the list of names an earlier command line wrote to {} could \
+             not be removed: {error}",
+            file.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Waits at most `within` for the shell to write `file` whole, and checks the names in it as
+/// [`exported_clear`] does.
+///
+/// # Errors
+///
+/// Returns why, as [`exported_clear`] does; a list that is not there whole in time is
+/// [`ENVIRONMENT_NOT_READ`].
+pub fn wait_for_names(
+    file: &Path,
+    within: Duration,
+    cleared: &[String],
+    allowed: &[String],
+) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let read = std::fs::read_to_string(file);
+        match &read {
+            Ok(names) if names.lines().last() == Some(LIST_END) => {
+                return exported_clear(names, cleared, allowed);
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(format!(
+                    "{ENVIRONMENT_NOT_READ} the session's shell wrote no whole list of the names it \
+                     exports to {} in time: {}",
+                    file.display(),
+                    read.map_or_else(
+                        |error| error.to_string(),
+                        |_| "it has no end mark".to_owned()
+                    )
+                ));
+            }
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
     }
 }
 
@@ -393,9 +459,15 @@ impl Provenance {
 
     /// Removes the names the shell wrote before an earlier command line, so that the list the
     /// next line writes is the only one [`Provenance::check_cleared_at_start`] can read.
-    pub fn forget_started(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns why, as [`forget_names`] does.
+    pub fn forget_started(&self) -> Result<(), String> {
         if self.cleared_required.load(Ordering::SeqCst) {
-            let _ = std::fs::remove_file(&self.started_file);
+            forget_names(&self.started_file)
+        } else {
+            Ok(())
         }
     }
 
@@ -405,30 +477,12 @@ impl Provenance {
     ///
     /// # Errors
     ///
-    /// Returns why, as [`Provenance::check_cleared`] does, and beginning with
-    /// [`ENVIRONMENT_NOT_READ`] when no list, or one without `PATH`, was written in time.
+    /// Returns why, as [`wait_for_names`] does.
     pub fn check_cleared_at_start(&self, within: Duration) -> Result<(), String> {
         if self.cleared.is_empty() || !self.cleared_required.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let deadline = Instant::now() + within;
-        loop {
-            match std::fs::read_to_string(&self.started_file) {
-                Ok(names) if names.lines().any(|line| line == EXPORTED_WITNESS) => {
-                    return exported_clear(&names, &self.cleared, &self.allowed);
-                }
-                other if Instant::now() >= deadline => {
-                    return Err(format!(
-                        "{ENVIRONMENT_NOT_READ} the session's shell wrote no complete list of \
-                         the names it exports before it ran the agent's line to {}: {}",
-                        self.started_file.display(),
-                        other
-                            .map_or_else(|error| error.to_string(), |_| "no PATH in it".to_owned())
-                    ));
-                }
-                _ => std::thread::sleep(Duration::from_millis(20)),
-            }
-        }
+        wait_for_names(&self.started_file, within, &self.cleared, &self.allowed)
     }
 
     /// Makes the launch check the variables the build list clears: the parts that run with the
@@ -1253,43 +1307,73 @@ mod tests {
         assert_eq!((mapping.device, mapping.inode), (None, None));
     }
 
+    /// The names a shell would write: each on a line, then the end mark.
+    fn list(names: &[&str]) -> String {
+        names
+            .iter()
+            .chain(&[LIST_END])
+            .map(|name| format!("{name}\n"))
+            .collect()
+    }
+
     /// A cleared variable the shell exports fails the check by name, a prefix clears every name
-    /// that begins with it but for those the build list sets itself, and a list without PATH was
-    /// not written.
+    /// that begins with it but for those the build list sets itself, and a list that does not end
+    /// with its mark or holds no PATH was not written whole.
     #[test]
     fn a_cleared_variable_the_shell_exports_fails_the_check_by_name() {
-        let exported = "HOME\nPATH\nCLAUDE_CODE_SUBAGENT_MODEL\nTERM\n";
+        let exported = list(&["HOME", "PATH", "CLAUDE_CODE_SUBAGENT_MODEL", "TERM"]);
         let cleared = [
             "CLAUDE_CODE_SUBAGENT_MODEL".to_owned(),
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE".to_owned(),
         ];
         let refused =
-            exported_clear(exported, &cleared, &[]).expect_err("an exported cleared name");
+            exported_clear(&exported, &cleared, &[]).expect_err("an exported cleared name");
         assert!(refused.starts_with(ENVIRONMENT_NOT_CLEAR), "{refused}");
         assert!(refused.ends_with("CLAUDE_CODE_SUBAGENT_MODEL, which the build list clears"));
         assert!(
             !refused.contains("_FORCE"),
             "only the exported name is said: {refused}"
         );
-        assert_eq!(exported_clear("HOME\nPATH\n", &cleared, &[]), Ok(()));
+        assert_eq!(
+            exported_clear(&list(&["HOME", "PATH"]), &cleared, &[]),
+            Ok(())
+        );
         // A name that merely starts with a cleared one, or holds it, is another variable.
         assert_eq!(
             exported_clear(
-                "PATH\nCLAUDE_CODE_SUBAGENT_MODEL_X\nX_CLAUDE_CODE_SUBAGENT_MODEL\n",
+                &list(&[
+                    "PATH",
+                    "CLAUDE_CODE_SUBAGENT_MODEL_X",
+                    "X_CLAUDE_CODE_SUBAGENT_MODEL"
+                ]),
                 &cleared,
                 &[]
             ),
             Ok(())
         );
-        // A prefix clears every name beneath it, but for the names the build list sets itself.
-        let prefixes = ["ANTHROPIC_*".to_owned(), "CLAUDE_*".to_owned()];
+        // A prefix clears every name beneath it, but for the names the build list sets itself, and
+        // the end mark is no name.
+        let prefixes = [
+            "ANTHROPIC_*".to_owned(),
+            "CLAUDE_*".to_owned(),
+            "KR_*".to_owned(),
+        ];
         let allowed = ["CLAUDE_CONFIG_DIR".to_owned()];
         assert_eq!(
-            exported_clear("PATH\nCLAUDE_CONFIG_DIR\nOTHER\n", &prefixes, &allowed),
+            exported_clear(
+                &list(&["PATH", "CLAUDE_CONFIG_DIR", "OTHER"]),
+                &prefixes,
+                &allowed
+            ),
             Ok(())
         );
         let refused = exported_clear(
-            "PATH\nCLAUDE_CONFIG_DIR\nANTHROPIC_DEFAULT_OPUS_MODEL\nCLAUDE_CODE_USE_VERTEX\n",
+            &list(&[
+                "PATH",
+                "CLAUDE_CONFIG_DIR",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "CLAUDE_CODE_USE_VERTEX",
+            ]),
             &prefixes,
             &allowed,
         )
@@ -1300,11 +1384,71 @@ mod tests {
             ),
             "{refused}"
         );
-        // A list that holds no PATH was not written, whatever else it holds or lacks.
-        for unwritten in ["", "HOME\nTERM\n"] {
-            let refused = exported_clear(unwritten, &cleared, &[]).expect_err("not written");
+        // A list without its end mark, or without PATH, was not written whole, whatever else it
+        // holds or lacks: a partial write with PATH first and a cleared name after it fails.
+        for unwritten in [
+            String::new(),
+            "HOME\nTERM\n".to_owned(),
+            list(&["HOME", "TERM"]),
+            "PATH\nHOME\n".to_owned(),
+            "PATH\nCLAUDE_CODE_SUBAGENT_MODEL\n".to_owned(),
+        ] {
+            let refused = exported_clear(&unwritten, &cleared, &[]).expect_err("not whole");
             assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
         }
+    }
+
+    /// The wait for the list the agent's line writes: no file is not read in time, a file that is
+    /// not whole is waited on until it is, a list written during the wait is the one checked, and
+    /// a list of an earlier line, removed first, cannot be the one read.
+    #[test]
+    fn the_wait_for_the_agents_names_reads_only_a_whole_list_written_after_the_removal() {
+        let unique: String = kr_ipc::new_uuid()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let directory = std::env::temp_dir().join(format!("kr-names-{unique}"));
+        std::fs::create_dir(&directory).expect("a directory of the test's own");
+        let file = directory.join("names");
+        let cleared = ["CLAUDE_CODE_*".to_owned()];
+        let quick = Duration::from_millis(150);
+        // No file.
+        let refused = wait_for_names(&file, quick, &cleared, &[]).expect_err("no file");
+        assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
+        // A file that is not whole: PATH before the cleared name, and no end mark.
+        std::fs::write(&file, "PATH\n").expect("writes part of a list");
+        let refused = wait_for_names(&file, quick, &cleared, &[]).expect_err("no end mark");
+        assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
+        // A list of an earlier line, removed first, is not there to pass.
+        std::fs::write(&file, list(&["PATH"])).expect("writes an earlier list");
+        forget_names(&file).expect("removes it");
+        assert!(!file.exists());
+        forget_names(&file).expect("a file that is not there is what is wanted");
+        assert!(wait_for_names(&file, quick, &cleared, &[]).is_err());
+        // A list written whole during the wait is the one checked, whichever way it ends.
+        for (names, clear) in [
+            (list(&["PATH", "HOME"]), true),
+            (list(&["PATH", "CLAUDE_CODE_X"]), false),
+        ] {
+            let writer = {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    std::fs::write(&file, "PATH\n").expect("writes a part");
+                    std::thread::sleep(Duration::from_millis(100));
+                    std::fs::write(&file, names).expect("writes the rest");
+                })
+            };
+            let found = wait_for_names(&file, Duration::from_secs(5), &cleared, &[]);
+            writer.join().expect("the writer ends");
+            assert_eq!(found.is_ok(), clear, "{found:?}");
+            forget_names(&file).expect("removes it");
+        }
+        // A file that cannot be removed says so.
+        let refused = forget_names(&directory).expect_err("a directory is not removed as a file");
+        assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
     /// Each process's files are its own, and each begins at its `f`.
