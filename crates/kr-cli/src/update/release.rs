@@ -251,13 +251,15 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 /// How long the system's own tool that says its version is given.
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How much of what a tool prints is kept.
+/// How much a tool may print: the tool that says a version prints a line, and one that prints more
+/// is given up on.
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
-/// `within`, in which case it is ended. Its output is read without blocking, in the loop that waits
-/// for it to end, so that a descendant that keeps the pipe open after the tool has exited holds the
-/// run for the bound and no longer, and the pipe is closed with the run.
+/// `within`, or prints more than [`TOOL_OUTPUT`], in which case it is ended. Its output is read
+/// without blocking, in the loop that waits for it to end, so that a descendant that keeps the pipe
+/// open after the tool has exited holds the run for the bound and no longer, and one that writes
+/// without end is given up on at once. The pipe is closed with the run.
 fn run_bounded(
     program: &str,
     arguments: &[&str],
@@ -290,12 +292,19 @@ fn run_bounded(
     let mut open = true;
     loop {
         while open {
+            if std::time::Instant::now() >= deadline {
+                ended(&mut child);
+                return None;
+            }
             let mut buffer = [0_u8; 512];
             match stdout.read(&mut buffer) {
                 Ok(0) => open = false,
                 Ok(read) => {
-                    let room = TOOL_OUTPUT.saturating_sub(printed.len());
-                    printed.extend_from_slice(&buffer[..read.min(room)]);
+                    printed.extend_from_slice(&buffer[..read]);
+                    if printed.len() > TOOL_OUTPUT {
+                        ended(&mut child);
+                        return None;
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -892,6 +901,28 @@ mod tests {
         let output = run_bounded("echo", &["hello"], std::time::Duration::from_secs(20))
             .expect("echo ends and says something");
         assert_eq!(output.stdout, b"hello\n");
+    }
+
+    /// A tool that writes without end is given up on at once, not read for as long as it writes:
+    /// the run ends with nothing, well inside the bound and without holding the caller up.
+    #[test]
+    fn a_tool_that_never_stops_writing_is_given_up_on() {
+        // On a thread of its own, so that a run that reads for ever fails the test and does not
+        // hang it.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let output = run_bounded("yes", &[], std::time::Duration::from_secs(5));
+            let _ = sender.send((output.is_none(), began.elapsed()));
+        });
+        let (given_up, took) = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the run of a tool that writes for ever ended");
+        assert!(given_up, "what it wrote is not returned");
+        assert!(
+            took < std::time::Duration::from_secs(4),
+            "and it was given up on before the bound: {took:?}"
+        );
     }
 
     /// When the bound of a tool that a descendant keeps the output of ends, this run's end of the
