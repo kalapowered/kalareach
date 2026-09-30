@@ -22,7 +22,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1155,19 +1155,20 @@ impl Session {
             pty.master.take_writer().expect("a terminal writer"),
         ));
         let answering = Arc::clone(&terminal);
+        let cursor_answered = Arc::new(AtomicUsize::new(0));
+        let answered_to = Arc::clone(&cursor_answered);
         let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             // A terminal read ends wherever the kernel had bytes, which can be in the middle of a
-            // query an editor is waiting for an answer to. What has not been answered is carried
-            // to the next read rather than dropped.
-            let mut carried: Vec<u8> = Vec::new();
+            // query an editor is waiting for an answer to, so the queries are read from the stream
+            // and not from one read of it.
+            let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
             while !finished.load(Ordering::Relaxed) {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(taken) => {
-                        carried.extend_from_slice(&buffer[..taken]);
-                        answer_carried_queries(&mut carried, &answering);
+                        queries.answer(&buffer[..taken], &answering);
                         collected
                             .lock()
                             .expect("the output lock")
@@ -1222,6 +1223,7 @@ impl Session {
             next_request: 1,
             commands: Commands::default(),
             output,
+            cursor_answered,
             stopped,
             stopped_reading,
             terminal,
@@ -2271,53 +2273,6 @@ impl Drop for SpawnGuard {
         }
         self.stopped.store(true, Ordering::Relaxed);
     }
-}
-
-/// The queries a terminal is expected to answer, and what this one answers them with.
-const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
-    (b"\x1b[6n", b"\x1b[1;1R"),
-    (b"\x1b[0c", b"\x1b[?6c"),
-    (b"\x1b[c", b"\x1b[?6c"),
-    (b"\x1b]11;?", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
-];
-
-/// Answers every complete query in `carried` and keeps only what could still become one.
-///
-/// A read ends wherever the kernel had bytes, so a query can arrive in two pieces. Each answer is
-/// sent once: everything up to the last query answered is dropped, and what is kept afterwards is
-/// shorter than the longest query, which is as much as an unfinished one can be.
-fn answer_carried_queries(carried: &mut Vec<u8>, terminal: &TerminalInput) {
-    let mut reply: Vec<u8> = Vec::new();
-    let mut answered = 0;
-    let mut index = 0;
-    while index < carried.len() {
-        let matched = TERMINAL_QUERIES.iter().find_map(|(query, answer)| {
-            carried[index..]
-                .starts_with(query)
-                .then_some((query.len(), *answer))
-        });
-        match matched {
-            Some((length, answer)) => {
-                reply.extend_from_slice(answer);
-                index += length;
-                answered = index;
-            }
-            None => index += 1,
-        }
-    }
-    let longest = TERMINAL_QUERIES
-        .iter()
-        .map(|(query, _)| query.len())
-        .max()
-        .unwrap_or(1);
-    let keep_from = answered.max(carried.len().saturating_sub(longest - 1));
-    carried.drain(..keep_from);
-    if reply.is_empty() {
-        return;
-    }
-    // Answered from the thread that read the query, and not queued behind what a check is typing:
-    // an editor waits only briefly for the answer and reads a late one as keys a person typed.
-    terminal.answer_now(&reply);
 }
 
 /// What one case's run concluded, for the report the qualification prints.

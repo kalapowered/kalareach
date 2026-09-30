@@ -17,7 +17,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -617,6 +617,8 @@ pub struct Session {
     /// What this session answers for the commands a line runs, and what the bridge reported.
     pub commands: Commands,
     output: Arc<Mutex<Vec<u8>>>,
+    /// Where in `output` the last cursor query the terminal answered ends.
+    cursor_answered: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     /// The reader thread's report that it has stopped, so a session that is torn down does not
     /// leave a thread still writing into what the next case reads.
@@ -829,16 +831,19 @@ impl Session {
             pty.master.take_writer().expect("a terminal writer"),
         ));
         let answering = Arc::clone(&terminal);
+        let cursor_answered = Arc::new(AtomicUsize::new(0));
+        let answered_to = Arc::clone(&cursor_answered);
         let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
+            let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
             while !finished.load(Ordering::Relaxed) {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(taken) => {
                         // A terminal that never answers a query is a terminal the editor waits
                         // for, so this one answers the three an editor asks at every prompt.
-                        answer_terminal_queries(&buffer[..taken], &answering);
+                        queries.answer(&buffer[..taken], &answering);
                         collected
                             .lock()
                             .expect("the output lock")
@@ -890,6 +895,7 @@ impl Session {
             next_request: 1,
             commands: Commands::default(),
             output,
+            cursor_answered,
             stopped,
             stopped_reading,
             terminal,
@@ -1632,6 +1638,12 @@ impl Session {
                 "the shell drew no prompt to type {line:?} at:\n{}",
                 self.terminal_output()
             );
+            // The line goes in once the editor reads the terminal itself.
+            assert!(
+                self.wait_for_editor_reading(),
+                "the editor never asked where the cursor was after the prompt, to type {line:?} at:\n{}",
+                self.terminal_output()
+            );
             // The return goes in once the editor has drawn what was typed, which is where it is
             // reading the terminal itself. Before that the terminal's own line discipline holds
             // the line, and it sends a line feed where the return was.
@@ -1649,6 +1661,36 @@ impl Session {
             self.type_bytes(&bytes);
         }
         self.mark = self.output.lock().expect("the output lock").len();
+    }
+
+    /// Waits until the editor has asked where the cursor is after the prompt `mark` points at and
+    /// been answered, which is where it stops starting to read and reads keys.
+    ///
+    /// The prompt is on the screen before the editor reads: it goes on to set the terminal up for
+    /// reading and to ask where the cursor is, and what a person types in that time goes to a
+    /// terminal that is not yet the editor's. A line typed then is sometimes never read, and the
+    /// editor shows nothing for it.
+    fn wait_for_editor_reading(&mut self) -> bool {
+        let deadline = self.deadline_for(REPLY);
+        loop {
+            let prompt_ended = {
+                let output = self.output.lock().expect("the output lock");
+                let mark = self.mark.min(output.len());
+                output[mark..]
+                    .windows(self.prompt.len())
+                    .position(|window| window == self.prompt.as_bytes())
+                    .map(|at| mark + at + self.prompt.len())
+            };
+            if prompt_ended
+                .is_some_and(|ended| self.cursor_answered.load(Ordering::Acquire) > ended)
+            {
+                return true;
+            }
+            if deadline.passed() {
+                return false;
+            }
+            self.pump(Duration::from_millis(10));
+        }
     }
 
     /// Waits for the editor's own drawing to reach the terminal after `start`.
@@ -2021,6 +2063,14 @@ impl TerminalInput {
     }
 }
 
+/// The queries an editor asks the terminal at every prompt, each with the reply a terminal gives.
+const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[c", b"\x1b[?6c"),
+    (b"\x1b[0c", b"\x1b[?6c"),
+    (b"\x1b]11;?", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+];
+
 /// Answers the queries a terminal is expected to answer while an editor draws a prompt.
 ///
 /// An editor that asks where the cursor is and waits for the reply cannot start its read loop
@@ -2028,21 +2078,74 @@ impl TerminalInput {
 /// this thread, the one that read the query: an answer that arrives after the editor has stopped
 /// waiting for it is read as keys a person typed, and the prompt the test then types at is not the
 /// one it thinks.
-fn answer_terminal_queries(bytes: &[u8], terminal: &TerminalInput) {
-    let mut reply: Vec<u8> = Vec::new();
-    if find(bytes, b"\x1b[6n") {
-        reply.extend_from_slice(b"\x1b[1;1R");
+///
+/// A query is a sequence in the stream the terminal shows, not in one read of it: a pseudo-terminal
+/// hands over what has arrived, and on a loaded machine that can be the first bytes of a query and
+/// then the rest. So what could be the start of one is kept from each read, a query cut between two
+/// reads is found once it is whole, and a query that ended in an earlier read is not answered
+/// again.
+struct TerminalQueries {
+    /// The last bytes read, which could be the start of a query the next read finishes.
+    carry: Vec<u8>,
+    /// How many bytes of the terminal's output have been read.
+    read: usize,
+    /// Where, in the terminal's output, the last cursor query this has answered ends. The editor
+    /// reads the keys typed at it once it has the answer, so a line typed before that is typed
+    /// while the editor is still starting to read.
+    cursor_answered_to: Arc<AtomicUsize>,
+}
+
+impl TerminalQueries {
+    fn new(cursor_answered_to: Arc<AtomicUsize>) -> Self {
+        Self {
+            carry: Vec::new(),
+            read: 0,
+            cursor_answered_to,
+        }
     }
-    if find(bytes, b"\x1b[c") || find(bytes, b"\x1b[0c") {
-        reply.extend_from_slice(b"\x1b[?6c");
+
+    /// Takes the next bytes the terminal showed and answers each query that ended in them.
+    fn answer(&mut self, bytes: &[u8], terminal: &TerminalInput) {
+        let kept = self.carry.len();
+        let stream = [self.carry.as_slice(), bytes].concat();
+        // Where the first byte of `stream` is in the terminal's output as a whole.
+        let origin = self.read - kept;
+        self.read += bytes.len();
+        let mut reply: Vec<u8> = Vec::new();
+        let mut cursor_answered_to = None;
+        let mut at = 0;
+        while at < stream.len() {
+            let matched = TERMINAL_QUERIES
+                .iter()
+                .find(|(query, _)| stream[at..].starts_with(query));
+            let Some((query, answer)) = matched else {
+                at += 1;
+                continue;
+            };
+            at += query.len();
+            // A query that ended in an earlier read was answered then.
+            if at <= kept {
+                continue;
+            }
+            reply.extend_from_slice(answer);
+            if *query == b"\x1b[6n" {
+                cursor_answered_to = Some(origin + at);
+            }
+        }
+        let longest = TERMINAL_QUERIES
+            .iter()
+            .map(|(query, _)| query.len())
+            .max()
+            .unwrap_or(1);
+        self.carry = stream[stream.len().saturating_sub(longest - 1)..].to_vec();
+        if reply.is_empty() {
+            return;
+        }
+        terminal.answer_now(&reply);
+        if let Some(ended) = cursor_answered_to {
+            self.cursor_answered_to.store(ended, Ordering::Release);
+        }
     }
-    if find(bytes, b"\x1b]11;?") {
-        reply.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
-    }
-    if reply.is_empty() {
-        return;
-    }
-    terminal.answer_now(&reply);
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> bool {
