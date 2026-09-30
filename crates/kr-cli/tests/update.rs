@@ -3066,6 +3066,10 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
             vec![("release/bin/kr", tar::EntryType::Char, &b""[..])],
         ),
         (
+            "volume",
+            vec![("release/bin/kr", tar::EntryType::new(b'V'), &b""[..])],
+        ),
+        (
             "climbing",
             vec![("release/../escape", tar::EntryType::Regular, &b"x"[..])],
         ),
@@ -3101,6 +3105,7 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
         ("link", "2, a symbolic link"),
         ("hard-link", "1, a hard link"),
         ("device", "3, a character device"),
+        ("volume", "of type V that"),
     ] {
         let archive = scratch.path().join(format!("{name}.tar.gz"));
         let said = kr_cli::update::release::unpack(&archive, &staging(&format!("{name}-said")))
