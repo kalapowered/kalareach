@@ -212,7 +212,7 @@ fn the_record_carries_what_was_measured() {
     let steps = corpus::steps(cols, rows);
     let outcomes = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
     let report = Report::new(
-        vec![("application".to_owned(), "a scripted terminal".to_owned())],
+        serde_json::json!({ "application": "a scripted terminal" }),
         identity,
         (cols, rows),
         outcomes,
@@ -220,7 +220,7 @@ fn the_record_carries_what_was_measured() {
     let text = serde_json::to_string(&report).expect("serialises");
     let value: serde_json::Value = serde_json::from_str(&text).expect("reads back");
     assert_eq!(value["probe"], "kr-term-probe/1");
-    assert_eq!(value["launcher"][0][1], "a scripted terminal");
+    assert_eq!(value["launcher"]["application"], "a scripted terminal");
     assert_eq!(value["window"], serde_json::json!([80, 24]));
     assert_eq!(value["steps"].as_array().map(Vec::len), Some(steps.len()));
     assert_eq!(value["summary"]["agree"], steps.len());

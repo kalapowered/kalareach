@@ -1,12 +1,12 @@
 //! Runs the corpus in the terminal this program is started in and writes the record.
 //!
 //! ```text
-//! kr-term-probe --out <record.json> [--meta key=value]...
+//! kr-term-probe --out <record.json> [--launcher <facts.json>]
 //! ```
 //!
-//! Standard input and output must be the terminal to measure. Each `--meta` pair is what the
-//! launcher read about the terminal from outside its own answers (its application, its version and
-//! its configuration) and goes into the record unchanged.
+//! Standard input and output must be the terminal to measure. The launcher file is a JSON value the
+//! launcher wrote from outside the terminal's own answers (its application, its version and its
+//! configuration), and goes into the record unchanged.
 
 #[cfg(unix)]
 mod unix {
@@ -93,15 +93,14 @@ mod unix {
 
     fn run() -> Result<String, Box<dyn std::error::Error>> {
         let mut out = None;
-        let mut launcher = Vec::new();
+        let mut launcher = serde_json::Value::Null;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--out" => out = arguments.next(),
-                "--meta" => {
-                    let pair = arguments.next().ok_or("--meta needs key=value")?;
-                    let (key, value) = pair.split_once('=').ok_or("--meta needs key=value")?;
-                    launcher.push((key.to_owned(), value.to_owned()));
+                "--launcher" => {
+                    let path = arguments.next().ok_or("--launcher needs a file")?;
+                    launcher = serde_json::from_str(&std::fs::read_to_string(path)?)?;
                 }
                 other => return Err(format!("unknown argument {other}").into()),
             }
