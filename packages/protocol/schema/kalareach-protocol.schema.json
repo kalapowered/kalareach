@@ -2940,6 +2940,17 @@
           "$ref": "#/$defs/TerminalPresentationMode",
           "description": "How this attachment now displays the canonical grid."
         },
+        "presentation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PresentationReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the attachment is shown a viewport after this report, or null when it is shown the\nsession's own stream.\n\nIt is the first condition, in the order [`PresentationReason`] lists them, that keeps the\nattachment off the stream as it stands after the report, so a report that changed the\npresentation changes the reason with it, and one that did not repeats what the attachment's\nsummary already says."
+        },
         "window_revision": {
           "$ref": "#/$defs/U64",
           "description": "The revision of this attachment's window after the report.\n\nThe host advances it whenever the window it keeps for this attachment changes (its size, its\nplace or its column), whether a report changed it or the host did, and every screen it\ninstalls names the revision of the window it is drawn for. A report that moved the window\nis answered with the revision of the screen already queued for it; one that changed the\nsize is drawn on the next subscription, whose screen names this revision or a later one;\none that changed nothing names the revision the window already had, and no screen follows."
@@ -2948,6 +2959,7 @@
       "required": [
         "geometry",
         "presentation",
+        "presentation_reason",
         "position",
         "column",
         "window_revision"
