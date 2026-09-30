@@ -24,14 +24,33 @@ class MainActivity : TauriActivity() {
         WindowInsetsCompat.Type.displayCutout()
       val bars = insets.getInsets(edges)
       content.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-      val remaining = WindowInsetsCompat.Builder(insets)
+      withoutBars(insets)
+    }
+  }
+
+  /** The window's insets with the bars and the cutout taken out, and the keyboard left in. */
+  private fun withoutBars(insets: WindowInsetsCompat): WindowInsetsCompat {
+    val remaining = WindowInsetsCompat.Builder(insets)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+      remaining
         .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.NONE)
         .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.NONE)
         .setInsets(WindowInsetsCompat.Type.displayCutout(), Insets.NONE)
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        remaining.setDisplayCutout(null)
-      }
-      remaining.build()
+    } else {
+      keepOnlyTheKeyboard(remaining, insets)
     }
+    // Consumes the cutout the platform reports on its own, which setting an inset does not.
+    return remaining.build().consumeDisplayCutout()
+  }
+
+  // Before Android 11 the bars and the keyboard share one rectangle, the window's system insets,
+  // and setting a bar's inset rewrites that rectangle from the bars alone, so the keyboard would
+  // be taken out with them. It is set whole instead, to what the keyboard alone takes.
+  @Suppress("DEPRECATION")
+  private fun keepOnlyTheKeyboard(remaining: WindowInsetsCompat.Builder, insets: WindowInsetsCompat) {
+    val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime())
+    remaining
+      .setSystemWindowInsets(Insets.of(0, 0, 0, keyboard.bottom))
+      .setStableInsets(Insets.NONE)
   }
 }
