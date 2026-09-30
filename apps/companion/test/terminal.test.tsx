@@ -1404,6 +1404,44 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
     }
   })
 
+  it('puts the focus on the mode button when the view opens again by itself from Attach again, after a pointer press of it', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      const { unmount } = open(port)
+      await screen.findByTestId('palette-provenance')
+      act(() => {
+        controls.terminalViews[0]?.end('The session ended.')
+      })
+      // A pointer opens it again: the focus is where the pointer left it.
+      await person.click(screen.getByRole('button', { name: 'Attach again' }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      await screen.findByTestId('palette-provenance')
+      expect(screen.getByRole('button', { name: 'Take control' })).not.toHaveFocus()
+      // It ends again, with the focus on Attach again, and the host coming back opens it without
+      // a press: the button goes, and the focus goes on to the mode button.
+      act(() => {
+        controls.terminalViews[1]?.end('The session ended again.')
+      })
+      const again = screen.getByRole('button', { name: 'Attach again' })
+      again.focus()
+      act(() => {
+        controls.setConnected(true)
+      })
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(3)
+      })
+      await screen.findByTestId('palette-provenance')
+      expect(screen.getByRole('button', { name: 'Take control' })).toHaveFocus()
+      unmount()
+    } finally {
+      restore()
+    }
+  })
+
   it('moves the focus to the mode button when control ends with the focus in the program keyboard', async () => {
     const person = userEvent.setup()
     const restore = laidOut()

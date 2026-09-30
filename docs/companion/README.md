@@ -180,9 +180,9 @@ on the terminal that selects nothing puts the focus in it, and the terminal show
 it has the focus. Tab and Shift-Tab go to the program. Control-Tab and Control-Shift-Tab move the
 focus to the next control or the one before, and stop at the first and the last. When control or the
 view ends and the focus was last in the field or on the mode button, the focus goes to the mode
-button, or to Attach again once the view has ended. Attach again pressed from the keyboard, or by a
-screen reader, puts the focus on the mode button once the view is open again; a pointer's press
-leaves it where the pointer put it.
+button, or to Attach again once the view has ended. Focus on Attach again goes to the mode button
+once the view is open again, whether the person pressed it or the view opened again by itself,
+unless a pointer pressed it: a pointer's press leaves the focus where the pointer put it.
 
 A drag belongs to the view it began in: taking control, the view ending or the session changing
 ends it without sending what it had not sent. The page never decides where the window is. Native
@@ -209,8 +209,8 @@ too, and what an input method turns into text, as Android's does with a hardware
 neither takes them nor lets them go. In the field Control-Tab and Control-Shift-Tab move the focus
 on or back in either mode. When control or the view ends and the focus was last in the field, on a
 terminal key or on the mode button, the focus goes to the mode button once the bar is back, or to
-Attach again once the view has ended, unless the person has put it on another control first; Attach
-again pressed from the keyboard does the same once the view is open again. While a
+Attach again once the view has ended, unless the person has put it on another control first;
+Attach again does the same once the view is open again, unless a pointer pressed it. While a
 software keyboard covers part of the session, the bar gives way to the terminal, its keys and the
 field, and the field sits on the keyboard's top edge. The terminal keeps at least four rows at its
 default size in any case: when the composer needs more room than is left, it scrolls from the

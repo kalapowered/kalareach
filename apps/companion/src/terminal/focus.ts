@@ -16,8 +16,8 @@
  * until the destination can take it. Focus the person puts on any other control first settles it,
  * and so does the destination leaving the page with its view.
  *
- * Attach again is one of the view's controls when the person pressed it without a pointer: the press
- * removes the button with the view that ended, and the focus it held goes with it.
+ * Attach again is one of the view's controls unless the person pressed it with a pointer: opening
+ * the view again removes the button with the view that ended, and the focus it held goes with it.
  */
 
 import { useLayoutEffect, useRef } from 'react'
@@ -30,27 +30,34 @@ function takesFocus(element: Element): boolean {
 }
 
 /**
- * Counts the control `id` among the view's own while its last press came from the keyboard or a
- * screen reader, and not from a pointer.
+ * Counts the control `id` among the view's own, unless the person's last press of it came from a
+ * pointer. `showing` is whether the control is there: a control that shows again has not been
+ * pressed yet.
  *
- * A press that ends the view the control sits in removes the control, and the focus it held with
- * it. A person at the keyboard has nowhere to go on from, so the focus is owed as it is for the
- * view's other controls. A person with a pointer put the focus where they pressed, and nothing of
- * it is owed: a pointer's click counts its presses, one or more, and a click nothing pointed at,
- * from Enter, Space or a screen reader, counts none.
+ * Opening the view again removes the control that asks for it, and the focus it held goes with it.
+ * A view that opens again by itself does the same. Whoever had the focus there has nowhere to go on
+ * from, so the focus is owed as it is for the view's other controls. A person with a pointer put
+ * the focus where they pressed, and nothing of it is owed: a pointer's click counts its presses,
+ * one or more, and a click that nothing pointed at, as from Enter or Space, counts none.
  */
-export function useKeyboardPress(id: string): {
+export function useOwnControl(
+  id: string,
+  showing: boolean
+): {
   /** Notes how the control was pressed: call it from the control's click handler. */
   readonly press: (event: { readonly detail: number }) => void
-  /** Whether `element` is that control, pressed without a pointer. */
+  /** Whether `element` is that control, and its last press was not a pointer's. */
   readonly held: (element: Element | null) => boolean
 } {
-  const withoutPointer = useRef(false)
+  const pointer = useRef(false)
+  useLayoutEffect(() => {
+    if (showing) pointer.current = false
+  }, [showing])
   return {
     press: (event) => {
-      withoutPointer.current = event.detail === 0
+      pointer.current = event.detail > 0
     },
-    held: (element) => withoutPointer.current && element?.id === id
+    held: (element) => !pointer.current && element?.id === id
   }
 }
 
