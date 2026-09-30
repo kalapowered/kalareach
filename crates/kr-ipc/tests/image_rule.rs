@@ -668,7 +668,6 @@ fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<
         package: &'a str,
         features: Vec<&'a str>,
         defaults: bool,
-        shipped: bool,
     }
 
     let packages: BTreeMap<&str, &serde_json::Value> = metadata["packages"]
@@ -683,32 +682,36 @@ fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<
             .as_str()
             .is_some_and(|manifest| normalise(Path::new(manifest)).starts_with(&host_crates))
     };
+    /// The dependencies a program is built with, by the name the package's features know each by.
+    /// A dependency that is listed more than once (normal, build and dev, or once for each target)
+    /// is one: what the program's entries ask for is joined, and a dev entry is not part of it.
     fn dependencies_of(package: &serde_json::Value) -> BTreeMap<String, Asked<'_>> {
-        package["dependencies"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|dependency| {
-                let name = dependency["name"].as_str()?;
-                let key = dependency["rename"].as_str().unwrap_or(name).to_owned();
-                Some((
-                    key,
-                    Asked {
-                        package: name,
-                        features: dependency["features"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(serde_json::Value::as_str)
-                            .collect(),
-                        defaults: dependency["uses_default_features"]
-                            .as_bool()
-                            .unwrap_or(true),
-                        shipped: matches!(dependency["kind"].as_str(), None | Some("build")),
-                    },
-                ))
-            })
-            .collect()
+        let mut found: BTreeMap<String, Asked<'_>> = BTreeMap::new();
+        for dependency in package["dependencies"].as_array().into_iter().flatten() {
+            let Some(name) = dependency["name"].as_str() else {
+                continue;
+            };
+            if !matches!(dependency["kind"].as_str(), None | Some("build")) {
+                continue;
+            }
+            let key = dependency["rename"].as_str().unwrap_or(name).to_owned();
+            let asked = found.entry(key).or_insert(Asked {
+                package: name,
+                features: Vec::new(),
+                defaults: false,
+            });
+            asked.features.extend(
+                dependency["features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            );
+            asked.defaults |= dependency["uses_default_features"]
+                .as_bool()
+                .unwrap_or(true);
+        }
+        found
     }
     // Every feature a walk from `start` turns on, as `(package, feature)`.
     let walk = |start: Vec<(String, String)>| -> BTreeSet<(String, String)> {
@@ -724,7 +727,7 @@ fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<
             let dependencies = dependencies_of(package);
             let turns_on =
                 |key: &str, pending: &mut Vec<(String, String)>, feature: Option<&str>| {
-                    let Some(asked) = dependencies.get(key).filter(|asked| asked.shipped) else {
+                    let Some(asked) = dependencies.get(key) else {
                         return;
                     };
                     let base: Vec<&str> = match feature {
@@ -766,10 +769,7 @@ fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<
             "its default features".to_owned(),
             vec![(name.to_owned(), "default".to_owned())],
         )];
-        for (key, asked) in dependencies_of(package)
-            .into_iter()
-            .filter(|(_, asked)| asked.shipped)
-        {
+        for (key, asked) in dependencies_of(package) {
             let mut start: Vec<(String, String)> = asked
                 .features
                 .iter()
@@ -1489,6 +1489,66 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
             "k: the testing feature of l is turned on by a normal or build dependency on l",
             "l: the testing feature of l is turned on by its default features",
         ]
+    );
+    // A dependency listed as a normal one and as a dev one is the same dependency: what the
+    // program's entry asks is not lost to the dev entry, in either order, and what only the dev
+    // entry asks is not counted.
+    for (first, second) in [("null", "dev"), ("dev", "null")] {
+        let kind = |kind: &str| {
+            if kind == "null" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(kind)
+            }
+        };
+        let listed = |normal_asks: &[&str], dev_asks: &[&str]| {
+            let entry = |kind_name: &str| {
+                let asks = if kind_name == "null" {
+                    normal_asks
+                } else {
+                    dev_asks
+                };
+                dependency("b", kind(kind_name), asks)
+            };
+            serde_json::json!({ "packages": [
+                host(
+                    "a",
+                    serde_json::json!([entry(first), entry(second)]),
+                    serde_json::json!({ "default": [] }),
+                ),
+                host(
+                    "b",
+                    serde_json::json!([]),
+                    serde_json::json!({ "extra": ["testing"], "testing": [] }),
+                ),
+            ]})
+        };
+        assert_eq!(
+            testing_in_production(&listed(&["extra"], &[]), Path::new("/w")),
+            vec!["a: the testing feature of b is turned on by a normal or build dependency on b"],
+            "the program's entry asks: {first} then {second}"
+        );
+        assert!(
+            testing_in_production(&listed(&[], &["extra"]), Path::new("/w")).is_empty(),
+            "only the dev entry asks: {first} then {second}"
+        );
+    }
+    // A crate that lists its own defaults as `kr-ipc/testing` through a dependency that is also a
+    // dev dependency is named as well.
+    let doubled = serde_json::json!({ "packages": [
+        host(
+            "a",
+            serde_json::json!([
+                dependency("b", serde_json::Value::Null, &[]),
+                dependency("b", serde_json::json!("dev"), &[]),
+            ]),
+            serde_json::json!({ "default": ["b/testing"] }),
+        ),
+        host("b", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+    ]});
+    assert_eq!(
+        testing_in_production(&doubled, Path::new("/w")),
+        vec!["a: the testing feature of b is turned on by its default features"]
     );
     // The control: dev dependencies and a testing feature that nothing turns on are fine.
     let fine = serde_json::json!({ "packages": [
