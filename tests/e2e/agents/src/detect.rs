@@ -258,6 +258,44 @@ pub struct Detected {
 pub const IDENTITY_UNPROVEN: &str = "unproven: no read the host serves names the executable or the \
      release an instance it detected runs; the image the launched process maps is under provenance";
 
+/// Why a launch was not detected as section 12 requires: a cause from a closed set, which a record
+/// says in words of its own, how many live instances the host announced, and the words that
+/// describe it, which can hold what the host named and stay in the part's log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Undetected {
+    /// The cause, one of [`Undetected::CAUSES`].
+    pub cause: &'static str,
+    /// How many live instances the host announced.
+    pub announced: usize,
+    /// The words that describe it.
+    pub why: String,
+}
+
+impl Undetected {
+    /// The causes, each named for what was not so: the launched execution ended; the host did not
+    /// announce exactly one live instance; the instance names another package, is not integrated
+    /// as a native terminal or does not say its bridges are refused; a device cannot read its
+    /// binding, or the binding is not integrated as a native terminal, does not hold the
+    /// announced launch profile, or has no live binding counted by `plugin.list`.
+    pub const CAUSES: [&'static str; 9] = [
+        "ended",
+        "not_one_instance",
+        "another_package",
+        "not_native_terminal",
+        "no_refusal",
+        "no_binding",
+        "binding_not_native_terminal",
+        "binding_profile",
+        "no_live_binding",
+    ];
+}
+
+impl std::fmt::Display for Undetected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.why)
+    }
+}
+
 /// Check (i): the host detected the launched execution, as section 12 requires of a manual launch:
 /// one live instance while the execution runs, naming the installed package, integrated as a native
 /// terminal with every bridge refused, whose binding a device reads with the announced profile. Its
@@ -267,36 +305,54 @@ pub const IDENTITY_UNPROVEN: &str = "unproven: no read the host serves names the
 /// # Errors
 ///
 /// Returns why the launch was not detected as the launched execution.
-pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<Detected, String> {
+pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<Detected, Undetected> {
     let instances = &shown.detection.instances;
+    let fail = |cause: &'static str, why: String| Undetected {
+        cause,
+        announced: instances.len(),
+        why,
+    };
     if !launched.running {
-        return Err(if instances.is_empty() {
-            "the launched execution has ended and no instance is live".to_owned()
-        } else {
-            format!(
-                "the launched execution has ended and {} instance(s) are still announced live",
-                instances.len()
-            )
-        });
+        return Err(fail(
+            "ended",
+            if instances.is_empty() {
+                "the launched execution has ended and no instance is live".to_owned()
+            } else {
+                format!(
+                    "the launched execution has ended and {} instance(s) are still announced live",
+                    instances.len()
+                )
+            },
+        ));
     }
     let Some(instance) = shown.detection.only() else {
-        return Err(format!(
-            "the host announced {} live instance(s) for the launched execution, not one: section \
-             12 keeps a manual launch valid through the same detection and capability process",
-            instances.len()
+        return Err(fail(
+            "not_one_instance",
+            format!(
+                "the host announced {} live instance(s) for the launched execution, not one: \
+                 section 12 keeps a manual launch valid through the same detection and capability \
+                 process",
+                instances.len()
+            ),
         ));
     };
     if instance.plugin_id.0.as_ref() != Some(&launched.plugin_id) {
-        return Err(format!(
-            "the instance names {:?}, not the installed package {}",
-            instance.plugin_id.0, launched.plugin_id
+        return Err(fail(
+            "another_package",
+            format!(
+                "the instance names {:?}, not the installed package {}",
+                instance.plugin_id.0, launched.plugin_id
+            ),
         ));
     }
     if instance.mode != IntegrationMode::NativeTerminal {
-        return Err(format!(
-            "the instance is integrated as {}, and a launch the integration did not make keeps \
-             only observation and terminal capabilities",
-            instance.mode.as_str()
+        return Err(fail(
+            "not_native_terminal",
+            format!(
+                "the instance is integrated as {}, and a launch the integration did not make \
+                 keeps only observation and terminal capabilities",
+                instance.mode.as_str()
+            ),
         ));
     }
     if instance
@@ -305,27 +361,42 @@ pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<Detected, St
         .as_deref()
         .is_none_or(|refusal| refusal.trim().is_empty())
     {
-        return Err("the instance does not say that its bridges are refused".to_owned());
+        return Err(fail(
+            "no_refusal",
+            "the instance does not say that its bridges are refused".to_owned(),
+        ));
     }
     let Some(binding) = shown.binding.as_ref() else {
-        return Err("a device cannot read the instance's binding".to_owned());
+        return Err(fail(
+            "no_binding",
+            "a device cannot read the instance's binding".to_owned(),
+        ));
     };
     if binding.binding.mode != IntegrationMode::NativeTerminal {
-        return Err(format!(
-            "the binding is integrated as {}",
-            binding.binding.mode.as_str()
+        return Err(fail(
+            "binding_not_native_terminal",
+            format!(
+                "the binding is integrated as {}",
+                binding.binding.mode.as_str()
+            ),
         ));
     }
     if binding.binding.profile_id.0.is_none() || binding.binding.profile_id != instance.profile_id {
-        return Err(format!(
-            "the binding's launch profile {:?} is not the announced one {:?}",
-            binding.binding.profile_id.0, instance.profile_id.0
+        return Err(fail(
+            "binding_profile",
+            format!(
+                "the binding's launch profile {:?} is not the announced one {:?}",
+                binding.binding.profile_id.0, instance.profile_id.0
+            ),
         ));
     }
     if !shown.live_bindings.is_some_and(|count| count >= 1) {
-        return Err(format!(
-            "plugin.list counts {:?} live bindings of the package",
-            shown.live_bindings
+        return Err(fail(
+            "no_live_binding",
+            format!(
+                "plugin.list counts {:?} live bindings of the package",
+                shown.live_bindings
+            ),
         ));
     }
     Ok(Detected {
@@ -336,14 +407,19 @@ pub fn check_detected(launched: &Launched, shown: &Shown) -> Result<Detected, St
 
 /// Check (i)'s result as evidence: the instance and what stays unproven, or why detection failed.
 #[must_use]
-pub fn detected_evidence(detected: &Result<Detected, String>) -> Value {
+pub fn detected_evidence(detected: &Result<Detected, Undetected>) -> Value {
     match detected {
         Ok(detected) => json!({
             "detected": true,
             "instance": detected.instance.to_string(),
             "identity": detected.identity,
         }),
-        Err(why) => json!({ "detected": false, "why": why }),
+        Err(undetected) => json!({
+            "detected": false,
+            "cause": undetected.cause,
+            "announced": undetected.announced,
+            "why": undetected.why,
+        }),
     }
 }
 
@@ -524,7 +600,9 @@ pub fn checker_controls(launched: &Launched, shown: &Shown, surface: &Surface) -
     control(
         "detected",
         "the instance names another package",
-        check_detected(launched, &other).map(|_| ()),
+        check_detected(launched, &other)
+            .map(|_| ())
+            .map_err(|undetected| undetected.why),
     );
     control(
         "detected",
@@ -536,7 +614,8 @@ pub fn checker_controls(launched: &Launched, shown: &Shown, surface: &Surface) -
             },
             shown,
         )
-        .map(|_| ()),
+        .map(|_| ())
+        .map_err(|undetected| undetected.why),
     );
     let mut retained = shown.clone();
     if retained.detection.instances.is_empty() {
@@ -638,5 +717,84 @@ fn stand_in_instance(plugin: &str) -> AgentInstanceSummary {
         started_at: kr_ipc::now_ms(),
         ended_at: Nullable::null(),
         refusal: Nullable::some("stand-in".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shown_with(instances: Vec<AgentInstanceSummary>) -> Shown {
+        Shown {
+            detection: Detection {
+                instances,
+                waited_ms: 0,
+            },
+            binding: None,
+            live_bindings: None,
+        }
+    }
+
+    fn launched(running: bool) -> Launched {
+        Launched {
+            plugin_id: PluginId::new("kalareach/example").expect("a plugin identifier"),
+            running,
+        }
+    }
+
+    /// Each way a launch is not detected as section 12 requires names its cause from the closed
+    /// set and the number of instances the host announced, whatever the words say.
+    #[test]
+    fn each_way_a_launch_is_not_detected_names_its_cause_and_the_instances_announced() {
+        let instance = || stand_in_instance("kalareach/example");
+        let cause = |launched: &Launched, shown: &Shown| {
+            check_detected(launched, shown)
+                .expect_err("not detected")
+                .cause
+        };
+        assert_eq!(
+            cause(&launched(false), &shown_with(vec![instance()])),
+            "ended"
+        );
+        assert_eq!(
+            cause(&launched(true), &shown_with(Vec::new())),
+            "not_one_instance"
+        );
+        assert_eq!(
+            cause(&launched(true), &shown_with(vec![instance(), instance()])),
+            "not_one_instance"
+        );
+        assert_eq!(
+            cause(
+                &launched(true),
+                &shown_with(vec![stand_in_instance("kalareach/other")])
+            ),
+            "another_package"
+        );
+        let mut integrated = instance();
+        integrated.mode = IntegrationMode::Gateway;
+        assert_eq!(
+            cause(&launched(true), &shown_with(vec![integrated])),
+            "not_native_terminal"
+        );
+        let mut silent = instance();
+        silent.refusal = Nullable::null();
+        assert_eq!(
+            cause(&launched(true), &shown_with(vec![silent])),
+            "no_refusal"
+        );
+        assert_eq!(
+            cause(&launched(true), &shown_with(vec![instance()])),
+            "no_binding"
+        );
+        let undetected = check_detected(&launched(true), &shown_with(vec![instance(), instance()]))
+            .expect_err("two instances");
+        assert_eq!(undetected.announced, 2);
+        assert!(Undetected::CAUSES.contains(&undetected.cause));
+        assert_eq!(
+            detected_evidence(&Err(undetected.clone()))["cause"],
+            "not_one_instance"
+        );
+        assert_eq!(detected_evidence(&Err(undetected))["announced"], 2);
     }
 }

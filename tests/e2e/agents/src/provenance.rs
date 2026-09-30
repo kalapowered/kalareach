@@ -43,9 +43,14 @@ use crate::stage::AgentProcess;
 pub const NOT_PINNED: &str = "not the pinned build:";
 
 /// How a part's failure begins when its session exports a variable the build list clears. The
-/// agent was not started, so the harness records the part as not run, with the rest of the line as
-/// its reason.
+/// agent was not started with it, so the harness records the part as not run, with the rest of
+/// the line as its reason.
 pub const ENVIRONMENT_NOT_CLEAR: &str = "the session's environment is not clear:";
+
+/// How a part's failure begins when the names its session's shell exports could not be read, so
+/// that none of the variables the build list clears is exported cannot be established. The part
+/// is not run either.
+pub const ENVIRONMENT_NOT_READ: &str = "the session's environment could not be read:";
 
 /// The file the session's shell writes its PATH to before each prompt, in the run's home.
 pub const PATH_FILE: &str = ".kr-agents-path";
@@ -54,18 +59,45 @@ pub const PATH_FILE: &str = ".kr-agents-path";
 /// one on each line and never a value, in the run's home.
 pub const EXPORTED_FILE: &str = ".kr-agents-exported";
 
-/// Checks the names a session's shell wrote to [`EXPORTED_FILE`] against the variables `cleared`
-/// names: the agent inherits what the shell exports, so none of them may be there.
+/// The file the session's shell writes the same names to just before it runs a command line, so
+/// that the last line it ran, the agent's, is the one it describes.
+pub const STARTED_FILE: &str = ".kr-agents-started";
+
+/// The variable every shell of a session exports, whose name the shell's list must hold for the
+/// list to be one: a list without it was not written.
+const EXPORTED_WITNESS: &str = "PATH";
+
+/// Whether `name` is one `pattern` names: a name, or a prefix when the pattern ends in `*`.
+fn names(pattern: &str, name: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .map_or(pattern == name, |prefix| name.starts_with(prefix))
+}
+
+/// Checks the names a session's shell wrote against the variables `cleared` names, each a name or
+/// a prefix that ends in `*`, except the names in `allowed`, which the build list sets itself: the
+/// agent inherits what the shell exports, so none of them may be there.
 ///
 /// # Errors
 ///
-/// Returns why, beginning with [`ENVIRONMENT_NOT_CLEAR`], naming the cleared variables that are
-/// exported, and never a value.
-pub fn exported_clear(exported: &str, cleared: &[String]) -> Result<(), String> {
-    let present: Vec<&str> = cleared
-        .iter()
-        .map(String::as_str)
-        .filter(|name| exported.lines().any(|line| line == *name))
+/// Returns why: beginning with [`ENVIRONMENT_NOT_READ`] when `exported` holds no `PATH`, since a
+/// list without it was not written; beginning with [`ENVIRONMENT_NOT_CLEAR`], naming the
+/// variables that are exported, and never a value, when it holds a cleared one.
+pub fn exported_clear(
+    exported: &str,
+    cleared: &[String],
+    allowed: &[String],
+) -> Result<(), String> {
+    if !exported.lines().any(|line| line == EXPORTED_WITNESS) {
+        return Err(format!(
+            "{ENVIRONMENT_NOT_READ} the names the session's shell exports do not include \
+             {EXPORTED_WITNESS}, so they were not written"
+        ));
+    }
+    let present: Vec<&str> = exported
+        .lines()
+        .filter(|name| !allowed.iter().any(|allowed| allowed == name))
+        .filter(|name| cleared.iter().any(|pattern| names(pattern, name)))
         .collect();
     if present.is_empty() {
         Ok(())
@@ -207,7 +239,10 @@ pub struct Provenance {
     link: PathBuf,
     path_file: PathBuf,
     exported_file: PathBuf,
+    started_file: PathBuf,
     cleared: Vec<String>,
+    allowed: Vec<String>,
+    cleared_required: AtomicBool,
     seen_path: Mutex<Option<String>>,
     seen: Mutex<Seen>,
     roots: Mutex<Vec<ProcessStartIdentity>>,
@@ -254,11 +289,32 @@ impl Provenance {
             link: run.root().join("agent").join("current").join("bin"),
             path_file: run.home().join(PATH_FILE),
             exported_file: run.home().join(EXPORTED_FILE),
+            started_file: run.home().join(STARTED_FILE),
             cleared: build
                 .account
                 .as_ref()
                 .map(|account| account.cleared.clone())
                 .unwrap_or_default(),
+            // What the build list sets in the session itself is not the person's.
+            allowed: build
+                .environment
+                .keys()
+                .chain(
+                    build
+                        .account
+                        .iter()
+                        .flat_map(|account| account.variables.keys()),
+                )
+                .chain(
+                    build
+                        .account
+                        .iter()
+                        .filter_map(|account| account.config_directory.as_ref())
+                        .map(|directory| &directory.variable),
+                )
+                .cloned()
+                .collect(),
+            cleared_required: AtomicBool::new(false),
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
             roots: Mutex::new(Vec::new()),
@@ -329,19 +385,40 @@ impl Provenance {
     ///
     /// # Errors
     ///
-    /// Returns why, beginning with [`ENVIRONMENT_NOT_CLEAR`], when the shell wrote no names or
-    /// exports one that is cleared.
+    /// Returns why, as [`exported_clear`] does, or beginning with [`ENVIRONMENT_NOT_READ`] when
+    /// the shell wrote no names.
     pub fn check_cleared(&self) -> Result<(), String> {
-        if self.cleared.is_empty() {
+        self.check_names(&self.exported_file)
+    }
+
+    /// Checks the same names as the shell wrote them just before it ran its last command line,
+    /// which is the agent's: what the agent started with, and not what the shell had at the
+    /// prompt before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why, as [`Provenance::check_cleared`] does.
+    pub fn check_cleared_at_start(&self) -> Result<(), String> {
+        self.check_names(&self.started_file)
+    }
+
+    /// Makes the launch check the variables the build list clears: the parts that run with the
+    /// person's login, whose turns the model answers, need them absent; the others start no turn.
+    pub fn require_cleared(&self) {
+        self.cleared_required.store(true, Ordering::SeqCst);
+    }
+
+    fn check_names(&self, file: &Path) -> Result<(), String> {
+        if self.cleared.is_empty() || !self.cleared_required.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let exported = std::fs::read_to_string(&self.exported_file).map_err(|error| {
+        let exported = std::fs::read_to_string(file).map_err(|error| {
             format!(
-                "{ENVIRONMENT_NOT_CLEAR} the session's shell wrote no exported names to {}: {error}",
-                self.exported_file.display()
+                "{ENVIRONMENT_NOT_READ} the session's shell wrote no exported names to {}: {error}",
+                file.display()
             )
         })?;
-        exported_clear(&exported, &self.cleared)
+        exported_clear(&exported, &self.cleared, &self.allowed)
     }
 
     /// Records the image each of `processes` maps and checks where it lies.
@@ -1147,7 +1224,9 @@ mod tests {
         assert_eq!((mapping.device, mapping.inode), (None, None));
     }
 
-    /// A cleared variable the shell exports fails the check by name, and no other name does.
+    /// A cleared variable the shell exports fails the check by name, a prefix clears every name
+    /// that begins with it but for those the build list sets itself, and a list without PATH was
+    /// not written.
     #[test]
     fn a_cleared_variable_the_shell_exports_fails_the_check_by_name() {
         let exported = "HOME\nPATH\nCLAUDE_CODE_SUBAGENT_MODEL\nTERM\n";
@@ -1155,22 +1234,48 @@ mod tests {
             "CLAUDE_CODE_SUBAGENT_MODEL".to_owned(),
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE".to_owned(),
         ];
-        let refused = exported_clear(exported, &cleared).expect_err("an exported cleared name");
+        let refused =
+            exported_clear(exported, &cleared, &[]).expect_err("an exported cleared name");
         assert!(refused.starts_with(ENVIRONMENT_NOT_CLEAR), "{refused}");
         assert!(refused.ends_with("CLAUDE_CODE_SUBAGENT_MODEL, which the build list clears"));
         assert!(
             !refused.contains("_FORCE"),
             "only the exported name is said: {refused}"
         );
-        assert_eq!(exported_clear("HOME\nPATH\n", &cleared), Ok(()));
+        assert_eq!(exported_clear("HOME\nPATH\n", &cleared, &[]), Ok(()));
         // A name that merely starts with a cleared one, or holds it, is another variable.
         assert_eq!(
             exported_clear(
-                "CLAUDE_CODE_SUBAGENT_MODEL_X\nX_CLAUDE_CODE_SUBAGENT_MODEL\n",
-                &cleared
+                "PATH\nCLAUDE_CODE_SUBAGENT_MODEL_X\nX_CLAUDE_CODE_SUBAGENT_MODEL\n",
+                &cleared,
+                &[]
             ),
             Ok(())
         );
+        // A prefix clears every name beneath it, but for the names the build list sets itself.
+        let prefixes = ["ANTHROPIC_*".to_owned(), "CLAUDE_*".to_owned()];
+        let allowed = ["CLAUDE_CONFIG_DIR".to_owned()];
+        assert_eq!(
+            exported_clear("PATH\nCLAUDE_CONFIG_DIR\nOTHER\n", &prefixes, &allowed),
+            Ok(())
+        );
+        let refused = exported_clear(
+            "PATH\nCLAUDE_CONFIG_DIR\nANTHROPIC_DEFAULT_OPUS_MODEL\nCLAUDE_CODE_USE_VERTEX\n",
+            &prefixes,
+            &allowed,
+        )
+        .expect_err("names beneath the prefixes");
+        assert!(
+            refused.ends_with(
+                "exports ANTHROPIC_DEFAULT_OPUS_MODEL, CLAUDE_CODE_USE_VERTEX, which the build list clears"
+            ),
+            "{refused}"
+        );
+        // A list that holds no PATH was not written, whatever else it holds or lacks.
+        for unwritten in ["", "HOME\nTERM\n"] {
+            let refused = exported_clear(unwritten, &cleared, &[]).expect_err("not written");
+            assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
+        }
     }
 
     /// Each process's files are its own, and each begins at its `f`.
