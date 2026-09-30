@@ -268,16 +268,14 @@ fn a_module_that_imports_from_an_unloaded_package_module_or_only_weakly_binds() 
     assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
 }
 
-/// A module the bridge cannot read is reported as one it could not read, and the contract refuses
-/// it: an inspection that is not whole is never a module that binds.
+/// A file the loader refuses is the loader's to report: the shell does not hold it, so the report
+/// has no entry for it, and the session is not refused for a module that never loaded.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
-fn a_module_that_cannot_be_read_is_reported_as_unread_and_refused() {
+fn a_file_the_loader_refuses_is_the_loaders_to_report_and_is_not_listed() {
     let package = Package::built(ShellKind::Zsh);
     let setup = home_with_modules(&package, &["kr_wrong_abi"]);
-    // A file named like a module, whose contents are not a module in any format the shell loads
-    // or this reads: the loader refuses it, so the report holds no entry for it, and what is left
-    // is a shell whose only module of the person's own is one that never loaded.
+    // A file named like a module, whose contents are not a module in any format the shell loads.
     std::fs::write(setup.home.join("modules/kr_wrong_abi.so"), b"not a module")
         .expect("writes the file");
     let mut session = Session::start_for(&package, &case(), &setup);
@@ -291,6 +289,49 @@ fn a_module_that_cannot_be_read_is_reported_as_unread_and_refused() {
         "a module the loader refused is the loader's to diagnose: {listed:?}"
     );
     assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+}
+
+/// A module the shell holds whose file is gone when the hooks go live cannot be read, and an
+/// inspection that is not whole is reported as such and refused by name, never taken for a module
+/// that binds.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
+fn a_module_whose_file_is_gone_is_reported_as_unread_and_refused() {
+    let package = Package::built(ShellKind::Zsh);
+    let modules = built_modules(&package);
+    let mut setup = home_loading(&package, &modules, "kr_user_compatible");
+    setup.environment.push((
+        "KR_TEST_REMOVE_AFTER_LOAD".to_owned(),
+        "kr_user_compatible".to_owned(),
+    ));
+
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
+    assert_eq!(
+        setup.recorded_order(),
+        ["user-top", "kr-module-loaded", "user-bottom"],
+        "the module loaded before its file was removed: {}",
+        refusals(&setup)
+    );
+    assert!(
+        !setup.home.join("modules/kr_user_compatible.so").exists(),
+        "the startup file removed the module's file"
+    );
+    let ours = module(&listed, "kr_user_compatible");
+    assert!(
+        matches!(&ours.imports, ModuleImports::NotRead(why) if !why.is_empty()),
+        "a module with no file to read is not one that binds: {ours:?}"
+    );
+    let refused = decide_activated_modules("zle-5.9", &listed)
+        .expect_err("an inspection that is not whole is not a pass");
+    assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
+    assert!(
+        refused.error.message.starts_with(
+            "module kr_user_compatible could not be checked against this reader (zle-5.9): "
+        ),
+        "{}",
+        refused.error.message
+    );
 }
 
 /// Every module of the package's own tree, loaded from a directory the person's module path puts
