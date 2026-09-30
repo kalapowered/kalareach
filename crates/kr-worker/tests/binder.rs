@@ -442,7 +442,9 @@ fn kr_req_11_13_a_binding_keeps_the_version_it_was_bound_with() {
 /// recognises it keeps the terminal as its route and no typed action is advertised through it.
 /// The package is still admitted and a binding is still made for the program, with no version;
 /// the connector's table is qualified against a version, so its channel is not served for that
-/// program, and the same package's channel opens for the build a signed record names.
+/// program, and the same package's channel opens for the build a signed record names. A typed
+/// action here is one of the connector's table, which only a served channel carries; the package's
+/// own declared actions are registered at bind whatever the version.
 #[test]
 fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and_no_typed_action() {
     let worker = Worker::open();
@@ -495,7 +497,9 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
         .expect("the binding carries its program");
     assert_eq!(bound.version, None);
 
-    // Its channel is not served, so nothing typed is offered through it.
+    // Its channel is not served, so no typed action of the connector's table is offered through
+    // it. The version the channel is opened with is the one the connector's own signed builds
+    // give, which is the version the admitted match gives.
     let connector = worker
         .sources
         .for_command(fixture::COMMAND)
@@ -505,13 +509,18 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
         starter: Some(launched()),
         started: None,
     };
+    assert_eq!(connector.qualified_version(&unnamed), None);
+    assert_eq!(
+        connector.qualified_version(&named),
+        matched.version_of(&named)
+    );
     let refusal = worker
         .broker
         .open_bridge_channel(
             instance(2),
             &bridge,
             &connector,
-            matched.version_of(&unnamed),
+            connector.qualified_version(&unnamed),
         )
         .expect_err("no channel for a build no record names");
     assert!(
@@ -523,7 +532,12 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
     // Control: the same package, the same instance and bridge, for the build a record names.
     worker
         .broker
-        .open_bridge_channel(instance(2), &bridge, &connector, matched.version_of(&named))
+        .open_bridge_channel(
+            instance(2),
+            &bridge,
+            &connector,
+            connector.qualified_version(&named),
+        )
         .expect("the channel opens for the build a signed record names");
 }
 
@@ -1614,6 +1628,73 @@ async fn kr_req_25_22_disable_at_once_ends_a_revoked_binding_once_its_admitted_r
         "each binding on the revoked release is warned about, and the session is told when none \
          is left"
     );
+}
+
+/// KR-REQ-18.06: a binding on a package the organisation's allowlist no longer names ends at its
+/// next admission boundary, as a disabled or removed package's does: it admits nothing more while
+/// a request it admitted is open, and says the allowlist may be why, not only that the package was
+/// disabled or removed.
+#[tokio::test]
+async fn kr_req_18_06_a_binding_ended_by_the_allowlist_admits_nothing_and_says_why() {
+    let worker = Worker::open();
+    let source = worker.claude_code();
+    let package = testing::admitted(&source);
+    let first = worker.admit(1, vec![package.clone()]);
+    worker
+        .broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(2)),
+        )
+        .expect("the launched instance is registered");
+    worker
+        .bind(1, 2, source.package_digest, first)
+        .expect("binds");
+    let connector = worker
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+    let (resource, _upstream) = relayed_approval(&worker.broker, &connector);
+    let caller = Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+    let answer = kr_protocol::agent::AgentApprovalRespondParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_worker::broker::subject(session(), instance(2)),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        resource_id: resource.resource_id,
+        option_id: "allow".to_owned(),
+    };
+    worker
+        .broker
+        .admit_approval(&caller, &answer, kr_ipc::now_ms())
+        .expect("the answer is admitted before the allowlist changes");
+    worker.rich_admission(1, 2).expect("admitted before");
+
+    worker.hand_over(Snapshot {
+        releases: vec![ReleaseState {
+            ends_at_next_boundary: true,
+            ..testing::release_of(&package)
+        }],
+        ..Snapshot::admitting(2, Vec::new())
+    });
+    assert!(
+        worker
+            .broker
+            .live_bindings()
+            .iter()
+            .any(|live| live.binding_id == binding(1) && live.ending),
+        "the binding whose request is open is reported ending"
+    );
+    let refusal = worker
+        .rich_admission(1, 2)
+        .expect_err("it admits nothing more")
+        .to_string();
+    assert!(refusal.contains("allowlist"), "{refusal}");
 }
 
 // ---------------------------------------------------------------------------------------------

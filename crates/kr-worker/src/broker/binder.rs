@@ -631,7 +631,8 @@ impl BrokerState {
             if state.ends_at_next_boundary {
                 self.end_at_next_boundary(
                     binding_id,
-                    "its package was disabled or removed from this environment",
+                    "its package is no longer admitted to this environment: it was disabled or \
+                     removed, or the organisation's allowlist no longer names it",
                 );
             }
         }
