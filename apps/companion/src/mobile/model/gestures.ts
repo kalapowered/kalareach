@@ -1,5 +1,8 @@
 /**
- * Touch on a raw terminal, and who owns it.
+ * Touch on a raw terminal, and what the view says of who owns it.
+ *
+ * The browser's own panning and zooming are off inside the terminal (`touch-action: none`), so the
+ * view is given every gesture in both modes and decides what each means; this says so to the person.
  *
  * The desktop view routes the wheel: in control mode it belongs to the program inside the
  * terminal, and a pan control that took it would make a pager or an editor unusable. A finger is
@@ -15,31 +18,7 @@
  */
 
 import type { TerminalControl, TerminalWheel } from '../../host/port'
-import { ASKING, type ViewMode } from '../../terminal/modes'
-
-/** One touch gesture, in the terms both modes understand. */
-export interface TouchGesture {
-  /** How many fingers are down. */
-  readonly pointers: number
-  /** How far the gesture has moved since it began. */
-  readonly deltaX: number
-  readonly deltaY: number
-  /** The pinch factor, where 1 is unchanged. Only meaningful with two fingers. */
-  readonly scale: number
-}
-
-/**
- * Whether the view should stop the browser handling this gesture itself.
- *
- * The answer is yes for every gesture the program owns, which is every gesture in control mode, and
- * for every gesture the view owns: a pinch in either mode, and any movement in view mode, which moves
- * the view's window, so the page never scrolls under a finger that is moving it. It is no for a
- * touch in view mode that has not moved, which neither of them uses.
- */
-export function consumesGesture(mode: ViewMode, gesture: TouchGesture): boolean {
-  if (gesture.pointers >= 2) return true
-  return mode === 'control' || Math.abs(gesture.deltaY) > 0 || Math.abs(gesture.deltaX) > 0
-}
+import { ASKING } from '../../terminal/modes'
 
 /**
  * What the view says of control: what view mode does, or why control last ended; that it asks the
