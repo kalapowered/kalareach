@@ -46,6 +46,7 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  KeyAction,
   KeypadCode,
   OwnerView,
   PairingView,
@@ -69,7 +70,7 @@ import type {
 } from './port'
 import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
-import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams } from './fake-decode'
+import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams, STORAGE_OBJECT_DELETE_PARAMS } from './fake-decode'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -937,18 +938,21 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         requireConnection()
         return retained(deletedArtefacts)
       }),
-    storageObjectDelete: (params) => {
-      const id = (params as { object_id?: string }).object_id
-      const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
-      if (artefact?.held_by_other_party) {
-        refuse(
-          'PERMISSION_DENIED',
-          'A copy an authorised viewer holds is not reachable from this host.'
-        )
-      }
-      if (id) deletedArtefacts.add(id)
-      return Promise.resolve(settledAs('storage.object.delete', 'applied'))
-    },
+    // Read as the request's own type is read, and answered as a rejection: a request that is not the
+    // artefact's identifier alone is refused by name, and nothing is deleted by it.
+    storageObjectDelete: (params) =>
+      Promise.resolve().then(() => {
+        const { object_id: id } = decodeParams<{ object_id: string }>(params, STORAGE_OBJECT_DELETE_PARAMS)
+        const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
+        if (artefact?.held_by_other_party) {
+          refuse(
+            'PERMISSION_DENIED',
+            'A copy an authorised viewer holds is not reachable from this host.'
+          )
+        }
+        deletedArtefacts.add(id)
+        return settledAs('storage.object.delete', 'applied')
+      }),
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
     // order, then the session identifier parsed and the size checked, or nothing opens.
@@ -2069,7 +2073,9 @@ function fakeTerminalView(
       // keeps control.
       input: (next) => {
         const input = readTerminalInput(next)
-        if (typeof input === 'string') return refused('INVALID_ARGUMENT', input)
+        if (typeof input === 'string') {
+          return refused('INVALID_ARGUMENT', `those are not this operation's parameters: ${input}`)
+        }
         if (closed || ended) return refused('LEASE_LOST', 'This view has ended, and took nothing.')
         switch (input.kind) {
           case 'take':
@@ -2142,13 +2148,6 @@ const KEYPAD: readonly string[] = [
   'NumpadEnter'
 ]
 
-/** Whether native code reads `text` as one character: one Unicode scalar, never a control character. */
-function oneScalar(text: string): boolean {
-  const scalars = [...text]
-  const point = scalars.length === 1 ? text.codePointAt(0) : undefined
-  return point !== undefined && !controlCharacter(point)
-}
-
 /** Whether a code point is a control character, as native code's `char::is_control` says. */
 function controlCharacter(point: number): boolean {
   return point <= 0x1f || (point >= 0x7f && point <= 0x9f)
@@ -2176,6 +2175,7 @@ interface IntegerType {
 
 const U32: IntegerType = { name: 'u32', least: 0n, greatest: 2n ** 32n - 1n }
 const U64: IntegerType = { name: 'u64', least: 0n, greatest: 2n ** 64n - 1n }
+const I32: IntegerType = { name: 'i32', least: -(2n ** 31n), greatest: 2n ** 31n - 1n }
 const I64: IntegerType = { name: 'i64', least: -(2n ** 63n), greatest: 2n ** 63n - 1n }
 
 /**
@@ -2195,27 +2195,29 @@ function asDecoded(value: number): { readonly integer: bigint } | { readonly flo
 }
 
 /**
- * A floating point number in the form native code's decoder writes one: every digit, without an
- * exponent, and with a decimal point. The digits are JavaScript's shortest form for the number; for
- * one with more significant digits than a double holds, or one halfway between two shortest forms,
- * the decoder's own digits can differ in the last place.
+ * A floating point number in the form native code's decoder writes one: the shortest digits that
+ * read back as the number, plain with a decimal point (`1000.0`, `0.00001`) for a magnitude from
+ * one hundred thousandth up to but not including 1e16, and otherwise a mantissa and an exponent with
+ * its sign (`1e+22`, `1.5e-7`). The digits are JavaScript's shortest form for the number, which are
+ * the decoder's, unless the decoder's own reading of the number differs in the last place.
  */
 function asFloatWords(value: number): string {
-  const text = String(value)
-  const exponent = /^(-?)(\d)(?:\.(\d+))?e([+-]\d+)$/.exec(text)
-  let written = text
-  if (exponent !== null) {
-    const [, sign = '', lead = '', rest = '', power = '0'] = exponent
-    const digits = lead + rest
-    const point = 1 + Number(power)
-    written =
-      point >= digits.length
-        ? sign + digits + '0'.repeat(point - digits.length)
-        : point <= 0
-          ? `${sign}0.${'0'.repeat(-point)}${digits}`
-          : `${sign}${digits.slice(0, point)}.${digits.slice(point)}`
+  const magnitude = Math.abs(value)
+  const sign = value < 0 || Object.is(value, -0) ? '-' : ''
+  const [mantissa = '0', power = '0'] = magnitude.toExponential().split('e')
+  const exponent = Number(power)
+  if (magnitude !== 0 && (magnitude < 1e-5 || magnitude >= 1e16)) {
+    return `${sign}${mantissa}e${exponent < 0 ? '-' : '+'}${Math.abs(exponent)}`
   }
-  return written.includes('.') ? written : `${written}.0`
+  const digits = mantissa.replace('.', '')
+  const point = exponent + 1
+  const written =
+    point >= digits.length
+      ? digits + '0'.repeat(point - digits.length)
+      : point <= 0
+        ? `0.${'0'.repeat(-point)}${digits}`
+        : `${digits.slice(0, point)}.${digits.slice(point)}`
+  return `${sign}${written.includes('.') ? written : `${written}.0`}`
 }
 
 /**
@@ -2314,137 +2316,235 @@ export function isSessionId(value: unknown): value is string {
 }
 
 
+/** One field of an input, as native code's type for it reads it. */
+interface InputField {
+  readonly name: string
+  /** Why native code's decoder does not read `value` as this field, in its words, or null when it does. */
+  readonly problem: (value: unknown) => string | null
+  /** A field native code takes as none when it is left out or null. */
+  readonly optional?: true
+}
+
+/** How native code's decoder names a value it did not expect, inside the parameters it reads. */
+const withinParameters = (value: unknown): string => {
+  const words = unexpected(value)
+  return words === 'unit value' ? 'null' : words
+}
+
+/** A whole number of `type`, as native code's decoder reads one inside the parameters it decodes. */
+const wholeNumber =
+  (type: IntegerType): InputField['problem'] =>
+  (value) =>
+    notInteger(type, value)?.replace('unit value', 'null') ?? null
+
+const aFlag: InputField['problem'] = (value) =>
+  typeof value === 'boolean' ? null : `invalid type: ${withinParameters(value)}, expected a boolean`
+
+/** A string, before native code's own rule for what the string may be. */
+const stringThen =
+  (rule: (text: string) => string | null): InputField['problem'] =>
+  (value) =>
+    typeof value === 'string' ? rule(value) : `invalid type: ${withinParameters(value)}, expected a string`
+
+/** A choice among names, as native code's decoder reads a value it takes for one of its variants. */
+const oneNamed =
+  (names: readonly string[]): InputField['problem'] =>
+  (value) => {
+    if (typeof value !== 'string') return `invalid type: ${withinParameters(value)}, expected string or map`
+    return names.includes(value) ? null : `unknown variant \`${value}\`, expected ${listed(names)}`
+  }
+
+/** How the decoder lists what it expected: `a`, `a` or `b`, or one of `a`, `b`, `c`. */
+function listed(names: readonly string[]): string {
+  const quoted = names.map((name) => `\`${name}\``)
+  if (quoted.length === 1) return quoted[0] ?? ''
+  if (quoted.length === 2) return `${quoted[0] ?? ''} or ${quoted[1] ?? ''}`
+  return `one of ${quoted.join(', ')}`
+}
+
+const KEY_ACTIONS = ['press', 'repeat', 'release']
+
+/** A key's name: one character that is not a control character, or the name of a key that makes none. */
+const keyName = stringThen((key) => {
+  const scalars = [...key]
+  if (scalars.length === 1) {
+    return controlCharacter(key.codePointAt(0) ?? 0) ? "a key's character is never a control character" : null
+  }
+  return key.length > 0 && new TextEncoder().encode(key).length <= 32 && /^[A-Za-z0-9]+$/.test(key)
+    ? null
+    : 'a key is one character or the name of a key'
+})
+
+/** The character a key makes with nothing held: one scalar, never a control character. */
+const keyCharacter = stringThen((text) => {
+  const scalars = [...text]
+  if (scalars.length !== 1) return "a key's character is one character"
+  return controlCharacter(text.codePointAt(0) ?? 0) ? "a key's character is never a control character" : null
+})
+
+const committedText = stringThen((text) => {
+  if (text.length === 0) return 'text says something'
+  const bytes = new TextEncoder().encode(text).length
+  if (bytes > MAX_TEXT_BYTES) return `text carries at most ${MAX_TEXT_BYTES} bytes at once, not ${bytes}`
+  return [...text].some((scalar) => controlCharacter(scalar.codePointAt(0) ?? 0))
+    ? 'text carries no control character: a key is sent as a key'
+    : null
+})
+
+const pastedText = stringThen((text) => {
+  if (text.length === 0) return 'a paste says something'
+  const bytes = new TextEncoder().encode(text).length
+  return bytes > MAX_PASTE_BYTES ? `a paste carries at most ${MAX_PASTE_BYTES} bytes at once, not ${bytes}` : null
+})
+
+/** How many times a wheel turns: a 32-bit integer, and then between one and the most, either way. */
+const turnsOfAWheel: InputField['problem'] = (value) => {
+  const read = wholeNumber(I32)(value)
+  if (read !== null) return read
+  const turns = value as number
+  return turns === 0 || Math.abs(turns) > MAX_TURNS
+    ? `a wheel turns between 1 and ${MAX_TURNS} times either way, not ${turns}`
+    : null
+}
+
+/** The variants of an input, in the order native code declares them, each with its fields in order. */
+const INPUT_VARIANTS: Readonly<Record<string, readonly InputField[]>> = {
+  take: [{ name: 'number', problem: wholeNumber(U64) }],
+  release: [{ name: 'number', problem: wholeNumber(U64) }],
+  wheel: [
+    { name: 'take', problem: wholeNumber(U64) },
+    { name: 'column', problem: wholeNumber(U32) },
+    { name: 'line', problem: wholeNumber(U32) },
+    { name: 'turns', problem: turnsOfAWheel },
+    { name: 'shift', problem: aFlag },
+    { name: 'alt', problem: aFlag },
+    { name: 'control', problem: aFlag }
+  ],
+  key: [
+    { name: 'take', problem: wholeNumber(U64) },
+    { name: 'key', problem: keyName },
+    { name: 'base', problem: (value) => (value === null ? null : keyCharacter(value)), optional: true },
+    { name: 'keypad', problem: (value) => (value === null ? null : oneNamed(KEYPAD)(value)), optional: true },
+    { name: 'shift', problem: aFlag },
+    { name: 'alt', problem: aFlag },
+    { name: 'control', problem: aFlag },
+    { name: 'caps_lock', problem: aFlag },
+    { name: 'num_lock', problem: aFlag },
+    { name: 'event', problem: oneNamed(KEY_ACTIONS) }
+  ],
+  text: [
+    { name: 'take', problem: wholeNumber(U64) },
+    { name: 'text', problem: committedText }
+  ],
+  paste: [
+    { name: 'take', problem: wholeNumber(U64) },
+    { name: 'text', problem: pastedText }
+  ]
+}
+
+const INPUT_KINDS = Object.keys(INPUT_VARIANTS)
+
+/** The plural of "element", as the decoder counts a variant's. */
+const elements = (count: number): string => `${count} element${count === 1 ? '' : 's'}`
+
 /**
- * The page's input read as native code reads it, or why it is not the view's input shape: exactly
- * the fields of its kind, a whole number for each number, a key one character or the name of a key,
- * text with no control character, and turns, text and a paste within what one input carries. A
- * key's unshifted character and keypad key may be left out, as none.
+ * The page's input read as native code reads it, or why native code refuses it, in the decoder's own
+ * words: the input is one of the variants of an internally tagged type, its fields are read in the
+ * order the map holds them (keys sorted, as a map of JSON values holds them), the first that is
+ * unknown or wrong ends the reading, and a field left out is the first left out in declaration order,
+ * but for a key's unshifted character and keypad key, which are none. A whole number, a flag, text
+ * and a choice are read as the field's own type reads them. A value written as a sequence is read
+ * field by field in the same order. The words for a number that is not a whole number use the
+ * decoder's notation for a floating point number; a map given for a choice, which the decoder reads
+ * as a one-entry map, is not modelled and is refused as a choice given by anything but a name.
  */
 export function readTerminalInput(value: unknown): TerminalInput | string {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'an input is a map'
+  if (Array.isArray(value)) return readInputSequence(value)
+  if (typeof value !== 'object' || value === null) {
+    return `invalid type: ${withinParameters(value)}, expected internally tagged enum Input`
+  }
   const fields = value as Record<string, unknown>
-  const exactly = (...names: string[]): string | null => {
-    const extra = Object.keys(fields).filter((name) => !names.includes(name))
-    if (extra.length > 0) return `unknown field \`${extra[0] ?? ''}\``
-    const missing = names.filter((name) => !(name in fields) && name !== 'base' && name !== 'keypad')
-    return missing.length > 0 ? `missing field \`${missing[0] ?? ''}\`` : null
+  if (!('kind' in fields)) return 'missing field `kind`'
+  const kind = fields['kind']
+  if (typeof kind !== 'string') return `invalid type: ${withinParameters(kind)}, expected variant identifier`
+  const declared = INPUT_VARIANTS[kind]
+  if (declared === undefined || !Object.hasOwn(INPUT_VARIANTS, kind)) {
+    return `unknown variant \`${kind}\`, expected ${listed(INPUT_KINDS)}`
   }
-  // A number is read as native code's decoder reads its field's integer type.
-  const whole = (name: string, type: IntegerType = U64): number | string => {
-    const number = fields[name]
-    return typeof number === 'number' && notInteger(type, number) === null
-      ? number
-      : `\`${name}\` is not a whole number in range`
+  const names = declared.map((field) => field.name)
+  for (const name of Object.keys(fields).sort()) {
+    if (name === 'kind') continue
+    const field = declared.find((each) => each.name === name)
+    if (field === undefined) {
+      return `unknown field \`${name}\`, expected ${listed(names)}`
+    }
+    const problem = field.problem(fields[name])
+    if (problem !== null) return problem
   }
-  const flag = (name: string): boolean | string =>
-    typeof fields[name] === 'boolean' ? fields[name] : `\`${name}\` is not true or false`
-  switch (fields['kind']) {
+  for (const field of declared) {
+    if (!(field.name in fields) && field.optional !== true) return `missing field \`${field.name}\``
+  }
+  return inputOf(kind, (name) => fields[name])
+}
+
+/** An input written as a sequence: its variant's name, then its fields in declaration order. */
+function readInputSequence(sequence: readonly unknown[]): TerminalInput | string {
+  const [kind, ...rest] = sequence
+  if (sequence.length === 0) return 'missing field `kind`'
+  if (typeof kind !== 'string') return `invalid type: ${withinParameters(kind)}, expected variant identifier`
+  const declared = Object.hasOwn(INPUT_VARIANTS, kind) ? INPUT_VARIANTS[kind] : undefined
+  if (declared === undefined) return `unknown variant \`${kind}\`, expected ${listed(INPUT_KINDS)}`
+  for (const [index, field] of declared.entries()) {
+    if (index >= rest.length) {
+      return `invalid length ${rest.length}, expected struct variant Input::${kind[0]?.toUpperCase() ?? ''}${kind.slice(1)} with ${elements(declared.length)}`
+    }
+    const problem = field.problem(rest[index])
+    if (problem !== null) return problem
+  }
+  if (rest.length > declared.length) {
+    return `invalid length ${rest.length}, expected ${elements(declared.length)} in sequence`
+  }
+  return inputOf(kind, (name) => rest[declared.findIndex((field) => field.name === name)])
+}
+
+/** The input a kind and its fields make, once every field is read. */
+function inputOf(kind: string, field: (name: string) => unknown): TerminalInput {
+  const flag = (name: string) => field(name) as boolean
+  const whole = (name: string) => field(name) as number
+  switch (kind) {
     case 'take':
-    case 'release': {
-      const wrong = exactly('kind', 'number')
-      if (wrong !== null) return wrong
-      const number = whole('number')
-      return typeof number === 'string' ? number : { kind: fields['kind'], number }
-    }
-    case 'wheel': {
-      const wrong = exactly('kind', 'take', 'column', 'line', 'turns', 'shift', 'alt', 'control')
-      if (wrong !== null) return wrong
-      const take = whole('take')
-      const column = whole('column', U32)
-      const line = whole('line', U32)
-      const turns = fields['turns']
-      const shift = flag('shift')
-      const alt = flag('alt')
-      const control = flag('control')
-      for (const read of [take, column, line, shift, alt, control]) {
-        if (typeof read === 'string') return read
-      }
-      if (typeof turns !== 'number' || !Number.isInteger(turns) || turns === 0 || Math.abs(turns) > MAX_TURNS) {
-        return `a wheel turns between 1 and ${MAX_TURNS} times either way`
-      }
+    case 'release':
+      return { kind, number: whole('number') }
+    case 'wheel':
       return {
-        kind: 'wheel',
-        take: take as number,
-        column: column as number,
-        line: line as number,
-        turns,
-        shift: shift as boolean,
-        alt: alt as boolean,
-        control: control as boolean
+        kind,
+        take: whole('take'),
+        column: whole('column'),
+        line: whole('line'),
+        turns: whole('turns'),
+        shift: flag('shift'),
+        alt: flag('alt'),
+        control: flag('control')
       }
-    }
-    case 'key': {
-      const wrong = exactly(
-        'kind',
-        'take',
-        'key',
-        'base',
-        'keypad',
-        'shift',
-        'alt',
-        'control',
-        'caps_lock',
-        'num_lock',
-        'event'
-      )
-      if (wrong !== null) return wrong
-      const take = whole('take')
-      const shift = flag('shift')
-      const alt = flag('alt')
-      const control = flag('control')
-      const capsLock = flag('caps_lock')
-      const numLock = flag('num_lock')
-      for (const read of [take, shift, alt, control, capsLock, numLock]) {
-        if (typeof read === 'string') return read
-      }
-      const key = fields['key']
-      const named = typeof key === 'string' && /^[A-Za-z0-9]{1,32}$/.test(key)
-      if (typeof key !== 'string' || !(oneScalar(key) || named)) {
-        return 'a key is one character or the name of a key'
-      }
-      const base = fields['base'] ?? null
-      if (base !== null && (typeof base !== 'string' || !oneScalar(base))) {
-        return "a key's character is one character, never a control character"
-      }
-      const keypad = fields['keypad'] ?? null
-      if (keypad !== null && (typeof keypad !== 'string' || !KEYPAD.includes(keypad))) {
-        return 'unknown variant: a keypad key is one of the keypad codes'
-      }
-      const event = fields['event']
-      if (event !== 'press' && event !== 'repeat' && event !== 'release') {
-        return 'unknown variant: a key is pressed, repeated or released'
-      }
+    case 'key':
       return {
-        kind: 'key',
-        take: take as number,
-        key,
-        base,
-        keypad: keypad as KeypadCode | null,
-        shift: shift as boolean,
-        alt: alt as boolean,
-        control: control as boolean,
-        caps_lock: capsLock as boolean,
-        num_lock: numLock as boolean,
-        event
+        kind,
+        take: whole('take'),
+        key: field('key') as string,
+        base: (field('base') ?? null) as string | null,
+        keypad: (field('keypad') ?? null) as KeypadCode | null,
+        shift: flag('shift'),
+        alt: flag('alt'),
+        control: flag('control'),
+        caps_lock: flag('caps_lock'),
+        num_lock: flag('num_lock'),
+        event: field('event') as KeyAction
       }
-    }
     case 'text':
-    case 'paste': {
-      const wrong = exactly('kind', 'take', 'text')
-      if (wrong !== null) return wrong
-      const take = whole('take')
-      if (typeof take === 'string') return take
-      const text = fields['text']
-      if (typeof text !== 'string' || text.length === 0) return 'text says something'
-      const most = fields['kind'] === 'text' ? MAX_TEXT_BYTES : MAX_PASTE_BYTES
-      if (new TextEncoder().encode(text).length > most) return `text carries at most ${most} bytes at once`
-      if (fields['kind'] === 'text' && [...text].some((scalar) => controlCharacter(scalar.codePointAt(0) ?? 0))) {
-        return 'text carries no control character: a key is sent as a key'
-      }
-      return { kind: fields['kind'], take, text }
-    }
+    case 'paste':
+      return { kind, take: whole('take'), text: field('text') as string }
     default:
-      return 'unknown variant: an input is a take, a release, a wheel, a key, text or a paste'
+      throw new Error(`no input of kind ${kind}`)
   }
 }
 
