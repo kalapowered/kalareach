@@ -181,7 +181,7 @@ takes one of three steps, and only `prepare` begins one.
 
 | Step | What the daemon does |
 | --- | --- |
-| `prepare` | Begins an attempt under a new identity. Closes its gate to new sessions, waits up to 45 seconds for the creates it has already started to settle, and answers with the attempt, its process, the arguments it was started with and the directory it was started in. The gate stays closed for five minutes unless the attempt ends first. An attempt already open is over. |
+| `prepare` | Begins an attempt under a new identity. Closes its gate to new sessions, waits up to 45 seconds for the creates it has already started to settle, and answers with the attempt, its process, the arguments it was started with and the directory it was started in. The gate stays closed for five minutes unless the attempt ends first. An attempt already open is over. A daemon that cannot say how it was started, because its working directory was removed, refuses before it changes anything. |
 | `stop` | Stops, when it names the attempt `prepare` answered and that attempt is the one the gate is closed for, within its five minutes. Refused for any other, so a daemon that was never prepared, one whose preparation lapsed and one whose attempt was ended or superseded are never stopped by it. |
 | `resume` | Ends the attempt it names, or whichever is open when it names none, and opens the gate: the update is not going ahead. Naming an attempt that is already over changes nothing. Refused, `ENVIRONMENT_UNAVAILABLE`, once the daemon has been told to stop. |
 
@@ -190,7 +190,9 @@ An attempt ends at its first stop or resume, when its five minutes lapse, and wh
 names its attempt, so a stop that arrives late, after the update it belonged to gave up and
 whatever came after, finds its attempt over and ends nothing. A daemon told to stop takes no other
 step: it refuses to resume and to prepare, and one that has resumed refuses a stop, so an updater
-that sees a daemon resume knows no stop of any earlier attempt will end it.
+that sees a daemon resume knows no stop of any earlier attempt will end it. A stop or a resume is
+taken whatever the daemon can say of how it was started, and a step that answers an error is a
+step that was not taken.
 
 A create that arrives while the gate is closed is refused with `RESOURCE_UNAVAILABLE`, naming the
 release the host is being updated to; the caller creates the session again once the new daemon is

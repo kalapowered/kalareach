@@ -845,10 +845,20 @@ impl Controller {
     ///
     /// `RESOURCE_UNAVAILABLE` when the creates under way do not settle within
     /// [`HANDOVER_SETTLE_MS`] (the attempt ends and the gate opens again), or when `stop` names an
-    /// attempt that is not the gate's; `INVALID_ARGUMENT` when `stop` names none;
+    /// attempt that is not the gate's; `INVALID_ARGUMENT` when `stop` names none, and when a
+    /// `prepare` finds that this daemon cannot say how it was started (nothing has changed then);
     /// `ENVIRONMENT_UNAVAILABLE` when `prepare` or `resume` comes after a `stop`.
     pub(super) async fn update_handover(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let params: HostUpdateHandoverParams = parse(&mutation.params)?;
+        // How this daemon was started is what the update starts a daemon of the new release like,
+        // so a prepare that cannot say is refused before it changes the gate. A stop or a resume
+        // is taken whatever this reads, and never answers an error for a step it has taken: what
+        // it answers with is not what a daemon is started from.
+        let started = match (&params.step, self.started()) {
+            (_, Ok(started)) => started,
+            (HandoverStep::Prepare, Err(error)) => return Err(error),
+            (_, Err(_)) => (Vec::new(), String::new()),
+        };
         let attempt = match params.step {
             HandoverStep::Prepare => {
                 let attempt = self.handover.close(
@@ -888,7 +898,7 @@ impl Controller {
             HandoverStep::Stop => Some(self.handover.stop(params.attempt.0)?),
             HandoverStep::Resume => self.handover.resume(params.attempt.0)?,
         };
-        encode(&self.started_as(attempt)?)
+        encode(&self.started_as(started, attempt))
     }
 
     /// Waits until a prepared handover has told this daemon to stop, which is when the process
@@ -897,9 +907,9 @@ impl Controller {
         self.handover.stopped().await;
     }
 
-    /// How this daemon was started: what a daemon of the release that replaces it is started with,
-    /// and the attempt the answer is for.
-    fn started_as(&self, attempt: Option<Uuid>) -> Result<HostUpdateHandoverResult> {
+    /// How this daemon was started: its arguments, its program's own name left out, and its working
+    /// directory. What a daemon of the release that replaces it is started with.
+    fn started(&self) -> Result<(Vec<String>, String)> {
         let arguments = std::env::args_os()
             .skip(1)
             .map(std::ffi::OsString::into_string)
@@ -921,12 +931,21 @@ impl Controller {
                         .to_owned(),
                 )
             })?;
-        Ok(HostUpdateHandoverResult {
+        Ok((arguments, working_directory))
+    }
+
+    /// The answer to a step: how the daemon was started, and the attempt the answer is for.
+    fn started_as(
+        &self,
+        (arguments, working_directory): (Vec<String>, String),
+        attempt: Option<Uuid>,
+    ) -> HostUpdateHandoverResult {
+        HostUpdateHandoverResult {
             attempt: Nullable(attempt),
             release: Nullable(ReleaseName::new(self.release.clone()).ok()),
             pid: U64::new(u64::from(std::process::id())),
             arguments,
             working_directory,
-        })
+        }
     }
 }

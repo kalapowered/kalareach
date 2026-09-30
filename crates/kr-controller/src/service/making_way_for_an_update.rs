@@ -215,18 +215,111 @@ fn an_attempt_is_current_only_until_it_is_over() {
     assert!(!handover.is_current(lapsed));
 }
 
-/// The whole handover through the daemon's own door: `prepare` answers how the daemon was
-/// started and closes the gate, a create is refused while it is closed and started after
-/// `resume`, and a second `prepare` and a `stop` end the daemon's service.
+/// A daemon does not answer a `prepare` as prepared when its attempt ended while it waited for the
+/// sessions it was creating: the attempt was resumed, so nothing acts on it any more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_daemon_makes_way_through_its_own_door() {
+async fn a_prepare_whose_attempt_ended_while_it_settled_is_refused() {
     let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let (controller, _) = start_controller(&temp).await;
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let serving = tokio::spawn(
+        Arc::clone(&controller).serve_clients(Listener::bind(&endpoint).expect("binds")),
+    );
+    let mut client = LocalClient::connect(
+        &endpoint,
+        LocalClientKind::Cli,
+        BuildId::new("kr/0.2.0+4254aa6e62e5").expect("a build"),
+    )
+    .await
+    .expect("reaches the daemon");
+
+    // A create is under way, so a prepare waits for it to settle.
+    let under_way = controller.handover.admit().expect("a create is under way");
+    let preparing = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::HostUpdateHandover,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &HostUpdateHandoverParams {
+                    step: HandoverStep::Prepare,
+                    target: target(),
+                    attempt: Nullable::null(),
+                },
+            )
+            .await
+    });
+    // Once its gate is closed, the attempt is begun; it is resumed while the create is still
+    // under way, and only then does the create settle.
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        match controller.handover.admit() {
+            Ok(another) => drop(another),
+            Err(_) => break,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prepare did not close the gate"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        controller.handover.resume(None).expect("resumes").is_some(),
+        "the attempt was open"
+    );
+    drop(under_way);
+    let refused = preparing
+        .await
+        .expect("the call ends")
+        .expect("the call reaches the daemon")
+        .expect_err("an attempt that ended is not answered as prepared");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        refused.message.contains("ended while it waited"),
+        "{}",
+        refused.message
+    );
+    // The control: a prepare with nothing under way is answered.
+    let mut client = LocalClient::connect(
+        &endpoint,
+        LocalClientKind::Cli,
+        BuildId::new("kr/0.2.0+4254aa6e62e5").expect("a build"),
+    )
+    .await
+    .expect("reaches the daemon");
+    let answered: HostUpdateHandoverResult = client
+        .mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment_id),
+            &HostUpdateHandoverParams {
+                step: HandoverStep::Prepare,
+                target: target(),
+                attempt: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon prepares")
+        .to_typed()
+        .expect("decodes");
+    assert!(answered.attempt.0.is_some());
+    serving.abort();
+}
+
+/// A daemon of a release of its own, in this process, over `temp`'s environment, whose supervisor
+/// records every launch it is asked for and starts nothing.
+async fn start_controller(
+    temp: &kr_ipc::testing::TempHost,
+) -> (Arc<Controller>, Arc<Mutex<Vec<WorkerLaunch>>>) {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let controller =
         Controller::start(ControllerSetup {
-            paths: environment.clone(),
+            paths: environment,
             environment_id,
             identity: Box::new(move || {
                 Ok(kr_ipc::verify::ControllerIdentity::open(
@@ -249,6 +342,18 @@ async fn a_daemon_makes_way_through_its_own_door() {
         })
         .await
         .expect("the daemon starts");
+    (controller, asked)
+}
+
+/// The whole handover through the daemon's own door: `prepare` answers how the daemon was
+/// started and closes the gate, a create is refused while it is closed and started after
+/// `resume`, and a second `prepare` and a `stop` end the daemon's service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_makes_way_through_its_own_door() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let (controller, asked) = start_controller(&temp).await;
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let serving = tokio::spawn(
         Arc::clone(&controller).serve_clients(Listener::bind(&endpoint).expect("binds")),
