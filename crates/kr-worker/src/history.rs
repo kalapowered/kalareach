@@ -264,10 +264,12 @@ impl OutputHistory {
     ///
     /// Appending never fails. A spool that cannot make room, write a segment or publish its
     /// boundary stops taking output at that cursor and keeps everything it holds: indexed, served,
-    /// counted against the cap and tried again by every retention pass. What arrives while it is
-    /// stopped is retained in the resident window only as far as the spool's remaining room
-    /// allows, so the two layers together stay within the cap, and the range neither holds reads
-    /// as a gap whose cause is the spool rather than a bound.
+    /// counted against the cap and tried again by every retention pass. A boundary that could not
+    /// be written is tried again by the next append as well, which does not wait for it: another
+    /// program can hold it for a moment. What arrives while the spool is stopped is retained in the
+    /// resident window only as far as the spool's remaining room allows, so the two layers
+    /// together stay within the cap, and the range neither holds reads as a gap whose cause is the
+    /// spool rather than a bound.
     pub fn append(&mut self, bytes: &[u8]) -> u64 {
         let start = self.next_cursor;
         if bytes.is_empty() {
@@ -287,6 +289,13 @@ impl OutputHistory {
                 spool.note_position(self.next_cursor);
             }
             return start;
+        }
+        // A spool stopped for want of its boundary is tried again before this append takes its
+        // bytes: one write that is never waited for, so a boundary that is still held costs the
+        // output path a refused write and no wait, and one that has been let go is written and the
+        // eviction made.
+        if self.spool.as_ref().is_some_and(Spool::awaits_boundary) {
+            self.try_resume();
         }
         let now = kr_ipc::now_ms();
         if let Some(spool) = self.spool.as_mut()
@@ -958,9 +967,10 @@ struct Spool {
     /// Where this spool stopped taking output, and why, when it has.
     ///
     /// A spool that could not make room, open or write a segment, or publish its boundary takes
-    /// nothing more until a retention pass finds that it can, and keeps everything it already
-    /// holds: dropping it would take its files out of the account while they were still on the
-    /// disk, and out of reach of the passes that collect them.
+    /// nothing more until a retention pass finds that it can, or, for a boundary that could not be
+    /// written, until an append does, and keeps everything it already holds: dropping it would
+    /// take its files out of the account while they were still on the disk, and out of reach of
+    /// the passes that collect them.
     suspended: Option<Suspension>,
     /// A write that stops part way, which a test arranges: the next write lays down this many
     /// bytes and then fails.
@@ -984,6 +994,21 @@ struct Suspension {
     /// nor read how much the file holds: past that, where the next byte would land in the file is
     /// not something this host knows, so nothing more is written to this spool.
     resumable: bool,
+    /// Whether what stops it now is a boundary that could not be written.
+    ///
+    /// Another program can hold the boundary for a moment, and the output path does not wait for
+    /// it, so the next append tries it again, as a retention pass does. The other stops - a
+    /// segment that could not be removed, opened or written - wait for a retention pass.
+    boundary: bool,
+}
+
+/// Why a spool could not make room for a write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoRoom {
+    /// What went wrong, in words a person can act on.
+    reason: String,
+    /// Whether the boundary that has to be written before anything goes could not be written.
+    boundary: bool,
 }
 
 /// Why a write into the newest segment failed, and how much of it the segment now holds.
@@ -1180,7 +1205,8 @@ impl Spool {
     ///
     /// Nothing here stands over the capacity. When the room cannot be made, or a segment cannot be
     /// opened or written, the spool stops at the first cursor it did not take, keeps everything it
-    /// holds, and takes nothing more until a retention pass finds that it can.
+    /// holds, and takes nothing more until a retention pass finds that it can, or, when the
+    /// boundary could not be written, until the next append does.
     fn append(&mut self, start: u64, bytes: &[u8]) -> Option<(u64, u64, u64)> {
         if self.suspended.is_some() {
             return None;
@@ -1210,8 +1236,8 @@ impl Spool {
                 .min(bytes.len() - written);
             let (made, failure) = self.make_room(take as u64, !rotate, cursor);
             evicted = joined(evicted, made);
-            if let Some(reason) = failure {
-                self.suspend(cursor, reason, true);
+            if let Some(no_room) = failure {
+                self.suspend(cursor, no_room.reason, true, no_room.boundary);
                 break;
             }
             if rotate {
@@ -1237,13 +1263,14 @@ impl Spool {
                                 segment_name(&path)
                             ),
                             true,
+                            false,
                         );
                         break;
                     }
                 }
             }
             if let Err(failed) = self.write_newest(&bytes[written..written + take]) {
-                self.suspend(cursor + failed.kept, failed.reason, failed.resumable);
+                self.suspend(cursor + failed.kept, failed.reason, failed.resumable, false);
                 break;
             }
             written += take;
@@ -1384,18 +1411,19 @@ impl Spool {
         needed: u64,
         keep_newest: bool,
         cursor: u64,
-    ) -> (Option<(u64, u64, u64)>, Option<String>) {
+    ) -> (Option<(u64, u64, u64)>, Option<NoRoom>) {
         if self.total_bytes.saturating_add(needed) <= self.layout.capacity_bytes {
             return (None, None);
         }
         if !self.record_boundary() {
             return (
                 None,
-                Some(
-                    "this session's spool boundary could not be written, so nothing was removed \
-                     to make room"
+                Some(NoRoom {
+                    reason: "this session's spool boundary could not be written, so nothing was \
+                             removed to make room"
                         .to_owned(),
-                ),
+                    boundary: true,
+                }),
             );
         }
         let from = self.oldest_cursor().unwrap_or(cursor);
@@ -1403,16 +1431,23 @@ impl Spool {
         let mut failure = None;
         while self.total_bytes.saturating_add(needed) > self.layout.capacity_bytes {
             if self.segments.is_empty() || (keep_newest && self.segments.len() == 1) {
-                failure = Some(format!(
-                    "{needed} bytes do not fit within this session's spool capacity of {} bytes",
-                    self.layout.capacity_bytes
-                ));
+                failure = Some(NoRoom {
+                    reason: format!(
+                        "{needed} bytes do not fit within this session's spool capacity of {} \
+                         bytes",
+                        self.layout.capacity_bytes
+                    ),
+                    boundary: false,
+                });
                 break;
             }
             match self.drop_oldest() {
                 Ok(went) => gone += went,
                 Err(reason) => {
-                    failure = Some(reason);
+                    failure = Some(NoRoom {
+                        reason,
+                        boundary: false,
+                    });
                     break;
                 }
             }
@@ -1425,14 +1460,22 @@ impl Spool {
     ///
     /// The first stop is the one kept, because it is where the output this spool did not take
     /// begins.
-    fn suspend(&mut self, at: u64, reason: String, resumable: bool) {
+    fn suspend(&mut self, at: u64, reason: String, resumable: bool, boundary: bool) {
         if self.suspended.is_none() {
             self.suspended = Some(Suspension {
                 at,
                 reason,
                 resumable,
+                boundary,
             });
         }
+    }
+
+    /// Whether the spool stopped because its boundary could not be written.
+    fn awaits_boundary(&self) -> bool {
+        self.suspended
+            .as_ref()
+            .is_some_and(|suspension| suspension.boundary)
     }
 
     /// Returns the first cursor this spool did not take, while it has stopped.
@@ -1469,8 +1512,13 @@ impl Spool {
             return (Resumption::Stopped, None);
         }
         let (made, failure) = self.make_room((pending.len() as u64).max(1), false, from);
-        if failure.is_some() {
-            self.suspended = Some(held);
+        if let Some(no_room) = failure {
+            // Still stopped where it first stopped, and for what it has found this time: an append
+            // tries the boundary again, and only a retention pass tries anything else.
+            self.suspended = Some(Suspension {
+                boundary: no_room.boundary,
+                ..held
+            });
             return (Resumption::Stopped, made);
         }
         let written = self.append(from, pending);
@@ -1988,6 +2036,199 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// A spool's boundary file held out of its reach, as another program holds it: on Windows by an
+    /// open handle that shares reading and writing but not deletion, as a scanner holds a file it
+    /// has just seen written, and elsewhere by a directory in its place, which no file can be
+    /// renamed over. Letting go gives the name back.
+    struct HeldBoundary {
+        #[cfg(windows)]
+        handle: std::fs::File,
+        #[cfg(not(windows))]
+        path: std::path::PathBuf,
+    }
+
+    impl HeldBoundary {
+        #[cfg(windows)]
+        fn take(path: &std::path::Path) -> Self {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// Reading and writing are shared; deleting is not.
+            const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+            let handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ_WRITE)
+                .open(path)
+                .expect("the boundary is held");
+            Self { handle }
+        }
+
+        #[cfg(not(windows))]
+        fn take(path: &std::path::Path) -> Self {
+            std::fs::remove_file(path).expect("takes the boundary's file away");
+            std::fs::create_dir(path).expect("puts a directory in its place");
+            Self {
+                path: path.to_owned(),
+            }
+        }
+
+        #[cfg(windows)]
+        fn let_go(self) {
+            drop(self.handle);
+        }
+
+        #[cfg(not(windows))]
+        fn let_go(self) {
+            std::fs::remove_dir(&self.path).expect("gives the name back");
+        }
+    }
+
+    /// A boundary that stays held across several appends stops nothing on the output path and
+    /// leaves the cap where it is, and the first append after it is let go writes it and gives up
+    /// what the cap needs. Where the test above lets go after one append, this holds it across two,
+    /// which is what a stopped spool has to survive without taking the next append's bytes for its
+    /// own or waiting for the file.
+    #[test]
+    fn a_boundary_held_across_appends_is_written_by_the_first_append_after_it_is_let_go() {
+        let directory = spool_directory("held-boundary-across");
+        let mut history = OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 16))
+            .expect("opens a spool");
+        // Each append has bytes of its own, so what is read back says which append it came from.
+        for byte in *b"abcd" {
+            history.append(&[byte; 8]);
+        }
+        let boundary = directory.join(BOUNDARY_FILE);
+        assert!(boundary.is_file(), "an eviction wrote the boundary");
+        let oldest = history.oldest_retained_cursor();
+        assert_eq!(history.retained_bytes(), 16);
+        let held = HeldBoundary::take(&boundary);
+        for byte in *b"ef" {
+            let started = std::time::Instant::now();
+            history.append(&[byte; 8]);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "the output path does not wait for the boundary: {took:?}"
+            );
+            assert_eq!(
+                history.oldest_retained_cursor(),
+                oldest,
+                "nothing goes while its boundary cannot be written"
+            );
+            assert_eq!(history.retained_bytes(), 16, "and the cap holds meanwhile");
+            assert_eq!(
+                history.suspended().map(|(at, _)| at),
+                Some(32),
+                "the spool stopped at the first cursor it did not take, and stays there"
+            );
+        }
+        held.let_go();
+        history.append(&[b'g'; 8]);
+        assert!(
+            history.oldest_retained_cursor() > oldest,
+            "the first append after the boundary is let go writes it and evicts"
+        );
+        assert!(
+            history.suspended().is_none(),
+            "and the spool takes output again"
+        );
+        assert!(history.retained_bytes() <= 16, "the cap holds");
+        assert_eq!(
+            read_boundary(&directory),
+            RecordedBoundary::At(48),
+            "the boundary says where the output had reached when it was written"
+        );
+        // What the spool could not take while the boundary was held is a gap that says why and
+        // ends where the spool took output again, and what follows it is the append that did.
+        let (gap, bytes) = read_to_end(&history, 32);
+        let gap = gap.expect("the range the stopped spool did not take is a gap");
+        assert_eq!(
+            (gap.from_cursor.get(), gap.to_cursor.get()),
+            (32, 48),
+            "the two appends made while the boundary was held"
+        );
+        assert_eq!(gap.cause, Some(HistoryGapCause::SpoolUnavailable));
+        assert_eq!(bytes, [b'g'; 8]);
+        // What it gave up when it could is one range that names the cap, and what is left is the
+        // newest segment it held and the one it wrote.
+        let taken = history.evictions();
+        let last = taken.last().expect("the eviction was recorded");
+        assert_eq!(
+            (last.limit, last.from_cursor, last.bytes),
+            (RetentionLimit::SessionCap, oldest, 8)
+        );
+        let (given_up, kept) = read_to_end(&history, oldest);
+        assert_eq!(
+            given_up.map(|gap| (gap.from_cursor.get(), gap.to_cursor.get())),
+            Some((oldest, oldest + 8)),
+            "the segment given up is a gap"
+        );
+        assert_eq!(
+            kept,
+            [[b'd'; 8], [b'g'; 8]].concat(),
+            "and what is served is the newest segment it held and the one it wrote"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A spool stopped for want of its boundary is tried again by the next append only while it is
+    /// the boundary that stops it. When the boundary is written and the oldest segment then cannot
+    /// be removed, the stop is a segment's, which waits for a retention pass: the appends that
+    /// follow neither try it again nor let the spool take output before the pass does.
+    #[test]
+    fn a_stop_that_moves_from_the_boundary_to_a_segment_waits_for_a_retention_pass() {
+        let directory = spool_directory("held-boundary-then-segment");
+        let mut history = OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 16))
+            .expect("opens a spool");
+        for byte in *b"abcd" {
+            history.append(&[byte; 8]);
+        }
+        let boundary = directory.join(BOUNDARY_FILE);
+        let oldest = history.oldest_retained_cursor();
+        let held = HeldBoundary::take(&boundary);
+        history.append(&[b'e'; 8]);
+        assert_eq!(history.suspended().map(|(at, _)| at), Some(32));
+        held.let_go();
+        // The boundary can be written now, but the oldest segment cannot be removed: a directory
+        // with something in it stands where its file was, so no platform removes it as a file.
+        let segment = directory.join(format!("{oldest:020}.out"));
+        std::fs::remove_file(&segment).expect("takes the oldest segment's file away");
+        std::fs::create_dir(&segment).expect("puts a directory in its place");
+        std::fs::write(segment.join("in-the-way"), b"x").expect("and something in it");
+        history.append(&[b'f'; 8]);
+        assert_eq!(
+            read_boundary(&directory),
+            RecordedBoundary::At(40),
+            "the append wrote the boundary that was let go"
+        );
+        assert_eq!(
+            history.suspended().map(|(at, _)| at),
+            Some(32),
+            "and the spool is still stopped where it stopped, for the segment now"
+        );
+        assert_eq!(history.oldest_retained_cursor(), oldest);
+        // The way is clear, and the next append does not take it: only a retention pass does.
+        std::fs::remove_dir_all(&segment).expect("clears the way");
+        history.append(&[b'g'; 8]);
+        assert_eq!(
+            history.suspended().map(|(at, _)| at),
+            Some(32),
+            "a stop that is not the boundary's is left to a retention pass"
+        );
+        history.apply_retention(
+            OutputRetention::DEFAULT,
+            history.retained_bytes(),
+            kr_ipc::now_ms(),
+            true,
+        );
+        assert!(
+            history.suspended().is_none(),
+            "the pass lets the spool take output again"
+        );
+        assert!(history.retained_bytes() <= 16, "the cap holds");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn the_spool_drops_its_oldest_segments_and_reports_the_gap() {
         let directory = std::env::temp_dir().join(format!("kr-spool-{}", kr_ipc::new_uuid()));
@@ -2076,11 +2317,17 @@ mod tests {
     fn read_back(directory: &std::path::Path, from: u64) -> (Option<HistoryGap>, Vec<u8>) {
         let reopened =
             OutputHistory::read_spool(directory, SpoolLayout::DEFAULT).expect("reads the spool");
+        read_to_end(&reopened, from)
+    }
+
+    /// Reads a history from `from` to its end, page by page: the first gap it reports and the
+    /// bytes it serves.
+    fn read_to_end(history: &OutputHistory, from: u64) -> (Option<HistoryGap>, Vec<u8>) {
         let mut cursor = from;
         let mut gap = None;
         let mut bytes = Vec::new();
-        while cursor < reopened.next_cursor() {
-            let page = reopened.page(cursor, 64).expect("a page");
+        while cursor < history.next_cursor() {
+            let page = history.page(cursor, 64).expect("a page");
             gap = gap.or(page.gap.0);
             bytes.extend_from_slice(page.bytes.as_slice());
             assert!(

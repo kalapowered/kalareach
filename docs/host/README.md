@@ -2390,7 +2390,9 @@ removed by a purge, and a pass that could not remove one says so. While it is st
 window keeps new output only within the room the spool has left, so the two together stay within
 the cap, and the range neither keeps reads as a gap with the cause `spool_unavailable`. A retention
 pass that finds the spool can make room again writes what the window still holds past the stop and
-lets the spool take output again.
+lets the spool take output again. A boundary that could not be written is tried again by the next
+append as well, which does not wait for it, because another program can hold that file for a moment:
+the first append after it is let go writes it and gives up the oldest segments.
 
 The host bound is applied on the worker's maintenance tick, from a reading of the environment's
 whole spool directory, so two sessions writing at once can take the host past it until the next
