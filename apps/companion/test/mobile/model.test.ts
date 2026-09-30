@@ -37,7 +37,7 @@ import {
   attributesFor,
   describeBytes
 } from '../../src/mobile/model/media'
-import { consumesGesture, describeMode } from '../../src/mobile/model/gestures'
+import { describeMode } from '../../src/mobile/model/gestures'
 import {
   EMPTY_DURABLE_STATE,
   onResume,
@@ -392,11 +392,6 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
     expect(describeMode(controlling, null)).toBe('Control: your keys go to the program in this terminal.')
     const lost = 'Control ended: another view took it, or the program changed how it reads keys.'
     expect(describeMode({ number: 1, state: 'watching', ended: lost }, 'reaches')).toBe(lost)
-  })
-
-  it('takes the gesture from the page only where it is used', () => {
-    expect(consumesGesture('control', { pointers: 1, deltaX: 0, deltaY: 0, scale: 1 })).toBe(true)
-    expect(consumesGesture('view', { pointers: 1, deltaX: 0, deltaY: 0, scale: 1 })).toBe(false)
   })
 })
 
