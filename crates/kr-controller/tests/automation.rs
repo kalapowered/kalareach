@@ -1521,21 +1521,47 @@ fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Con
     registry
 }
 
+/// Waits until `condition` holds, and fails when it does not within a liveness bound: what the
+/// wait measures is whether the condition is ever met, and one that is met costs what it costs.
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "waited 60 s for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// A start that does not pass its configuration gate executes nothing a stopped daemon left
 /// behind. The document it has to put into force withdraws authority and owes a fence, the
 /// registry cannot raise it, and the start fails; the trigger left pending in the journal is
 /// still pending afterwards.
+///
+/// The first start's daemon has to be gone, its dispatcher included, before the trigger is left
+/// pending. Dropping the daemon aborts the dispatcher's task, but a pass it had already handed to a
+/// blocking thread goes on to its end, holding the service, and reads the journal when a loaded
+/// machine gets to it: after the trigger was left pending it would dispatch it, and the failed
+/// start would be blamed. The service is the dispatcher's own, so the test waits for the last
+/// holder of it to let go. The failed start is then held to the same rule: it runs on a runtime of
+/// its own, which is ended before it is judged, and not after a length of time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     // A first start makes the registry and the journal; then the daemon stops.
-    drop(
-        start_daemon(&environment, environment_id, Clocks::system())
-            .await
-            .unwrap_or_else(|error| panic!("the first start: {error}")),
-    );
+    let first = start_daemon(&environment, environment_id, Clocks::system())
+        .await
+        .unwrap_or_else(|error| panic!("the first start: {error}"));
+    let dispatcher = Arc::downgrade(first.automation().service());
+    drop(first);
+    until(
+        "the first daemon's dispatcher to let go of the service",
+        || dispatcher.strong_count() == 0,
+    )
+    .await;
     let pending = trigger_left_pending(environment.state_dir(), environment_id).await;
     let registry = refuse_fences(&environment);
     write_configuration(
@@ -1543,16 +1569,37 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
         &narrowing_document(&[ActionRight::SessionView]),
     );
 
-    let Err(refused) = start_daemon(&environment, environment_id, Clocks::system()).await else {
+    // The start runs on a runtime of its own, and the runtime is dropped before the journal is
+    // read: dropping one ends every task it holds and waits for every pass it handed to a blocking
+    // thread. Nothing the failed start began is left running then, whichever kind of work it was,
+    // and a pass that had read the pending event is in the journal by then. What this cannot tell
+    // is a dispatcher that was ended before its first read from one that was never started, so it
+    // holds the start to what it can see: it is refused, and the event is still where it was left.
+    let refused = {
+        let environment = environment.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("a runtime for the start");
+            let outcome = runtime
+                .block_on(async {
+                    start_daemon(&environment, environment_id, Clocks::system())
+                        .await
+                        .map(drop)
+                })
+                .map_err(|error| error.to_string());
+            drop(runtime);
+            outcome
+        })
+        .join()
+        .expect("the start's thread ended")
+    };
+    let Err(refused) = refused else {
         panic!("the start does not pass its configuration gate");
     };
-    assert!(
-        refused.to_string().contains("could not be put into force"),
-        "{refused}"
-    );
-    // The dispatcher of a daemon that had started executing would have read the pending event
-    // by now; give a dispatcher left behind the time it would need.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(refused.contains("could not be put into force"), "{refused}");
     // The first start's dispatcher registered and read nothing; the event left since is where it
     // was left.
     let journal =
