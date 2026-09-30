@@ -94,8 +94,21 @@ pub async fn produced(runtime: &SessionRuntime, marker: &[u8]) {
 /// for a host that answers the same question more than once: the second answer is not the first,
 /// and a test waiting for "an answer" would go on from the one that had already arrived.
 pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usize) {
+    retained_carrying(runtime, marker, count, LIVENESS_DEADLINE).await;
+}
+
+/// Waits until the session's retained output carries `marker` `count` times, and returns that
+/// output, or fails when the session's shell has ended first or `within` has passed.
+///
+/// The wait behind [`produced_times`], for a suite whose own bound is not the liveness one.
+pub async fn retained_carrying(
+    runtime: &SessionRuntime,
+    marker: &[u8],
+    count: usize,
+    within: Duration,
+) -> Vec<u8> {
     let started = tokio::time::Instant::now();
-    let deadline = started + LIVENESS_DEADLINE;
+    let deadline = started + within;
     loop {
         // Whether the session had closed is read before its output is, so the output a closed
         // session had is there before it is judged: its closure waits for what the terminal still
@@ -104,7 +117,7 @@ pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usiz
         let closed = runtime.state() == kr_protocol::session::SessionState::Closed;
         let seen = retained(runtime);
         if carried_times(&seen, marker) >= count {
-            return;
+            return seen;
         }
         // A session whose shell has ended writes no more of what is waited for, whether the shell
         // exited by itself, was closed, or was one the platform would not run. That is a failure

@@ -889,24 +889,10 @@ fn retained(runtime: &SessionRuntime) -> Vec<u8> {
 /// Waits for `marker` to appear in the session's retained output.
 ///
 /// A marker that never appears is a failure here rather than an empty answer a caller has to make
-/// sense of, and the failure says how long it waited and what for.
+/// sense of, and the failure says how long it waited and what for. A session that closes before
+/// the marker appears fails the wait at once, with how it closed and what its shell wrote.
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + within;
-    loop {
-        let seen = retained(runtime);
-        if seen.windows(marker.len()).any(|window| window == marker) {
-            return seen;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {:?} in the session's retained output: {:?}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker),
-            String::from_utf8_lossy(&seen)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    common::retained_carrying(runtime, marker, 1, within).await
 }
 
 #[tokio::test(flavor = "multi_thread")]

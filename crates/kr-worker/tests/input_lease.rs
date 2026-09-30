@@ -34,6 +34,8 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
 /// The bracketed-paste start delimiter.
 const PASTE_START: &[u8] = b"\x1b[200~";
 
@@ -126,7 +128,6 @@ fn retained(session: &Session) -> Vec<u8> {
     seen
 }
 
-/// Waits for `marker` in the runtime's retained output, or gives up after `within`.
 /// How long a wait for something to appear is given.
 ///
 /// A liveness wait is not a measurement: it is there to fail when something never happens. The five
@@ -140,24 +141,10 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 /// Waits for `marker` to appear in the session's retained output.
 ///
 /// A marker that never appears is a failure here rather than partial output a caller has to make
-/// sense of, and the failure says how long it waited and what for.
+/// sense of, and the failure says how long it waited and what for. A shell that ends before it
+/// writes the marker fails the wait at once, with what it wrote.
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + within;
-    loop {
-        let seen = retained(&runtime.session());
-        if contains(&seen, marker) {
-            return seen;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {:?} in the session's retained output: {:?}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker),
-            String::from_utf8_lossy(&seen)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    common::retained_carrying(runtime, marker, 1, within).await
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
