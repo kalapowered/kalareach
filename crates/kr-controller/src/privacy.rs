@@ -32,9 +32,9 @@
 //!   it.
 //! * **Disabling is two phases.** It is refused while a daemon step, or a session whose worker is
 //!   running or may still start, owes cleanup. Otherwise the new generation is recorded first and
-//!   then each fence is released; a
-//!   release that is still pending, or that a store refused, is owed and retried, and the report
-//!   says privacy mode is still being turned off until every release has landed.
+//!   then each fence is released; a release that is still pending, or that a store refused, is
+//!   owed and retried, and the report says privacy mode is still being turned off until every
+//!   release has landed.
 //!
 //! # The startup order
 //!
@@ -210,10 +210,10 @@ impl PrivacyState {
     ///
     /// It is taken only by a thread that holds the record's own mutex ([`EnvironmentPrivacy`]'s
     /// `inner`), once [`EnvironmentPrivacy::open`] has published the state it starts with, and
-    /// nothing that holds a reader's guard takes that mutex. That is what keeps the
-    /// queue of a read-write lock, in which a waiting writer stops new readers, from turning a
-    /// reader that waits for something a writer holds into a stall; a new taker of this side goes
-    /// under the same rule.
+    /// nothing that holds a reader's guard takes that mutex. That is what keeps the queue of a
+    /// read-write lock, in which a waiting writer stops new readers, from turning a reader that
+    /// waits for something a writer holds into a stall; a new taker of this side goes under the
+    /// same rule.
     fn change(&self) -> Change<'_> {
         Change {
             held: self

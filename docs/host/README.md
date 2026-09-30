@@ -2944,12 +2944,15 @@ reason to keep output.
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
 
-* **A fenced launch holds turning privacy mode off back for good.** A second claim on a
-  reservation that a worker has already claimed fences it, and the first worker's ready report is
-  then refused; that worker goes on with its session and is never recorded. A launch does not
-  claim twice in the ordinary way. Nothing settles a fenced reservation that has no worker row,
-  and the registry says something may still run there, so this host does not take its session for
-  ended: if it owes cleanup, `kr privacy off` stays refused while it stands, also after a restart.
+* **A session whose launch was fenced is not reached again.** A second claim on a reservation that
+  a worker has already claimed fences it, and the first worker's ready report is then refused;
+  that worker goes on with its session and is never recorded. A launch does not claim twice in the
+  ordinary way. A worker whose reservation is fenced is also left out of the directory a start
+  rebuilds. It is not told the generation, so it keeps what its session prints while privacy mode
+  is on, and the report keeps listing the session as awaiting its worker. The registry says
+  something may still run there, so this host does not take the session for ended: if it owes
+  cleanup, `kr privacy off` stays refused, also after a restart, until a closure is recorded for
+  the session.
 
 * **A session created while privacy mode is on learns the generation from the tick.** Its worker
   is told on a tick after it starts rather than before its shell runs, and its obligation is
