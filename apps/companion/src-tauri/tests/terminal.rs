@@ -786,6 +786,79 @@ async fn rapid_sizes_end_at_the_newest_with_one_report_outstanding() {
     assert!(link.quiet_for(QUIET).await);
 }
 
+/// The page shows the presentation and its reason from the view's summary of the attachment, and
+/// a size report can change both, so the answer to the report is what the page is told from then
+/// on: the reason the host names, and none once the attachment is shown the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_reports_answer_is_what_the_page_shows_of_the_presentation() {
+    use kr_protocol::attachment::{PresentationReason, TerminalPresentationMode};
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = showing(&page_view, &mut worker, 3).await;
+    let opened = page_view.state(3, 0).await;
+    assert_eq!(
+        opened["attachment"]["presentation_reason"], "unqualified_terminal_profile",
+        "the attach answer's reason is what the page shows first"
+    );
+
+    let mut count = page_view.states(3).len();
+    for (round, (size, presentation, reason, shown)) in [
+        (
+            (12, 3),
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::SizeMismatch),
+            "viewport",
+        ),
+        ((10, 2), TerminalPresentationMode::Direct, None, "direct"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Each report leaves the window at the next revision, and the screen drawn for it is the
+        // next generation at a cursor of its own.
+        let revision = round as u64 + 1;
+        let generation = revision + 1;
+        let cursor = 40 + 20 * revision;
+        page_view.resize(&view, size.0, size.1);
+        let asked = link.expect(Method::AttachmentViewport).await;
+        link.answer(
+            &asked,
+            &viewport_answer_shown(revision, presentation, reason),
+        )
+        .await;
+        link.push("session.resync", &resync_marker(cursor)).await;
+        let subscribe = link.expect(Method::EventsSubscribe).await;
+        link.answer(&subscribe, &scripted_worker::subscribed())
+            .await;
+        link.restart_stream();
+        screen(&mut link, generation, cursor, vec![row(0, "at")], revision).await;
+        // The state the page is sent once the screen for this report has arrived.
+        let state = tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let states = page_view.states(3);
+                if let Some(state) = states[count..]
+                    .iter()
+                    .find(|state| state["state"] == "showing" && text_of(state) == ["at"])
+                {
+                    break state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the screen for the report reaches the page within the watchdog");
+        assert_eq!(state["attachment"]["presentation"], shown);
+        match reason {
+            Some(reason) => assert_eq!(state["attachment"]["presentation_reason"], reason.as_str()),
+            None => assert!(
+                state["attachment"].get("presentation_reason").is_none(),
+                "an attachment shown the stream has no reason: {state}"
+            ),
+        }
+        count = page_view.states(3).len();
+    }
+}
+
 /// A refused size is not sent again until the page measures another, and a newer size made while
 /// it was outstanding goes after the refusal.
 #[tokio::test(flavor = "multi_thread")]
@@ -1304,13 +1377,27 @@ async fn control_characters_never_reach_the_page() {
 /// The host's answer to an accepted size report: the window stays at the live screen's first line
 /// and column, and the report left it at `window_revision`.
 fn viewport_answer(window_revision: u64) -> kr_protocol::attachment::AttachmentViewportResult {
+    viewport_answer_shown(
+        window_revision,
+        kr_protocol::attachment::TerminalPresentationMode::Viewport,
+        Some(kr_protocol::attachment::PresentationReason::SizeMismatch),
+    )
+}
+
+/// The same answer, for a report that left the attachment shown as `presentation` for `reason`.
+fn viewport_answer_shown(
+    window_revision: u64,
+    presentation: kr_protocol::attachment::TerminalPresentationMode,
+    reason: Option<kr_protocol::attachment::PresentationReason>,
+) -> kr_protocol::attachment::AttachmentViewportResult {
     kr_protocol::attachment::AttachmentViewportResult {
         geometry: kr_protocol::attachment::GeometryState {
             owner: kr_protocol::scalars::Nullable::null(),
             epoch: kr_protocol::ids::GeometryEpoch::new(1),
             dimensions: Dimensions::new(80, 24),
         },
-        presentation: kr_protocol::attachment::TerminalPresentationMode::Viewport,
+        presentation,
+        presentation_reason: kr_protocol::scalars::Nullable(reason),
         position: kr_protocol::scalars::Nullable::null(),
         column: kr_protocol::scalars::U64::ZERO,
         window_revision: kr_protocol::scalars::U64::new(window_revision),

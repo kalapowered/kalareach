@@ -526,7 +526,7 @@ impl AttachmentTable {
         dimensions: Dimensions,
         anchor: crate::projection::ViewportAnchor,
         column: u32,
-    ) -> Result<TerminalPresentationMode> {
+    ) -> Result<(TerminalPresentationMode, Option<PresentationReason>)> {
         self.check_viewport(id, dimensions)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         let canonical = self.dimensions;
@@ -552,7 +552,6 @@ impl AttachmentTable {
             .ok_or_else(|| unknown(id))?;
         attachment
             .presentation(canonical, carryable)
-            .map(|(mode, _)| mode)
             .ok_or_else(|| {
                 WorkerError::InvalidArgument(
                     "a semantic attachment has no terminal presentation".to_owned(),
@@ -992,7 +991,10 @@ mod tests {
                     0,
                 )
                 .expect("reports"),
-            TerminalPresentationMode::Viewport
+            (
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::SizeMismatch)
+            )
         );
         assert_eq!(table.geometry().dimensions, Dimensions::new(100, 30));
     }
@@ -1169,7 +1171,7 @@ mod tests {
                     0,
                 )
                 .expect("reports"),
-            TerminalPresentationMode::Direct
+            (TerminalPresentationMode::Direct, None)
         );
     }
 
@@ -1192,7 +1194,10 @@ mod tests {
                     0,
                 )
                 .expect("reports"),
-            TerminalPresentationMode::Viewport
+            (
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::UnqualifiedTerminalProfile)
+            )
         );
     }
 
@@ -1215,7 +1220,10 @@ mod tests {
                     0,
                 )
                 .expect("reports"),
-            TerminalPresentationMode::Viewport
+            (
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::NoTerminalProfile)
+            )
         );
     }
 
@@ -1233,7 +1241,10 @@ mod tests {
                     0,
                 )
                 .expect("reports"),
-            TerminalPresentationMode::Viewport
+            (
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::StreamNotCarryable)
+            )
         );
         assert_eq!(table.projected().len(), 1);
     }

@@ -213,6 +213,8 @@ impl Window {
 pub struct Landed {
     /// How the attachment now displays the canonical grid.
     pub presentation: kr_protocol::attachment::TerminalPresentationMode,
+    /// Why it is shown a viewport, or `None` when it is shown the session's own stream.
+    pub presentation_reason: Option<kr_protocol::attachment::PresentationReason>,
     /// Where the window ended up: a row above the live screen, a line of the live screen below its
     /// first, or `None` for the live screen from its first line.
     pub position: Option<kr_protocol::attachment::ViewportPosition>,

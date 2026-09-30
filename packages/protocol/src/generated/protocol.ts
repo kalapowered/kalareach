@@ -5055,6 +5055,16 @@ export interface AttachmentViewportResult {
    */
   presentation: 'direct' | 'viewport'
   /**
+   * Why the attachment is shown a viewport after this report, or null when it is shown the
+   * session's own stream.
+   *
+   * It is the first condition, in the order [`PresentationReason`] lists them, that keeps the
+   * attachment off the stream as it stands after the report, so a report that changed the
+   * presentation changes the reason with it, and one that did not repeats what the attachment's
+   * summary already says.
+   */
+  presentation_reason: PresentationReason | null
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   window_revision: string

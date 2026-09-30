@@ -1073,6 +1073,83 @@ async fn presentation_is_decided_apart_from_who_owns_the_size() {
     );
 }
 
+/// KR-REQ-08.02: a viewport report is answered with the reason the attachment is shown a viewport,
+/// none when it is shown the session's own stream, and a report that moves the attachment from one
+/// to the other changes the presentation and the reason together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_viewport_answer_names_why_the_attachment_is_a_viewport() {
+    let wired = wired(WAITS, CANONICAL).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let report = async |client: &mut LocalClient, attachment: AttachmentId, size: Dimensions| {
+        let answer: AttachmentViewportResult = client
+            .mutate(
+                Method::AttachmentViewport,
+                ActionId::new(kr_ipc::new_uuid()),
+                wired.target(),
+                &AttachmentViewportParams {
+                    position: kr_protocol::scalars::Nullable::null(),
+                    attachment_id: attachment,
+                    dimensions: size,
+                    column: kr_protocol::scalars::U64::ZERO,
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("reports")
+            .to_typed()
+            .expect("decodes");
+        (answer.presentation, answer.presentation_reason.0)
+    };
+
+    // A terminal that declared no profile, at the session's own size.
+    let undeclared: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &SessionAttachParams {
+                terminal_profile_id: Nullable::null(),
+                ..terminal(wired.session_id, CANONICAL, false)
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        report(&mut client, undeclared.attachment.attachment_id, CANONICAL).await,
+        (
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::NoTerminalProfile)
+        ),
+        "the size matches and no profile was declared"
+    );
+
+    // A qualified terminal at the session's size is shown the stream, and a report of another size
+    // moves it to a viewport and names why in the same answer.
+    let matching = attach_over(&mut client, &wired, CANONICAL, false).await;
+    assert_eq!(
+        report(&mut client, matching, CANONICAL).await,
+        (TerminalPresentationMode::Direct, None),
+        "a direct attachment has no reason"
+    );
+    assert_eq!(
+        report(&mut client, matching, Dimensions::new(52, 14)).await,
+        (
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::SizeMismatch)
+        )
+    );
+    assert_eq!(
+        report(&mut client, matching, CANONICAL).await,
+        (TerminalPresentationMode::Direct, None),
+        "and a report that restores the size takes the reason away with the viewport"
+    );
+}
+
 /// KR-REQ-08.74: a transfer between two terminals of one size still tells everybody.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {

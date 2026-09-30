@@ -385,6 +385,14 @@ pub struct AttachmentViewportResult {
     pub geometry: GeometryState,
     /// How this attachment now displays the canonical grid.
     pub presentation: TerminalPresentationMode,
+    /// Why the attachment is shown a viewport after this report, or null when it is shown the
+    /// session's own stream.
+    ///
+    /// It is the first condition, in the order [`PresentationReason`] lists them, that keeps the
+    /// attachment off the stream as it stands after the report, so a report that changed the
+    /// presentation changes the reason with it, and one that did not repeats what the attachment's
+    /// summary already says.
+    pub presentation_reason: Nullable<PresentationReason>,
     /// Where the window ended up: a row identifier above the live screen, a line of the live
     /// screen below its first, or null for the live screen from its first line.
     ///
@@ -519,6 +527,7 @@ mod tests {
                 dimensions: Dimensions::new(80, 24),
             },
             presentation: TerminalPresentationMode::Viewport,
+            presentation_reason: Nullable::some(PresentationReason::HistoryWindow),
             position: Nullable::some(ViewportPosition::Row(U64::new(512))),
             column: U64::new(40),
             window_revision: U64::new(9),
@@ -700,6 +709,40 @@ mod tests {
             );
             assert!(!reason.describe().is_empty());
         }
+    }
+
+    /// KR-REQ-08.02: the answer to a viewport report names the reason beside the presentation, and
+    /// carries none for an attachment shown the session's own stream.
+    #[test]
+    fn a_viewport_answer_names_its_reason_and_a_direct_one_names_none() {
+        let answer = |presentation, reason| AttachmentViewportResult {
+            geometry: GeometryState {
+                owner: Nullable::null(),
+                epoch: GeometryEpoch::new(1),
+                dimensions: Dimensions::new(80, 24),
+            },
+            presentation,
+            presentation_reason: Nullable(reason),
+            position: Nullable::null(),
+            column: U64::ZERO,
+            window_revision: U64::new(2),
+        };
+        for reason in PresentationReason::ALL {
+            let projected = answer(TerminalPresentationMode::Viewport, Some(reason));
+            let reread: AttachmentViewportResult =
+                read(&wire(&projected)).expect("a projected answer reads back");
+            assert_eq!(reread, projected);
+            assert_eq!(reread.presentation_reason.0, Some(reason));
+        }
+        let direct = answer(TerminalPresentationMode::Direct, None);
+        let reread: AttachmentViewportResult =
+            read(&wire(&direct)).expect("a direct answer reads back");
+        assert_eq!(reread.presentation_reason.0, None);
+        assert_eq!(
+            serde_json::to_value(&direct).expect("encodes")["presentation_reason"],
+            serde_json::Value::Null,
+            "the member is always present and null when there is no reason"
+        );
     }
 
     /// A summary is part of a write result, so it stays closed: a field this build does not declare

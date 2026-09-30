@@ -525,13 +525,18 @@ impl View {
             // screen naming its revision has arrived, whichever came first. A screen that waited
             // for this answer is drawn now, with what the answer settled.
             let answer = match response.outcome {
-                Outcome::Ok(value) => {
-                    value
-                        .to_typed::<AttachmentViewportResult>()
-                        .map_or(Answer::Refused, |result| Answer::Accepted {
+                Outcome::Ok(value) => match value.to_typed::<AttachmentViewportResult>() {
+                    Ok(result) => {
+                        // The page shows the presentation and its reason from this summary, and
+                        // the report may have changed both: the answer says what they are now.
+                        self.attachment.presentation = Nullable::some(result.presentation);
+                        self.attachment.presentation_reason = result.presentation_reason.0;
+                        Answer::Accepted {
                             window_revision: result.window_revision.get(),
-                        })
-                }
+                        }
+                    }
+                    Err(_) => Answer::Refused,
+                },
                 Outcome::Error(_) => Answer::Refused,
             };
             self.window.answered(answer);

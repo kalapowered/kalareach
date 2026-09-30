@@ -2110,9 +2110,9 @@ impl Session {
         // place, and the row it names is what the attachment holds from here.
         let anchor = self.engine.resolve_position(position, dimensions);
         let column = self.engine.resolve_column(column, dimensions);
-        let presentation = self
-            .attachments
-            .viewport(attachment_id, dimensions, anchor, column)?;
+        let (presentation, presentation_reason) =
+            self.attachments
+                .viewport(attachment_id, dimensions, anchor, column)?;
         let window_revision = self
             .attachments
             .window(attachment_id, dimensions)
@@ -2145,6 +2145,7 @@ impl Session {
         }
         Ok(crate::projection::Landed {
             presentation,
+            presentation_reason,
             position: anchor.position(),
             column: u64::from(column),
             window_revision,
