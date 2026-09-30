@@ -131,6 +131,7 @@ pub fn adapt(event: &Event, context: AdaptContext) -> Adapted {
                 .copied()
                 .map(|param| to_vt(param, limit, &mut clamped))
                 .collect();
+            keep_the_column_on_the_grid(&mut vt, *final_byte, context.cols);
             normalise(&mut vt, *final_byte);
             let parsed: Vec<Action> = CSI::parse(&vt, *truncated, char::from(*final_byte))
                 .map(Action::CSI)
@@ -336,6 +337,34 @@ fn action_is_unrecognised(action: &Action) -> bool {
             matches!(**osc, OperatingSystemCommand::Unspecified(_))
         }
         _ => false,
+    }
+}
+
+/// Holds an absolute column that names a column past the last one on the last column.
+///
+/// The grid library lets an absolute column go one past the last, to keep the cursor of a row that
+/// was wrapped when the window changed. A sequence that asks for a column beyond the edge would
+/// leave the cursor there, off the grid, where a terminal stops it on the last column: the next
+/// character would then be placed beyond the row's end and a cursor report would name a column
+/// the grid does not have. Only the grid sees the held value. A terminal given the original bytes
+/// stops on the last column the same way, so the sequence is not counted as clamped and its bytes
+/// are still forwarded.
+///
+/// The column is the second field of a cursor position (`H`, `f`) and the first of a column
+/// position (`G`, `` ` ``).
+fn keep_the_column_on_the_grid(params: &mut [VtCsiParam], final_byte: u8, cols: u32) {
+    let field = match final_byte {
+        b'H' | b'f' => 1,
+        b'G' | b'`' => 0,
+        _ => return,
+    };
+    let mut at = 0;
+    for param in params {
+        match param {
+            VtCsiParam::P(b';') => at += 1,
+            VtCsiParam::Integer(value) if at == field => *value = (*value).min(i64::from(cols)),
+            _ => {}
+        }
     }
 }
 

@@ -1350,6 +1350,11 @@ impl CanonicalGrid {
     }
 
     /// The cursor position, zero-based.
+    ///
+    /// A character that reaches the right margin leaves the cursor on the last column with a wrap
+    /// pending, and that is where this says it is. The library leaves a two-cell character's cursor
+    /// on the character's first cell, one column short of the margin it ended on; a terminal, and a
+    /// one-cell character at the same margin, leave it on the last.
     #[must_use]
     pub fn cursor(&self) -> (u32, u32) {
         let pos = self.terminal.cursor_pos();
@@ -1364,6 +1369,9 @@ impl CanonicalGrid {
             reason = "a column index is bounded by the validated column count"
         )]
         let col = pos.x as u32;
+        if self.terminal.pending_wrap() {
+            return (col.max(self.margins_horizontal().1), row);
+        }
         (col, row)
     }
 
