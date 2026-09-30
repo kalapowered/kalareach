@@ -436,6 +436,18 @@ function Enable-KalaReachHooks {
     if ($script:Hooks.Activated -or -not $script:Kr.Registered) { return }
     $script:Hooks.Activated = $true
 
+    # The editor was qualified when this module loaded, which is the first thing in the profile so
+    # that the bridge is open before anything the profile asks. A profile can still import another
+    # editor after that, and the qualification the session reports has to hold for the editor that
+    # is reading now.
+    $qualified = Test-KrQualifiedEditor
+    if (-not $qualified.Ok) {
+        Send-KrIntegrationLost 'post_startup_failure' $qualified.Detail
+        Write-KrDiagnostic $qualified.Reason $qualified.Detail
+        Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
+        return
+    }
+
     if (-not (Test-KrInnerReadLine)) {
         # Somebody else's reader was already the host's entry point, so the editor this package
         # was qualified against is not the one reading this shell.

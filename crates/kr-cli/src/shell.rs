@@ -17,7 +17,9 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
-use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
+use kr_shell_integration::host::startup::{
+    self, Change, EntryRecord, HomeLayout, Placement, RecordError,
+};
 
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request};
@@ -271,7 +273,7 @@ pub fn install(
                 Change::Added
             }
         } else {
-            startup::install(&entry.file, body, record).map_err(|error| {
+            startup::install(&entry.file, body, Placement::of(package.kind()), record).map_err(|error| {
                 CliError::Other(shown!(
                     "{}: {}",
                     Shown::root(&entry.file),
@@ -663,7 +665,7 @@ mod tests {
         )
         .expect("the path is text");
         assert_eq!(
-            startup::install(&zshrc, &body, &record).expect("installs"),
+            startup::install(&zshrc, &body, Placement::End, &record).expect("installs"),
             Change::Added
         );
         // The install that wrote it recorded the file.
