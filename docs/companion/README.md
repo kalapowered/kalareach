@@ -358,8 +358,8 @@ once when let go short of a dismissal, and fades where a dismissal leaves it.
 
 On the phone the settings are not a destination. A session's top bar carries a Settings control
 that opens the same sheet over the session, with the appearance choices: the session stays behind
-it with its draft, and the choices sit three across while each names itself whole and take a row of
-their own at larger text. The system's back closes the sheet first and leaves the session on the
+it with its draft, and the choices sit three across while each names itself whole and wrap onto
+another row at larger text. The system's back closes the sheet first and leaves the session on the
 next.
 
 ## Running it

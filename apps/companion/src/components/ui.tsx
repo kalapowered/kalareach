@@ -602,12 +602,25 @@ export function Sheet({
     const sheet = sheetRef.current
     if (!sheet) return
     restoreFocus.current = document.activeElement as HTMLElement | null
-    const focusable = () =>
-      Array.from(
+    // The controls Tab moves between. A group of radios is one of them, at the checked radio or at
+    // the first where none is checked: the others are reached by the arrow keys, so treating each
+    // as a stop would put the trap's edge where Tab never lands and let Tab out of the sheet.
+    const focusable = () => {
+      const all = Array.from(
         sheet.querySelectorAll<HTMLElement>(
           'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
         )
       )
+      const radios = all.filter(
+        (element): element is HTMLInputElement =>
+          element instanceof HTMLInputElement && element.type === 'radio' && element.name !== ''
+      )
+      return all.filter((element) => {
+        if (!(element instanceof HTMLInputElement) || element.type !== 'radio' || element.name === '') return true
+        const group = radios.filter((radio) => radio.name === element.name && radio.form === element.form)
+        return (group.find((radio) => radio.checked) ?? group[0]) === element
+      })
+    }
     focusable()[0]?.focus()
 
     const onKey = (event: KeyboardEvent) => {
@@ -648,6 +661,32 @@ export function Sheet({
   const presentation: SheetPresentation = !open ? 'leaving' : atRest ? 'here' : 'arriving'
 
   /**
+   * Carries a surface that was closed while a finger held it the rest of the way out: whatever ends
+   * the hold, it is on its way out and nothing else could take it there, since closing it again has
+   * no effect. With reduced motion the fade that began at the close is what takes it away.
+   */
+  const carryOut = (from: number, velocity: number) => {
+    if (reduced) return
+    const height = sheetRef.current?.offsetHeight || 1
+    animation.current?.stop()
+    presented.current.offset = from
+    presented.current.velocity = velocity
+    animation.current = animateSpring({
+      from,
+      velocity,
+      to: height,
+      onFrame: (value) => {
+        presented.current.velocity = (value - presented.current.offset) * 60
+        place(value)
+      },
+      onDone: () => {
+        presented.current.velocity = 0
+        setMounted(false)
+      }
+    })
+  }
+
+  /**
    * Ends a drag the platform took away, a cancelled touch or a lost capture, as a release that
    * dismisses nothing: the surface goes back where it sits, and the grab is over.
    */
@@ -655,6 +694,10 @@ export function Sheet({
     const start = dragStart.current
     dragStart.current = null
     if (!start) return
+    if (!open) {
+      carryOut(presented.current.offset, 0)
+      return
+    }
     if (reduced) {
       place(0)
       setAtRest(true)
@@ -739,6 +782,10 @@ export function Sheet({
             // stop dead where the finger left, which is the one thing a thrown surface must not do.
             presented.current.offset = offset
             presented.current.velocity = velocity
+            if (!open) {
+              carryOut(offset, velocity)
+              return
+            }
             if (Math.abs(offset - start.offset) < DRAG_THRESHOLD && velocity === 0) {
               place(start.offset)
               setAtRest(start.offset === 0)

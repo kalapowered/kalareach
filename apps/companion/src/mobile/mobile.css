@@ -842,9 +842,9 @@
 }
 
 /*
- * The appearance choices sit three across while each names itself whole, and take a row of their
- * own when a larger text size leaves too little room for one. A caption is its word, the gap and
- * the check, and the word grows with the text while the check does not.
+ * The appearance choices sit three across while each names itself whole, and wrap onto another row
+ * when a larger text size leaves too little room for one. A caption is its word, the gap and the
+ * check, and the word grows with the text while the check does not.
  */
 .m-shell .theme-options {
   grid-template-columns: repeat(auto-fit, minmax(calc(2.75rem + 24px), 1fr));
