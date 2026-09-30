@@ -567,14 +567,16 @@ fn session_config(
     )]
     let mut context = ExecutionContext::resolve(create.worker_profile);
     // The database the session's terminal libraries read. A worker that cannot write it says so
-    // and the session reads whatever its host has: the terminal still works, and the environment's
-    // diagnostics show that no private database was selected.
+    // and the session reads whatever its host has: the terminal still works, and the worker's log
+    // line below says that no private database was selected and why.
     #[cfg(unix)]
     match kr_worker::environment::materialise_terminfo(environment.state_dir()) {
         Ok(directory) => context.terminfo = Some(directory),
-        Err(error) => eprintln!(
-            "kr-worker: no private terminfo database ({error}); this session reads its host's own"
-        ),
+        Err(error) => context.terminfo_unavailable = Some(error.to_string()),
+    }
+    #[cfg(not(unix))]
+    {
+        context.terminfo_unavailable = Some("this platform has no terminfo library".to_owned());
     }
     let desktop = context
         .desktop
@@ -586,6 +588,13 @@ fn session_config(
         &shell_path,
         &specification.release,
         specification.session_id,
+    );
+    // The worker's own log says which terminfo database the session reads and what it kept of the
+    // creator's, next to the other lines it writes about how it started the session.
+    eprintln!(
+        "kr-worker: session {}: {}",
+        specification.session_id,
+        launch_environment.sources.terminfo.describe()
     );
     let mut environment_pairs = launch_environment.to_pairs();
     if let Some(bridge) = bridge {

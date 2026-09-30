@@ -1117,20 +1117,27 @@ three comparisons.
 
 ### Selecting it
 
-A worker writes the database into `terminfo` inside its state directory when it starts a session's
-shell, and leaves a file that already holds the current bytes alone. The write replaces a file whole,
-so workers of several sessions can do it at once. The session's `TERMINFO` names that directory, and
-the environment's diagnostics record it next to `TERM`.
+A worker writes the database into `terminfo/<digest>` inside its state directory when it starts a
+session's shell, where the digest names the compiled bytes. A directory is therefore never rewritten
+with other contents: a worker of a build whose data differs writes a directory of its own, and a
+session an older build started keeps reading the database its own engine answers capability
+queries from. A directory that already holds the current bytes is left alone, and a file is
+replaced whole, so workers of several sessions can write at once and none reads a partial file. The
+session's `TERMINFO` names that directory.
 
-A creator's own `TERMINFO` and `TERMINFO_DIRS` are neither dropped nor obeyed. The library reads
-`TERMINFO` first and `TERMINFO_DIRS` after it, so the private database answers `xterm-256color` and
-the creator's directories follow it: the creator's `TERMINFO` goes at the front of `TERMINFO_DIRS`,
-which keeps its place in the search, and both values are reported as an override. A creator's
-directory still serves the terminal names the private database has no entry for.
+The library reads `TERMINFO` first, then `$HOME/.terminfo`, then each entry of `TERMINFO_DIRS`, then
+its compiled-in directories. The private database comes first, so it answers `xterm-256color`. A
+creator's own `TERMINFO` and `TERMINFO_DIRS` are neither dropped nor obeyed: the creator's
+`TERMINFO` goes at the front of `TERMINFO_DIRS`, which keeps its place in the search after
+`$HOME/.terminfo`, and both values are reported as an override. A creator's directory still serves
+the terminal names the private database has no entry for.
 
-A worker that cannot write the database says so, and that session reads whatever database its host
-has. A Windows host has no terminfo library for a shell to consult, so nothing is written or set
-there.
+The worker writes one line to its own log for each session: the private directory and what it kept
+of the creator's, for example `terminfo: private database <directory>; the creator's
+TERMINFO=<path> follow it`. A worker that cannot write the database says why on the same line, and
+the creator's variables stay exactly as the creator set them, so that session reads whatever
+database its creator's search and its host provide, which may not be a stock one. A Windows host has
+no terminfo library for a shell to consult, so nothing is written or set there.
 
 ### Multiplexers inside a session
 
@@ -1263,14 +1270,16 @@ interesting part.
 
 Direct mode hands a physical terminal the session's own bytes, so it holds only where the terminal
 puts its cursor where the canonical grid does. `kr-term-probe` measures that. It runs in the window
-it is started in, and for each of 136 steps it writes a full reset, the step's bytes and a cursor
-position report, and compares the answer with the cursor a canonical grid of the same size holds
-after the same bytes. The steps cover cursor addressing, delayed wrap at the last column, scroll
+it is started in, and for each of 136 steps it writes a full reset, the step's bytes, a cursor
+position report and a request for primary device attributes, and compares the answer with the
+cursor a canonical grid of the same size holds after the same bytes. The steps cover cursor addressing, delayed wrap at the last column, scroll
 regions and left and right margins, tabs, backspace at the edges, wide characters, combining marks,
 emoji sequences, ambiguous-width characters, the alternate screen and the control characters that
 move the cursor. Each answer is read up to the reply to primary device attributes, which every
-terminal gives last, so a terminal that ignores the report is recorded as silent and not taken for
-one that answers wrongly.
+terminal gives last, so a terminal that ignores the position report is recorded as silent and not
+taken for one that answers wrongly. A read is bounded to ten seconds and 64 KiB. When the reply to
+primary device attributes does not arrive, the run stops at that step and says so in the record,
+because an answer still on its way would be taken for the next step's.
 
 Each run writes a record to `fixtures/terminal/physical/<terminal>-<version>.json`: the launcher's
 own reading of the application (its bundle, its version, its profile settings and the environment
@@ -1284,18 +1293,19 @@ test made, with no Apple Event sent:
 
 | Terminal | Version | Window | Steps | Agree | Differ | Silent |
 | --- | --- | --- | --- | --- | --- | --- |
-| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 115 | 21 | 0 |
-| iTerm2 | 3.7.1 | 179 by 39 | 136 | 121 | 15 | 0 |
+| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 114 | 22 | 0 |
+| iTerm2 | 3.7.1 | 179 by 37 | 136 | 121 | 15 | 0 |
 
 The table lists every step on which either terminal differs. A cell gives the grid's position, then
 the terminal's in bold, as row and column; `agrees` means the two match. The grid is not changed to
 follow a terminal, and a difference is a finding, not a fault in either side.
 
-| Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 39 |
+| Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 37 |
 | --- | --- | --- | --- |
-| `addressing.clamps-to-the-corner` | `\e[9999;9999H` | 24;81 / **24;80** | 39;180 / **39;179** |
+| `addressing.clamps-to-the-corner` | `\e[9999;9999H` | 24;81 / **24;80** | 37;180 / **37;179** |
 | `addressing.save-and-restore-csi` | `\e[5;6H\e[s\e[1;1H\e[u` | 5;6 / **1;1** | agrees |
 | `autowrap.pending-then-left` | `a×80\e[D` | 1;79 / **1;80** | 1;178 / **1;179** |
+| `autowrap.pending-survives-erase-line` | `a×80\e[Kb` | 2;2 / **1;80** | agrees |
 | `autowrap.pending-survives-save-and-restore` | `a×80\e7\e[H\e8x` | 2;2 / **1;80** | 2;2 / **1;179** |
 | `autowrap.last-row-scrolls` | `\e[24;1Ha×81` | 24;2 / **24;80** | agrees |
 | `autowrap.insert-mode-at-the-edge` | `\e[4h\e[1;80Hxy` | 2;2 / **1;80** | agrees |
@@ -1322,6 +1332,13 @@ follow a terminal, and a difference is a finding, not a fault in either side.
 | `alternate-screen.save-and-restore-by-mode` | `\e[5;6H\e[?1048h\e[1;1H\e[?1048l` | 5;6 / **1;1** | agrees |
 | `controls.line-feed-mode-adds-a-return` | `\e[20habc\n` | agrees | 2;1 / **2;4** |
 
+The cursor report is the only thing measured. It does not show whether a wrap is pending at the
+cursor, what is on the screen, or how a region scrolled; a step that leaves the cursor in the same
+place can still leave a different screen. Two steps that ask whether a pending wrap
+survives an operation (`autowrap.pending-survives-erase-line` and
+`autowrap.pending-survives-save-and-restore`) end with a character written afterwards, so the cursor
+shows where that character went.
+
 What the records show:
 
 - **Both terminals answer alike and the grid differs.** A column past the right edge in `CSI H`
@@ -1335,10 +1352,12 @@ What the records show:
   is right is a question for the profile, not something the records decide.
 - **Terminal.app alone differs on** the save and restore forms `CSI s`, `CSI u` and mode 1048, on
   left and right margins (mode 69), on cursor movement inside a scroll region, on reverse index at
-  the top of the screen when a region is set, on a wrap on the last row and in insert mode, on the
-  zero-width joiner, the soft hyphen and the keycap sequence.
+  the top of the screen when a region is set, on a wrap on the last row and in insert mode, on
+  erase in line while a wrap is pending (it clears the pending wrap, so the next character lands on
+  the last column and the grid's goes to the next row), on the zero-width joiner, the soft hyphen
+  and the keycap sequence.
 - **iTerm2 alone differs on** a wide character or an emoji one column from the edge, which it wraps
-  as xterm does where the grid and Terminal.app leave it on the last row; on a combining mark at
+  as xterm does where the grid and Terminal.app leave it on the last column; on a combining mark at
   the start of a line, which it gives a cell of its own; on the emoji presentation selector, which
   makes U+2764 two cells; on regional-indicator pairs and flags, which it draws four cells wide
   where the grid and Terminal.app draw two; on a joined family, which it draws as one cluster of

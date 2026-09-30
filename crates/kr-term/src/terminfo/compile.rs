@@ -245,7 +245,14 @@ fn replace_file(directory: &Path, target: &Path, bytes: &[u8]) -> std::io::Resul
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let staging = directory.join(format!(".{name}.{}", std::process::id()));
+    // Unique within this process as well as across processes, so two threads installing at once
+    // never write one staging file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staging = directory.join(format!(
+        ".{name}.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let mut file = std::fs::File::create(&staging)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
