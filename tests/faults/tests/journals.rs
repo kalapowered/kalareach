@@ -252,13 +252,14 @@ fn unreadable(archive: &Archive) -> bool {
         .any(|reason| matches!(reason, Incompleteness::JournalUnreadable { .. }))
 }
 
-/// The archive reads a crashed session's journal whose receipts table has its root page overwritten
-/// as if nothing in it were damaged. It counts the receipts from indexes, and SQLite answers a count
-/// from an index without reading the table, so the archive never meets the damaged page: it reports
-/// three receipts and nothing unreadable, while the store's own check finds the damage and every
-/// receipt read fails. Section 24 asks for an explicit incomplete archive here. This test keeps a
-/// record of that behaviour; when the archive checks its store's pages, as the worker's own recovery
-/// does, it fails, and is replaced by one that the archive reports the journal unreadable.
+/// The archive reads a crashed session's journal whose receipts table has its root page
+/// overwritten as if nothing in it were damaged. It counts the receipts from indexes, and SQLite
+/// answers a count from an index without reading the table, so the archive never meets the damaged
+/// page: it reports three receipts and nothing unreadable, while the store's own check finds the
+/// damage and every receipt read fails. Section 24 asks for an explicit incomplete archive here.
+/// This test keeps a record of that behaviour; when the archive checks its store's pages, as the
+/// worker's own recovery does, it fails, and is replaced by one that the archive reports the
+/// journal unreadable.
 #[test]
 fn the_archive_reads_a_journal_whose_receipts_table_is_damaged_as_one_with_nothing_unreadable() {
     let (damaged, session_id) = in_a_host("damaged-receipts", Made::WithFault);
