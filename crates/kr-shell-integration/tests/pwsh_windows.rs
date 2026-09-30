@@ -313,6 +313,7 @@ async fn register(
         BridgeEvent::HooksActivated(HooksActivated {
             session_id: endpoint.session_id(),
             prompt_generation: PromptGeneration::new(1),
+            modules: Vec::new(),
         })
     );
     id

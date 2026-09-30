@@ -147,7 +147,7 @@ refused before its declaration is read at all:
 | `key_injection_forbidden` | `SHELL_INTEGRATION_UNSUPPORTED` | The declaration named pseudo-terminal key injection as its launch path |
 | `editor_abi_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The editor ABI is not one this build was qualified against |
 | `integration_version_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The integration version is not supported |
-| `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI |
+| `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI, or a module the shell holds after its startup files imports a name this reader does not provide or could not be read |
 | `package_mismatch` | `PERMISSION_DENIED` | The declaration describes a different build from the package this session launched |
 
 An installation is read shell by shell. A record this host cannot read refuses that shell by name
@@ -190,6 +190,19 @@ The phases advance on what the bridge reports, never on a guess. The handshake a
 `hooks_activated` says its user-facing hooks are live after the startup files, which is what makes a
 session qualified. `integration_lost` says the ground has gone, and the worker infers the same when
 the bridge's connection ends.
+
+The handshake is made before any startup file runs, so a native module a startup file loads is not
+in the declaration. `hooks_activated` carries the dynamic modules the shell holds by then, and the
+worker judges them before the session qualifies: a module that imports a name the running reader
+does not provide, or that the bridge could not read, refuses the session with
+`module_tree_unsupported`, and the create answers `SHELL_INTEGRATION_UNSUPPORTED` with that reason,
+the module and the import, and what to do (rebuild the module, stop loading it in KalaReach
+sessions, or create the session with `--shell-mode native_compat`). The Zsh package reads each
+module's import table and asks the running shell for each undefined name; that finds a module built
+against an editor whose functions this one lacks, and it does not find a module built against
+another layout of the same names, one loaded after the hooks go live, or one the loader itself
+refuses (which the loader reports). The Bash, Fish and PSReadLine packages list no modules: Bash's
+loadable builtins (`enable -f`) and PowerShell's binary modules are not checked.
 
 A loss before qualification closes the creating session, whatever it was: a create that cannot
 deliver the managed contract fails rather than succeeding with less, and an explicit compatibility
@@ -244,7 +257,7 @@ shells runs as it was typed and reports no block.
 | `command_block` | When a command starts and again when it ends | `session_id`, `prompt_generation`, `command`, `started_at_ms`, `duration_ms`, `exit_status`, `cwd`, `cwd_revision` |
 | `gesture_changed` | The line discipline's `VEOF` changed, or the configured PSReadLine gesture did | `session_id`, `gesture`, `effective_at` |
 | `pre_eof_consumed` | An eligible gesture was consumed because it could not be attributed | `session_id`, `prompt_generation`, `reason`, `hint_printed` |
-| `hooks_activated` | Once, after the user's startup files have run and before the first primary reader | `session_id`, `prompt_generation` |
+| `hooks_activated` | Once, after the user's startup files have run and before the first primary reader | `session_id`, `prompt_generation`, `modules` (each dynamic module the shell holds: `name`, `path`, and `imports`, which is `bound`, `{missing: <name>}` or `{not_read: <why>}`; empty for a shell that lists none) |
 | `integration_lost` | The hooks, the reader or the root shell have gone | `session_id`, `loss` (`post_startup_failure`, `semantic_hook_loss`, `bridge_disconnected`, `unqualified_root_replacement`), `detail` |
 
 The nested objects those fields carry:

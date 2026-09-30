@@ -418,12 +418,50 @@ pub struct PreEofConsumed {
     pub hint_printed: bool,
 }
 
+/// What the bridge found when it read the imports of one module the shell has loaded.
+///
+/// A module the person loads is built against some editor, and nothing in the module says which.
+/// What a bridge can say is whether the running shell provides every name the module imports, so
+/// that is what this records. It is a statement about names and no more: a module built against
+/// another layout of the same names binds, and is [`Self::Bound`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleImports {
+    /// Every name the module imports is provided by the running shell and the modules it has
+    /// loaded.
+    Bound,
+    /// The first name the running shell does not provide, which the module would fail on at the
+    /// first call that needs it.
+    Missing(String),
+    /// The bridge could not read the module's imports, and why. An inspection that is not whole is
+    /// never [`Self::Bound`].
+    NotRead(String),
+}
+
+/// One dynamic module the shell holds when its hooks go live.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadedModule {
+    /// The name the shell loaded it by.
+    pub name: String,
+    /// The file it was loaded from, as the loader named it.
+    pub path: String,
+    /// What reading its imports found.
+    pub imports: ModuleImports,
+}
+
 /// The integration's user-facing hooks are live.
 ///
 /// Sent once, after the user's startup files have run and before the first primary reader the
 /// session will report. It is what moves a session from authenticated to qualified: until it
 /// arrives, rich launch and a ready or create success stay disabled, because a startup file could
 /// still replace the reader or fail.
+///
+/// It also carries the dynamic modules the shell holds by then. The handshake is made before any
+/// startup file runs, so a module a startup file loads is not there to be judged when the
+/// declaration is; here it is, and [`decide_activated_modules`](crate::contract::transport::decide_activated_modules)
+/// judges the list before the session qualifies. A shell with nothing to say about its modules
+/// sends none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksActivated {
@@ -431,6 +469,8 @@ pub struct HooksActivated {
     pub session_id: SessionId,
     /// The prompt generation the first primary reader will start at.
     pub prompt_generation: PromptGeneration,
+    /// The dynamic modules the shell holds, each with what reading its imports found.
+    pub modules: Vec<LoadedModule>,
 }
 
 /// The integration lost the ground it stood on.
@@ -526,6 +566,76 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn activated(modules: Vec<LoadedModule>) -> HooksActivated {
+        HooksActivated {
+            session_id: session(),
+            prompt_generation: PromptGeneration::new(1),
+            modules,
+        }
+    }
+
+    #[test]
+    fn the_report_that_the_hooks_are_live_round_trips_with_its_modules() {
+        let modules = vec![
+            LoadedModule {
+                name: "zsh/complete".to_owned(),
+                path: "/opt/kalareach/lib/zsh/5.9/zsh/complete.so".to_owned(),
+                imports: ModuleImports::Bound,
+            },
+            LoadedModule {
+                name: "kr_user".to_owned(),
+                path: "/home/person/modules/kr_user.so".to_owned(),
+                imports: ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
+            },
+            LoadedModule {
+                name: "odd".to_owned(),
+                path: "/home/person/modules/odd.so".to_owned(),
+                imports: ModuleImports::NotRead("its format is not one this reads".to_owned()),
+            },
+        ];
+        for carried in [Vec::new(), modules] {
+            let event = BridgeEvent::HooksActivated(activated(carried));
+            let bytes = kr_cbor::to_canonical_vec(&event).expect("encodes");
+            let decoded: BridgeEvent =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    /// The bridges write this by hand, so its shape is fixed here: the list is required, each
+    /// import verdict is the contract's own tagging, and a report without the list is refused.
+    #[test]
+    fn the_report_has_the_shape_the_bridges_write() {
+        for (json, expected) in [
+            (serde_json::json!("bound"), ModuleImports::Bound),
+            (
+                serde_json::json!({"missing": "zle_x"}),
+                ModuleImports::Missing("zle_x".to_owned()),
+            ),
+            (
+                serde_json::json!({"not_read": "why"}),
+                ModuleImports::NotRead("why".to_owned()),
+            ),
+        ] {
+            let decoded: ModuleImports = serde_json::from_value(json).expect("the tagging decodes");
+            assert_eq!(decoded, expected);
+        }
+        let without_the_list = serde_json::json!({
+            "session_id": serde_json::to_value(session()).unwrap(),
+            "prompt_generation": serde_json::to_value(PromptGeneration::new(1)).unwrap(),
+        });
+        assert!(
+            serde_json::from_value::<HooksActivated>(without_the_list).is_err(),
+            "a report that says nothing of its modules is not one this build reads"
+        );
+        let unknown_member = serde_json::json!({
+            "session_id": serde_json::to_value(session()).unwrap(),
+            "prompt_generation": serde_json::to_value(PromptGeneration::new(1)).unwrap(),
+            "modules": [{"name": "m", "path": "/m.so", "imports": "bound", "abi": "zle-5.8"}],
+        });
+        assert!(serde_json::from_value::<HooksActivated>(unknown_member).is_err());
     }
 
     #[test]

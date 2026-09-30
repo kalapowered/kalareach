@@ -390,7 +390,9 @@ pub enum QualificationReason {
     EditorAbiUnsupported,
     /// The integration version is not one this worker supports.
     IntegrationVersionUnsupported,
-    /// A loadable module in the shell's module tree is ABI-incompatible with the packaged reader.
+    /// A loadable module in the shell's module tree is ABI-incompatible with the packaged reader,
+    /// or a module the shell holds after its startup files imports a name this reader does not
+    /// provide, or could not be read.
     ModuleTreeUnsupported,
     /// The declaration does not describe the package this session launched.
     PackageMismatch,

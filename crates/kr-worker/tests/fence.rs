@@ -36,7 +36,9 @@ use kr_protocol::root::{
 };
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
-use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated, ReaderIdle};
+use kr_shell_integration::contract::events::{
+    BridgeEvent, EofGesture, HooksActivated, LoadedModule, ModuleImports, ReaderIdle,
+};
 use kr_shell_integration::contract::fence::{AmbiguityReason, DetachTarget, InputRef, LeaseView};
 use kr_shell_integration::contract::qualification::{IntegrationLoss, ShellKind};
 use kr_shell_integration::contract::requests::{
@@ -236,12 +238,13 @@ async fn unpumped() -> Unpumped {
     // test needs from them is a session that accepts input and holds it for a reader.
     {
         let driver = session.fence_mut().expect("a driver");
-        assert!(driver.registered(ShellKind::Zsh));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
         let _ = driver.bridge_event(
             kr_protocol::ids::RequestId::new(1),
             &BridgeEvent::HooksActivated(HooksActivated {
                 session_id,
                 prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
             }),
         );
         assert!(driver.phase().reports_ready());
@@ -464,6 +467,7 @@ async fn wired_holding_fences(
         Bridging {
             clock: Arc::clone(clock) as Arc<_>,
             fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
+            hello_abi: "zle-5.9",
         },
         |_| {},
     )
@@ -476,6 +480,8 @@ struct Bridging {
     clock: Arc<dyn kr_transport::clock::ContinuousClock>,
     /// What the server keeps each published fence from its connection's writer for, if anything.
     fence_hold: Option<FenceHold>,
+    /// The editor ABI the reference shell's hello declares. The worker supports `zle-5.9`.
+    hello_abi: &'static str,
 }
 
 impl Bridging {
@@ -484,6 +490,7 @@ impl Bridging {
         Self {
             clock: Arc::new(SystemContinuousClock::new()),
             fence_hold: None,
+            hello_abi: "zle-5.9",
         }
     }
 }
@@ -568,17 +575,25 @@ async fn wired_built(
     }
     let bridge_task = tokio::spawn(server.serve());
 
+    let declared = ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", bridging.hello_abi);
     let hello =
-        qualified_hello(&reference(), session_id, &address, process, &secret).expect("a hello");
+        qualified_hello(&declared, session_id, &address, process, &secret).expect("a hello");
     let (mut bridge, outcome) =
         tokio::time::timeout(SOON, ScriptedBridge::connect(&address, &hello))
             .await
             .expect("the worker accepted a connection")
             .expect("connects");
-    assert!(
-        matches!(outcome, HandshakeOutcome::Accepted(_)),
-        "a qualified root shell registers: {outcome:?}"
-    );
+    if bridging.hello_abi == "zle-5.9" {
+        assert!(
+            matches!(outcome, HandshakeOutcome::Accepted(_)),
+            "a qualified root shell registers: {outcome:?}"
+        );
+    } else {
+        assert!(
+            matches!(outcome, HandshakeOutcome::Refused(_)),
+            "a shell built against another editor is refused: {outcome:?}"
+        );
+    }
     if register {
         // The user's startup files have run and the integration's own hooks are live. Until this
         // the session is authenticated but not qualified, and it holds no fence.
@@ -586,6 +601,7 @@ async fn wired_built(
             .send_event(BridgeEvent::HooksActivated(HooksActivated {
                 session_id,
                 prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
             }))
             .await
             .expect("reports");
@@ -1921,6 +1937,7 @@ async fn a_peer_that_closes_only_what_it_reads_from_is_reported_as_a_lost_bridge
         .send_event(BridgeEvent::HooksActivated(HooksActivated {
             session_id,
             prompt_generation: PromptGeneration::new(1),
+            modules: Vec::new(),
         }))
         .await
         .expect("reports");
@@ -4935,6 +4952,119 @@ async fn a_launch_is_refused_once_an_application_takes_the_foreground_and_is_nev
         !contains(&seen, b"-launched") && !contains(&seen, b"printf"),
         "the launch reached the terminal: {}",
         String::from_utf8_lossy(&seen)
+    );
+    wired.close().await;
+}
+
+fn activation(session_id: SessionId, modules: Vec<LoadedModule>) -> BridgeEvent {
+    BridgeEvent::HooksActivated(HooksActivated {
+        session_id,
+        prompt_generation: PromptGeneration::new(1),
+        modules,
+    })
+}
+
+/// KR-REQ-07.87: a session whose shell holds modules that bind qualifies, and the create that is
+/// waiting on it is answered.
+#[tokio::test]
+async fn a_shell_holding_modules_that_bind_qualifies_and_the_create_is_answered() {
+    let mut wired = wired_with(ShellMode::Managed, false).await;
+    wired
+        .bridge
+        .send_event(activation(
+            wired.session_id,
+            vec![LoadedModule {
+                name: "kr_user".to_owned(),
+                path: "/home/person/modules/kr_user.so".to_owned(),
+                imports: ModuleImports::Bound,
+            }],
+        ))
+        .await
+        .expect("reports");
+    wired
+        .runtime
+        .await_qualification(Duration::from_secs(10))
+        .await
+        .expect("the create is answered");
+    wired.close().await;
+}
+
+/// KR-REQ-07.87, KR-REQ-07.88: a module the editor cannot bind ends the create with the named
+/// error, never a ready state, and the session it was creating is closed.
+#[tokio::test]
+async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() {
+    let mut wired = wired_with(ShellMode::Managed, false).await;
+    wired
+        .bridge
+        .send_event(activation(
+            wired.session_id,
+            vec![LoadedModule {
+                name: "kr_user".to_owned(),
+                path: "/home/person/modules/kr_user.so".to_owned(),
+                imports: ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
+            }],
+        ))
+        .await
+        .expect("reports");
+    let error = wired
+        .runtime
+        .await_qualification(Duration::from_secs(10))
+        .await
+        .expect_err("a session with a module that cannot bind is not answered ready");
+    assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
+    assert_eq!(
+        error.message,
+        "module_tree_unsupported: module kr_user imports zle_abi_newer_entry, which this reader \
+         (zle-5.9) does not provide; rebuild the module for this reader, stop loading it in \
+         KalaReach sessions, or create the session with --shell-mode native_compat"
+    );
+    // The session that was being created is closed, and it was never ready.
+    tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
+        .await
+        .expect("the session closes");
+    assert_eq!(
+        wired.runtime.state(),
+        kr_protocol::session::SessionState::Closed
+    );
+    let session = wired.runtime.session();
+    assert!(!session.fence().expect("a driver").phase().reports_ready());
+    drop(session);
+    // The answer survives the closure: asking again names the same refusal.
+    let again = wired
+        .runtime
+        .await_qualification(Duration::from_secs(1))
+        .await
+        .expect_err("still refused");
+    assert_eq!(again.message, error.message);
+    wired.close().await;
+}
+
+/// A hello refused for what the shell cannot do reaches the create as the named error at once,
+/// where it used to wait out its bound and say the integration did not qualify.
+#[tokio::test]
+async fn a_shell_refused_at_the_handshake_ends_the_create_with_the_named_error() {
+    let wired = wired_built(
+        ShellMode::Managed,
+        false,
+        Bridging {
+            hello_abi: "zle-5.8",
+            ..Bridging::ordinary()
+        },
+        |_| {},
+    )
+    .await;
+    let error = wired
+        .runtime
+        .await_qualification(Duration::from_secs(10))
+        .await
+        .expect_err("a shell built against another editor is not qualified");
+    assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
+    assert!(
+        error.message.starts_with(
+            "editor_abi_unsupported: editor ABI zle-5.8 is not one this build was qualified against"
+        ),
+        "{}",
+        error.message
     );
     wired.close().await;
 }

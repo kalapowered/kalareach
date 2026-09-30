@@ -145,6 +145,7 @@ Write-Report ("accepted gesture_byte={0} hint={1}" -f $script:Kr.GestureByte, $s
 $script:Kr.Registered = $true
 $script:Kr.Managed = $true
 Send-KrEvent 'hooks_activated' @{
+    modules           = @()
     session_id        = $script:Kr.Session
     prompt_generation = [uint64]1
 }

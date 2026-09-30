@@ -1299,6 +1299,71 @@ impl SessionRuntime {
         self.session().state()
     }
 
+    /// Waits until the root integration has qualified, or says why it did not.
+    ///
+    /// Waiting is on the phase rather than on a timer: the session is asked what it is, and a
+    /// session that has closed in the meantime answers immediately rather than holding this for
+    /// the bound. What the integration was refused for is asked first, because it outlives the
+    /// closure that follows it: a create whose shell was refused says why, by the reason's name and
+    /// the refusal's own words, and never that the session ended. The host records the same
+    /// refusal, with where the module was loaded from, on the worker's diagnostics stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the answer the create fails with.
+    pub async fn await_qualification(
+        &self,
+        within: std::time::Duration,
+    ) -> std::result::Result<(), kr_protocol::error::ProtocolError> {
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            {
+                let session = self.session();
+                if let Some(driver) = session.fence() {
+                    if let Some(refusal) = driver.qualification_refusal() {
+                        eprintln!(
+                            "kr-worker: session {}: the root integration was refused ({}): {}; {}",
+                            session.id(),
+                            refusal.refused.reason.as_str(),
+                            refusal.refused.error.message,
+                            refusal.diagnostic
+                        );
+                        return Err(qualification_answer(&refusal.refused));
+                    }
+                    if driver.phase().reports_ready() {
+                        return Ok(());
+                    }
+                    if !driver.phase().consumes_eligible_eof() {
+                        return Err(ProtocolError::new(
+                            ErrorCode::ShellIntegrationUnsupported,
+                            "the root shell was replaced by something this build cannot qualify, \
+                             so this session claims none of the managed contract",
+                        ));
+                    }
+                }
+                if session.state() != SessionState::Live {
+                    return Err(ProtocolError::new(
+                        ErrorCode::ShellIntegrationUnsupported,
+                        "the session ended before its root integration qualified",
+                    ));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProtocolError::new(
+                    ErrorCode::ShellIntegrationUnsupported,
+                    format!(
+                        "the root integration did not qualify within {} seconds; the session is \
+                         closed and an explicit compatibility retry is a new create request",
+                        within.as_secs()
+                    ),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Returns the lease epoch the writer is comparing every queued batch against.
     ///
     /// It is [`Session::input_fence`] read from the outside: the session publishes it as it changes
@@ -1307,6 +1372,33 @@ impl SessionRuntime {
     pub fn input_fence(&self) -> u64 {
         self.fence.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// What a create fails with when the root integration was refused: the reason's own name, the
+/// refusal's words, and the choices the person has. A capability failure is a configuration
+/// answer, and the session reports it with the named choices rather than substituting a shell.
+fn qualification_answer(
+    refused: &kr_shell_integration::contract::transport::BridgeRefused,
+) -> kr_protocol::error::ProtocolError {
+    use kr_shell_integration::contract::qualification::QualificationReason;
+
+    let choices = match refused.reason {
+        QualificationReason::ModuleTreeUnsupported => {
+            "rebuild the module for this reader, stop loading it in KalaReach sessions, or \
+             create the session with --shell-mode native_compat"
+        }
+        _ => {
+            "use a shell package this build qualifies, or create the session with --shell-mode native_compat"
+        }
+    };
+    kr_protocol::error::ProtocolError::new(
+        refused.code(),
+        format!(
+            "{}: {}; {choices}",
+            refused.reason.as_str(),
+            refused.error.message
+        ),
+    )
 }
 
 /// How long a worker waits for one acceptance to reach the transport it answers on.
