@@ -439,22 +439,16 @@ fn block(
                 }
                 if tokens[at].token == Token::Ident("include".to_owned()) {
                     let next = tokens.get(at + 1).map(|next| &next.token);
-                    let after_path = at >= 2
-                        && tokens[at - 1].token == Token::Punct(':')
-                        && tokens[at - 2].token == Token::Punct(':');
                     if next == Some(&Token::Punct('!')) {
                         reading.unfollowed.push((
                             tokens[at].line,
                             "an include! brings in source where this reading does not follow",
                         ));
-                    } else if after_path
-                        && matches!(
-                            next,
-                            Some(Token::Ident(word)) if word == "as"
-                        )
-                    {
-                        // `use std::include as load;` renames the macro, and `load!(..)` then
-                        // brings in source under a name this reading does not look for.
+                    } else if matches!(next, Some(Token::Ident(word)) if word == "as") {
+                        // `use std::include as load;`, `use std::{include as load};` and the like
+                        // rename the macro, and `load!(..)` then brings in source under a name this
+                        // reading does not look for. Whatever comes before it, an `include` that
+                        // is renamed is refused.
                         reading.unfollowed.push((
                             tokens[at].line,
                             "an import of include under another name could bring in source",
@@ -660,58 +654,147 @@ fn production_roots(metadata: &serde_json::Value, workspace: &Path) -> Roots {
     roots
 }
 
-/// Where the `testing` feature, whose items this reading passes over as test code, could be turned
-/// on in a program: a normal or build dependency of one of the host's crates that asks for it, and
-/// a default feature that enables it, as `crate: how`.
+/// Where the `testing` feature of one of the host's crates, whose items this reading passes over
+/// as test code, could be turned on in a program, as `crate: how`.
+///
+/// A program is built from one of the host's crates with its default features and with what its
+/// normal and build dependencies ask of theirs. Each of those starts a walk over the features that
+/// turn others on, in the crate's own table and in its dependencies' (`feature`, `dep:name`,
+/// `name/feature`, `name?/feature`), and any walk that reaches a `testing` feature of one of the
+/// host's crates is named. A dev dependency is not part of a program.
 fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
-    let mut found = Vec::new();
-    for package in metadata["packages"].as_array().into_iter().flatten() {
-        let Some(manifest) = package["manifest_path"].as_str() else {
-            continue;
-        };
-        if !normalise(Path::new(manifest)).starts_with(workspace.join("crates")) {
-            continue;
-        }
-        let name = package["name"].as_str().unwrap_or("a package");
-        for dependency in package["dependencies"].as_array().into_iter().flatten() {
-            let shipped = matches!(dependency["kind"].as_str(), None | Some("build"));
-            let asks = dependency["features"]
-                .as_array()
+    /// A package's dependency as its feature table names it, and what it asks of it.
+    struct Asked<'a> {
+        package: &'a str,
+        features: Vec<&'a str>,
+        defaults: bool,
+        shipped: bool,
+    }
+
+    let packages: BTreeMap<&str, &serde_json::Value> = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|package| Some((package["name"].as_str()?, package)))
+        .collect();
+    let host_crates = workspace.join("crates");
+    let is_host_crate = |package: &serde_json::Value| {
+        package["manifest_path"]
+            .as_str()
+            .is_some_and(|manifest| normalise(Path::new(manifest)).starts_with(&host_crates))
+    };
+    fn dependencies_of(package: &serde_json::Value) -> BTreeMap<String, Asked<'_>> {
+        package["dependencies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| {
+                let name = dependency["name"].as_str()?;
+                let key = dependency["rename"].as_str().unwrap_or(name).to_owned();
+                Some((
+                    key,
+                    Asked {
+                        package: name,
+                        features: dependency["features"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect(),
+                        defaults: dependency["uses_default_features"]
+                            .as_bool()
+                            .unwrap_or(true),
+                        shipped: matches!(dependency["kind"].as_str(), None | Some("build")),
+                    },
+                ))
+            })
+            .collect()
+    }
+    // Every feature a walk from `start` turns on, as `(package, feature)`.
+    let walk = |start: Vec<(String, String)>| -> BTreeSet<(String, String)> {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut pending = start;
+        while let Some((name, feature)) = pending.pop() {
+            if !seen.insert((name.clone(), feature.clone())) {
+                continue;
+            }
+            let Some(package) = packages.get(name.as_str()) else {
+                continue;
+            };
+            let dependencies = dependencies_of(package);
+            let turns_on =
+                |key: &str, pending: &mut Vec<(String, String)>, feature: Option<&str>| {
+                    let Some(asked) = dependencies.get(key).filter(|asked| asked.shipped) else {
+                        return;
+                    };
+                    let base: Vec<&str> = match feature {
+                        Some(feature) => vec![feature],
+                        None => asked.features.clone(),
+                    };
+                    for feature in base {
+                        pending.push((asked.package.to_owned(), feature.to_owned()));
+                    }
+                    if feature.is_none() && asked.defaults {
+                        pending.push((asked.package.to_owned(), "default".to_owned()));
+                    }
+                };
+            let entries = package["features"][feature.as_str()].as_array();
+            for entry in entries
                 .into_iter()
                 .flatten()
-                .any(|feature| feature.as_str() == Some("testing"));
-            if shipped && asks {
-                found.push(format!(
-                    "{name}: a normal or build dependency on {} asks for its testing feature",
-                    dependency["name"].as_str().unwrap_or("a crate")
-                ));
+                .filter_map(serde_json::Value::as_str)
+            {
+                if let Some(key) = entry.strip_prefix("dep:") {
+                    turns_on(key, &mut pending, None);
+                } else if let Some((key, other)) = entry.split_once('/') {
+                    let key = key.strip_suffix('?').unwrap_or(key);
+                    turns_on(key, &mut pending, Some(other));
+                    if !entry.contains("?/") {
+                        turns_on(key, &mut pending, None);
+                    }
+                } else {
+                    pending.push((name.clone(), entry.to_owned()));
+                }
             }
         }
-        // What the default features enable, and what those enable in turn.
-        let table = package["features"].as_object();
-        let mut seen = BTreeSet::from(["default".to_owned()]);
-        let mut pending = vec!["default".to_owned()];
-        while let Some(feature) = pending.pop() {
-            let enables = table
-                .and_then(|table| table.get(&feature))
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str);
-            for entry in enables {
-                if entry == "testing" || entry.ends_with("/testing") || entry.ends_with("?/testing")
-                {
-                    found.push(format!("{name}: the default features enable {entry}"));
-                } else if table.is_some_and(|table| table.contains_key(entry))
-                    && seen.insert(entry.to_owned())
-                {
-                    pending.push(entry.to_owned());
+        seen
+    };
+    let mut found = BTreeSet::new();
+    for package in packages.values().filter(|package| is_host_crate(package)) {
+        let name = package["name"].as_str().unwrap_or("a package");
+        let mut starts = vec![(
+            "its default features".to_owned(),
+            vec![(name.to_owned(), "default".to_owned())],
+        )];
+        for (key, asked) in dependencies_of(package)
+            .into_iter()
+            .filter(|(_, asked)| asked.shipped)
+        {
+            let mut start: Vec<(String, String)> = asked
+                .features
+                .iter()
+                .map(|feature| (asked.package.to_owned(), (*feature).to_owned()))
+                .collect();
+            if asked.defaults {
+                start.push((asked.package.to_owned(), "default".to_owned()));
+            }
+            starts.push((format!("a normal or build dependency on {key}"), start));
+        }
+        for (how, start) in starts {
+            for (turned_on, feature) in walk(start) {
+                let host_feature = feature == "testing"
+                    && packages
+                        .get(turned_on.as_str())
+                        .is_some_and(|turned_on| is_host_crate(turned_on));
+                if host_feature {
+                    found.insert(format!(
+                        "{name}: the testing feature of {turned_on} is turned on by {how}"
+                    ));
                 }
             }
         }
     }
-    found.sort();
-    found
+    found.into_iter().collect()
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -1232,14 +1315,23 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
         unfollowed(&[("src/lib.rs", "fn f() {}\ninclude!(\"generated.rs\");")]),
         vec!["src/lib.rs: line 2: an include! brings in source where this reading does not follow"]
     );
-    // An import of `include` that renames it could bring in source under another name.
-    assert_eq!(
-        unfollowed(&[(
-            "src/lib.rs",
-            "use std::include as load;\nload!(\"../tools/extra.rs\");"
-        )]),
-        vec!["src/lib.rs: line 1: an import of include under another name could bring in source"]
-    );
+    // An import of `include` that renames it could bring in source under another name, whatever
+    // the import's shape.
+    for import in [
+        "use std::include as load;",
+        "use std::{include as load};",
+        "use std::{self, include as load};",
+        "use include as load;",
+    ] {
+        let source = format!("{import}\nload!(\"../tools/extra.rs\");");
+        assert_eq!(
+            unfollowed(&[("src/lib.rs", source.as_str())]),
+            vec![
+                "src/lib.rs: line 1: an import of include under another name could bring in source"
+            ],
+            "{import}"
+        );
+    }
     // The controls: the same declarations are followed when their files are held, in test code
     // nothing is named, and `include_str!` is data, not source.
     assert!(
@@ -1319,49 +1411,93 @@ fn a_root_outside_the_source_directory_is_named() {
 
 /// A `testing` feature a program could turn on is named, so the reading's passing over of items
 /// under it as test code cannot be undone by a dependency: a normal or build dependency that asks for
-/// it, and a default feature that enables it, each directly or through another feature.
+/// it, a default feature that enables it, and a feature that a dependency's request or a default
+/// leads to, each directly or through other features and dependencies.
 #[test]
 fn a_testing_feature_a_program_could_turn_on_is_named() {
+    let host = |name: &str, dependencies: serde_json::Value, features: serde_json::Value| {
+        serde_json::json!({
+            "name": name,
+            "manifest_path": format!("/w/crates/{name}/Cargo.toml"),
+            "dependencies": dependencies,
+            "features": features,
+        })
+    };
+    let dependency = |name: &str, kind: serde_json::Value, features: &[&str]| {
+        serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "features": features,
+            "uses_default_features": true,
+        })
+    };
     let metadata = serde_json::json!({ "packages": [
-        {
-            "name": "a",
-            "manifest_path": "/w/crates/a/Cargo.toml",
-            "dependencies": [
-                { "name": "b", "kind": null, "features": ["testing"] },
-                { "name": "c", "kind": "build", "features": ["testing"] },
-                { "name": "d", "kind": "dev", "features": ["testing"] },
-                { "name": "e", "kind": null, "features": ["other"] },
-            ],
-            "features": { "default": ["extra"], "extra": ["b/testing"], "testing": [] },
-        },
-        {
-            "name": "f",
-            "manifest_path": "/w/crates/f/Cargo.toml",
-            "dependencies": [],
-            "features": { "default": ["testing"], "testing": [] },
-        },
-        {
+        host(
+            "a",
+            serde_json::json!([
+                dependency("b", serde_json::Value::Null, &["testing"]),
+                dependency("c", serde_json::json!("build"), &["testing"]),
+                dependency("d", serde_json::json!("dev"), &["testing"]),
+                dependency("e", serde_json::Value::Null, &["extra"]),
+            ]),
+            serde_json::json!({ "default": [] }),
+        ),
+        host("b", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+        host("c", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+        host("d", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+        host(
+            "e",
+            serde_json::json!([]),
+            serde_json::json!({ "extra": ["testing"], "testing": [] }),
+        ),
+        host(
+            "f",
+            serde_json::json!([]),
+            serde_json::json!({ "default": ["testing"], "testing": [] }),
+        ),
+        host(
+            "i",
+            serde_json::json!([dependency("j", serde_json::Value::Null, &[])]),
+            serde_json::json!({ "default": ["more"], "more": ["j/testing"] }),
+        ),
+        host("j", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+        host(
+            "k",
+            serde_json::json!([dependency("l", serde_json::Value::Null, &[])]),
+            serde_json::json!({}),
+        ),
+        host(
+            "l",
+            serde_json::json!([]),
+            serde_json::json!({ "default": ["testing"], "testing": [] }),
+        ),
+        serde_json::json!({
             "name": "g",
             "manifest_path": "/w/apps/g/Cargo.toml",
-            "dependencies": [{ "name": "b", "kind": null, "features": ["testing"] }],
+            "dependencies": [dependency("b", serde_json::Value::Null, &["testing"])],
             "features": {},
-        },
+        }),
     ]});
     assert_eq!(
         testing_in_production(&metadata, Path::new("/w")),
         vec![
-            "a: a normal or build dependency on b asks for its testing feature",
-            "a: a normal or build dependency on c asks for its testing feature",
-            "a: the default features enable b/testing",
-            "f: the default features enable testing",
+            "a: the testing feature of b is turned on by a normal or build dependency on b",
+            "a: the testing feature of c is turned on by a normal or build dependency on c",
+            "a: the testing feature of e is turned on by a normal or build dependency on e",
+            "f: the testing feature of f is turned on by its default features",
+            "i: the testing feature of j is turned on by its default features",
+            "k: the testing feature of l is turned on by a normal or build dependency on l",
+            "l: the testing feature of l is turned on by its default features",
         ]
     );
-    // The control: dev dependencies and a testing feature that nothing enables by default are fine.
-    let fine = serde_json::json!({ "packages": [{
-        "name": "a",
-        "manifest_path": "/w/crates/a/Cargo.toml",
-        "dependencies": [{ "name": "d", "kind": "dev", "features": ["testing"] }],
-        "features": { "default": [], "testing": [] },
-    }]});
+    // The control: dev dependencies and a testing feature that nothing turns on are fine.
+    let fine = serde_json::json!({ "packages": [
+        host(
+            "a",
+            serde_json::json!([dependency("d", serde_json::json!("dev"), &["testing"])]),
+            serde_json::json!({ "default": [], "testing": [] }),
+        ),
+        host("d", serde_json::json!([]), serde_json::json!({ "testing": [] })),
+    ]});
     assert!(testing_in_production(&fine, Path::new("/w")).is_empty());
 }
