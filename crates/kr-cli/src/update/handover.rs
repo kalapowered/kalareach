@@ -480,9 +480,8 @@ pub(super) async fn answers_as_now(environment: &Environment) -> Option<BuildId>
     let endpoint = environment.paths.controller_endpoint().ok()?;
     let deadline = tokio::time::Instant::now() + DAEMON_ANSWER;
     loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(
-            left,
+        match tokio::time::timeout_at(
+            deadline,
             LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
         )
         .await

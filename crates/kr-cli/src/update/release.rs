@@ -251,8 +251,8 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 /// How long the system's own tool that says its version is given.
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How much a tool may print: the tool that says a version prints a short line, and one that prints
-/// more than this is given up on.
+/// How many bytes a tool may print: the tool that says a version prints a short line, and one that
+/// prints more than this is given up on.
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
@@ -926,45 +926,59 @@ mod tests {
 
     /// When the bound of a tool that a descendant keeps the output of ends, this run's end of the
     /// pipe is closed: nothing of it stays open, on a thread or otherwise, until the descendant
-    /// ends. A descendant that writes to it afterwards is ended by the broken pipe.
+    /// ends. The descendant says what it finds when it writes: the pipe closed, or, as the control,
+    /// open while the run still reads it. It says so in a file, which is waited for, so nothing
+    /// depends on which process is scheduled first.
     #[test]
     fn a_tool_s_pipe_is_closed_when_its_bound_ends() {
         let directory = tempfile::tempdir().expect("a directory");
-        let after = |name: &str, writes: bool| {
-            let flag = directory.path().join(name);
-            let script = if writes {
-                "(sleep 1; echo late; : > \"$1\") & echo hello"
-            } else {
-                "(sleep 1; : > \"$1\") & echo hello"
-            };
-            assert!(
-                run_bounded(
-                    "sh",
-                    &["-c", script, "sh", &flag.display().to_string()],
-                    std::time::Duration::from_millis(300)
-                )
-                .is_none(),
-                "the descendant holds the pipe past the bound"
-            );
-            flag
+        // The descendant writes after `seconds` and records whether the write went through; SIGPIPE
+        // is ignored, so a closed pipe is an error to it and not its end. The write is a program's
+        // own, so that a shell's buffer does not carry what it could not write into the file.
+        let script = |seconds: u32| {
+            format!(
+                "(trap '' PIPE; sleep {seconds}; if /bin/echo late; then echo open > \"$1\"; else echo \
+                 closed > \"$1\"; fi) & echo hello"
+            )
         };
-        let writing = after("writing", true);
-        let silent = after("silent", false);
-        // The descendants end in a second each, on a loaded host later: what the one that writes
-        // nothing does is waited for, and it began after the one that writes.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !silent.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let told = |flag: &std::path::Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !flag.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Written whole by a redirection that has finished when the file is read whole.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::fs::read_to_string(flag).unwrap_or_default()
+        };
+        // The bound ends while the descendant holds the pipe, and its write finds it closed.
+        let closed = directory.path().join("closed");
         assert!(
-            silent.exists(),
-            "the control: a descendant that writes nothing goes on to its end"
+            run_bounded(
+                "sh",
+                &["-c", &script(3), "sh", &closed.display().to_string()],
+                std::time::Duration::from_secs(2)
+            )
+            .is_none(),
+            "the descendant holds the pipe past the bound"
         );
+        assert_eq!(
+            told(&closed),
+            "closed\n",
+            "the pipe was closed at the bound"
+        );
+        // The control: where the run waits for the descendant, its write goes through and is read.
+        let open = directory.path().join("open");
+        let output = run_bounded(
+            "sh",
+            &["-c", &script(1), "sh", &open.display().to_string()],
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the run ends when the descendant does");
         assert!(
-            !writing.exists(),
-            "a descendant that writes to the pipe finds it closed"
+            String::from_utf8_lossy(&output.stdout).contains("late"),
+            "the write of a descendant is read while the run waits"
         );
+        assert_eq!(told(&open), "open\n");
     }
 
     /// A release's manifest that is a pipe is refused at once, and one that is a link is not
