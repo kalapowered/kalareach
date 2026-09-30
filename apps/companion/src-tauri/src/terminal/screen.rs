@@ -312,8 +312,10 @@ fn placed(screen: &Screen, top: u64, rows: u32, left: u64, columns: u32) -> (Win
     )
 }
 
-/// Places one run on a desktop: the client library's renderer's own rule, and its control filter.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// Places one run: the client library's renderer's own rule, and its control filter.
+///
+/// It is the same code on every platform, a phone's included, because the width model it measures
+/// with builds for all of them.
 fn place(run: &CellRun, left: u64, columns: u32) -> Placement {
     use kr_client::projection::paint;
 
@@ -338,62 +340,6 @@ fn place(run: &CellRun, left: u64, columns: u32) -> Placement {
                 cells: piece.cells,
             })
             .collect(),
-    }
-}
-
-/// Places one run on a phone, which has no pinned width model to measure text with.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn place(run: &CellRun, left: u64, columns: u32) -> Placement {
-    plain(run, left, columns)
-}
-
-/// Places a run with no width model at all.
-///
-/// Printable ASCII is the one text whose width every destination agrees about: a scalar each, a
-/// cell each. A run that is only that, and whose cells are its scalars, is placed; any other run is
-/// blank across its cells, and counted, rather than drawn at a width nobody measured.
-#[cfg_attr(
-    any(target_os = "linux", target_os = "macos", target_os = "windows"),
-    allow(
-        dead_code,
-        reason = "the desktop's placement measures; this rule is the phones'"
-    )
-)]
-fn plain(run: &CellRun, left: u64, columns: u32) -> Placement {
-    let start = run.column.get();
-    let cells = run.cells.get();
-    let end = start.saturating_add(cells);
-    let right = left.saturating_add(u64::from(columns));
-    if end <= left || start >= right {
-        return Placement::default();
-    }
-    let from = start.max(left);
-    let to = end.min(right);
-    let inside = to.saturating_sub(from);
-    let ascii = run
-        .text
-        .bytes()
-        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-        && u64::try_from(run.text.len()).is_ok_and(|length| length == cells);
-    if ascii {
-        let skip = usize::try_from(from.saturating_sub(start)).unwrap_or(usize::MAX);
-        let take = usize::try_from(inside).unwrap_or(usize::MAX);
-        return Placement {
-            pieces: vec![Piece {
-                text: run.text.chars().skip(skip).take(take).collect(),
-                column: from,
-                cells: inside,
-            }],
-            replaced: 0,
-        };
-    }
-    Placement {
-        pieces: vec![Piece {
-            text: " ".repeat(usize::try_from(inside).unwrap_or(0)),
-            column: from,
-            cells: inside,
-        }],
-        replaced: 1,
     }
 }
 
@@ -541,28 +487,57 @@ mod tests {
             .collect()
     }
 
-    /// KR-REQ-13.08 and KR-REQ-04.04: a phone, which has no width model to measure with, places a
-    /// run of printable ASCII whose cells are its scalars, clipped to the window.
+    /// KR-REQ-13.08: a run of mixed widths is placed at each cluster's own column, on every
+    /// platform: the width model this measures with is the one the terminal engine measures with,
+    /// so a phone's placement is a desktop's cell for cell.
     #[test]
-    fn a_phone_places_a_run_of_plain_ascii() {
-        let placed = plain(&run(2, 5, "hello"), 0, 20);
-        assert_eq!(texts(&placed), vec![("hello", 2, 5)]);
+    fn a_run_of_mixed_widths_places_each_cluster_at_its_own_column() {
+        // ASCII, a wide pair, a combining mark, a wide emoji, then ASCII: 1 + 4 + 1 + 2 + 1 cells.
+        let mixed = run(3, 9, "a\u{4e2d}\u{6587}e\u{301}\u{1f600}b");
+        let placed = place(&mixed, 0, 40);
         assert_eq!(placed.replaced, 0);
-        let clipped = plain(&run(2, 5, "hello"), 3, 3);
-        assert_eq!(texts(&clipped), vec![("ell", 3, 3)]);
+        assert_eq!(
+            texts(&placed),
+            vec![
+                ("a", 3, 1),
+                ("\u{4e2d}", 4, 2),
+                ("\u{6587}", 6, 2),
+                ("e\u{301}", 8, 1),
+                ("\u{1f600}", 9, 2),
+                ("b", 11, 1),
+            ]
+        );
+        // The window's edge cuts a wide cluster whole rather than half drawing it.
+        let clipped = place(&mixed, 5, 4);
+        assert!(
+            clipped
+                .pieces
+                .iter()
+                .all(|piece| piece.column >= 5 && piece.column + piece.cells <= 9),
+            "{clipped:?}"
+        );
     }
 
-    /// KR-REQ-04.04: any other run is blank across its cells on a phone, and counted, rather than
-    /// drawn at a width nobody measured.
+    /// Control: a run of printable ASCII is placed one cell to a piece, as a desktop always did,
+    /// and clipped to the window.
     #[test]
-    fn a_phone_leaves_any_other_run_blank_and_counts_it() {
-        for text in ["h\u{e9}llo", "\u{4e2d}\u{6587}x", "a\u{7}bcd", "ab"] {
-            let placed = plain(&run(1, 5, text), 0, 20);
-            assert_eq!(texts(&placed), vec![("     ", 1, 5)], "{text:?}");
-            assert_eq!(placed.replaced, 1, "{text:?}");
-        }
+    fn a_run_of_plain_ascii_is_placed_and_clipped() {
+        let placed = place(&run(2, 5, "hello"), 0, 20);
         assert_eq!(
-            plain(&run(30, 2, "ab"), 0, 20),
+            texts(&placed),
+            vec![
+                ("h", 2, 1),
+                ("e", 3, 1),
+                ("l", 4, 1),
+                ("l", 5, 1),
+                ("o", 6, 1)
+            ]
+        );
+        assert_eq!(placed.replaced, 0);
+        let clipped = place(&run(2, 5, "hello"), 3, 3);
+        assert_eq!(texts(&clipped), vec![("e", 3, 1), ("l", 4, 1), ("l", 5, 1)]);
+        assert_eq!(
+            place(&run(30, 2, "ab"), 0, 20),
             Placement::default(),
             "outside"
         );

@@ -36,8 +36,8 @@ tauri-build = { workspace = true, features = [] }
 # The one secure store, the Android TLS verifier's start and the browser-backed sign-in session.
 companion-platform.workspace = true
 kr-cbor.workspace = true
-# The shared native client: sessions, cursors, drafts, controls and the upload path. The projected
-# screen it can also paint is a desktop window's; see the target table below.
+# The shared native client: sessions, cursors, drafts, controls, the upload path and the projected
+# screen's painter, which measures text with the pinned width model on every platform.
 kr-client.workspace = true
 kr-crypto.workspace = true
 # Where the host on this machine keeps its runtime directory and its controller endpoint.
@@ -61,13 +61,8 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
 ureq.workspace = true
 
-# The three desktop targets. A desktop window paints a local terminal view; a phone has no local
-# terminal, and reads a host's projection as protocol values and draws them itself, so the mobile
-# builds take the shared client without the part that measures a screen with a terminal state
-# library.
+# The three desktop targets.
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-kr-client = { workspace = true, features = ["terminal"] }
-kr-term.workspace = true
 opus.workspace = true
 opusic-sys.workspace = true
 webrtc.workspace = true
@@ -92,6 +87,8 @@ windows-future = { workspace = true, features = ["std"] }
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
+# The pinned width model, which a test measures a placed run against.
+kr-width.workspace = true
 # The pairing suite runs this computer against kr-controller's in-process daemon, whose test
 # support it includes by path.
 iroh.workspace = true
