@@ -385,14 +385,37 @@ fn port_of(room: &LoopbackRoom) -> &str {
         .expect("a port in the origin")
 }
 
-/// The room hears nothing within a moment, so nothing went around the proxy.
+/// The room has heard nothing from the attempt, so nothing went around the proxy.
+///
+/// It is asked once the attempt has ended, when whatever the attempt connected to the room is
+/// already waiting to be taken, so no time has to pass. The room takes its connections in the order
+/// they came, and this connects once itself: if the first connection the room takes is not this
+/// one, something else reached the room before it.
 async fn room_heard_nothing(room: &LoopbackRoom) {
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), room.listener.accept())
-            .await
-            .is_err(),
+    let probe = TcpStream::connect(room.listener.local_addr().expect("an address"))
+        .await
+        .expect("the room takes a connection");
+    let (_first, from) = tokio::time::timeout(WATCHDOG, room.listener.accept())
+        .await
+        .expect("the room takes the connection this made")
+        .expect("a connection");
+    assert_eq!(
+        from,
+        probe.local_addr().expect("an address"),
         "the attempt reached the room without the proxy"
     );
+}
+
+/// The room hears a connection that reached it before the check did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[should_panic(expected = "the attempt reached the room without the proxy")]
+async fn a_connection_that_reached_the_room_is_heard() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let _around_the_proxy = TcpStream::connect(room.listener.local_addr().expect("an address"))
+        .await
+        .expect("the room takes a connection");
+    room_heard_nothing(&room).await;
 }
 
 /// The address the tests name as unanswered refuses a connection. A machine that answers there
