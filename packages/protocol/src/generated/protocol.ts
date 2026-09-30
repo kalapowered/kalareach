@@ -1318,7 +1318,13 @@ export type PluginAdmission =
        * Why, as a kind a program can act on.
        */
       reason:
-        'disabled' | 'revoked' | 'unsupported' | 'incomplete' | 'past_a_limit' | 'unrecordable'
+        | 'disabled'
+        | 'revoked'
+        | 'not_allowed'
+        | 'unsupported'
+        | 'incomplete'
+        | 'past_a_limit'
+        | 'unrecordable'
       state: 'left_out'
     }
 /**
