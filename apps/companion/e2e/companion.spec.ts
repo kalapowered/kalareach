@@ -3376,3 +3376,105 @@ test.describe('the phone terminal under two fingers', () => {
     ).toBe('')
   })
 })
+
+// KR-REQ-13.09: the phone's settings open over a live session and leave it behind them, whole at a
+// person's own text size: the bar's controls, the sheet's edges and each appearance choice.
+test.describe("the phone's settings over a live session", () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const SIZES: readonly Seen[] = [
+    { width: 390, height: 844, scale: '100%' },
+    { width: 320, height: 720, scale: '200%' }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const seen of SIZES) {
+      test(`open over the session, whole, on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen, `&session=${SESSION}`)
+        const field = page.getByLabel('Message this session')
+        await field.fill('a draft the sheet leaves alone')
+        const settings = page.getByRole('button', { name: 'Settings' })
+        const target = surface === 'ios' ? 44 : 48
+        const bar = await page.locator('.m-topbar').evaluate((header) => {
+          const box = (element: Element | null) => {
+            const rect = element?.getBoundingClientRect()
+            return rect ? { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom } : null
+          }
+          return {
+            title: box(header.querySelector('h1')),
+            settings: box(header.querySelector('[aria-label="Settings"]')),
+            back: box(header.querySelector('[aria-label="Back to sessions"]')),
+            headerRight: header.getBoundingClientRect().right
+          }
+        })
+        expect(bar.settings, 'the bar has settings').not.toBeNull()
+        if (bar.settings === null || bar.title === null) return
+        expect(bar.settings.right - bar.settings.left, 'settings target width').toBeGreaterThanOrEqual(target - 0.5)
+        expect(bar.settings.bottom - bar.settings.top, 'settings target height').toBeGreaterThanOrEqual(target - 0.5)
+        expect(bar.settings.right, 'settings stays on the screen').toBeLessThanOrEqual(seen.width + 0.5)
+        expect(bar.title.right, 'the title is clear of settings').toBeLessThanOrEqual(bar.settings.left + 0.5)
+        if (bar.back !== null) expect(bar.back.right, 'the title is clear of back').toBeLessThanOrEqual(bar.title.left + 0.5)
+
+        await settings.click()
+        const sheet = page.getByTestId('sheet')
+        await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+        const shown = await sheet.evaluate((element) => {
+          const rect = element.getBoundingClientRect()
+          const body = element.querySelector<HTMLElement>('.dialog-body')
+          const cards = Array.from(element.querySelectorAll<HTMLElement>('.theme-option')).map((card) => {
+            const box = card.getBoundingClientRect()
+            const caption = card.querySelector<HTMLElement>('.theme-caption')
+            return {
+              left: box.left,
+              right: box.right,
+              cut: caption === null ? Infinity : caption.scrollWidth - caption.clientWidth
+            }
+          })
+          return {
+            left: rect.left,
+            right: rect.right,
+            bottom: rect.bottom,
+            sideways: body === null ? Infinity : body.scrollWidth - body.clientWidth,
+            bodyLeft: body?.getBoundingClientRect().left ?? 0,
+            bodyRight: body?.getBoundingClientRect().right ?? 0,
+            cards
+          }
+        })
+        expect(shown.left, 'the sheet starts on the screen').toBeGreaterThanOrEqual(-0.5)
+        expect(shown.right, 'the sheet ends on the screen').toBeLessThanOrEqual(seen.width + 0.5)
+        expect(shown.bottom, 'the sheet rests on the bottom edge').toBeCloseTo(seen.height, 0)
+        expect(shown.sideways, 'nothing in the sheet runs sideways').toBeLessThanOrEqual(1)
+        expect(shown.cards).toHaveLength(3)
+        for (const card of shown.cards) {
+          expect(card.left, 'each choice starts inside the sheet').toBeGreaterThanOrEqual(shown.bodyLeft - 0.5)
+          expect(card.right, 'each choice ends inside the sheet').toBeLessThanOrEqual(shown.bodyRight + 0.5)
+          expect(card.cut, 'each choice names itself whole').toBeLessThanOrEqual(1)
+        }
+        // The session is behind the sheet, with its draft.
+        await expect(field).toHaveValue('a draft the sheet leaves alone')
+        await still(page, `settings-13.09-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
+      })
+    }
+
+    test(`close by the system's back first, and leave the session by the next, on ${surface}`, async ({
+      page
+    }) => {
+      await onPhone(page, surface, { width: 390, height: 844, scale: '100%' }, `&session=${SESSION}`)
+      await page.getByRole('button', { name: 'Settings' }).click()
+      await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+        timeout: PRESENTATION_DEADLINE
+      })
+      await page.evaluate(() => {
+        window.history.back()
+      })
+      await expect(page.getByTestId('sheet')).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+      await expect(page.getByLabel('Message this session')).toBeVisible()
+      await page.evaluate(() => {
+        window.history.back()
+      })
+      await expect(page.getByLabel('Message this session')).toHaveCount(0)
+      await expect(page.getByRole('heading', { level: 1 })).toHaveText('Sessions')
+    })
+  }
+})

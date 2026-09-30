@@ -101,6 +101,32 @@ export function TabBar({
   )
 }
 
+/**
+ * The control in the top bar that opens the settings over a session. It is the size a target is on
+ * this platform in both dimensions, like the back control beside it.
+ */
+export function SettingsButton({
+  onPress,
+  surface
+}: {
+  readonly onPress: () => void
+  readonly surface: Surface
+}): ReactNode {
+  const target = minimumTarget(surface)
+  return (
+    <button
+      type="button"
+      className="icon-btn"
+      style={{ minInlineSize: target, minBlockSize: target }}
+      aria-label="Settings"
+      aria-haspopup="dialog"
+      onClick={onPress}
+    >
+      <SettingsGlyph />
+    </button>
+  )
+}
+
 /** The bar along the top. */
 export function TopBar({
   title,
@@ -238,6 +264,23 @@ export function HostsGlyph(): ReactNode {
         strokeWidth="1.6"
       />
       <path d="M7 7.5h.01M7 16.5h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+/** Two sliders: the settings. */
+export function SettingsGlyph(): ReactNode {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+      <path
+        d="M4 8h8.5M17.5 8H20M4 16h2.5M11.5 16H20"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <circle cx="15" cy="8" r="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="9" cy="16" r="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
     </svg>
   )
 }
