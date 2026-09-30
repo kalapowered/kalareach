@@ -1674,7 +1674,7 @@ async fn a_gesture_with_a_stale_fence_is_refused_rather_than_becoming_an_end_of_
 // A-17: a desktop reading never stands between the fence and the terminal.
 // --------------------------------------------------------------------------------------------
 
-/// A-17: asking whether the desktop has gone costs no conversation with the platform.
+/// KR-REQ-07.83: asking whether the desktop has gone costs no conversation with the platform.
 ///
 /// The watch holds the answer and a reading reaches it from outside the session, so a session held
 /// while a login facility was answering is not a thing that can happen. This is the shape of the
@@ -1706,7 +1706,8 @@ async fn asking_whether_the_desktop_has_gone_takes_no_reading() {
     );
 }
 
-/// A-17: held input reaches the writer at its own deadline while a desktop reading is outstanding.
+/// KR-REQ-07.83: held input reaches the writer at its own deadline while a desktop reading is
+/// outstanding.
 ///
 /// The session is desktop-bound, so its supervision wants a reading; the reading is taken on a
 /// blocking thread, and this runtime has one, which this test occupies. The probe is therefore
@@ -1804,6 +1805,353 @@ async fn wired_desktop_bound() -> Wired {
         config.worker_profile = WorkerProfile::DesktopBound;
     })
     .await
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-07.83: a login manager that never answers, on a host with no graphical login.
+// --------------------------------------------------------------------------------------------
+
+/// The variable that tells a case it is the one running in a process of its own, and names where
+/// the login manager it was started with keeps its record.
+#[cfg(target_os = "linux")]
+const OWN_LOGIN_MANAGER: &str = "KR_CASE_LOGIN_MANAGER";
+
+/// A login manager that fails the way one that cannot be reached does the first time it is asked,
+/// which is when the session opens, and never answers again. It records the process that is
+/// waiting, so the case knows a reading is outstanding and can tell when that process is gone.
+#[cfg(target_os = "linux")]
+const UNANSWERING_LOGIN_MANAGER: &str = r#"#!/bin/sh
+here=$(dirname "$0")
+if mkdir "$here/asked-once" 2>/dev/null; then
+    echo "Failed to connect to bus: No such file or directory" >&2
+    exit 1
+fi
+echo $$ > "$here/waiting.tmp"
+mv "$here/waiting.tmp" "$here/waiting"
+exec sleep 3600
+"#;
+
+/// A login manager with a graphical session, led by the process that started the case.
+#[cfg(target_os = "linux")]
+const ANSWERING_LOGIN_MANAGER: &str = r#"#!/bin/sh
+printf '%s\n' "Type=x11" "Class=user" "State=active" "Remote=no" "LockedHint=no" "Active=yes" \
+    "Leader=$KR_CASE_LEADER" "Desktop=test" "Name=tester"
+"#;
+
+/// A login manager that has no such session, which is what a logout leaves.
+#[cfg(target_os = "linux")]
+const LOGGED_OUT_LOGIN_MANAGER: &str = r#"#!/bin/sh
+echo "Failed to get session: No such session" >&2
+exit 1
+"#;
+
+/// Runs the named case again in a process of its own, whose search path holds a `loginctl` that
+/// behaves as `script` says, and returns where that program keeps its record when this is that
+/// process.
+///
+/// The platform reading finds its command by name on the process's own search path, and a test
+/// cannot change that in place: the path is shared with every other case running in this binary.
+/// So the case is started again, with only the search path it needs, and the outer call checks
+/// that the inner one ran and passed. In the outer process this returns nothing and the case ends
+/// there.
+#[cfg(target_os = "linux")]
+fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std::path::PathBuf> {
+    if let Some(directory) = std::env::var_os(OWN_LOGIN_MANAGER) {
+        return Some(directory.into());
+    }
+    let home = tempfile::tempdir().expect("a directory on the internal disk");
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).expect("a directory for the program");
+    let source = home.path().join("loginctl.source");
+    std::fs::write(&source, script).expect("the program's text");
+    kr_ipc::testing::place_program(&source, &bin.join("loginctl"));
+    let output = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", case, "--nocapture", "--test-threads=1"])
+        .env(OWN_LOGIN_MANAGER, &bin)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("XDG_SESSION_ID", "42")
+        .env("KR_CASE_LEADER", std::process::id().to_string())
+        .output()
+        .expect("starts the case in a process of its own");
+    // A reading the case left outstanding is a process this test started, and it is stopped here
+    // whatever became of the case. It is only ever the recorded one, and only while it is still
+    // the program that was waiting.
+    if let Some(waiting) = waiting_reading(&bin)
+        && std::fs::read(format!("/proc/{waiting}/cmdline"))
+            .is_ok_and(|command| command.starts_with(b"sleep"))
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &waiting.to_string()])
+            .status();
+    }
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && said.contains("test result: ok. 1 passed"),
+        "the case, run in a process of its own, did not pass:\n{said}"
+    );
+    None
+}
+
+/// Returns the process the unanswering login manager recorded as waiting, once it has.
+#[cfg(target_os = "linux")]
+fn waiting_reading(record: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(record.join("waiting"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Returns whether a process is still in the process table, which one that has ended and not been
+/// reaped is.
+#[cfg(target_os = "linux")]
+fn still_there(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// KR-REQ-07.83: a reading the platform never answers leaves the launch hold on its own deadline,
+/// and ends with its command killed and reaped and the session not lost.
+///
+/// The session is desktop-bound on a host with no graphical login, and its login manager is a
+/// program that never answers once the session has opened. The supervision's first reading
+/// therefore stays outstanding for as long as the platform command is given. A launch reserves the
+/// fence, the keys typed while it is in flight are held, and the machine's clock reaches the
+/// hold's deadline: the reader is told the transaction is revoked, the held keys reach the
+/// terminal in the order they were typed, and the reader, which installs nothing, refuses the
+/// launch as `EDITOR_BUSY`. All of that happens while the reading is still outstanding. Later the
+/// command the reading started is gone from the process table, which is what reaping it means,
+/// and the reading, folded in as an answer that establishes nothing, has not closed the session.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_answers() {
+    let Some(record) = in_a_process_with_this_login_manager(
+        "a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_answers",
+        UNANSWERING_LOGIN_MANAGER,
+    ) else {
+        return;
+    };
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging {
+            clock: Arc::clone(&clock) as Arc<_>,
+            fence_hold: None,
+        },
+        |config| config.worker_profile = WorkerProfile::DesktopBound,
+    )
+    .await;
+
+    // The reading is outstanding when the login manager has been asked a second time and is
+    // waiting: the first question was the session's own, when it opened.
+    let waiting = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(waiting) = waiting_reading(&record) {
+                return waiting;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the supervision asked the platform for its first reading");
+
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let _ = fenced_with(&mut wired, holder, None).await;
+    let params = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand("kr-launched-command".to_owned()),
+        expected_prompt_generation: PromptGeneration::new(1),
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let target = wired.target();
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    tokio::time::timeout(SOON, async {
+        while wired.runtime.session().fence().expect("a driver").state()
+            != FenceState::LaunchReserved
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the launch reserved the fence");
+    type_keys(&wired, holder, 0, b"first\n");
+    type_keys(&wired, holder, 1, b"second\n");
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        2,
+        "the machine holds what arrives while the launch is in flight"
+    );
+    assert!(
+        !echoed_now(&wired.runtime, b"first"),
+        "and nothing has reached the terminal"
+    );
+
+    // The hold's deadline is reached on the machine's own clock. Nothing but this and the reader's
+    // own frames can end it, and the reading has not ended.
+    clock.advance(Duration::from_millis(250));
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"second").await;
+    assert!(
+        still_there(waiting),
+        "the reading had ended before the held keys were released, so this case did not show \
+         that the release does not wait for it"
+    );
+    let seen = retained(&wired.runtime.session());
+    assert!(
+        position(&seen, b"first").expect("the first batch")
+            < position(&seen, b"second").expect("the second batch"),
+        "released in the order they were typed"
+    );
+    let revoked = loop {
+        match wired.next().await {
+            ToBridge::LaunchRevoked { transaction, .. } => break transaction,
+            _ => continue,
+        }
+    };
+    assert_eq!(revoked, request.transaction, "the reader was told to stop");
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Rejected(LaunchRejection {
+                transaction: request.transaction,
+                reason: LaunchRejectionReason::Revoked,
+                fence_id: request.fence_id,
+                prompt_generation: PromptGeneration::new(1),
+                buffer_revision: EditorBufferRevision::new(1),
+            })),
+        )
+        .await
+        .expect("answers");
+    let refused = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins")
+        .expect("reaches the worker")
+        .expect_err("the reader installed nothing");
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
+    assert!(
+        !contains(&retained(&wired.runtime.session()), b"kr-launched-command"),
+        "and the command never went into the terminal"
+    );
+    assert!(wired.runtime.session().late_installations().is_empty());
+
+    // The reading's own deadline ends it: the command is killed and reaped, so its process is not
+    // in the table at all.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while still_there(waiting) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the platform command was killed and reaped");
+    // The session has been given what the reading found, which is nothing: the supervision does
+    // not ask again until the slower cadence says so.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while wired
+            .runtime
+            .session()
+            .desktop_probe(std::time::Instant::now())
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reading was folded into the watch");
+    {
+        let session = wired.runtime.session();
+        assert!(
+            !session.desktop_lost(),
+            "a reading the platform never answered is not a desktop that ended"
+        );
+        assert!(session.closure().is_none(), "and the session is still open");
+    }
+    wired.close().await;
+}
+
+/// The control for the case above: a login manager that answers reads as present, and the session
+/// is bound to the login it names and is not lost.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answering_login_manager_reads_as_present_and_binds_the_session() {
+    let Some(_record) = in_a_process_with_this_login_manager(
+        "an_answering_login_manager_reads_as_present_and_binds_the_session",
+        ANSWERING_LOGIN_MANAGER,
+    ) else {
+        return;
+    };
+    let wired = wired_desktop_bound().await;
+    {
+        let session = wired.runtime.session();
+        let bound = session
+            .summary()
+            .desktop
+            .desktop_session_id
+            .as_ref()
+            .map(|name| name.as_str().to_owned())
+            .expect("the session is bound to the login the manager described");
+        assert!(bound.contains(":session=42:"), "{bound}");
+        assert!(!session.desktop_lost());
+    }
+    wired.close().await;
+}
+
+/// The other control: a login manager that has no such session is a desktop that ended, and this
+/// same wiring closes the session for it, so the case above cannot pass by never being able to.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_manager_with_no_such_session_ends_a_desktop_bound_session() {
+    let Some(_record) = in_a_process_with_this_login_manager(
+        "a_login_manager_with_no_such_session_ends_a_desktop_bound_session",
+        LOGGED_OUT_LOGIN_MANAGER,
+    ) else {
+        return;
+    };
+    let wired = wired_desktop_bound().await;
+    let record = tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
+        .await
+        .expect("the session closes when its login is gone");
+    assert_eq!(record.reason, ClosureReason::DesktopLost);
+    wired._bridge_task.abort();
+    wired._serving.abort();
 }
 
 // --------------------------------------------------------------------------------------------
