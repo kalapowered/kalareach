@@ -526,14 +526,15 @@ budgets in force and reports why, so the next acceptance tries again. `transfer_
 bytes one synchronisation transfers, the metadata, the index and a full mirror's payloads together,
 2 GiB by default; a sync past it is refused by name and the generation in use stays.
 
-`disable_policy` is put in force from the next admission, at start and at every acceptance after it.
-It is recorded with the plugin admission revision it moves in one step, so every worker is sent a
-round and a policy equal to the one in force sends none; an acceptance whose revision cannot be
-written puts none in force and reports why, so the next acceptance tries again. It follows the
-document by a different rule from the budgets: only a document this host loaded and that names a
-policy decides it. A document that names none, and one that is absent, unreadable, of a version
-this build does not know or invalid, leaves the policy this host holds, and `kr doctor` says that
-it is the one last accepted. Going back to warning only is a document naming `warn_only`. Under
+`disable_policy` is put in force from the next admission, at start and at every acceptance after it,
+by the rule the enrolment budgets follow: a document this host loaded decides it, and one that names
+none has the default, `warn_only`; a document that is absent, unreadable, of a version this build
+does not know or invalid decides nothing, and the policy this host holds stays in force, which `kr
+doctor` says is the one last accepted. It is recorded with the plugin admission revision it moves in
+one step, so every worker is sent a round and a policy equal to the one in force sends none; an
+acceptance whose revision cannot be written puts none in force and reports why, so the next
+acceptance tries again. A policy this host holds and cannot read is reported as not known, never as
+the default. A document that does not use the setting has no `disable_policy` member. Under
 `disable_at_next_admission` a binding on a revoked release keeps observing and is refused every
 rich admission; under `disable_at_once` it ends at its next admission boundary once the request it
 admitted has completed.

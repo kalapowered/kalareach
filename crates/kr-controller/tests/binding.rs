@@ -1451,3 +1451,105 @@ async fn plugin_list_names_an_installation_this_host_does_not_support() {
         "{detail}"
     );
 }
+
+/// Writes the host's configuration document naming `policy`, at the revision after the one on
+/// disk, as a person editing their own file does.
+fn name_the_policy(hosted: &Hosted, policy: kr_protocol::admission::RevocationPolicy) {
+    let path = kr_worker::config::document_path(&hosted.tree.environment());
+    let mut document: serde_json::Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).expect("a document this host wrote"),
+        Err(_) => serde_json::to_value(
+            kr_protocol::hostinfo::configuration::ConfigurationDocument::empty(),
+        )
+        .expect("an empty document"),
+    };
+    let revision = document["revision"].as_u64().expect("a revision") + 1;
+    document["revision"] = serde_json::json!(revision);
+    document["ceilings"]["disable_policy"] = serde_json::to_value(policy).expect("a policy");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        serde_json::to_string(&document).expect("JSON").as_bytes(),
+    )
+    .expect("the document");
+}
+
+/// KR-REQ-25.22: the first snapshot a worker that outlived the last daemon is sent carries the
+/// policy this host's configuration decides, not the one the catalogue recorded before the
+/// restart: the cadence that sends it starts before the document is accepted, so the policy is
+/// put in force when the catalogue opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configuration_decides() {
+    use kr_protocol::admission::RevocationPolicy;
+    let mut hosted = Hosted::start().await;
+    let _session = hosted.session().await;
+    assert!(hosted.counted_once_known().await.is_present());
+    assert_eq!(
+        hosted.controller().catalogue().policies_carried(),
+        [RevocationPolicy::WarnOnly],
+        "control: the worker was handed warn only before the document named anything"
+    );
+
+    // The document is edited while no daemon reads it: the restart is what meets it.
+    name_the_policy(&hosted, RevocationPolicy::DisableAtOnce);
+    hosted.restart().await;
+    assert!(hosted.counted_once_known().await.is_present());
+    let carried = hosted.controller().catalogue().policies_carried();
+    assert!(!carried.is_empty(), "the worker was sent a round");
+    assert!(
+        carried
+            .iter()
+            .all(|policy| *policy == RevocationPolicy::DisableAtOnce),
+        "no snapshot the restarted daemon computed carried the policy before it: {carried:?}"
+    );
+}
+
+/// KR-REQ-25.22: a policy that moves sends every worker a round at once, as a package limit does,
+/// without waiting for the cadence. The worker cannot answer here, so the round stays out, and
+/// that is what shows it was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_policy_that_moves_sends_every_worker_a_round_at_once() {
+    use kr_protocol::admission::RevocationPolicy;
+    let hosted = Hosted::start().await;
+    let created = hosted.session().await;
+    let session_id = created.session.session_id;
+    let worker = hosted
+        .launched_for(Some(session_id))
+        .await
+        .process
+        .expect("started");
+    assert!(hosted.counted_once_known().await.is_present());
+    assert!(hosted.pending().await.is_empty());
+
+    let stopped = Stopped::stop(&worker);
+    name_the_policy(&hosted, RevocationPolicy::DisableAtNextAdmission);
+    drop(hosted.controller().effective_configuration().await);
+    assert_eq!(
+        hosted.pending().await,
+        vec![format!("session {session_id}")],
+        "the worker is pending at the revision the policy moved"
+    );
+    // The cadence's own pass is thirty seconds away from any point in this test's first seconds,
+    // so a round out before it is the one the change asked for.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !hosted.controller().admission_round_out(session_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no round was sent when the policy moved"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(stopped);
+    assert_eq!(
+        hosted.counted_once_known().await,
+        Nullable::some(U64::new(0)),
+        "the worker answers at the new revision"
+    );
+    assert!(hosted.pending().await.is_empty());
+    assert_eq!(
+        hosted.controller().catalogue().policies_carried().last(),
+        Some(&RevocationPolicy::DisableAtNextAdmission)
+    );
+}

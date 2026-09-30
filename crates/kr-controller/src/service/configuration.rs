@@ -129,9 +129,10 @@ impl Controller {
                 from_document: false,
             },
         };
-        // The disable policy the catalogue enforces: put in force when this reading loaded a
-        // document that names one, and left as it is otherwise. It is recorded with the admission
-        // revision it moves, so a change sends every worker a round.
+        // The disable policy the catalogue enforces, by the budgets' rule: this reading decides it
+        // when it loaded a document, whether the document names one or leaves the default, and
+        // leaves it as it is when it did not. It is recorded with the admission revision it moves,
+        // so a change sends every worker a round; one that cannot be recorded changes nothing.
         let mut policy_failure = None;
         let disable_policy = match crate::config::catalogue::disable_policy_in_force(&resolver) {
             Some(policy) => match self.catalogue.put_disable_policy_in_force(policy).await {
@@ -140,7 +141,7 @@ impl Controller {
                         self.admissions_due();
                     }
                     crate::config::EnforcedDisablePolicy {
-                        value: policy,
+                        value: Some(policy),
                         from_document: true,
                     }
                 }
@@ -154,13 +155,13 @@ impl Controller {
                             .withheld(ContentClass::Message, &error.message),
                     );
                     crate::config::EnforcedDisablePolicy {
-                        value: self.retained_disable_policy(&mut None).await,
+                        value: self.held_disable_policy(&mut policy_failure).await,
                         from_document: false,
                     }
                 }
             },
             None => crate::config::EnforcedDisablePolicy {
-                value: self.retained_disable_policy(&mut policy_failure).await,
+                value: self.held_disable_policy(&mut policy_failure).await,
                 from_document: false,
             },
         };
@@ -398,27 +399,24 @@ impl Controller {
         }
     }
 
-    /// The disable policy already in force, for a reading that decided none.
-    ///
-    /// A policy that cannot be read is not reported as the product's own: the answer says so in
-    /// `failure`, and the value returned is what this host enforces when it cannot tell, which is
-    /// the strictest reading of the setting it could not read.
-    async fn retained_disable_policy(
+    /// The disable policy already in force, for a reading that decided none, or `None` with the
+    /// reason added to `failure` where the policy this host holds cannot be read: an unreadable
+    /// policy is never reported as the default.
+    async fn held_disable_policy(
         &self,
         failure: &mut Option<Sentence>,
-    ) -> kr_protocol::admission::RevocationPolicy {
+    ) -> Option<kr_protocol::admission::RevocationPolicy> {
         match self.catalogue.disable_policy_in_force().await {
-            Ok(policy) => policy,
+            Ok(policy) => Some(policy),
             Err(error) => {
-                *failure = Some(
-                    Sentence::new()
-                        .stated(
-                            "the disable policy this host holds could not be read, so nothing \
-                             is known of it: ",
-                        )
-                        .withheld(ContentClass::Message, &error.message),
-                );
-                kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission
+                let problem = Sentence::new()
+                    .stated("the disable policy this host holds could not be read: ")
+                    .withheld(ContentClass::Message, &error.message);
+                *failure = Some(match failure.take() {
+                    Some(earlier) => earlier.stated("; ").sentence(&problem),
+                    None => problem,
+                });
+                None
             }
         }
     }
