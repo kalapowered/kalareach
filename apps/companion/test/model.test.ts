@@ -233,6 +233,7 @@ describe('what the person sent', () => {
     expect(stateOfReceipt({ state: 'unknown' } as never)).toBe('unknown')
   })
 
+  // KR-REQ-13.15: what the person sent is queued, sent and applied as three different states.
   it('moves one submission through queued, sent and applied', () => {
     let submission = queued('s1', 'hello', 0)
     expect(submission.state).toBe('queued')
