@@ -5864,3 +5864,412 @@ async fn a_shell_refused_at_the_handshake_ends_the_create_with_the_named_error()
     );
     wired.close().await;
 }
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-08.49: the host's answers to the application, and what they do to the reader.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-08.49: an answer leaves the response lane carrying the lane's own deadline.
+///
+/// The writer is the last boundary before the application, and an answer can wait in the queue for
+/// the terminal behind an application that has stopped reading. What the writer drops an answer
+/// against is the deadline the lane gave it when it was offered, two seconds on the lane's clock,
+/// which is what this reads from the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_leaves_the_lane_with_the_lanes_deadline() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let config = configuration(&temp, ShellMode::NativeCompat);
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    let before = kr_ipc::now_ms().get();
+    // The terminal's own question about what it is talking to, which the host answers itself.
+    session.ingest_output(b"\x1b[c");
+    let after = kr_ipc::now_ms().get();
+    let replies: Vec<_> = session
+        .take_pending_input()
+        .into_iter()
+        .filter_map(|batch| match batch {
+            kr_worker::session::InputBatch::Reply {
+                bytes,
+                expires_at_ms,
+            } => Some((bytes, expires_at_ms)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replies.len(), 1, "the host answers the question once");
+    let (bytes, expires_at_ms) = &replies[0];
+    assert_eq!(bytes.as_slice(), b"\x1b[?62;22c");
+    let expires = expires_at_ms.expect("the answer carries the lane's deadline");
+    assert!(
+        (before + 2_000..=after + 2_000).contains(&expires),
+        "the deadline is two seconds after the answer was offered: {before}..{after} and {expires}"
+    );
+}
+
+/// Queues the host's own answer to the application for the terminal, as the response lane does
+/// when the program in the terminal asks what it is talking to.
+fn the_host_answers_the_application(wired: &Wired) {
+    let mut session = wired.runtime.session();
+    session.ingest_output(b"\x1b[c");
+    wired.runtime.flush_locked(&mut session);
+}
+
+/// KR-REQ-08.49: an answer the host queues for the terminal after the reader proved its queues
+/// clear invalidates the fence, and a launch cannot be reserved on it until the reader has said
+/// again, from its own snapshot, that it is clear.
+///
+/// The mechanism is `FenceDriver::host_reply_queued`, which tells the machine of every byte the
+/// host puts into the terminal that no person typed. The driver had been told of a person's input
+/// only, and an answer is never held behind an exchange because it holds no lease, so it could reach
+/// the reader behind a published fence without the fence noticing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_queued_after_the_fence_invalidates_it_until_the_reader_proves_its_queues_again()
+{
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+
+    the_host_answers_the_application(&wired);
+    let (invalidated, why) = loop {
+        match wired.next().await {
+            ToBridge::FencePublished(kr_protocol::root::FencePublication::Invalidated {
+                fence_id,
+                reason,
+                ..
+            }) => break (fence_id, reason),
+            _ => continue,
+        }
+    };
+    assert_eq!(
+        invalidated, fence.fence_id,
+        "the fence the bridge held is the one named"
+    );
+    assert_eq!(
+        why,
+        kr_protocol::root::WithheldReason::QueuesNotDrained,
+        "the reader's queues are no longer known to be clear"
+    );
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(driver.state(), FenceState::Unfenced);
+        assert!(driver.fence().is_none());
+        assert_eq!(
+            driver.host_reply_bytes(),
+            b"\x1b[?62;22c".len() as u64,
+            "every byte the host queued for the terminal is accounted for"
+        );
+    }
+
+    // A launch asked for now has no fence to be reserved on.
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &ShellLaunchParams {
+                session_id: wired.session_id,
+                command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                expected_prompt_generation: fence.prompt_generation,
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("refused");
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
+
+    // The reader idles, which is where a withheld fence is asked for again, and its own snapshot
+    // is what accounts for the bytes it was sent. A launch reserved on that fence is not refused.
+    wired
+        .bridge
+        .send_event(idle(wired.session_id, 1, 1))
+        .await
+        .expect("idles");
+    let second = asked_for_a_fence(&mut wired).await;
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, second))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    let target = wired.target();
+    let session_id = wired.session_id;
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &ShellLaunchParams {
+                    session_id,
+                    command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                    expected_prompt_generation: PromptGeneration::new(1),
+                    expected_buffer_revision: EditorBufferRevision::new(1),
+                },
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    assert_eq!(
+        wired.runtime.session().fence().expect("a driver").state(),
+        FenceState::LaunchReserved,
+        "the launch was reserved on the fence the reader proved again"
+    );
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
+                transaction: request.transaction,
+                installed: request.command.clone(),
+                fence_id: request.fence_id,
+                prompt_generation: PromptGeneration::new(1),
+                buffer_revision: EditorBufferRevision::new(2),
+                reader_revision: ReaderRevision::new(1),
+            })),
+        )
+        .await
+        .expect("installs");
+    let _ = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered");
+    wired.close().await;
+}
+
+/// The control for the case above: output that asks nothing is answered with nothing, and the fence
+/// stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_the_host_has_no_answer_for_leaves_the_fence_standing() {
+    let mut wired = wired().await;
+    let _holder = wired.holder();
+    let fence = fenced(&mut wired, 1, 1).await;
+    {
+        let mut session = wired.runtime.session();
+        session.ingest_output(b"plain output\r\n");
+        wired.runtime.flush_locked(&mut session);
+    }
+    let session = wired.runtime.session();
+    let driver = session.fence().expect("a driver");
+    assert_eq!(driver.state(), FenceState::Fenced);
+    assert_eq!(
+        driver.fence().map(|held| held.fence_id),
+        Some(fence.fence_id),
+        "nothing was sent to the reader, so nothing it proved is in question"
+    );
+    assert_eq!(driver.host_reply_bytes(), 0);
+    drop(session);
+    wired.close().await;
+}
+
+/// KR-REQ-08.49: a launch reserved before the host's answer is revoked as queued prior input, and
+/// the caller is refused as the editor being busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let target = wired.target();
+    let session_id = wired.session_id;
+    let prompt = fence.prompt_generation;
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &ShellLaunchParams {
+                    session_id,
+                    command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                    expected_prompt_generation: prompt,
+                    expected_buffer_revision: EditorBufferRevision::new(1),
+                },
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    assert_eq!(
+        wired.runtime.session().fence().expect("a driver").state(),
+        FenceState::LaunchReserved
+    );
+
+    the_host_answers_the_application(&wired);
+    let (transaction, reason) = loop {
+        match wired.next().await {
+            ToBridge::LaunchRevoked {
+                transaction,
+                reason,
+            } => break (transaction, reason),
+            _ => continue,
+        }
+    };
+    assert_eq!(transaction, request.transaction);
+    assert_eq!(
+        reason,
+        LaunchRejectionReason::QueuedPriorInput,
+        "the reader's queue holds bytes the launch was not reserved against"
+    );
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Rejected(LaunchRejection {
+                transaction: request.transaction,
+                reason: LaunchRejectionReason::QueuedPriorInput,
+                fence_id: request.fence_id,
+                prompt_generation: prompt,
+                buffer_revision: EditorBufferRevision::new(1),
+            })),
+        )
+        .await
+        .expect("answers");
+    let refused = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins")
+        .expect("reaches the worker")
+        .expect_err("refused");
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
+    wired.close().await;
+}
+
+/// KR-REQ-08.49: an answer queued while the exchange is in flight withholds the fence the reader's
+/// acknowledgement would have published, and the next exchange, from the reader's own snapshot,
+/// publishes one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_queued_during_the_exchange_withholds_the_fence_until_the_next_one() {
+    let mut wired = wired().await;
+    let _holder = wired.holder();
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let first = asked_for_a_fence(&mut wired).await;
+    the_host_answers_the_application(&wired);
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, first))
+        .await
+        .expect("acknowledges");
+    let withheld = loop {
+        match wired.next().await {
+            ToBridge::FencePublished(publication) => break publication,
+            _ => continue,
+        }
+    };
+    assert!(
+        matches!(
+            withheld,
+            kr_protocol::root::FencePublication::Withheld {
+                reason: kr_protocol::root::WithheldReason::QueuesNotDrained,
+                ..
+            }
+        ),
+        "an acknowledgement the answer overlapped proves nothing about it: {withheld:?}"
+    );
+    assert_eq!(
+        wired.runtime.session().fence().expect("a driver").state(),
+        FenceState::Unfenced
+    );
+
+    wired
+        .bridge
+        .send_event(idle(wired.session_id, 1, 1))
+        .await
+        .expect("idles");
+    let second = asked_for_a_fence(&mut wired).await;
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, second))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    wired.close().await;
+}
+
+/// KR-REQ-08.49: with a real qualified reader at its prompt, the host's answer to the application
+/// invalidates the fence the reader proved, and the reader proves it again from its own snapshot.
+///
+/// The mechanism is `FenceDriver::host_reply_queued`, which tells the fence machine of every byte
+/// the host queues for the terminal that no person typed. The answer goes into the terminal the
+/// real shell is reading, so what the reader's next snapshot accounts for is real input.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again() {
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = installed_package_of(kind);
+        let shell = RealShell::start(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        // Taking the keys is what starts an exchange, and the real reader answers it.
+        let _keys = shell.keys();
+        until_fenced(&shell.runtime).await;
+        let proved = shell
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .fence()
+            .map(|fence| fence.fence_id)
+            .expect("the reader proved a fence");
+
+        {
+            let mut session = shell.runtime.session();
+            session.ingest_output(b"\x1b[c");
+            shell.runtime.flush_locked(&mut session);
+            let driver = session.fence().expect("a driver");
+            assert!(
+                driver.fence().is_none(),
+                "{kind:?}: the answer reached the reader's terminal behind the fence it proved"
+            );
+            assert_eq!(driver.host_reply_bytes(), b"\x1b[?62;22c".len() as u64);
+        }
+        // The reader consumes what it was sent and idles, which is where the exchange is asked for
+        // again, and it answers from its own snapshot.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                {
+                    let session = shell.runtime.session();
+                    let driver = session.fence().expect("a driver");
+                    if driver.state() == FenceState::Fenced
+                        && driver.fence().map(|fence| fence.fence_id) != Some(proved)
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved its queues again"));
+        shell.close().await;
+    }
+}

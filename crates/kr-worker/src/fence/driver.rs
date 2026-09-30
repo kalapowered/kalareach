@@ -363,6 +363,9 @@ pub struct FenceDriver {
     handed: u64,
     /// The fence the bridge currently holds, so an invalidation can name it.
     published: Option<FenceId>,
+    /// How many bytes of the host's own answers to the application the machine has been told
+    /// were queued for the terminal, whatever it did about them.
+    host_reply_bytes: u64,
     /// The transaction the reader is deciding now, and the ones whose callers are still waiting
     /// for a confirmation that may never come. Both follow the machine's own actions.
     live_launch: Option<LaunchTransactionId>,
@@ -432,6 +435,7 @@ impl FenceDriver {
             unwritten: VecDeque::new(),
             handed: 0,
             published: None,
+            host_reply_bytes: 0,
             live_launch: None,
             awaiting: VecDeque::new(),
             receipt: None,
@@ -738,6 +742,32 @@ impl FenceDriver {
             }),
             Context::Other,
         )
+    }
+
+    /// Reports that the host queued its own answer to the application for the terminal.
+    ///
+    /// The answer holds no lease and is never held behind an exchange, so it can reach the reader
+    /// after the reader proved its queues clear. Until this existed the driver was told of a
+    /// person's bytes only, and a reply could arrive behind a published fence without the fence
+    /// noticing. The machine now withholds an exchange the bytes overlap, invalidates a fence they
+    /// follow and revokes a launch reserved on it; the reader's next idle callback asks again, and
+    /// its own snapshot then accounts for what it was sent.
+    pub fn host_reply_queued(&mut self, bytes: u64) -> Effects {
+        self.host_reply_bytes = self.host_reply_bytes.saturating_add(bytes);
+        self.apply(
+            &Stimulus::HostReplyQueued(kr_shell_integration::contract::fence::HostReplyQueued {
+                bytes: U64::new(bytes),
+            }),
+            Context::Other,
+        )
+    }
+
+    /// Returns how many bytes of the host's own answers to the application have been queued for
+    /// the terminal while this driver watched, which is every byte the reader was sent that no
+    /// person typed.
+    #[must_use]
+    pub const fn host_reply_bytes(&self) -> u64 {
+        self.host_reply_bytes
     }
 
     /// Reports a lease change the worker has already made.
@@ -1376,6 +1406,7 @@ const fn withheld_for(reason: FenceInvalidation) -> WithheldReason {
         FenceInvalidation::EditorEntered => WithheldReason::EditorEntered,
         FenceInvalidation::EditorLeft => WithheldReason::EditorLeft,
         FenceInvalidation::LeaseChanged => WithheldReason::LeaseChanged,
+        FenceInvalidation::HostReply => WithheldReason::QueuesNotDrained,
         FenceInvalidation::ReaderMoved => WithheldReason::ReaderMoved,
         FenceInvalidation::DetachAccepted => WithheldReason::DetachAccepted,
         FenceInvalidation::AttachmentRemoved => WithheldReason::AttachmentRemoved,
