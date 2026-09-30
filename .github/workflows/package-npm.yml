@@ -1,0 +1,170 @@
+name: package-npm
+
+# Publishes the plugin SDK to the npm registry from the archive a package release carries.
+#
+# A tag of the form `packages/v<version>+<short commit>` releases the two archives
+# (`package-release.yml`), and this workflow takes the SDK's archive from that release, holds it to
+# the release's own sums and to what `npm pack` makes of the same commit, and asks npm what it would
+# do with it. Publishing is a separate job behind the `release-signing` environment: it runs the
+# same archive through `npm publish --provenance`, authenticated by the workflow's own identity, so
+# no registry token exists anywhere in this repository. The registry side (the `@kalareach`
+# organisation, the package's trusted publisher for this workflow file) belongs to the person who
+# owns the organisation.
+#
+# A run started by hand rehearses everything up to that gate: it packs the checked-out commit with
+# the release script, checks and dry-runs the result, and reaches the gated job, which refuses to
+# publish anything that is not a tagged release.
+on:
+  push:
+    tags:
+      - 'packages/v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Trusted publishing needs npm 11.5.1 or later; the Node that runs the release ships an older one.
+  NPM_VERSION: 11.20.0
+
+jobs:
+  check:
+    name: check the archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Install npm
+        run: npm install --global "npm@$NPM_VERSION"
+
+      # rust-toolchain.toml pins the exact toolchain; a rehearsal packs with the generators it builds.
+      - name: Install the pinned toolchain
+        if: github.ref_type != 'tag'
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        if: github.ref_type != 'tag'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # A tagged run takes the archive the release published, once the release is public: the
+      # release workflow runs beside this one on the same tag, so it may not exist yet. What was
+      # downloaded is held to the release's own sha512 before anything reads it.
+      - name: Take the archive from the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          attempt=1
+          until gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --dir "$RUNNER_TEMP/release" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS; do
+            if [ "$attempt" -ge 60 ]; then
+              echo "$GITHUB_REF_NAME has no published release with the SDK archive after thirty minutes." >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 30
+          done
+          cd "$RUNNER_TEMP/release"
+          set -- kalareach-plugin-sdk-*.tgz
+          [ "$#" -eq 1 ] || { echo "Expected one SDK archive, found: $*" >&2; exit 1; }
+          grep -v '^#' SHA512SUMS | grep -F -- "  $1" | sha512sum -c -
+          echo "ARCHIVE=$RUNNER_TEMP/release/$1" >> "$GITHUB_ENV"
+
+      # A rehearsal packs this commit as a release would, with the release's own script.
+      - name: Pack the archive from this commit
+        if: github.ref_type != 'tag'
+        run: |
+          set -euo pipefail
+          bash scripts/release-packages.sh --output "$RUNNER_TEMP/release"
+          set -- "$RUNNER_TEMP"/release/kalareach-plugin-sdk-*.tgz
+          [ "$#" -eq 1 ] || { echo "Expected one SDK archive, found: $*" >&2; exit 1; }
+          echo "ARCHIVE=$1" >> "$GITHUB_ENV"
+
+      # The checkout the archive is compared with is the tagged commit, and its own install
+      # provides the package's dependency to the consumer check.
+      - name: Install the package's dependencies
+        run: pnpm install --frozen-lockfile --filter @kalareach/plugin-sdk
+
+      - name: Test the archive check
+        run: python3 scripts/check-release-npm.py self-test
+
+      - name: Hold the archive to npm's own pack
+        run: python3 scripts/check-release-npm.py check --archive "$ARCHIVE"
+
+      - name: Ask npm what publishing would do
+        run: npm publish "$ARCHIVE" --dry-run --access public
+
+  publish:
+    name: publish to npm
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The gate. Nothing above needs the environment, and nothing below runs before it is approved.
+    environment: release-signing
+    permissions:
+      contents: read
+      # The workflow's identity is what npm authenticates and what the provenance statement names.
+      id-token: write
+    steps:
+      - name: Refuse anything that is not a tagged release
+        if: github.ref_type != 'tag'
+        run: |
+          echo "Only a tagged release is published; this run is $GITHUB_REF." >&2
+          exit 1
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm
+        run: npm install --global "npm@$NPM_VERSION"
+
+      - name: Take the archive from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS
+          cd "$RUNNER_TEMP/release"
+          set -- kalareach-plugin-sdk-*.tgz
+          [ "$#" -eq 1 ] || { echo "Expected one SDK archive, found: $*" >&2; exit 1; }
+          grep -v '^#' SHA512SUMS | grep -F -- "  $1" | sha512sum -c -
+          echo "ARCHIVE=$RUNNER_TEMP/release/$1" >> "$GITHUB_ENV"
+
+      - name: Publish with provenance
+        run: npm publish "$ARCHIVE" --provenance --access public
