@@ -223,6 +223,9 @@ pub struct GenerationSpec {
     pub edit_entry: Option<fn(&mut IndexEntry)>,
     /// The platforms the example package's manifest lists, where not the example's own.
     pub platforms: Option<Vec<kr_plugin_sdk::matching::PlatformSupport>>,
+    /// A change made to the index's document after it is rendered, before it is signed: an index
+    /// that says something no entry of a catalogue can.
+    pub edit_index_json: Option<fn(&mut serde_json::Value)>,
 }
 
 impl Default for GenerationSpec {
@@ -253,6 +256,7 @@ impl Default for GenerationSpec {
             extra_targets: Vec::new(),
             edit_entry: None,
             platforms: None,
+            edit_index_json: None,
         }
     }
 }
@@ -651,7 +655,13 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             .chain(spec.listed_only.iter().cloned())
             .collect(),
     };
-    let index_bytes = index.canonical_json().expect("serialisable").into_bytes();
+    let mut index_bytes = index.canonical_json().expect("serialisable").into_bytes();
+    if let Some(edit) = spec.edit_index_json {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&index_bytes).expect("a rendered index");
+        edit(&mut document);
+        index_bytes = serde_json::to_vec(&document).expect("serialisable");
+    }
     std::fs::write(targets.join("index.json"), &index_bytes).expect("writable");
     // Each extra target is written where a client inside the targets location addresses it: the
     // file transport reads a location's path as it stands, encoding and all. A name that leaves
