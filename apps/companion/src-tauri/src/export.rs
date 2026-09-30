@@ -664,15 +664,28 @@ mod tests {
 
     #[test]
     fn an_asciicast_header_carries_the_dimensions_the_timestamp_and_the_omissions() {
+        // One omission the caller supplies, and one the recording causes by holding a clipboard
+        // write: the header lists both, in that order, each with its kind, words and count.
+        let supplied = Omission {
+            kind: "privacy_generation".into(),
+            detail: "content this session never retained".into(),
+            count: 4,
+        };
         let cast = asciicast(
             dimensions(),
             1_700_000_000,
             "s-1",
-            &[Frame {
-                at_ms: 250,
-                text: "hello\r\n".into(),
-            }],
-            Vec::new(),
+            &[
+                Frame {
+                    at_ms: 250,
+                    text: "hello\r\n".into(),
+                },
+                Frame {
+                    at_ms: 300,
+                    text: "\u{1b}]52;c;c2VjcmV0\u{7}".into(),
+                },
+            ],
+            vec![supplied.clone()],
         )
         .expect("a valid recording");
         let mut lines = cast.body.lines();
@@ -682,7 +695,34 @@ mod tests {
         assert_eq!(header["width"], 120);
         assert_eq!(header["height"], 40);
         assert_eq!(header["timestamp"], 1_700_000_000_u64);
-        assert!(header["kalareach"]["omissions"].is_array());
+        assert_eq!(
+            header["kalareach"]["omissions"],
+            serde_json::json!([
+                {
+                    "kind": "privacy_generation",
+                    "detail": "content this session never retained",
+                    "count": 4
+                },
+                {
+                    "kind": "clipboard_write",
+                    "detail": detail_of(CLIPBOARD_WRITE),
+                    "count": 1
+                }
+            ]),
+            "the header lists the omission supplied and the one caused, whole"
+        );
+        assert_eq!(
+            cast.omissions,
+            [
+                supplied,
+                Omission {
+                    kind: CLIPBOARD_WRITE.into(),
+                    detail: detail_of(CLIPBOARD_WRITE).into(),
+                    count: 1,
+                }
+            ],
+            "what the recording returns is what its header lists"
+        );
 
         let frame: serde_json::Value =
             serde_json::from_str(lines.next().expect("a frame")).expect("valid JSON");
