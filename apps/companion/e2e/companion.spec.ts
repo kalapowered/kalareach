@@ -3411,6 +3411,33 @@ test.describe('the phone terminal under two fingers', () => {
   })
 })
 
+// KR-REQ-13.17: where the platform pans the page to keep a focused field in sight, the shell goes
+// with the visual viewport, so what it holds is where the person sees it and nothing is above the
+// screen; the page gains nothing to scroll by it.
+test.describe("the phone's shell and a page the platform panned", () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`follows the visual viewport by as much as it was panned, on ${surface}`, async ({ page }) => {
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=${surface}`)
+      await page.locator('.m-shell').waitFor()
+      const shell = () =>
+        page.locator('.m-shell').evaluate((element) => {
+          const box = element.getBoundingClientRect()
+          return { top: box.top, height: box.height, scroll: document.documentElement.scrollHeight }
+        })
+      const at = await shell()
+      expect(at.top).toBe(0)
+      await page.evaluate(() => {
+        document.documentElement.style.setProperty('--pan', '200px')
+      })
+      const panned = await shell()
+      expect(panned.top, 'the shell goes down with the visual viewport').toBe(200)
+      expect(panned.height, 'and keeps its height').toBe(at.height)
+      expect(panned.scroll, 'the page gains nothing to scroll').toBeLessThanOrEqual(Math.max(at.scroll, 844))
+    })
+  }
+})
+
 // KR-REQ-13.09: the phone's settings open over a live session and leave it behind them, whole at a
 // person's own text size: the bar's controls, the sheet's edges and each appearance choice.
 test.describe("the phone's settings over a live session", () => {
