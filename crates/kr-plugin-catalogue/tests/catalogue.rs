@@ -157,6 +157,8 @@ async fn kr_req_11_07_a_generation_verifies_through_the_qualified_client() {
     assert_eq!(index.entries[0].plugin_id, plugin());
 }
 
+/// KR-REQ-25.21: metadata signed by a root this host did not adopt is refused, and nothing is
+/// activated, so a catalogue record is trusted only when its signature verifies.
 #[tokio::test]
 async fn kr_req_11_07_metadata_signed_by_another_root_is_refused() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -189,6 +191,8 @@ async fn kr_req_11_07_metadata_signed_by_another_root_is_refused() {
     );
 }
 
+/// KR-REQ-25.21: a package file whose bytes are not the ones the signed metadata pins is refused
+/// at install, before anything is written.
 #[tokio::test]
 async fn kr_req_11_07_a_tampered_target_does_not_verify() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -708,6 +712,8 @@ async fn kr_req_11_07_the_verified_root_is_what_the_next_load_starts_from() {
     );
 }
 
+/// KR-REQ-25.21: a payload is fetched only as the accepted generation names it, so what a host
+/// installs is what verification decided.
 #[tokio::test]
 async fn kr_req_11_05_a_payload_is_fetched_only_out_of_the_accepted_generation() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -1163,9 +1169,207 @@ async fn kr_req_11_08_a_delegation_a_newer_targets_version_removes_stops_resolvi
 }
 
 // ---------------------------------------------------------------------------------------------
+// KR-REQ-25.21: signed catalogue records are verified before anything is installed
+// ---------------------------------------------------------------------------------------------
+
+/// Makes the index name another hash for the presentation than the one the signed metadata pins.
+fn names_another_payload_hash(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    let payload = entry
+        .payloads
+        .iter_mut()
+        .find(|payload| payload.role == kr_plugin_sdk::plugin::PayloadRole::Presentation)
+        .expect("the example carries a presentation");
+    payload.digest = PayloadDigest::of(b"a payload the signed metadata does not pin");
+}
+
+/// An index that names a payload hash the signed metadata does not pin is refused when the
+/// generation is verified, before any of it is kept: what an index says about a payload is checked
+/// against what the metadata pins, so a payload is never fetched under a hash only the index
+/// vouches for.
+#[tokio::test]
+async fn kr_req_25_21_an_index_that_names_a_payload_hash_the_signed_metadata_does_not_pin_is_refused()
+ {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            edit_entry: Some(names_another_payload_hash),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("the index and the metadata disagree about a payload");
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+    assert!(
+        refusal
+            .to_string()
+            .contains("is not the payload the index declares"),
+        "{refusal}"
+    );
+    assert!(catalogue.index(&repository()).is_err(), "nothing activated");
+    assert!(index_documents(&catalogue).is_empty(), "nothing kept");
+}
+
+/// Bytes under a payload's name whose hash the signed index does not name are refused at install,
+/// the same length as the signed ones, so it is the hash that refuses them. Nothing reaches the
+/// store, and the same package installs once the signed bytes are back.
+#[tokio::test]
+async fn kr_req_25_21_a_payload_whose_hash_the_signed_index_does_not_name_never_reaches_the_store()
+{
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+
+    let presentation = generation
+        .targets_dir()
+        .join("packages/kalareach/example-declarative/0.1.0")
+        .join(kr_plugin_sdk::package::PRESENTATION_FILE);
+    let signed = std::fs::read(&presentation).expect("readable");
+    let mut substituted = signed.clone();
+    let last = substituted.len() - 1;
+    substituted[last] ^= 0x01;
+    assert_eq!(substituted.len(), signed.len());
+    std::fs::write(&presentation, &substituted).expect("writable");
+
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("bytes the signed index does not name");
+    assert!(
+        matches!(
+            refusal,
+            CatalogueError::Integrity { .. } | CatalogueError::Untrusted { .. }
+        ),
+        "{refusal}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(absent(&store, generation.manifest_digest()));
+    assert!(
+        !store
+            .holds_payload(PayloadDigest::of(&substituted), substituted.len() as u64)
+            .expect("readable"),
+        "the substituted bytes were not kept"
+    );
+    assert!(
+        catalogue.installations().expect("readable").is_empty(),
+        "nothing is recorded as installed"
+    );
+
+    std::fs::write(&presentation, &signed).expect("writable");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the signed bytes install");
+    assert!(complete(&store, generation.manifest_digest()));
+}
+
+/// A generation whose index is altered after it was signed is refused, whatever the alteration is,
+/// and the accepted generation stays: here a revocation stripped from the index a repository
+/// published, which would let a withdrawn release be installed again.
+#[tokio::test]
+async fn kr_req_25_21_a_revocation_stripped_from_a_signed_index_is_refused_and_the_accepted_one_stays()
+ {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation one");
+    let kept = index_documents(&catalogue);
+
+    let second = same_package_again(home.path(), &first, 2, Some(revoke)).await;
+    first.replace_with(&second);
+    let index = first.targets_dir().join("index.json");
+    let published = std::fs::read(&index).expect("readable");
+    let mut document: serde_json::Value = serde_json::from_slice(&published).expect("an index");
+    assert!(
+        !document["entries"][0]["revocation"].is_null(),
+        "generation two revokes the release"
+    );
+    document["entries"][0]["revocation"] = serde_json::Value::Null;
+    std::fs::write(&index, serde_json::to_vec(&document).expect("serialisable")).expect("writable");
+
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("an index that is not the one signed");
+    assert!(
+        matches!(
+            refusal,
+            CatalogueError::Integrity { .. } | CatalogueError::Untrusted { .. }
+        ),
+        "{refusal}"
+    );
+    assert_eq!(
+        catalogue
+            .index(&repository())
+            .expect("activated")
+            .generation
+            .get(),
+        1,
+        "the accepted generation stays"
+    );
+    assert_eq!(index_documents(&catalogue), kept, "nothing new was kept");
+
+    // Control: the index as it was signed is accepted, revocation and all.
+    std::fs::write(&index, &published).expect("writable");
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the generation as it was signed");
+    let entry = catalogue
+        .index(&repository())
+        .expect("activated")
+        .entries
+        .into_iter()
+        .next()
+        .expect("an entry");
+    assert!(!entry.accepts_new_bindings(), "the revocation is kept");
+}
+
+// ---------------------------------------------------------------------------------------------
 // KR-REQ-11.09: expiry blocks new generations; pinned packages stay usable offline
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-25.21: a package pinned on its hash stays usable when a newer generation is refused.
 #[tokio::test]
 async fn kr_req_11_09_expired_metadata_blocks_a_new_generation_and_leaves_the_old_one_usable() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -5949,6 +6153,8 @@ async fn failed_index_fetch_must_reject_subsequent_old_keys() {
     );
 }
 
+/// KR-REQ-25.21: an installed package is identified by its hash, and that hash authorises no other
+/// version.
 #[tokio::test]
 async fn installed_hash_must_not_authorise_another_version() {
     let home = tempfile::tempdir().expect("tempdir");
