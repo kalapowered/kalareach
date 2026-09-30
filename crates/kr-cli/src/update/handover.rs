@@ -496,7 +496,8 @@ pub(super) async fn answers_as_now(environment: &Environment) -> Option<BuildId>
             Ok(Err(error))
                 if nothing_listening(&error) && tokio::time::Instant::now() < deadline =>
             {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let next = tokio::time::Instant::now() + Duration::from_millis(100);
+                tokio::time::sleep_until(next.min(deadline)).await;
             }
             _ => return None,
         }

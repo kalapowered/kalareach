@@ -256,7 +256,8 @@ const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
-/// `within`, or prints more than [`TOOL_OUTPUT`], in which case it is ended. Its output is read
+/// `within`, prints more than [`TOOL_OUTPUT`], or leaves a pipe that cannot be read, in which case
+/// it is ended. Its output is read
 /// without blocking, in the loop that waits for it to end, so that a descendant that keeps the pipe
 /// open after the tool has exited holds the run for the bound and no longer, and one that writes
 /// without end is given up on at once. The pipe is closed with the run.
@@ -927,8 +928,8 @@ mod tests {
     /// When the bound of a tool that a descendant keeps the output of ends, this run's end of the
     /// pipe is closed: nothing of it stays open, on a thread or otherwise, until the descendant
     /// ends. The descendant says what it finds when it writes: the pipe closed, or, as the control,
-    /// open while the run still reads it. It says so in a file, which is waited for, so nothing
-    /// depends on which process is scheduled first.
+    /// open while the run still reads it. It says so in a file, which is waited for, and writes
+    /// ten seconds after a bound of one, so that only a stall of nine seconds could reorder them.
     #[test]
     fn a_tool_s_pipe_is_closed_when_its_bound_ends() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -946,17 +947,23 @@ mod tests {
             while !flag.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            // Written whole by a redirection that has finished when the file is read whole.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            std::fs::read_to_string(flag).unwrap_or_default()
+            // What the descendant wrote is complete once it ends in a newline.
+            while std::time::Instant::now() < deadline {
+                let text = std::fs::read_to_string(flag).unwrap_or_default();
+                if text.ends_with('\n') {
+                    return text;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            String::new()
         };
         // The bound ends while the descendant holds the pipe, and its write finds it closed.
         let closed = directory.path().join("closed");
         assert!(
             run_bounded(
                 "sh",
-                &["-c", &script(3), "sh", &closed.display().to_string()],
-                std::time::Duration::from_secs(2)
+                &["-c", &script(10), "sh", &closed.display().to_string()],
+                std::time::Duration::from_secs(1)
             )
             .is_none(),
             "the descendant holds the pipe past the bound"
