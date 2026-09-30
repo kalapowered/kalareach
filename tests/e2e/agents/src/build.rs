@@ -521,6 +521,10 @@ pub struct Account {
     /// share.
     #[serde(default)]
     pub confinement: Option<Confinement>,
+    /// Whether a part stops once the agent is up and the checks that precede its first turn have
+    /// passed, and starts none: to see what a start shows before any turn is charged.
+    #[serde(default)]
+    pub stop_before_turns: bool,
     /// Files that would load the person's own settings, hooks or servers into the agent, none of
     /// which may exist before it starts: `{config}` names the configuration directory of the run's
     /// own and `{work}` the working directory.
