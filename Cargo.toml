@@ -27,6 +27,7 @@ members = [
     "crates/kr-protocol",
     "crates/kr-shell-integration",
     "crates/kr-term",
+    "crates/kr-term-probe",
     "crates/kr-transfer",
     "crates/kr-transport",
     "crates/kr-voice",
