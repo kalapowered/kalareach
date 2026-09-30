@@ -1298,6 +1298,39 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  it('puts the focus on the mode button when the view opens again by itself from Attach again, after a pointer press of it', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    act(() => {
+      controls.terminalViews[0]?.end('The session ended.')
+    })
+    await person.click(screen.getByRole('button', { name: 'Attach again' }))
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    expect(screen.getByRole('button', { name: 'Take control' })).not.toHaveFocus()
+    act(() => {
+      controls.terminalViews[1]?.end('The session ended again.')
+    })
+    screen.getByRole('button', { name: 'Attach again' }).focus()
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(3)
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    expect(screen.getByRole('button', { name: 'Take control' })).toHaveFocus()
+  })
+
   it('pays the focus owed once the mode button can take it, unless the person put it on another control first', async () => {
     // The bar that holds the mode button is hidden while a software keyboard is up: here, while
     // `hidden` holds, nothing in the bar is shown.
