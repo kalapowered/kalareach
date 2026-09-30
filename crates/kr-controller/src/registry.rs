@@ -2748,10 +2748,13 @@ mod tests {
         drop(read);
         std::mem::forget(daemon);
         // A registry that is a link is not opened: the reader refuses it, by its own words.
-        let link = directory.path().join("link.sqlite3");
-        std::os::unix::fs::symlink(&path, &link).expect("a link");
-        assert!(!Registry::take_in_its_log(&link).expect("left to the reader"));
-        let refused = Registry::open_to_read(&link, environment()).expect_err("a link");
-        assert!(refused.to_string().contains("link"), "{refused}");
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link.sqlite3");
+            std::os::unix::fs::symlink(&path, &link).expect("a link");
+            assert!(!Registry::take_in_its_log(&link).expect("left to the reader"));
+            let refused = Registry::open_to_read(&link, environment()).expect_err("a link");
+            assert!(refused.to_string().contains("link"), "{refused}");
+        }
     }
 }
