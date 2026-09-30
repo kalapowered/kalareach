@@ -238,36 +238,6 @@ pub struct Admissions {
     pub not_admitted: Vec<NotAdmitted>,
 }
 
-/// The adapters an organisation's policy allows, shared by the catalogue and whoever puts a policy
-/// in force, and read at every admission: a change reaches the next computation without the
-/// catalogue being told. `None` allows every adapter the host qualifies, and a set narrows
-/// admission to the adapters it names, never past what an installation, its grants and its
-/// package already allow.
-///
-/// Admissions carry the allowlist, so whoever puts one in force raises the admission revision
-/// after it, as any other change that moves admissions with no record changing does.
-#[derive(Clone, Debug, Default)]
-pub struct AllowedAdapters(std::sync::Arc<std::sync::Mutex<Option<BTreeSet<PluginId>>>>);
-
-impl AllowedAdapters {
-    /// Puts `allowed` in force for every admission from now on.
-    pub fn put(&self, allowed: Option<BTreeSet<PluginId>>) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = allowed;
-    }
-
-    /// Returns the adapters allowed now, or `None` where every adapter is.
-    #[must_use]
-    pub fn get(&self) -> Option<BTreeSet<PluginId>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
 /// The first part of an admission computation: everything the records and the current indexes
 /// say, read while the caller holds the catalogue.
 ///
@@ -471,12 +441,14 @@ pub(crate) fn plan(
             not_admitted.push(refuse(NotAdmittedReason::Disabled));
             continue;
         }
-        if !permitted(&installation.plugin_id) {
-            not_admitted.push(refuse(NotAdmittedReason::NotAllowed));
-            continue;
-        }
+        // A revocation is what a person can act on, so it is what an installation the allowlist
+        // also leaves out is reported as.
         if let Some(record) = revocation {
             not_admitted.push(refuse(NotAdmittedReason::Revoked(record)));
+            continue;
+        }
+        if !permitted(&installation.plugin_id) {
+            not_admitted.push(refuse(NotAdmittedReason::NotAllowed));
             continue;
         }
         let builds = match (entry.as_ref(), host.os, host.architecture) {
