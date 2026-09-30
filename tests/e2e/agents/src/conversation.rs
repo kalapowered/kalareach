@@ -86,6 +86,40 @@ pub fn answers(
     Ok(counted.len())
 }
 
+/// Whether the agent's own record of its latest request for approval after line `after` of `text`
+/// names `command` and the folder `cwd` it runs in: the last line holding `marker` is JSON whose
+/// `request.display.command` is `command` and whose `request.display.cwd` is `cwd`.
+///
+/// # Errors
+///
+/// Returns what the record names in their place, or that there is none.
+pub fn request_names(
+    text: &str,
+    after: Option<usize>,
+    marker: &str,
+    command: &str,
+    cwd: &str,
+) -> Result<(), String> {
+    let line = text
+        .lines()
+        .enumerate()
+        .filter(|(index, line)| after.is_none_or(|from| *index > from) && line.contains(marker))
+        .map(|(_, line)| line)
+        .last()
+        .ok_or_else(|| "the conversation holds no record of a request for approval".to_owned())?;
+    let record: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| format!("the request's record is not JSON: {error}"))?;
+    let display = &record["request"]["display"];
+    let names = |key: &str| display[key].as_str().unwrap_or_default().to_owned();
+    if names("command") != command {
+        return Err("the request's record names another command".to_owned());
+    }
+    if names("cwd") != cwd {
+        return Err("the request's record names another folder to run it in".to_owned());
+    }
+    Ok(())
+}
+
 /// Whether a line of `text` holding `marker` lies after the line `from` and before the line `to`:
 /// a turn that started between them, where the agent marks each turn's start. `None` where `to`
 /// does not come after `from`.
@@ -179,6 +213,44 @@ mod tests {
             answers(quoted, None, (&answer, &call, &asking)),
             Ok(0),
             "a line that is no call record is not a call"
+        );
+    }
+
+    #[test]
+    fn a_request_for_approval_is_the_command_and_the_folder_the_agent_recorded() {
+        let request = |command: &str, cwd: &str| {
+            format!(
+                "{{\"type\":\"interaction.request\",\"request\":{{\"display\":{{\"kind\":\"command\",\"command\":\"{command}\",\"cwd\":\"{cwd}\"}}}}}}\n"
+            )
+        };
+        let marker = r#""type":"interaction.request""#;
+        let text = format!(
+            "{{\"type\":\"turn.prompt\"}}\n{}{}",
+            request("echo a >> a", "/r/w"),
+            request("echo kr1 >> a", "/r/w")
+        );
+        assert_eq!(
+            request_names(&text, Some(0), marker, "echo kr1 >> a", "/r/w"),
+            Ok(())
+        );
+        assert!(
+            request_names(&text, Some(0), marker, "echo a >> a", "/r/w").is_err(),
+            "the latest request is the one read"
+        );
+        assert!(request_names(&text, Some(0), marker, "echo kr1 >> a", "/elsewhere").is_err());
+        assert!(
+            request_names(&text, Some(3), marker, "echo kr1 >> a", "/r/w").is_err(),
+            "nothing after that line"
+        );
+        assert!(
+            request_names(
+                "not json with the mark \"type\":\"interaction.request\"\n",
+                None,
+                marker,
+                "c",
+                "d"
+            )
+            .is_err()
         );
     }
 

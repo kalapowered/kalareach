@@ -378,6 +378,16 @@ impl Provenance {
                         .filter_map(|account| account.config_directory.as_ref())
                         .map(|directory| &directory.variable),
                 )
+                .chain(
+                    build
+                        .account
+                        .iter()
+                        .filter_map(|account| account.confinement.as_ref())
+                        .flat_map(|confinement| {
+                            std::iter::once(&confinement.variable)
+                                .chain(&confinement.proxy_variables)
+                        }),
+                )
                 .cloned()
                 .collect(),
             cleared_required: AtomicBool::new(false),

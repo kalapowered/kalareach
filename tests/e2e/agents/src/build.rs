@@ -83,6 +83,15 @@ pub struct Approval {
     /// it, where [`Approval::deny`] would not in every one of them; [`Approval::deny`] otherwise.
     #[serde(default)]
     pub refuse: Option<String>,
+    /// Whether the part's command names its log relative to the folder the agent works in, since
+    /// the folder's absolute path does not fit one line of the dialog; the part then answers only
+    /// when the agent's own record of the request names the command and the run's folder.
+    #[serde(default)]
+    pub relative_log: bool,
+    /// What marks the line of a conversation file that records a request for approval, which
+    /// carries the command and the folder it runs in as `"command":"..."` and `"cwd":"..."`.
+    #[serde(default)]
+    pub request_line: Option<String>,
 }
 
 impl Approval {
@@ -395,6 +404,50 @@ pub struct ConfigDirectory {
     pub files: BTreeMap<String, String>,
 }
 
+/// How the agent is confined for the parts that use the person's login, where it keeps its data in
+/// a directory shared with their own sessions: a sandbox its processes cannot leave, whose only
+/// way out is the run's proxy; a record that trusts the run's folder; a project file that switches
+/// the person's servers off; and checks of the files it shares with them (see
+/// [`crate::confine`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Confinement {
+    /// The committed sandbox profile, as an absolute path the harness fills in.
+    pub profile: PathBuf,
+    /// The agent's data directory in the person's home, relative to it.
+    pub data: String,
+    /// The variable that names the data directory for the agent; its home stays the run's.
+    pub variable: String,
+    /// The hosts the run's proxy relays to, on port 443.
+    pub hosts: Vec<String>,
+    /// The variables given the proxy's address.
+    pub proxy_variables: Vec<String>,
+    /// The table of the configuration that names the login the agent uses.
+    pub provider: String,
+    /// Where the person's servers are named and where the project's file that switches them off
+    /// goes.
+    pub servers: ProjectServers,
+    /// The tools the agent's own default policy approves without asking, recorded with the run.
+    pub unasked_tools: Vec<String>,
+    /// Paths in the data directory whose rewrite is only reported, relative to it: the agent's
+    /// own upkeep files, which change whenever it runs.
+    pub reported: Vec<String>,
+}
+
+/// Where the agent reads its servers and how a project switches each off.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectServers {
+    /// The person's file that names them, relative to the data directory.
+    pub source: String,
+    /// The member of it that holds them.
+    pub member: String,
+    /// The project's file, relative to the working directory.
+    pub file: String,
+    /// What each server is given there.
+    pub entry: serde_json::Value,
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -453,6 +506,21 @@ pub struct Account {
     /// The key that queues a prompt behind a running turn, where it is not the submit key.
     #[serde(default)]
     pub queue_key: Option<String>,
+    /// The key that joins a prompt already queued to the running turn, where steering is a second
+    /// step: the prompt is entered first, and this is sent once `steer_ready` shows.
+    #[serde(default)]
+    pub steer_key: Option<String>,
+    /// Text the screen shows once a prompt waits and `steer_key` would steer it.
+    #[serde(default)]
+    pub steer_ready: Option<String>,
+    /// What marks the line of a conversation file that records a steering prompt, where it is not a
+    /// prompt line.
+    #[serde(default)]
+    pub steer_line: Option<String>,
+    /// How the agent is confined, where it keeps its data in a directory the person's own sessions
+    /// share.
+    #[serde(default)]
+    pub confinement: Option<Confinement>,
     /// Files that would load the person's own settings, hooks or servers into the agent, none of
     /// which may exist before it starts: `{config}` names the configuration directory of the run's
     /// own and `{work}` the working directory.
@@ -966,6 +1034,8 @@ mod tests {
             options_start: Some("Yes, proceed".to_owned()),
             others: Vec::new(),
             refuse: Some("\u{1b}".to_owned()),
+            relative_log: false,
+            request_line: None,
         };
         let rows = |lines: &[&str]| owned(lines);
         let command = "echo kr0123 >> approved.log";

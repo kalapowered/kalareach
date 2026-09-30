@@ -73,11 +73,15 @@ pub mod account;
 #[cfg(unix)]
 pub mod build;
 #[cfg(unix)]
+pub mod confine;
+#[cfg(unix)]
 pub mod conversation;
 #[cfg(unix)]
 pub mod detect;
 #[cfg(unix)]
 pub mod keychain;
+#[cfg(unix)]
+pub mod network;
 #[cfg(unix)]
 pub mod observe;
 #[cfg(unix)]

@@ -28,6 +28,7 @@ use kr_e2e_agents::account::{
 use kr_e2e_agents::build::{
     Account, AccountHome, Action, Build, Inputs, Launch, quote, with_dates,
 };
+use kr_e2e_agents::confine::{self, Layout, Setup};
 use kr_e2e_agents::conversation::answers;
 use kr_e2e_agents::detect::{
     Detection, Held, Launched, Shown, Surface, all_rejected, announced_now, backend_files,
@@ -35,6 +36,7 @@ use kr_e2e_agents::detect::{
     checker_controls, detected_evidence, wait_for_detection, wait_for_no_instance,
 };
 use kr_e2e_agents::keychain::RunKeychain;
+use kr_e2e_agents::network::{Policy, Proxy};
 use kr_e2e_agents::observe::{
     AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
     typed_actions,
@@ -166,6 +168,9 @@ struct Guards {
     /// The files the agent and the person's other programs only append lines to, as the part found
     /// them: a line that was there changing or going is a change the part stops on.
     append_only: Vec<AppendOnly>,
+    /// The list of workspaces the agent keeps in the person's data directory, as the part found it:
+    /// it may only gain the run's own folder.
+    workspaces: Option<Workspaces>,
     /// When the files were last read.
     read_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// What changed, once a look found a change: the part stops on it.
@@ -180,6 +185,16 @@ struct Guards {
     agents: std::sync::Mutex<Vec<ProcessStartIdentity>>,
     /// What a stop on a change ended, and what still ran after it: for the part's outcome.
     stopped: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+/// The person's list of workspaces as a part found it, and the folder it may gain.
+struct Workspaces {
+    /// The list's file, relative to the person's home.
+    relative: String,
+    /// Its bytes before the part.
+    before: String,
+    /// The run's folder, as the agent names it.
+    folder: PathBuf,
 }
 
 /// The probes a part runs, each by its process group, whose leader stays unreaped while it is
@@ -226,6 +241,32 @@ impl Guards {
                 "~/{}: a line that was there before the part changed or went while it ran",
                 file.relative
             ));
+        }
+        if let Some(workspaces) = &self.workspaces {
+            let path = self.home.join(&workspaces.relative);
+            match read_if_there(&path) {
+                Ok(Some(bytes)) => {
+                    let verdict = String::from_utf8(bytes)
+                        .map_err(|_| "the list is not text".to_owned())
+                        .and_then(|now| {
+                            confine::workspaces_verdict(
+                                &workspaces.before,
+                                &now,
+                                &workspaces.folder,
+                            )
+                        });
+                    if let Err(why) = verdict {
+                        return Some(format!(
+                            "~/{}: it changed other than by gaining the run's folder: {why}",
+                            workspaces.relative
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    return Some(format!("~/{} went while the part ran", workspaces.relative));
+                }
+                Err(error) => return Some(format!("~/{}: {error}", workspaces.relative)),
+            }
         }
         self.before.iter().zip(&now).find_map(|(first, second)| {
             let changed = first.sha256 != second.sha256;
@@ -564,6 +605,10 @@ struct Login {
     ledger: Ledger,
     key: Option<(String, String)>,
     person_home: PathBuf,
+    /// For a confined agent: what its data directory said before the part, read once.
+    setup: Option<Setup>,
+    /// For a confined agent: the run's proxy, its only way out of the machine.
+    proxy: Option<Proxy>,
 }
 
 impl Login {
@@ -592,6 +637,542 @@ impl Ending {
             replacement: None,
             windows: Vec::new(),
         }
+    }
+}
+
+/// The name of a process of the person's that runs the agent's own program, where the agent is
+/// confined and shares its data directory with them: the guards would take its writes for the
+/// agent's, and the workspace list could not be restored without losing them.
+fn other_agent_running(command: &str) -> Option<String> {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-axo", "comm="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.rsplit('/').next() == Some(command))
+        .map(str::to_owned)
+}
+
+/// The run's folder as the agent sees it: its resolved path.
+fn folder_of(run: &Run) -> PathBuf {
+    std::fs::canonicalize(run.work())
+        .unwrap_or_else(|error| panic!("the run's folder as the system names it: {error}"))
+}
+
+/// The paths and the proxy port of a confined agent's sandbox, as the system resolves them.
+fn layout_of(stage: &Stage<'_, '_>) -> Layout {
+    let login = stage.login.expect("a part with a login");
+    let confinement = login
+        .account
+        .confinement
+        .as_ref()
+        .expect("a confined agent");
+    let setup = login.setup.as_ref().expect("a confined agent's setup");
+    let resolved = |path: PathBuf| {
+        std::fs::canonicalize(&path)
+            .unwrap_or_else(|error| panic!("{} as the system names it: {error}", path.display()))
+    };
+    Layout {
+        home: resolved(stage.run.home()),
+        work: folder_of(stage.run),
+        tmp: resolved(stage.run.root().join("tmp")),
+        skills: resolved(stage.run.root().join("skills")),
+        agent: resolved(stage.run.root().join("agent")),
+        build: resolved(stage.build.prefix.clone()),
+        shells: resolved(stage.shell.prefix.clone()),
+        data: resolved(login.person_home.join(&confinement.data)),
+        person: resolved(login.person_home.clone()),
+        slot: setup.slot.clone(),
+        proxy_port: login.proxy.as_ref().expect("the run's proxy").port(),
+    }
+}
+
+/// Before the agent's host starts, for a confined agent: its folder is where the system says it is,
+/// with no `.git` above it, its empty skills directory exists, the project file that switches the
+/// person's servers off is written, and the folder is trusted, by a record that is the run's own.
+///
+/// # Panics
+///
+/// Panics, as an isolation that is not established, when any of it is not so.
+fn confine_prepare(login: &Login, run: &Run) {
+    let (Some(confinement), Some(setup)) = (&login.account.confinement, &login.setup) else {
+        return;
+    };
+    let folder = folder_of(run);
+    if let Some(above) = confine::git_above(&folder) {
+        panic!(
+            "{ISOLATION_UNPROVEN} a .git lies above the run's folder ({} levels up), so the agent              would read instruction files from the directories between them",
+            folder
+                .ancestors()
+                .position(|path| path == above)
+                .unwrap_or(0)
+        );
+    }
+    let skills = run.root().join("skills");
+    if !skills.is_dir() {
+        kr_ipc::paths::create_private_tree(run.root(), &skills)
+            .expect("the run's empty skills directory");
+    }
+    let project = folder.join(&confinement.servers.file);
+    if let Some(parent) = project.parent() {
+        std::fs::create_dir_all(parent).expect("the project file's directory");
+    }
+    std::fs::write(
+        &project,
+        confine::project_servers(
+            &setup.servers,
+            &confinement.servers.member,
+            &confinement.servers.entry,
+        ),
+    )
+    .expect("writes the project file");
+    let trust = login
+        .person_home
+        .join(&confinement.data)
+        .join(confine::TRUST);
+    confine::write_trust(&trust, &folder, now_ms())
+        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+}
+
+/// At each start of a confined agent: the settings of the person's configuration would let no tool
+/// run unasked, the project file is the one written and nothing else is in its directory, and the
+/// folder is trusted, so the agent starts none of the person's servers.
+///
+/// # Panics
+///
+/// Panics, as an isolation that is not established, when any of it is not so.
+fn confine_holds(stage: &Stage<'_, '_>) {
+    let login = stage.login.expect("a part with a login");
+    let (Some(confinement), Some(setup)) = (&login.account.confinement, &login.setup) else {
+        return;
+    };
+    if let Some(why) = setup.settings.problem() {
+        panic!("{ISOLATION_UNPROVEN} {why}");
+    }
+    let folder = folder_of(stage.run);
+    let project = folder.join(&confinement.servers.file);
+    let written = std::fs::read_to_string(&project).unwrap_or_default();
+    assert!(
+        confine::is_project_servers(
+            &written,
+            &setup.servers,
+            &confinement.servers.member,
+            &confinement.servers.entry
+        ),
+        "{ISOLATION_UNPROVEN} the run's project file is not the one that switches the person's \
+         servers off"
+    );
+    let directory = project.parent().expect("the project file's directory");
+    let others = std::fs::read_dir(directory)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert!(
+        others == 1,
+        "{ISOLATION_UNPROVEN} the project file's directory holds {others} entries, not the one \
+         file written"
+    );
+    let trust = login
+        .person_home
+        .join(&confinement.data)
+        .join(confine::TRUST);
+    assert!(
+        confine::trust_records_for(&trust, &folder) == 1,
+        "{ISOLATION_UNPROVEN} the run's folder is not trusted by exactly one record"
+    );
+}
+
+/// After a confined part, once what it started has ended: what it left of the run in the person's
+/// data directory is removed and checked gone (the trust records for its folder, its bucket of
+/// sessions), the list of workspaces is compared with the copy taken before it and restored if it
+/// changed other than by gaining the run's folder, and the run's directory is searched for the
+/// strings of the login's files. Returns the evidence, by counts and booleans, and why the agent
+/// stops, where it does.
+fn confine_close(
+    login: &Login,
+    guards: Option<&Guards>,
+    root: &Path,
+    ended: bool,
+) -> (serde_json::Value, Vec<(&'static str, String)>) {
+    let (Some(confinement), Some(setup), Some(proxy)) =
+        (&login.account.confinement, &login.setup, &login.proxy)
+    else {
+        return (serde_json::Value::Null, Vec::new());
+    };
+    let mut stop: Vec<(&'static str, String)> = Vec::new();
+    let data = login.person_home.join(&confinement.data);
+    let folder = root.join("w");
+    let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+    let trust = data.join(confine::TRUST);
+    let trust_removed = confine::remove_trust(&trust, &folder).unwrap_or_else(|why| {
+        stop.push(("run_data_left", why));
+        0
+    });
+    let trust_left = confine::trust_records_for(&trust, &folder);
+    let bucket = data.join("sessions").join(confine::workdir_key(&folder));
+    let bucket_existed = bucket.exists();
+    if ended && bucket_existed {
+        let _ = std::fs::remove_dir_all(&bucket);
+    }
+    let bucket_left = bucket.exists();
+    if trust_left > 0 || bucket_left {
+        stop.push((
+            "run_data_left",
+            format!(
+                "what the run left in the person's data directory could not be removed: {trust_left} \
+                 trust record(s), its sessions {}",
+                if bucket_left { "still there" } else { "gone" }
+            ),
+        ));
+    }
+    let workspaces = guards
+        .and_then(|guards| guards.workspaces.as_ref())
+        .map(|workspaces| {
+            let path = login.person_home.join(&workspaces.relative);
+            let now = std::fs::read_to_string(&path).map_err(|error| error.to_string());
+            let verdict = now.and_then(|now| {
+                confine::workspaces_verdict(&workspaces.before, &now, &workspaces.folder)
+            });
+            let mut restored = false;
+            if verdict.is_err() && ended {
+                let temporary = path.with_extension("json.kr-restore");
+                restored = std::fs::write(&temporary, &workspaces.before)
+                    .and_then(|()| std::fs::rename(&temporary, &path))
+                    .is_ok();
+                let read_again = std::fs::read_to_string(&path).ok();
+                restored = restored && read_again.as_deref() == Some(workspaces.before.as_str());
+            }
+            if verdict.is_err() {
+                stop.push((
+                    "workspace_list_changed",
+                    format!(
+                        "the person's list of workspaces changed other than by gaining the run's \
+                     folder ({}), and {}",
+                        verdict.clone().err().unwrap_or_default(),
+                        if restored {
+                            "the copy taken before the part was put back"
+                        } else {
+                            "it could not be put back"
+                        }
+                    ),
+                ));
+            }
+            (verdict.is_ok(), restored)
+        });
+    if workspaces.is_some_and(|(additive, _)| additive)
+        && let Some(path) = private_copy_path()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    let scans: Vec<_> = setup
+        .secrets
+        .iter()
+        .map(|secret| files_holding(root, secret.as_bytes()))
+        .collect();
+    let found = scans.iter().filter(|scan| !scan.held_by.is_empty()).count();
+    let complete = scans.iter().all(|scan| scan.complete());
+    if found > 0 || !complete {
+        stop.push((
+            "secret_found",
+            format!(
+                "{found} string(s) of the login's files were found in the run's directory, and the \
+                 search was {}complete",
+                if complete { "" } else { "not " }
+            ),
+        ));
+    }
+    let names = proxy.refused_authorities();
+    if !names.is_empty() {
+        eprintln!("the proxy refused, in order: {}", names.join("; "));
+    }
+    let profile = std::fs::read(&confinement.profile).map_or_else(
+        |_| "unreadable".to_owned(),
+        |bytes| {
+            kr_cbor::sha256(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        },
+    );
+    (
+        json!({
+            "profile_sha256": profile,
+            "proxy": {
+                "hosts": confinement.hosts,
+                "tunnels": proxy.counts().allowed(),
+                "refused": proxy.counts().refused(),
+            },
+            "unasked_tools": confinement.unasked_tools,
+            "settings": { "rules": setup.settings.rules, "allow_built_in": setup.settings.allow_built_in, "mode_manual": !setup.settings.mode_not_manual, "loads_more": setup.settings.loads_more },
+            "servers_switched_off": setup.servers.len(),
+            "left_in_data": { "trust_records_removed": trust_removed, "trust_records_left": trust_left, "sessions_bucket_existed": bucket_existed, "sessions_bucket_left": bucket_left },
+            "workspaces": workspaces.map(|(additive, restored)| json!({ "additive": additive, "restored": restored })),
+            "secrets": { "strings": setup.secrets.len(), "found_in_run": found, "complete": complete },
+            "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
+        }),
+        stop,
+    )
+}
+
+/// What each launch of a confined agent showed before its first turn, by booleans and counts, for
+/// the part's evidence: one test runs in a process, so this is the part's.
+static ZERO_TURN: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+
+/// The digits a line of the agent's screen shows after `prefix`, as a status: `kr-zt-3-1007` after
+/// `kr-zt-3-` is 7. The typed line itself shows `$((1000+$?))` there, never digits.
+fn status_after(rows: &[String], prefix: &str) -> Option<i64> {
+    rows.iter().rev().find_map(|row| {
+        let at = row.find(prefix)?;
+        let digits: String = row[at + prefix.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (digits.len() == 4)
+            .then(|| digits.parse::<i64>().ok())?
+            .map(|value| value - 1000)
+    })
+}
+
+/// Runs one shell line at the confined agent's composer, with the agent's own `!` escape: the agent
+/// runs it in its own process tree with no model call and no dialog. Waits for the line's status
+/// and returns it with the screen.
+fn shell_line(
+    logged: &mut Logged,
+    stage: &Stage<'_, '_>,
+    number: u32,
+    line: &str,
+) -> (i64, Vec<String>) {
+    let prefix = format!("kr-zt-{number}-");
+    logged.type_text(stage, &format!("! {line}; echo {prefix}$((1000+$?))"));
+    std::thread::sleep(Duration::from_millis(300));
+    let submit = stage
+        .login
+        .expect("a part with a login")
+        .account
+        .submit
+        .clone();
+    logged.type_text(stage, &submit);
+    let rows = logged.wait_for(
+        stage,
+        &format!("{prefix}1"),
+        "the agent's shell line reports its status",
+    );
+    let status = status_after(&rows, &prefix)
+        .unwrap_or_else(|| panic!("{ISOLATION_UNPROVEN} the shell line {number} shows no status"));
+    (status, rows)
+}
+
+/// Before a confined agent's first turn: it shows every one of the person's servers disabled and no
+/// tool of theirs; through the agent's own `!` escape, in its own process tree, a read outside the
+/// profile is refused where one inside is not, a write outside is refused, a direct connection to a
+/// provider address of either family is refused, the run's proxy refuses a host it was not given and
+/// tunnels to one it was, and the person's own copy of the agent cannot be run; and no connection
+/// of the tree goes anywhere but the run's proxy. A failure stops the agent before a turn.
+///
+/// # Panics
+///
+/// Panics, as an isolation that is not established, when anything is otherwise.
+fn confine_checks(stage: &Stage<'_, '_>, logged: &mut Logged) {
+    let login = stage.login.expect("a part with a login");
+    let (Some(confinement), Some(setup), Some(proxy)) =
+        (&login.account.confinement, &login.setup, &login.proxy)
+    else {
+        return;
+    };
+    let account = login.account();
+    let rows = logged.screen.view.rows();
+    assert!(
+        !rows.iter().any(|row| row.contains("Trust this folder?")),
+        "{ISOLATION_UNPROVEN} the agent asks whether to trust the folder, so its record is not the \
+         one the agent looks for"
+    );
+    // The servers: every one of the person's is listed, disabled, and no tool is available.
+    logged.type_text(stage, &account.slash.input);
+    std::thread::sleep(Duration::from_millis(300));
+    logged.type_text(stage, &account.submit);
+    let panel = logged.wait_for(stage, &account.slash.shows, "the agent lists its servers");
+    let count = setup.servers.len();
+    let listed_disabled = setup.servers.iter().all(|name| {
+        panel
+            .iter()
+            .any(|row| row.contains(name.as_str()) && row.contains("disabled"))
+    });
+    let counted = panel
+        .iter()
+        .any(|row| row.contains(&format!("{count} disabled")) && row.contains("0 tools available"));
+    if !account.dismiss.is_empty() {
+        logged.type_text(stage, &account.dismiss);
+    }
+    let _ = logged.wait_idle(stage, "the composer is back after the server list");
+    assert!(
+        listed_disabled && counted,
+        "{ISOLATION_UNPROVEN} the agent's server list does not show all {count} of the person's \
+         servers disabled with no tool available"
+    );
+    // The canaries: one outside the run, one inside it.
+    let token = nonce();
+    let outside = std::env::temp_dir().join(format!("krcanary-{token}"));
+    let inside = folder_of(stage.run).join("canary-in");
+    std::fs::write(&outside, format!("kr-out-{token}")).expect("the outside canary");
+    std::fs::write(&inside, format!("kr-in-{token}")).expect("the inside canary");
+    let _guards = (Remove(outside.clone()), Remove(outside.with_extension("w")));
+    let (read_outside, screen_out) =
+        shell_line(logged, stage, 1, &format!("cat '{}'", outside.display()));
+    let (read_inside, screen_in) =
+        shell_line(logged, stage, 2, &format!("cat '{}'", inside.display()));
+    let (write_outside, _) = shell_line(
+        logged,
+        stage,
+        3,
+        &format!("echo x > '{}'", outside.with_extension("w").display()),
+    );
+    let (direct_v4, _) = shell_line(
+        logged,
+        stage,
+        4,
+        "/usr/bin/curl --noproxy '*' -4 -sS -m 6 -o /dev/null https://1.1.1.1/",
+    );
+    let (direct_v6, _) = shell_line(
+        logged,
+        stage,
+        5,
+        "/usr/bin/curl --noproxy '*' -6 -sS -m 6 -o /dev/null 'https://[2606:4700:4700::1111]/'",
+    );
+    let refused_before = proxy.counts().refused();
+    let tunnels_before = proxy.counts().allowed();
+    let (other_host, _) = shell_line(
+        logged,
+        stage,
+        6,
+        "/usr/bin/curl -sS -m 6 -o /dev/null https://example.com/",
+    );
+    let host = confinement.hosts.first().cloned().unwrap_or_default();
+    let (through_proxy, _) = shell_line(
+        logged,
+        stage,
+        7,
+        &format!("/usr/bin/curl -sS -m 15 -o /dev/null https://{host}/"),
+    );
+    let person_copy = login
+        .person_home
+        .join(&confinement.data)
+        .join("bin")
+        .join(&stage.build.command);
+    let exec_denied = if person_copy.exists() {
+        let (status, _) = shell_line(
+            logged,
+            stage,
+            8,
+            &format!("'{}' --version >/dev/null 2>&1", person_copy.display()),
+        );
+        Some(status == 126 || status == 1)
+    } else {
+        None
+    };
+    let refused = proxy.counts().refused() > refused_before;
+    let tunnelled = proxy.counts().allowed() > tunnels_before;
+    let processes: Vec<u32> = logged
+        .agent
+        .every_process()
+        .iter()
+        .filter_map(|process| u32::try_from(process.identity.pid.get()).ok())
+        .collect();
+    let connections = tcp_connections_of(&processes);
+    let only_the_proxy = connections.as_ref().is_ok_and(|remotes| {
+        remotes
+            .iter()
+            .all(|remote| remote == &format!("127.0.0.1:{}", proxy.port()))
+    });
+    let shows_outside = screen_out
+        .iter()
+        .any(|row| row.contains(&format!("kr-out-{token}")));
+    let shows_inside = screen_in
+        .iter()
+        .any(|row| row.contains(&format!("kr-in-{token}")));
+    let result = json!({
+        "servers_disabled": count,
+        "server_list_complete": listed_disabled && counted,
+        "canary_read_outside_refused": read_outside != 0 && !shows_outside,
+        "canary_read_inside_works": read_inside == 0 && shows_inside,
+        "write_outside_refused": write_outside != 0,
+        "direct_connection_v4_refused": direct_v4 == 7,
+        "direct_connection_v6_refused": direct_v6 == 7,
+        "proxy_refused_a_host_it_was_not_given": other_host != 0 && refused,
+        "proxy_tunnelled_to_a_host_it_was_given": through_proxy == 0 && tunnelled,
+        "person_copy_cannot_run": exec_denied,
+        "connections_only_to_the_proxy": only_the_proxy,
+        "connections_seen": connections.as_ref().map_or(0, Vec::len),
+    });
+    if let Ok(mut zero) = ZERO_TURN.lock() {
+        zero.push(result.clone());
+    }
+    let failed: Vec<&str> = result
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| **value == json!(false))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{ISOLATION_UNPROVEN} before any turn the confined agent showed: {}",
+        failed.join(", ")
+    );
+    guards_hold(stage);
+}
+
+/// Removes a file when dropped, whatever ended the part.
+struct Remove(PathBuf);
+
+impl Drop for Remove {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The remote end of each TCP connection the processes `pids` hold, as `lsof` names them.
+fn tcp_connections_of(pids: &[u32]) -> Result<Vec<String>, String> {
+    if pids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-iTCP", "-p", &list, "-Fn"])
+        .output()
+        .map_err(|error| format!("lsof did not run: {error}"))?;
+    // lsof exits 1 when it finds no such connection; its `n` lines name `local->remote` pairs.
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter_map(|pair| pair.split_once("->").map(|(_, remote)| remote.to_owned()))
+        .collect())
+}
+
+/// The part's private copy of the person's list of workspaces, beside the guarded files' record.
+fn private_copy_path() -> Option<PathBuf> {
+    std::env::var_os(kr_e2e_agents::account::KEY_SCAN_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(value).with_file_name("workspaces-before.json"))
+}
+
+/// Keeps `text` in the part's private copy, owner-only.
+fn write_private_copy(text: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(path) = private_copy_path() {
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .unwrap_or_else(|error| panic!("the private copy {}: {error}", path.display()));
     }
 }
 
@@ -674,11 +1255,40 @@ fn staged(
         });
         let person_home =
             PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
+        let mut account = account;
+        // A confined agent's data directory is read once, before anything starts: which login is in
+        // use, what its configuration sets, and which servers it names. Its other logins join the
+        // files that may not change, and the one in use those whose change is only recorded.
+        let setup = account.confinement.clone().map(|confinement| {
+            if let Some(name) = other_agent_running(&inputs.build.command) {
+                panic!(
+                    "part {part} does not start: a process of the person's own runs {name}, which                      shares the data directory the part guards"
+                );
+            }
+            let setup = Setup::read(
+                &person_home,
+                &confinement.data,
+                &confinement.provider,
+                &confinement.servers,
+            )
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            account.guarded.extend(setup.other_logins.iter().cloned());
+            account.recorded.push(format!(
+                "{}/credentials/{}.json",
+                confinement.data, setup.slot
+            ));
+            setup
+        });
+        let proxy = account.confinement.as_ref().map(|confinement| {
+            Proxy::start(Policy::public(&confinement.hosts)).expect("the run's proxy")
+        });
         Login {
             ledger: Ledger::from_environment(&account.budget, account.turns),
             account,
             key,
             person_home,
+            setup,
+            proxy,
         }
     });
     let shell = match shells::managed_zsh() {
@@ -749,6 +1359,26 @@ fn staged(
         });
         (files, before, item, lines)
     });
+    let run = Run::start(&format!("part {part}"));
+    let root = run.root().to_path_buf();
+    // The person's list of workspaces before anything starts: it may only gain the run's folder. A
+    // copy of its bytes goes to the part's private evidence, for the one case that restores it.
+    let workspaces = login.as_ref().and_then(|login| {
+        let confinement = login.account.confinement.as_ref()?;
+        let relative = format!("{}/workspaces.json", confinement.data);
+        let before =
+            std::fs::read_to_string(login.person_home.join(&relative)).unwrap_or_else(|error| {
+                panic!("{ISOLATION_UNPROVEN} ~/{relative} cannot be read: {error}")
+            });
+        let folder = std::fs::canonicalize(run.work())
+            .unwrap_or_else(|error| panic!("the run's folder as the system names it: {error}"));
+        write_private_copy(&before);
+        Some(Workspaces {
+            relative,
+            before,
+            folder,
+        })
+    });
     let guards = login
         .as_ref()
         .zip(watched.as_ref())
@@ -759,6 +1389,7 @@ fn staged(
             guarded: login.account.guarded.clone(),
             shared: login.account.shared.clone(),
             append_only: lines.clone(),
+            workspaces,
             read_at: std::sync::Mutex::new(None),
             changed: std::sync::Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
@@ -766,8 +1397,6 @@ fn staged(
             agents: std::sync::Mutex::new(Vec::new()),
             stopped: std::sync::Mutex::new(None),
         });
-    let run = Run::start(&format!("part {part}"));
-    let root = run.root().to_path_buf();
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
     if needs_login {
         provenance.require_cleared();
@@ -859,6 +1488,13 @@ fn staged(
             let _ = std::fs::remove_dir_all(&directory);
             !directory.exists()
         });
+    // What a confined agent left of the run in the person's data directory, while the run's directory
+    // is still there to search.
+    let (confinement_evidence, confinement_stop) = login
+        .as_ref()
+        .map_or((serde_json::Value::Null, Vec::new()), |login| {
+            confine_close(login, guards.as_ref(), &root, writers.is_ok())
+        });
     drop(run);
     let mut key_evidence = None;
     let mut key_failure = None;
@@ -913,7 +1549,7 @@ fn staged(
                             format!("~/{} changed", first.relative),
                         ));
                     }
-                    entries.push(json!({ "file": format!("~/{}", first.relative), "changed": changed, "shared": shared, "recorded_only": recorded, "names_run": names_run }));
+                    entries.push(json!({ "file": format!("~/{}", first.relative), "changed": changed, "size_changed": first.bytes != second.bytes, "modified_changed": first.modified_ns != second.modified_ns, "shared": shared, "recorded_only": recorded, "names_run": names_run }));
                 }
                 let item_after = login
                     .account
@@ -1041,6 +1677,7 @@ fn staged(
     // directories could not be read whole afterwards, the agent rewrote a file it had there, or a
     // file of the person's that must not change did.
     let mut stop = watched_stop;
+    stop.extend(confinement_stop);
     if let Some(what) = &guard_change {
         stop.push((
             "guarded_file_changed",
@@ -1145,6 +1782,9 @@ fn staged(
                 if let Some(keys) = &key_evidence {
                     evidence.insert("key".to_owned(), keys.clone());
                 }
+                if !confinement_evidence.is_null() {
+                    evidence.insert("confinement".to_owned(), confinement_evidence.clone());
+                }
                 if !stop.is_empty() {
                     evidence.insert("stop_agent".to_owned(), json!(true));
                 }
@@ -1203,6 +1843,9 @@ fn staged(
         }
         if let Some(keys) = &key_evidence {
             evidence.insert("key".to_owned(), keys.clone());
+        }
+        if !confinement_evidence.is_null() {
+            evidence.insert("confinement".to_owned(), confinement_evidence.clone());
         }
     }
     if !stop.is_empty() {
@@ -1294,12 +1937,33 @@ fn person_home_report(
             })
             .collect()
     };
+    // The files a confined agent keeps up itself, and the login it refreshes, are reported and
+    // never stop it; every other rewrite of a file it had does.
+    let upkeep = |path: &Path| {
+        login
+            .account
+            .confinement
+            .as_ref()
+            .is_some_and(|confinement| {
+                let data = login.person_home.join(&confinement.data);
+                confinement
+                    .reported
+                    .iter()
+                    .any(|reported| path.starts_with(data.join(reported)))
+                    || login.setup.as_ref().is_some_and(|setup| {
+                        path == data
+                            .join("credentials")
+                            .join(format!("{}.json", setup.slot))
+                    })
+            })
+    };
     let rewrites = before.count_paths_by_root(
         found
             .rewritten
             .iter()
             .chain(&found.changed_uncompared)
-            .map(PathBuf::as_path),
+            .map(PathBuf::as_path)
+            .filter(|path| !upkeep(path)),
     );
     (
         json!({
@@ -1346,6 +2010,9 @@ fn run_part(
     guards: Option<&Guards>,
     body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
 ) -> Outcome {
+    if let Some(login) = login {
+        confine_prepare(login, run);
+    }
     // Before anything starts in the run's home: a keychain of its own, its default there, or, for
     // an agent whose login is a keychain item, the person's login keychain, borrowed.
     let keychain = match login {
@@ -1567,7 +2234,7 @@ fn start_agent_as(
         let processes = launch(
             stage.run,
             &session,
-            (&words.join(" "), &server.ready),
+            (&words.join(" "), &server.ready, &stage.build.command),
             stage.provenance,
             &Expected::pinned(stage.build),
             &|| guards_hold(stage),
@@ -1594,15 +2261,41 @@ fn start_agent_as(
         what,
         context_of(stage),
     );
-    let mut line = stage.build.command_line(port);
-    for word in extra {
-        line.push(' ');
-        line.push_str(&quote(word));
-    }
+    let confined = stage
+        .login
+        .and_then(|login| login.account.confinement.as_ref());
+    let line = if let Some(confinement) = confined {
+        // The system's sandbox program applies the profile and executes the agent in the same
+        // process: the run's proxy is the only way out, and the agent is the shell's own child.
+        let mut arguments: Vec<String> = stage
+            .build
+            .arguments
+            .iter()
+            .map(|argument| argument.replace("{port}", &port.to_string()))
+            .collect();
+        arguments.extend(extra.iter().cloned());
+        confine::sandbox_words(
+            &confinement.profile,
+            &layout_of(stage),
+            &stage.build.command,
+            &arguments,
+        )
+        .iter()
+        .map(|word| quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+    } else {
+        let mut line = stage.build.command_line(port);
+        for word in extra {
+            line.push(' ');
+            line.push_str(&quote(word));
+        }
+        line
+    };
     let processes = launch(
         stage.run,
         &session,
-        (&line, ready),
+        (&line, ready, &stage.build.command),
         stage.provenance,
         &Expected::pinned(stage.build),
         &|| guards_hold(stage),
@@ -1775,7 +2468,7 @@ fn prepare_login(stage: &Stage<'_, '_>) -> (Installation, Variables, Variables) 
         .filter(|(name, _)| !PROXY_VARIABLES.contains(&name.as_str()))
         .cloned()
         .collect();
-    if login.account.home == AccountHome::Person {
+    if login.account.home == AccountHome::Person && login.account.confinement.is_none() {
         for (name, value) in &mut variables {
             if name == "HOME" {
                 *value = login.person_home.display().to_string();
@@ -1793,6 +2486,17 @@ fn prepare_login(stage: &Stage<'_, '_>) -> (Installation, Variables, Variables) 
     for (name, value) in &login.account.variables {
         variables.retain(|(existing, _)| existing != name);
         variables.push((name.clone(), value.clone()));
+    }
+    // A confined agent keeps the run's own home, gets the person's data directory by its variable,
+    // and reaches the network through the run's proxy alone.
+    if let (Some(confinement), Some(proxy)) = (&login.account.confinement, &login.proxy) {
+        let data = login.person_home.join(&confinement.data);
+        variables.retain(|(existing, _)| existing != &confinement.variable);
+        variables.push((confinement.variable.clone(), data.display().to_string()));
+        for name in &confinement.proxy_variables {
+            variables.retain(|(existing, _)| existing != name);
+            variables.push((name.clone(), proxy.url()));
+        }
     }
     if let Some(config) = &login.account.config_directory {
         let directory = stage.run.root().join(CONFIG_DIRECTORY);
@@ -1838,9 +2542,16 @@ fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<Pat
             AccountHome::Person => login.person_home.clone(),
         }
     };
+    // Where a confined agent files a folder's conversations is named by the folder.
+    let bucket = login.account.confinement.is_some().then(|| {
+        confine::workdir_key(&std::fs::canonicalize(run.work()).unwrap_or_else(|_| run.work()))
+    });
     with_dates(std::slice::from_ref(&login.account.conversations), dates)
         .iter()
-        .map(|relative| base.join(relative))
+        .map(|relative| match &bucket {
+            Some(bucket) => base.join(relative.replace("{bucket}", bucket)),
+            None => base.join(relative),
+        })
         .collect()
 }
 
@@ -1911,6 +2622,8 @@ fn login_home(stage: &Stage<'_, '_>) -> PathBuf {
     let login = stage.login.expect("a part with a login");
     match login.account.home {
         AccountHome::Run => stage.run.home(),
+        // A confined agent runs with the run's own home, and only keeps its data in the person's.
+        AccountHome::Person if login.account.confinement.is_some() => stage.run.home(),
         AccountHome::Person => login.person_home.clone(),
     }
 }
@@ -1977,6 +2690,7 @@ impl Logged {
                 rows.join("\n")
             );
         }
+        confine_checks(stage, &mut logged);
         guards_hold(stage);
         logged
     }
@@ -2498,6 +3212,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             )
         });
     }
+    confine_holds(stage);
     for path in absent_paths(stage) {
         assert!(
             !path.exists(),
@@ -2703,6 +3418,12 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
         .display()
         .to_string();
     let work = stage.run.work().display().to_string();
+    let person = stage
+        .login
+        .expect("a part with a login")
+        .person_home
+        .display()
+        .to_string();
     // The account name as the system has it, as the agent itself reads it, not the environment's.
     let user = std::process::Command::new("/usr/bin/id")
         .arg("-un")
@@ -2722,6 +3443,7 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
                 path.replace("{config}", &config)
                     .replace("{work}", &work)
                     .replace("{home}", &home)
+                    .replace("{person}", &person)
                     .replace("{user}", &user),
             )
         })
@@ -3644,7 +4366,11 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
         let second_processes = launch(
             stage.run,
             &second_session,
-            (&stage.build.command_line(first.port), &newer.ready),
+            (
+                &stage.build.command_line(first.port),
+                &newer.ready,
+                &stage.build.command,
+            ),
             stage.provenance,
             &Expected::newer(stage.build, &newer),
             &|| {},
@@ -3724,7 +4450,11 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
         let relaunched = launch(
             stage.run,
             &first.session,
-            (&stage.build.command_line(first.port), &newer.ready),
+            (
+                &stage.build.command_line(first.port),
+                &newer.ready,
+                &stage.build.command,
+            ),
             stage.provenance,
             &Expected::newer(stage.build, &newer),
             &|| {},
@@ -4880,6 +5610,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &format!("Stop counting. {steer_question} ({mark}-t)"),
                 "a steering prompt",
             );
+            // Where steering is a second step, the prompt waits, and its key goes once the screen
+            // says it would steer.
+            if let (Some(key), Some(ready)) = (&account.steer_key, &account.steer_ready) {
+                let _ = logged.wait_for(stage, ready, "the prompt waits and can be steered");
+                logged.type_text(stage, key);
+            }
             let after_steer = turn_runs(stage, &mut logged, &conversation, None, &steered_done);
             let steered_conversation = recorded(
                 stage,
@@ -4903,10 +5639,17 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &steered_conversation,
                 &[&steer_sum, &account.reply_line],
             );
+            // A steering prompt is a line of its own kind where the agent writes one.
             let steering_prompt = first_line_with(
                 &steered_conversation,
                 None,
-                &[&format!("{mark}-t"), &account.prompt_line],
+                &[
+                    &format!("{mark}-t"),
+                    account
+                        .steer_line
+                        .as_deref()
+                        .unwrap_or(&account.prompt_line),
+                ],
             );
             let steer = Order {
                 busy_at_submission: before_steer.holds() && after_steer.unfinished,
@@ -5248,7 +5991,15 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         // it.
         let log = stage.run.work().join("a");
         let tag = format!("kr{}", &mark[mark.len() - 6..]);
-        let command = format!("echo {tag} >> {}", log.display());
+        // Where the folder's absolute path does not fit a line of the dialog, the log is named
+        // relative to the folder the agent works in, and the agent's own record of the request must
+        // name that folder before the command is answered.
+        let logs_at = if account.approval.relative_log {
+            "a".to_owned()
+        } else {
+            log.display().to_string()
+        };
+        let command = format!("echo {tag} >> {logs_at}");
         assert!(
             account.approval.command_line.as_deref().unwrap_or("").len() + command.len() + 8
                 <= usize::from(kr_e2e_m1b::window::COLUMNS),
@@ -5275,6 +6026,35 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             refused_before,
             "one resolution: the agent asked for something else before the part's command"
         );
+        if let Some(request_line) = &account.approval.request_line {
+            let conversations = conversation_roots(stage);
+            let found = conversation_of(
+                &conversations,
+                &mark,
+                &account.prompt_line,
+                stage.conversations_before,
+            );
+            let named = found
+                .ok_or_else(|| "the part's conversation is not found".to_owned())
+                .and_then(|conversation| {
+                    let text = std::fs::read_to_string(&conversation)
+                        .map_err(|error| format!("the conversation cannot be read: {error}"))?;
+                    let prompt_at =
+                        first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
+                    kr_e2e_agents::conversation::request_names(
+                        &text,
+                        prompt_at,
+                        request_line,
+                        &command,
+                        &folder_of(stage.run).display().to_string(),
+                    )
+                });
+            if let Err(why) = named {
+                // The dialog is still open: refused, and the part fails on why.
+                logged.type_text(stage, &account.approval.deny);
+                panic!("the request the agent recorded is not the part's command: {why}");
+            }
+        }
         // The race: the local terminal denies and, at once, the device, which holds the lease,
         // allows. The local key is written to its terminal first; the lease decides.
         logged
@@ -5411,7 +6191,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         answered(&local, local.answer_capability_queries(0));
         std::thread::sleep(Duration::from_millis(500));
         let second = format!("{tag}-2");
-        let second_command = format!("echo {second} >> {}", log.display());
+        let second_command = format!("echo {second} >> {logs_at}");
         guards_hold(stage);
         let _ = stage
             .login
@@ -5863,6 +6643,29 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &upper,
             "session B answers from the saved conversation",
         );
+        // Where the resume continues the saved conversation, session B's question is written into
+        // the same conversation session A saved: two executions on one conversation.
+        let b_wrote_into_a = (!account.resume_forks).then(|| {
+            let file = conversation_of(
+                &conversations,
+                &mark,
+                &account.prompt_line,
+                stage.conversations_before,
+            );
+            file.is_some_and(|file| {
+                settled_line(
+                    stage,
+                    &file,
+                    &["What code did I ask you to remember?", &account.prompt_line],
+                );
+                first_line_with(
+                    &file,
+                    None,
+                    &["What code did I ask you to remember?", &account.prompt_line],
+                )
+                .is_some()
+            })
+        });
         // Two executions, each detected on its own, kept apart.
         let detected_first = check_detected(&launched(stage, &first.agent), &shown_first);
         let detected_second = check_detected(&launched(stage, &second.agent), &shown_second);
@@ -5928,7 +6731,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             "account": account_evidence(stage, first.turns + second.turns),
             "conversation": conversation,
             "session_a": { "detection": shown_first.detection.evidence(), "detected": detected_evidence(&detected_first), "owners": owners(&first) },
-            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume, "same_conversation": !account.resume_forks },
+            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume, "same_conversation": !account.resume_forks, "wrote_into_a_conversation": b_wrote_into_a },
             "control": { "what": "session B's marker typed into session A", "breaks_property": true, "isolated": control },
         });
         // Where the agent forks a saved conversation for a second process, the part shows two
@@ -5955,6 +6758,13 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
                     .as_ref()
                     .map_or_else(ToString::to_string, |_| "detected".to_owned())
             ));
+        }
+        if b_wrote_into_a == Some(false) {
+            failures.push(
+                "session B's question is not in the conversation session A saved, so the resume \
+                 did not continue it"
+                    .to_owned(),
+            );
         }
         if account.resume_forks {
             failures.push(

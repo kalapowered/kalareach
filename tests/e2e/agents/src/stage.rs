@@ -818,7 +818,9 @@ pub struct AgentProcess {
 /// first screen, the image every process beneath the shell maps is recorded and checked, and the
 /// launch must have run `expected` in the way its build list names ([`Provenance`]). `between` is
 /// called just before the command is typed and every few tens of milliseconds while the agent is
-/// awaited, for what the part checks.
+/// awaited, for what the part checks. `command` is the program the shell must find first in the run's
+/// link to the build: the line's first word, or, where a wrapper the system provides starts it (the
+/// sandbox program), the program the wrapper starts.
 ///
 /// # Panics
 ///
@@ -830,7 +832,7 @@ pub struct AgentProcess {
 pub fn launch(
     run: &Run,
     session: &Session,
-    (line, ready): (&str, &str),
+    (line, ready, command): (&str, &str, &str),
     provenance: &Provenance,
     expected: &Expected,
     between: &dyn Fn(),
@@ -843,7 +845,6 @@ pub fn launch(
             .any(|row| row.contains(ready)),
         "the screen already shows {ready:?} before `{line}` is typed"
     );
-    let command = line.split_whitespace().next().expect("a command");
     provenance
         .check_path(command)
         .unwrap_or_else(|why| panic!("{why}"));
