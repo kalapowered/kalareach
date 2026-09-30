@@ -28,6 +28,12 @@
 //!   idle callback.
 //! * **Outside a registered root editor nothing waits.** An application does not have a reader
 //!   bridge, so no end-of-file candidate queue delays a Ctrl-D inside one.
+//! * **A host answer to the application can change what the reader sees.** It is queued for the
+//!   terminal without a lease and is never held, so it can arrive after the reader proved its
+//!   queues clear. One that arrives while an exchange is in flight withholds the fence, one that
+//!   arrives after publication invalidates it, and a launch reserved on it is revoked as queued
+//!   prior input. The reader's next idle callback asks again, and its own snapshot then accounts
+//!   for the bytes.
 //! * **An interrupt bypasses the hold.** It needs the current epoch and accepts only the configured
 //!   native interrupt action; there is no variant of it that carries command bytes.
 //! * **A failed fence never restarts the shell.** There is no action in this vocabulary that
@@ -226,6 +232,8 @@ pub enum Stimulus {
     ReaderIdled(ReaderIdled),
     /// Input arrived from a client.
     InputArrived(InputArrived),
+    /// The host queued its own answer to the application.
+    HostReplyQueued(HostReplyQueued),
     /// A client asked for an interrupt.
     InterruptRequested(InterruptRequested),
     /// An attachment was removed, by `kr detach` with an identifier or by losing its connection.
@@ -244,6 +252,17 @@ pub enum Stimulus {
     IntegrationLost(IntegrationLoss),
     /// The session began closing.
     SessionClosing,
+}
+
+/// The host queued its own answer to the application, for the terminal's input.
+///
+/// A worker-generated reply is not a person's input: it holds no lease and is never held behind an
+/// exchange, so the machine is told about it rather than asked what to do with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReplyQueued {
+    /// How many bytes it is.
+    pub bytes: U64,
 }
 
 /// Why input was discarded.
@@ -270,6 +289,9 @@ pub enum FenceInvalidation {
     EditorLeft,
     /// The input lease changed.
     LeaseChanged,
+    /// The host's own answer to the application reached the terminal's input after the reader
+    /// proved its queues clear.
+    HostReply,
     /// The reader this fence proved something about was replaced.
     ReaderMoved,
     /// A detach was accepted.
@@ -792,6 +814,10 @@ struct Exchange {
     epoch: InputLeaseEpoch,
     prompt_generation: PromptGeneration,
     reader_revision: ReaderRevision,
+    /// Whether the host queued an answer for the terminal after the exchange began. The reader
+    /// took its snapshot at a moment the worker cannot place against those bytes, so the
+    /// acknowledgement proves nothing about them.
+    reached: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -949,6 +975,7 @@ impl FenceMachine {
             }
             Stimulus::ReaderIdled(idled) => self.reader_idled(at, idled, &mut actions),
             Stimulus::InputArrived(arrival) => self.input_arrived(arrival, &mut actions),
+            Stimulus::HostReplyQueued(reply) => self.host_reply_queued(reply, &mut actions),
             Stimulus::InterruptRequested(request) => {
                 self.interrupt_requested(request, &mut actions)
             }
@@ -1134,8 +1161,10 @@ impl FenceMachine {
             self.withhold(WithheldReason::ReaderMoved, actions);
             return;
         }
-        if !ack.queues.all_drained() || !ack.snapshot.is_drained() {
-            // A retry never discards the mixed queues; it waits for them to drain.
+        if !ack.queues.all_drained() || !ack.snapshot.is_drained() || exchange.reached {
+            // A retry never discards the mixed queues; it waits for them to drain. A host answer
+            // queued since the exchange began is one the reader's snapshot cannot be placed
+            // against, so the next exchange's snapshot is what accounts for it.
             self.withhold(WithheldReason::QueuesNotDrained, actions);
             return;
         }
@@ -1273,6 +1302,26 @@ impl FenceMachine {
             return;
         }
         actions.push(Action::Forward(arrival.input.clone()));
+    }
+
+    fn host_reply_queued(&mut self, reply: &HostReplyQueued, actions: &mut Vec<Action>) {
+        // Outside a registered root editor an application is reading the terminal, and the answer
+        // is what it asked for. Nothing here has a proof to lose.
+        if self.editor.is_none() || self.state == FenceState::Closing || reply.bytes.get() == 0 {
+            return;
+        }
+        if let Some(exchange) = self.exchange.as_mut() {
+            exchange.reached = true;
+        }
+        // A launch reserved on the fence has the reader's mailbox to decide it, and the reader's
+        // queue now holds bytes the launch was not reserved against.
+        self.cancel_launch(LaunchRejectionReason::QueuedPriorInput, actions);
+        if self.fence.is_some() {
+            self.invalidate_fence(FenceInvalidation::HostReply, actions);
+        }
+        if self.state == FenceState::Fenced || self.state == FenceState::LaunchReserved {
+            self.state = FenceState::Unfenced;
+        }
     }
 
     fn interrupt_requested(&mut self, request: &InterruptRequested, actions: &mut Vec<Action>) {
@@ -1836,6 +1885,7 @@ impl FenceMachine {
             epoch: self.lease.epoch,
             prompt_generation: editor.prompt_generation,
             reader_revision: editor.reader_revision,
+            reached: false,
         });
         actions.push(Action::AskFence(params));
     }

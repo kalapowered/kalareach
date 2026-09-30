@@ -422,6 +422,9 @@ pub struct Session {
     /// counter is shared with the writer and comes down as each batch is written.
     /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
     queued_input_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many answers the writer has dropped because their lane deadline passed while they
+    /// waited for the terminal.
+    dropped_replies: Arc<std::sync::atomic::AtomicU64>,
     /// The part of that which belongs to the **current** lease, and which a lease change discards.
     ///
     /// What is left is the response lane's share, so the two bounds section 8 and section 9 name
@@ -685,6 +688,7 @@ impl Session {
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dropped_replies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             input_gate: Arc::new(std::sync::Mutex::new(())),
             terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3023,7 +3027,7 @@ impl Session {
     /// The response lane bounds what it holds; this bounds what has left the lane and is waiting
     /// for an application that has stopped reading its input. One that asks questions and never
     /// reads the answers stops being answered here rather than growing this queue without limit.
-    fn queue_replies(&mut self, replies: Vec<Vec<u8>>) {
+    fn queue_replies(&mut self, replies: Vec<crate::projection::LaneReply>) {
         for reply in replies {
             let queued = self
                 .queued_input_bytes
@@ -3035,12 +3039,24 @@ impl Session {
             // editor's machine is holding counts towards the second, because it is accepted input
             // on its way to the same terminal.
             let outstanding = queued.saturating_add(self.held_input_bytes);
-            if held.saturating_add(reply.len()) > MAX_PENDING_REPLY_BYTES
-                || outstanding.saturating_add(reply.len()) > MAX_QUEUED_INPUT_BYTES
+            if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
+                || outstanding.saturating_add(reply.bytes.len()) > MAX_QUEUED_INPUT_BYTES
             {
                 return;
             }
-            self.queue_input(InputBatch::Reply { bytes: reply });
+            let length = reply.bytes.len() as u64;
+            self.queue_input(InputBatch::Reply {
+                bytes: reply.bytes,
+                expires_at_ms: reply.expires_at_ms,
+            });
+            // The root editor's machine hears of it, in the order the terminal will: the answer is
+            // queued first, so anything the machine publishes because of it goes behind the bytes
+            // it is about. Every byte the host puts into the terminal is accounted, not only a
+            // person's.
+            if let Some(driver) = self.fence.as_mut() {
+                let effects = driver.host_reply_queued(length);
+                self.apply_fence_effects(effects);
+            }
         }
     }
 
@@ -3056,6 +3072,20 @@ impl Session {
             self.queued_lease_bytes.add(epoch, batch.len());
         }
         self.pending_input.push_back(Queued::Batch(batch));
+    }
+
+    /// Returns the counter the writer adds to for each answer it drops.
+    #[must_use]
+    pub fn dropped_replies(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.dropped_replies)
+    }
+
+    /// Returns how many answers the writer has dropped, because the response lane's deadline for
+    /// each passed while it waited for a terminal that would not take it.
+    #[must_use]
+    pub fn replies_dropped(&self) -> u64 {
+        self.dropped_replies
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the counter the writer releases as the application takes its input.
@@ -4684,6 +4714,15 @@ pub enum InputBatch {
     Reply {
         /// The bytes of the answer.
         bytes: Vec<u8>,
+        /// When the response lane stops thinking this answer worth writing, on the lane's own
+        /// clock (`kr_ipc::now_ms`), or nothing when the lane set no deadline.
+        ///
+        /// It travels with the bytes because the writer is the last boundary before the
+        /// application, and an answer can wait there behind an application that has stopped
+        /// reading its input. The lane drops an answer that has waited too long in the lane; this
+        /// is the same rule for the time it waits in the queue for the terminal, and an answer the
+        /// application asked for and then stopped waiting for is worse written than not.
+        expires_at_ms: Option<u64>,
     },
     /// A lease has changed, with nothing queued behind it.
     ///
@@ -4698,7 +4737,7 @@ impl InputBatch {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Lease { bytes, .. } | Self::Reply { bytes } => bytes.len(),
+            Self::Lease { bytes, .. } | Self::Reply { bytes, .. } => bytes.len(),
             Self::LeaseChanged => 0,
         }
     }

@@ -576,6 +576,7 @@ impl SessionRuntime {
         // cannot be taken while a write of its own is part way through.
         let gate = session.input_gate();
         let queued_input = session.queued_input_bytes();
+        let dropped_replies = session.dropped_replies();
         let queued_lease = session.queued_lease_bytes();
         let delivered_paste_open = session.delivered_paste_open();
         let lease_change_queued = session.lease_change_queued();
@@ -694,6 +695,7 @@ impl SessionRuntime {
         let writer_fence = Arc::clone(&fence);
         let writer_gate = Arc::clone(&gate);
         let writer_queued = Arc::clone(&queued_input);
+        let writer_dropped_replies = Arc::clone(&dropped_replies);
         let writer_lease = Arc::clone(&queued_lease);
         let writer_paste_open = Arc::clone(&delivered_paste_open);
         let writer_lease_change = Arc::clone(&lease_change_queued);
@@ -746,15 +748,30 @@ impl SessionRuntime {
                         paste.clone(),
                         *authority_deadline_boot_ms,
                     ),
-                    InputBatch::Reply { bytes } => (
-                        None,
-                        bytes.as_slice(),
-                        PasteTransition::default(),
-                        // The host's own answer to a question the application asked belongs to the
-                        // application, not to any caller's grant, so no grant's expiry withholds
-                        // it.
-                        None,
-                    ),
+                    InputBatch::Reply {
+                        bytes,
+                        expires_at_ms,
+                    } => {
+                        // An answer whose lane deadline passed while it waited for the terminal is
+                        // dropped before its first byte reaches the application. The application
+                        // asked and has stopped waiting, and the answer would arrive as input it
+                        // never asked for. It is never dropped once it has started: half an answer
+                        // is worse than either.
+                        if expires_at_ms.is_some_and(|expires| kr_ipc::now_ms().get() > expires) {
+                            release(&writer_queued, bytes.len());
+                            writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
+                            continue;
+                        }
+                        (
+                            None,
+                            bytes.as_slice(),
+                            PasteTransition::default(),
+                            // The host's own answer to a question the application asked belongs to
+                            // the application, not to any caller's grant, so no grant's expiry
+                            // withholds it.
+                            None,
+                        )
+                    }
                     InputBatch::LeaseChanged => continue,
                 };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
@@ -1914,5 +1931,119 @@ mod tests {
         assert_eq!(delivery, Delivery::Gone);
         assert_eq!(delivered, 0);
         assert_eq!(written, 0);
+    }
+
+    /// A session of a program that echoes what it is given, on the internal disk.
+    fn echoing_runtime() -> (
+        kr_ipc::testing::TempHost,
+        std::sync::Arc<super::SessionRuntime>,
+    ) {
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{SessionEpoch, SessionId};
+        use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+
+        let host = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let config = crate::session::SessionConfig {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: DisplayNumber::new(1),
+            shell: crate::testing::posix_script("exec cat"),
+            shell_mode: ShellMode::NativeCompat,
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            dimensions: Dimensions::new(80, 24),
+            journal_path: Some(host.environment().journal_database(session_id)),
+            spool_directory: Some(host.environment().session_spool(session_id)),
+            worker_endpoint: None,
+            send_queue_bytes: 8 * 1024 * 1024,
+            resident_bytes: 1024 * 1024,
+            time: crate::action::time::TimeSources::system(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+        };
+        let mut session = crate::session::Session::open(config).expect("opens the session");
+        session.launch().expect("launches the program");
+        let runtime = super::SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime");
+        (host, std::sync::Arc::new(runtime))
+    }
+
+    /// Reads everything the session has retained from the terminal.
+    fn retained_output(runtime: &super::SessionRuntime) -> Vec<u8> {
+        let session = runtime.session();
+        let mut seen = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            let page = session
+                .history_page(cursor, 1024 * 1024)
+                .expect("reads the retained output");
+            if page.bytes.as_slice().is_empty() {
+                return seen;
+            }
+            seen.extend_from_slice(page.bytes.as_slice());
+            cursor = page.next_cursor.get();
+        }
+    }
+
+    /// KR-REQ-08.49: an answer whose lane deadline passed while it waited for the terminal is dropped
+    /// by the writer and never written, and one still within its deadline is.
+    ///
+    /// The deadlines are the lane's own clock's reading and a fixed distance either side of it, so
+    /// nothing here is decided by how long anything took: the answer that is past its deadline is
+    /// queued first, and the program echoes what it is given in order, so once the second answer
+    /// has come back the first has either been written or been dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_that_outwaited_its_lane_deadline_is_dropped_and_one_within_it_is_written() {
+        use crate::session::InputBatch;
+
+        let (_host, runtime) = echoing_runtime();
+        let now = kr_ipc::now_ms().get();
+        runtime
+            .input
+            .send(InputBatch::Reply {
+                bytes: b"kr-late\n".to_vec(),
+                expires_at_ms: Some(now.saturating_sub(1)),
+            })
+            .expect("the writer is taking input");
+        runtime
+            .input
+            .send(InputBatch::Reply {
+                bytes: b"kr-early\n".to_vec(),
+                expires_at_ms: Some(now + 60_000),
+            })
+            .expect("the writer is taking input");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !retained_output(&runtime)
+                .windows(b"kr-early".len())
+                .any(|window| window == b"kr-early")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the answer within its deadline reached the terminal");
+        let seen = retained_output(&runtime);
+        assert!(
+            !seen
+                .windows(b"kr-late".len())
+                .any(|window| window == b"kr-late"),
+            "an answer past its deadline was written: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            runtime.session().replies_dropped(),
+            1,
+            "and the writer says it dropped exactly that one"
+        );
+        runtime
+            .close(kr_protocol::session::ClosureReason::CloseRequested)
+            .1
+            .release();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(30), runtime.wait_closed()).await;
     }
 }

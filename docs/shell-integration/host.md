@@ -117,6 +117,17 @@ between the two would let another writer put a batch in front of one the machine
 grouping the actions by kind would tell the bridge a detach had happened before the attachment was
 gone, or interrupt an application before the launch that interrupt revoked had been called off.
 
+The driver tells the machine of every byte the host puts into the terminal, not only a person's. The
+host's own answer to a question the application asked holds no lease and is never held behind an
+exchange, so it can reach the reader after the reader proved its queues clear. The driver reports it
+as a `host_reply_queued` stimulus when the answer is queued, ahead of anything the machine publishes
+because of it. An answer that arrives while an exchange is in flight withholds the fence that
+exchange would have published, one that arrives after publication invalidates the fence, and a
+launch reserved on the fence is revoked as queued prior input. The reader's next idle callback asks
+again, and its own snapshot is what accounts for the bytes. The writer drops an answer whose response
+lane deadline passed while it waited for a terminal that would not take it, before its first byte and
+never part way through.
+
 | Action | What the worker does |
 | --- | --- |
 | `ask_fence`, `send_launch`, `cancel_native_operations` | One request on the bridge, which the reader thread answers |

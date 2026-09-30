@@ -65,6 +65,29 @@ pub const MAX_RETAINED_TAIL: usize = 1024 * 1024;
 /// turn into in one write, so a burst of queries cannot become one enormous write.
 pub const MAX_REPLY_BYTES: usize = 4 * 1024;
 
+/// One answer the response lane released for the application's input.
+///
+/// It carries the moment the lane stops thinking the answer worth writing, because the lane's
+/// deadline is measured from when the answer was offered and the answer can wait a long time after
+/// that in the queue for the terminal, behind an application that has stopped reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneReply {
+    /// The bytes of the answer.
+    pub bytes: Vec<u8>,
+    /// When the lane stops thinking the answer worth writing, on the lane's own clock, in
+    /// milliseconds. Nothing when the lane set no deadline.
+    pub expires_at_ms: Option<u64>,
+}
+
+impl LaneReply {
+    fn of(reply: &kr_term::lane::Response) -> Self {
+        Self {
+            bytes: reply.bytes().to_vec(),
+            expires_at_ms: (reply.expires_at_ms() != 0).then_some(reply.expires_at_ms()),
+        }
+    }
+}
+
 /// What one batch of raw output became.
 #[derive(Clone, Debug, Default)]
 pub struct Filtered {
@@ -78,7 +101,7 @@ pub struct Filtered {
     /// the application caused them.
     pub effects: Vec<crate::output::OwedEffect>,
     /// What the host owes the application, to be written into its terminal input.
-    pub replies: Vec<Vec<u8>>,
+    pub replies: Vec<LaneReply>,
     /// Where the stream stopped being something a direct attachment can take unchanged.
     pub projection_required_at: Option<u64>,
     /// Whether the projection generation advanced, which invalidates every client's screen.
@@ -424,13 +447,13 @@ impl TerminalEngine {
     ///
     /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the
     /// moment one of those closes is a moment to look again. Nothing else in the engine changes.
-    pub fn drain_replies(&mut self, gate: LaneGate) -> Vec<Vec<u8>> {
+    pub fn drain_replies(&mut self, gate: LaneGate) -> Vec<LaneReply> {
         let now_ms = self.now_ms();
         self.engine
             .lane_mut()
             .drain(gate, MAX_REPLY_BYTES, now_ms)
-            .into_iter()
-            .map(|reply| reply.bytes().to_vec())
+            .iter()
+            .map(LaneReply::of)
             .collect()
     }
 
@@ -908,7 +931,7 @@ impl TerminalEngine {
             }
         }
         for reply in self.engine.lane_mut().drain(gate, MAX_REPLY_BYTES, now_ms) {
-            filtered.replies.push(reply.bytes().to_vec());
+            filtered.replies.push(LaneReply::of(&reply));
         }
         filtered
     }
@@ -993,7 +1016,11 @@ mod tests {
             "no attached terminal is asked the question"
         );
         assert_eq!(
-            filtered.replies,
+            filtered
+                .replies
+                .iter()
+                .map(|reply| reply.bytes.clone())
+                .collect::<Vec<_>>(),
             vec![b"\x1b[?62;22c".to_vec()],
             "the host answers it once, into the application's own input"
         );
