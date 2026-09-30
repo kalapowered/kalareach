@@ -140,7 +140,8 @@ if ($Mode -eq 'hello') {
 
 if (-not (Wait-KrHandshake)) { Stop-WithReason 'no handshake reply was read' }
 # The hint is written last so a reader of this file can anchor on the whole of it.
-Write-Report ("accepted gesture_byte={0} hint={1}" -f $script:Kr.GestureByte, $script:Kr.Hint)
+Write-Report ("accepted gesture_byte={0} gesture_chord={1} gesture_disabled={2} hint={3}" -f
+    $script:Kr.GestureByte, $script:Kr.GestureChord, $script:Kr.GestureDisabled, $script:Kr.Hint)
 
 $script:Kr.Registered = $true
 $script:Kr.Managed = $true
