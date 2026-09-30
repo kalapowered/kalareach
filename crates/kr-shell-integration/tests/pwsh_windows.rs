@@ -59,6 +59,19 @@ const UPSTREAM_VERSION: &str = "7.4";
 /// the client already held would not establish.
 const WORKER_EOF_BYTE: u64 = 26;
 
+/// The gesture this worker answers a terminal-byte session with.
+fn worker_eof_byte() -> EofGesture {
+    EofGesture::TerminalEof {
+        byte: kr_protocol::scalars::U64::new(WORKER_EOF_BYTE),
+    }
+}
+
+/// The chord this worker configures for a session whose gesture is one.
+///
+/// Not the module's own default of `Ctrl+d`, so a client that reports it back read it off the
+/// worker's accept rather than out of what it already held.
+const WORKER_CHORD: &str = "Ctrl+k";
+
 /// How long the client is given to reach the listener.
 ///
 /// Bounded, because the failure worth reporting is the client's: an unbounded `accept()` turns a
@@ -240,6 +253,7 @@ async fn register(
     reader: &mut BridgeReader,
     writer: &mut BridgeWriter,
     peer: &PeerIdentity,
+    gesture: EofGesture,
 ) -> RequestId {
     let FromBridge::Hello(hello) = within("the hello", reader.recv()).await.expect("a hello")
     else {
@@ -257,9 +271,7 @@ async fn register(
         supported_integration_versions: vec![REFERENCE_INTEGRATION_VERSION.to_owned()],
         launched_package: None,
         already_registered: false,
-        gesture: EofGesture::TerminalEof {
-            byte: kr_protocol::scalars::U64::new(WORKER_EOF_BYTE),
-        },
+        gesture,
     };
     let outcome = admit(
         endpoint.secret(),
@@ -350,7 +362,14 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
     let mut client = start_client(&endpoint, directory.path(), "exchange", &[]);
 
     let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
-    let id = register(&endpoint, &mut reader, &mut writer, &peer).await;
+    let id = register(
+        &endpoint,
+        &mut reader,
+        &mut writer,
+        &peer,
+        worker_eof_byte(),
+    )
+    .await;
     within(
         "the answer to the event",
         writer.send_event_result(id, EventOutcome::Received),
@@ -383,6 +402,54 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
     println!("the endpoint ended with: {error}");
 }
 
+/// KR-REQ-07.73, KR-REQ-07.74
+///
+/// The gesture on Windows is a chord the worker configures, and the accept is where the module
+/// learns it. The worker names a chord that is not the module's default, and the client reports
+/// the chord it applied and no terminal byte or disabled gesture beside it, so it read the chord off
+/// the pipe. The three inputs that scenario offers, each pressed at a live editor, are driven
+/// through a pseudo-terminal on Unix; this proves the configuration reaches the module over the
+/// pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_module_applies_the_chord_the_worker_configures_over_the_hosts_named_pipe() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let session_id = SessionId::new(Uuid::from_bytes([0x73; 16]));
+    let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
+    let mut client = start_client(&endpoint, directory.path(), "exchange", &[]);
+
+    let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
+    let id = register(
+        &endpoint,
+        &mut reader,
+        &mut writer,
+        &peer,
+        EofGesture::Chord {
+            keys: WORKER_CHORD.to_owned(),
+        },
+    )
+    .await;
+    within(
+        "the answer to the event",
+        writer.send_event_result(id, EventOutcome::Received),
+    )
+    .await
+    .expect("answers the event");
+
+    let status = ends(&mut client, || report(directory.path(), "exchange")).await;
+    let observed = report(directory.path(), "exchange");
+    assert!(status.success(), "the client ended {status}:\n{observed}");
+    assert!(
+        observed.contains(&format!(
+            " gesture_chord={WORKER_CHORD} gesture_disabled=False "
+        )),
+        "the client did not apply the chord the worker sent:\n{observed}"
+    );
+    assert!(
+        observed.contains("accepted gesture_byte=4 "),
+        "a chord gesture leaves the terminal byte at its default and nothing is read from it:\n{observed}"
+    );
+}
+
 /// KR-ACC-010, KR-REQ-07.37
 ///
 /// The other direction of the same teardown: the worker drops the pipe while the client is between
@@ -397,7 +464,14 @@ async fn the_client_reports_the_loss_when_the_worker_drops_the_pipe() {
     let mut client = start_client(&endpoint, directory.path(), "closed", &[]);
 
     let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
-    let _id = register(&endpoint, &mut reader, &mut writer, &peer).await;
+    let _id = register(
+        &endpoint,
+        &mut reader,
+        &mut writer,
+        &peer,
+        worker_eof_byte(),
+    )
+    .await;
     drop(reader);
     drop(writer);
 
