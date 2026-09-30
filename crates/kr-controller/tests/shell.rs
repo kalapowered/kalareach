@@ -30,7 +30,7 @@ use kr_shell_integration::host::package::{
     CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
     PackageShell, PackageStartupEntry, ShellPackage, StartupMode,
 };
-use kr_shell_integration::host::startup::{self, Change, HomeLayout};
+use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout};
 use kr_shell_integration::host::terminal::{
     self, Source, TerminalApplication, TerminalUnavailable,
 };
@@ -430,6 +430,8 @@ fn the_environment_is_the_creators_snapshot_filtered_and_then_the_contexts_and_t
 #[test]
 fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     let home = tempfile::tempdir().expect("a directory");
+    let state = tempfile::tempdir().expect("a directory");
+    let record = EntryRecord::in_state_directory(&state.path().join("state"));
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
     install_package(packages.path(), ShellKind::Bash);
@@ -461,7 +463,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
             )
             .expect("the path is text");
             assert_eq!(
-                startup::install(&target.path, &body).expect("installs"),
+                startup::install(&target.path, &body, &record).expect("installs"),
                 Change::Added
             );
         }
@@ -499,7 +501,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     for package in set.packages() {
         for target in layout.targets(package.kind()) {
             assert_eq!(
-                startup::remove(&target.path).expect("removes"),
+                startup::remove(&target.path, &record).expect("removes"),
                 Change::Removed
             );
         }
