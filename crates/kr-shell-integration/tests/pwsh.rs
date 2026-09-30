@@ -267,6 +267,16 @@ fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate() {
     shellpkg::an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(PWSH);
 }
 
+/// The cursor position query the editor asks at every prompt reaches the terminal in pieces on a
+/// loaded machine, and the editor waits for its answer before it reads a key.
+#[test]
+fn the_terminal_answers_a_cursor_query_whichever_way_the_output_is_cut() {
+    shellpkg::a_terminal_query_the_output_splits_across_reads_is_answered_once(
+        b"\x1b[6n",
+        b"\x1b[1;1R",
+    );
+}
+
 /// KR-REQ-01.06
 #[test]
 #[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

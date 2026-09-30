@@ -2476,6 +2476,70 @@ pub fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(kind:
     assert!(phase.lost(lost.loss).closes_session);
 }
 
+/// A writer that keeps what it is given, for a case that reads what the terminal answered.
+struct Recorded(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Recorded {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("the record is not poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A query the editor sends that reaches the terminal in two reads is answered once, and the same
+/// query sent twice is answered twice.
+///
+/// A pseudo-terminal hands over what has arrived, and on a loaded machine that can be the first
+/// bytes of a query and then the rest of it. An editor that asked where the cursor is waits for the
+/// reply before it reads a key, so a query the terminal did not recognise because it came in pieces
+/// left the editor waiting for ever, and the line typed at it was never drawn.
+pub fn a_terminal_query_the_output_splits_across_reads_is_answered_once(
+    whole: &[u8],
+    reply: &[u8],
+) {
+    for cut in 1..whole.len() {
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let terminal = TerminalInput::of(Box::new(Recorded(Arc::clone(&kept))));
+        let mut queries = TerminalQueries::new(Arc::new(AtomicUsize::new(0)));
+        queries.answer(&[b"prompt> ", &whole[..cut]].concat(), &terminal);
+        queries.answer(&[&whole[cut..], b" and more"].concat(), &terminal);
+        assert_eq!(
+            *kept.lock().expect("the record is not poisoned"),
+            reply,
+            "the query {whole:?} cut after {cut} bytes was not answered exactly once"
+        );
+    }
+    // The control: a query that is not cut is answered once, and one that came in a read of its own
+    // after another is answered again.
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let terminal = TerminalInput::of(Box::new(Recorded(Arc::clone(&kept))));
+    let answered_to = Arc::new(AtomicUsize::new(0));
+    let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
+    queries.answer(whole, &terminal);
+    queries.answer(b"nothing asked", &terminal);
+    queries.answer(whole, &terminal);
+    assert_eq!(
+        *kept.lock().expect("the record is not poisoned"),
+        [reply, reply].concat(),
+        "two queries, each in one read, are two answers and text that asks nothing is none"
+    );
+    // Where the last answered cursor query ends is where it ended in the whole of the output.
+    if whole == b"\x1b[6n" {
+        assert_eq!(
+            answered_to.load(Ordering::Acquire),
+            whole.len() + b"nothing asked".len() + whole.len(),
+            "the editor is known to have been answered after everything the terminal showed before it"
+        );
+    }
+}
+
 /// Removes the per-package licence paragraph, which is the one part that differs on purpose.
 fn strip_licence_note(source: &str) -> String {
     source
