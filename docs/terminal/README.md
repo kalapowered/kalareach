@@ -691,6 +691,12 @@ resize, or a buffer switch or full reset that brings a window above the live pag
 screen. The answer to `attachment.viewport` names the revision the report left, and the reset and
 the snapshot of every screen name the revision of the window they are drawn for.
 
+The answer also names the presentation the report left the attachment in and, when that is a
+viewport, the reason: the first condition that keeps the attachment off the session's own stream, in
+the order the summaries list them. It is null for an attachment shown the stream. A report that
+moves an attachment between the two changes the presentation and the reason together, so a view
+shows what its last report produced without asking for the attachment's summary again.
+
 A report that moved the window has its screen queued before its answer is written. One that changed
 the size or the presentation is drawn on the client's next subscription, whose first screen names
 the report's revision or a later one. One that changed nothing names the revision the client already

@@ -5925,6 +5925,7 @@ impl WorkerService {
                     encode(&AttachmentViewportResult {
                         geometry: session.geometry(),
                         presentation: landed.presentation,
+                        presentation_reason: Nullable(landed.presentation_reason),
                         // Where the window actually landed, which is not always where it was
                         // asked to go: a row the session has given up becomes the oldest one it
                         // still holds, and a row inside the live page becomes the live page.
