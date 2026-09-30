@@ -1500,8 +1500,11 @@ async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_rele
     );
     let pid = host.daemons[0].id();
     assert!(
-        message.contains(&format!("(process {pid})")) && message.contains(&format!("kill {pid}")),
-        "the daemon is named, with how to stop it: {said}"
+        message.contains(&format!(
+            "(process {pid}) answers as kr-controller/{}",
+            one.name()
+        )) && message.contains(&format!("kill {pid}")),
+        "the daemon is named, with what it answers as and how to stop it: {said}"
     );
     assert_eq!(host.record()["update"]["state"], "switched");
 }
