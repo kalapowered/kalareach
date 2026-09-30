@@ -748,30 +748,15 @@ impl SessionRuntime {
                         paste.clone(),
                         *authority_deadline_boot_ms,
                     ),
-                    InputBatch::Reply {
-                        bytes,
-                        expires_at_ms,
-                    } => {
-                        // An answer whose lane deadline passed while it waited for the terminal is
-                        // dropped before its first byte reaches the application. The application
-                        // asked and has stopped waiting, and the answer would arrive as input it
-                        // never asked for. It is never dropped once it has started: half an answer
-                        // is worse than either.
-                        if expires_at_ms.is_some_and(|expires| kr_ipc::now_ms().get() > expires) {
-                            release(&writer_queued, bytes.len());
-                            writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
-                            continue;
-                        }
-                        (
-                            None,
-                            bytes.as_slice(),
-                            PasteTransition::default(),
-                            // The host's own answer to a question the application asked belongs to
-                            // the application, not to any caller's grant, so no grant's expiry
-                            // withholds it.
-                            None,
-                        )
-                    }
+                    InputBatch::Reply { bytes, .. } => (
+                        None,
+                        bytes.as_slice(),
+                        PasteTransition::default(),
+                        // The host's own answer to a question the application asked belongs to the
+                        // application, not to any caller's grant, so no grant's expiry withholds
+                        // it. Its own deadline is the response lane's, looked at below.
+                        None,
+                    ),
                     InputBatch::LeaseChanged => continue,
                 };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
@@ -785,6 +770,15 @@ impl SessionRuntime {
                     continue;
                 }
                 let lease_epoch = epoch.unwrap_or_default();
+                // The response lane's deadline for an answer, when this batch is one. It is looked
+                // at before every attempt to write until the first byte has reached the
+                // application, so an answer that waits for room in the terminal is dropped once it
+                // has lapsed, and one that has begun is finished: half an answer is worse than
+                // either.
+                let lane_deadline = match &batch {
+                    InputBatch::Reply { expires_at_ms, .. } => *expires_at_ms,
+                    _ => None,
+                };
                 // A second fence, independent of the lease's. The lease says who may write; this
                 // says how long what they wrote stays admissible. A batch the session accepted a
                 // moment before its caller's grant ran out can wait here, for the terminal and for
@@ -806,7 +800,7 @@ impl SessionRuntime {
                 }
                 // Written in pieces, with the fence looked at before each one, so that a
                 // takeover reaches this writer between pieces rather than behind a whole batch.
-                let mut delivered_so_far = 0_usize;
+                let delivered_so_far = std::cell::Cell::new(0_usize);
                 let (delivered, delivery) = write_batch(
                     &mut Terminal {
                         writer: &mut writer,
@@ -818,6 +812,9 @@ impl SessionRuntime {
                     &mut || {
                         epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire))
                             || expired(writer_clock.as_ref())
+                            || (delivered_so_far.get() == 0
+                                && lane_deadline
+                                    .is_some_and(|deadline| kr_ipc::now_ms().get() > deadline))
                     },
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
@@ -834,8 +831,8 @@ impl SessionRuntime {
                         // would otherwise read framing from before the batch began and report that
                         // no paste was interrupted when one was. The value names the lease, so a
                         // later lease change cannot mistake this paste for its own.
-                        delivered_so_far = delivered_so_far.saturating_add(written);
-                        if let Some(open) = transition.after(delivered_so_far) {
+                        delivered_so_far.set(delivered_so_far.get().saturating_add(written));
+                        if let Some(open) = transition.after(delivered_so_far.get()) {
                             writer_paste_open.store(
                                 if open {
                                     lease_epoch.saturating_add(1)
@@ -870,6 +867,9 @@ impl SessionRuntime {
                     // application has, and a takeover reports the remainder as discarded.
                     let remainder = bytes.len().saturating_sub(delivered);
                     release(&writer_queued, remainder);
+                    if lane_deadline.is_some() && delivered == 0 {
+                        writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
+                    }
                     // The lease's own share comes back only while the lease is still the one that
                     // queued these bytes: a lease change has already taken its count, and the
                     // count names the epoch it belongs to, so this subtracts nothing after one.
