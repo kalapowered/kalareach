@@ -6060,16 +6060,17 @@ async fn output_the_host_has_no_answer_for_leaves_the_fence_standing() {
         session.ingest_output(b"plain output\r\n");
         wired.runtime.flush_locked(&mut session);
     }
-    let session = wired.runtime.session();
-    let driver = session.fence().expect("a driver");
-    assert_eq!(driver.state(), FenceState::Fenced);
-    assert_eq!(
-        driver.fence().map(|held| held.fence_id),
-        Some(fence.fence_id),
-        "nothing was sent to the reader, so nothing it proved is in question"
-    );
-    assert_eq!(driver.host_reply_bytes(), 0);
-    drop(session);
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(driver.state(), FenceState::Fenced);
+        assert_eq!(
+            driver.fence().map(|held| held.fence_id),
+            Some(fence.fence_id),
+            "nothing was sent to the reader, so nothing it proved is in question"
+        );
+        assert_eq!(driver.host_reply_bytes(), 0);
+    }
     wired.close().await;
 }
 
