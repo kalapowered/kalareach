@@ -897,6 +897,8 @@ typedef struct {
 /* Where the package's own modules are, once known: the directory that holds `zsh/zle.so`. */
 static char kr_package_modules[PATH_MAX];
 
+int (*kr_loaded_modules_hook)(kr_loaded_module **out, size_t *count) = NULL;
+
 static void
 kr_scan_not_read(kr_scan *scan, const char *why)
 {
@@ -1357,6 +1359,18 @@ kr_locate_package_modules(void)
 }
 
 static void
+kr_free_loaded(kr_loaded_module *modules, size_t count)
+{
+    size_t i;
+
+    for (i = 0; modules != NULL && i < count; i++) {
+        free(modules[i].name);
+        free(modules[i].path);
+    }
+    free(modules);
+}
+
+static void
 kr_free_reports(kr_module_report *reports, size_t count)
 {
     size_t i;
@@ -1384,13 +1398,17 @@ kr_inspect_modules(kr_module_report **out, size_t *count)
 
     *out = NULL;
     *count = 0;
-    if (!kr_shell_loaded_modules(&loaded, &loaded_count)) {
+    /* A shell that holds no native modules of its own has none to list. */
+    if (kr_loaded_modules_hook == NULL) {
+        return 1;
+    }
+    if (!kr_loaded_modules_hook(&loaded, &loaded_count)) {
         return 0;
     }
     kr_locate_package_modules();
     reports = calloc(loaded_count > 0 ? loaded_count : 1, sizeof(*reports));
     if (reports == NULL) {
-        kr_shell_free_modules(loaded, loaded_count);
+        kr_free_loaded(loaded, loaded_count);
         return 0;
     }
     for (i = 0; i < loaded_count; i++) {
@@ -1413,7 +1431,7 @@ kr_inspect_modules(kr_module_report **out, size_t *count)
             free(report->name);
             free(report->path);
             kr_free_reports(reports, made);
-            kr_shell_free_modules(loaded, loaded_count);
+            kr_free_loaded(loaded, loaded_count);
             return 0;
         }
         kr_utf8_clean(report->name);
@@ -1422,7 +1440,7 @@ kr_inspect_modules(kr_module_report **out, size_t *count)
         memcpy(report->detail, scan.detail, sizeof(report->detail));
         made++;
     }
-    kr_shell_free_modules(loaded, loaded_count);
+    kr_free_loaded(loaded, loaded_count);
     *out = reports;
     *count = made;
     return 1;

@@ -164,6 +164,12 @@ fn activation_report(session: &mut Session) -> Vec<LoadedModule> {
     activated.modules
 }
 
+/// What the shell said when a module the home's startup file loaded was refused, for a failure that
+/// needs to say why.
+fn refusals(setup: &CaseSetup) -> String {
+    std::fs::read_to_string(setup.home.join("module-error")).unwrap_or_default()
+}
+
 fn module<'a>(modules: &'a [LoadedModule], name: &str) -> &'a LoadedModule {
     modules
         .iter()
@@ -185,7 +191,8 @@ fn a_module_built_for_the_packages_editor_binds_and_the_session_may_qualify() {
     assert_eq!(
         setup.recorded_order(),
         ["user-top", "kr-module-loaded", "user-bottom"],
-        "the shell loaded the person's module before the integration went live"
+        "the shell loaded the person's module before the integration went live: {}",
+        refusals(&setup)
     );
     let ours = module(&listed, "kr_user_compatible");
     assert_eq!(ours.imports, ModuleImports::Bound);
@@ -214,7 +221,8 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
     assert_eq!(
         setup.recorded_order(),
         ["user-top", "kr-module-loaded", "user-bottom"],
-        "the module loaded, since the loader binds lazily"
+        "the module loaded, since the loader binds lazily: {}",
+        refusals(&setup)
     );
     assert_eq!(
         module(&listed, "kr_user_newer").imports,
@@ -321,9 +329,10 @@ fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
         .count();
     assert!(
         loaded >= 20,
-        "only {loaded} of {} modules loaded, so the control judged too few: {:?}",
+        "only {loaded} of {} modules loaded, so the control judged too few: {:?} {}",
         names.len(),
-        setup.recorded_order()
+        setup.recorded_order(),
+        refusals(&setup)
     );
     // Each module that loaded is in the report, from the home's own directory, and binds. A
     // control that passed with an empty list would prove nothing.

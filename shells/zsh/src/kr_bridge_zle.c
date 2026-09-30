@@ -422,20 +422,20 @@ kr_setup_symbol(const char *module_name)
     return symbol;
 }
 
-void
-kr_shell_free_modules(kr_loaded_module *modules, size_t count)
+static void
+kr_zle_free_partial(kr_loaded_module *modules, size_t count)
 {
     size_t i;
 
-    for (i = 0; modules != NULL && i < count; i++) {
+    for (i = 0; i < count; i++) {
         free(modules[i].name);
         free(modules[i].path);
     }
     free(modules);
 }
 
-int
-kr_shell_loaded_modules(kr_loaded_module **out, size_t *count)
+static int
+kr_zle_loaded_modules(kr_loaded_module **out, size_t *count)
 {
     kr_loaded_module *list;
     size_t capacity = 0;
@@ -478,7 +478,7 @@ kr_shell_loaded_modules(kr_loaded_module **out, size_t *count)
             list[made].handle = module->u.handle;
             list[made].name = strdup(unmeta(module->node.nam));
             if (list[made].name == NULL) {
-                kr_shell_free_modules(list, made);
+                kr_zle_free_partial(list, made);
                 return 0;
             }
             /* The address of that function says which file the loader took the module from. */
@@ -487,7 +487,7 @@ kr_shell_loaded_modules(kr_loaded_module **out, size_t *count)
                 list[made].header = where.dli_fbase;
                 if (list[made].path == NULL) {
                     free(list[made].name);
-                    kr_shell_free_modules(list, made);
+                    kr_zle_free_partial(list, made);
                     return 0;
                 }
             }
@@ -627,6 +627,8 @@ kr_line_accepted(void)
 void
 kr_zle_setup(void)
 {
+    /* This shell loads native modules of its own, so its bridge lists them when the hooks go live. */
+    kr_loaded_modules_hook = kr_zle_loaded_modules;
     kr_bridge_activate();
     /* Only the registered root shell asks; any other shell of this package pays nothing. */
     if (kr_bridge_registered()) {
@@ -637,6 +639,7 @@ kr_zle_setup(void)
 void
 kr_zle_finish(void)
 {
+    kr_loaded_modules_hook = NULL;
     kr_resolve_hook = NULL;
     kr_bridge_resolution_free(&kr_resolution_now);
 }
