@@ -729,11 +729,18 @@ impl Host {
     }
 
     /// Runs a program with this host's roots and nothing of this test's own environment.
+    /// Runs a program with this host's roots and nothing of this test's own environment, and fails
+    /// the test, ending the program, when it has not ended within five minutes: a program that
+    /// waits for a writer for ever does not hang the suite.
     fn run(&self, program: &Path, arguments: &[&str]) -> Output {
-        self.command(program, arguments)
+        let child = self
+            .command(program, arguments)
             .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|error| panic!("{} did not start: {error}", program.display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("{} did not start: {error}", program.display()));
+        finish_within(child, Duration::from_secs(300))
     }
 
     fn command(&self, program: &Path, arguments: &[&str]) -> Command {
@@ -759,19 +766,6 @@ impl Host {
         let output = self.run(&self.store.stable(Program::Kr), arguments);
         let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
         (output, said)
-    }
-
-    /// Runs a program as `run` does, and fails the test, ending the program, when it has not ended
-    /// within `limit`: a program that waits for a writer for ever does not hang the suite.
-    fn run_within(&self, program: &Path, arguments: &[&str], limit: Duration) -> Output {
-        let child = self
-            .command(program, arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("{} did not start: {error}", program.display()));
-        finish_within(child, limit)
     }
 
     /// Runs `kr host update` of the current release with `archive` and `--json`, with a variable
@@ -1544,7 +1538,7 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     drop(going);
 
-    let output = update.wait_with_output().expect("kr ends");
+    let output = finish_within(update, Duration::from_secs(300));
     let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     assert!(
         output.status.success(),
@@ -2015,7 +2009,7 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
     .expect("takes its environment");
     drop(starting);
 
-    let output = update.wait_with_output().expect("kr ends");
+    let output = finish_within(update, Duration::from_secs(300));
     let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     assert_eq!(
         output.status.code(),
@@ -2182,7 +2176,7 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
         .expect("the daemon begins another attempt");
     drop(starting);
 
-    let output = update.wait_with_output().expect("kr ends");
+    let output = finish_within(update, Duration::from_secs(300));
     let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     assert_eq!(
         output.status.code(),
@@ -2301,7 +2295,7 @@ async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
     .expect("the daemon begins another attempt");
     drop(starting);
 
-    let output = update.wait_with_output().expect("kr ends");
+    let output = finish_within(update, Duration::from_secs(300));
     let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     assert_eq!(
         output.status.code(),
@@ -2476,7 +2470,7 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
     assert_eq!(host.store.current().expect("reads"), None);
 
     drop(starting);
-    let output = install.wait_with_output().expect("kr ends");
+    let output = finish_within(install, Duration::from_secs(300));
     assert!(
         output.status.success(),
         "kr host install: {}",
@@ -2693,11 +2687,7 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
         let program = unpacked.join("bin").join(Program::Kr.file_name());
 
         // A pipe waited for would fail the test at the limit; the run itself takes a moment.
-        let refused = host.run_within(
-            &program,
-            &["host", "install", "--store", &store],
-            Duration::from_secs(300),
-        );
+        let refused = host.run(&program, &["host", "install", "--store", &store]);
         assert_eq!(refused.status.code(), Some(1), "{what}");
         let said = String::from_utf8_lossy(&refused.stderr).into_owned();
         assert!(
