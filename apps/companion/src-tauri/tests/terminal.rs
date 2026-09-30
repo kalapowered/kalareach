@@ -392,13 +392,8 @@ fn refusal_of_a_worker(worker: &str) -> String {
         companion_tauri::connection::build_id()
             .expect("this build's identifier")
             .as_str(),
-        version(kr_protocol::hello::PACKAGE_VERSION),
+        kr_protocol::hello::PACKAGE_VERSION,
     )
-}
-
-/// A protocol package version, as a refusal says it.
-fn version(version: kr_protocol::hello::PackageVersion) -> String {
-    format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
 /// A worker that states a protocol version of another compatibility level is asked for nothing:
@@ -419,7 +414,7 @@ async fn a_worker_of_another_protocol_version_is_never_attached_to() {
         ended["reason"],
         refusal_of_a_worker(&format!(
             "kr-worker/0.1.0 with protocol {}",
-            version(Stated::another_level())
+            Stated::another_level()
         ))
     );
     assert!(
@@ -466,7 +461,7 @@ async fn a_build_identifier_that_is_not_a_name_and_a_release_is_not_repeated() {
         ended["reason"],
         refusal_of_a_worker(&format!(
             "[a build this application does not name] with protocol {}",
-            version(Stated::another_level())
+            Stated::another_level()
         ))
     );
     page.held_becomes(0).await;
