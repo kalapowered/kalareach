@@ -10,8 +10,8 @@ pub struct Report {
     /// The record's format.
     pub probe: &'static str,
     /// What the launcher read about the terminal outside its own answers: the application, its
-    /// version and its configuration, as `key=value` pairs in the order given.
-    pub launcher: Vec<(String, String)>,
+    /// version and its configuration, exactly as the launcher recorded them.
+    pub launcher: serde_json::Value,
     /// The terminal's own answers about itself.
     pub terminal: Identity,
     /// The window the corpus was built for, as `[columns, rows]`.
@@ -56,7 +56,7 @@ impl Report {
     /// Builds the record for a run.
     #[must_use]
     pub fn new(
-        launcher: Vec<(String, String)>,
+        launcher: serde_json::Value,
         terminal: Identity,
         window: (u32, u32),
         steps: Vec<Outcome>,
