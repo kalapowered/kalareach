@@ -1521,6 +1521,65 @@ async fn refused_challenge(
     }
 }
 
+/// A new candidate's proof that it holds the invitation `open`, sent naming `named` instead, and
+/// the host's refusal of it.
+///
+/// The proof is a real one for the invitation the host is offering, so the only thing wrong with
+/// it is the invitation it names: what the host answers is its answer about that one.
+async fn refused_direct_proof(
+    host: &Host,
+    candidate: &Device,
+    open: &PairInviteResult,
+    named: kr_protocol::ids::InvitationId,
+) -> ProtocolError {
+    use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
+
+    let candidate = candidate.candidate();
+    let payload = calls::direct_payload(open);
+    let connection = candidate
+        .endpoint
+        .connect(calls::host_addr(&payload), kr_protocol::hello::ALPN)
+        .await
+        .expect("the candidate reaches the host");
+    let mut unpaired = kr_transport::handshake::connect_unpaired(&connection, candidate.identity)
+        .await
+        .expect("an unpaired connection");
+    let PairRedeemResult::Challenge(challenge) = unpaired
+        .call::<_, PairRedeemResult>(
+            Method::PairRedeem,
+            &PairRedeemParams::Challenge {
+                invitation_id: payload.invitation_id,
+            },
+        )
+        .await
+        .expect("the host issues a challenge for the invitation it offers")
+    else {
+        panic!("the first redemption step answers with a challenge");
+    };
+    let live_host = calls::HostPeer(*challenge.endpoint_id.as_bytes());
+    let (mut proof, _transcript) = kr_pairing::direct::redeem_proof(
+        &payload,
+        &challenge,
+        &candidate.keys.authorisation,
+        &candidate.declared,
+        &live_host,
+    )
+    .expect("a redemption proof");
+    proof.invitation_id = named;
+    let answer = unpaired
+        .call::<_, PairRedeemResult>(
+            Method::PairRedeem,
+            &PairRedeemParams::Direct(Box::new(proof)),
+        )
+        .await;
+    connection.close(0u32.into(), b"refused");
+    let _ = host;
+    match answer {
+        Err(kr_transport::error::TransportError::Refused(error)) => error,
+        other => panic!("the host refuses the proof, not {other:?}"),
+    }
+}
+
 /// KR-ACC-015: a consumed invitation stays consumed across a host restart. A direct invitation
 /// redeemed and committed before the restart is still committed after it, and the device it
 /// paired is still paired; one left open is consumed by the restart itself. A candidate that
@@ -1594,7 +1653,8 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
     for invitation_id in [committed.invitation_id, open.invitation_id] {
         let stranger = Device::create().await;
         let refused = refused_challenge(&host, &stranger, invitation_id).await;
-        assert_ne!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+        // A reused invitation, and one the restart consumed, each return the specific rejection.
+        assert_eq!(refused.code, ErrorCode::PairingRejected, "{refused:?}");
         assert!(
             host.network()
                 .devices()
@@ -1604,7 +1664,13 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
             "a candidate presenting a consumed invitation pairs nothing"
         );
     }
-    calls::invite_direct(
+    // An invitation this host never issued is not one it is offering, and that is all it says: the
+    // specific rejections are for invitations it knows the end of.
+    let never_issued =
+        kr_protocol::ids::InvitationId::new(kr_protocol::scalars::Uuid::from_bytes([0xee; 16]));
+    let refused = refused_challenge(&host, &Device::create().await, never_issued).await;
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    let current = calls::invite_direct(
         environment,
         &mut client,
         InviteGrantKind::SessionInvitation,
@@ -1613,5 +1679,20 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
     )
     .await
     .expect("the restarted host issues a new invitation");
+    // With that one open, an old invitation named by either step is still refused for what became
+    // of it, and one never issued is still only one the host is not offering: the invitation the
+    // host is offering now does not decide what a candidate that names another is told.
+    for invitation_id in [committed.invitation_id, open.invitation_id] {
+        let refused = refused_challenge(&host, &Device::create().await, invitation_id).await;
+        assert_eq!(refused.code, ErrorCode::PairingRejected, "{refused:?}");
+        let refused =
+            refused_direct_proof(&host, &Device::create().await, &current, invitation_id).await;
+        assert_eq!(refused.code, ErrorCode::PairingRejected, "{refused:?}");
+    }
+    let refused = refused_challenge(&host, &Device::create().await, never_issued).await;
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    let refused =
+        refused_direct_proof(&host, &Device::create().await, &current, never_issued).await;
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     host.stop().await;
 }

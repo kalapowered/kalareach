@@ -1541,27 +1541,53 @@ impl PairingHost {
         }
     }
 
+    /// Answers a candidate that names a direct invitation this host is not offering now.
+    ///
+    /// An invitation this host issued and that has ended, whether it was reused, cancelled, denied,
+    /// ran out or was left open by a host that restarted, is refused for what became of it, under
+    /// the code that says so: section 10 asks a specific rejection, and the durable record is what
+    /// still knows after the invitation's own object is gone. An invitation this host never issued
+    /// as a direct one is not one it is offering, and that is all the candidate is told.
+    fn not_on_offer(&self, invitation_id: InvitationId) -> ProtocolError {
+        match self.rows.row(invitation_id) {
+            Ok(Some(row)) if row.terms.mode == InviteModeKind::Direct => {
+                protocol_refusal(ended_as(row.record.state))
+            }
+            Ok(_) => ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this host is not offering that direct invitation",
+            ),
+            Err(_) => ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "this host could not look that invitation up",
+            ),
+        }
+    }
+
     fn redeem(
         &self,
         peer: &ConnectionPeer,
         params: &PairRedeemParams,
     ) -> std::result::Result<PairRedeemResult, ProtocolError> {
         let mut open = self.open();
+        let named = match params {
+            PairRedeemParams::Challenge { invitation_id } => *invitation_id,
+            PairRedeemParams::Direct(proof) => proof.invitation_id,
+        };
         let Some(OpenMode::Direct(invitation)) = open.as_mut().map(|offered| &mut offered.mode)
         else {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host is not offering a direct invitation",
-            ));
+            drop(open);
+            return Err(self.not_on_offer(named));
         };
+        // Whichever step it is, one that names an invitation other than the one on offer is told
+        // about the one it names, and not about the one on offer: that is what the invitation's
+        // own object would otherwise answer as a proof that does not fit it.
+        if named != invitation.invitation_id() {
+            drop(open);
+            return Err(self.not_on_offer(named));
+        }
         match params {
-            PairRedeemParams::Challenge { invitation_id } => {
-                if *invitation_id != invitation.invitation_id() {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "that invitation is not the one this host is offering",
-                    ));
-                }
+            PairRedeemParams::Challenge { .. } => {
                 let challenge = invitation
                     .issue_challenge(peer as &dyn LivePeer)
                     .map_err(protocol_refusal)?;
@@ -1762,9 +1788,12 @@ fn not_offering(invitation_id: InvitationId) -> ControllerError {
     }
 }
 
-/// Says what became of the invitation an action issued, which a retry of that action is told.
-fn no_longer_open(row: &InvitationRow) -> ControllerError {
-    let error = match row.record.state {
+/// What became of an invitation that is no longer on offer, as the error it is reported under.
+///
+/// A record still open or locked with no invitation object behind it was left by a host that
+/// restarted, and is reported as that.
+const fn ended_as(state: InvitationState) -> kr_pairing::PairingError {
+    match state {
         InvitationState::Consumed { reason } => kr_pairing::PairingError::Consumed { reason },
         InvitationState::Committed => kr_pairing::PairingError::AlreadyCommitted,
         InvitationState::Open | InvitationState::Locked { .. } => {
@@ -1772,8 +1801,12 @@ fn no_longer_open(row: &InvitationRow) -> ControllerError {
                 reason: PairingConsumedReason::HostRestarted,
             }
         }
-    };
-    let refused = refusal(error);
+    }
+}
+
+/// Says what became of the invitation an action issued, which a retry of that action is told.
+fn no_longer_open(row: &InvitationRow) -> ControllerError {
+    let refused = refusal(ended_as(row.record.state));
     ControllerError::Refused {
         code: refused.code(),
         detail: format!("the invitation this action issued is no longer open: {refused}"),
@@ -1839,6 +1872,59 @@ mod tests {
                 })
             }
         })
+    }
+
+    /// KR-REQ-10.35: an invitation that is no longer on offer is refused for what became of it,
+    /// under the code section 10 gives that ending: expired for one that ran out, exhausted for one
+    /// that ran out of guesses, and rejected for every other, a reused one and one left unfinished
+    /// by a host that restarted included. None of them is a permission the candidate lacks.
+    #[test]
+    fn an_ended_invitation_is_refused_under_the_code_of_its_ending() {
+        let attempt_id = AttemptId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        for (state, code) in [
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::Expired,
+                },
+                ErrorCode::PairingExpired,
+            ),
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::AttemptsExhausted,
+                },
+                ErrorCode::PairingAttemptsExhausted,
+            ),
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::Cancelled,
+                },
+                ErrorCode::PairingRejected,
+            ),
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::Denied,
+                },
+                ErrorCode::PairingRejected,
+            ),
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::HostRestarted,
+                },
+                ErrorCode::PairingRejected,
+            ),
+            (InvitationState::Committed, ErrorCode::PairingRejected),
+            (InvitationState::Open, ErrorCode::PairingRejected),
+            (
+                InvitationState::Locked { attempt_id },
+                ErrorCode::PairingRejected,
+            ),
+        ] {
+            assert_eq!(
+                protocol_refusal(ended_as(state)).code,
+                code,
+                "an invitation in {state:?}"
+            );
+        }
     }
 
     /// KR-REQ-10.05: a write that failed is reported as a failure even when the admission lapses

@@ -86,6 +86,15 @@ short of a commitment that way: the endpoint a candidate authenticated with live
 restart lost, so a host with no way to tell one authenticated asker from another says nothing
 rather than telling a stranger that somebody's pairing was denied.
 
+A candidate that presents a direct invitation this host is not offering is refused, and the
+refusal's code corresponds to the reason the direct invitation is no longer available
+(`PAIRING_EXPIRED` if the direct invitation timed out, `PAIRING_ATTEMPTS_EXHAUSTED` if it spent its
+guesses, or `PAIRING_REJECTED` for every other ending: the direct invitation was reused, cancelled,
+denied, or cancelled due to a host restart). The store will remember the reason that the direct
+invitation became unavailable even if the direct invitation object itself is no longer available. If
+the candidate provides an identifier this host never issued as a direct invitation, the method will
+complete with the error code `PERMISSION_DENIED`. That is all the candidate is told.
+
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
 normalised full code under a distinct random local key from secure storage, never a transport or
