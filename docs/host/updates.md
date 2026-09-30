@@ -92,9 +92,11 @@ directory and says to remove it and run the command again.
 An install or an update waits for a control daemon that is starting, which holds the install lock
 while it starts, for at most thirty seconds, and an update does so before it stops anything. A
 daemon that takes longer makes the run exit with 9 and name the store, with nothing stopped: every
-control daemon the update had prepared resumes. Every wait of an install or an update has a bound:
-a release's files are read without following a link or waiting for a writer, and a program that
-starts in a release that is being removed or replaced waits for that removal for at most thirty
+control daemon the update had prepared resumes. Every wait of an install or an update on the
+store has a bound: a release's files, and an environment's lock file and registry, are read without
+following a link or waiting for a writer, so a pipe under their names is refused; the system's own
+tool that says its version is given ten seconds, whatever a program it starts does; and a program
+that starts in a release that is being removed or replaced waits for that removal for at most thirty
 seconds.
 
 ## Updating
@@ -121,7 +123,8 @@ Only the current release's `kr` updates the host. An update, in order:
    its attempt is over, holds the update, and is not waited for. Once every daemon has stopped, it
    reads the store's environments again, so an environment whose daemon started after the first
    look is found; holds every environment's lock, where a daemon the update did not stop holds the
-   update; and reads every environment's registry: a worker at a level the new release does not
+   update; and reads every environment's registry, which it does not open where it is not a
+   regular file: a worker at a level the new release does not
    retain, a worker that does not answer its challenge and has not ended, and a session still being
    started each hold the update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started

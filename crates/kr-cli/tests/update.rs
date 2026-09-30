@@ -576,7 +576,7 @@ impl Host {
     /// Runs `kr host update` of the current release with `archive` and `--json`, with a variable
     /// set that no control daemon of a store starts with: every daemon it starts refuses to run.
     fn update_whose_daemons_fail(&self, archive: &str) -> (Output, Value) {
-        let output = self
+        let mut update = self
             .command(
                 &self.store.stable(Program::Kr),
                 &["host", "update", "--archive", archive, "--json"],
@@ -586,8 +586,22 @@ impl Host {
                 self.tree.root(),
             )
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("kr runs");
+        // An update that waits for a writer, or for a daemon, for ever fails the test and does not
+        // hang it: its own waits are bounded by a few minutes at most.
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while matches!(update.try_wait(), Ok(None)) {
+            if Instant::now() >= deadline {
+                let _ = update.kill();
+                let _ = update.wait();
+                panic!("the update did not end within five minutes");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let output = update.wait_with_output().expect("kr ends");
         let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
         (output, said)
     }
@@ -1361,9 +1375,11 @@ async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
 }
 
-/// KR-REQ-26.09: an update that a daemon it never stopped holds waits, and when a daemon it did
-/// stop does not start again from the release still current, the update stays recorded; the next
-/// run starts that daemon before anything else, and then updates the host.
+/// KR-REQ-26.09: when a daemon the update stopped does not start again from the release still
+/// current, the update stays recorded; the next run starts that daemon before anything else, and
+/// then updates the host. What ends this update, after the stop, is a registry that is not a regular
+/// file, which is refused and never opened: a pipe there would hold the update for as long as
+/// nothing wrote to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_for_the_next_run() {
     let mut host = Host::bare();
@@ -1372,17 +1388,19 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     host.install(&one);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
-    // A second environment of the store, held by something that is not listening: it was not
-    // there to be asked to make way, so the update stops nothing of it and is held by it.
+    // A second environment of the store, no daemon of it running, whose registry is a pipe: the
+    // update finds nothing holding it before it stops this host's daemon, and refuses to read it
+    // after.
     let other = kr_ipc::testing::TempHost::create();
     host.store
         .record_roots(other.paths().runtime_root(), other.paths().state_root())
         .expect("records the other environment's roots");
-    let other_lock = kr_controller::singleton::SingletonLock::hold(
-        &other.environment().singleton_lock(),
-        other.environment_id(),
-    )
-    .expect("holds the other environment");
+    let registry = other.environment().registry_database();
+    let made = Command::new("mkfifo")
+        .arg(&registry)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&scratch, &archive);
@@ -1393,8 +1411,7 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
         message.contains(&format!(
-            "the update to {} waits: a control daemon holds environment {}",
-            two.name(),
+            "environment {}'s registry is not a regular file",
             other.environment_id()
         )),
         "{said}"
@@ -1411,9 +1428,9 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     assert_eq!(record["update"]["state"], "handing_over", "{record}");
     assert_eq!(record["staged"], two.name().as_str(), "{record}");
 
-    // The control: once nothing holds the update and the daemon can start, the next run starts it
+    // The control: once the registry is not a pipe and the daemon can start, the next run starts it
     // again from the release that is still current, and then updates the host.
-    drop(other_lock);
+    std::fs::remove_file(&registry).expect("the pipe is removed");
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert!(
         output.status.success(),
