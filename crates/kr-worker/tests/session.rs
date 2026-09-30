@@ -538,6 +538,46 @@ async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     assert!(runtime.session().root_identity().is_some());
 }
 
+/// A shell that ends before it writes what a test waits for fails that wait once its session has
+/// closed, with what the shell wrote, and the test is not left to wait out the liveness bound. A
+/// shell that cannot start, as one the platform refuses to run does, ends this way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_that_ends_before_its_marker_fails_the_wait_with_what_it_wrote() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "printf 'kr-early\\n'; exit 3");
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::start(
+            config,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts a session"),
+    );
+    let waiting = {
+        let runtime = std::sync::Arc::clone(&runtime);
+        tokio::spawn(async move { produced(&runtime, b"kr-never.").await })
+    };
+    // A fraction of the liveness bound: a wait that fails because the shell ended does so as soon
+    // as the closure has, which is nowhere near it.
+    let waited = tokio::time::timeout(LIVENESS_DEADLINE / 4, waiting)
+        .await
+        .expect("the wait ended when the shell's session closed, not at the liveness bound");
+    let failure = waited.expect_err("the wait fails: the marker is never written");
+    let panic = failure.into_panic();
+    let said = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|said| (*said).to_owned()))
+        .expect("the wait failed with a message");
+    assert!(
+        said.contains("closed"),
+        "it says the session closed: {said}"
+    );
+    assert!(
+        said.contains("kr-early"),
+        "and what the shell wrote: {said}"
+    );
+}
+
 /// KR-REQ-07.55: a duplicate close returns the existing state: one asked while the closure runs
 /// joins it rather than starting another, and one asked after it has finished is answered with the
 /// final record.

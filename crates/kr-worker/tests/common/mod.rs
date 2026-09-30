@@ -97,10 +97,32 @@ pub async fn produced_times(runtime: &SessionRuntime, marker: &[u8], count: usiz
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     loop {
+        // Whether the session had closed is read before its output is, so the output a closed
+        // session had is there before it is judged: its closure waits for what the terminal still
+        // held, for as long as its drain period lasts. A shell that writes its marker more than
+        // that after the session closed is judged closed first.
+        let closed = runtime.state() == kr_protocol::session::SessionState::Closed;
         let seen = retained(runtime);
         if carried_times(&seen, marker) >= count {
             return;
         }
+        // A session whose shell has ended writes no more of what is waited for, whether the shell
+        // exited by itself, was closed, or was one the platform would not run. That is a failure
+        // now, with how the session closed and what the shell wrote, and not one the wait's own
+        // bound reports later.
+        assert!(
+            !closed,
+            "the session closed after {:?} before {count} of {} arrived (closure: {}): the retained \
+             output carries {} of them and ends {}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker).escape_debug(),
+            runtime.session().closure().map_or_else(
+                || "none recorded".to_owned(),
+                |record| format!("{:?}, exit {:?}", record.reason, record.root_exit_code)
+            ),
+            carried_times(&seen, marker),
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
         assert!(
             tokio::time::Instant::now() < deadline,
             "waited {:?} for {count} of {} in the session's retained output, which carries {} of \
