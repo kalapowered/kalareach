@@ -2229,6 +2229,77 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
     );
 }
 
+/// KR-REQ-26.09: a release kept in the store whose manifest is a link or a pipe is not trusted and
+/// not read: the install refuses by naming its directory and says what to do, and once the directory
+/// has been removed the install goes through.
+#[test]
+fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    // What is put where the kept release's manifest is, given the manifest's path and a directory
+    // outside the store.
+    type Instead = fn(&Path, &Path);
+    let insteads: [(&str, Instead); 2] = [
+        (
+            "a link to a file with the same bytes",
+            |manifest, outside| {
+                let elsewhere = outside.join("release.json");
+                std::fs::copy(manifest, &elsewhere).expect("copied");
+                std::fs::remove_file(manifest).expect("removed");
+                std::os::unix::fs::symlink(&elsewhere, manifest).expect("linked");
+            },
+        ),
+        ("a pipe", |manifest, _| {
+            std::fs::remove_file(manifest).expect("removed");
+            let made = Command::new("mkfifo")
+                .arg(manifest)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "a pipe is made");
+        }),
+    ];
+    for (what, instead) in insteads {
+        let host = Host::bare();
+        host.store
+            .create_directories()
+            .expect("the store's directories");
+        std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+        let kept = host.store.release_directory(one.name());
+        one.write(&kept);
+        let outside = host.scratch("outside");
+        instead(&host.store.manifest(one.name()), &outside);
+        let store = host.store.root().display().to_string();
+        let unpacked = host.scratch("unpacked").join(one.name().as_str());
+        one.write(&unpacked);
+        let program = unpacked.join("bin").join(Program::Kr.file_name());
+
+        let began = Instant::now();
+        let refused = host.run(&program, &["host", "install", "--store", &store]);
+        assert_eq!(refused.status.code(), Some(1), "{what}");
+        let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert!(
+            said.contains(&kept.display().to_string()) && said.contains("kr host install again"),
+            "{what}: {said}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "{what}: not waited for"
+        );
+        assert_eq!(host.store.current().expect("reads"), None, "{what}");
+
+        // The control: with the directory removed, the install goes through.
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).expect("opens");
+        std::fs::remove_dir_all(&kept).expect("removes");
+        host.install(&one);
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(one.name().clone()),
+            "{what}"
+        );
+    }
+}
+
 /// KR-REQ-26.06: a program of a release still being staged does not start once it is runnable,
 /// where an install copies it and where an update unpacks it; the same tree outside the store
 /// starts.

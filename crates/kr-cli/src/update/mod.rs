@@ -601,11 +601,23 @@ fn replace_kept(
     let Ok(about) = std::fs::symlink_metadata(&directory) else {
         return Ok(());
     };
-    if about.file_type().is_dir() && release::manifest_document(&directory)? != document {
-        return Err(CliError::Other(shown!(
-            "the store already holds a release named {} that is not this one",
-            crate::shown::release(&manifest.release)
-        )));
+    if about.file_type().is_dir() {
+        let kept = release::manifest_document(&directory).map_err(|_| {
+            CliError::Other(shown!(
+                "the store holds a directory for release {} whose manifest is not a file this host \
+                 reads, a link or a pipe among the possible causes: remove {} and run kr host {} \
+                 again",
+                crate::shown::release(&manifest.release),
+                Shown::root(&directory),
+                command
+            ))
+        })?;
+        if kept != document {
+            return Err(CliError::Other(shown!(
+                "the store already holds a release named {} that is not this one",
+                crate::shown::release(&manifest.release)
+            )));
+        }
     }
     let removed = store
         .retire(&manifest.release, update_lock)
