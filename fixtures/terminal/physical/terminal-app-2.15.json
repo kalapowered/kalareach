@@ -25,7 +25,7 @@
       "LANG": "en_US.UTF-8",
       "LC_ALL": null,
       "LC_CTYPE": null,
-      "STY": "46409.s3",
+      "STY": "set",
       "TERM": "xterm-256color",
       "TERMINFO": null,
       "TERMINFO_DIRS": "/Applications/iTerm.app/Contents/Resources/terminfo:/usr/share/terminfo",
@@ -76,6 +76,7 @@
         "col": 10
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -91,6 +92,7 @@
         "col": 81
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -106,6 +108,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -121,6 +124,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -136,6 +140,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -151,6 +156,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -166,6 +172,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -181,6 +188,7 @@
         "col": 30
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -196,6 +204,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -211,6 +220,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -226,6 +236,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -241,6 +252,7 @@
         "col": 6
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -256,6 +268,7 @@
         "col": 6
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -271,6 +284,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -286,6 +300,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -301,6 +316,7 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -316,6 +332,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -331,6 +348,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -346,6 +364,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -361,6 +380,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -376,6 +396,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -391,6 +412,7 @@
         "col": 79
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -406,6 +428,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -421,6 +444,7 @@
         "col": 79
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -436,22 +460,24 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
       "id": "autowrap.pending-survives-erase-line",
       "group": "autowrap",
-      "bytes": "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161611b5b4b",
+      "bytes": "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161611b5b4b62",
       "terminal": {
         "row": 1,
         "col": 80
       },
       "canonical": {
-        "row": 1,
-        "col": 80
+        "row": 2,
+        "col": 2
       },
-      "canonical_pending_wrap": true,
-      "agrees": true
+      "canonical_pending_wrap": false,
+      "barrier": true,
+      "agrees": false
     },
     {
       "id": "autowrap.pending-survives-save-and-restore",
@@ -466,6 +492,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -481,6 +508,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -496,6 +524,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -511,6 +540,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -526,6 +556,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -541,6 +572,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -556,6 +588,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -571,6 +604,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -586,6 +620,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -601,6 +636,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -616,6 +652,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -631,6 +668,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -646,6 +684,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -661,6 +700,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -676,6 +716,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -691,6 +732,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -706,6 +748,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -721,6 +764,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -736,6 +780,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -751,6 +796,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -766,6 +812,7 @@
         "col": 9
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -781,6 +828,7 @@
         "col": 9
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -796,6 +844,7 @@
         "col": 10
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -811,6 +860,7 @@
         "col": 20
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -826,6 +876,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -841,6 +892,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -856,6 +908,7 @@
         "col": 9
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -871,6 +924,7 @@
         "col": 25
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -886,6 +940,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -901,6 +956,7 @@
         "col": 80
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -916,6 +972,7 @@
         "col": 20
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -931,6 +988,7 @@
         "col": 17
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -946,6 +1004,7 @@
         "col": 25
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -961,6 +1020,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -976,6 +1036,7 @@
         "col": 17
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -991,6 +1052,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1006,6 +1068,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1021,6 +1084,7 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1036,6 +1100,7 @@
         "col": 9
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1051,6 +1116,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1066,6 +1132,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1081,6 +1148,7 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1096,6 +1164,7 @@
         "col": 79
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1111,6 +1180,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1126,6 +1196,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1141,6 +1212,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1156,6 +1228,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1171,6 +1244,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1186,6 +1260,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1201,6 +1276,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1216,6 +1292,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1231,6 +1308,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1246,6 +1324,7 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1261,6 +1340,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1276,6 +1356,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1291,6 +1372,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1306,6 +1388,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1321,6 +1404,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1336,6 +1420,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1351,6 +1436,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1366,6 +1452,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1381,6 +1468,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1396,6 +1484,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1411,6 +1500,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1426,6 +1516,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1441,6 +1532,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1456,6 +1548,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1471,6 +1564,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1486,6 +1580,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1501,6 +1596,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1516,6 +1612,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1531,6 +1628,7 @@
         "col": 7
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1546,6 +1644,7 @@
         "col": 8
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1561,6 +1660,7 @@
         "col": 80
       },
       "canonical_pending_wrap": true,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1576,6 +1676,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1591,6 +1692,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1606,6 +1708,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1621,6 +1724,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1636,6 +1740,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1651,6 +1756,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1666,6 +1772,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1681,6 +1788,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1696,6 +1804,7 @@
         "col": 5
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1711,6 +1820,7 @@
         "col": 6
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1726,6 +1836,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1741,6 +1852,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1756,6 +1868,7 @@
         "col": 6
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": false
     },
     {
@@ -1771,6 +1884,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1786,6 +1900,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1801,6 +1916,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1816,6 +1932,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1831,6 +1948,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1846,6 +1964,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1861,6 +1980,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1876,6 +1996,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1891,6 +2012,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1906,6 +2028,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1921,6 +2044,7 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1936,6 +2060,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1951,6 +2076,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1966,6 +2092,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1981,6 +2108,7 @@
         "col": 2
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -1996,6 +2124,7 @@
         "col": 7
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2011,6 +2140,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2026,6 +2156,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2041,6 +2172,7 @@
         "col": 1
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2056,6 +2188,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2071,6 +2204,7 @@
         "col": 6
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2086,6 +2220,7 @@
         "col": 4
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     },
     {
@@ -2101,13 +2236,15 @@
         "col": 3
       },
       "canonical_pending_wrap": false,
+      "barrier": true,
       "agrees": true
     }
   ],
+  "stopped": null,
   "summary": {
     "steps": 136,
-    "agree": 115,
-    "differ": 21,
+    "agree": 114,
+    "differ": 22,
     "unanswered": 0
   }
 }

@@ -18,8 +18,10 @@ pub struct Report {
     pub window: (u32, u32),
     /// The pinned terminal library the canonical grid is built on.
     pub canonical_library: &'static str,
-    /// One outcome for each step.
+    /// One outcome for each step measured.
     pub steps: Vec<Outcome>,
+    /// Why the run ended before the corpus did, when it did.
+    pub stopped: Option<String>,
     /// The counts.
     pub summary: Summary,
 }
@@ -59,8 +61,9 @@ impl Report {
         launcher: serde_json::Value,
         terminal: Identity,
         window: (u32, u32),
-        steps: Vec<Outcome>,
+        measured: crate::run::Measured,
     ) -> Self {
+        let steps = measured.outcomes;
         Self {
             probe: "kr-term-probe/1",
             launcher,
@@ -69,6 +72,7 @@ impl Report {
             canonical_library: kr_term::unicode::LIBRARY.revision,
             summary: Summary::of(&steps),
             steps,
+            stopped: measured.stopped,
         }
     }
 }

@@ -13,6 +13,7 @@ mod unix {
     use std::io;
     use std::os::fd::AsFd as _;
     use std::process::ExitCode;
+    use std::time::{Duration, Instant};
 
     use kr_term_probe::corpus;
     use kr_term_probe::replies;
@@ -20,7 +21,13 @@ mod unix {
     use kr_term_probe::run::{self, Terminal};
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios};
 
-    /// Raw mode on standard input, with a read that gives up after five seconds without a byte.
+    /// The longest a read waits for the reply to primary device attributes, in total, and the most
+    /// bytes it takes while waiting. A terminal that keeps writing without ever sending the reply
+    /// is not waited on for ever.
+    const DEADLINE: Duration = Duration::from_secs(10);
+    const MOST_BYTES: usize = 64 * 1024;
+
+    /// Raw mode on standard input, read in short slices so the deadline is kept.
     struct Raw {
         saved: Termios,
         buffer: Vec<u8>,
@@ -33,9 +40,9 @@ mod unix {
             let mut raw = saved.clone();
             raw.make_raw();
             raw.special_codes[SpecialCodeIndex::VMIN] = 0;
-            // Tenths of a second: a read that hears nothing for five seconds is a terminal that
-            // will not answer, and the step is recorded as unanswered.
-            raw.special_codes[SpecialCodeIndex::VTIME] = 50;
+            // Tenths of a second: each read waits a fifth of a second for a byte, and the deadline
+            // above is the total.
+            raw.special_codes[SpecialCodeIndex::VTIME] = 2;
             rustix::termios::tcsetattr(stdin.as_fd(), OptionalActions::Flush, &raw)?;
             Ok(Self {
                 saved,
@@ -64,17 +71,16 @@ mod unix {
         fn receive(&mut self) -> io::Result<Option<Vec<u8>>> {
             let stdin = io::stdin();
             let mut chunk = [0_u8; 512];
+            let started = Instant::now();
             self.buffer.clear();
-            loop {
+            while started.elapsed() < DEADLINE && self.buffer.len() < MOST_BYTES {
                 let read = rustix::io::read(stdin.as_fd(), &mut chunk)?;
-                if read == 0 {
-                    return Ok(None);
-                }
                 self.buffer.extend_from_slice(&chunk[..read]);
                 if replies::primary_attributes(&self.buffer).is_some() {
                     return Ok(Some(std::mem::take(&mut self.buffer)));
                 }
             }
+            Ok(None)
         }
     }
 
@@ -117,19 +123,23 @@ mod unix {
             );
         }
 
-        let (identity, outcomes) = {
+        let (identity, measured) = {
             let mut terminal = Raw::enter()?;
             let identity = run::identify(&mut terminal)?;
-            let outcomes = run::measure_all(&mut terminal, &corpus::steps(cols, rows), cols, rows)?;
-            (identity, outcomes)
+            let measured = run::measure_all(&mut terminal, &corpus::steps(cols, rows), cols, rows)?;
+            (identity, measured)
         };
-        let report = Report::new(launcher, identity, (cols, rows), outcomes);
+        let report = Report::new(launcher, identity, (cols, rows), measured);
         let mut text = serde_json::to_string_pretty(&report)?;
         text.push('\n');
         std::fs::write(&out, text)?;
         let summary = report.summary;
+        let stopped = report
+            .stopped
+            .as_deref()
+            .map_or_else(String::new, |why| format!("; stopped early: {why}"));
         Ok(format!(
-            "{} steps: {} agree, {} differ, {} unanswered; record in {out}",
+            "{} steps: {} agree, {} differ, {} unanswered{stopped}; record in {out}",
             summary.steps, summary.agree, summary.differ, summary.unanswered
         ))
     }

@@ -139,7 +139,9 @@ fn a_terminal_that_is_the_canonical_grid_agrees_on_every_step() {
         "it answers the barrier"
     );
     let steps = corpus::steps(cols, rows);
-    let outcomes = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
+    let measured = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
+    assert_eq!(measured.stopped, None);
+    let outcomes = measured.outcomes;
     let differing = ids(&outcomes, |outcome| !outcome.agrees);
     assert!(
         differing.is_empty(),
@@ -152,13 +154,16 @@ fn a_terminal_that_is_the_canonical_grid_agrees_on_every_step() {
     );
 }
 
-/// A terminal with one fault disagrees on the steps that fault reaches and on no others.
+/// A terminal with one fault disagrees on the steps that fault reaches. The steps named as
+/// unaffected are ones no wide character is in, so a difference there would be the harness's.
 #[test]
 fn a_terminal_that_draws_wide_characters_narrow_is_found_on_the_wide_steps() {
     let (cols, rows) = (80, 24);
     let mut terminal = Simulated::new(cols, rows, narrow);
     let steps = corpus::steps(cols, rows);
-    let outcomes = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
+    let outcomes = run::measure_all(&mut terminal, &steps, cols, rows)
+        .expect("measures")
+        .outcomes;
     let differing = ids(&outcomes, |outcome| !outcome.agrees);
     for expected in [
         "wide.two-cjk-characters",
@@ -185,22 +190,131 @@ fn a_terminal_that_draws_wide_characters_narrow_is_found_on_the_wide_steps() {
     }
 }
 
-/// A terminal that says nothing is recorded as silent, which is not the same finding as one that
-/// answers wrongly.
+/// A terminal that says nothing stops the run at its first step: the reply that ends each read
+/// never came, so there is no telling whether it is still on its way.
 #[test]
-fn a_terminal_that_says_nothing_is_recorded_as_unanswered() {
+fn a_terminal_that_says_nothing_stops_the_run_at_the_first_step() {
     let steps = corpus::steps(80, 24);
-    let outcomes = run::measure_all(&mut Silent, &steps, 80, 24).expect("measures");
-    let summary = Summary::of(&outcomes);
+    let measured = run::measure_all(&mut Silent, &steps, 80, 24).expect("measures");
+    assert_eq!(
+        measured.outcomes.len(),
+        1,
+        "the run stopped at the first step"
+    );
+    assert!(measured.stopped.is_some());
+    let summary = Summary::of(&measured.outcomes);
     assert_eq!(
         (summary.agree, summary.differ, summary.unanswered),
-        (0, 0, steps.len())
+        (0, 0, 1)
     );
-    assert!(outcomes.iter().all(|outcome| outcome.terminal.is_none()));
+    assert!(
+        measured
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.terminal.is_none() && !outcome.barrier)
+    );
     assert_eq!(
         run::identify(&mut Silent).expect("identifies"),
         run::Identity::default()
     );
+}
+
+/// A terminal whose reply to the barrier comes one step late. The run must not take that late
+/// reply for the next step's answer, so it stops at the step whose barrier is missing and the
+/// records show no step answered with another step's position.
+struct Late {
+    inner: Simulated,
+    /// The read (from zero) at which the barrier is held back and delivered with the next one.
+    hold_at: usize,
+    reads: usize,
+    held: Vec<u8>,
+}
+
+impl Terminal for Late {
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.send(bytes)
+    }
+
+    fn receive(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let bytes = self.inner.receive()?;
+        self.reads += 1;
+        if self.reads == self.hold_at + 1 {
+            // This read times out; its bytes arrive with the next read.
+            self.held = bytes.unwrap_or_default();
+            return Ok(None);
+        }
+        Ok(bytes.map(|bytes| [std::mem::take(&mut self.held), bytes].concat()))
+    }
+}
+
+#[test]
+fn a_late_reply_is_not_taken_for_the_next_steps_answer() {
+    let (cols, rows) = (80, 24);
+    let steps = corpus::steps(cols, rows);
+    let mut late = Late {
+        inner: Simulated::new(cols, rows, faithful),
+        hold_at: 5,
+        reads: 0,
+        held: Vec::new(),
+    };
+    let measured = run::measure_all(&mut late, &steps, cols, rows).expect("measures");
+    assert_eq!(
+        measured.outcomes.len(),
+        6,
+        "stopped at the step that missed its reply"
+    );
+    assert!(
+        measured
+            .stopped
+            .as_deref()
+            .is_some_and(|why| why.contains(&steps[5].id))
+    );
+    assert!(measured.outcomes[5].terminal.is_none());
+    assert!(
+        measured.outcomes[..5].iter().all(|outcome| outcome.agrees),
+        "the steps before it are the ones that were answered in time"
+    );
+}
+
+/// A terminal that sends the barrier and no cursor report is recorded as silent on that step, and
+/// the run goes on, because the barrier says nothing is still on its way.
+struct NoCursorReport(Simulated);
+
+impl Terminal for NoCursorReport {
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // The cursor position report is never asked, so the terminal never answers it.
+        let mut kept = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at..].starts_with(b"\x1b[6n") {
+                at += 4;
+            } else {
+                kept.push(bytes[at]);
+                at += 1;
+            }
+        }
+        self.0.send(&kept)
+    }
+
+    fn receive(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.0.receive()
+    }
+}
+
+#[test]
+fn a_barrier_with_no_cursor_report_is_an_unanswered_step_and_the_run_goes_on() {
+    let (cols, rows) = (80, 24);
+    let steps = corpus::steps(cols, rows);
+    let mut terminal = NoCursorReport(Simulated::new(cols, rows, faithful));
+    let measured = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
+    assert_eq!(measured.stopped, None);
+    assert_eq!(measured.outcomes.len(), steps.len());
+    let summary = Summary::of(&measured.outcomes);
+    assert_eq!(
+        (summary.agree, summary.differ, summary.unanswered),
+        (0, 0, steps.len())
+    );
+    assert!(measured.outcomes.iter().all(|outcome| outcome.barrier));
 }
 
 /// The record carries the launcher's facts, the terminal's own answers and one outcome per step.
@@ -210,12 +324,12 @@ fn the_record_carries_what_was_measured() {
     let mut terminal = Simulated::new(cols, rows, faithful);
     let identity = run::identify(&mut terminal).expect("identifies");
     let steps = corpus::steps(cols, rows);
-    let outcomes = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
+    let measured = run::measure_all(&mut terminal, &steps, cols, rows).expect("measures");
     let report = Report::new(
         serde_json::json!({ "application": "a scripted terminal" }),
         identity,
         (cols, rows),
-        outcomes,
+        measured,
     );
     let text = serde_json::to_string(&report).expect("serialises");
     let value: serde_json::Value = serde_json::from_str(&text).expect("reads back");
