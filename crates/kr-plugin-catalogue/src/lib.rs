@@ -326,7 +326,7 @@ pub struct Catalogue {
     limits: LimitsInForce,
     /// The adapters an organisation's policy allows, where one applies; every adapter the host
     /// qualifies where none does. It is not kept in the records: the host that holds the policy
-    /// puts it in force again when it starts.
+    /// puts it in force again when it starts, before the first admission round.
     allowed_adapters: Option<BTreeSet<PluginId>>,
 }
 

@@ -747,7 +747,7 @@ pub fn effective(
                     policy_line(policy.value)
                 } else {
                     policy_line(policy.value).stated(
-                        "; the policy this host last accepted, because this document named none",
+                        "; the policy this host last accepted, because this document did not decide it",
                     )
                 },
                 source: policy_source,
