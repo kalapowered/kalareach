@@ -8,8 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_controller::archive::{Archive, ArchiveService, Incompleteness};
 use kr_faults::journal::{self, Fault, JournalFixture, Made};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::SessionId;
 use kr_protocol::receipt::{ReceiptState, RejectionReason};
 use kr_protocol::scalars::TimestampMs;
 use kr_worker::journal::{Journal, SCHEMA_VERSION};
@@ -221,6 +223,132 @@ fn a_commit_cut_inside_its_last_log_frame_is_gone_and_the_store_is_not_corrupt()
     let (_control_directory, control) = made("interrupted-accept", Made::AsControl);
     let whole = Journal::open_existing(&control).expect("the control opens");
     assert_eq!(state_of(&whole, 9), Some(ReceiptState::Accepted));
+}
+
+/// A kept journal made where a host keeps a session's journal, for the archive to read, on a host
+/// tree of its own that goes with the handle.
+fn in_a_host(name: &str, made: Made) -> (kr_ipc::testing::TempHost, SessionId) {
+    let host = kr_ipc::testing::TempHost::create();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let path = host.environment().journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("the session's directory"))
+        .expect("creates the session's directory");
+    fixture(name)
+        .make(&path, made)
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    (host, session_id)
+}
+
+fn archive_of(host: &kr_ipc::testing::TempHost, session_id: SessionId) -> Archive {
+    ArchiveService::new(host.environment())
+        .archive(session_id)
+        .unwrap_or_else(|error| panic!("the archive answers: {error}"))
+}
+
+fn unreadable(archive: &Archive) -> bool {
+    archive
+        .incompleteness
+        .iter()
+        .any(|reason| matches!(reason, Incompleteness::JournalUnreadable { .. }))
+}
+
+/// The archive reads a crashed session's journal whose receipts table has its root page overwritten
+/// as if nothing in it were damaged. It counts the receipts from indexes, and SQLite answers a count
+/// from an index without reading the table, so the archive never meets the damaged page: it reports
+/// three receipts and nothing unreadable, while the store's own check finds the damage and every
+/// receipt read fails. Section 24 asks for an explicit incomplete archive here. This test keeps a
+/// record of that behaviour; when the archive checks its store's pages, as the worker's own recovery
+/// does, it fails, and is replaced by one that the archive reports the journal unreadable.
+#[test]
+fn the_archive_reads_a_journal_whose_receipts_table_is_damaged_as_one_with_nothing_unreadable() {
+    let (damaged, session_id) = in_a_host("damaged-receipts", Made::WithFault);
+    let archive = archive_of(&damaged, session_id);
+    assert!(!unreadable(&archive), "{:?}", archive.incompleteness);
+    assert_eq!(archive.receipts, 3, "counted from an index");
+    let journal = Journal::open_read_only(damaged.environment().journal_database(session_id))
+        .expect("the journal opens to be read");
+    assert_ne!(
+        journal.pragma_string("quick_check").ok().as_deref(),
+        Some("ok"),
+        "the store's own check finds the damage"
+    );
+    assert!(
+        journal
+            .read(journal::actor().expect("the actor"), action(1))
+            .is_err(),
+        "and a receipt cannot be read"
+    );
+
+    let (control, session_id) = in_a_host("damaged-receipts", Made::AsControl);
+    let archive = archive_of(&control, session_id);
+    assert!(!unreadable(&archive), "{:?}", archive.incompleteness);
+    assert_eq!(archive.receipts, 3);
+}
+
+/// KR-REQ-27.05, an interrupted transaction: the archive reads a crashed session's journal whose
+/// last commit was cut inside its log, finds that action nowhere and the store readable; the same
+/// journal with its log whole holds the action.
+#[test]
+fn the_archive_finds_no_trace_of_a_commit_cut_in_its_log_and_its_control_holds_it() {
+    let (cut, session_id) = in_a_host("interrupted-accept", Made::WithFault);
+    let archive = archive_of(&cut, session_id);
+    assert!(!unreadable(&archive), "{:?}", archive.incompleteness);
+    assert_eq!(
+        archive.receipts, 1,
+        "only the action committed before the cut"
+    );
+
+    let (whole, session_id) = in_a_host("interrupted-accept", Made::AsControl);
+    assert_eq!(archive_of(&whole, session_id).receipts, 2);
+}
+
+/// KR-REQ-27.05, the recovery states: the archive counts the actions a crashed worker left
+/// unfinished, an intent with no marker and a marker with no answer, as an incomplete record; once
+/// it owns the dead worker's stores, recovery leaves the marker unknown and rejects the intent, and
+/// the record is complete in that respect. A journal whose actions all ended has none to count.
+#[test]
+fn the_archive_counts_what_a_worker_left_unfinished_and_recovery_settles_it() {
+    let (host, session_id) = in_a_host("unfinished-actions", Made::WithFault);
+    let unfinished = |archive: &Archive| {
+        archive
+            .incompleteness
+            .iter()
+            .find_map(|reason| match reason {
+                Incompleteness::RecoveryUnfinished { unresolved } => Some(*unresolved),
+                _ => None,
+            })
+    };
+    assert_eq!(unfinished(&archive_of(&host, session_id)), Some(2));
+    let service = ArchiveService::new(host.environment());
+    let ownership = service
+        .take_ownership(
+            session_id,
+            kr_protocol::session::DisplayNumber::new(1),
+            &ended_process(),
+        )
+        .unwrap_or_else(|error| panic!("owns the dead worker's stores: {error}"));
+    let recovered = service
+        .recover_journal(&ownership)
+        .unwrap_or_else(|error| panic!("recovers the journal: {error}"));
+    assert_eq!((recovered.left_unknown, recovered.rejected), (1, 1));
+    assert_eq!(unfinished(&archive_of(&host, session_id)), None);
+
+    let (control, session_id) = in_a_host("damaged-receipts", Made::AsControl);
+    assert_eq!(unfinished(&archive_of(&control, session_id)), None);
+}
+
+/// A process that has ended, as the kernel described it while it ran: the worker a recovery
+/// takes ownership after.
+fn ended_process() -> kr_protocol::identity::ProcessStartIdentity {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("starts a process");
+    let identity =
+        kr_ipc::identity::process_start_identity(child.id()).expect("the kernel describes it");
+    child.kill().expect("ends it");
+    child.wait().expect("collects it");
+    identity
 }
 
 #[test]
