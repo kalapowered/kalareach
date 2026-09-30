@@ -5321,6 +5321,140 @@ async fn kr_req_11_04_a_signed_ten_thousand_entry_snapshot_syncs_and_serves_offl
     );
 }
 
+/// What a probe on the runtime sees of a sync: how many times a task that only yields ran once
+/// the index of the repository had been delivered.
+#[derive(Clone, Debug, Default)]
+struct RuntimeProbe {
+    ticks: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    at_index: Arc<std::sync::atomic::AtomicU64>,
+    delivered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RuntimeProbe {
+    /// Starts the task that yields to the runtime, counting each time it runs.
+    fn start(&self) -> tokio::task::JoinHandle<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (ticks, stop) = (Arc::clone(&self.ticks), Arc::clone(&self.stop));
+        tokio::spawn(async move {
+            while !stop.load(Relaxed) {
+                tokio::task::yield_now().await;
+                ticks.fetch_add(1, Relaxed);
+            }
+        })
+    }
+
+    /// Notes that the last byte of the index has been delivered.
+    fn index_delivered(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.at_index.store(self.ticks.load(Relaxed), Relaxed);
+        self.delivered.store(true, Relaxed);
+    }
+
+    /// Returns how many times the probe ran since the index was delivered, and stops it.
+    fn finish(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stop.store(true, Relaxed);
+        assert!(
+            self.delivered.load(Relaxed),
+            "the index was never delivered"
+        );
+        self.ticks.load(Relaxed) - self.at_index.load(Relaxed)
+    }
+}
+
+/// Reads the local repository and tells its probe when the last byte of the index has been
+/// delivered, which is where everything a host does with the index begins.
+#[derive(Clone, Debug)]
+struct Announcing {
+    probe: RuntimeProbe,
+}
+
+#[tough::async_trait]
+impl tough::Transport for Announcing {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        use futures::StreamExt as _;
+
+        let stream = tough::FilesystemTransport.fetch(url.clone()).await?;
+        if !url.path().ends_with("/index.json") {
+            return Ok(stream);
+        }
+        let probe = self.probe.clone();
+        Ok(Box::pin(
+            stream.chain(
+                futures::stream::once(async move { probe.index_delivered() })
+                    .filter_map(|()| async { None::<Result<tough::Bytes, tough::TransportError>> }),
+            ),
+        ))
+    }
+}
+
+/// Runs `work` on a current-thread runtime, where a task that must run and the work share the one
+/// thread, and returns how many times that task ran after the index arrived.
+fn ticks_after_the_index<F, Fut>(work: F) -> u64
+where
+    F: FnOnce(RuntimeProbe) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(async {
+            let probe = RuntimeProbe::default();
+            let ticker = probe.start();
+            work(probe.clone()).await;
+            let ticks = probe.finish();
+            ticker.await.expect("the probe finished");
+            ticks
+        })
+}
+
+/// A synchronisation hands the runtime back once the index has arrived, so a task that has to run
+/// between its awaits (a terminal's input, on the thread the sync shares) runs before the sync is
+/// over, for a catalogue of any size. The control is a stand-in that reads the same index without
+/// awaiting, which the probe sees as never having run.
+#[test]
+fn kr_ac_017_a_sync_hands_the_runtime_back_after_the_index_arrives() {
+    // Control: parsing the index inline, with no await after it arrives, leaves the probe no turn.
+    let control = ticks_after_the_index(|probe| async move {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = ten_thousand_entries(home.path()).await;
+        let bytes = std::fs::read(generation.targets_dir().join("index.json")).expect("an index");
+        probe.index_delivered();
+        let index: kr_plugin_sdk::catalogue::CatalogueIndex =
+            serde_json::from_slice(&bytes).expect("an index");
+        assert_eq!(index.entries.len(), 10_000);
+    });
+    assert_eq!(control, 0, "an inline parse leaves the task no turn");
+
+    for entries in [1usize, 10_000] {
+        let ticks = ticks_after_the_index(|probe| async move {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = if entries == 1 {
+                Generation::build(home.path(), GenerationSpec::default()).await
+            } else {
+                ten_thousand_entries(home.path()).await
+            };
+            let mut catalogue = enrolled(
+                home.path(),
+                &generation,
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .await;
+            catalogue.set_transport(Arc::new(Announcing { probe }));
+            let outcome = catalogue.sync(&repository()).await.expect("a sync");
+            assert_eq!(outcome.entries, entries);
+        });
+        assert!(
+            ticks >= 1,
+            "{entries} entries: the task that must run never ran between the index arriving and \
+             the sync finishing"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-11.15 and KR-REQ-11.18: capability evidence and signed qualification
 // ---------------------------------------------------------------------------------------------
