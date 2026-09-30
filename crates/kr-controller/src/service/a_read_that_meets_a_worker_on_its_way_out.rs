@@ -514,18 +514,9 @@ async fn replaced(world: Silent, descriptor: bool) -> Silent {
             .expect("the worker's descriptor goes");
     }
     drop(controller);
-    let started = std::time::Instant::now();
-    let controller = loop {
-        match Controller::start(fake::setup(&_temp)).await {
-            Ok(controller) => break controller,
-            Err(crate::error::ControllerError::AlreadyRunning { .. })
-                if started.elapsed() < Duration::from_secs(60) =>
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(error) => panic!("the daemon does not start again: {error}"),
-        }
-    };
+    let controller = crate::testing::taken_over(|| Controller::start(fake::setup(&_temp)))
+        .await
+        .unwrap_or_else(|error| panic!("the daemon does not start again: {error}"));
     fake::acknowledged(&controller, session_id);
     let actor = crate::service::local_actor(
         kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
