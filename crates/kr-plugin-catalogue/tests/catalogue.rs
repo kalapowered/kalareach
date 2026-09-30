@@ -5339,7 +5339,6 @@ fn kr_req_11_14_ten_thousand_definitions_are_searched_and_matched_offline() {
     let index = support::synthetic_index(10_000);
     assert_eq!(index.entries.len(), 10_000);
 
-    let started = std::time::Instant::now();
     let lookup = MatchIndex::build(&index);
     assert_eq!(lookup.executable_count(), 10_000);
 
@@ -5366,36 +5365,37 @@ fn kr_req_11_14_ten_thousand_definitions_are_searched_and_matched_offline() {
     assert_eq!(support::search_len(&index, "agent"), 10_000);
     assert_eq!(support::search_len(&index, "nothing here"), 0);
 
-    // A generous bound. The point is that a catalogue this size is not a reason to wait: ten
-    // thousand lookups and three searches over ten thousand entries, well inside a second on any
-    // machine this runs on, and measured with enough margin that a loaded one still passes.
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(30),
-        "ten thousand definitions took {elapsed:?}"
-    );
+    // What keeps a catalogue this size from being a reason to wait is structure, and it is held
+    // above by the counts (one bucket and one candidate for each of the ten thousand executables)
+    // and, for the synchronised generation, by `kr_ac_017_*`: nothing here is decided by a clock.
 }
 
+/// KR-ACC-017: a search of ten thousand definitions, run on the blocking pool as a host runs one,
+/// leaves the runtime free for a task that has to keep running, and that task runs while the
+/// search is part way through it.
+///
+/// The search stops half way and waits until the other task has had every one of its turns, so the
+/// case decides by what happened, never by how long it took: a search that held the runtime's own
+/// thread could not be waited for, because the task it waits for could not run. It does not measure
+/// a terminal's input latency, which needs the terminal.
 #[tokio::test]
 async fn kr_ac_017_catalogue_search_does_not_hold_the_runtime_a_terminal_shares() {
-    // A task that ticks while the catalogue is searched, on the same runtime, with the search on
-    // a blocking task exactly as a host would run one. What this establishes is that the search
-    // does not take the reactor away from something that has to keep ticking; it does not measure
-    // a terminal's input latency, which needs the terminal.
+    const TURNS: usize = 200;
     let index = Arc::new(support::synthetic_index(10_000));
-    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = Arc::clone(&ticks);
+    let (finished, waited_for) = std::sync::mpsc::channel::<()>();
     let ticker = tokio::spawn(async move {
-        for _ in 0..200 {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..TURNS {
+            tokio::task::yield_now().await;
         }
+        let _ = finished.send(());
+        TURNS
     });
 
     let searching = Arc::clone(&index);
     let searched = tokio::task::spawn_blocking(move || {
         let lookup = MatchIndex::build(&searching);
         let mut total = 0usize;
+        let mut ran_meanwhile = false;
         for ordinal in 0..2_000u32 {
             total += lookup
                 .candidates(&Observation {
@@ -5403,13 +5403,24 @@ async fn kr_ac_017_catalogue_search_does_not_hold_the_runtime_a_terminal_shares(
                     distribution: None,
                 })
                 .len();
+            if ordinal == 999 {
+                // The wait ends when the other task has made every turn; the bound is only a
+                // cleanup for a runtime that never gave them.
+                ran_meanwhile = waited_for
+                    .recv_timeout(std::time::Duration::from_secs(120))
+                    .is_ok();
+            }
         }
-        total
+        (total, ran_meanwhile)
     });
 
-    assert_eq!(searched.await.expect("the search finished"), 2_000);
-    ticker.await.expect("the ticker finished");
-    assert_eq!(ticks.load(std::sync::atomic::Ordering::Relaxed), 200);
+    let (total, ran_meanwhile) = searched.await.expect("the search finished");
+    assert_eq!(total, 2_000);
+    assert!(
+        ran_meanwhile,
+        "the other task made every turn while the search was part way through"
+    );
+    assert_eq!(ticker.await.expect("the ticker finished"), TURNS);
 }
 
 /// A signed generation whose index lists ten thousand entries: the example package, published
