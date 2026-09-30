@@ -224,6 +224,173 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
     }
 }
 
+/// Runs a script in a host of its own with the package's module imported, and returns what it
+/// printed.
+///
+/// The script is given the module as `$module`, and reaches the module's own functions through it.
+/// The host is one the editor has no terminal for, so a script drives the module's binding
+/// functions and reads the editor's own table back, which is all these cases need.
+fn in_the_package_host(script: &str) -> String {
+    let package = shellpkg::Package::built(PWSH);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory");
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         $module = Get-Module KalaReach.ShellBridge; {script}"
+    );
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    assert!(
+        asked.status.success(),
+        "the host ended with {:?}:\n{said}\n{told}",
+        asked.status
+    );
+    said
+}
+
+/// Returns one line a script printed as `kr-key[name]=[value]`.
+fn said(output: &str, name: &str) -> String {
+    let prefix = format!("kr-key[{name}]=[");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the script said nothing about {name}:\n{output}"))
+        .strip_suffix(']')
+        .expect("the line's shape")
+        .to_owned()
+}
+
+/// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,
+/// so a key of the person's is never taken over by a chord that means the same key.
+///
+/// The editor keeps `Ctrl+Alt+?` under the plain question mark, which is how a terminal sends it:
+/// the two are one key. A chord that spells a key differently from how the editor stores it would
+/// bind the other key, and what was on that one would be replaced by an operation of the editor's
+/// the module meant for a different chord. The person's own function on the plain question mark
+/// keeps running through the module's wrapper for it, and the person's own script keeps its
+/// descriptions. Each case is a host of its own, because what one binds is what the next reads.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_chord_the_editor_spells_as_another_key_never_takes_that_key_over() {
+    // A function of the editor's the person put on the plain question mark. The operation of the
+    // same name on the spelled-out chord is processed after it, and would have replaced it.
+    let function = in_the_package_host(
+        r#"Set-PSReadLineKeyHandler -Chord '?' -Function AcceptAndGetNext;
+           $null = & $module { Install-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord '?';
+           Write-Output "kr-key[function]=[$($held.Description)]";
+           $enter = Get-PSReadLineKeyHandler -Chord 'Enter';
+           Write-Output "kr-key[control]=[$($enter.Description)]""#,
+    );
+    assert_eq!(
+        said(&function, "function"),
+        "KalaReach: AcceptAndGetNext",
+        "the person's function on the plain question mark is what the module wrapped:\n{function}"
+    );
+    assert_eq!(
+        said(&function, "control"),
+        "KalaReach: AcceptLine",
+        "a chord the editor stores as spelled is wrapped, so the check does not skip everything"
+    );
+
+    // A script of the person's, with descriptions of its own.
+    let script = in_the_package_host(
+        r#"Set-PSReadLineKeyHandler -Chord '?' -ScriptBlock { param($key, $arg) } `
+               -BriefDescription 'theirs' -Description 'the person wrote this';
+           $null = & $module { Install-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord '?';
+           Write-Output "kr-key[script]=[$($held.Function)|$($held.Description)]""#,
+    );
+    assert_eq!(
+        said(&script, "script"),
+        "theirs|the person wrote this",
+        "the person's script on the plain question mark kept its descriptions:\n{script}"
+    );
+
+    // The gesture's chord, which is bound by the module's own call and not by the loop.
+    let gesture = in_the_package_host(
+        r#"$answer = & $module { $script:Kr.GestureChord = 'Ctrl+Alt+?'; $script:Kr.GestureDisabled = $false; Install-KrGestureHandler };
+           Write-Output "kr-key[unbindable]=[$($answer.Ok)|$($answer.Reason)]";
+           $held = Get-PSReadLineKeyHandler -Chord '?';
+           Write-Output "kr-key[question]=[$(@($held).Count)]";
+           $answer = & $module { $script:Kr.GestureChord = 'Ctrl+d'; Install-KrGestureHandler };
+           Write-Output "kr-key[bindable]=[$($answer.Ok)|$($answer.Reason)]";
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d';
+           Write-Output "kr-key[detach]=[$($held.Description)]""#,
+    );
+    assert_eq!(
+        said(&gesture, "unbindable"),
+        "False|gesture_chord_unbindable",
+        "a gesture chord the editor spells as another key is refused by name:\n{gesture}"
+    );
+    assert_eq!(
+        said(&gesture, "question"),
+        "0",
+        "and the key it would have taken over is left unbound"
+    );
+    assert_eq!(
+        said(&gesture, "bindable"),
+        "True|",
+        "a chord stored as spelled is bound"
+    );
+    assert_eq!(
+        said(&gesture, "detach"),
+        "KalaReach: detach at an empty root prompt"
+    );
+}
+
+/// KR-REQ-07.85: the module can read how the editor spells a chord, or it is not the editor the
+/// package was qualified against.
+///
+/// The spelling comes from the editor's own key type, so a stand-in editor that does not have it
+/// answers nothing, and the control is the editor the package was qualified against.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_module_reads_how_the_editor_spells_a_chord_and_refuses_one_that_does_not_say() {
+    // The editor the package was qualified against is read first: what a case puts in the module's
+    // place stays there for the rest of the host's run.
+    let output = in_the_package_host(&format!(
+        "Write-Output \"kr-key[real]=[$(& $module {{ Get-KrBoundSpelling 'Ctrl+Alt+?' }})]\"; \
+         Write-Output \"kr-key[accepted]=[$(& $module {{ (Test-KrKeySpelling).Reason }})]\"; \
+         Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition @'{STAND_IN_EDITORS}'@; \
+         Write-Output \"kr-key[stand-in]=[$(& $module {{ param($editor) $script:Rl = $editor; Get-KrBoundSpelling 'Ctrl+d' }} ([type]'KrEditorLive'))]\"; \
+         Write-Output \"kr-key[refused]=[$(& $module {{ (Test-KrKeySpelling).Reason }})]\""
+    ));
+    assert_eq!(
+        said(&output, "real"),
+        "?",
+        "the editor says the spelled-out chord is the plain question mark:\n{output}"
+    );
+    assert_eq!(
+        said(&output, "stand-in"),
+        "",
+        "a stand-in without the editor's key type says nothing"
+    );
+    assert_eq!(
+        said(&output, "refused"),
+        "psreadline_key_spelling_unreadable"
+    );
+    assert_eq!(
+        said(&output, "accepted"),
+        "",
+        "the qualified editor is accepted"
+    );
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

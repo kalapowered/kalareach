@@ -233,9 +233,14 @@ with, and the session being created closes with that loss.
 Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt
 ends the shell the way the editor's own would; when a wrapped handler is what runs, the exit the
 editor signals is recognised through the exception chain and carried out by replacing the empty line
-with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. And a
-key the wrapper binds without having asked to, such as the plain `?` that a modified chord can come
-out as, is put back to what it was, so the character types as it does without the module.
+with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. And the
+module binds only a chord the editor stores under the spelling it was given: the editor keeps
+`Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that
+chord would take the plain question mark over and whatever the person had there would go. Such a
+chord is left alone, and a configured gesture whose chord is one is refused as
+`gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as
+`psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound
+safely.
 
 `Publish-KalaReachQualification` is what `scripts/build-shells.sh` is for the others: it checks the
 editor against the range the manifest pins, records what it found, installs the module and the
