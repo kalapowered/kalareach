@@ -1772,6 +1772,10 @@
       "additionalProperties": false,
       "description": "One entry of a bound agent's shared state.",
       "properties": {
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The binding revision that was in force when it was observed.\n\nThe revision advances when the upstream owner or selected thread changes, and an answer's\nown binding is the revision in force when it is read. An entry names the one it was seen\nunder, so what one owner said is never read as the words of the owner that followed it."
+        },
         "kind": {
           "description": "What kind of entry it is, as the connector's declarative presentation names it.",
           "type": "string"
@@ -1791,6 +1795,17 @@
         "text": {
           "description": "The entry's text, already filtered by the shared host-side history filter.",
           "type": "string"
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn that was running when it was observed, where one was."
         }
       },
       "required": [
@@ -1798,7 +1813,9 @@
         "kind",
         "text",
         "omitted_text_bytes",
-        "observed_at"
+        "observed_at",
+        "binding_revision",
+        "turn_id"
       ],
       "type": "object"
     },

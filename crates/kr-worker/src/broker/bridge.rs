@@ -524,6 +524,15 @@ struct Reported {
 }
 
 impl BridgeThreads {
+    /// Whether a hook the kernel says started at `started` started before the report that began the
+    /// binding's current revision, so that what it reports was observed under an earlier one.
+    #[must_use]
+    pub(crate) fn started_before_revision(&self, started: Option<u64>) -> bool {
+        self.began
+            .zip(started)
+            .is_some_and(|(began, started)| started < began)
+    }
+
     /// Why this bridge suspends rich mutations, while it does.
     pub(crate) fn suspension(&self) -> Option<&'static str> {
         self.unsettled.then_some(UNVERIFIED_THREAD)
@@ -779,10 +788,13 @@ impl crate::broker::Broker {
                 .bridge
                 .remember_request(request.clone(), observation.thread.clone());
         }
-        let cursor =
-            instance
-                .semantic
-                .append(observation.event.kind(), observation.summary(), now)?;
+        let under = instance.observed_under_report(&observation.thread, reporter.started);
+        let cursor = instance.semantic.append(
+            observation.event.kind(),
+            observation.summary(),
+            now,
+            under,
+        )?;
         Ok((thread, cursor))
     }
 
@@ -853,10 +865,7 @@ fn decide(
     };
     // Started before the report that began the binding's current revision: every question bound
     // to that revision was asked after this, whatever it says.
-    let before_revision = bridge
-        .began
-        .zip(reporter.started)
-        .is_some_and(|(began, started)| started < began);
+    let before_revision = bridge.started_before_revision(reporter.started);
     match place {
         Some(std::cmp::Ordering::Greater) => {
             newest(state, application_instance_id, observation, reporter, now)
@@ -1319,6 +1328,119 @@ mod tests {
             .binding_state(id)
             .expect("known")
             .rich_mutations_suspended
+    }
+
+    /// KR-REQ-12.04: an entry made from a report about a thread other than the selected one, which
+    /// can arrive after the selection has moved on, names no turn: the turn that is running is the
+    /// selected thread's, and the entry is not of it.
+    #[test]
+    fn a_report_about_an_earlier_thread_is_not_recorded_under_the_turn_of_the_one_selected_now() {
+        let id = instance(1);
+        let broker = broker_with(&[id]);
+        apply(&broker, id, 10, &start("thread-a"));
+        apply(&broker, id, 20, &start("thread-b"));
+        broker
+            .set_turn(
+                id,
+                Some(kr_protocol::ids::AgentTurnId::new("turn-b").expect("valid")),
+            )
+            .expect("a turn runs in the selected thread");
+        for thread in ["thread-a", "thread-b"] {
+            broker
+                .observe_bridge(
+                    id,
+                    &reporter(id, 30),
+                    &observed(ObservedEvent::Notification, thread),
+                    TimestampMs::new(2),
+                )
+                .expect("recorded");
+        }
+        let replay = broker
+            .replay(
+                id,
+                None,
+                &crate::broker::semantic::GrantLowerBound {
+                    from: kr_protocol::ids::StreamCursor::new(1),
+                },
+                kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+            )
+            .expect("replays");
+        let notifications: Vec<_> = replay
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == ObservedEvent::Notification.kind())
+            .map(|entry| (entry.binding_revision, entry.turn_id.0.clone()))
+            .collect();
+        let now = revision(&broker, id);
+        assert_eq!(
+            notifications,
+            [
+                (now, None),
+                (
+                    now,
+                    Some(kr_protocol::ids::AgentTurnId::new("turn-b").expect("valid"))
+                )
+            ],
+            "the report about the earlier thread names no turn, and the one about the selected thread \
+             names the turn running in it"
+        );
+    }
+
+    /// KR-REQ-12.04: a report from a hook that started before the report that began the current
+    /// revision names no turn either, even about the thread selected now: the thread was selected
+    /// again since, and the turn running in it began after the report was made.
+    #[test]
+    fn a_report_from_before_the_thread_was_selected_again_is_not_recorded_under_its_turn() {
+        let id = instance(1);
+        let broker = broker_with(&[id]);
+        apply(&broker, id, 10, &start("thread-a"));
+        apply(&broker, id, 20, &start("thread-b"));
+        apply(&broker, id, 30, &start("thread-a"));
+        broker
+            .set_turn(
+                id,
+                Some(kr_protocol::ids::AgentTurnId::new("turn-a2").expect("valid")),
+            )
+            .expect("a turn runs in the selected thread");
+        for hook in [15, 35] {
+            broker
+                .observe_bridge(
+                    id,
+                    &reporter(id, hook),
+                    &observed(ObservedEvent::Notification, "thread-a"),
+                    TimestampMs::new(2),
+                )
+                .expect("recorded");
+        }
+        let replay = broker
+            .replay(
+                id,
+                None,
+                &crate::broker::semantic::GrantLowerBound {
+                    from: kr_protocol::ids::StreamCursor::new(1),
+                },
+                kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+            )
+            .expect("replays");
+        let notifications: Vec<_> = replay
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == ObservedEvent::Notification.kind())
+            .map(|entry| (entry.binding_revision, entry.turn_id.0.clone()))
+            .collect();
+        let now = revision(&broker, id);
+        assert_eq!(
+            notifications,
+            [
+                (now, None),
+                (
+                    now,
+                    Some(kr_protocol::ids::AgentTurnId::new("turn-a2").expect("valid"))
+                )
+            ],
+            "the report from before the selection names no turn, and the one after it names the \
+             turn running now"
+        );
     }
 
     /// KR-REQ-11.62: the report whose hook the kernel says started last decides the thread. A thread

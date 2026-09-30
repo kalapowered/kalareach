@@ -199,6 +199,14 @@ pub struct AgentSnapshotEntry {
     pub omitted_text_bytes: U64,
     /// When it was observed.
     pub observed_at: TimestampMs,
+    /// The binding revision that was in force when it was observed.
+    ///
+    /// The revision advances when the upstream owner or selected thread changes, and an answer's
+    /// own binding is the revision in force when it is read. An entry names the one it was seen
+    /// under, so what one owner said is never read as the words of the owner that followed it.
+    pub binding_revision: AgentBindingRevision,
+    /// The turn that was running when it was observed, where one was.
+    pub turn_id: Nullable<AgentTurnId>,
 }
 
 /// The result of `agent.snapshot`.

@@ -32,8 +32,8 @@
 use std::collections::VecDeque;
 
 use kr_protocol::agent::AgentSnapshotEntry;
-use kr_protocol::ids::StreamCursor;
-use kr_protocol::scalars::{TimestampMs, U64};
+use kr_protocol::ids::{AgentBindingRevision, AgentTurnId, StreamCursor};
+use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_protocol::semantic::{
     MAX_SEMANTIC_SNAPSHOT_BYTES, MAX_SEMANTIC_TREE_NODES, SemanticBudget, SemanticContinuation,
     SemanticLimit,
@@ -254,6 +254,18 @@ fn cut(entry: &AgentSnapshotEntry, allowance: u64) -> Result<AgentSnapshotEntry,
     })
 }
 
+/// What an entry is observed under: the binding revision in force and the turn that is running.
+///
+/// The log records it with the entry, so a reader of the entry later knows which owner and which
+/// turn it belongs to, whatever the binding has moved on to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedUnder {
+    /// The binding revision in force.
+    pub binding_revision: AgentBindingRevision,
+    /// The turn that is running, where one is.
+    pub turn_id: Option<AgentTurnId>,
+}
+
 /// One instance's retained semantic entries.
 #[derive(Debug)]
 pub struct SemanticLog {
@@ -279,7 +291,7 @@ impl SemanticLog {
         }
     }
 
-    /// Appends one observed entry and returns its cursor.
+    /// Appends one observed entry, made under `under`, and returns its cursor.
     ///
     /// # Errors
     ///
@@ -289,6 +301,7 @@ impl SemanticLog {
         kind: impl Into<String>,
         text: impl Into<String>,
         at: TimestampMs,
+        under: ObservedUnder,
     ) -> Result<StreamCursor, Exhausted> {
         let following = self.next.checked_add(1).ok_or(Exhausted)?;
         let cursor = StreamCursor::new(self.next);
@@ -301,6 +314,8 @@ impl SemanticLog {
                 text: text.into(),
                 omitted_text_bytes: U64::ZERO,
                 observed_at: at,
+                binding_revision: under.binding_revision,
+                turn_id: Nullable::from(under.turn_id),
             },
         ));
         while self.entries.len() > MAX_RETAINED_ENTRIES {
@@ -454,9 +469,17 @@ mod tests {
         log
     }
 
+    /// The first revision, with no turn running: what most of these tests observe under.
+    fn first() -> ObservedUnder {
+        ObservedUnder {
+            binding_revision: AgentBindingRevision::new(1),
+            turn_id: None,
+        }
+    }
+
     /// Appends one message at `at`, which every log these tests write has numbers left for.
     fn said(log: &mut SemanticLog, text: impl Into<String>, at: u64) -> StreamCursor {
-        log.append("message", text, TimestampMs::new(at))
+        log.append("message", text, TimestampMs::new(at), first())
             .expect("the log has numbers left")
     }
 
@@ -698,7 +721,14 @@ mod tests {
         let mut log = SemanticLog::new();
         log.resume_after(StreamCursor::new(u64::MAX - 2));
         let given: Vec<Result<StreamCursor, Exhausted>> = (0..3_u64)
-            .map(|index| log.append("message", format!("entry {index}"), TimestampMs::new(index)))
+            .map(|index| {
+                log.append(
+                    "message",
+                    format!("entry {index}"),
+                    TimestampMs::new(index),
+                    first(),
+                )
+            })
             .collect();
         assert_eq!(
             given,
@@ -728,7 +758,7 @@ mod tests {
         let mut spent = SemanticLog::new();
         spent.resume_after(StreamCursor::new(u64::MAX));
         assert_eq!(
-            spent.append("message", "more", TimestampMs::new(1)),
+            spent.append("message", "more", TimestampMs::new(1), first()),
             Err(Exhausted),
             "a checkpoint at the last number leaves none to give"
         );
@@ -847,6 +877,41 @@ mod tests {
         assert_eq!(part.entries.len(), 1, "carried, cut");
         assert!(part.entries[0].omitted_text_bytes.get() > 0);
         assert!(part.continuation.is_none());
+    }
+
+    /// An entry keeps the revision and the turn it was observed under, and so does the cut that
+    /// carries it when its text does not fit.
+    #[test]
+    fn an_entry_keeps_what_it_was_observed_under_when_its_text_is_cut() {
+        let mut log = SemanticLog::new();
+        let turn = AgentTurnId::new("turn-9").expect("valid");
+        let under = ObservedUnder {
+            binding_revision: AgentBindingRevision::new(3),
+            turn_id: Some(turn.clone()),
+        };
+        log.append("message", "x".repeat(5_000), TimestampMs::new(1), under)
+            .expect("the log has numbers left");
+        said(&mut log, "seen after the turn", 2);
+        let part = log
+            .replay(None, &EverythingAdmitted, 1_000, SnapshotCarried::NOTHING)
+            .expect("a part");
+        let cut = &part.entries[0];
+        assert!(cut.omitted_text_bytes.get() > 0, "the text was cut");
+        assert_eq!(cut.binding_revision, AgentBindingRevision::new(3));
+        assert_eq!(cut.turn_id, Nullable::some(turn));
+        let rest = log
+            .replay(
+                Some(part.consumed),
+                &EverythingAdmitted,
+                MAX_SEMANTIC_SNAPSHOT_BYTES,
+                SnapshotCarried::NOTHING,
+            )
+            .expect("a part");
+        assert_eq!(
+            rest.entries[0].binding_revision,
+            AgentBindingRevision::new(1)
+        );
+        assert_eq!(rest.entries[0].turn_id, Nullable::null());
     }
 
     #[test]

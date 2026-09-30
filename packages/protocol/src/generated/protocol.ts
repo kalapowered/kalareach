@@ -4266,6 +4266,10 @@ export interface SemanticContinuation {
  */
 export interface AgentSnapshotEntry {
   /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
    * What kind of entry it is, as the connector's declarative presentation names it.
    */
   kind: string
@@ -4285,6 +4289,10 @@ export interface AgentSnapshotEntry {
    * The entry's text, already filtered by the shared host-side history filter.
    */
   text: string
+  /**
+   * The turn that was running when it was observed, where one was.
+   */
+  turn_id: AgentTurnId | null
 }
 /**
  * Parameters of `agent.turn.steer`.

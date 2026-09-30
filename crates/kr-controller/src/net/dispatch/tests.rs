@@ -1129,6 +1129,8 @@ async fn a_device_reads_an_agents_history_and_an_approval_record_under_its_grant
             text: "said under the grant".to_owned(),
             omitted_text_bytes: U64::ZERO,
             observed_at: TimestampMs::new(2_500),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+            turn_id: Nullable::null(),
         }],
         continuation: Nullable::null(),
         history_gap: false,

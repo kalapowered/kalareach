@@ -879,6 +879,74 @@ async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_
     assert_eq!(upstream.submitted().len(), 1, "nothing more was carried");
 }
 
+/// KR-REQ-12.04: an observation names the execution owner and the turn it was made under, so what
+/// was observed under one owner or in one turn is never read as another's.
+#[tokio::test]
+async fn an_observation_names_the_owner_and_the_turn_it_was_made_under() {
+    let broker = agent_broker();
+    broker
+        .set_turn(instance(), Some(AgentTurnId::new("turn-1").expect("valid")))
+        .expect("a turn is running");
+    broker
+        .observe(
+            instance(),
+            "message",
+            "said in the first owner's turn",
+            TimestampMs::new(2),
+        )
+        .expect("observed");
+    broker
+        .advance_binding(instance(), None, TimestampMs::new(3))
+        .expect("the owner changed");
+    broker
+        .observe(
+            instance(),
+            "message",
+            "said under the second owner",
+            TimestampMs::new(4),
+        )
+        .expect("observed");
+    let read = broker
+        .agent_snapshot(
+            &AgentSnapshotParams {
+                subject: subject(session(), instance()),
+                from_node: Nullable::null(),
+            },
+            &GrantLowerBound {
+                from: StreamCursor::new(1),
+            },
+            kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+        )
+        .expect("the read succeeds");
+    for entry in &read.entries {
+        let entry = serde_json::to_value(entry).expect("an entry");
+        assert!(
+            entry.get("binding_revision").is_some() && entry.get("turn_id").is_some(),
+            "an entry names neither the owner nor the turn it was observed under, and is read under \
+             {:?}: {entry}",
+            read.binding
+        );
+    }
+    // Each names the one it was observed under, not the one the read is made under.
+    let observed: Vec<_> = read
+        .entries
+        .iter()
+        .map(|entry| (entry.binding_revision, entry.turn_id.0.clone()))
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            (
+                AgentBindingRevision::new(1),
+                Some(AgentTurnId::new("turn-1").expect("valid"))
+            ),
+            (AgentBindingRevision::new(2), None),
+        ],
+        "the first was said in the first owner's turn, and the second under the owner that followed"
+    );
+    assert_eq!(read.binding.binding_revision, AgentBindingRevision::new(2));
+}
+
 /// KR-REQ-23.40: `agent.approval.respond` answers the exact pending resource, with a decision the
 /// request actually offered, once.
 #[tokio::test]

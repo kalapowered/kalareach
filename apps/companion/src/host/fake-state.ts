@@ -431,7 +431,9 @@ export class ScriptedRecords {
         kind,
         text,
         omitted_text_bytes: '0',
-        observed_at: String(now - 600_000 + index * 1_000)
+        observed_at: String(now - 600_000 + index * 1_000),
+        binding_revision: '4',
+        turn_id: null
       })),
       withheld: 0,
       withheldNodes: new Set(),
@@ -718,7 +720,9 @@ export class ScriptedRecords {
       kind,
       text,
       omitted_text_bytes: String(omitted),
-      observed_at: String(this.#ids.nowMs + node)
+      observed_at: String(this.#ids.nowMs + node),
+      binding_revision: agent.binding.binding_revision,
+      turn_id: agent.binding.turn_id
     })
   }
 
@@ -1451,12 +1455,16 @@ export class ScriptedRecords {
     }
   }
 
-  /** Moves a session's binding to a new revision, as a change of conversation does. */
+  /**
+   * Moves a session's binding to a new revision, as a change of conversation does, which ends the
+   * turn that was running.
+   */
   moveBinding(sessionId: string): void {
     const agent = this.#agentOf(sessionId)
     agent.binding = {
       ...agent.binding,
-      binding_revision: String(Number(agent.binding.binding_revision) + 1)
+      binding_revision: String(Number(agent.binding.binding_revision) + 1),
+      turn_id: null
     }
   }
 

@@ -1605,6 +1605,20 @@ from there, the rest is a snapshot of its own, so a reader that follows every co
 reads the whole history once, in order. An entry's number is never given twice: a history that has
 given its last number refuses the next entry with `RESOURCE_UNAVAILABLE` and records nothing.
 
+Each entry also names the binding revision in force and the turn running when the worker recorded
+it, so an entry seen under one execution owner or in one turn is not read as another's. When an
+answer is built, the binding of the answer is read, which may be later than the binding of some of
+the entries in the answer. It is also possible for an entry, recorded during the building of an
+answer, to be of a later revision than that of the answer.
+
+Two types of entry name no turn. One is when the entry is built from a report made by the
+application about a thread other than the selected thread. The other is when the entry is built from
+a report whose hook was started before the report which started the current revision, that is,
+before the last change to the selection. On platforms which do not record the start time of a hook,
+only the thread is compared. Both of these types of entry may arrive after the selection has changed
+and the running turn is not the turn to which the entry belongs. The report which ends a thread is
+recorded as part of the revision after the thread has ended. A cut entry keeps both members.
+
 ## Action windows and the dispatch lease
 
 Both are the transport's own components (`kr_transport::window`, `kr_transport::lease`), used

@@ -208,6 +208,8 @@ async fn a_snapshot_is_read_on_the_sessions_own_worker_with_the_pages_parameters
             text: "Found it: the test waits on a timer.".to_owned(),
             omitted_text_bytes: U64::ZERO,
             observed_at: TimestampMs::new(7),
+            binding_revision: revision(),
+            turn_id: Nullable::some(turn()),
         }],
         continuation: Nullable::null(),
         history_gap: false,

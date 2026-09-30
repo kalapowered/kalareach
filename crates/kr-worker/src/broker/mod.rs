@@ -142,7 +142,7 @@ pub use crate::broker::profiles::{
     RegistrationRefused, new_profile_id,
 };
 pub use crate::broker::semantic::{
-    Exhausted, GrantLowerBound, HistoryFilter, Replay, SemanticLog, SnapshotCarried,
+    Exhausted, GrantLowerBound, HistoryFilter, ObservedUnder, Replay, SemanticLog, SnapshotCarried,
 };
 pub use crate::broker::tokens::{Invocation, TokenStore};
 pub use crate::broker::volatile::{RecoveryGeneration, VolatileState, VolatileTransition};
@@ -368,6 +368,44 @@ struct RetainedFrame {
 }
 
 impl Instance {
+    /// Returns what an entry observed now is observed under.
+    #[must_use]
+    pub fn observed_under(&self) -> ObservedUnder {
+        ObservedUnder {
+            binding_revision: self.binding_revision,
+            turn_id: self.turn_id.clone(),
+        }
+    }
+
+    /// Returns what an entry is observed under when the application reported it about `thread`
+    /// from a hook the kernel says started at `started`.
+    ///
+    /// The revision is the one in force when the entry is recorded. The turn is the one running in
+    /// the selected thread, and a report names it only when it can be of the current revision's
+    /// time: a report about another thread, or from a hook that started before the report that
+    /// began the current revision, can arrive after the selection has moved on, and the turn that
+    /// is running is not its own. Such an entry names no turn. A report that is of the current
+    /// revision's time names the turn running when it is recorded, which is not placed any
+    /// closer than that. Where the platform keeps no start time for the hook, a report about the
+    /// selected thread is taken as of the current revision's time.
+    #[must_use]
+    pub fn observed_under_report(
+        &self,
+        thread: &AgentThreadId,
+        started: Option<u64>,
+    ) -> ObservedUnder {
+        let under = self.observed_under();
+        if self.thread_id.as_ref() == Some(thread) && !self.bridge.started_before_revision(started)
+        {
+            under
+        } else {
+            ObservedUnder {
+                turn_id: None,
+                ..under
+            }
+        }
+    }
+
     /// Returns the binding state a client reads.
     #[must_use]
     pub fn state(&self) -> AgentBindingState {
@@ -3504,9 +3542,10 @@ impl Broker {
             .instances
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let under = instance.observed_under();
         instance
             .semantic
-            .append(kind, text, now)
+            .append(kind, text, now, under)
             .map_err(BrokerError::from)
     }
 

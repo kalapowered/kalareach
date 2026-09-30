@@ -299,21 +299,32 @@ describe('an entry of the history (KR-REQ-13.15)', () => {
       kind: 'message',
       text: 'The start',
       omitted_text_bytes: '10',
-      observed_at: '0'
+      observed_at: '0',
+      binding_revision: '1',
+      turn_id: null
     })
     const whole = agentEntry('i-1', {
       node: '7',
       kind: 'message',
       text: 'The start and the rest',
       omitted_text_bytes: '0',
-      observed_at: '0'
+      observed_at: '0',
+      binding_revision: '1',
+      turn_id: null
     })
     expect(cut.id).toBe(whole.id)
     expect(BigInt(whole.revision)).toBeGreaterThan(BigInt(cut.revision))
     // Bytes, not characters: a non-ASCII character is more than one.
     expect(
-      agentEntry('i-1', { node: '1', kind: 'message', text: 'é', omitted_text_bytes: '0', observed_at: '0' })
-        .revision
+      agentEntry('i-1', {
+        node: '1',
+        kind: 'message',
+        text: 'é',
+        omitted_text_bytes: '0',
+        observed_at: '0',
+        binding_revision: '1',
+        turn_id: null
+      }).revision
     ).toBe('2')
   })
 })
@@ -327,7 +338,9 @@ describe('what the host withheld, counted once (KR-REQ-25.25)', () => {
         kind: 'message',
         text: String(node),
         omitted_text_bytes: '0',
-        observed_at: '0'
+        observed_at: '0',
+        binding_revision: '1',
+        turn_id: null
       })),
       withheld_entries: String(withheld),
       continuation:
