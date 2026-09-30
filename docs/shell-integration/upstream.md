@@ -75,6 +75,99 @@ date, with the choices above) or `not-affected`.
 | 2026-09-20 | CVE-2026-62801, PowerShell, published at github.com/PowerShell/Announcements/issues/98; fixed in 7.4.20, 7.5.11 and 7.6.6 | psreadline | The host this package was qualified against is 7.6.6, which is the fixed release of its own series, so the qualified identity carries the fix. A person on an earlier 7.4 or 7.5 release is on an affected host and updates it; this package qualifies the editor against the host the person runs and does not ship one. | 2026-10-04 | not-affected |
 <!-- /kr:triage -->
 
+## Native modules and the editor ABI
+
+A person can load a native Zsh module of their own into a managed session. Zsh's loader records no
+editor ABI and refuses nothing for a module that binds its imports lazily, so a module built against
+an editor whose functions this package lacks loads without complaint and ends the shell at the first
+call that needs the missing function. The session answers that with a named error before it is
+ready. It never reaches a ready state with such a module loaded.
+
+The triage record above, the update target and the requalification steps are the standing record for
+the packages. This section is the proof that the editor check refuses what it claims to, and the
+limits of what it claims.
+
+### What the check does
+
+When the integration reports that its hooks are live, which is after every startup file has run, the
+Zsh package lists each dynamic module the shell holds that did not come from the package's own
+module directory. For each one it reads the undefined symbols in the module's file (Mach-O, fat
+files included, and ELF64) and asks the running shell whether the shell, the modules already loaded
+or the module's own libraries provide each name. A module from the package's own tree is skipped by
+a path check, and a name the module imports weakly is not judged. The report says, for each module,
+
+* `bound`: every name resolves;
+* `missing`: the first name that does not, with the module and its path;
+* `not_read`: why the file could not be inspected (unreadable, too large, a format the reader does
+  not know, a path the loader does not give).
+
+The worker refuses the session on `missing` and on `not_read`, because an inspection that cannot be
+made whole is not a pass. The create answers `SHELL_INTEGRATION_UNSUPPORTED` with the reason
+`module_tree_unsupported` and names the module and the import, or the module and why it could not
+be checked. The Bash, Fish and PowerShell bridges send an empty list.
+
+### The proof
+
+`crates/kr-shell-integration/tests/module_abi.rs` compiles modules as a person compiles one, against
+the headers of this repository's own Zsh package (`tests/shells/zsh/native-module-abi/`), loads each
+from a startup file into the built package, and reads the report the shell sends.
+
+| Module | What it is | Result |
+| --- | --- | --- |
+| compatible | imports only what the package provides | loads, `bound`, the session may qualify |
+| newer | also calls a function no editor of this release has | loads, `missing` naming that function, the session is refused with `module_tree_unsupported` |
+| lazy | imports from a package module that is not loaded yet | `bound`: the shell loads that module on demand |
+| weak | imports a name it is content to lose | `bound` |
+| removed | loads, and its file is removed by the startup file that loaded it | `not_read`, refused with the module named and why it could not be checked |
+| a file the loader refuses | not a module in any format the shell loads | the loader reports it; the report has no entry, and the session is not refused for a module that never loaded |
+| the package's own modules, loaded from another directory | what a module of the shell's own kind imports | every one `bound` |
+
+The newer module is the control that matters: the loader accepts it, which is the false ready state
+the check exists to prevent, and the check refuses it.
+
+### What it does not detect
+
+* **A layout difference whose symbols resolve.** A module built against another layout of the same
+  names binds every symbol it imports, and no import check tells it from one built for this editor.
+  Two configures of the pinned release show it. `--enable-multibyte` and `--disable-multibyte`
+  export the same editor state, `zleline`, `zlell` and `zlecs`, with different element types
+  (`wchar_t` and `char`), and 1,131 function names in common. A module that uses only shared names
+  binds in either build. A module that calls one of the 27 functions only the multibyte build
+  exports, or one of the 8 only the other does, is refused by the other.
+* **A changed signature, meaning or data type** behind a name that still resolves.
+* **A module loaded after the hooks go live**: a later `precmd`, `zle-line-init`, deferred or
+  on-demand loading, or a `module_path` the person extended after the check.
+* **A module the loader refuses.** The loader reports that itself.
+* **Loadable builtins and modules of other shells**: Bash's `enable -f`, Fish and PowerShell's
+  binary modules. PowerShell's own editor range is enforced by the PSReadLine package, and this
+  proof does not cover it.
+
+### What the check costs at activation
+
+The check runs once per session, when the hooks go live, on the shell's own thread, and reads only
+regular files, each at most 64 MiB. A shell that loaded no module of its own pays for the list and
+a path check per package module. Each module of the person's own adds one read of its file and one
+lookup per undefined name.
+
+Measured from a timer around the whole check in a session under the built package, median of ten
+sessions per row, file cache warm:
+
+| The shell holds | Apple M4 Pro, macOS 26 | AMD EPYC 7502P, Linux (glibc 2.43) |
+| --- | --- | --- |
+| no module of its own | 0.12 ms | 0.10 ms |
+| 1 small module | 0.22 ms | 0.16 ms |
+| 3 small modules | 0.28 ms | 0.17 ms |
+| 8 small modules | 0.62 ms | 0.43 ms |
+| 10 of the package's own modules, read from another directory | 2.2 ms | 0.73 ms |
+| about 35 of the package's own modules, read from another directory | 4.7 ms | 1.8 ms |
+
+A `.zshrc` that loads the package's own modules pays only the path check. One that loads a few
+modules of its own pays about a tenth of a millisecond for each. The last two rows are the worst
+case, every one of the package's dozens of modules read as if it were the person's, and they stay
+under five milliseconds. A cold read adds the time to fetch each module's file from disk, which
+these figures leave out.
+
+
 ## Requalifying a package
 
 1. Change the pin in `shells/<shell>/manifest.json` to the fixed upstream release and its digest.
@@ -88,7 +181,11 @@ date, with the choices above) or `not-affected`.
 4. `bash scripts/fetch-shell-stacks.sh` — the startup customisations, if they are not already here.
 5. `bash scripts/e2e-fence.sh` — the whole qualification against the rebuilt package, on a real
    daemon and a real shell.
-6. Add a row to the triage record with the date, the change, the packages, the assessment, the
+6. `cargo test -p kr-shell-integration --test module_abi --test relocation -- --include-ignored` —
+   the native-module proof described below, and the proof that a moved Zsh tree still finds its
+   modules, against the rebuilt package. A release whose editor changed is the release that can
+   make a module the last one accepted fail to bind.
+7. Add a row to the triage record with the date, the change, the packages, the assessment, the
    target release date and the status.
 
 The identity the rebuild writes is a digest of its inputs, so the same pin and the same patches
