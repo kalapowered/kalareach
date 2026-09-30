@@ -22219,6 +22219,11 @@
           "type": "string"
         },
         {
+          "const": "not_allowed",
+          "description": "The organisation's allowlist does not name its package.",
+          "type": "string"
+        },
+        {
           "const": "unsupported",
           "description": "Its manifest does not support this host's operating system or architecture.",
           "type": "string"
