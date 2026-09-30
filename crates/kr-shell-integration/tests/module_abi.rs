@@ -22,10 +22,9 @@
 //! worker gives is driven by the worker's own suite.
 //!
 //! The cases drive this tree's built package, which an ordinary run does not have, so they are
-//! left out of one. A run that built the packages runs them with `--include-ignored`, as
-//! continuous integration's shell-packages job does. Building the modules needs the pinned Zsh
-//! archive that `scripts/build-shells.sh` fetched into the package cache, and is done once per
-//! package build.
+//! left out of one. A run that built the packages runs them with `--include-ignored`. Building the
+//! modules needs the pinned Zsh archive that `scripts/build-shells.sh` fetched into the package
+//! cache, and is done once per package build.
 
 #![cfg(unix)]
 
@@ -181,7 +180,7 @@ fn module<'a>(modules: &'a [LoadedModule], name: &str) -> &'a LoadedModule {
 /// KR-REQ-07.87, KR-REQ-07.88: the control. A module built for the package's editor loads, the
 /// report says it binds, and the contract lets the session qualify.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_module_built_for_the_packages_editor_binds_and_the_session_may_qualify() {
     let package = Package::built(ShellKind::Zsh);
     let modules = built_modules(&package);
@@ -209,7 +208,7 @@ fn a_module_built_for_the_packages_editor_binds_and_the_session_may_qualify() {
 /// does not have. The shell loads it, the report names what is missing, and the contract refuses
 /// the session with the named reason.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused() {
     let package = Package::built(ShellKind::Zsh);
     let modules = built_modules(&package);
@@ -243,7 +242,7 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
 /// that is not loaded yet binds (the shell loads it on demand), and so does one that imports a name
 /// it is content to lose.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_module_that_imports_from_an_unloaded_package_module_or_only_weakly_binds() {
     let package = Package::built(ShellKind::Zsh);
     let modules = built_modules(&package);
@@ -272,7 +271,7 @@ fn a_module_that_imports_from_an_unloaded_package_module_or_only_weakly_binds() 
 /// A module the bridge cannot read is reported as one it could not read, and the contract refuses
 /// it: an inspection that is not whole is never a module that binds.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_module_that_cannot_be_read_is_reported_as_unread_and_refused() {
     let package = Package::built(ShellKind::Zsh);
     let setup = home_with_modules(&package, &["kr_wrong_abi"]);
@@ -299,7 +298,7 @@ fn a_module_that_cannot_be_read_is_reported_as_unread_and_refused() {
 /// control that the diagnosis does not refuse what is built for the editor: the modules are real,
 /// dozens of them, and they import all that a module of the shell's own kind imports.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
     let package = Package::built(ShellKind::Zsh);
     let tree = PathBuf::from(
