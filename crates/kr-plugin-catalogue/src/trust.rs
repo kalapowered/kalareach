@@ -545,12 +545,21 @@ pub async fn verify(
     // rendered as the store keeps it. It runs on the blocking pool, so the runtime this host shares
     // with everything else is handed back until the result is here.
     let ledger = ledger.clone();
-    let checked =
-        tokio::task::spawn_blocking(move || check_index(&bytes, repository, targets, &ledger))
-            .await
-            .map_err(|source| CatalogueError::StorageUnavailable {
-                detail: format!("checking the index did not finish: {source}"),
-            })??;
+    let checked = match tokio::task::spawn_blocking(move || {
+        check_index(&bytes, repository, targets, &ledger)
+    })
+    .await
+    {
+        Ok(checked) => checked?,
+        // A panic in the checks is a defect in them, and unwinds here as it would had they run here.
+        Err(source) if source.is_panic() => std::panic::resume_unwind(source.into_panic()),
+        // The only other way a task ends unfinished is the runtime stopping under it.
+        Err(source) => {
+            return Err(CatalogueError::StorageUnavailable {
+                detail: format!("the runtime stopped before the index was checked: {source}"),
+            });
+        }
+    };
 
     Ok(VerifiedGeneration {
         generation: checked.index.generation,
