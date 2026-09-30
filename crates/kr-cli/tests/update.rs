@@ -607,6 +607,13 @@ impl Host {
 
     /// Starts `program` as this host's daemon and waits for it to answer.
     async fn start_daemon(&mut self, program: &Path) {
+        let root = self.tree.root().to_path_buf();
+        self.start_daemon_in(program, &root).await;
+    }
+
+    /// Starts `program` as this host's daemon, with `working_directory` as its own, and waits for
+    /// it to answer.
+    async fn start_daemon_in(&mut self, program: &Path, working_directory: &Path) {
         let log = self
             .tree
             .root()
@@ -616,6 +623,7 @@ impl Host {
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         let child = self
             .command(program, &arguments)
+            .current_dir(working_directory)
             .stdin(Stdio::null())
             .stdout(file.try_clone().expect("duplicates the log"))
             .stderr(file)
@@ -1560,6 +1568,97 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
             .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
         "the daemon this test started still serves the environment"
     );
+}
+
+/// KR-REQ-26.09: a daemon whose working directory was removed cannot say how it was started, and a
+/// `prepare` finds that out before it has changed anything: it is refused and the gate stays open.
+/// A `resume` and a `stop` are taken all the same, and answer, since what they answer is not what a
+/// daemon is started from: a step that answers an error is a step that was not taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_cannot_say_how_it_was_started_is_refused_before_its_gate_closes() {
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::update::HostUpdateHandoverResult;
+
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    let kr = host.store.stable(Program::Kr);
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+
+    // A daemon prepared while its directory is there, whose directory then goes: its resume is taken
+    // and answers, and its gate is open.
+    let directory = host.scratch("first-daemon-directory");
+    host.start_daemon_in(&controller, &directory).await;
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let attempt = handover_step(&host, &mut client, HandoverStep::Prepare, None, &two)
+        .await
+        .expect("the daemon prepares")
+        .to_typed::<HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("it answers the attempt it began");
+    std::fs::remove_dir(&directory).expect("the daemon's directory is removed");
+    handover_step(
+        &host,
+        &mut client,
+        HandoverStep::Resume,
+        Some(attempt),
+        &two,
+    )
+    .await
+    .expect("a resume is taken and answers");
+    let (display, _) = host.new_session(&kr);
+    host.close(&kr, &display);
+    // Another prepare is refused before it closes the gate: the daemon cannot say how it was
+    // started, and a session is still created.
+    let refused = handover_step(&host, &mut client, HandoverStep::Prepare, None, &two)
+        .await
+        .expect_err("a daemon that cannot say how it was started does not prepare");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    let (display, _) = host.new_session(&kr);
+    host.close(&kr, &display);
+
+    // Another daemon, prepared with its directory there: its stop is taken and answers, and the
+    // daemon ends.
+    for mut daemon in host.daemons.drain(..) {
+        daemon.kill().expect("stops");
+        daemon.wait().expect("ends");
+    }
+    let directory = host.scratch("second-daemon-directory");
+    host.start_daemon_in(&controller, &directory).await;
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let attempt = handover_step(&host, &mut client, HandoverStep::Prepare, None, &two)
+        .await
+        .expect("the daemon prepares")
+        .to_typed::<HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("it answers the attempt it began");
+    std::fs::remove_dir(&directory).expect("the daemon's directory is removed");
+    handover_step(&host, &mut client, HandoverStep::Stop, Some(attempt), &two)
+        .await
+        .expect("a stop is taken and answers");
+    let daemon = host
+        .daemons
+        .last_mut()
+        .expect("the daemon this test started");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(daemon.try_wait(), Ok(None)) {
+        assert!(Instant::now() < deadline, "the daemon did not stop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// KR-REQ-26.08: a daemon that starts after an update's first look, in an environment the update
