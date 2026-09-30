@@ -4185,7 +4185,8 @@ async fn installed_and_enabled(catalogue: &mut Catalogue, digest: PayloadDigest)
 
 /// A package whose own manifest does not list this host's operating system is not admitted, and
 /// separately one that lists the operating system and not this host's architecture there; each
-/// refusal says which of the two it was.
+/// refusal says which of the two it was. KR-REQ-18.06: the platforms a package lists are what a host
+/// admits it from.
 #[tokio::test]
 async fn an_unsupported_operating_system_and_separately_an_unsupported_architecture_are_not_admitted()
  {
@@ -4407,7 +4408,8 @@ fn builds_here_and_elsewhere(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
 }
 
 /// An admitted package carries the builds its current generation's entry names for this host's
-/// platform, and no other's; the installed release reads them too.
+/// platform, and no other's; the installed release reads them too. KR-REQ-18.06: the qualified
+/// builds a signed entry names are what a host admits an adapter's versions from.
 #[tokio::test]
 async fn an_admitted_package_carries_the_builds_named_for_this_hosts_platform() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -4476,6 +4478,9 @@ fn too_many_builds(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
 
 /// An index whose entry names a build on a platform the release does not list, or more builds than
 /// an entry may, is refused when it is verified, and the generation in use stays.
+/// KR-REQ-18.06 and KR-REQ-11.18: a signed entry may name a build only on a platform its release
+/// lists and one version for each executable, so the compatibility data a host admits from is
+/// consistent before it is used.
 #[tokio::test]
 async fn an_index_that_breaks_the_builds_rules_is_refused_and_the_generation_in_use_stays() {
     for (why, edit) in [
@@ -5657,6 +5662,72 @@ fn kr_ac_017_a_sync_hands_the_runtime_back_after_the_index_arrives() {
              the sync finishing"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-18.06: a signed registry with compatibility data and organisation allowlists
+// ---------------------------------------------------------------------------------------------
+
+/// An organisation's allowlist narrows what admission lets new bindings use: an installed, enabled
+/// package it does not name is not admitted, says why, and ends a binding at its next admission
+/// boundary, while the installation itself stays. A set that names it admits it again, and so does
+/// no set at all. The set here is one a test makes; how a signed policy reaches a host is not this
+/// crate's.
+#[tokio::test]
+async fn kr_req_18_06_an_installation_outside_the_organisations_allowlist_is_not_admitted() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let admitted = |catalogue: &Catalogue| {
+        catalogue
+            .admissions(environment(), &[], &this_host())
+            .expect("readable")
+    };
+
+    // Control: with no allowlist in force, the adapters the host qualifies are all admitted.
+    let everyone = admitted(&catalogue);
+    assert_eq!(everyone.packages.len(), 1, "{everyone:?}");
+    assert!(!everyone.releases[0].ends_at_next_boundary);
+
+    let another = PluginId::new("kalareach/another-adapter").expect("a valid plugin identifier");
+    catalogue
+        .allowed_adapters()
+        .put(Some(BTreeSet::from([another])));
+    let narrowed = admitted(&catalogue);
+    assert!(narrowed.packages.is_empty(), "{narrowed:?}");
+    assert_eq!(narrowed.not_admitted.len(), 1);
+    assert_eq!(
+        narrowed.not_admitted[0].reason,
+        NotAdmittedReason::NotAllowed
+    );
+    assert!(
+        narrowed.not_admitted[0].detail().contains("allows"),
+        "{}",
+        narrowed.not_admitted[0].detail()
+    );
+    assert!(
+        narrowed.releases[0].ends_at_next_boundary,
+        "a binding on it ends at its next admission boundary"
+    );
+    let installation = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("the installation stays");
+    assert!(installation.enabled, "the installation is not touched");
+
+    catalogue
+        .allowed_adapters()
+        .put(Some(BTreeSet::from([plugin()])));
+    assert_eq!(admitted(&catalogue).packages.len(), 1);
+    catalogue.allowed_adapters().put(None);
+    assert_eq!(admitted(&catalogue).packages.len(), 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6916,17 +6987,31 @@ fn the_other_component_answer(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) 
     entry.has_component = !entry.has_component;
 }
 
+fn another_sdk_range(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.sdk_range =
+        kr_plugin_sdk::version::VersionRange::parse(">=0.0.1, <0.0.2").expect("a version range");
+}
+
+fn another_wit_range(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.wit_range =
+        kr_plugin_sdk::version::VersionRange::parse(">=0.0.1, <0.0.2").expect("a version range");
+}
+
 /// A package already here is installed only when the entry that names it agrees with its manifest.
 ///
 /// A later signed index can say something about a hash that the manifest the hash names does not.
 /// The package is reused without a fetch, and what is installed is read from its own manifest, so
 /// the disagreement is refused rather than installed under the index's version of it.
+/// KR-REQ-18.06: the SDK and WIT ranges and the platforms an entry declares are the manifest's, or
+/// the entry is not what a host admits from.
 #[tokio::test]
 async fn a_package_already_here_is_installed_only_when_its_entry_agrees_with_its_manifest() {
-    let edits: [(&str, EntryEdit); 4] = [
+    let edits: [(&str, EntryEdit); 6] = [
         ("requested capabilities", one_capability_fewer),
         ("match rules", no_match_rules),
         ("platform support", no_platforms),
+        ("SDK and WIT ranges", another_sdk_range),
+        ("SDK and WIT ranges", another_wit_range),
         ("component", the_other_component_answer),
     ];
     for (field, edit) in edits {

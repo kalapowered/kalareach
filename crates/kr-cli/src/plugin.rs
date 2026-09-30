@@ -476,6 +476,9 @@ fn line(plugin: &PluginSummary) -> Line {
         match reason {
             // What the states above already say.
             PluginLeftOutReason::Disabled | PluginLeftOutReason::Revoked => {}
+            PluginLeftOutReason::NotAllowed => {
+                states.push("not admitted: not among the adapters the organisation allows");
+            }
             PluginLeftOutReason::Unsupported => states.push("not admitted: not for this host"),
             PluginLeftOutReason::Incomplete => {
                 states.push("not admitted: not whole in this host's store");

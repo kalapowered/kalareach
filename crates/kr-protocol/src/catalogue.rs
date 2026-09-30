@@ -508,6 +508,8 @@ pub enum PluginLeftOutReason {
     Disabled,
     /// Its repository revoked its exact package hash.
     Revoked,
+    /// The organisation's allowlist does not name its package.
+    NotAllowed,
     /// Its manifest does not support this host's operating system or architecture.
     Unsupported,
     /// Its package is not whole in this host's store.

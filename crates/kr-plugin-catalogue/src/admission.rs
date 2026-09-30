@@ -154,7 +154,7 @@ pub struct ReleaseState {
     /// The most a binding on it may use now.
     pub grant_cap: BTreeSet<PluginCapability>,
     /// Whether a binding on it ends at its next admission boundary: its package is disabled or
-    /// removed in this environment.
+    /// removed in this environment, or the organisation's allowlist does not name it.
     pub ends_at_next_boundary: bool,
 }
 
@@ -165,6 +165,8 @@ pub enum NotAdmittedReason {
     Disabled,
     /// The current generation of its origin revoked its exact package hash.
     Revoked(RevocationRecord),
+    /// The organisation's allowlist does not name its package.
+    NotAllowed,
     /// Its manifest does not support this host.
     Unsupported {
         /// What it does not support.
@@ -196,6 +198,9 @@ impl NotAdmitted {
         let subject = format!("{} at {}", self.plugin_id, self.package_digest);
         match &self.reason {
             NotAdmittedReason::Disabled => format!("{subject} is installed and disabled"),
+            NotAdmittedReason::NotAllowed => {
+                format!("{subject} is not among the adapters this organisation allows")
+            }
             NotAdmittedReason::Revoked(record) => format!(
                 "{subject} was revoked by its repository: {}",
                 record.statement.as_str()
@@ -231,6 +236,36 @@ pub struct Admissions {
     pub releases: Vec<ReleaseState>,
     /// Every installation left out of `packages`, and why.
     pub not_admitted: Vec<NotAdmitted>,
+}
+
+/// The adapters an organisation's policy allows, shared by the catalogue and whoever puts a policy
+/// in force, and read at every admission: a change reaches the next computation without the
+/// catalogue being told. `None` allows every adapter the host qualifies, and a set narrows
+/// admission to the adapters it names, never past what an installation, its grants and its
+/// package already allow.
+///
+/// Admissions carry the allowlist, so whoever puts one in force raises the admission revision
+/// after it, as any other change that moves admissions with no record changing does.
+#[derive(Clone, Debug, Default)]
+pub struct AllowedAdapters(std::sync::Arc<std::sync::Mutex<Option<BTreeSet<PluginId>>>>);
+
+impl AllowedAdapters {
+    /// Puts `allowed` in force for every admission from now on.
+    pub fn put(&self, allowed: Option<BTreeSet<PluginId>>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = allowed;
+    }
+
+    /// Returns the adapters allowed now, or `None` where every adapter is.
+    #[must_use]
+    pub fn get(&self) -> Option<BTreeSet<PluginId>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// The first part of an admission computation: everything the records and the current indexes
@@ -376,7 +411,10 @@ pub(crate) fn plan(
     live: &[LiveRelease],
     host: &HostPlatform,
     limits: PackageLimits,
+    allowed: Option<&BTreeSet<PluginId>>,
 ) -> CatalogueResult<AdmissionPlan> {
+    let permitted =
+        |plugin_id: &PluginId| allowed.is_none_or(|allowed| allowed.contains(plugin_id));
     let revision = records.admission_revision()?;
     let policy = records.disable_policy()?;
     let installations: Vec<Installation> = records
@@ -421,7 +459,7 @@ pub(crate) fn plan(
                 origin: origin.clone(),
                 revocation: revocation.clone(),
                 grant_cap: grants.clone(),
-                ends_at_next_boundary: !installation.enabled,
+                ends_at_next_boundary: !installation.enabled || !permitted(&installation.plugin_id),
             },
         );
         let refuse = |reason| NotAdmitted {
@@ -431,6 +469,10 @@ pub(crate) fn plan(
         };
         if !installation.enabled {
             not_admitted.push(refuse(NotAdmittedReason::Disabled));
+            continue;
+        }
+        if !permitted(&installation.plugin_id) {
+            not_admitted.push(refuse(NotAdmittedReason::NotAllowed));
             continue;
         }
         if let Some(record) = revocation {
@@ -482,7 +524,8 @@ pub(crate) fn plan(
                 origin: release.origin.clone(),
                 revocation,
                 grant_cap,
-                ends_at_next_boundary: !installed.is_some_and(|installation| installation.enabled),
+                ends_at_next_boundary: !installed.is_some_and(|installation| installation.enabled)
+                    || !permitted(&release.plugin_id),
             },
         );
     }

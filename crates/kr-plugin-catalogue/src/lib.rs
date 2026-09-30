@@ -84,8 +84,8 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
 pub use crate::admission::{
-    AdmissionPlan, Admissions, AdmittedComponent, AdmittedPackage, LiveRelease, NotAdmitted,
-    NotAdmittedReason, PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
+    AdmissionPlan, Admissions, AdmittedComponent, AdmittedPackage, AllowedAdapters, LiveRelease,
+    NotAdmitted, NotAdmittedReason, PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
 };
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
@@ -324,6 +324,8 @@ pub struct Catalogue {
     /// The limits in force, read at every use: every package's, and what one synchronisation may
     /// transfer.
     limits: LimitsInForce,
+    /// The adapters an organisation's policy allows, read at every admission.
+    allowed_adapters: AllowedAdapters,
 }
 
 impl Catalogue {
@@ -372,6 +374,7 @@ impl Catalogue {
             broker,
             transport,
             limits: LimitsInForce::default(),
+            allowed_adapters: AllowedAdapters::default(),
         })
     }
 
@@ -768,6 +771,13 @@ impl Catalogue {
         &self.limits
     }
 
+    /// Returns the adapters an organisation's policy allows, which every admission reads: nothing
+    /// is allowed or refused by it until a host puts a set in force.
+    #[must_use]
+    pub const fn allowed_adapters(&self) -> &AllowedAdapters {
+        &self.allowed_adapters
+    }
+
     /// Raises the admission revision under `authority`, for something the admissions carry that
     /// moves with no record changing: the native bridges a change follows. Every snapshot of the
     /// admissions computed before it is then below every one computed after it, and every worker
@@ -797,8 +807,17 @@ impl Catalogue {
         host: &HostPlatform,
     ) -> CatalogueResult<AdmissionPlan> {
         let limits = self.limits.get().package;
+        let allowed = self.allowed_adapters.get();
         self.read_kept(|records| {
-            admission::plan(&self.root, records, environment_id, live, host, limits)
+            admission::plan(
+                &self.root,
+                records,
+                environment_id,
+                live,
+                host,
+                limits,
+                allowed.as_ref(),
+            )
         })
     }
 
