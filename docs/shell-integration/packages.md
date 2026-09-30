@@ -45,7 +45,7 @@ cleanly.
 
 ## What Zsh changes
 
-Four patches, against `zsh-5.9`.
+Five patches, against `zsh-5.9`.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -53,6 +53,7 @@ Four patches, against `zsh-5.9`.
 | `0002-zle-reader-state` | `Src/Zle/zle_misc.c` | Three reader states the detach condition needs |
 | `0003-terminfo-variable-checks` | `configure.ac`, `configure` | The published upstream fix for the terminfo capability-name probes |
 | `0004-exec-command-resolve` | `Src/exec.c`, `Src/zsh.h`, `Src/Zle/zle_main.c` | The question in front of each command a line starts, and the launcher its answer can name |
+| `0005-module-paths-from-executable` | `Src/init.c` | The default module path and function path, read from where the executable is |
 
 The first patch does five things, all inside `zle_main.c`:
 
@@ -103,6 +104,15 @@ it, and refuses everything but a top-level command of the accepted line that the
 itself. When the answer names a launcher, the forked child's `execute` starts it in the command's
 place with the backend's variables added, and a launcher that cannot be started leaves the child
 running the command as it was typed.
+
+The fifth patch is what lets a tree be moved. A release is kept under a directory of its own, beside
+its predecessors, so the shell has to load its editor and its modules from where it is and not from
+the prefix the build named. `setupvals` reads the executable's own place (`/proc/self/exe` on Linux,
+`_NSGetExecutablePath` on macOS), takes `<prefix>` from `<prefix>/bin/zsh`, and where
+`<prefix>/lib/zsh/<version>` is a directory that is not the build's module directory it makes that
+directory `module_path` and moves every default function directory that was under the build's prefix
+under this one. A shell that is not in a `bin` directory keeps the paths it was built with, and what
+a person sets in their startup files is set afterwards and wins.
 
 ## What Bash changes
 

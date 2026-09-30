@@ -57,6 +57,12 @@
       "file": "patches/0004-exec-command-resolve.patch",
       "revision": "1",
       "purpose": "The executor asks the integration before it forks an external command started in the foreground with no pipe, through a pointer the line editor's bridge sets and clears, and the forked child starts the launcher the answer names in its place, with the backend's variables added; any other answer, and a launcher that cannot be started, leave the command exactly as it was typed."
+    },
+    {
+      "name": "module-paths-from-executable",
+      "file": "patches/0005-module-paths-from-executable.patch",
+      "revision": "1",
+      "purpose": "The default module path and the default function path are read from the executable's own place, so a tree that is installed under a directory of its own and moved still loads its editor and its modules from where it is; a tree that is not in a bin directory, or whose modules are where the build put them, keeps the paths it was built with, and what a person sets in their startup files still wins."
     }
   ],
   "sources": [

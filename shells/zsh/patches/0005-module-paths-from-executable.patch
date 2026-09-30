@@ -1,0 +1,131 @@
+Subject: [PATCH 5/5] init: find the modules and functions from where the executable is
+
+A tree that is installed under a directory of its own, and may be moved, has to load its modules and
+read its functions from where it is, not from where it was built: a release kept in a store beside
+its predecessors would otherwise load the editor from a path that no longer exists, or from the
+wrong release. The default module path and the default function path are therefore read from the
+executable. `<prefix>/bin/zsh` gives `<prefix>`, and where `<prefix>/lib/zsh/<version>` is a
+directory and is not the module directory the build named, the module path is that directory and
+every function directory that was under the build's prefix is under this one. A shell that is not in
+a `bin` directory, on a platform whose executable's place cannot be read, or whose tree holds no
+modules where the build put them, keeps the paths it was built with, and the settings a person
+makes in their startup files are made after this and win as they always did.
+
+---
+--- a/Src/init.c
++++ b/Src/init.c
+@@ -36,6 +36,10 @@
+ 
+ #include "version.h"
+ 
++#ifdef __APPLE__
++# include <mach-o/dyld.h>
++#endif
++
+ /**/
+ int noexitct = 0;
+ 
+@@ -877,8 +881,95 @@
+ }
+ 
+ /* Initialize lots of global variables and hash tables */
++
++/*
++ * Where the tree this executable belongs to is, read from the executable itself: `<prefix>/bin/zsh`
++ * gives `<prefix>`.  A tree that is installed under a directory of its own and may be moved has to
++ * find its modules and its functions from where it is, not from where it was built.  Returns NULL
++ * when the executable is not in a `bin` directory or its place cannot be read on this platform.
++ */
++
++/**/
++static char *
++executable_prefix(void)
++{
++    char found[PATH_MAX + 1], resolved[PATH_MAX + 1], *slash;
++#if defined(__APPLE__)
++    uint32_t size = sizeof(found);
++
++    if (_NSGetExecutablePath(found, &size) != 0)
++	return NULL;
++#elif defined(__linux__)
++    ssize_t length = readlink("/proc/self/exe", found, sizeof(found) - 1);
++
++    if (length <= 0)
++	return NULL;
++    found[length] = '\0';
++#else
++    return NULL;
++#endif
++    if (!realpath(found, resolved))
++	return NULL;
++    slash = strrchr(resolved, '/');
++    if (!slash || slash == resolved)
++	return NULL;
++    *slash = '\0';
++    slash = strrchr(resolved, '/');
++    if (!slash || strcmp(slash, "/bin"))
++	return NULL;
++    *slash = '\0';
++    return metafy(resolved, -1, META_DUP);
++}
++
++/*
++ * Points the default module path and function path at the tree this executable is in, when that
++ * tree holds its modules under `lib/zsh/<version>` and is not where the build put it.  The
++ * settings a user makes in their startup files are made after this and still win.
++ */
+ 
+ /**/
++static void
++rebase_default_paths(void)
++{
++    static const char modules_tail[] = "/lib/zsh/" ZSH_VERSION;
++    char *prefix = executable_prefix(), *built = ztrdup(MODULE_DIR), *modules;
++    size_t built_length = strlen(built), tail_length = strlen(modules_tail), prefix_length;
++    struct stat about;
++    char **element;
++
++    if (!prefix)
++	goto done;
++    prefix_length = strlen(prefix);
++    /* The build's own prefix is what its module directory is under. */
++    if (built_length <= tail_length ||
++	strcmp(built + built_length - tail_length, modules_tail))
++	goto done;
++    built_length -= tail_length;
++    built[built_length] = '\0';
++    if (built_length == prefix_length && !strncmp(built, prefix, prefix_length))
++	goto done;
++    modules = tricat(prefix, modules_tail, "");
++    if (stat(unmeta(modules), &about) != 0 || !S_ISDIR(about.st_mode)) {
++	zsfree(modules);
++	goto done;
++    }
++    zsfree(module_path[0]);
++    module_path[0] = modules;
++    for (element = fpath; element && *element; element++) {
++	if (!strncmp(*element, built, built_length) &&
++	    ((*element)[built_length] == '/' || (*element)[built_length] == '\0')) {
++	    char *moved = tricat(prefix, *element + built_length, "");
++
++	    zsfree(*element);
++	    *element = moved;
++	}
++    }
++  done:
++    zsfree(built);
++    zsfree(prefix);
++}
++
++/**/
+ void
+ setupvals(char *cmd, char *runscript, char *zsh_name)
+ {
+@@ -1044,6 +1135,7 @@
+     mailpath = mkarray(NULL);
+     psvar    = mkarray(NULL);
+     module_path = mkarray(ztrdup(MODULE_DIR));
++    rebase_default_paths();
+     modulestab = newmoduletable(17, "modules");
+     linkedmodules = znewlinklist();
+ 
