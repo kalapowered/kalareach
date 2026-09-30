@@ -38,9 +38,10 @@ refuses it with `UNSUPPORTED_SCHEMA`.
 
 A failure the page shows says the host's own words and, where its code maps to something the person
 can do, that action after them: pair the device again, sign in, update, wait, refresh, check
-whether it went through, or change a setting. It never says the code. A failure whose code asks
-nothing of the person says the host's words alone. Native code names the action by its key, and the
-page's words for each key are the client library's own.
+whether it went through, or change a setting. The client library says a host's refusal as its code,
+a colon and the host's words, and the page leaves the code out. A failure whose code asks nothing of
+the person says the host's words alone. Native code names the action by its key, and the page's
+words for each key are the client library's own.
 
 Native code tells the page about changes through listeners: the connection's state, the host's
 events, where the account stands, pairing, owner confirmations and dropped files. The shell

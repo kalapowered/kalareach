@@ -454,6 +454,36 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
     expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration')
   })
 
+  it('says what to do about a send whose outcome is unknown, in words and never the code (KR-REQ-23.57)', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    // A failure as native code sends it: the client library's rendering, the code and a colon in
+    // front of the host's words, and the key of the action the code maps to.
+    const lost = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'OUTCOME_UNKNOWN',
+          message: 'OUTCOME_UNKNOWN: the connection ended after the request was sent',
+          user_action: 'check_the_outcome'
+        })
+    }
+    render(
+      <AppProvider port={lost}>
+        <MobileApp surface="android" storage={null} />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'run the migration')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    const said = await screen.findAllByText(
+      'the connection ended after the request was sent. Check whether this went through before trying it again.'
+    )
+    expect(said.length).toBeGreaterThan(0)
+    expect(document.body).not.toHaveTextContent('OUTCOME_UNKNOWN')
+  })
+
   it('says so when the device refuses to keep what was written', async () => {
     const person = userEvent.setup()
     const refusing = {
