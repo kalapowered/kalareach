@@ -154,13 +154,13 @@ impl Controller {
                             .withheld(ContentClass::Message, &error.message),
                     );
                     crate::config::EnforcedDisablePolicy {
-                        value: self.retained_disable_policy().await,
+                        value: self.retained_disable_policy(&mut None).await,
                         from_document: false,
                     }
                 }
             },
             None => crate::config::EnforcedDisablePolicy {
-                value: self.retained_disable_policy().await,
+                value: self.retained_disable_policy(&mut policy_failure).await,
                 from_document: false,
             },
         };
@@ -398,13 +398,29 @@ impl Controller {
         }
     }
 
-    /// The disable policy already in force, for a reading that decided none. A policy that cannot
-    /// be read is reported as the product's own, and the acceptance says why it could not be.
-    async fn retained_disable_policy(&self) -> kr_protocol::admission::RevocationPolicy {
-        self.catalogue
-            .disable_policy_in_force()
-            .await
-            .unwrap_or(kr_protocol::admission::RevocationPolicy::WarnOnly)
+    /// The disable policy already in force, for a reading that decided none.
+    ///
+    /// A policy that cannot be read is not reported as the product's own: the answer says so in
+    /// `failure`, and the value returned is what this host enforces when it cannot tell, which is
+    /// the strictest reading of the setting it could not read.
+    async fn retained_disable_policy(
+        &self,
+        failure: &mut Option<Sentence>,
+    ) -> kr_protocol::admission::RevocationPolicy {
+        match self.catalogue.disable_policy_in_force().await {
+            Ok(policy) => policy,
+            Err(error) => {
+                *failure = Some(
+                    Sentence::new()
+                        .stated(
+                            "the disable policy this host holds could not be read, so nothing \
+                             is known of it: ",
+                        )
+                        .withheld(ContentClass::Message, &error.message),
+                );
+                kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission
+            }
+        }
     }
 
     /// Puts the document's session ceiling where admission reads it, and returns what is in force.

@@ -5684,9 +5684,10 @@ where
 /// control is a stand-in that parses the same index on the runtime's thread, which finishes before
 /// the pool is let go.
 ///
-/// What this shows is that work on the index is off the runtime's thread and that the sync does
-/// not finish until it is done. It does not show how long any later stretch on the calling thread
-/// runs.
+/// What this shows is that the sync sends work to the blocking pool after the index arrives and
+/// does not finish until the pool has done it. It does not tell which operations inside that work
+/// are on the pool (a parse on the runtime's thread followed by a render on the pool would pass),
+/// nor how long any later stretch on the calling thread runs.
 #[test]
 fn kr_ac_017_a_sync_hands_the_runtime_back_while_its_work_on_the_index_is_pending() {
     // Control: parsing the index on the runtime's thread finishes without waiting for the pool.
