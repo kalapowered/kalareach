@@ -766,6 +766,17 @@ jobs:
           rustup target add aarch64-pc-windows-msvc
           cargo check --locked -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project --target aarch64-pc-windows-msvc
 
+      # Whatever the tests wrote to the artefact directory, kept whether the run passed or not: a
+      # failure on this platform is the only evidence of how it failed here. A run whose tests
+      # wrote nothing there keeps nothing.
+      - name: Keep the test evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-windows
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
   shell-packages:
     name: shell-packages
     runs-on: ubuntu-24.04
@@ -1417,6 +1428,17 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 45
         run: bash scripts/performance.sh
+
+      # The figures and whatever else the steps above wrote to the artefact directory, kept whether
+      # or not the run passed: on this platform they are the only record of how a failure looked.
+      - name: Keep the test evidence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-macos
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
 
       # What the disk had left once every step above was done, and the size of what the save below
       # stores.
