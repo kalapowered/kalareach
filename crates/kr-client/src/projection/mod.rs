@@ -31,7 +31,6 @@
 //! byte arriving. An update that does not match both is refused, and the client asks for a fresh
 //! snapshot rather than applying a change to a screen it never had.
 
-#[cfg(feature = "terminal")]
 pub mod paint;
 
 use std::collections::BTreeMap;

@@ -28,6 +28,7 @@ queries, and one destination for side effects.
 | `snapshot` | Presentation state, deltas, and side-effect-free restoration |
 | `probe` | The bounded handshake with a physical terminal |
 | `terminfo` | The private pinned `xterm-256color` database and the XTGETTCAP responder |
+| `unicode` | The pinned width model, whose functions live in `kr-width` so that a phone measures with the same tables |
 
 ## The class table
 
@@ -233,6 +234,20 @@ The library also keeps a row in one of two representations, and the compact one 
 single string. Reading that string back by clustering it again would undo the cut, so the pinned
 revision has a compact row record where its cells are whenever clustering would not give them back.
 A row therefore keeps the cells it was given, on screen and in the scrollback alike.
+
+The width functions are in their own crate, `kr-width`, over the pinned library's cell crate, which
+holds the width function and its tables. `kr-term` uses them for the grid and re-exports them, and a
+client that paints a screen it was sent uses them directly. The library's terminal-state crates
+depend on a terminal-mode crate that has no target for Apple's mobile systems, and its cell crate
+does not, so a phone measures text with the tables the terminal engine measures with, and places a
+run of mixed widths at the columns a desktop does. A test holds `kr-width` to
+`wezterm_term::grapheme_column_width`: every scalar, the rows of `fixtures/terminal/width.json` and
+a generated corpus of sequences must come out the same, and a run's width is the sum of its scalars'
+widths, because the function itself caps a cluster at two.
+
+Below U+0300 `is_zero_width` does not look scalars up in the table, since almost nothing there is
+zero width. The exceptions are the C0 and C1 controls, which never reach it, and U+00AD, which the
+table gives no cells and which `is_zero_width` reports as having one.
 
 Three rules keep the answer the same however the reads fall.
 
