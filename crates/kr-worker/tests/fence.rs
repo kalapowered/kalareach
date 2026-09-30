@@ -6056,8 +6056,17 @@ async fn an_answer_still_unwritten_when_a_later_exchange_begins_keeps_that_excha
         .await
         .expect("enters");
     let first = asked_for_a_fence(&mut wired).await;
+    // The boundary is held by a thread of its own until the case lets it go, so no guard is held
+    // across an await here.
     let boundary = wired.runtime.session().input_gate();
-    let held = boundary.lock().expect("the input boundary is not poisoned");
+    let (holding, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _boundary = boundary.lock().expect("the input boundary is not poisoned");
+        holding.send(()).expect("the case is waiting");
+        let _ = released.recv();
+    });
+    held.recv().expect("the boundary is held");
     the_host_answers_the_application(&wired);
     wired
         .bridge
@@ -6087,7 +6096,8 @@ async fn an_answer_still_unwritten_when_a_later_exchange_begins_keeps_that_excha
         FenceState::Unfenced
     );
 
-    drop(held);
+    release.send(()).expect("the holder is waiting");
+    holder.join().expect("the holder ended");
     until_replies_written(&wired.runtime).await;
     wired
         .bridge
