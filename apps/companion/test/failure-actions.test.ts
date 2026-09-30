@@ -33,6 +33,40 @@ describe('the words for a failure', () => {
     expect(Object.keys(USER_ACTIONS)).toHaveLength(7)
   })
 
+  it('end the host’s words before the action when they do not end a sentence themselves', () => {
+    expect(
+      failureMessage({
+        code: 'UPSTREAM_UNAVAILABLE',
+        message: 'this application is not connected to a host',
+        user_action: 'wait'
+      })
+    ).toBe('this application is not connected to a host. Wait a moment and try again.')
+    expect(
+      failureMessage({ code: 'RATE_LIMITED', message: 'slow down (retry after 30s)', user_action: 'wait' })
+    ).toBe('slow down (retry after 30s). Wait a moment and try again.')
+  })
+
+  it('leave out the code the client library puts in front of a host’s words, as native code sends it', () => {
+    expect(
+      failureMessage({
+        code: 'UNKNOWN_SESSION',
+        message: 'UNKNOWN_SESSION: no session has that number.',
+        user_action: 'resync'
+      })
+    ).toBe('no session has that number. Refresh: this view has fallen behind.')
+    expect(
+      failureMessage({ code: 'SESSION_CLOSED', message: 'SESSION_CLOSED: the session closed.', user_action: 'nothing' })
+    ).toBe('the session closed.')
+    // Only its own code goes: another code in the words is the host's to say.
+    expect(
+      failureMessage({ code: 'SESSION_CLOSED', message: 'STALE_SESSION: the session closed.', user_action: 'nothing' })
+    ).toBe('STALE_SESSION: the session closed.')
+    // A refusal with no words after the code is a failure with no words.
+    expect(failureMessage({ code: 'SESSION_CLOSED', message: 'SESSION_CLOSED: ', user_action: 'nothing' })).toBe(
+      'Something went wrong.'
+    )
+  })
+
   it('offer the action of a failure that came with no words of its own too', () => {
     expect(failureMessage({ code: 'PAIRING_EXPIRED', message: ' ', user_action: 'pair_again' })).toBe(
       'Something went wrong. Pair this device with the host again.'

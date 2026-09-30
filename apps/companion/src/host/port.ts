@@ -1238,7 +1238,7 @@ export function isHostError(value: unknown): value is HostError {
 }
 
 /**
- * What a person can do about a failure, in words, for each action native code names a code's by.
+ * What a person can do about a failure, in words, for each key native code names an action by.
  *
  * Section 23 has the interface translate a code into a direct action rather than show the code.
  * Native code attaches the key of the action a code maps to (`UserAction::as_str` in the client
@@ -1258,15 +1258,23 @@ export const USER_ACTIONS: Readonly<Record<string, string>> = {
 /**
  * The message to show for a failure, whatever shape it arrived in, and never an empty one: a
  * failure that came with no words of its own is still a failure, and says so in these. A host
- * failure whose code maps to something the person can do says that after the host's words, and
- * never the code.
+ * failure whose code maps to something the person can do says that after the host's words.
+ *
+ * The client library says a host's refusal as its code, a colon and the host's words. The words are
+ * for the person and the code is not, so the code goes: section 23 has the interface translate a
+ * code into a direct action, and not show the code by default.
  */
 export function failureMessage(value: unknown): string {
-  const own = isHostError(value) || value instanceof Error ? value.message : ''
-  const said = own.trim().length > 0 ? own : 'Something went wrong.'
-  const key = isHostError(value) ? value.user_action : undefined
+  const failure = isHostError(value) ? value : null
+  const own = failure !== null ? failure.message : value instanceof Error ? value.message : ''
+  const codeFirst = failure === null ? '' : `${failure.code}: `
+  const words = codeFirst !== '' && own.startsWith(codeFirst) ? own.slice(codeFirst.length) : own
+  const said = words.trim().length > 0 ? words : 'Something went wrong.'
+  const key = failure?.user_action
   const action = typeof key === 'string' && Object.hasOwn(USER_ACTIONS, key) ? USER_ACTIONS[key] : undefined
-  return action === undefined ? said : `${said} ${action}`
+  if (action === undefined) return said
+  const sentence = said.trimEnd()
+  return `${sentence}${/[.!?…]$/.test(sentence) ? '' : '.'} ${action}`
 }
 
 /** The protocol code of a failure, or null when it did not carry one. */

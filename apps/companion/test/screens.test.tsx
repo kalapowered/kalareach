@@ -416,6 +416,46 @@ describe('the semantic view', () => {
     expect(screen.getByTestId('composer-send')).toBeEnabled()
   })
 
+  it('says what to do about a file that was not uploaded, in words and never the code (KR-REQ-23.57)', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let fail: (failure: unknown) => void = () => undefined
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          attachmentUpload: () =>
+            new Promise((_, reject) => {
+              fail = reject
+            })
+        }}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer-queue')
+    await person.type(screen.getByTestId('composer-input'), 'Look at this')
+    controls.dropFiles([
+      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
+    ])
+    await screen.findByTestId('draft-attachments')
+    // A failure as native code sends it: the code and a colon in front of the host's words, and the
+    // key of the action the code maps to.
+    await act(async () => {
+      fail({
+        code: 'STORAGE_UNAVAILABLE',
+        message: 'STORAGE_UNAVAILABLE: the staging area is full',
+        user_action: 'wait'
+      })
+      await Promise.resolve()
+    })
+    expect(await screen.findByTestId('insertion-refusal')).toHaveTextContent(
+      'diagram.png was not uploaded: the staging area is full. Wait a moment and try again.'
+    )
+    expect(screen.getByTestId('insertion-refusal')).not.toHaveTextContent('STORAGE_UNAVAILABLE')
+  })
+
   it.each([
     ['succeeds', true],
     ['fails', false]
