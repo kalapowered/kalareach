@@ -5,7 +5,6 @@
 //! writer that agrees only with its own reader proves nothing about the libraries a shell, `vim` or
 //! `tmux` will load it with.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use kr_term::terminfo::{self, CompileError, Description};
@@ -34,11 +33,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// Writes `description` into a database directory the way the host does, under every leaf.
-fn database_of(description: &Description, root: &Path) {
-    description.install(root).expect("the database is written");
 }
 
 // ------------------------------------------------------------------------------- the header
@@ -215,7 +209,13 @@ fn the_database_directory_holds_the_entry_under_every_convention() {
 #[cfg(unix)]
 mod tools {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::process::Command;
+
+    /// Writes `description` into a database directory the way the host does, under every leaf.
+    fn database_of(description: &Description, root: &Path) {
+        description.install(root).expect("the database is written");
+    }
 
     /// The `infocmp` programs a host may have: the system's, and one from a package manager.
     fn infocmps() -> Vec<PathBuf> {
