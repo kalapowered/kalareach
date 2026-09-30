@@ -948,24 +948,11 @@ fn shell_line(
     // paste, whose first character is text, and would be sent to the model as a prompt. Nothing
     // else is typed until the composer shows it is in shell mode.
     logged.type_text(stage, "!");
-    let opened = std::time::Instant::now();
-    loop {
-        logged.screen.pump(stage, Duration::from_millis(100));
-        if logged
-            .screen
-            .view
-            .rows()
-            .iter()
-            .any(|row| row.trim_start().starts_with("\u{2502} !"))
-        {
-            break;
-        }
-        assert!(
-            opened.elapsed() < Duration::from_secs(5),
-            "{ISOLATION_UNPROVEN} the composer did not show its shell mode after the escape, so \
-             no shell line was typed"
-        );
-    }
+    let _ = logged.wait_for(
+        stage,
+        "shell mode",
+        "the composer shows its shell mode after the escape, before any shell line is typed",
+    );
     logged.type_text(stage, &format!(" {line}; echo {prefix}$((1000+$?))"));
     std::thread::sleep(Duration::from_millis(300));
     let submit = stage
