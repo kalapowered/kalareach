@@ -1324,8 +1324,15 @@ async fn kr_req_25_21_a_revocation_stripped_from_a_signed_index_is_refused_and_t
         !document["entries"][0]["revocation"].is_null(),
         "generation two revokes the release"
     );
+    // The document written out again unedited is the signed bytes, so only the edit below can be
+    // what the metadata refuses.
+    let mut written = serde_json::to_vec(&document).expect("serialisable");
+    written.push(b'\n');
+    assert_eq!(written, published, "an unedited document is the signed one");
     document["entries"][0]["revocation"] = serde_json::Value::Null;
-    std::fs::write(&index, serde_json::to_vec(&document).expect("serialisable")).expect("writable");
+    let mut stripped = serde_json::to_vec(&document).expect("serialisable");
+    stripped.push(b'\n');
+    std::fs::write(&index, &stripped).expect("writable");
 
     let refusal = catalogue
         .sync(&repository())
@@ -5499,6 +5506,14 @@ async fn kr_req_11_04_a_signed_ten_thousand_entry_snapshot_syncs_and_serves_offl
         });
         assert_eq!(found.len(), 1, "agent-{ordinal}");
     }
+
+    // The package that was published with its files is matched as well: ten thousand entries.
+    let found = lookup.candidates(&Observation {
+        executable_path: "/usr/local/bin/example-agent".to_owned(),
+        distribution: None,
+    });
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].plugin_id, plugin());
 
     // A payload that was never fetched is unavailable, not a capability this host invented.
     let uncached = PluginId::new("kalareach/agent-7421").expect("a valid plugin identifier");
