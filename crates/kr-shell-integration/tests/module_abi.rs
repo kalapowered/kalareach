@@ -319,6 +319,11 @@ fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let setup = home_with_modules(&package, &names);
     copy_tree(&tree, &setup.home.join("modules"));
+    // The editor the shell runs is the one its module path finds first. Where the shell sets it up
+    // only when a startup file asks, after that file has put the home's directory first, a copy of
+    // it here would be the editor, and the package's own directory would be this one.
+    std::fs::remove_file(setup.home.join("modules/zsh/zle.so"))
+        .expect("the copy of the editor goes, so the package's own is loaded");
     warm(&package, &setup, &names);
 
     let mut session = Session::start_for(&package, &case(), &setup);
