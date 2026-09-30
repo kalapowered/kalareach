@@ -2,13 +2,13 @@
 //!
 //! The control daemon runs in this test's process, as the host suites run it, and starts each
 //! session's worker as a detached process of its own: the real `kr-worker` this workspace builds,
-//! checked to be this build and copied to the internal disk with everything else a launched
-//! process touches. The session's root program asks for bracketed paste, records every byte of
-//! input it reads, as it reads it, in a file of its own, so what reached the application is read
-//! from the application's own record, and writes a numbered line every twentieth of a second once
-//! the test releases it. A terminal is a local client on the worker's own endpoint, as a person's
-//! is; a client that is to be killed is this test binary run again, as a process of its own, in a
-//! mode where it does that and nothing else.
+//! whose version is checked to be this build's, copied to the internal disk with everything else a
+//! launched process touches. The session's root program asks for bracketed paste, records every
+//! byte of input it reads, as it reads it, in a file of its own, so what reached the application is
+//! read from the application's own record, and writes a numbered line every twentieth of a second
+//! once the test releases it. A terminal is a local client on the worker's own endpoint, as a
+//! person's is; a client that is to be killed is this test binary run again, as a process of its
+//! own, in a mode where it does that and nothing else.
 //!
 //! A kill happens only at a named point that the peers prove. A paste is open once the program's
 //! record holds the paste's start and the first half of what was pasted. Output is flowing once the
@@ -74,7 +74,7 @@ const RESTART_WATCH: Duration = Duration::from_secs(3);
 ///
 /// The terminal is put into raw mode first, so every byte of input reaches the record as it was
 /// written and nothing is echoed. Its reader, a child that copies the terminal's input into the
-/// record, starts before anything is written. It writes nothing until the test creates
+/// record, starts before anything is written. It writes no numbered line until the test creates
 /// `kr-flow-go`, once every terminal has subscribed, and ends itself by a signal to its own process
 /// number when the test creates `kr-die`.
 const ROOT_PROGRAM: &str = r#"#!/bin/sh
@@ -127,10 +127,12 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The worker this workspace builds, beside this test, checked to be this build.
+/// The worker this workspace builds, beside this test.
 ///
 /// A test run of this crate alone does not build the worker, so one an earlier build left in the
-/// target directory could be started, and every check below would be about another build.
+/// target directory could be started, and every check below would be about another build. The
+/// version the worker reports is checked against this build's, which catches a worker of another
+/// release or protocol; a run of this crate alone builds the worker first.
 fn built_worker() -> PathBuf {
     let mut directory = std::env::current_exe().expect("this test's own path");
     directory.pop();
@@ -177,7 +179,7 @@ impl Host {
         assert_eq!(
             String::from_utf8_lossy(&said.stdout).trim(),
             this,
-            "the worker at {} is of another build; build this one",
+            "the worker at {} is of another version; build this one",
             worker.display()
         );
         let root_program = tree.root().join("kr-kill-root");
@@ -258,7 +260,7 @@ impl Host {
     }
 
     /// Creates a session running the root program in `work`, and waits until the program is
-    /// running: its reader has started and its record is open. It writes nothing yet.
+    /// running: its reader has started and its record is open. It writes no line yet.
     async fn create(&self, work: &Path) -> (SessionId, Dimensions) {
         let created: SessionCreateResult = self
             .daemon()
@@ -449,9 +451,11 @@ struct Half {
 impl Half {
     /// Kills the client half where it stands, and collects it.
     fn kill(&mut self) -> std::process::ExitStatus {
-        let mut child = self.child.take().expect("the half is running");
+        let child = self.child.as_mut().expect("the half is running");
         child.kill().expect("kills the client half");
-        child.wait().expect("collects the client half")
+        let status = child.wait().expect("collects the client half");
+        self.child = None;
+        status
     }
 }
 
@@ -868,7 +872,7 @@ async fn a_session_closed_on_request_is_not_ended_as_a_killed_worker_ends_one() 
     for terminal in [&mut holder, &mut onlooker] {
         let how = terminal.until_ended().await;
         assert!(
-            matches!(&how, Ended::Closed(closure) if closure.reason == ClosureReason::CloseRequested),
+            matches!(&how, Ended::Closed(closed) if closed.reason == ClosureReason::CloseRequested),
             "each terminal is told the session was closed on request: {how:?}"
         );
     }
@@ -997,8 +1001,8 @@ fn names_the_kill(closure: &ClosureRecord) -> bool {
 }
 
 /// KR-REQ-27.05, the root program killed on its own: the root program kills itself while its
-/// output flows. The session closes with the kill signal that ended it, every terminal is told so, the worker
-/// ends by itself, the record stays with the daemon, and nothing starts again.
+/// output flows. The session closes with the kill signal that ended it, every terminal is told so,
+/// the worker ends by itself, the record stays with the daemon, and nothing starts again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_root_program_killed_during_output_closes_its_session_with_the_signal_and_tells_everyone()
 {
