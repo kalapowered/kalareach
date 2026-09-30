@@ -1187,11 +1187,7 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
             let piece = &text[start..index];
             out.push(Cluster {
                 text: piece,
-                cells: if has_cell {
-                    cells_for(piece) as u64
-                } else {
-                    0
-                },
+                cells: if has_cell { cells_for(piece) as u64 } else { 0 },
             });
             start = index;
         }
@@ -2878,9 +2874,7 @@ mod safety {
                     truncated: false,
                     runs: vec![CellRun {
                         column: U64::ZERO,
-                        cells: U64::new(
-                            u64::try_from(cells_for(text)).unwrap_or_default(),
-                        ),
+                        cells: U64::new(u64::try_from(cells_for(text)).unwrap_or_default()),
                         text: text.to_owned(),
                         rendition: CellRendition::PLAIN,
                         hyperlink: Nullable(link.map(str::to_owned)),
