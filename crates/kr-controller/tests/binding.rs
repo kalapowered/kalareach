@@ -1476,10 +1476,11 @@ fn name_the_policy(hosted: &Hosted, policy: kr_protocol::admission::RevocationPo
     .expect("the document");
 }
 
-/// KR-REQ-25.22: the first snapshot a worker that outlived the last daemon is sent carries the
-/// policy this host's configuration decides, not the one the catalogue recorded before the
-/// restart: the cadence that sends it starts before the document is accepted, so the policy is
-/// put in force when the catalogue opens.
+/// KR-REQ-25.22: no snapshot a restarted daemon computes for a worker that outlived the last one
+/// carries the policy the catalogue recorded before the restart rather than the one this host's
+/// configuration decides. The cadence that sends the first round starts before the document is
+/// accepted, so the policy is put in force when the catalogue opens; the configuration suite holds
+/// that ordering by construction, and this case shows it with a real worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configuration_decides() {
     use kr_protocol::admission::RevocationPolicy;
