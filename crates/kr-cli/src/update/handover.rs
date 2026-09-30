@@ -26,7 +26,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::install::Store;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, EnvironmentId};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -304,7 +304,8 @@ pub async fn held(store: &Store, environment: &Environment, within: Duration) ->
 }
 
 /// Waits for the daemon holding an environment to have gone: [`DAEMON_STOP`], and each look at the
-/// environment may itself wait, for its own bound, for a daemon that is starting.
+/// environment may itself wait, for its own bound, for a daemon that is starting, and the last look
+/// asks what the daemon there answers as.
 ///
 /// `expected` is the release a daemon that has taken its place answers as.
 ///
@@ -446,9 +447,11 @@ pub async fn hold(
 ///
 /// Whether a daemon still holds the environment is asked as [`held`] asks, under the install lock,
 /// so that no daemon part way through taking the environment meets the look and exits. What it then
-/// answers as is asked once: a daemon that answers as `expected` is serving, whatever it did while
-/// the update waited, and is not to be stopped. Where a daemon that is starting holds the install
-/// lock past its bound, the environment is not looked at and no process is named.
+/// answers as is asked once, for up to [`DAEMON_ANSWER`], a daemon that has taken the environment
+/// and not yet begun to listen being given that time: a daemon that answers as `expected` is
+/// serving, whatever it did while the update waited, and is not to be stopped. Where a daemon that
+/// is starting holds the install lock past its bound, the environment is not looked at and no
+/// process is named.
 pub async fn still_running(
     store: &Store,
     environment: &Environment,
@@ -464,63 +467,90 @@ pub async fn still_running(
             let answers_as = answers_as_now(environment).await;
             holder_said(
                 environment.environment_id,
-                Some((pid, answers_as.as_deref())),
+                Some((pid, answers_as.as_ref())),
                 expected,
             )
         }
     }
 }
 
-/// What a daemon holding an environment answers as, if it answers within [`DAEMON_ANSWER`].
-async fn answers_as_now(environment: &Environment) -> Option<String> {
+/// What a daemon holding an environment answers as, if it answers within [`DAEMON_ANSWER`]: a
+/// daemon that has taken the environment and does not yet listen is tried again until then.
+pub(super) async fn answers_as_now(environment: &Environment) -> Option<BuildId> {
     let endpoint = environment.paths.controller_endpoint().ok()?;
-    let client = tokio::time::timeout(
-        DAEMON_ANSWER,
-        LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let stated = client
-        .acknowledgement()
-        .build
-        .as_ref()
-        .map(|build| build.build_id.as_str().to_owned());
-    stated
+    let deadline = tokio::time::Instant::now() + DAEMON_ANSWER;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(
+            left,
+            LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
+                return client
+                    .acknowledgement()
+                    .build
+                    .as_ref()
+                    .map(|build| build.build_id.clone());
+            }
+            Ok(Err(error))
+                if nothing_listening(&error) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// What is said of an environment's daemon: `None` when no daemon holds it now, and otherwise the
 /// process its lock names and the build it answers as, where it answers.
 pub(super) fn holder_said(
     environment_id: EnvironmentId,
-    holder: Option<(Option<u32>, Option<&str>)>,
+    holder: Option<(Option<u32>, Option<&BuildId>)>,
     expected: &ReleaseName,
 ) -> Shown {
+    let expected_build = format!("kr-controller/{expected}");
     match holder {
         None => shown!(
             "the control daemon of environment {} went away while the update waited for it; run \
              kr host update again",
             environment_id
         ),
-        Some((_, Some(answers_as))) if answers_as == format!("kr-controller/{expected}") => shown!(
+        Some((_, Some(answers_as))) if answers_as.as_str() == expected_build => shown!(
             "the control daemon of environment {} now answers as a daemon of {}; run kr host \
              update again",
             environment_id,
             crate::shown::release(expected)
         ),
-        Some((Some(pid), _)) => shown!(
-            "the control daemon of environment {} (process {}) is still running and does not \
-             answer as a daemon of {}; stop it with `kill {}` and run kr host update again",
+        Some((Some(pid), Some(answers_as))) => shown!(
+            "the control daemon of environment {} (process {}) answers as {}, not as a daemon of \
+             {}; stop it with `kill {}` and run kr host update again",
             environment_id,
             pid,
+            crate::shown::build_name(answers_as),
             crate::shown::release(expected),
             pid
         ),
-        Some((None, _)) => shown!(
-            "the control daemon of environment {} is still running and does not answer as a \
-             daemon of {}; stop it and run kr host update again",
+        Some((None, Some(answers_as))) => shown!(
+            "the control daemon of environment {} answers as {}, not as a daemon of {}; stop it \
+             and run kr host update again",
             environment_id,
+            crate::shown::build_name(answers_as),
             crate::shown::release(expected)
+        ),
+        Some((Some(pid), None)) => shown!(
+            "the control daemon of environment {} (process {}) is still running and does not \
+             answer; stop it with `kill {}` and run kr host update again",
+            environment_id,
+            pid,
+            pid
+        ),
+        Some((None, None)) => shown!(
+            "the control daemon of environment {} is still running and does not answer; stop it \
+             and run kr host update again",
+            environment_id
         ),
     }
 }

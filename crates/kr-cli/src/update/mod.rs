@@ -1577,33 +1577,65 @@ mod tests {
     }
 
     /// What is said of a daemon that still holds an environment: gone, or serving as the release
-    /// asked for (it is not to be stopped, whatever it did meanwhile), or named with how to stop it.
+    /// asked for (it is not to be stopped, whatever it did meanwhile), or named with how to stop it,
+    /// and, where it answers as another release, that.
     #[test]
     fn a_daemon_that_now_answers_as_the_release_asked_for_is_not_named_to_be_killed() {
         let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
         let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let build = |text: &str| kr_protocol::ids::BuildId::new(text).expect("a build");
         let said = |holder| handover::holder_said(environment, holder, &expected).to_string();
         assert!(said(None).contains("went away"));
         // A daemon that answers as the release asked for serves: it is not a process to stop.
-        let serving = said(Some((Some(4242), Some("kr-controller/0.2.0+bbbbbbbbbbbb"))));
+        let serving = build("kr-controller/0.2.0+bbbbbbbbbbbb");
+        let serving = said(Some((Some(4242), Some(&serving))));
         assert!(
             serving.contains("now answers as a daemon of 0.2.0+bbbbbbbbbbbb")
                 && !serving.contains("kill"),
             "{serving}"
         );
-        // The controls: one that answers as another release, and one that does not answer, are
-        // named, or said to be there.
-        let another = said(Some((Some(4242), Some("kr-controller/0.1.0+aaaaaaaaaaaa"))));
+        // The controls: one that answers as another release is named with what it answers as, and
+        // one that does not answer is said not to; each with how to stop it.
+        let before = build("kr-controller/0.1.0+aaaaaaaaaaaa");
+        let another = said(Some((Some(4242), Some(&before))));
         assert!(
-            another.contains("process 4242") && another.contains("kill 4242"),
+            another.contains("process 4242")
+                && another.contains("answers as kr-controller/0.1.0+aaaaaaaaaaaa")
+                && another.contains("not as a daemon of 0.2.0+bbbbbbbbbbbb")
+                && another.contains("kill 4242"),
             "{another}"
         );
+        let unnamed_another = said(Some((None, Some(&before))));
+        assert!(
+            unnamed_another.contains("answers as kr-controller/0.1.0+aaaaaaaaaaaa")
+                && !unnamed_another.contains("kill"),
+            "{unnamed_another}"
+        );
         let silent = said(Some((Some(4242), None)));
-        assert!(silent.contains("kill 4242"), "{silent}");
+        assert!(
+            silent.contains("does not answer") && silent.contains("kill 4242"),
+            "{silent}"
+        );
         let unnamed = said(Some((None, None)));
         assert!(
-            unnamed.contains("still running") && !unnamed.contains("kill"),
+            unnamed.contains("does not answer") && !unnamed.contains("kill"),
             "{unnamed}"
+        );
+    }
+
+    /// A daemon that has taken its environment and does not yet listen is asked again for a moment
+    /// before it is said not to answer: it may be about to. Nothing answers here, so the whole
+    /// moment is taken, and none of it is taken back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_does_not_listen_yet_is_asked_again_before_it_is_said_silent() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_store, environment) = store_and_environment(&temp);
+        let began = std::time::Instant::now();
+        assert!(handover::answers_as_now(&environment).await.is_none());
+        assert!(
+            began.elapsed() >= std::time::Duration::from_secs(4),
+            "asked again until the moment was over: {:?}",
+            began.elapsed()
         );
     }
 
