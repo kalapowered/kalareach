@@ -7,8 +7,8 @@ supplies its own push credentials. This reads every file it is given and fails o
 be one of those:
 
   * a PEM private key: a `-----BEGIN ... PRIVATE KEY-----` header followed by a base64 body, in a
-    file or inside a JSON string with its line breaks written as `\\n`. A header quoted in source
-    text, with no body after it, is not a key;
+    file, inside a JSON string with its line breaks written as `\\n`, or wrapped in base64 again. A
+    header quoted in source text, with no body after it, is not a key;
   * a JSON Web Key with private members: `d` (or `p`, `q`, `dp`, `dq`, `qi`) on an RSA, EC or OKP
     key, or `k` on a symmetric one;
   * a raw seed: a file of exactly 32 or 64 bytes that is not text (an Ed25519 or X25519 seed, or a
@@ -19,8 +19,13 @@ be one of those:
   * a Google API key or a service-account document written into a file.
 
 A path may be a directory, a file, or an archive (`.tar`, `.tar.gz`, `.tgz`, `.zip`, read member by
-member, nested archives included). `--tracked` reads the files the repository tracks instead of
-walking a directory, which is what a checkout's scan means.
+member, nested archives included). A directory is read whole, every file under it: a release tree
+has no directory that is not part of the release. `--tracked` reads the files the repository
+tracks instead, which is what a checkout's scan means.
+
+What this does not find: a key in a binary encoding (DER, PuTTY, age, minisign), a key in an archive
+format it does not read (tar.xz, apk, ipa, nupkg are read as raw bytes), and a secret that is not a
+key. A file it cannot inspect is reported as such and is never counted as clean.
 
     python3 scripts/check-release-secrets.py scan [--tracked] PATH...
     python3 scripts/check-release-secrets.py self-test
@@ -32,6 +37,7 @@ repository's own tracked files, which must be clean.
 """
 
 import argparse
+import base64
 import fnmatch
 import io
 import json
@@ -55,8 +61,12 @@ JWK_PRIVATE = {"RSA": {"d", "p", "q", "dp", "dq", "qi"}, "EC": {"d"}, "OKP": {"d
 JWK_FALLBACK = re.compile(rb'"(?:d|p|q|dp|dq|qi|k)"\s*:\s*"[A-Za-z0-9_-]{16,}"')
 GOOGLE_API_KEY = re.compile(rb"AIza[0-9A-Za-z_-]{35}")
 SERVICE_ACCOUNT = re.compile(rb'"type"\s*:\s*"service_account"')
-HEX = re.compile(rb"\A[0-9a-fA-F]+\n?\Z")
-BASE64 = re.compile(rb"\A[A-Za-z0-9+/]+={0,2}\n?\Z")
+HEX = re.compile(rb"\A[0-9a-fA-F]+\Z")
+BASE64 = re.compile(rb"\A[A-Za-z0-9+/]+={0,2}\Z")
+# A long run of base64, which may be a key encoded again.
+BASE64_RUN = re.compile(rb"[A-Za-z0-9+/]{120,}={0,2}")
+# The most a file may be for this to read it as a JSON document or as an encoded key.
+TEXT_LIMIT = 64 * 1024 * 1024
 
 # Names that are a credential whatever they hold, as glob patterns on the file's own name.
 CREDENTIAL_NAMES = [
@@ -78,10 +88,6 @@ CREDENTIAL_NAMES = [
 
 ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".zip")
 
-# Where a checkout keeps files that are never part of a scan.
-SKIP_DIRECTORIES = {".git", "node_modules", "target"}
-
-
 def looks_like_text(data):
     return all(byte in (9, 10, 13) or 32 <= byte < 127 for byte in data)
 
@@ -102,35 +108,60 @@ def jwk_problems(value, path):
     return found
 
 
-def scan_bytes(path, data):
-    """Returns [(path, what)] for one file's bytes."""
+def pem_problems(path, data, how):
+    """A PEM private key in `data`: its header followed by a base64 body."""
     found = []
-    name = os.path.basename(path)
+    for header in PEM_HEADER.finditer(data):
+        tail = data[header.end(): header.end() + 8192]
+        if PEM_BODY.match(tail):
+            kind = (header.group(1) or b"").decode().strip() or "PKCS#8"
+            found.append((path, f"holds a PEM private key ({kind}){how}"))
+    return found
+
+
+def scan_bytes(path, data, name=None):
+    """Returns [(path, what)] for one file's bytes.
+
+    `name` is the file's own name, which is not the tail of `path` for a member of an archive.
+    """
+    found = []
+    name = name if name is not None else os.path.basename(path)
 
     for pattern, what in CREDENTIAL_NAMES:
         if fnmatch.fnmatchcase(name, pattern):
             found.append((path, f"is named for {what}"))
             break
 
-    for header in PEM_HEADER.finditer(data):
-        tail = data[header.end(): header.end() + 8192]
-        if PEM_BODY.match(tail):
-            kind = (header.group(1) or b"").decode().strip() or "PKCS#8"
-            found.append((path, f"holds a PEM private key ({kind})"))
+    found += pem_problems(path, data, "")
+    if len(data) <= TEXT_LIMIT:
+        # A key encoded again: base64 of a PEM block, on its own or inside a document.
+        for run in BASE64_RUN.finditer(data):
+            try:
+                inner = base64.b64decode(run.group(0) + b"=" * (-len(run.group(0)) % 4))
+            except ValueError:
+                continue
+            found += pem_problems(path, inner, ", encoded again in base64")
+            if found and found[-1][1].endswith("encoded again in base64"):
+                break
 
+    # The line ending of a seed written as text is not part of the seed.
+    bare = data.rstrip(b"\r\n")
     if len(data) in (32, 64) and not looks_like_text(data) and len(set(data)) >= 16:
         found.append((path, f"is a raw {len(data)}-byte binary file, the size of a private key seed"))
-    if len(data) in (64, 65, 128, 129) and HEX.match(data):
+    if len(bare) in (64, 128) and HEX.match(bare):
         found.append((path, "is a file of hex digits the size of a private key seed"))
-    if len(data) in (44, 45, 88, 89) and BASE64.match(data):
+    if len(bare) in (44, 88) and BASE64.match(bare):
         found.append((path, "is a base64 file the size of a private key seed"))
 
-    if len(data) <= 8 * 1024 * 1024 and b'"kty"' in data:
-        try:
-            found += jwk_problems(json.loads(data), path)
-        except (ValueError, UnicodeDecodeError):
-            if JWK_FALLBACK.search(data):
-                found.append((path, "holds what reads as a JSON Web Key's private member"))
+    if b'"kty"' in data:
+        if len(data) > TEXT_LIMIT:
+            found.append((path, "may hold a JSON Web Key and is too large to inspect for one"))
+        else:
+            try:
+                found += jwk_problems(json.loads(data), path)
+            except (ValueError, UnicodeDecodeError):
+                if JWK_FALLBACK.search(data):
+                    found.append((path, "holds what reads as a JSON Web Key's private member"))
 
     if GOOGLE_API_KEY.search(data):
         found.append((path, "holds a Google API key"))
@@ -150,28 +181,30 @@ def scan_archive(path, data, depth):
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 for info in archive.infolist():
                     if not info.is_dir():
-                        found += scan_member(f"{path}!{info.filename}", archive.read(info), depth)
+                        found += scan_member(f"{path}!{info.filename}", archive.read(info), depth,
+                                             os.path.basename(info.filename))
         else:
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
                 for member in archive.getmembers():
                     if member.isreg():
                         found += scan_member(
-                            f"{path}!{member.name}", archive.extractfile(member).read(), depth
+                            f"{path}!{member.name}", archive.extractfile(member).read(), depth,
+                            os.path.basename(member.name),
                         )
     except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as error:
         return [(path, f"is an archive the scan could not read ({error})")]
     return found
 
 
-def scan_member(path, data, depth):
+def scan_member(path, data, depth, name=None):
     if path.lower().endswith(ARCHIVE_SUFFIXES):
         return scan_archive(path, data, depth + 1)
-    return scan_bytes(path, data)
+    return scan_bytes(path, data, name)
 
 
 def files_under(directory):
     for root, directories, names in os.walk(directory):
-        directories[:] = sorted(d for d in directories if d not in SKIP_DIRECTORIES)
+        directories.sort()
         for name in sorted(names):
             yield os.path.join(root, name)
 
@@ -237,6 +270,15 @@ def self_test():
         "seed-hex": ("keys/seed.txt", ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n").encode()),
         "seed-base64": ("keys/seed.b64", b"nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=\n"),
         "apns-key": ("push/AuthKey_ABC123DEFG.p8", b"anything"),
+        # At the top of an archive, where the member's own name is the whole of its path.
+        "firebase-at-the-root": ("google-services.json", b"{}"),
+        # Under directories a checkout scan leaves out, which a release tree has no such thing as.
+        "pem-under-node_modules": ("node_modules/pkg/private.pem",
+                                   f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n".encode()),
+        "pem-wrapped-in-base64": ("keys/wrapped.b64", base64.b64encode(
+            f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n".encode())),
+        "seed-hex-crlf": ("keys/seed-crlf.txt",
+                          b"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\r\n"),
         "firebase-android": ("app/google-services.json", b"{}"),
         "firebase-apple": ("app/GoogleService-Info.plist", b"<plist/>"),
         # Written in two pieces so this file does not hold the whole of what it plants.
@@ -306,6 +348,18 @@ def self_test():
         found = scan_paths([clean_tar], False)
         if found:
             failures.append(f"the near misses in an archive were refused: {found}")
+
+    # A document too large to read for a private JSON Web Key is refused and never counted as clean.
+    global TEXT_LIMIT
+    saved, TEXT_LIMIT = TEXT_LIMIT, 64
+    try:
+        big = json.dumps(dict(kty="EC", crv="P-256", x="a" * 43, y="b" * 43,
+                              d="c" * 43)).encode() + b" " * 100
+        found = scan_bytes("big.jwk", big)
+        if not any("too large to inspect" in what for _, what in found):
+            failures.append(f"a document larger than the limit was counted clean: {found}")
+    finally:
+        TEXT_LIMIT = saved
 
     found = scan_paths([root], True)
     if found:
