@@ -98,9 +98,9 @@ store has a bound: a release's files and an environment's lock file are opened w
 link or waiting for a writer, the release archive without waiting for one (a link a person names it
 by is followed), and an environment's registry is checked to be a regular file, or a link to one,
 before it is opened, so a pipe in any of these places is refused; the system's own tool that says
-its version is given ten seconds and is ended if it prints more than a line, whatever a program it
-starts does; and a program that starts in a release that is being removed or replaced waits for
-that removal for at most thirty seconds.
+its version is given ten seconds and is ended if it prints more than 4096 bytes, whatever a
+program it starts does; and a program that starts in a release that is being removed or replaced
+waits for that removal for at most thirty seconds.
 
 ## Updating
 
