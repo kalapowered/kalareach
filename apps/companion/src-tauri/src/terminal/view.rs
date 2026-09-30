@@ -29,8 +29,10 @@ use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Notification, Outcome, ParamsValue, Request,
     Response,
 };
-use kr_protocol::ids::{ActionId, RequestId, SessionId};
+use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
+use kr_protocol::ids::{ActionId, BuildId, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
+use kr_protocol::local::LocalBuild;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs, Nullable, U64};
@@ -184,6 +186,9 @@ async fn open(
     } = crate::worker::reach(&paths, session_id)
         .await
         .map_err(crate::worker::Unreached::words)?;
+    // The worker has proved who it is, and it says what it is: the attach waits on its screens, so
+    // a worker whose screens this view cannot read is refused before it is asked for anything.
+    check_build(client.acknowledgement().build.as_ref())?;
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
     // Able to take the input lease, which asking for this does not do: only the person's own take
@@ -240,6 +245,74 @@ async fn open(
         descriptor,
         attached,
     })
+}
+
+/// Refuses a worker whose screens this build cannot be sure to read, before the session is asked
+/// for anything.
+///
+/// A worker outlives an upgrade, so the application can meet a worker of an earlier build, or of a
+/// later one. It reads a worker's screens when the worker states, in its answer to the hello, a
+/// build whose protocol version shares this build's compatibility level
+/// ([`PackageVersion::shares_frames_with`]). A worker that states no build is of a build before
+/// that statement. Attaching to either of the others would wait on screens the view cannot draw.
+///
+/// The refusal is an unsupported schema, said as the action it maps to: the words name both builds
+/// and both protocol versions and say what to do, and no protocol code.
+fn check_build(stated: Option<&LocalBuild>) -> Result<(), String> {
+    let worker = match stated {
+        Some(build) if build.protocol_version.shares_frames_with(PACKAGE_VERSION) => {
+            return Ok(());
+        }
+        Some(build) => format!(
+            "runs on {} with protocol {}",
+            build_name(&build.build_id),
+            version(build.protocol_version)
+        ),
+        None => "runs on a worker of an earlier build, which does not state its build or its \
+                 protocol version"
+            .to_owned(),
+    };
+    let ours = crate::connection::build_id().map_err(|error| error.message)?;
+    Err(format!(
+        "This session {worker}, and this application is {} with protocol {}: this application \
+         cannot show a session whose worker speaks another protocol version. Close the session, \
+         or open it with the application of the worker's build.",
+        build_name(&ours),
+        version(PACKAGE_VERSION)
+    ))
+}
+
+/// The longest build identifier a refusal names.
+const BUILD_NAME_LIMIT: usize = 64;
+
+/// What a build identifier says: the identifier when it is a program's name and a release, such as
+/// `kr-worker/0.1.0`, and that it is not one otherwise. A worker states its own, so any other text
+/// is replaced rather than repeated.
+///
+/// The name is lower-case letters, digits and dashes, starting with a letter; the release is
+/// numbers separated by dots; the whole is at most [`BUILD_NAME_LIMIT`] bytes.
+fn build_name(build_id: &BuildId) -> &str {
+    let text = build_id.as_str();
+    let named = text.len() <= BUILD_NAME_LIMIT
+        && text.split_once('/').is_some_and(|(name, release)| {
+            name.starts_with(|first: char| first.is_ascii_lowercase())
+                && name.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+                && release.split('.').all(|number| {
+                    !number.is_empty() && number.chars().all(|digit| digit.is_ascii_digit())
+                })
+        });
+    if named {
+        text
+    } else {
+        "[a build this application does not name]"
+    }
+}
+
+/// A protocol package version, as a refusal says it.
+fn version(version: PackageVersion) -> String {
+    format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
 /// What a link that failed part way says.

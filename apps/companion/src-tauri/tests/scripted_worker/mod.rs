@@ -25,13 +25,15 @@ use kr_protocol::attachment::{
 use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
+use kr_protocol::hello::{
+    ActionWindow, PACKAGE_VERSION, PROTOCOL_VERSION, PackageVersion, ReceiveLimits,
+};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{
-    ActionWindowId, AttachmentId, BootEpoch, ConnectionId, EnvironmentId, EventSequence, EventType,
-    GeometryEpoch, RequestId, SessionEpoch, SessionId, StreamId,
+    ActionWindowId, AttachmentId, BootEpoch, BuildId, ConnectionId, EnvironmentId, EventSequence,
+    EventType, GeometryEpoch, RequestId, SessionEpoch, SessionId, StreamId,
 };
-use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
+use kr_protocol::local::{LocalBuild, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
 use kr_protocol::projection::{
     CellRendition, CellRun, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
@@ -65,6 +67,54 @@ pub enum Challenge {
     HeldAtProof,
 }
 
+/// What the scripted worker states about its build in its answer to the hello.
+#[derive(Clone, Debug)]
+pub enum Stated {
+    /// A build of this protocol version, as a worker of the same release states it.
+    ThisBuild,
+    /// A build of this protocol version whose patch number is one further.
+    ThisBuildPatched,
+    /// Nothing, as a worker of a build before the statement answers.
+    Nothing,
+    /// Another build, at this protocol version's compatibility level in another minor number.
+    AnotherLevel,
+    /// Another build whose identifier is text of a worker's own choosing.
+    Unnamed(&'static str),
+}
+
+impl Stated {
+    /// The version another compatibility level has: the next minor number below 1.0.0, the next
+    /// major number from it.
+    pub fn another_level() -> PackageVersion {
+        if PACKAGE_VERSION.major == 0 {
+            PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
+        } else {
+            PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
+        }
+    }
+
+    fn build(&self) -> Option<LocalBuild> {
+        let named = |version| LocalBuild {
+            build_id: BuildId::new("kr-worker/0.1.0").expect("a build identifier"),
+            protocol_version: version,
+        };
+        match self {
+            Self::ThisBuild => Some(named(PACKAGE_VERSION)),
+            Self::ThisBuildPatched => Some(named(PackageVersion::new(
+                PACKAGE_VERSION.major,
+                PACKAGE_VERSION.minor,
+                PACKAGE_VERSION.patch + 1,
+            ))),
+            Self::Nothing => None,
+            Self::AnotherLevel => Some(named(Self::another_level())),
+            Self::Unnamed(text) => Some(LocalBuild {
+                build_id: BuildId::new(*text).expect("a build identifier"),
+                protocol_version: Self::another_level(),
+            }),
+        }
+    }
+}
+
 /// The display number of the next worker this process starts, so two never share an endpoint.
 static NEXT_DISPLAY: AtomicU64 = AtomicU64::new(1);
 
@@ -94,14 +144,37 @@ impl ScriptedWorker {
     /// A worker for one session, published in a fresh host tree, answering its challenge as told.
     pub fn start(challenge: Challenge) -> Self {
         let host = TempHost::create();
-        let mut worker = Self::publish(host.environment(), host.environment_id(), challenge);
+        let mut worker = Self::publish(
+            host.environment(),
+            host.environment_id(),
+            challenge,
+            Stated::ThisBuild,
+        );
+        worker.host = Some(host);
+        worker
+    }
+
+    /// A worker that answers its challenge and states `stated` about its build.
+    pub fn start_stating(stated: Stated) -> Self {
+        let host = TempHost::create();
+        let mut worker = Self::publish(
+            host.environment(),
+            host.environment_id(),
+            Challenge::Answered,
+            stated,
+        );
         worker.host = Some(host);
         worker
     }
 
     /// A second session's worker, published in the host tree `beside` is.
     pub fn start_beside(beside: &Self, challenge: Challenge) -> Self {
-        Self::publish(beside.environment.clone(), beside.environment_id, challenge)
+        Self::publish(
+            beside.environment.clone(),
+            beside.environment_id,
+            challenge,
+            Stated::ThisBuild,
+        )
     }
 
     /// The host tree's environment, where the application reads descriptors.
@@ -113,6 +186,7 @@ impl ScriptedWorker {
         environment: EnvironmentPaths,
         environment_id: EnvironmentId,
         challenge: Challenge,
+        stated: Stated,
     ) -> Self {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -198,7 +272,7 @@ impl ScriptedWorker {
                     },
                     capabilities: CanonicalSet::new(),
                     max_receive: ReceiveLimits::default(),
-                    build: None,
+                    build: stated.build(),
                 };
                 if writer
                     .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
