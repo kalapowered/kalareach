@@ -220,6 +220,8 @@ started again as it was recorded. One that does not listen is either starting or
 it is waited for until it answers, or until it has gone and the recorded daemon is started. Where
 another daemon of the store is starting meanwhile and holds the install lock for more than thirty
 seconds, the environment cannot be looked at: the update says that, and names no process to stop.
+A daemon that answers as the release asked for by the time it is looked at is serving, and is not
+named either.
 
 A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
 worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says

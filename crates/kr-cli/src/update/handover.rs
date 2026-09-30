@@ -26,7 +26,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::install::Store;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::ActionId;
+use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -303,16 +303,21 @@ pub async fn held(store: &Store, environment: &Environment, within: Duration) ->
     }
 }
 
-/// Waits up to [`DAEMON_STOP`] for the daemon holding an environment to have gone.
+/// Waits for the daemon holding an environment to have gone: [`DAEMON_STOP`], and each look at the
+/// environment may itself wait, for its own bound, for a daemon that is starting.
+///
+/// `expected` is the release a daemon that has taken its place answers as.
 ///
 /// # Errors
 ///
 /// Returns a failure naming the process the lock names when it has not gone by then.
-pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
+pub async fn gone(store: &Store, environment: &Environment, expected: &ReleaseName) -> Result<()> {
     let deadline = tokio::time::Instant::now() + DAEMON_STOP;
     while held(store, environment, INSTALL_LOCK_WAIT).await? {
         if tokio::time::Instant::now() >= deadline {
-            return Err(CliError::Other(still_running(store, environment).await));
+            return Err(CliError::Other(
+                still_running(store, environment, expected).await,
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -440,32 +445,83 @@ pub async fn hold(
 /// What a daemon that is still there says: the process its lock names, and how to stop it.
 ///
 /// Whether a daemon still holds the environment is asked as [`held`] asks, under the install lock,
-/// so that no daemon part way through taking the environment meets the look and exits. A daemon
-/// that has gone since is said to have gone, since the lock names a process only while it is held;
-/// where a daemon that is starting holds the install lock past its bound, the environment is not
-/// looked at and no process is named.
-pub async fn still_running(store: &Store, environment: &Environment) -> Shown {
+/// so that no daemon part way through taking the environment meets the look and exits. What it then
+/// answers as is asked once: a daemon that answers as `expected` is serving, whatever it did while
+/// the update waited, and is not to be stopped. Where a daemon that is starting holds the install
+/// lock past its bound, the environment is not looked at and no process is named.
+pub async fn still_running(
+    store: &Store,
+    environment: &Environment,
+    expected: &ReleaseName,
+) -> Shown {
     match held(store, environment, INSTALL_LOCK_WAIT).await {
-        Ok(false) => shown!(
+        Err(error) => error.said(),
+        Ok(false) => holder_said(environment.environment_id, None, expected),
+        Ok(true) => {
+            let pid = SingletonLock::holder(&environment.paths.singleton_lock())
+                .ok()
+                .flatten();
+            let answers_as = answers_as_now(environment).await;
+            holder_said(
+                environment.environment_id,
+                Some((pid, answers_as.as_deref())),
+                expected,
+            )
+        }
+    }
+}
+
+/// What a daemon holding an environment answers as, if it answers within [`DAEMON_ANSWER`].
+async fn answers_as_now(environment: &Environment) -> Option<String> {
+    let endpoint = environment.paths.controller_endpoint().ok()?;
+    let client = tokio::time::timeout(
+        DAEMON_ANSWER,
+        LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let stated = client
+        .acknowledgement()
+        .build
+        .as_ref()
+        .map(|build| build.build_id.as_str().to_owned());
+    stated
+}
+
+/// What is said of an environment's daemon: `None` when no daemon holds it now, and otherwise the
+/// process its lock names and the build it answers as, where it answers.
+pub(super) fn holder_said(
+    environment_id: EnvironmentId,
+    holder: Option<(Option<u32>, Option<&str>)>,
+    expected: &ReleaseName,
+) -> Shown {
+    match holder {
+        None => shown!(
             "the control daemon of environment {} went away while the update waited for it; run \
              kr host update again",
-            environment.environment_id
+            environment_id
         ),
-        Ok(true) => match SingletonLock::holder(&environment.paths.singleton_lock()) {
-            Ok(Some(pid)) => shown!(
-                "the control daemon of environment {} (process {}) is still running and does not \
-                 answer; stop it with `kill {}` and run kr host update again",
-                environment.environment_id,
-                pid,
-                pid
-            ),
-            _ => shown!(
-                "the control daemon of environment {} is still running and does not answer; stop \
-                 it and run kr host update again",
-                environment.environment_id
-            ),
-        },
-        Err(error) => error.said(),
+        Some((_, Some(answers_as))) if answers_as == format!("kr-controller/{expected}") => shown!(
+            "the control daemon of environment {} now answers as a daemon of {}; run kr host \
+             update again",
+            environment_id,
+            crate::shown::release(expected)
+        ),
+        Some((Some(pid), _)) => shown!(
+            "the control daemon of environment {} (process {}) is still running and does not \
+             answer as a daemon of {}; stop it with `kill {}` and run kr host update again",
+            environment_id,
+            pid,
+            crate::shown::release(expected),
+            pid
+        ),
+        Some((None, _)) => shown!(
+            "the control daemon of environment {} is still running and does not answer as a \
+             daemon of {}; stop it and run kr host update again",
+            environment_id,
+            crate::shown::release(expected)
+        ),
     }
 }
 

@@ -950,6 +950,12 @@ impl Host {
             daemon.wait().expect("ends");
         }
         self.switch(two.name());
+        self.record_the_update_as_switched(one, two);
+    }
+
+    /// Records an update from `one` to `two` as switched, with the daemon of this host to be
+    /// started as it was, whatever runs and whatever `current` names.
+    fn record_the_update_as_switched(&self, one: &Assembled, two: &Assembled) {
         let restart = serde_json::json!({
             "environment": self.tree.environment_id(),
             "runtime_root": self.tree.paths().runtime_root(),
@@ -1437,6 +1443,48 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
+/// daemon of the release before it, which resumes and goes on answering as that release: the update
+/// says what it answered as, and then names the daemon with how to stop it, and keeps the update.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_release_before() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    host.put(&two);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    // `current` names the release after it, and the update is recorded as switched, while the
+    // daemon of the release before it still runs.
+    host.switch(two.name());
+    host.record_the_update_as_switched(&one, &two);
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!("answers as kr-controller/{}", one.name()))
+            && message.contains(&format!("not as a daemon of {}", two.name())),
+        "what failed comes first: {said}"
+    );
+    let pid = host.daemons[0].id();
+    assert!(
+        message.contains(&format!("(process {pid})")) && message.contains(&format!("kill {pid}")),
+        "the daemon is named, with how to stop it: {said}"
+    );
+    assert_eq!(host.record()["update"]["state"], "switched");
 }
 
 /// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
