@@ -280,6 +280,25 @@ mod tools {
         parse(&String::from_utf8(output.stdout).expect("infocmp prints text"))
     }
 
+    /// Reads the host's own `xterm-256color`: what an unmanaged shell on this host, reached over
+    /// SSH or started outside KalaReach, has for the same name.
+    fn read_stock(infocmp: &Path) -> Read {
+        let home = Scratch::new("home");
+        let mut command = Command::new(infocmp);
+        scrub(&mut command, home.path());
+        let output = command
+            .args(["-x", "-1", "xterm-256color"])
+            .output()
+            .expect("infocmp runs");
+        assert!(
+            output.status.success(),
+            "{} has no xterm-256color: {}",
+            infocmp.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse(&String::from_utf8(output.stdout).expect("infocmp prints text"))
+    }
+
     fn parse(text: &str) -> Read {
         let mut read = Read::default();
         for line in text.lines() {
@@ -490,7 +509,15 @@ mod tools {
             }
             let refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
             let output = tput(root, &refs);
-            if output.stdout != expected {
+            // Newer `tput` follows `clear` with the capability that erases the scrollback, when the
+            // entry has one, unless it is told not to. That is `tput`'s own addition to the value.
+            let scrollback = description
+                .strings
+                .get("E3")
+                .map(|value| [expected.clone(), value.as_bytes().to_vec()].concat());
+            let read_as_expected = output.stdout == expected
+                || (cap.name == "clear" && scrollback.is_some_and(|both| output.stdout == both));
+            if !read_as_expected {
                 found.push(format!(
                     "tput string {}: {:?} against {:?}",
                     cap.name, output.stdout, expected
@@ -710,6 +737,89 @@ mod tools {
             ]
             .into(),
         }
+    }
+
+    /// Capabilities the private database has and a stock one may lack: what the profile declares
+    /// beyond it. `Tc` and `RGB` are its truecolour flags, `BE` and `BD` its bracketed paste
+    /// toggles, and the rest are the extended colour forms and the strike-through and
+    /// styled-underline sequences that stock entries gained over the releases.
+    const ADDED: [&str; 7] = ["BD", "BE", "Smulx", "rmxx", "setrgbb", "setrgbf", "smxx"];
+
+    /// Output capabilities whose value differs from a stock one, and the reason. The reset strings
+    /// no longer touch DEC modes 3 and 4, which the profile does not track. The cursor-style
+    /// reset, the alternate-screen pair and the full reset are what earlier stock releases had,
+    /// before the title stack and the palette reset were added to them.
+    const REWRITTEN: [&str; 6] = ["is2", "rs2", "Se", "smcup", "rmcup", "rs1"];
+
+    /// Every output sequence `pinned` names that a stock database neither names too nor is listed
+    /// as an addition or a rewrite.
+    fn unexplained_differences(stock: &Read, pinned: &Description) -> Vec<String> {
+        let mut found = Vec::new();
+        for (name, value) in &pinned.strings {
+            let output = terminfo::strings()
+                .iter()
+                .find(|capability| capability.name == name)
+                .is_none_or(|capability| capability.direction == terminfo::Direction::Output);
+            if !output {
+                continue;
+            }
+            match stock.strings.get(name) {
+                Some(stock_value) if stock_value == value.as_bytes() => {}
+                Some(_) if REWRITTEN.contains(&name.as_str()) => {}
+                Some(stock_value) => found.push(format!(
+                    "{name} is {:?} in the stock database and {value:?} here",
+                    String::from_utf8_lossy(stock_value)
+                )),
+                None if ADDED.contains(&name.as_str()) => {}
+                None => found.push(format!(
+                    "the stock database has no {name}, which the private one names as {value:?}"
+                )),
+            }
+        }
+        found
+    }
+
+    /// The private database names the sequences a stock `xterm-256color` names.
+    ///
+    /// An application in a KalaReach session writes what its terminfo entry says, and one that
+    /// reaches a remote host over SSH writes what that host's stock entry says. The two agree,
+    /// capability by capability, apart from what is listed above and why. A stock database on
+    /// another release, or a change here, that adds a difference fails this and has to be
+    /// answered in the list and in the terminal reference.
+    #[test]
+    fn the_private_database_names_the_sequences_a_stock_database_names() {
+        for infocmp in infocmps() {
+            let stock = read_stock(&infocmp);
+            let differences = unexplained_differences(&stock, &Description::pinned());
+            assert!(
+                differences.is_empty(),
+                "{} ({}) reading {}: {differences:#?}",
+                infocmp.display(),
+                version(&infocmp),
+                stock.file
+            );
+        }
+    }
+
+    /// Control: a sequence only the private database names, and one it changed, are found.
+    #[test]
+    fn a_private_sequence_is_found_by_the_stock_comparison() {
+        let mut edited = Description::pinned();
+        edited
+            .strings
+            .insert("cup".to_owned(), "\x1b[%p1%d;%p2%dH".to_owned());
+        edited
+            .strings
+            .insert("kr-private".to_owned(), "\x1b[?9999h".to_owned());
+        let stock = read_stock(&infocmps().remove(0));
+        let differences = unexplained_differences(&stock, &edited);
+        assert_eq!(differences.len(), 2, "{differences:#?}");
+        assert!(differences.iter().any(|line| line.starts_with("cup is")));
+        assert!(
+            differences
+                .iter()
+                .any(|line| line.contains("no kr-private"))
+        );
     }
 
     /// Whichever leaf directory a reading library uses, it finds the entry: the system's `tput`

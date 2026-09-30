@@ -1085,8 +1085,87 @@ Features negotiated outside terminfo, such as synchronised output through DEC mo
 their own profile capability. There is no terminfo capability for them, and there is no implicit
 support either.
 
-Installing and selecting the compiled database on a host is packaging work, not this crate's: what
-lives here is the pinned data and the responder that answers from it.
+### The compiled file
+
+`terminfo::compiled` writes the same data as the binary file a terminfo library loads.
+`kr-term-fixtures --terminfo <directory>` writes it into a directory in the layout a library reads,
+and the fixture file carries the bytes, so a change to any capability changes the fixture in the
+same commit.
+
+The file is the legacy format: a header, the names line, the predefined boolean, number and string
+tables, and after them an extended section for the capabilities a library does not predefine (`Tc`,
+`RGB`, `BE`, `BD`, `PS`, `PE`, the modified-key strings and the rest). A library that predates the
+extended section stops at the size the header gives. Numbers are 16 bits wide, so no value can be
+above 32767, and the compiler refuses one that is. That is why `pairs` is 32767 here where a recent
+stock entry says 65536, which needs the 32-bit format that ncurses before 6.1 cannot read. The
+entry is stored under two directory names, `x/xterm-256color` and `78/xterm-256color`, because a
+library names the directory after the first letter or, when it is built for a case-insensitive file
+system, after that letter's code in hex, and macOS's own does the second.
+
+The bytes are checked against the host's own tools, not only against this crate's reader. On macOS
+(the system's ncurses 6.0 and Homebrew's 6.6) and on Linux (ncurses 6.6), `infocmp -x -A` reads
+back every boolean, number and string the data holds, and `tput` reads the same values by name.
+`tic -x`, given the source `infocmp` prints for the entry, writes the same bytes. Every string equals
+the answer to the XTGETTCAP query for the same name, and a capability edited in one place fails all
+three comparisons.
+
+### Selecting it
+
+A worker writes the database into `terminfo` inside its state directory when it starts a session's
+shell, and leaves a file that already holds the current bytes alone. The write replaces a file whole,
+so workers of several sessions can do it at once. The session's `TERMINFO` names that directory, and
+the environment's diagnostics record it next to `TERM`.
+
+A creator's own `TERMINFO` and `TERMINFO_DIRS` are neither dropped nor obeyed. The library reads
+`TERMINFO` first and `TERMINFO_DIRS` after it, so the private database answers `xterm-256color` and
+the creator's directories follow it: the creator's `TERMINFO` goes at the front of `TERMINFO_DIRS`,
+which keeps its place in the search, and both values are reported as an override. A creator's
+directory still serves the terminal names the private database has no entry for.
+
+A worker that cannot write the database says so, and that session reads whatever database its host
+has. A Windows host has no terminfo library for a shell to consult, so nothing is written or set
+there.
+
+### Multiplexers inside a session
+
+A multiplexer started in a session reads the private database for its outer terminal. With tmux 3.6
+on Linux and 3.7 on macOS, every capability tmux lists for the outer terminal that the database also
+has is the database's value, except the ones tmux sets by its own rule whatever the database says:
+the cursor style (`Se`, `Ss`), the underline styles (`Smulx`) and the colour forms (`setrgbf`,
+`setrgbb`). tmux reads `Tc` and `RGB` from the database, gives the applications inside it its own
+terminal name, keeps `TERMINFO` pointing at the private directory, and leaves the outer session's
+`TERM` and `TERMINFO` as they were.
+
+tmux also writes DEC private modes 2031 and 7727 to any terminal whose name begins with `xterm`. The
+profile has no class for either, so the engine consumes them and counts them as unclassified
+sequences. No capability in the database names them, so they come from tmux and not from what the
+database advertises.
+
+### SSH into an unmanaged host
+
+`ssh` forwards `TERM` and not `TERMINFO`, so a shell on a host that is not a KalaReach environment
+reads that host's stock `xterm-256color`. That is the baseline, and a private KalaReach terminal
+name is not assumed to exist there. A remote KalaReach environment supplies its own qualified
+database.
+
+What the two share: an application writes the same sequence for every output capability the private
+database has and a stock one has. What a stock database lacks depends on its release:
+
+- `Tc` and `RGB`, the truecolour flags, on every release checked;
+- `Smulx` (styled underlines) and `setrgbf` and `setrgbb` (colour forms) on ncurses 6.6, and on
+  macOS's system database, which is older, also `BE`, `BD`, `PS`, `PE` (bracketed paste) and `smxx`
+  and `rmxx` (strike-through).
+
+A stock 6.6 entry also names keypad and mouse capabilities the private database leaves out, such as
+`ka1`, `kpADD` and `XM`, and a boolean `XF` for focus events. Nothing in the profile depends on
+them.
+
+Other differences are deliberate: the reset strings `is2` and `rs2` leave DEC modes 3 and 4
+alone, the device-attributes report `u8` states the reply the broker sends, and the printer, memory
+lock and `Setulc` capabilities are absent because the profile has no class for them. The cursor
+style reset `Se`, the alternate screen pair `smcup` and `rmcup`, and the full reset `rs1` are what
+an earlier stock release had. A test compares the two databases on the host running it, so a stock
+release that adds a difference fails there and has to be answered here.
 
 ## Probes
 

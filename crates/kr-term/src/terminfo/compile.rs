@@ -110,11 +110,11 @@ impl Description {
 
     /// The directories of a database the entry is stored in, one for each lookup convention.
     ///
-    /// A library on a case-sensitive file system names the directory after the terminal name's
-    /// first character. One built for a case-insensitive file system, which is how macOS's is, names
-    /// it after that character's code in two hexadecimal digits so that `A` and `a` cannot collide.
-    /// The convention is a compile-time choice of the reading library, not of the host that wrote
-    /// the file, so a database that any host may read holds the entry under both.
+    /// A library names the directory after the terminal name's first character or, when it was
+    /// built for a case-insensitive file system, after that character's code in two hexadecimal
+    /// digits so that `A` and `a` cannot collide. The choice is made when the library is built,
+    /// and macOS's own library keeps its entries under the hexadecimal name. A database that any
+    /// host may read holds the entry under both.
     #[must_use]
     pub fn leaf_directories(&self) -> [String; 2] {
         let first = self.terminal_name().chars().next().unwrap_or_default();
