@@ -7,6 +7,8 @@
 
 import { describe, expect, it } from 'vitest'
 
+import refusals from './fixtures/terminal-input-refusals.json'
+
 import { fakeHost, readTerminalInput, terminalScreen } from '../src/host/fake'
 import type { TerminalScreen, TerminalView, TerminalViewState } from '../src/host/port'
 import { cellAt, cellUnder, dragRows, MAX_TURNS, wheelPixels, wheelTurns } from '../src/terminal/input'
@@ -186,6 +188,29 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     expect(
       readTerminalInput({ kind: 'wheel', take: 1, column: 2, line: 3, turns: -1024, shift: true, alt: false, control: false })
     ).toEqual({ kind: 'wheel', take: 1, column: 2, line: 3, turns: -1024, shift: true, alt: false, control: false })
+  })
+
+  it('refuses an input in the words native code refuses it in, and reads what it reads', () => {
+    // The cases and their words are native code's own, read from its decoder by a test of its own:
+    // an input it refuses is refused here in the same words, and one it reads is read.
+    expect(refusals.length).toBeGreaterThan(100)
+    for (const each of refusals) {
+      const read = readTerminalInput(each.input)
+      if (each.words === null) expect(typeof read, JSON.stringify(each.input)).toBe('object')
+      else expect(read, JSON.stringify(each.input)).toBe(each.words)
+    }
+  })
+
+  it('refuses an input a view was sent in the command layer\'s words, as a refusal that asks nothing more', async () => {
+    const { port } = fakeHost()
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const wheel = { kind: 'wheel', take: 1, column: 0, line: 0, turns: 0, shift: false, alt: false, control: false }
+    await expect(view.input(wheel as never)).rejects.toEqual({
+      code: 'INVALID_ARGUMENT',
+      message:
+        "those are not this operation's parameters: a wheel turns between 1 and 1024 times either way, not 0",
+      user_action: 'nothing'
+    })
   })
 
   it('reads a key named as one character or a name, text with no control character, and a paste as it is', () => {
@@ -433,13 +458,14 @@ describe("the scripted host reads a view's opening, size and moves as native cod
       expect(await said(view.resize(grid as never)), JSON.stringify(grid)).toBe(words)
     }
     for (const [move, words] of [
-      // Digits past 64 bits are a floating point number to the decoder.
-      [{ number: 2 ** 64, live: true }, 'invalid args `number` for command `terminal_view_move`: invalid type: floating point `18446744073709552000.0`, expected u64'],
+      // Digits past 64 bits are a floating point number to the decoder, which writes an exponent from
+      // 1e16 up and below 1e-5.
+      [{ number: 2 ** 64, live: true }, 'invalid args `number` for command `terminal_view_move`: invalid type: floating point `1.8446744073709552e+19`, expected u64'],
       // JSON writes 2^63 as 9223372036854776000, an integer the decoder reads and i64 does not hold.
       [{ number: 1, across: 2 ** 63, down: 0 }, 'invalid args `across` for command `terminal_view_move`: invalid value: integer `9223372036854776000`, expected i64'],
       // The least i64 as JavaScript writes it is past 64 bits too.
-      [{ number: 1, across: -(2 ** 63), down: 0 }, 'invalid args `across` for command `terminal_view_move`: invalid type: floating point `-9223372036854776000.0`, expected i64'],
-      [{ number: 1, across: 0, down: 1e21 }, 'invalid args `down` for command `terminal_view_move`: invalid type: floating point `1000000000000000000000.0`, expected i64']
+      [{ number: 1, across: -(2 ** 63), down: 0 }, 'invalid args `across` for command `terminal_view_move`: invalid type: floating point `-9.223372036854776e+18`, expected i64'],
+      [{ number: 1, across: 0, down: 1e21 }, 'invalid args `down` for command `terminal_view_move`: invalid type: floating point `1e+21`, expected i64']
     ] as const) {
       expect(await said(view.move(move as never)), JSON.stringify(move)).toBe(words)
     }
