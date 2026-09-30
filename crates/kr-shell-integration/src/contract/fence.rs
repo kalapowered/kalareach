@@ -32,8 +32,10 @@
 //!   terminal without a lease and is never held, so it can arrive after the reader proved its
 //!   queues clear. One that arrives while an exchange is in flight withholds the fence, one that
 //!   arrives after publication invalidates it, and a launch reserved on it is revoked as queued
-//!   prior input. The reader's next idle callback asks again, and its own snapshot then accounts
-//!   for the bytes.
+//!   prior input. An answer the terminal's writer has not yet written when an exchange begins is
+//!   told to the machine again as that exchange's own, because the reader's snapshot can be taken
+//!   before those bytes reach it. The reader's next idle callback asks again, and its own snapshot
+//!   then accounts for the bytes.
 //! * **An interrupt bypasses the hold.** It needs the current epoch and accepts only the configured
 //!   native interrupt action; there is no variant of it that carries command bytes.
 //! * **A failed fence never restarts the shell.** There is no action in this vocabulary that

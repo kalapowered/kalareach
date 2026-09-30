@@ -6034,6 +6034,108 @@ async fn an_answer_queued_during_the_exchange_withholds_the_fence_until_the_next
     wired.close().await;
 }
 
+/// KR-REQ-08.49: an answer the writer has not yet written when a later exchange begins keeps that
+/// exchange from publishing a fence, and one the writer has written lets the exchange after it
+/// publish.
+///
+/// The terminal's writer is held at its input boundary, which is where it waits when the terminal
+/// has no room, so the answer stays queued and unwritten for as long as the case wants and nothing
+/// here is decided by how long anything took. The first exchange overlaps the answer and is
+/// withheld. The second begins after the answer was queued, so what the machine was told of it
+/// says nothing about it, and the reader's snapshot was taken before the bytes reach it: the
+/// acknowledgement must still not publish. Once the writer has written the answer the next
+/// exchange proves the queues clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_still_unwritten_when_a_later_exchange_begins_keeps_that_exchange_from_publishing()
+ {
+    let mut wired = wired().await;
+    let _holder = wired.holder();
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let first = asked_for_a_fence(&mut wired).await;
+    let boundary = wired.runtime.session().input_gate();
+    let held = boundary.lock().expect("the input boundary is not poisoned");
+    the_host_answers_the_application(&wired);
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, first))
+        .await
+        .expect("acknowledges");
+    withheld_as_not_drained(&mut wired, "an acknowledgement the answer overlapped").await;
+
+    wired
+        .bridge
+        .send_event(idle(wired.session_id, 1, 1))
+        .await
+        .expect("idles");
+    let second = asked_for_a_fence(&mut wired).await;
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, second))
+        .await
+        .expect("acknowledges");
+    withheld_as_not_drained(
+        &mut wired,
+        "an exchange that began with the answer unwritten",
+    )
+    .await;
+    assert_eq!(
+        wired.runtime.session().fence().expect("a driver").state(),
+        FenceState::Unfenced
+    );
+
+    drop(held);
+    until_replies_written(&wired.runtime).await;
+    wired
+        .bridge
+        .send_event(idle(wired.session_id, 1, 1))
+        .await
+        .expect("idles");
+    let third = asked_for_a_fence(&mut wired).await;
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, third))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    wired.close().await;
+}
+
+/// Waits until the writer has written every answer the host queued for the terminal.
+async fn until_replies_written(runtime: &SessionRuntime) {
+    let owed = runtime.session().unwritten_replies();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while owed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer wrote the host's answer once its boundary was let go");
+}
+
+/// Reads the fence publications until one says the queues were not clear.
+async fn withheld_as_not_drained(wired: &mut Wired, why: &str) {
+    let publication = loop {
+        match wired.next().await {
+            ToBridge::FencePublished(publication) => break publication,
+            _ => continue,
+        }
+    };
+    assert!(
+        matches!(
+            publication,
+            kr_protocol::root::FencePublication::Withheld {
+                reason: kr_protocol::root::WithheldReason::QueuesNotDrained,
+                ..
+            }
+        ),
+        "{why} proves nothing about the answer: {publication:?}"
+    );
+}
+
 /// KR-REQ-08.49: with a real qualified reader at its prompt, the host's answer to the application
 /// invalidates the fence the reader proved, and the reader proves it again from its own snapshot.
 ///

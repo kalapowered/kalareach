@@ -425,6 +425,12 @@ pub struct Session {
     /// How many answers the writer has dropped because their lane deadline passed while they
     /// waited for the terminal.
     dropped_replies: Arc<std::sync::atomic::AtomicU64>,
+    /// How many bytes of the host's own answers have been queued for the terminal and are neither
+    /// written nor dropped yet. The writer takes them off as each piece reaches the terminal or the
+    /// rest of an answer is dropped, and the root editor's driver reads it when an exchange begins:
+    /// a reader that took its snapshot before those bytes reached the terminal cannot account for
+    /// them.
+    unwritten_replies: Arc<std::sync::atomic::AtomicUsize>,
     /// The part of that which belongs to the **current** lease, and which a lease change discards.
     ///
     /// What is left is the response lane's share, so the two bounds section 8 and section 9 name
@@ -689,6 +695,7 @@ impl Session {
             projections: crate::snapshot::Bases::new(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dropped_replies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            unwritten_replies: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             input_gate: Arc::new(std::sync::Mutex::new(())),
             terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -750,7 +757,8 @@ impl Session {
     /// It goes in before the reader can report anything, so the first boundary the shell reaches
     /// has somewhere to go. A `native_compat` session installs none, which is what makes its input
     /// forward like any application's.
-    pub fn install_fence(&mut self, driver: crate::fence::FenceDriver) {
+    pub fn install_fence(&mut self, mut driver: crate::fence::FenceDriver) {
+        driver.watch_unwritten_replies(Arc::clone(&self.unwritten_replies));
         self.fence = Some(driver);
     }
 
@@ -3046,6 +3054,8 @@ impl Session {
                 break;
             }
             queued_bytes = queued_bytes.saturating_add(reply.bytes.len() as u64);
+            self.unwritten_replies
+                .fetch_add(reply.bytes.len(), std::sync::atomic::Ordering::AcqRel);
             self.queue_input(InputBatch::Reply {
                 bytes: reply.bytes,
                 expires_at_ms: reply.expires_at_ms,
@@ -3076,6 +3086,13 @@ impl Session {
             self.queued_lease_bytes.add(epoch, batch.len());
         }
         self.pending_input.push_back(Queued::Batch(batch));
+    }
+
+    /// Returns the counter the writer takes each answer's bytes off as they reach the terminal or
+    /// are dropped.
+    #[must_use]
+    pub fn unwritten_replies(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.unwritten_replies)
     }
 
     /// Returns the counter the writer adds to for each answer it drops.
