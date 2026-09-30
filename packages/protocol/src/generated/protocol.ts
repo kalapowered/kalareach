@@ -14329,9 +14329,9 @@ export interface HostUpdateHandoverParams {
  */
 export interface HostUpdateHandoverResult {
   /**
-   * The arguments it was started with, its program's own name left out. Only a `prepare` answers
-   * how the daemon was started, and refuses where it cannot say; a `stop` or a `resume` answers
-   * this empty in that case.
+   * The arguments it was started with, its program's own name left out. A `prepare` answers how
+   * the daemon was started, and refuses where it cannot say; a `stop` or a `resume` is taken all
+   * the same and answers this empty where it cannot.
    */
   arguments: string[]
   /**
@@ -14348,7 +14348,7 @@ export interface HostUpdateHandoverResult {
    */
   release: ReleaseName | null
   /**
-   * The directory it was started in; empty as `arguments` is where a `stop` or a `resume` cannot
+   * The directory it was started in; empty, as `arguments` is, where a `stop` or a `resume` cannot
    * say.
    */
   working_directory: string

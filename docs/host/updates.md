@@ -94,12 +94,13 @@ An install or an update waits for a control daemon that is starting, which holds
 while it starts, for at most thirty seconds, and an update does so before it stops anything. A
 daemon that takes longer makes the run exit with 9 and name the store, with nothing stopped: every
 control daemon the update had prepared resumes. Every wait of an install or an update on the
-store has a bound: a release's files, an environment's lock file and registry, and the release
-archive are opened without waiting for a writer, so a pipe under any of their names is refused, and
-all but the archive, which a link may name, are opened without following a link; the system's own
-tool that says its version is given ten seconds, whatever a program it starts does; and a program
-that starts in a release that is being removed or replaced waits for that removal for at most thirty
-seconds.
+store has a bound: a release's files and an environment's lock file are opened without following a
+link or waiting for a writer, the release archive without waiting for one (a link a person names it
+by is followed), and an environment's registry is checked to be a regular file, or a link to one,
+before it is opened, so a pipe in any of these places is refused; the system's own tool that says
+its version is given ten seconds and is ended if it prints more than a line, whatever a program it
+starts does; and a program that starts in a release that is being removed or replaced waits for
+that removal for at most thirty seconds.
 
 ## Updating
 
