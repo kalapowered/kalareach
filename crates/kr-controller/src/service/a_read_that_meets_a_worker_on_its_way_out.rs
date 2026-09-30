@@ -465,16 +465,20 @@ pub(super) async fn scripted(script: &Arc<Scripted>) -> Silent {
         .registry
         .lock()
         .await
-        .adopt_worker(&WorkerRecord {
-            session_id: world.session_id,
-            display_number: descriptor.display_number,
-            public_key: descriptor.worker_public_key,
-            process_identity: descriptor.process_start_identity.clone(),
-            endpoint: descriptor.endpoint.clone(),
-            profile: WorkerProfile::HeadlessUser,
-            state: SessionState::Live,
-            acknowledged_revision: AuthorityRevision::new(0),
-        })
+        .adopt_worker(
+            &WorkerRecord {
+                session_id: world.session_id,
+                display_number: descriptor.display_number,
+                public_key: descriptor.worker_public_key,
+                process_identity: descriptor.process_start_identity.clone(),
+                endpoint: descriptor.endpoint.clone(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            },
+            // A headless worker is bound to no desktop.
+            Some(&kr_protocol::identity::DesktopBinding::none()),
+        )
         .expect("the registry records the worker");
     fake::acknowledged(&world.controller, world.session_id);
     world
@@ -667,6 +671,7 @@ async fn reported(script: &Arc<Scripted>, admitted: bool) -> Silent {
                     state: SessionState::Live,
                     acknowledged_revision: AuthorityRevision::new(0),
                 },
+                &kr_protocol::identity::DesktopBinding::none(),
             )
             .expect("records the worker");
         let descriptor = kr_protocol::worker::WorkerDescriptor {

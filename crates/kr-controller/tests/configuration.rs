@@ -2665,6 +2665,7 @@ fn record_unreachable_worker(
                 state: kr_protocol::session::SessionState::Live,
                 acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
             },
+            &kr_protocol::identity::DesktopBinding::none(),
         )
         .expect("the worker is recorded");
     reservation.session_id

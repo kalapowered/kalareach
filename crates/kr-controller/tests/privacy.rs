@@ -261,16 +261,20 @@ impl Worker {
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
-            .adopt_worker(&WorkerRecord {
-                session_id,
-                display_number,
-                public_key,
-                process_identity: process.clone(),
-                endpoint: endpoint.as_text(),
-                profile: WorkerProfile::HeadlessUser,
-                state: SessionState::Live,
-                acknowledged_revision: AuthorityRevision::new(0),
-            })
+            .adopt_worker(
+                &WorkerRecord {
+                    session_id,
+                    display_number,
+                    public_key,
+                    process_identity: process.clone(),
+                    endpoint: endpoint.as_text(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+                // A headless worker is bound to no desktop.
+                Some(&kr_protocol::identity::DesktopBinding::none()),
+            )
             .expect("the worker is recorded");
         drop(registry);
         kr_ipc::descriptor::publish(

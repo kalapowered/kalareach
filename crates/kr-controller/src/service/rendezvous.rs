@@ -405,8 +405,11 @@ impl Controller {
             acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
         };
         // The key and the live phase are committed together: a registry that says a session is
-        // live always knows which key answers for it.
-        registry.record_worker(reservation_id, &record)?;
+        // live always knows which key answers for it. The desktop the worker says it is bound to
+        // goes with them, from its own report: what this daemon reads of the desktop it runs on
+        // now is not what the worker was bound to, and a daemon that starts on another login has
+        // to know which desktop each worker belongs to.
+        registry.record_worker(reservation_id, &record, &ready.session.desktop)?;
         drop(registry);
 
         let descriptor = WorkerDescriptor {

@@ -13,6 +13,11 @@
 //!   verification is checked against.
 //! * A **tombstone** is the record of a closed session, so a reader is answered rather than being
 //!   sent to an endpoint that might start something.
+//! * A worker's **desktop identity** is the desktop session and login-session generation the worker
+//!   says it is bound to, in its ready report or, for a worker a daemon adopts again after a stop,
+//!   in its own description of itself. It is recorded with the worker's row, so a daemon that
+//!   starts again on another login still knows which desktop each worker belongs to. A worker
+//!   bound to none is recorded with none.
 //!
 //! # Process identities in whole seconds
 //!
@@ -27,9 +32,12 @@
 //! creation time.
 
 use kr_ipc::identity::CurrentProcess;
-use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource, WorkerProfile};
+use kr_protocol::identity::{
+    DesktopBinding, ProcessStartIdentity, ProcessStartSource, WorkerProfile,
+};
 use kr_protocol::ids::{
-    ActorId, AuthorityRevision, BootEpoch, ControllerGeneration, EnvironmentId, SessionId,
+    ActorId, AuthorityRevision, BootEpoch, ControllerGeneration, DesktopSessionId, EnvironmentId,
+    SessionId,
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{ClosureRecord, DisplayNumber, SessionState};
@@ -39,7 +47,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +216,23 @@ pub struct Registry {
     /// It settles the records the previous build made in whole seconds; a test states what the
     /// kernel says instead.
     current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
+}
+
+/// The two columns a worker's desktop identity is kept in.
+///
+/// The login generation is an unsigned number and the column holds a signed one, so it is kept as
+/// the same 64 bits: every generation there can be comes back as it went in.
+fn desktop_columns(desktop: &DesktopBinding) -> (Option<String>, Option<i64>) {
+    (
+        desktop
+            .desktop_session_id
+            .as_ref()
+            .map(|identity| identity.as_str().to_owned()),
+        desktop
+            .login_generation
+            .as_ref()
+            .map(|generation| generation.get().cast_signed()),
+    )
 }
 
 impl Registry {
@@ -509,7 +534,9 @@ impl Registry {
                      profile          TEXT NOT NULL,
                      state            TEXT NOT NULL,
                      acknowledged_revision INTEGER NOT NULL DEFAULT 0,
-                     stated_source    TEXT NOT NULL DEFAULT ''
+                     stated_source    TEXT NOT NULL DEFAULT '',
+                     desktop_session_id TEXT,
+                     login_generation INTEGER
                  );
                  CREATE TABLE IF NOT EXISTS tombstones (
                      session_id BLOB PRIMARY KEY,
@@ -549,17 +576,24 @@ impl Registry {
                 self.migrate_2_to_3()?;
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
+                self.migrate_5_to_6()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
+                self.migrate_5_to_6()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
+                self.migrate_5_to_6()?;
             }
-            Some(4) => self.migrate_4_to_5()?,
+            Some(4) => {
+                self.migrate_4_to_5()?;
+                self.migrate_5_to_6()?;
+            }
+            Some(5) => self.migrate_5_to_6()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -692,6 +726,40 @@ impl Registry {
                  UPDATE schema_version SET version = 5;
                  COMMIT;",
             )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 5 to 6: a worker's row gains the desktop identity it is bound to, the desktop
+    /// session and the login-session generation, both null.
+    ///
+    /// A worker an earlier build recorded has none recorded, and reads back as bound to none: the
+    /// row's profile still says whether it is a desktop-bound worker, and the identity it was
+    /// bound to is what that build never kept.
+    ///
+    /// This migration goes when there can no longer be a version 5 registry to read, which is the
+    /// first release: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_5_to_6(&self) -> Result<()> {
+        let has = |column: &str| -> Result<bool> {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('workers') WHERE name = ?1",
+                    params![column],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+                .map_err(ControllerError::registry)
+        };
+        let mut statements = String::from("BEGIN;");
+        if !has("desktop_session_id")? {
+            statements.push_str("ALTER TABLE workers ADD COLUMN desktop_session_id TEXT;");
+        }
+        if !has("login_generation")? {
+            statements.push_str("ALTER TABLE workers ADD COLUMN login_generation INTEGER;");
+        }
+        statements.push_str("UPDATE schema_version SET version = 6; COMMIT;");
+        self.connection
+            .execute_batch(&statements)
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -1674,10 +1742,13 @@ impl Registry {
         Ok(reservations)
     }
 
-    /// Records a worker inside the reservation-to-live transition.
+    /// Records a worker inside the reservation-to-live transition, with the desktop it states it is
+    /// bound to.
     ///
-    /// The public key, the process identity and the live phase are committed together, so a
-    /// registry that knows a session is live always knows which key answers for it.
+    /// The public key, the process identity, the live phase and the desktop identity are committed
+    /// together: a registry that knows a session is live knows which key answers for it and which
+    /// desktop its worker said it was bound to, and reads both back after a restart. A worker bound
+    /// to no desktop is recorded with none.
     ///
     /// # Errors
     ///
@@ -1686,8 +1757,10 @@ impl Registry {
         &mut self,
         reservation_id: ReservationId,
         worker: &WorkerRecord,
+        desktop: &DesktopBinding,
     ) -> Result<()> {
         let recorded = self.to_record(worker.session_id, &worker.process_identity)?;
+        let (desktop_session, login_generation) = desktop_columns(desktop);
         let transaction = self
             .connection
             .transaction()
@@ -1695,8 +1768,9 @@ impl Registry {
         transaction
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
-                     process_source, process_start, endpoint, profile, state, stated_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     process_source, process_start, endpoint, profile, state, stated_source,
+                     desktop_session_id, login_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (session_id) DO UPDATE SET
                      public_key = excluded.public_key,
                      process_pid = excluded.process_pid,
@@ -1704,7 +1778,9 @@ impl Registry {
                      process_start = excluded.process_start,
                      endpoint = excluded.endpoint,
                      state = excluded.state,
-                     stated_source = excluded.stated_source",
+                     stated_source = excluded.stated_source,
+                     desktop_session_id = excluded.desktop_session_id,
+                     login_generation = excluded.login_generation",
                 params![
                     worker.session_id.get().as_bytes().as_slice(),
                     i64::try_from(worker.display_number.get()).unwrap_or(i64::MAX),
@@ -1716,6 +1792,8 @@ impl Registry {
                     worker.profile.as_str(),
                     worker.state.as_str(),
                     source_name(worker.process_identity.source),
+                    desktop_session,
+                    login_generation,
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1741,21 +1819,30 @@ impl Registry {
         Ok(())
     }
 
-    /// Records a worker row without touching any reservation phase.
+    /// Records a worker row without touching any reservation phase, with the desktop it states it
+    /// is bound to where it stated one.
     ///
     /// Recovery uses this: the worker already exists and already proved itself, so what is missing
-    /// is the daemon's own record of it, not a transition.
+    /// is the daemon's own record of it, not a transition. `desktop` is empty only where nothing
+    /// says what the worker is bound to, as when it could not be asked; a row that has an identity
+    /// keeps it.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
-    pub fn adopt_worker(&mut self, worker: &WorkerRecord) -> Result<()> {
+    pub fn adopt_worker(
+        &mut self,
+        worker: &WorkerRecord,
+        desktop: Option<&DesktopBinding>,
+    ) -> Result<()> {
         let recorded = self.to_record(worker.session_id, &worker.process_identity)?;
+        let (desktop_session, login_generation) = desktop.map_or((None, None), desktop_columns);
         self.connection
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
-                     process_source, process_start, endpoint, profile, state, stated_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     process_source, process_start, endpoint, profile, state, stated_source,
+                     desktop_session_id, login_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (session_id) DO UPDATE SET
                      public_key = excluded.public_key,
                      process_pid = excluded.process_pid,
@@ -1763,7 +1850,11 @@ impl Registry {
                      process_start = excluded.process_start,
                      endpoint = excluded.endpoint,
                      state = excluded.state,
-                     stated_source = excluded.stated_source",
+                     stated_source = excluded.stated_source,
+                     desktop_session_id = CASE WHEN ?13 THEN excluded.desktop_session_id
+                                               ELSE workers.desktop_session_id END,
+                     login_generation = CASE WHEN ?13 THEN excluded.login_generation
+                                             ELSE workers.login_generation END",
                 params![
                     worker.session_id.get().as_bytes().as_slice(),
                     i64::try_from(worker.display_number.get()).unwrap_or(i64::MAX),
@@ -1775,6 +1866,9 @@ impl Registry {
                     worker.profile.as_str(),
                     worker.state.as_str(),
                     source_name(worker.process_identity.source),
+                    desktop_session,
+                    login_generation,
+                    desktop.is_some(),
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1833,6 +1927,49 @@ impl Registry {
             });
         }
         Ok(workers)
+    }
+
+    /// Returns the desktop identity a session's worker is bound to, or `None` when the registry
+    /// holds no worker for the session.
+    ///
+    /// A worker bound to no desktop, or one an earlier build recorded, reads back as bound to
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails or a stored identity
+    /// cannot be read.
+    pub fn desktop_of(&self, session_id: SessionId) -> Result<Option<DesktopBinding>> {
+        let stored: Option<(Option<String>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT desktop_session_id, login_generation FROM workers WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        stored
+            .map(|(desktop, generation)| {
+                let desktop_session_id =
+                    desktop
+                        .map(DesktopSessionId::new)
+                        .transpose()
+                        .map_err(|error| {
+                            ControllerError::registry(format!(
+                                "a worker's recorded desktop identity cannot be read: {error}"
+                            ))
+                        })?;
+                Ok(DesktopBinding {
+                    desktop_session_id: desktop_session_id.into(),
+                    login_generation: generation
+                        .map(|generation| {
+                            kr_protocol::scalars::U64::new(generation.cast_unsigned())
+                        })
+                        .into(),
+                })
+            })
+            .transpose()
     }
 
     /// Records a closed session and removes its worker row.
@@ -2287,8 +2424,8 @@ mod tests {
             .expect("the launcher is recorded")
     }
 
-    /// A registry the previous build left at version 4 opens at version 5, with no clock floor
-    /// and no lost continuity recorded: what a registry that created no floor holds.
+    /// A registry the previous build left at version 4 opens at the current version, with no clock
+    /// floor and no lost continuity recorded: what a registry that created no floor holds.
     #[test]
     fn a_version_4_registry_opens_with_no_floor_recorded() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -2473,7 +2610,9 @@ mod tests {
             kernel_replaced,
         ] {
             registry.current_process = now;
-            registry.adopt_worker(&record).expect("adopts");
+            registry
+                .adopt_worker(&record, Some(&DesktopBinding::none()))
+                .expect("adopts");
             assert_eq!(worker(&registry, 1), finer(1001));
             assert_eq!(stated(&registry, 1), "windows_process_start_seconds");
         }
@@ -2486,7 +2625,9 @@ mod tests {
             process_identity: in_seconds(1005),
             ..record.clone()
         };
-        registry.adopt_worker(&arriving).expect("adopts");
+        registry
+            .adopt_worker(&arriving, Some(&DesktopBinding::none()))
+            .expect("adopts");
         assert_eq!(worker(&registry, 5), finer(1005));
         assert_eq!(stated(&registry, 5), "windows_process_start_seconds");
         // One this build started states the creation time, which is recorded as it is.
@@ -2496,9 +2637,65 @@ mod tests {
             process_identity: finer(1009),
             ..record
         };
-        registry.adopt_worker(&current).expect("adopts");
+        registry
+            .adopt_worker(&current, Some(&DesktopBinding::none()))
+            .expect("adopts");
         assert_eq!(worker(&registry, 9), finer(1009));
         assert_eq!(stated(&registry, 9), "windows_process_creation_time");
+    }
+
+    /// KR-REQ-24.01: a registry an earlier build wrote records no desktop identity, and reads with
+    /// none for the workers it holds; a desktop recorded afterwards is kept across an opening.
+    #[test]
+    fn an_earlier_registrys_workers_read_with_no_desktop_and_a_recorded_one_is_kept() {
+        use kr_protocol::identity::DesktopBinding;
+        use kr_protocol::ids::DesktopSessionId;
+        use kr_protocol::scalars::Nullable;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        previous_build_registry(&path, &[(1, finer(1001))], &[]);
+        let mut registry = Registry::open(&path, environment()).expect("brings the registry on");
+        assert_eq!(
+            registry.desktop_of(session(1)).expect("reads"),
+            Some(DesktopBinding::none()),
+            "a worker an earlier build recorded is bound to no recorded desktop"
+        );
+        let desktop = DesktopBinding {
+            desktop_session_id: Nullable::some(
+                DesktopSessionId::new("desktop-501-boot-9-login-4").expect("a desktop identity"),
+            ),
+            login_generation: Nullable::some(U64::new(4)),
+        };
+        let record = WorkerRecord {
+            session_id: session(1),
+            display_number: DisplayNumber::new(1),
+            public_key: AuthorisationKey::from_bytes([1; 32]),
+            process_identity: finer(1001),
+            endpoint: "worker".to_owned(),
+            profile: WorkerProfile::DesktopBound,
+            state: SessionState::Live,
+            acknowledged_revision: AuthorityRevision::new(0),
+        };
+        let reservation = registry
+            .reservation_for_session(session(1))
+            .expect("reads")
+            .expect("the worker's reservation")
+            .reservation_id;
+        // Recording a worker promotes a claim, so the reservation the earlier build left is one.
+        registry
+            .connection
+            .execute("UPDATE reservations SET phase = 'claimed'", [])
+            .expect("the reservation is claimed");
+        registry
+            .record_worker(reservation, &record, &desktop)
+            .expect("records the desktop");
+        drop(registry);
+        let registry = Registry::open(&path, environment()).expect("opens again");
+        assert_eq!(
+            registry.desktop_of(session(1)).expect("reads"),
+            Some(desktop)
+        );
     }
 
     #[test]
@@ -2582,7 +2779,7 @@ mod tests {
 
         Registry::open(&path, environment())
             .expect("a registry")
-            .adopt_worker(&worker_row(1, 4_001))
+            .adopt_worker(&worker_row(1, 4_001), Some(&DesktopBinding::none()))
             .expect("records a worker");
         let read = Registry::open_to_read(&path, environment()).expect("a registry reads");
         assert_eq!(
@@ -2648,7 +2845,7 @@ mod tests {
         let path = directory.path().join("registry.sqlite3");
         Registry::open(&path, environment())
             .expect("a registry")
-            .adopt_worker(&worker_row(1, 4_001))
+            .adopt_worker(&worker_row(1, 4_001), Some(&DesktopBinding::none()))
             .expect("records a worker");
         let before = files_in(directory.path());
         assert_eq!(before.len(), 1, "a closed registry is one file: {before:?}");
@@ -2697,7 +2894,7 @@ mod tests {
         let actual = directory.path().join("actual.sqlite3");
         Registry::open(&actual, environment())
             .expect("a registry")
-            .adopt_worker(&worker_row(1, 4_001))
+            .adopt_worker(&worker_row(1, 4_001), Some(&DesktopBinding::none()))
             .expect("records a worker");
         let link = directory.path().join("registry.sqlite3");
         std::os::unix::fs::symlink(&actual, &link).expect("links the registry");

@@ -1447,17 +1447,21 @@ fn a_live_worker_recorded_only_in_the_registry_keeps_its_journal() {
     let session_id = session();
     write_version_one_journal(&archive, session_id);
     registry(&archive)
-        .adopt_worker(&kr_controller::registry::WorkerRecord {
-            session_id,
-            display_number: DisplayNumber::new(1),
-            public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
-            process_identity: kr_ipc::identity::current_process_start_identity()
-                .expect("an identity"),
-            endpoint: "/tmp/kr-archive-test.sock".to_owned(),
-            profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-            state: kr_protocol::session::SessionState::Live,
-            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
-        })
+        .adopt_worker(
+            &kr_controller::registry::WorkerRecord {
+                session_id,
+                display_number: DisplayNumber::new(1),
+                public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+                process_identity: kr_ipc::identity::current_process_start_identity()
+                    .expect("an identity"),
+                endpoint: "/tmp/kr-archive-test.sock".to_owned(),
+                profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                state: kr_protocol::session::SessionState::Live,
+                acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+            },
+            // A headless worker is bound to no desktop.
+            Some(&kr_protocol::identity::DesktopBinding::none()),
+        )
         .expect("records the worker");
     let imported = archive
         .import_journals()

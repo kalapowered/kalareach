@@ -394,7 +394,16 @@ impl Controller {
         };
         {
             let mut registry = self.registry.lock().await;
-            registry.adopt_worker(&record)?;
+            // The desktop it says it is bound to, where it was asked and described its own session:
+            // one that could not be asked, or described another, keeps the identity its row already
+            // has.
+            registry.adopt_worker(
+                &record,
+                described
+                    .as_ref()
+                    .filter(|summary| summary.session_id == proof.session_id)
+                    .map(|summary| &summary.desktop),
+            )?;
         }
         let descriptor = WorkerDescriptor {
             session_id: proof.session_id,

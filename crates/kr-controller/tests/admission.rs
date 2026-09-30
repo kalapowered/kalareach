@@ -418,7 +418,11 @@ fn a_ready_report_cannot_revive_a_fenced_reservation() {
     };
     assert!(
         registry
-            .record_worker(reservation.reservation_id, &record)
+            .record_worker(
+                reservation.reservation_id,
+                &record,
+                &kr_protocol::identity::DesktopBinding::none()
+            )
             .is_err(),
         "a late ready report does not answer the question fencing asked"
     );
@@ -703,7 +707,11 @@ fn the_registry_reads_back_every_durable_record_it_keeps() {
         acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
     };
     registry
-        .record_worker(live.reservation_id, &worker)
+        .record_worker(
+            live.reservation_id,
+            &worker,
+            &kr_protocol::identity::DesktopBinding::none(),
+        )
         .expect("records the worker");
 
     // A closed session: its reservation and its tombstone.
@@ -765,4 +773,149 @@ fn the_registry_reads_back_every_durable_record_it_keeps() {
         .expect("reads")
         .expect("the closed reservation");
     assert_eq!(closed_again.phase, LaunchPhase::Closed);
+}
+
+/// KR-REQ-24.01: the controller registry keeps the desktop identity each worker is bound to, the
+/// desktop session and the login-session generation it was taken at, and a daemon that opens the
+/// registry again reads it back. A headless worker is bound to none and reads back as bound to
+/// none. A worker adopted again with nothing stated keeps the identity it was recorded with, and
+/// one adopted with a binding to state takes it, whether it had one or none.
+#[test]
+fn kr_req_24_01_the_registry_keeps_the_desktop_identity_a_worker_is_bound_to() {
+    use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+    use kr_protocol::ids::DesktopSessionId;
+    use kr_protocol::scalars::{Nullable, U64};
+
+    let (host, mut registry) = registry();
+    let mut worker_for = |byte: u8, profile: WorkerProfile| {
+        let reservation = registry
+            .reserve(
+                &actor("local:501"),
+                kr_ipc::new_uuid(),
+                digest(byte),
+                &intent(),
+                TimestampMs::new(1),
+            )
+            .expect("reserves")
+            .reservation;
+        registry
+            .set_phase(reservation.reservation_id, LaunchPhase::Spawned)
+            .expect("spawned");
+        let key = kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]);
+        registry
+            .claim_rendezvous(reservation.reservation_id, key)
+            .expect("claims");
+        (
+            reservation.reservation_id,
+            kr_controller::registry::WorkerRecord {
+                session_id: reservation.session_id,
+                display_number: reservation.display_number,
+                public_key: key,
+                process_identity: kr_protocol::identity::ProcessStartIdentity::new(
+                    4000 + u64::from(byte),
+                    kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+                    77,
+                ),
+                endpoint: format!("/tmp/kr-registry-test-{byte}.sock"),
+                profile,
+                state: kr_protocol::session::SessionState::Live,
+                acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+            },
+        )
+    };
+    let (bound_reservation, bound) = worker_for(7, WorkerProfile::DesktopBound);
+    let (headless_reservation, headless) = worker_for(8, WorkerProfile::HeadlessUser);
+    let (largest_reservation, largest) = worker_for(9, WorkerProfile::DesktopBound);
+    let (late_reservation, late) = worker_for(10, WorkerProfile::DesktopBound);
+    let (released_reservation, released) = worker_for(11, WorkerProfile::DesktopBound);
+    let desktop = DesktopBinding {
+        desktop_session_id: Nullable::some(
+            DesktopSessionId::new("desktop-501-boot-9-login-4").expect("a desktop identity"),
+        ),
+        login_generation: Nullable::some(U64::new(4)),
+    };
+    registry
+        .record_worker(bound_reservation, &bound, &desktop)
+        .expect("records the desktop-bound worker");
+    registry
+        .record_worker(headless_reservation, &headless, &DesktopBinding::none())
+        .expect("records the headless worker");
+    // The largest generation a login can have is kept whole rather than cut to what a signed
+    // column holds.
+    let last_login = DesktopBinding {
+        desktop_session_id: Nullable::some(
+            DesktopSessionId::new("desktop-501-boot-9-login-9").expect("a desktop identity"),
+        ),
+        login_generation: Nullable::some(U64::new(u64::MAX)),
+    };
+    registry
+        .record_worker(largest_reservation, &largest, &last_login)
+        .expect("records the worker of the last login");
+    // Two more workers, one recorded bound to none and one bound to a desktop, for the adoptions
+    // below that state a binding.
+    registry
+        .record_worker(late_reservation, &late, &DesktopBinding::none())
+        .expect("records the worker that binds later");
+    registry
+        .record_worker(released_reservation, &released, &desktop)
+        .expect("records the worker that is released");
+    // Adopted again with nothing to state, as recovery does a worker it could not ask.
+    registry
+        .adopt_worker(&bound, None)
+        .expect("adopts the worker");
+    // Adopted with a binding to state: a worker recorded bound to none takes it, and one recorded
+    // bound to a desktop is bound to none by it.
+    let taken = DesktopBinding {
+        desktop_session_id: Nullable::some(
+            DesktopSessionId::new("desktop-501-boot-9-login-5").expect("a desktop identity"),
+        ),
+        login_generation: Nullable::some(U64::new(5)),
+    };
+    registry
+        .adopt_worker(&late, Some(&taken))
+        .expect("adopts the worker with the binding it states");
+    registry
+        .adopt_worker(&released, Some(&DesktopBinding::none()))
+        .expect("adopts the worker with none to state");
+    drop(registry);
+
+    let reopened = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("reopens the registry");
+    assert_eq!(
+        reopened.desktop_of(bound.session_id).expect("reads"),
+        Some(desktop),
+        "the desktop a worker is bound to comes back as it was recorded, and survives an adoption"
+    );
+    assert_eq!(
+        reopened.desktop_of(largest.session_id).expect("reads"),
+        Some(last_login),
+        "the largest generation a login can have comes back whole"
+    );
+    assert_eq!(
+        reopened.desktop_of(headless.session_id).expect("reads"),
+        Some(DesktopBinding::none()),
+        "a worker bound to no desktop reads back as bound to none"
+    );
+    assert_eq!(
+        reopened.desktop_of(late.session_id).expect("reads"),
+        Some(taken),
+        "a worker recorded bound to none takes the binding an adoption states"
+    );
+    assert_eq!(
+        reopened.desktop_of(released.session_id).expect("reads"),
+        Some(DesktopBinding::none()),
+        "and one recorded bound to a desktop is bound to none by an adoption that states none"
+    );
+    assert_eq!(
+        reopened
+            .desktop_of(kr_protocol::ids::SessionId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0xee; 16])
+            ))
+            .expect("reads"),
+        None,
+        "and a session with no worker has none to read"
+    );
 }

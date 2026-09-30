@@ -783,11 +783,36 @@ async fn seed_claim(
     controller: &Controller,
     actor_id: &kr_protocol::ids::ActorId,
 ) -> crate::registry::Reservation {
+    seed_claim_as(
+        controller,
+        actor_id,
+        kr_protocol::identity::WorkerProfile::HeadlessUser,
+        |_| {
+            *kr_crypto::keys::AuthorisationKeyPair::generate()
+                .expect("a key")
+                .public()
+        },
+    )
+    .await
+}
+
+/// As [`seed_claim`], for a session of `profile`, with the key the claim names chosen once the
+/// reservation, and so the session, is known: a worker that is to answer a challenge for the
+/// session has to be made for it.
+async fn seed_claim_as(
+    controller: &Controller,
+    actor_id: &kr_protocol::ids::ActorId,
+    profile: kr_protocol::identity::WorkerProfile,
+    key_of: impl FnOnce(&crate::registry::Reservation) -> kr_protocol::scalars::AuthorisationKey,
+) -> crate::registry::Reservation {
     let mut registry = controller.registry.lock().await;
     // A reservation records the create request it was made for, because that is what a later
     // launch and a later publication both read the session's own context out of.
-    let intent = kr_cbor::to_canonical_vec(&create_params(controller.paths.environment_id()))
-        .expect("encodes");
+    let intent = kr_cbor::to_canonical_vec(&SessionCreateParams {
+        worker_profile: profile,
+        ..create_params(controller.paths.environment_id())
+    })
+    .expect("encodes");
     let admission = registry
         .reserve(
             actor_id,
@@ -801,14 +826,249 @@ async fn seed_claim(
     registry
         .set_phase(reservation_id, LaunchPhase::Spawned)
         .expect("spawned");
+    let key = key_of(&admission.reservation);
     registry
-        .claim_rendezvous(
-            reservation_id,
-            *kr_crypto::keys::AuthorisationKeyPair::generate()
-                .expect("a key")
-                .public(),
-        )
+        .claim_rendezvous(reservation_id, key)
         .expect("claims")
+}
+
+/// A worker that answers the daemon's challenge as the worker of `identity`'s session and, when
+/// its session is read, describes the session `described` as bound to `desktop`.
+fn worker_stating(
+    listener: kr_ipc::endpoint::Listener,
+    identity: Arc<kr_ipc::verify::WorkerIdentity>,
+    endpoint_text: String,
+    described: kr_protocol::ids::SessionId,
+    desktop: kr_protocol::identity::DesktopBinding,
+) -> tokio::task::JoinHandle<()> {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::scalars::CanonicalSet;
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((connection, peer)) = listener.accept().await else {
+                return;
+            };
+            let identity = Arc::clone(&identity);
+            let endpoint_text = endpoint_text.clone();
+            let desktop = desktop.clone();
+            tokio::spawn(async move {
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, StreamKind::Control);
+                let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                    let answers = match super::a_close_a_worker_never_answers::handshake(
+                        &frame,
+                        &identity,
+                        &endpoint_text,
+                        connection_id,
+                        &peer,
+                        &CanonicalSet::new(),
+                    ) {
+                        Some(answers) => answers,
+                        None => match frame {
+                            ControlFrame::Request(request)
+                                if request.method == Method::SessionRead.into() =>
+                            {
+                                let mut read =
+                                    super::a_close_a_worker_never_answers::read_result(described);
+                                read.session.desktop = desktop.clone();
+                                vec![ControlFrame::Response(Response {
+                                    request_id: request.request_id,
+                                    outcome: Outcome::Ok(
+                                        ParamsValue::from_typed(&read).expect("encodes"),
+                                    ),
+                                })]
+                            }
+                            _ => Vec::new(),
+                        },
+                    };
+                    for answer in answers {
+                        if writer.write_message(&answer).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// KR-REQ-24.01: the desktop identity a worker states in its ready report is recorded with its
+/// row, and a daemon that starts again on the environment reads it back: the desktop session and
+/// the login-session generation the worker is bound to, not what this host reads of its own
+/// desktop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_desktop_identity_is_recorded_from_its_report_and_read_back_after_a_restart() {
+    use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+    use kr_protocol::ids::DesktopSessionId;
+    use kr_protocol::scalars::U64;
+
+    let (temp, controller, _asked) = daemon().await;
+    let environment = temp.environment();
+    let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let mut worker = None;
+    let reservation = seed_claim_as(
+        &controller,
+        &actor_id,
+        WorkerProfile::DesktopBound,
+        |reservation| {
+            let made = Arc::new(
+                kr_ipc::verify::WorkerIdentity::generate(
+                    reservation.session_id,
+                    kr_protocol::ids::SessionEpoch::V1,
+                    kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    kr_ipc::identity::process_start_identity(std::process::id())
+                        .expect("this process's start identity"),
+                    kr_protocol::hello::PROTOCOL_VERSION,
+                )
+                .expect("a worker identity"),
+            );
+            let key = *made.public_key();
+            worker = Some(made);
+            key
+        },
+    )
+    .await;
+    let identity = worker.expect("the worker was made for its claim");
+    let claim = identity
+        .rendezvous(kr_protocol::worker::ReservationId::new(
+            reservation.reservation_id.get(),
+        ))
+        .expect("a startup claim");
+    let desktop = DesktopBinding {
+        desktop_session_id: Nullable::some(
+            DesktopSessionId::new("desktop-501-boot-9-login-4").expect("a desktop identity"),
+        ),
+        login_generation: Nullable::some(U64::new(4)),
+    };
+    let mut session =
+        super::a_close_a_worker_never_answers::read_result(reservation.session_id).session;
+    session.desktop = desktop.clone();
+    let report = kr_protocol::worker::WorkerReady {
+        session_id: reservation.session_id,
+        endpoint: environment
+            .worker_endpoint(reservation.display_number)
+            .expect("an endpoint")
+            .as_text(),
+        root_process: identity.process_start_identity().clone(),
+        shell_path: "/bin/zsh".to_owned(),
+        dimensions: kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS,
+        session: Box::new(session),
+    };
+    controller
+        .record_ready(reservation.reservation_id, &claim, &report)
+        .await
+        .expect("records the worker from its report");
+    let environment_id = controller.paths.environment_id();
+    drop(controller);
+
+    let reopened = crate::registry::Registry::open(environment.registry_database(), environment_id)
+        .expect("the registry opens again");
+    assert_eq!(
+        reopened.desktop_of(reservation.session_id).expect("reads"),
+        Some(desktop),
+        "the desktop the worker said it was bound to comes back"
+    );
+}
+
+/// KR-REQ-24.01: a daemon that stopped after a worker took its claim and before the worker's
+/// report was recorded recovers the worker by challenge, and its registry row keeps the desktop
+/// the worker says it is bound to, as one recorded by the report does. A worker bound to none is
+/// recovered as one bound to none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_recovered_by_its_claim_keeps_the_desktop_it_states() {
+    use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+    use kr_protocol::ids::DesktopSessionId;
+    use kr_protocol::scalars::U64;
+
+    let bound = DesktopBinding {
+        desktop_session_id: Nullable::some(
+            DesktopSessionId::new("desktop-501-boot-9-login-4").expect("a desktop identity"),
+        ),
+        login_generation: Nullable::some(U64::new(4)),
+    };
+    // What the worker describes, who it describes, and what the recovered row then holds.
+    for (case, profile, stated, describes_another_session, held) in [
+        (
+            "a worker bound to a desktop",
+            WorkerProfile::DesktopBound,
+            bound.clone(),
+            false,
+            bound.clone(),
+        ),
+        (
+            "a worker bound to none",
+            WorkerProfile::HeadlessUser,
+            DesktopBinding::none(),
+            false,
+            DesktopBinding::none(),
+        ),
+        (
+            // A description of another session says nothing of this worker's desktop, and what it
+            // states is not taken for it.
+            "a worker that describes another session",
+            WorkerProfile::DesktopBound,
+            bound,
+            true,
+            DesktopBinding::none(),
+        ),
+    ] {
+        let (temp, controller, _asked) = daemon().await;
+        let environment = temp.environment();
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let mut worker = None;
+        let reservation = seed_claim_as(&controller, &actor_id, profile, |reservation| {
+            let identity = Arc::new(
+                kr_ipc::verify::WorkerIdentity::generate(
+                    reservation.session_id,
+                    kr_protocol::ids::SessionEpoch::V1,
+                    kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    kr_ipc::identity::process_start_identity(std::process::id())
+                        .expect("this process's start identity"),
+                    kr_protocol::hello::PROTOCOL_VERSION,
+                )
+                .expect("a worker identity"),
+            );
+            let key = *identity.public_key();
+            worker = Some(identity);
+            key
+        })
+        .await;
+        let identity = worker.expect("the worker was made for its claim");
+        let endpoint = environment
+            .worker_endpoint(reservation.display_number)
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the worker");
+        let described = if describes_another_session {
+            kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())
+        } else {
+            reservation.session_id
+        };
+        let serving = worker_stating(listener, identity, endpoint.as_text(), described, stated);
+
+        controller
+            .recover_claims()
+            .await
+            .expect("the claim is recovered");
+
+        // Read from the file by a registry opened again, as a daemon that starts after this one
+        // reads it, and not through the handle that wrote the row.
+        let reopened = crate::registry::Registry::open(
+            environment.registry_database(),
+            controller.paths.environment_id(),
+        )
+        .expect("the registry opens again");
+        assert_eq!(
+            reopened
+                .desktop_of(reservation.session_id)
+                .expect("the registry reads"),
+            Some(held),
+            "{case}: the recovered row holds what the worker stated of its own session"
+        );
+        serving.abort();
+    }
 }
 
 /// KR-REQ-07.09: a daemon starting after a crash settles every launch its predecessor left
@@ -959,6 +1219,7 @@ async fn a_recorded_worker_that_answers_nobody_is_not_published_again() {
                     state: kr_protocol::session::SessionState::Live,
                     acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
                 },
+                &kr_protocol::identity::DesktopBinding::none(),
             )
             .expect("records the worker");
         reservation.session_id
