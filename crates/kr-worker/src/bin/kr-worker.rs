@@ -558,13 +558,6 @@ fn session_config(
     // The context a worker of this profile runs in, resolved from the login session the service
     // manager placed it in. A headless worker takes none of it, because it must outlive that
     // login session.
-    #[cfg_attr(
-        not(unix),
-        expect(
-            unused_mut,
-            reason = "only a Unix session has a terminfo library to point"
-        )
-    )]
     let mut context = ExecutionContext::resolve(create.worker_profile);
     // The database the session's terminal libraries read. A worker that cannot write it says so
     // and the session reads whatever its host has: the terminal still works, and the worker's log
