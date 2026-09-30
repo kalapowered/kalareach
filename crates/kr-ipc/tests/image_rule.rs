@@ -1533,8 +1533,79 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
             "only the dev entry asks: {first} then {second}"
         );
     }
-    // A crate that lists its own defaults as `kr-ipc/testing` through a dependency that is also a
-    // dev dependency is named as well.
+    // Two entries of a dependency that a program is built with (a normal one and a build one, or
+    // one for each target) are joined, in either order: what either asks is asked.
+    for (first_asks, second_asks) in [(&["extra"][..], &[][..]), (&[][..], &["extra"][..])] {
+        let joined = serde_json::json!({ "packages": [
+            host(
+                "a",
+                serde_json::json!([
+                    dependency("b", serde_json::Value::Null, first_asks),
+                    dependency("b", serde_json::json!("build"), second_asks),
+                ]),
+                serde_json::json!({ "default": [] }),
+            ),
+            host(
+                "b",
+                serde_json::json!([]),
+                serde_json::json!({ "extra": ["testing"], "testing": [] }),
+            ),
+        ]});
+        assert_eq!(
+            testing_in_production(&joined, Path::new("/w")),
+            vec!["a: the testing feature of b is turned on by a normal or build dependency on b"],
+            "{first_asks:?} then {second_asks:?}"
+        );
+    }
+    // Default features on in one entry only are on: `b`'s defaults name `testing`. With every entry
+    // asking for none, only `b` itself, built with its own defaults, is named.
+    let without_defaults = |kind: serde_json::Value| {
+        serde_json::json!({
+            "name": "b",
+            "kind": kind,
+            "features": [],
+            "uses_default_features": false,
+        })
+    };
+    let defaults_of = |one: serde_json::Value, other: serde_json::Value| {
+        serde_json::json!({ "packages": [
+            host(
+                "a",
+                serde_json::json!([one, other]),
+                serde_json::json!({ "default": [] }),
+            ),
+            host(
+                "b",
+                serde_json::json!([]),
+                serde_json::json!({ "default": ["testing"], "testing": [] }),
+            ),
+        ]})
+    };
+    assert_eq!(
+        testing_in_production(
+            &defaults_of(
+                without_defaults(serde_json::Value::Null),
+                dependency("b", serde_json::json!("build"), &[])
+            ),
+            Path::new("/w")
+        ),
+        vec![
+            "a: the testing feature of b is turned on by a normal or build dependency on b",
+            "b: the testing feature of b is turned on by its default features",
+        ]
+    );
+    assert_eq!(
+        testing_in_production(
+            &defaults_of(
+                without_defaults(serde_json::Value::Null),
+                without_defaults(serde_json::json!("build"))
+            ),
+            Path::new("/w")
+        ),
+        vec!["b: the testing feature of b is turned on by its default features"]
+    );
+    // A crate whose own default feature names a dependency's `testing`, where that dependency is
+    // also a dev dependency, is named as well.
     let doubled = serde_json::json!({ "packages": [
         host(
             "a",
