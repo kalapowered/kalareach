@@ -1265,6 +1265,39 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     })
   })
 
+  it('puts the focus on the mode button when Attach again is pressed from the keyboard, and leaves it where a pointer left it', async () => {
+    for (const by of ['pointer', 'keyboard'] as const) {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      act(() => {
+        controls.terminalViews[0]?.end('The session ended.')
+      })
+      const again = screen.getByRole('button', { name: 'Attach again' })
+      if (by === 'keyboard') {
+        again.focus()
+        await person.keyboard('{Enter}')
+      } else {
+        await person.click(again)
+      }
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      expect(screen.queryByTestId('attach-again'), by).toBeNull()
+      if (by === 'keyboard') {
+        expect(screen.getByRole('button', { name: 'Take control' }), by).toHaveFocus()
+      } else {
+        expect(document.activeElement, by).toBe(document.body)
+      }
+      cleanup()
+    }
+  })
+
   it('pays the focus owed once the mode button can take it, unless the person put it on another control first', async () => {
     // The bar that holds the mode button is hidden while a software keyboard is up: here, while
     // `hidden` holds, nothing in the bar is shown.

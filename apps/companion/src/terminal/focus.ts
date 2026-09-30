@@ -15,6 +15,9 @@
  * software keyboard is up, which the keyboard's own field going makes it leave. So the move is owed
  * until the destination can take it. Focus the person puts on any other control first settles it,
  * and so does the destination leaving the page with its view.
+ *
+ * Attach again is one of the view's controls when the person pressed it without a pointer: the press
+ * removes the button with the view that ended, and the focus it held goes with it.
  */
 
 import { useLayoutEffect, useRef } from 'react'
@@ -24,6 +27,31 @@ function takesFocus(element: Element): boolean {
   if (!element.isConnected || element.matches(':disabled')) return false
   const control = element as HTMLElement
   return typeof control.checkVisibility === 'function' ? control.checkVisibility() : true
+}
+
+/**
+ * Counts the control `id` among the view's own while its last press came from the keyboard or a
+ * screen reader, and not from a pointer.
+ *
+ * A press that ends the view the control sits in removes the control, and the focus it held with
+ * it. A person at the keyboard has nowhere to go on from, so the focus is owed as it is for the
+ * view's other controls. A person with a pointer put the focus where they pressed, and nothing of
+ * it is owed: a pointer's click counts its presses, one or more, and a click nothing pointed at,
+ * from Enter, Space or a screen reader, counts none.
+ */
+export function useKeyboardPress(id: string): {
+  /** Notes how the control was pressed: call it from the control's click handler. */
+  readonly press: (event: { readonly detail: number }) => void
+  /** Whether `element` is that control, pressed without a pointer. */
+  readonly held: (element: Element | null) => boolean
+} {
+  const withoutPointer = useRef(false)
+  return {
+    press: (event) => {
+      withoutPointer.current = event.detail === 0
+    },
+    held: (element) => withoutPointer.current && element?.id === id
+  }
 }
 
 /**
