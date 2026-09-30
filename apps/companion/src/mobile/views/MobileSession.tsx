@@ -447,9 +447,14 @@ export function MobileSession({
     if (element === null) return
     const root = document.documentElement
     const cover = () => {
-      const under = Math.max(0, window.innerHeight - element.getBoundingClientRect().bottom)
       const style = getComputedStyle(root)
       const covered = parseFloat(style.getPropertyValue('--keyboard')) || 0
+      // What lies under the session is measured in the shell's own terms, from where the session
+      // ends to where the shell does: the shell follows the visual viewport when the page is
+      // panned, so a distance to the window's edge would count the pan.
+      const shell = element.closest<HTMLElement>('.m-shell')
+      const edge = shell === null ? window.innerHeight : shell.getBoundingClientRect().bottom
+      const under = Math.max(0, edge - element.getBoundingClientRect().bottom)
       element.style.setProperty('--under-session', `${under}px`)
       setKeyboardUp(covered > under)
       const rem = parseFloat(style.fontSize)

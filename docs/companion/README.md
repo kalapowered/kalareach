@@ -366,7 +366,9 @@ next. A sheet rests clear of the bottom inset the platform reports.
 
 Where the platform pans the phone's page to keep a focused field in sight, the shell goes with the
 visual viewport by as much as it was panned, so nothing of it is above the screen, and what the
-keyboard takes of the height is at its foot.
+keyboard takes of the height is at its foot, the composer above it. This holds where the platform
+shrinks the layout viewport to what is visible while it pans, as iOS does the first time a field
+takes the focus.
 
 At larger text sizes the phone's inbox breaks a long word, such as a path or a command, where its
 row ends instead of running past the screen, and the count on the Attention tab is a circle that

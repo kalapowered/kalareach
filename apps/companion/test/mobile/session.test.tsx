@@ -1561,6 +1561,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
       this: Element
     ) {
+      if (this.classList.contains('m-shell')) return DOMRect.fromRect({ x: 0, y: 0, width: 390, height: 800 })
       return this.classList.contains('m-session')
         ? DOMRect.fromRect({ x: 0, y: 100, width: 390, height: 610 })
         : new DOMRect()
