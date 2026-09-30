@@ -587,6 +587,32 @@ impl Session {
     /// Panics as [`Session::start`] does.
     #[must_use]
     pub fn start_with(package: &Package, environment: &[(String, String)]) -> Self {
+        Self::start_configured(
+            package,
+            environment,
+            kr_shell_integration::contract::events::EofGesture::default(),
+        )
+    }
+
+    /// Starts the packaged shell, answering its handshake with `gesture` as the key that ends
+    /// input.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Session::start`] does.
+    #[must_use]
+    pub fn start_with_gesture(
+        package: &Package,
+        gesture: kr_shell_integration::contract::events::EofGesture,
+    ) -> Self {
+        Self::start_configured(package, &[], gesture)
+    }
+
+    fn start_configured(
+        package: &Package,
+        environment: &[(String, String)],
+        gesture: kr_shell_integration::contract::events::EofGesture,
+    ) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-shell-")
             .tempdir()
@@ -774,7 +800,7 @@ impl Session {
             supported_integration_versions: vec![hello.shell.integration_version.clone()],
             launched_package: None,
             already_registered: false,
-            gesture: kr_shell_integration::contract::events::EofGesture::default(),
+            gesture,
         };
         let peer = ObservedPeer {
             uid: endpoint_owner(&endpoint_path),

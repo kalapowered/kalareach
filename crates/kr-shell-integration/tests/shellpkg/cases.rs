@@ -13,7 +13,8 @@ use kr_protocol::root::{
 };
 use kr_protocol::scalars::{DurationMs, U64, Uuid};
 use kr_shell_integration::contract::events::{
-    BridgeEvent, ConsumeReason, EofGesture, NativeReason, PreEofDecision,
+    BridgeEvent, ConsumeReason, DEFAULT_EOF_BYTE, EofGesture, NativeReason, PreEofDecision,
+    PressedKey,
 };
 use kr_shell_integration::contract::fixtures::{PreEofStep, Script};
 use kr_shell_integration::contract::qualification::{BridgeAbi, DetachExclusion, ShellKind};
@@ -2097,6 +2098,144 @@ pub fn the_bridge_core_is_identical_in_both_packages() {
             );
         }
     }
+}
+
+/// The chords the committed `psreadline-chord-gesture` scenario offers: the configured one and the
+/// other one it says is the editor's own, and how many offers there are and of what kind.
+///
+/// Read from the scenario rather than restated, so a scenario that changes fails the drive that
+/// stands for it. The third offer is a terminal byte handed to a chord configuration, which is the
+/// contract's own case of an input the reader reports by a different kind of name.
+fn chord_scenario() -> (String, String) {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|scenario| scenario.id == "psreadline-chord-gesture")
+        .expect("the chord scenario is committed");
+    let Script::PreEof(script) = scenario.script else {
+        panic!("the chord scenario drives the pre-EOF decision");
+    };
+    let EofGesture::Chord { keys: configured } = script.view.gesture.clone() else {
+        panic!("the chord scenario configures a chord");
+    };
+    let offers: Vec<_> = script
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            PreEofStep::Offer {
+                context, expect, ..
+            } => Some((context.key.clone(), expect.clone())),
+            _ => None,
+        })
+        .collect();
+    let [
+        (first, PreEofDecision::SubmitDetach(_)),
+        (second, PreEofDecision::Native { .. }),
+        (third, PreEofDecision::Native { .. }),
+    ] = offers.as_slice()
+    else {
+        panic!(
+            "the chord scenario offers the configured chord, another chord and a byte: {offers:?}"
+        );
+    };
+    assert_eq!(
+        first,
+        &PressedKey::chord(configured.clone()),
+        "the first offer is the configured chord"
+    );
+    let PressedKey::Chord { keys: other } = second else {
+        panic!("the second offer is another chord");
+    };
+    assert_ne!(other, &configured);
+    assert_eq!(
+        third,
+        &PressedKey::byte(DEFAULT_EOF_BYTE),
+        "the third offer is the terminal's byte"
+    );
+    (configured, other.clone())
+}
+
+/// The bytes a terminal sends for `Ctrl+<letter>`.
+fn control_bytes(chord: &str) -> Vec<u8> {
+    let letter = chord
+        .strip_prefix("Ctrl+")
+        .and_then(|rest| rest.chars().next())
+        .filter(char::is_ascii_lowercase)
+        .unwrap_or_else(|| panic!("{chord} is not a control chord this drive can type"));
+    vec![letter as u8 - b'a' + 1]
+}
+
+/// KR-REQ-07.73, and `psreadline-chord-gesture`: the configured chord carries the detach, and any
+/// other key, the terminal's end-of-file byte included, is the editor's own.
+///
+/// The scenario offers three inputs to a session whose gesture is a chord: the chord, another chord
+/// and the terminal's byte. Through a pseudo-terminal the editor reports every key as a chord, so
+/// the terminal's byte is one chord among the others and the scenario's chord `Ctrl+d` is that byte
+/// too. The offers are therefore driven in two sessions, each a real key press: with the scenario's
+/// chord configured, the other chord is the editor's own and the configured one detaches; with the
+/// other chord configured, the terminal's byte is not the gesture and the editor does what it does
+/// with it, which at an empty prompt is to end the shell.
+pub fn the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_own(
+    kind: ShellKind,
+) {
+    let (configured, other) = chord_scenario();
+    let package = Package::built(kind);
+
+    // The scenario's own configuration. Another chord goes first and the configured one after it,
+    // on the one reader thread, so the detach arriving with no decision before it is the other
+    // chord having decided nothing.
+    let mut session = Session::start_with_gesture(
+        &package,
+        EofGesture::Chord {
+            keys: configured.clone(),
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let (enter, fence) = session.fenced_prompt(1);
+    session.type_bytes(&control_bytes(&other));
+    session.type_bytes(&control_bytes(&configured));
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    let BridgeEvent::EofDetach(detach) = event else {
+        unreachable!()
+    };
+    assert_eq!(detach.fence_id, fence.fence_id);
+    assert_eq!(detach.prompt_generation, enter.prompt_generation);
+    assert!(
+        session.no_managed_decision_before(1),
+        "{other} is not the configured chord and decided something before {configured} did"
+    );
+    session.answer_event(id, detached(attachment_id(1)));
+    assert!(
+        session.alive(),
+        "the configured chord ended the shell instead of detaching an attachment"
+    );
+    drop(session);
+
+    // The other chord configured, so the terminal's byte is not the gesture.
+    let mut session = Session::start_with_gesture(
+        &package,
+        EofGesture::Chord {
+            keys: other.clone(),
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let (_enter, _fence) = session.fenced_prompt(1);
+    session.type_bytes(&[DEFAULT_EOF_BYTE]);
+    assert!(
+        session.ended_within(REPLY),
+        "the editor kept the terminal's byte, which is not the configured chord, instead of doing \
+         what it does with it at an empty prompt:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.no_managed_decision_before(0),
+        "the terminal's byte was decided on as if it were the configured chord {other}"
+    );
 }
 
 /// Removes the per-package licence paragraph, which is the one part that differs on purpose.

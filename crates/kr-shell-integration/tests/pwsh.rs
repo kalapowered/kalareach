@@ -126,6 +126,13 @@ fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone() {
     shellpkg::a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(PWSH);
 }
 
+/// KR-REQ-07.37, KR-REQ-07.73, `psreadline-chord-gesture`
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_configured_chord_detaches_and_any_other_key_is_the_editors_own() {
+    shellpkg::the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_own(PWSH);
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

@@ -716,6 +716,32 @@ function Invoke-KalaReachService {
     }
 }
 
+# Runs one of the editor's own operations by name, as the editor runs it for the key.
+#
+# The editor ends the shell from an empty prompt by throwing its exit exception out of the
+# operation. It handles that itself for an operation it runs, and reports it as a failed handler
+# when a script block ran the operation, which leaves the person's Ctrl+d doing nothing once this
+# module is in front of it. The exception is recognised here and the shell is ended the way the
+# editor documents a handler ending it: the line is replaced by `exit` and accepted.
+function Invoke-KrEditorOperation {
+    param([string]$Name, $Key, $Argument)
+    $type = [Microsoft.PowerShell.PSConsoleReadLine]
+    $method = $type.GetMethod($Name, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))
+    if ($null -eq $method) { return }
+    try {
+        $method.Invoke($null, @($Key, $Argument)) | Out-Null
+    } catch {
+        $ends = $false
+        for ($inner = $_.Exception; $null -ne $inner; $inner = $inner.InnerException) {
+            if ($inner.GetType().FullName -eq 'Microsoft.PowerShell.ExitException') { $ends = $true; break }
+        }
+        if (-not $ends) { throw }
+        $type::RevertLine()
+        $type::Insert('exit')
+        $type::AcceptLine()
+    }
+}
+
 function Invoke-KalaReachPending {
     <#
     .SYNOPSIS
@@ -739,9 +765,7 @@ function Invoke-KalaReachPending {
         $script:State.InvokingKeys = [byte[]]@([byte]0x1b)
     }
     try {
-        $type = [Microsoft.PowerShell.PSConsoleReadLine]
-        $method = $type.GetMethod($Function, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))
-        if ($null -ne $method) { $method.Invoke($null, @($Key, $Argument)) | Out-Null }
+        Invoke-KrEditorOperation $Function $Key $Argument
     } finally {
         if (-not [string]::IsNullOrEmpty($Pending)) { $script:Pending[$Pending]-- }
         $script:State.InvokingKeys = $previousKeys
@@ -788,7 +812,7 @@ function Invoke-KalaReachGesture {
         $chord = "$($script:Hooks.GestureChord)"
         $native = if ($chord.Length -eq 1) { 'SelfInsert' } else { 'DeleteCharOrExit' }
         try {
-            [Microsoft.PowerShell.PSConsoleReadLine]::$native($Key, $Argument)
+            Invoke-KrEditorOperation $native $Key $Argument
         } catch { }
         return
     }
@@ -796,9 +820,7 @@ function Invoke-KalaReachGesture {
         & $before $Key $Argument
         return
     }
-    $type = [Microsoft.PowerShell.PSConsoleReadLine]
-    $method = $type.GetMethod([string]$before, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))
-    if ($null -ne $method) { $method.Invoke($null, @($Key, $Argument)) | Out-Null }
+    Invoke-KrEditorOperation ([string]$before) $Key $Argument
 }
 
 function Test-KalaReachBridge {
