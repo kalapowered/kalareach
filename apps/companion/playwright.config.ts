@@ -27,17 +27,19 @@ export default defineConfig({
     { name: 'webkit', use: { ...devices['Desktop Safari'] } }
   ],
   // Both servers are this run's own. A server already listening on either port could be serving
-  // another checkout's bundle, so the run stops rather than test it.
+  // another checkout's bundle, so the run stops rather than test it. Each is told which process is
+  // the run, this one, and ends once that process has gone: a run that is killed runs no cleanup of
+  // its own, and its servers would otherwise go on serving after it.
   webServer: [
     {
-      command: `node scripts/preview-harness.mjs ${HARNESS_PORT}`,
+      command: `node scripts/preview-harness.mjs ${HARNESS_PORT} ${process.pid}`,
       url: `http://localhost:${HARNESS_PORT}/harness.html`,
       reuseExistingServer: false,
       timeout: 60_000
     },
     // The bundle the desktop window loads, served beside the harness so one test can open it.
     {
-      command: `node scripts/preview-desktop.mjs ${DESKTOP_PORT}`,
+      command: `node scripts/preview-desktop.mjs ${DESKTOP_PORT} ${process.pid}`,
       url: `http://localhost:${DESKTOP_PORT}/`,
       reuseExistingServer: false,
       timeout: 60_000

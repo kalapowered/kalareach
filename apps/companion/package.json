@@ -22,7 +22,8 @@
     "android:classes": "node scripts/android-classes.mjs",
     "test:android-classes": "node scripts/android-classes-selftest.mjs",
     "identifiers": "node scripts/identifiers.mjs",
-    "test:identifiers": "node scripts/identifiers-selftest.mjs"
+    "test:identifiers": "node scripts/identifiers-selftest.mjs",
+    "test:preview": "node scripts/preview-selftest.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
