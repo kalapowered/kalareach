@@ -1439,10 +1439,10 @@ async fn an_acceptance_that_describes_another_session_is_not_kept() {
     world.serving.abort();
 }
 
-/// A worker whose reservation this host fenced is not reached by a daemon that starts: the daemon
-/// does not even connect to it, presents it no generation, and leaves it out of the directory, as
-/// recovery leaves such a worker. The control: a worker whose reservation stands is reached and
-/// admitted as before.
+/// KR-REQ-24.04: the directory a daemon rebuilds from its workers when it starts leaves out a
+/// worker whose reservation this host fenced: the daemon does not even connect to it, presents it
+/// no generation, and leaves it out of the directory, as recovery leaves such a worker. The
+/// control: a worker whose reservation stands is reached and admitted as before.
 ///
 /// The daemon before the restart recorded the worker and stopped before it admitted it, so it
 /// never reached the worker, and every connection the worker accepts is the new daemon's.
