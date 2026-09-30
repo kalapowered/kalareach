@@ -1798,6 +1798,48 @@ async fn a_policy_this_host_cannot_read_is_reported_as_unknown_until_a_document_
     host.stop().await;
 }
 
+/// KR-REQ-25.22: the policy a host's configuration decides is in force from the moment the
+/// catalogue opens, not only from an acceptance: a document the registry already accepted owes no
+/// acceptance at start, so a catalogue whose record differs from it (a store restored from an older
+/// copy, or one made new) takes the document's policy when it opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalogue_whose_record_differs_from_the_accepted_document_takes_its_policy_at_start() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    name_the_policy(host.controller(), Some("disable_at_once"));
+    accept(host.controller()).await;
+    let stopped = host.shut_down().await;
+
+    // While no daemon runs, the catalogue's record goes back to warning only.
+    let environment = stopped.tree().environment();
+    {
+        let mut catalogue = kr_plugin_catalogue::Catalogue::open(
+            &environment.state_dir().join("catalogue"),
+            std::sync::Arc::new(
+                kr_plugin_catalogue::transport::RepositoryTransport::local_only(
+                    "this test reaches no repository",
+                ),
+            ),
+        )
+        .expect("the catalogue's records");
+        catalogue
+            .set_disable_policy(kr_plugin_catalogue::DisablePolicy::WarnOnly)
+            .expect("the older record");
+    }
+
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let (carried, held, _) = policy_in_force(host.controller()).await;
+    assert_eq!(held, RevocationPolicy::DisableAtOnce, "in force at start");
+    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
+    assert_eq!(
+        host.controller().catalogue().policies_carried(),
+        [RevocationPolicy::DisableAtOnce],
+        "and no snapshot was computed before it"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-25.22: a policy whose record cannot be written with the admission revision it moves does
 /// not change: the policy before it stays in force, the acceptance reports why, and the same
 /// document accepted again puts it in force.
