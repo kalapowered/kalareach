@@ -96,8 +96,9 @@ daemon that takes longer makes the run exit with 9 and name the store, with noth
 control daemon the update had prepared resumes. Every wait of an install or an update on the
 store has a bound: a release's files and an environment's lock file are opened without following a
 link or waiting for a writer, the release archive without waiting for one (a link a person names it
-by is followed), and an environment's registry is checked to be a regular file, or a link to one,
-before it is opened, so a pipe in any of these places is refused; the system's own tool that says
+by is followed), and an environment's registry is read by the controller's own reader, as it is
+and with nothing made beside it, which refuses a link, and what is not a regular file, before it
+opens anything, so a pipe in any of these places is refused; the system's own tool that says
 its version is given ten seconds and is ended if it prints more than 4096 bytes, whatever a
 program it starts does; and a program that starts in a release that is being removed or replaced
 waits for that removal for at most thirty seconds.
