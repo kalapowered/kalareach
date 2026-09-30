@@ -1527,10 +1527,10 @@ mod tests {
             environment.environment_id,
         )
         .expect("a daemon holds the environment");
-        let refused = handover::hold(&environment, Some(tokio::time::Instant::now()))
-            .await
-            .err()
-            .expect("the daemon has not gone");
+        let Err(refused) = handover::hold(&environment, Some(tokio::time::Instant::now())).await
+        else {
+            panic!("the daemon has not gone");
+        };
         assert_eq!(refused.exit_code(), 9, "{refused}");
         let said = refused.to_string();
         assert!(
