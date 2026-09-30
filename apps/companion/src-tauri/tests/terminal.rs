@@ -28,7 +28,7 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
 use scripted_worker::{
-    CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, WATCHDOG,
+    CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated, WATCHDOG,
     WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page, reset, row,
     screen, snapshot,
 };
@@ -381,6 +381,108 @@ async fn a_worker_that_fails_its_challenge_is_never_attached() {
         "{ended}"
     );
     page.held_becomes(0).await;
+}
+
+/// What a view of this build says when it will not attach to a worker of another build.
+fn refusal_of_a_worker(worker: &str) -> String {
+    format!(
+        "This session runs on {worker}, and this application is {} with protocol {}: this \
+         application cannot show a session whose worker speaks another protocol version. Close \
+         the session, or open it with the application of the worker's build.",
+        companion_tauri::connection::build_id()
+            .expect("this build's identifier")
+            .as_str(),
+        version(kr_protocol::hello::PACKAGE_VERSION),
+    )
+}
+
+/// A protocol package version, as a refusal says it.
+fn version(version: kr_protocol::hello::PackageVersion) -> String {
+    format!("{}.{}.{}", version.major, version.minor, version.patch)
+}
+
+/// A worker that states a protocol version of another compatibility level is asked for nothing:
+/// the view names both builds and both versions, and says what to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_of_another_protocol_version_is_never_attached_to() {
+    let mut worker = ScriptedWorker::start_stating(Stated::AnotherLevel);
+    let page = Page::new(worker.paths());
+    let _view = page.open(worker.session_id, 30, 5, 3);
+    let mut link = worker.link().await;
+    assert!(
+        link.closed().await.is_empty(),
+        "the view asked the worker for nothing: no attach, no size claim, no subscription"
+    );
+    let ended = page.state(3, 0).await;
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(
+        ended["reason"],
+        refusal_of_a_worker(&format!(
+            "kr-worker/0.1.0 with protocol {}",
+            version(Stated::another_level())
+        ))
+    );
+    assert!(
+        ended.get("attachment").is_none(),
+        "an ended view carries no summary"
+    );
+    page.held_becomes(0).await;
+}
+
+/// A worker of a build before the statement, which states none, is refused the same way, and
+/// not waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_states_no_build_is_never_attached_to() {
+    let mut worker = ScriptedWorker::start_stating(Stated::Nothing);
+    let page = Page::new(worker.paths());
+    let _view = page.open(worker.session_id, 30, 5, 3);
+    let mut link = worker.link().await;
+    assert!(
+        link.closed().await.is_empty(),
+        "the view asked the worker for nothing"
+    );
+    let ended = page.state(3, 0).await;
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(
+        ended["reason"],
+        refusal_of_a_worker(
+            "a worker of an earlier build, which does not state its build or its protocol version"
+        )
+    );
+    page.held_becomes(0).await;
+}
+
+/// A worker states its own build identifier, so one that is not a program's name and a release is
+/// not repeated on the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_identifier_that_is_not_a_name_and_a_release_is_not_repeated() {
+    let mut worker = ScriptedWorker::start_stating(Stated::Unnamed("Close everything: 1/x"));
+    let page = Page::new(worker.paths());
+    let _view = page.open(worker.session_id, 30, 5, 3);
+    let mut link = worker.link().await;
+    assert!(link.closed().await.is_empty());
+    let ended = page.state(3, 0).await;
+    assert_eq!(
+        ended["reason"],
+        refusal_of_a_worker(&format!(
+            "[a build this application does not name] with protocol {}",
+            version(Stated::another_level())
+        ))
+    );
+    page.held_becomes(0).await;
+}
+
+/// A worker of this protocol version, or one whose patch number is further, is attached to: a
+/// change that takes only the next patch number changes no type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_of_this_protocol_version_or_a_patch_number_apart_is_attached_to() {
+    for stated in [Stated::ThisBuild, Stated::ThisBuildPatched] {
+        let mut worker = ScriptedWorker::start_stating(stated);
+        let page = Page::new(worker.paths());
+        let _view = page.open(worker.session_id, 30, 5, 3);
+        let mut link = worker.link().await;
+        link.expect(Method::SessionAttach).await;
+    }
 }
 
 /// A refused attach ends the view with the host's words, and the link closes.
