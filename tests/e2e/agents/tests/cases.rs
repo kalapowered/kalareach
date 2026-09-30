@@ -947,7 +947,9 @@ fn shell_line(
     // The escape is a key of its own: a line that reaches the composer in one write is taken for a
     // paste, whose first character is text, and would be sent to the model as a prompt. Nothing
     // else is typed until the composer shows it is in shell mode.
-    logged.type_text(stage, "!");
+    // Sent as the terminal's enhanced keyboard protocol reports the key, which the agent reads
+    // whether or not it asked for that protocol: a bare `!` in a write of its own was dropped.
+    logged.type_text(stage, "\u{1b}[33u");
     let _ = logged.wait_for(
         stage,
         "shell mode",
