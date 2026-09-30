@@ -170,12 +170,13 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
 ///
 /// Returns the failure to read the registry.
 pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Result<Vec<Holding>> {
-    let Some(database) = registry_file(environment)? else {
+    if !has_registry(environment)? {
         return Ok(Vec::new());
-    };
+    }
+    let database = environment.paths.registry_database();
     let (spawned, running, workers) = {
         let registry =
-            Registry::open_read_only(&database, environment.environment_id).map_err(|error| {
+            Registry::open_to_read(&database, environment.environment_id).map_err(|error| {
                 CliError::Other(shown!(
                     "environment {}'s registry could not be read: {}",
                     environment.environment_id,
@@ -254,27 +255,21 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
     Ok(holding)
 }
 
-/// An environment's registry file, or `None` when it has none.
+/// Whether an environment has a registry to read.
 ///
-/// A link is followed, as the daemon's own open of it does; what it leads to must be a regular
-/// file: a pipe there would hold the update, which holds the install lock, for as long as nothing
-/// wrote to it.
+/// Only its being there is looked at: the reader ([`Registry::open_to_read`]) refuses one that is
+/// not a regular file, and one that is a link, before it opens anything, so a pipe there holds
+/// nothing up, and reads it as it is, with nothing made beside it.
 ///
 /// # Errors
 ///
-/// Returns a refusal naming the environment when the registry is not a regular file, and the failure
-/// to look at it.
-fn registry_file(environment: &Environment) -> Result<Option<std::path::PathBuf>> {
-    let database = environment.paths.registry_database();
-    match std::fs::metadata(&database) {
-        Ok(about) if about.is_file() => Ok(Some(database)),
-        Ok(_) => Err(CliError::Other(shown!(
-            "environment {}'s registry is not a regular file",
-            environment.environment_id
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+/// Returns the failure to look at it.
+fn has_registry(environment: &Environment) -> Result<bool> {
+    match std::fs::symlink_metadata(environment.paths.registry_database()) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(CliError::Other(shown!(
-            "environment {}'s registry could not be read: {}",
+            "environment {}'s registry could not be looked at: {}",
             environment.environment_id,
             Shown::io(&error)
         ))),
@@ -311,11 +306,11 @@ async fn challenge(
 mod tests {
     use super::*;
 
-    /// An environment's registry is looked at as a file before anything opens it: none is none, a
-    /// regular file or a link to one is the registry, and a pipe, or a link to one, is refused
-    /// without being opened.
+    /// An environment's registry is looked for before it is read: none is none, and one that is a
+    /// pipe or a link is there, and the reader refuses it at once without opening it, where a plain
+    /// open of a pipe would have waited for a writer.
     #[test]
-    fn a_registry_is_a_regular_file_or_a_link_to_one() {
+    fn a_registry_that_is_a_pipe_or_a_link_is_refused_by_the_reader_and_not_waited_for() {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = Environment {
             environment_id: temp.environment_id(),
@@ -323,30 +318,43 @@ mod tests {
             host: temp.paths().clone(),
         };
         let registry = environment.paths.registry_database();
-        assert!(matches!(registry_file(&environment), Ok(None)), "none");
-        // A pipe is refused, and a plain open of it would have waited for a writer.
+        assert!(!has_registry(&environment).expect("looks"), "none");
         let made = std::process::Command::new("mkfifo")
             .arg(&registry)
             .status()
             .expect("mkfifo runs");
         assert!(made.success(), "a pipe is made");
-        let said = registry_file(&environment)
-            .expect_err("a pipe is not a registry")
-            .to_string();
-        assert!(said.contains("is not a regular file"), "{said}");
-        // A link to one is refused as well.
+        assert!(
+            has_registry(&environment).expect("looks"),
+            "a pipe is there"
+        );
+        // On a thread of its own, so that a wait for a writer fails the test and does not hang it.
+        let read = |path: std::path::PathBuf, id: EnvironmentId| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(Registry::open_to_read(&path, id).is_err());
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the reader was not held up by a pipe")
+        };
+        assert!(
+            read(registry.clone(), environment.environment_id),
+            "a pipe is refused"
+        );
         let pipe = registry.with_file_name("pipe");
         std::fs::rename(&registry, &pipe).expect("moved");
         std::os::unix::fs::symlink(&pipe, &registry).expect("a link");
-        assert!(registry_file(&environment).is_err(), "a link to a pipe");
-        // The control: a file of its own, and a link to one, are the registry.
+        assert!(
+            read(registry.clone(), environment.environment_id),
+            "a link to a pipe is refused"
+        );
+        // The control: a registry that the daemon made is read.
         std::fs::remove_file(&registry).expect("the link goes");
-        let file = registry.with_file_name("elsewhere.sqlite");
-        std::fs::write(&file, b"").expect("a file");
-        std::os::unix::fs::symlink(&file, &registry).expect("a link");
-        assert!(matches!(registry_file(&environment), Ok(Some(_))), "a link");
-        std::fs::remove_file(&registry).expect("the link goes");
-        std::fs::write(&registry, b"").expect("a file");
-        assert!(matches!(registry_file(&environment), Ok(Some(_))), "a file");
+        drop(Registry::open(&registry, environment.environment_id).expect("a registry"));
+        assert!(
+            !read(registry, environment.environment_id),
+            "a registry of its own is read"
+        );
     }
 }

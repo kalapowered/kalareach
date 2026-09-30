@@ -1667,7 +1667,7 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
         message.contains(&format!(
-            "environment {}'s registry is not a regular file",
+            "environment {}'s registry could not be read: ",
             other.environment_id()
         )),
         "{said}"
