@@ -323,6 +323,21 @@ fn host_version(system: FloorSystem) -> Option<FloorVersion> {
 /// digest, taken as it was written.
 pub type Written = BTreeMap<String, (u64, Digest256)>;
 
+/// Opens an archive for reading without waiting for a writer: a pipe named as an archive would
+/// otherwise hold the run for ever, under the update lock. A link is followed, since a person may
+/// name an archive by one; what it leads to is checked to be a regular file.
+fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)
+}
+
 /// Unpacks a release archive, `.tar.gz`, into `staging`, an owner-only directory, and returns the
 /// release's directory in it and what was written.
 ///
@@ -341,7 +356,14 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
             Shown::io(error)
         ))
     };
-    let file = std::fs::File::open(archive).map_err(|error| unreadable(&error))?;
+    let file = open_archive(archive).map_err(|error| unreadable(&error))?;
+    if !file
+        .metadata()
+        .map_err(|error| unreadable(&error))?
+        .is_file()
+    {
+        return Err(refused_archive(archive, "is not a regular file"));
+    }
     let mut entries =
         tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file)));
     let mut top: Option<String> = None;
@@ -357,7 +379,16 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
         // does of a file that has some, on the systems that say so. It is refused, and said to
         // be, rather than read as the link or device it is not: a release archive has every file
         // whole.
-        if kind.is_gnu_sparse() {
+        // The POSIX form of a sparse file is a regular entry that carries `GNU.sparse.*` extension
+        // keys, which this reading does not expand either.
+        let sparse_by_extension = match entry.pax_extensions() {
+            Ok(Some(extensions)) => extensions
+                .flatten()
+                .any(|extension| extension.key_bytes().starts_with(b"GNU.sparse.")),
+            Ok(None) => false,
+            Err(error) => return Err(unreadable(&error)),
+        };
+        if kind.is_gnu_sparse() || sparse_by_extension {
             return Err(refused_archive(
                 archive,
                 "has a sparse entry, which a release's archive does not use: write every file \
@@ -365,12 +396,7 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
             ));
         }
         if !kind.is_file() && !kind.is_dir() {
-            return Err(CliError::Other(shown!(
-                "the archive {} is not a release this host installs: it has an entry of type {} \
-                 that is neither a file nor a directory, such as a link or a device",
-                Shown::root(archive),
-                u32::from(kind.as_byte())
-            )));
+            return Err(refused_kind(archive, kind.as_byte()));
         }
         let path = entry.path().map_err(|error| unreadable(&error))?;
         let (entry_top, relative) = split_entry(&path).ok_or_else(|| {
@@ -726,6 +752,27 @@ fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
         Shown::root(archive),
         reason
     ))
+}
+
+/// The refusal of an entry that is neither a file nor a directory, saying which kind it is by the
+/// character tar gives it, with its usual name: `2` is a symbolic link, `1` a hard link.
+fn refused_kind(archive: &Path, kind: u8) -> CliError {
+    let said = |kind: Shown| {
+        shown!(
+            "the archive {} is not a release this host installs: it has an entry of type {} that \
+             is neither a file nor a directory, such as a link or a device",
+            Shown::root(archive),
+            kind
+        )
+    };
+    CliError::Other(match kind {
+        b'1' => said(Shown::said("1, a hard link")),
+        b'2' => said(Shown::said("2, a symbolic link")),
+        b'3' => said(Shown::said("3, a character device")),
+        b'4' => said(Shown::said("4, a block device")),
+        b'6' => said(Shown::said("6, a pipe")),
+        other => said(shown!("{}", other)),
+    })
 }
 
 fn refused_tree(tree: &Path, reason: &'static str) -> CliError {

@@ -93,8 +93,9 @@ An install or an update waits for a control daemon that is starting, which holds
 while it starts, for at most thirty seconds, and an update does so before it stops anything. A
 daemon that takes longer makes the run exit with 9 and name the store, with nothing stopped: every
 control daemon the update had prepared resumes. Every wait of an install or an update on the
-store has a bound: a release's files, and an environment's lock file and registry, are read without
-following a link or waiting for a writer, so a pipe under their names is refused; the system's own
+store has a bound: a release's files, an environment's lock file and registry, and the release
+archive are opened without waiting for a writer, so a pipe under any of their names is refused, and
+all but the archive, which a link may name, are opened without following a link; the system's own
 tool that says its version is given ten seconds, whatever a program it starts does; and a program
 that starts in a release that is being removed or replaced waits for that removal for at most thirty
 seconds.
@@ -160,8 +161,9 @@ A release is taken in only whole and checked:
 
 - The archive is refused at the first entry that is a link, a device, a sparse file or anything
   but a file or a directory, whose path is absolute or climbs out of the top directory, or that
-  repeats a file. A file is written whole: an archiver that leaves the holes of a sparse file out
-  writes an archive this host does not take.
+  repeats a file. A file is written whole: an archiver that leaves the holes of a sparse file out,
+  in GNU's form or in the POSIX form that carries `GNU.sparse` keys, writes an archive this host
+  does not take. An archive that is not a regular file, a pipe among them, is refused at once.
 - The manifest is signed by a threshold of the release keys the update channel's root names for its
   targets role. The root the host trusts is the one the current release carries, at
   `share/update-root.json`; a release carries that root or the one that follows it, the next

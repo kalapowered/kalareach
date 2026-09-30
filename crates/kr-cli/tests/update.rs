@@ -2748,12 +2748,40 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
             "nothing was written outside the staging directory"
         );
     }
-    // The refusal says what the entry was.
-    let archive = scratch.path().join("link.tar.gz");
-    let said = kr_cli::update::release::unpack(&archive, &staging("link-said"))
-        .expect_err("a link is refused")
-        .to_string();
-    assert!(said.contains("an entry of type"), "{said}");
+    // The refusal says what the entry was, by the character tar gives it and its usual name.
+    for (name, expected) in [
+        ("link", "2, a symbolic link"),
+        ("hard-link", "1, a hard link"),
+        ("device", "3, a character device"),
+    ] {
+        let archive = scratch.path().join(format!("{name}.tar.gz"));
+        let said = kr_cli::update::release::unpack(&archive, &staging(&format!("{name}-said")))
+            .expect_err("it is refused")
+            .to_string();
+        assert!(said.contains(expected), "{name}: {said}");
+    }
+    // A pipe named as the archive is refused at once, and not waited for.
+    let pipe = scratch.path().join("pipe.tar.gz");
+    let made = Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a pipe is made");
+    // Run on a thread of its own, so that a wait for a writer fails the test and does not hang it.
+    let target = staging("pipe");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            kr_cli::update::release::unpack(&pipe, &target)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        );
+    });
+    let refused = receiver
+        .recv_timeout(Duration::from_secs(20))
+        .expect("a pipe named as the archive was waited for")
+        .expect_err("a pipe is not an archive");
+    assert!(refused.contains("is not a regular file"), "{refused}");
 }
 
 /// KR-REQ-26.09: a sparse entry, a file written with its holes left out, which the tar crate's
@@ -2828,6 +2856,36 @@ fn a_sparse_entry_is_refused_as_one() {
         .expect("written");
     let said = kr_cli::update::release::unpack(&sparse, &staging("sparse"))
         .expect_err("a sparse entry is refused")
+        .to_string();
+    assert!(said.contains("a sparse entry"), "{said}");
+
+    // The POSIX form of a sparse file is a regular entry that carries `GNU.sparse.*` extension keys:
+    // it is refused as a sparse entry at its first entry too, not later as a file that is missing.
+    let posix = scratch.path().join("posix.tar.gz");
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        std::fs::File::create(&posix).expect("an archive"),
+        flate2::Compression::fast(),
+    ));
+    builder
+        .append_pax_extensions([
+            ("GNU.sparse.major", &b"1"[..]),
+            ("GNU.sparse.name", &b"release/bin/kr"[..]),
+        ])
+        .expect("extensions");
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path("release/GNUSparseFile.1/kr")
+        .expect("a path");
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &b"data"[..]).expect("an entry");
+    builder
+        .into_inner()
+        .and_then(flate2::write::GzEncoder::finish)
+        .expect("written");
+    let said = kr_cli::update::release::unpack(&posix, &staging("posix"))
+        .expect_err("a POSIX sparse entry is refused")
         .to_string();
     assert!(said.contains("a sparse entry"), "{said}");
 }
