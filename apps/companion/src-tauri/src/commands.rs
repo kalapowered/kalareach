@@ -1593,13 +1593,19 @@ pub async fn terminal_view_input(
     input: Value,
 ) -> Result<()> {
     let input: crate::terminal::Input = decode(input)?;
-    views.input(&view, input).await.map_err(|refused| {
-        let code = match refused {
-            crate::terminal::Refused::NotControlling(_) => kr_protocol::error::ErrorCode::LeaseLost,
-            crate::terminal::Refused::Unsent(_) => kr_protocol::error::ErrorCode::InputIncompatible,
-        };
-        CommandError::new(code, refused.message())
-    })
+    views
+        .input(&view, input)
+        .await
+        .map_err(|refused| match refused {
+            crate::terminal::Refused::NotControlling(_) => {
+                CommandError::new(kr_protocol::error::ErrorCode::LeaseLost, refused.message())
+            }
+            // The words say why the program cannot take the input, which no update would change.
+            crate::terminal::Refused::Unsent(_) => CommandError::stated(
+                kr_protocol::error::ErrorCode::InputIncompatible,
+                refused.message(),
+            ),
+        })
 }
 
 /// Closes a view: it detaches, closes its link and publishes nothing more.

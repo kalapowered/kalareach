@@ -3541,6 +3541,9 @@ async fn keys_text_and_paste_wait_for_the_sessions_screen() {
         ] {
             let refusal = answer.expect_err(what);
             assert_eq!(code(&refusal), "INPUT_INCOMPATIBLE", "{what}");
+            // The words say why, and there is nothing to update: an update is not what the code
+            // maps to for a host's refusal, and not what this refusal asks.
+            assert_eq!(refusal["user_action"], "nothing", "{what}");
             assert_eq!(
                 refusal["message"],
                 format!(

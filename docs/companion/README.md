@@ -41,7 +41,9 @@ can do, that action after them: pair the device again, sign in, update, wait, re
 whether it went through, or change a setting. The client library says a host's refusal as its code,
 a colon and the host's words, and the page leaves the code out. A failure whose code asks nothing of
 the person says the host's words alone. Native code names the action by its key, and the page's
-words for each key are the client library's own.
+words for each key are the client library's own. A refusal the application makes itself, for a
+cause it knows (a size limit, a dropped folder, input the program cannot read), names no action:
+its words say what is wrong, and no update, wait or setting would change it.
 
 Native code tells the page about changes through listeners: the connection's state, the host's
 events, where the account stands, pairing, owner confirmations and dropped files. The shell
