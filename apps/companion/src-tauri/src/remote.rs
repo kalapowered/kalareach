@@ -153,12 +153,21 @@ impl Fetcher for HttpsFetcher {
             .with_config()
             .limit(limit + 1)
             .read_to_vec()
-            .map_err(|error| {
-                CommandError::too_large(format!(
-                    "the image exceeds the {limit}-byte import limit: {error}"
-                ))
-            })?;
+            .map_err(|error| body_read_failure(&error, limit))?;
         Ok((media_type, bytes))
+    }
+}
+
+/// The failure for a response body that could not be read to its end.
+///
+/// Only a body that ran past the limit is too large. A connection that broke or ran out of time
+/// says nothing of the size, and another try may read the image whole.
+fn body_read_failure(error: &ureq::Error, limit: u64) -> CommandError {
+    match error {
+        ureq::Error::BodyExceedsLimit(_) => CommandError::too_large(format!(
+            "the image exceeds the {limit}-byte import limit: {error}"
+        )),
+        _ => CommandError::unavailable(format!("the image could not be read: {error}")),
     }
 }
 
@@ -210,6 +219,36 @@ mod tests {
         let fetcher = answering("image/png", vec![0; MAX_IMPORT_BYTES as usize + 1]);
         let error = import("https://example.org/a.png", &fetcher).expect_err("too large");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::QuotaExceeded);
+    }
+
+    /// A body the reader stopped at the limit is a size refusal, which waiting does not lift. A
+    /// read that broke, or ran out of time, says nothing of the size: another try may read it whole.
+    #[test]
+    fn only_a_body_past_the_limit_is_a_size_refusal() {
+        let past = body_read_failure(
+            &ureq::Error::BodyExceedsLimit(MAX_IMPORT_BYTES),
+            MAX_IMPORT_BYTES,
+        );
+        assert_eq!(past.code, kr_protocol::error::ErrorCode::QuotaExceeded);
+        assert_eq!(past.user_action, "nothing");
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let broken = body_read_failure(&ureq::Error::Io(kind.into()), MAX_IMPORT_BYTES);
+            assert_eq!(
+                broken.code,
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "{kind:?}"
+            );
+            assert_eq!(broken.user_action, "wait", "{kind:?}");
+            assert!(
+                !broken.message.contains("limit"),
+                "{kind:?}: {}",
+                broken.message
+            );
+        }
     }
 
     /// KR-REQ-13.23: an import is only ever an authorised https fetch; anything else is refused
