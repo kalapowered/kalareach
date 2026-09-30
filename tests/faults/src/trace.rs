@@ -4,9 +4,9 @@
 //! A trace opens a worker's session in this process on a [`SimulatedTime`] timeline and plays the
 //! session's peers from a script: the application, whose output is read through the read loop's own
 //! entry, and the clients, which attach and subscribe the way the worker's service subscribes one,
-//! take the input lease and type. Nothing waits on a clock. A step that moves time says by how much,
-//! and a timer that comes due fires in that step, so a race happens in the same order on every run
-//! and on every machine.
+//! take the input lease and type. Nothing waits on a clock. A step that moves time says by how
+//! much, and a timer that comes due fires in that step, so a race happens in the same order on
+//! every run and on every machine.
 //!
 //! Each step does something or states an expectation, and [`replay`] names the trace and the step
 //! whose expectation did not hold. Beside what a trace states, every attach checks the screen the
@@ -512,7 +512,12 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         journal_home: journal,
         gaps: (0, 0),
     };
-    replay.gaps.0 = replay.stored_gaps().map_or(0, |gaps| gaps.len());
+    if trace.journal.is_some() {
+        replay.gaps.0 = replay
+            .stored_gaps()
+            .map_err(|what| stopped(None, Cause::Malformed, what))?
+            .len();
+    }
     for (index, step) in trace.steps.iter().enumerate() {
         replay
             .run(step)
@@ -560,6 +565,21 @@ impl JournalHome {
 
     fn path(&self) -> std::path::PathBuf {
         self.directory.path().join("journal.sqlite3")
+    }
+}
+
+/// Whether the intervals a journal reads as written down, oldest first, are the ones a replay has
+/// had recorded: exactly `owed` of them, and when this step recorded one, the newest of its kind.
+fn gaps_written_down(owed: usize, recorded: Option<&str>, stored: &[&str]) -> Result<(), String> {
+    if stored.len() == owed && (recorded.is_none() || stored.last().copied() == recorded) {
+        Ok(())
+    } else {
+        Err(format!(
+            "reads {} interval(s) written down, ending {:?}, and the trace has had {owed} \
+             recorded, the last {recorded:?}",
+            stored.len(),
+            stored.last()
+        ))
     }
 }
 
@@ -729,7 +749,9 @@ impl Replay {
         let waiting = self.reference.lane().queued_bytes();
         if waiting > 0 {
             return Err(malformed(format!(
-                "this output asks for more reply bytes than the session writes in one read                  ({}), leaves {waiting} bytes waiting for a later read, and drops them after two                  seconds of the host's own clock, which a trace does not move",
+                "this output asks for more reply bytes than the session writes in one read ({}), \
+                 leaves {waiting} bytes waiting for a later read, and drops them after two seconds \
+                 of the host's own clock, which a trace does not move",
                 kr_worker::projection::MAX_REPLY_BYTES
             )));
         }
@@ -780,14 +802,8 @@ impl Replay {
             ("a reader that opens the file afresh", &reopened),
         ] {
             let kinds: Vec<&str> = gaps.iter().map(|gap| gap.kind.as_str()).collect();
-            if gaps.len() != owed || (gap.is_some() && kinds.last() != expect.as_ref()) {
-                return Err(unmet(format!(
-                    "{whose} reads {} interval(s) written down, ending {:?}, and the trace \
-                     has had {owed} recorded, the last {expect:?}",
-                    gaps.len(),
-                    kinds.last()
-                )));
-            }
+            gaps_written_down(owed, expect, &kinds)
+                .map_err(|what| unmet(format!("{whose} {what}")))?;
         }
         Ok(())
     }
@@ -1237,6 +1253,19 @@ fn chunked(items: &[usize], parts: usize) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recovery_is_read_back_once_of_the_kind_it_recorded_and_no_other_way_passes() {
+        assert_eq!(gaps_written_down(1, Some("full"), &["full"]), Ok(()));
+        assert_eq!(gaps_written_down(2, None, &["corrupt", "full"]), Ok(()));
+        // Never written down, written down twice, and of another kind: each fails.
+        assert!(gaps_written_down(1, Some("full"), &[]).is_err());
+        assert!(gaps_written_down(1, Some("full"), &["full", "full"]).is_err());
+        assert!(gaps_written_down(1, Some("full"), &["corrupt"]).is_err());
+        // A second recovery that found nothing to record leaves the count as it was.
+        assert!(gaps_written_down(1, None, &["full", "full"]).is_err());
+        assert!(gaps_written_down(1, None, &[]).is_err());
+    }
 
     #[test]
     fn delta_debugging_keeps_exactly_the_items_the_failure_needs() {

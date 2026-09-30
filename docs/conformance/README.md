@@ -500,7 +500,7 @@ step, so a race happens in the same order on every run.
 
 The session still decides three things on the host's own clock, which no step moves: a reply to a
 question the application asks while the person's input is inside a paste or a held delimiter waits
-until that closes and is dropped after two seconds, the replies of one read past 4 KiB wait for a
+until that closes and is dropped after two seconds, the replies of one read past 4 KiB may wait for a
 later read and are dropped after the same two seconds, and replies past 256 a second are dropped.
 The replayer refuses a trace that reaches any of them, so no replay turns on how fast the machine
 ran it: an output that asks a question while the input side holds the reply back, one whose replies
