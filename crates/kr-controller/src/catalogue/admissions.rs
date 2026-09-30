@@ -346,6 +346,20 @@ fn policy(policy: DisablePolicy) -> RevocationPolicy {
     }
 }
 
+/// The catalogue's own disable policy for the one the configuration names.
+pub(super) fn disable_policy_of(policy: RevocationPolicy) -> DisablePolicy {
+    match policy {
+        RevocationPolicy::WarnOnly => DisablePolicy::WarnOnly,
+        RevocationPolicy::DisableAtNextAdmission => DisablePolicy::DisableAtNextAdmission,
+        RevocationPolicy::DisableAtOnce => DisablePolicy::DisableAtOnce,
+    }
+}
+
+/// The wire's word for the catalogue's disable policy.
+pub(super) fn revocation_policy_of(policy_in_force: DisablePolicy) -> RevocationPolicy {
+    policy(policy_in_force)
+}
+
 fn origin(origin: &kr_plugin_catalogue::ReleaseOrigin) -> ReleaseOrigin {
     ReleaseOrigin {
         repository_id: origin.repository_id.to_string(),

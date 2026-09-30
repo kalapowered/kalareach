@@ -94,7 +94,8 @@ configuration file this host reads.
   "ceilings": {
     "session_limit": 16,
     "grant_rights": null,
-    "enrolment": { "retained_generations": 5 }
+    "enrolment": { "retained_generations": 5 },
+    "disable_policy": "disable_at_next_admission"
   },
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
   "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
@@ -471,6 +472,7 @@ force is refused and reported as refused.
 | --- | --- |
 | `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit yet, so nothing narrows the choice and `kr doctor` says so |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
+| `disable_policy` | not an intersection but the administrator's own setting: what happens to a live binding whose release its repository revokes. `warn_only` (the default), `disable_at_next_admission` or `disable_at_once` |
 | `enrolment` | section 11's own budgets: what one repository's metadata, kept generations and cached payloads may cost, how large one package may be and how many bytes one synchronisation may transfer; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
 
 A ceiling is applied where the thing it restricts reads it, and an edit whose value the
@@ -523,6 +525,18 @@ revision in the same step, and an acceptance whose revision cannot be written pu
 budgets in force and reports why, so the next acceptance tries again. `transfer_bytes` bounds the
 bytes one synchronisation transfers, the metadata, the index and a full mirror's payloads together,
 2 GiB by default; a sync past it is refused by name and the generation in use stays.
+
+`disable_policy` is put in force from the next admission, at start and at every acceptance after it.
+It is recorded with the plugin admission revision it moves in one step, so every worker is sent a
+round and a policy equal to the one in force sends none; an acceptance whose revision cannot be
+written puts none in force and reports why, so the next acceptance tries again. It follows the
+document by a different rule from the budgets: only a document this host loaded and that names a
+policy decides it. A document that names none, and one that is absent, unreadable, of a version
+this build does not know or invalid, leaves the policy this host holds, and `kr doctor` says that
+it is the one last accepted. Going back to warning only is a document naming `warn_only`. Under
+`disable_at_next_admission` a binding on a revoked release keeps observing and is refused every
+rich admission; under `disable_at_once` it ends at its next admission boundary once the request it
+admitted has completed.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would
