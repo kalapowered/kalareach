@@ -81,6 +81,18 @@ describe('the shell and the visual viewport', () => {
     expect(measured()).toEqual({ keyboard: '344px', pan: '120px' })
   })
 
+  it('says the same when the platform shrinks the layout viewport to what is visible while it pans', () => {
+    const viewport = withViewport()
+    render(<Probe />)
+    // The layout viewport is now the 362 px that are visible, scrolled 337 px down: the page has
+    // the height it had without a keyboard, 699 px, and the keyboard took the difference.
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 362 })
+    act(() => {
+      viewport.move(362, 337)
+    })
+    expect(measured()).toEqual({ keyboard: '337px', pan: '337px' })
+  })
+
   it('leaves neither behind when the shell goes', () => {
     const viewport = withViewport()
     const { unmount } = render(<Probe />)

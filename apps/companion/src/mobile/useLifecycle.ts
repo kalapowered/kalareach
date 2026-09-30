@@ -182,9 +182,11 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
  * the difference is what the keyboard takes, measured, since a guessed height is wrong on every
  * device it was not measured on. Where the platform then pans the page to keep a focused field in
  * sight, the visual viewport is scrolled down inside the layout viewport by its `offsetTop`, and
- * whatever of the shell is above that is above the screen. The shell goes with the visual viewport
- * (`--pan`), so what it holds stays where the person sees it, and the keyboard is at its foot
- * whether or not the page was panned.
+ * whatever of the shell is above that is above the screen; a platform may also shrink the layout
+ * viewport to what is visible while it pans, so the height the page has without a keyboard is the
+ * larger of the layout viewport's and the visible height and the pan together. The shell goes with
+ * the visual viewport (`--pan`), so what it holds stays where the person sees it, and the keyboard
+ * is at its foot whether or not the page was panned.
  */
 export function useKeyboardInset(): void {
   useEffect(() => {
@@ -192,8 +194,12 @@ export function useKeyboardInset(): void {
     if (!viewport) return
     const root = document.documentElement
     const measure = () => {
-      const taken = Math.max(0, window.innerHeight - viewport.height)
+      // The height the page has when no keyboard is up: the layout viewport's, which the platform
+      // may shrink to what is visible while it pans to a field, and then the visible height and the
+      // pan add up to it.
       const panned = Math.max(0, viewport.offsetTop)
+      const whole = Math.max(window.innerHeight, viewport.height + panned)
+      const taken = Math.max(0, whole - viewport.height)
       root.style.setProperty('--keyboard', `${Math.round(taken)}px`)
       root.style.setProperty('--pan', `${Math.round(panned)}px`)
     }
