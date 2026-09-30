@@ -2536,6 +2536,116 @@ async fn closing_a_controlling_view_detaches_and_writes_nothing_after() {
 /// Input to a view that has ended, closed by the page or by its link, or to a view that was never
 /// open, is refused as control that has ended, and nothing of it reaches a session: the page is
 /// never told that input was taken when it was not.
+/// What native code says of an input it cannot read, or that it reads: the words the scripted host
+/// is held to, in the fixture the page's tests read the same cases from.
+#[test]
+fn native_code_says_why_it_cannot_read_an_input_in_the_words_the_scripted_host_holds() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(
+        "../../test/fixtures/terminal-input-refusals.json"
+    ))
+    .expect("the cases");
+    assert!(cases.len() > 100, "{} cases", cases.len());
+    let mut differing = Vec::new();
+    for case in cases {
+        let read =
+            serde_json::from_value::<companion_tauri::terminal::Input>(case["input"].clone());
+        let said = match read {
+            Ok(_) => Value::Null,
+            Err(error) => Value::String(error.to_string()),
+        };
+        if said != case["words"] {
+            differing.push(format!(
+                "{}: native code says {said}, not {}",
+                case["input"], case["words"]
+            ));
+        }
+    }
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+}
+
+/// A number the command layer cannot read as the argument's integer type is worded as the decoder
+/// words it, floating point notation included: the scripted host holds its own words to these.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_number_the_command_layer_cannot_read_is_worded_in_the_decoders_notation() {
+    let worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let said = |command: &str, body: &str| {
+        let body: Value = serde_json::from_str(body).expect("a body");
+        page.invoke("main", command, body).expect_err("refused")
+    };
+    for (command, body, words) in [
+        // Digits past 64 bits are a floating point number to the decoder, and it writes an
+        // exponent from 1e16 up and below 1e-5.
+        (
+            "terminal_view_move",
+            r#"{"view":"x","number":18446744073709552000,"across":0,"down":0,"live":true}"#,
+            "invalid args `number` for command `terminal_view_move`: invalid type: floating point `1.8446744073709552e+19`, expected u64",
+        ),
+        // JSON writes 2^63 as 9223372036854776000, an integer the decoder reads and i64 does not hold.
+        (
+            "terminal_view_move",
+            r#"{"view":"x","number":1,"across":9223372036854776000,"down":0}"#,
+            "invalid value: integer `9223372036854776000`, expected i64",
+        ),
+        // The least i64 as JavaScript writes it is past 64 bits too.
+        (
+            "terminal_view_move",
+            r#"{"view":"x","number":1,"across":-9223372036854776000,"down":0}"#,
+            "invalid type: floating point `-9.223372036854776e+18`, expected i64",
+        ),
+        (
+            "terminal_view_move",
+            r#"{"view":"x","number":1,"across":0,"down":1e+21}"#,
+            "invalid type: floating point `1e+21`, expected i64",
+        ),
+        (
+            "terminal_view_resize",
+            r#"{"view":"x","columns":1e-7,"rows":24}"#,
+            "invalid type: floating point `1e-7`, expected u64",
+        ),
+        (
+            "terminal_view_resize",
+            r#"{"view":"x","columns":0.00001,"rows":24}"#,
+            "invalid type: floating point `0.00001`, expected u64",
+        ),
+    ] {
+        let refusal = said(command, body);
+        let refusal = refusal.as_str().expect("the command layer's words");
+        assert!(refusal.ends_with(words), "{body}: {refusal}");
+    }
+}
+
+/// A wheel that turns no times is refused with the decoder's words, after the command layer's own,
+/// as a refusal of the application's own that asks nothing more of the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wheel_that_turns_no_times_is_refused_in_the_decoders_words() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, _link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    let refusal = page_view
+        .input(
+            &view,
+            json!({"kind": "wheel", "take": 1, "column": 0, "line": 0, "turns": 0,
+                   "shift": false, "alt": false, "control": false}),
+        )
+        .expect_err("no turns");
+    assert_eq!(code(&refusal), "INVALID_ARGUMENT");
+    assert_eq!(
+        refusal["message"],
+        "those are not this operation's parameters: a wheel turns between 1 and 1024 times \
+         either way, not 0"
+    );
+    assert_eq!(refusal["user_action"], "nothing");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn input_to_a_view_that_has_ended_or_was_never_open_is_refused() {
     let refused_as_ended = |page: &Page, view: &str| {

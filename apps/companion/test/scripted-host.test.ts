@@ -366,6 +366,39 @@ describe('the scripted host and attention, review and sharing', () => {
   })
 })
 
+describe("the scripted host and a retained artefact's deletion", () => {
+  it("reads the request as the request's own type is read, and refuses the rest by name", async () => {
+    const { port } = fakeHost()
+    const refusals: [unknown, string][] = [
+      [{}, 'missing field `object_id`'],
+      [{ object_id: 3 }, '`object_id` is an identifier of 1 to 256 bytes'],
+      [{ object_id: '' }, '`object_id` is an identifier of 1 to 256 bytes'],
+      [{ object_id: 'obj-1\u0000' }, '`object_id` is an identifier of 1 to 256 bytes'],
+      [{ object_id: 'obj-1', hold: true }, 'unknown field `hold`'],
+      ['obj-1', '`` is a map'],
+      [null, '`` is a map']
+    ]
+    for (const [params, problem] of refusals) {
+      await expect(port.storageObjectDelete(params, {}), JSON.stringify(params)).rejects.toEqual({
+        code: 'INVALID_ARGUMENT',
+        message: `those are not this operation's parameters: ${problem}`,
+        user_action: 'nothing'
+      })
+    }
+    // Nothing was deleted by a request it refused.
+    expect(JSON.stringify(await port.storageStatus({}))).toContain('obj-1')
+  })
+
+  it('deletes what a request of the right shape names, and refuses a copy held elsewhere as before', async () => {
+    const { port } = fakeHost()
+    await port.storageObjectDelete({ object_id: 'obj-1' }, {})
+    expect(JSON.stringify(await port.storageStatus({}))).not.toContain('obj-1')
+    await expect(port.storageObjectDelete({ object_id: 'obj-3' }, {})).rejects.toMatchObject({
+      code: 'PERMISSION_DENIED'
+    })
+  })
+})
+
 describe('the scripted host and packages', () => {
   it('lists only the environment it owns', async () => {
     const { port } = fakeHost()
