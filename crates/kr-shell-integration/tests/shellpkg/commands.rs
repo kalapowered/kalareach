@@ -1188,6 +1188,10 @@ struct Corpus {
 struct Observed {
     files: BTreeMap<String, String>,
     starts: BTreeMap<String, Vec<ProbeRun>>,
+    /// The reserved variables (`KR_`) any agent was started with, by name: the one declared
+    /// difference between a managed shell and an ordinary one, kept so a case can say which of
+    /// them may be there and that the bridge's own never are.
+    reserved: std::collections::BTreeSet<String>,
 }
 
 impl Corpus {
@@ -1530,9 +1534,18 @@ fn observe(arena: &Path, replacing: &[(String, &'static str)]) -> Observed {
         files.insert(name, normalise(&text));
     }
     let mut starts: BTreeMap<String, Vec<ProbeRun>> = BTreeMap::new();
+    let mut reserved = std::collections::BTreeSet::new();
     for name in AGENT_NAMES {
         let runs = read_runs(&arena.join("records").join(format!("{name}.record")))
             .into_iter()
+            .inspect(|run| {
+                reserved.extend(
+                    run.environment
+                        .keys()
+                        .filter(|name| name.starts_with("KR_"))
+                        .cloned(),
+                );
+            })
             .map(|run| ProbeRun {
                 arguments: run.arguments.iter().map(|word| normalise(word)).collect(),
                 // The reserved variables are the one declared difference between a managed shell
@@ -1547,7 +1560,11 @@ fn observe(arena: &Path, replacing: &[(String, &'static str)]) -> Observed {
             .collect();
         starts.insert(name.to_owned(), runs);
     }
-    Observed { files, starts }
+    Observed {
+        files,
+        starts,
+        reserved,
+    }
 }
 
 /// Every place two shells' observations differ, each named by the file or the agent it is about.
@@ -1710,6 +1727,15 @@ pub fn ordinary_commands_and_agent_names_run_as_in_an_unmanaged_shell(kind: Shel
             ordinary.starts[name].len(),
             if name == "claude" { 3 } else { 1 },
             "{name}: the corpus started it the same number of times in the ordinary shell"
+        );
+    }
+    // The bridge's own variables leave the environment once the handshake is done, so no agent is
+    // started with the endpoint or the secret, whatever else a session exports.
+    for name in ["KR_SHELL_BRIDGE", "KR_SHELL_BRIDGE_SECRET"] {
+        assert!(
+            !managed.reserved.contains(name),
+            "{name} reached an agent's environment: {:?}",
+            managed.reserved
         );
     }
     let differences = differences(&managed, &ordinary);

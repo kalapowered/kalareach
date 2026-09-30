@@ -218,6 +218,20 @@ states they wait in are observable, and puts its end-of-file decision on the con
 front of whatever was bound there. It calls the editor's published API and reads the editor's own
 key queue, which is what a fence rests on and what the editor publishes no count of.
 
+The editor's own queue is read live and refused when it cannot be: the two fields exist, the editor
+has an instance, the instance has a queue and the queue answers with a count. A build that renames
+the queue, has none, or holds something that is not a queue is refused as `psreadline_queue_unreadable`
+when the module loads, and again when the hooks activate after the profile, because a profile that
+runs in between can import another editor. An editor whose queue stops answering later reports its
+queues as not drained rather than empty.
+
+Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt
+ends the shell the way the editor's own would; when a wrapped handler is what runs, the exit the
+editor signals is recognised through the exception chain and carried out by replacing the empty line
+with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. And a
+key the wrapper binds without having asked to, such as the plain `?` that a modified chord can come
+out as, is put back to what it was, so the character types as it does without the module.
+
 `Publish-KalaReachQualification` is what `scripts/build-shells.sh` is for the others: it checks the
 editor against the range the manifest pins, records what it found, installs the module and the
 marked profile block under the same cache layout, and writes the identity record beside them. The

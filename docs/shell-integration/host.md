@@ -270,7 +270,11 @@ runs without rewriting anything they own. Nothing replaces `.bashrc`, points a s
 PowerShell's entry loads the module that opens the bridge, and the session takes no input from
 outside until the bridge has authenticated, so a profile that asks a question ahead of the entry
 would ask one nobody could answer. The entry therefore goes first: `kr shell install` puts it at
-the start of the profile, and moves an entry an earlier install left at the end. Every other
+the start of the profile, below what PowerShell requires to come first (a byte-order mark, comments,
+`#Requires` lines, `using` statements and a script `param` block), and moves an entry an earlier
+install left at the end. The entry is in the profile PowerShell names for this user and host, which
+PowerShell reads after the all-users profiles and the per-user `profile.ps1`: a question asked in one
+of those runs before the bridge exists and cannot be answered. Every other
 shell's reader comes with the shell itself and its entry only says, after the user's
 configuration, that the hooks are live, so those entries stay last. The module qualifies the
 editor when it loads and again when the hooks activate after the profile, because a profile that

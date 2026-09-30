@@ -166,7 +166,10 @@ function Get-KrReaderState {
     $text = $State.BufferSeen
     # The keys this editor has read and not yet acted on. The module answers only where the
     # reader is between operations, so there is never one selected and unrun on top of these.
-    $queued = Get-KrQueuedKeys
+    # A queue this editor no longer lets this package read is not an empty one: the reader says
+    # its queues are not drained, so no fence is proved over keys it could not count.
+    $known = Read-KrQueuedKeys
+    $queued = if ($null -eq $known) { [uint64]0 } else { $known }
     $typeahead = $queued
     $modes = Get-KrEditorModes
 
@@ -190,8 +193,8 @@ function Get-KrReaderState {
         keys              = [byte[]]$State.InvokingKeys
         queued_keys       = [uint64]$queued
         pending_bytes     = [uint64]$typeahead
-        tty_typeahead_drained = [bool]($typeahead -eq 0)
-        macro_input_drained   = [bool]($queued -eq 0 -and $script:Pending.macro_input -eq 0)
+        tty_typeahead_drained = [bool]($null -ne $known -and $typeahead -eq 0)
+        macro_input_drained   = [bool]($null -ne $known -and $queued -eq 0 -and $script:Pending.macro_input -eq 0)
         partial_key_drained   = [bool]($script:Pending.multikey_sequence -eq 0)
         cwd_revision      = [uint64]$State.CwdRevision
     }

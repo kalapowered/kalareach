@@ -763,8 +763,10 @@ impl FenceDriver {
     }
 
     /// Returns how many bytes of the host's own answers to the application have been queued for
-    /// the terminal while this driver watched, which is every byte the reader was sent that no
-    /// person typed.
+    /// the terminal while this driver watched.
+    ///
+    /// It counts what was queued, not what was written: an answer the writer later drops for
+    /// lateness is in it, and so is one queued while no root editor was registered.
     #[must_use]
     pub const fn host_reply_bytes(&self) -> u64 {
         self.host_reply_bytes
