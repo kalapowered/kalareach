@@ -164,6 +164,10 @@ pub struct VerifiedGeneration {
     pub index: CatalogueIndex,
     /// The exact bytes the index was read from, for the metadata budget.
     pub index_bytes: u64,
+    /// The index in the canonical rendering the store keeps it in.
+    pub rendered: Vec<u8>,
+    /// The digest of that rendering, which is what one generation number is compared by.
+    pub rendered_digest: PayloadDigest,
     /// Every target the metadata pins, by target name.
     pub targets: BTreeMap<String, TargetRecord>,
     /// The delegations beneath the top-level targets role.
@@ -535,8 +539,54 @@ pub async fn verify(
     sync.begin(Operation::Payload);
     let index_bytes = bytes.len() as u64;
     ledger.check_metadata_bytes(sync.spent(), Stage::Actual, "metadata and index")?;
+    // What follows is work in proportion to the catalogue that waits on nothing: the index is
+    // parsed, what each entry declares is checked, every target it names is resolved through the
+    // client's delegation search and compared with what the metadata pins, and the index is
+    // rendered as the store keeps it. It runs on the blocking pool, so the runtime this host shares
+    // with everything else is handed back until the result is here.
+    let ledger = ledger.clone();
+    let checked =
+        tokio::task::spawn_blocking(move || check_index(&bytes, repository, targets, &ledger))
+            .await
+            .map_err(|source| CatalogueError::StorageUnavailable {
+                detail: format!("checking the index did not finish: {source}"),
+            })??;
+
+    Ok(VerifiedGeneration {
+        generation: checked.index.generation,
+        index: checked.index,
+        index_bytes,
+        rendered: checked.rendered,
+        rendered_digest: checked.rendered_digest,
+        targets: checked.targets,
+        delegations,
+        versions,
+        root,
+        repository: checked.repository,
+        sync,
+    })
+}
+
+/// The index of a generation, checked against the metadata that pins it.
+struct CheckedIndex {
+    index: CatalogueIndex,
+    rendered: Vec<u8>,
+    rendered_digest: PayloadDigest,
+    targets: BTreeMap<String, TargetRecord>,
+    repository: Repository,
+}
+
+/// Parses the index a generation's metadata pins, checks what each entry declares, resolves every
+/// target the index names through the client, and compares the two, adding each target it
+/// resolves to `targets`. It renders the index the way the store keeps it.
+fn check_index(
+    bytes: &[u8],
+    repository: Repository,
+    mut targets: BTreeMap<String, TargetRecord>,
+    ledger: &BudgetLedger,
+) -> CatalogueResult<CheckedIndex> {
     let index: CatalogueIndex =
-        serde_json::from_slice(&bytes).map_err(|source| CatalogueError::Integrity {
+        serde_json::from_slice(bytes).map_err(|source| CatalogueError::Integrity {
             detail: format!("{INDEX_TARGET} is not a catalogue index: {source}"),
         })?;
     ledger.check_metadata_entries(index.entries.len() as u64, Stage::Actual, INDEX_TARGET)?;
@@ -568,17 +618,21 @@ pub async fn verify(
         targets.insert(name, record);
     }
     check_index_against_targets(&index, &targets)?;
-
-    Ok(VerifiedGeneration {
-        generation: index.generation,
+    // The index is kept in its canonical rendering, named by that rendering's digest, which is
+    // also what one generation number is compared by.
+    let rendered = index
+        .canonical_json()
+        .map_err(|source| CatalogueError::Integrity {
+            detail: format!("the index could not be rendered: {source}"),
+        })?
+        .into_bytes();
+    let rendered_digest = PayloadDigest::of(&rendered);
+    Ok(CheckedIndex {
         index,
-        index_bytes,
+        rendered,
+        rendered_digest,
         targets,
-        delegations,
-        versions,
-        root,
         repository,
-        sync,
     })
 }
 
