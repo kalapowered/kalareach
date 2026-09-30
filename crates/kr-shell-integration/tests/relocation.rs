@@ -13,8 +13,7 @@
 //! Linux the shell's own memory map is read and names the copy's `zle.so`.
 //!
 //! The cases drive this tree's built package, which an ordinary run does not have, so they are left
-//! out of one. A run that built the packages runs them with `--include-ignored`, as continuous
-//! integration's shell-packages job does.
+//! out of one. A run that built the packages runs them with `--include-ignored`.
 
 #![cfg(unix)]
 
@@ -87,7 +86,7 @@ fi
 
 /// KR-REQ-07.86: the package as it was built finds its own modules, which is the control.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn the_package_where_it_was_built_finds_its_own_modules() {
     let package = Package::built(ShellKind::Zsh);
     let root = package_root(&package);
@@ -103,7 +102,7 @@ fn the_package_where_it_was_built_finds_its_own_modules() {
 /// KR-REQ-07.86: a moved copy finds its modules and functions where it is, and what a person sets
 /// afterwards still wins.
 #[test]
-#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_moved_tree_loads_its_editor_and_modules_from_where_it_is() {
     let package = Package::built(ShellKind::Zsh);
     let original = package_root(&package);

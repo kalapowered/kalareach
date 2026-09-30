@@ -22,8 +22,7 @@
 //! a byte behind. That test needs no package and runs everywhere.
 //!
 //! The home-driving cases need this tree's built packages, the fetched stacks and a built `kr`, so
-//! an ordinary run leaves them out. A run that has them runs them with `--include-ignored`, as
-//! continuous integration's shell-packages job does.
+//! an ordinary run leaves them out. A run that has them runs them with `--include-ignored`.
 
 #![cfg(unix)]
 
@@ -633,7 +632,7 @@ fn drivable() -> (Vec<(QualificationCase, Package)>, Vec<String>) {
 /// under, the installer adds its marked entry and nothing else, adds no `exec kr`, and takes what it
 /// added out again; and a managed session started over the installed home qualifies under the stack.
 #[test]
-#[ignore = "needs this tree's built shell packages, the fetched stacks and a built kr; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
+#[ignore = "needs this tree's built shell packages, the fetched stacks and a built kr; it runs with --include-ignored where they are"]
 fn installing_over_each_plugin_stack_adds_only_the_marked_entry_and_removes_cleanly() {
     let kr = Kr::new();
     let index = StackIndex::read().unwrap_or_else(|reason| panic!("{reason}"));
@@ -694,7 +693,7 @@ fn installing_over_each_plugin_stack_adds_only_the_marked_entry_and_removes_clea
 /// file, a startup file that does not end in a line break, and a bash home whose login file is
 /// `.profile`: each takes the entry and gives it back, and the iTerm2 file is not touched.
 #[test]
-#[ignore = "needs this tree's built shell packages and a built kr; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
+#[ignore = "needs this tree's built shell packages and a built kr; it runs with --include-ignored where they are"]
 fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() {
     /// The files a home starts with: each one's name and its text.
     type StartupFiles<'a> = Vec<(&'a str, &'a str)>;
