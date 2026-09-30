@@ -223,26 +223,27 @@ impl Registry {
     }
 
     /// Takes into a registry's own file what a write-ahead log or a rollback journal beside it
-    /// holds, as the daemon's clean stop does, and says whether it did.
+    /// holds, as the daemon's clean stop does, and says whether it opened the registry to.
     ///
     /// What a daemon that ended by a signal leaves behind: the records are in the log, and
     /// [`Registry::open_to_read`] refuses to read a file that has not taken them in. This changes no
     /// record, migrates nothing and settles nothing: the log is checkpointed and the file closed,
     /// which removes it. The caller holds the environment's singleton lock, so no daemon writes
-    /// meanwhile. Only a log or a journal that is a regular file with something in it is opened for;
-    /// the file itself must be a regular file, and not a link.
+    /// meanwhile. Only a log or a journal that is a regular file with something in it is opened
+    /// for. A file that is not a regular file, and a link, are left as they are and said not to
+    /// hold a log: [`Registry::open_to_read`] refuses them, by its own words, before it opens
+    /// anything.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the file is not a regular file or is
-    /// a link, when a log or a journal beside it is not a regular file, and when the log cannot be
-    /// taken in.
+    /// Returns [`ControllerError::RegistryUnavailable`] when the file cannot be looked at, when a
+    /// log or a journal beside it is not a regular file, and when the log cannot be taken in.
     pub fn take_in_its_log(path: impl AsRef<std::path::Path>) -> Result<bool> {
         let path = path.as_ref();
         let refuse = |detail: String| ControllerError::RegistryUnavailable { detail };
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(refuse("this registry is not a regular file".to_owned())),
+            Ok(_) => return Ok(false),
             Err(error) => {
                 return Err(refuse(format!(
                     "this registry could not be looked at: {error}"
@@ -287,7 +288,7 @@ impl Registry {
             .map_err(ControllerError::registry)?;
         if blocked != 0 {
             return Err(refuse(
-                "this registry's write-ahead log could not be taken in while something reads it"
+                "this registry's write-ahead log could not be taken in while another connection uses it"
                     .to_owned(),
             ));
         }
@@ -2746,5 +2747,11 @@ mod tests {
         assert_eq!(read.generation().expect("reads").get(), 1);
         drop(read);
         std::mem::forget(daemon);
+        // A registry that is a link is not opened: the reader refuses it, by its own words.
+        let link = directory.path().join("link.sqlite3");
+        std::os::unix::fs::symlink(&path, &link).expect("a link");
+        assert!(!Registry::take_in_its_log(&link).expect("left to the reader"));
+        let refused = Registry::open_to_read(&link, environment()).expect_err("a link");
+        assert!(refused.to_string().contains("link"), "{refused}");
     }
 }
