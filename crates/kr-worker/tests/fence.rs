@@ -5895,7 +5895,7 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    let _holder = holder_over(&mut client, &wired).await;
+    let holder = holder_over(&mut client, &wired).await;
     let fence = fenced(&mut wired, 1, 1).await;
     let target = wired.target();
     let session_id = wired.session_id;
@@ -5928,8 +5928,17 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
         wired.runtime.session().fence().expect("a driver").state(),
         FenceState::LaunchReserved
     );
+    // Keys typed while the launch holds the editor wait for it.
+    type_keys(&wired, holder, 0, b"held-keys\n");
+    assert!(
+        !echoed_now(&wired.runtime, b"held-keys"),
+        "the launch holds what is typed while it is reserved"
+    );
 
     the_host_answers_the_application(&wired);
+    // The revocation ends the hold with it: the keys go to the terminal, in the order they were
+    // typed, rather than waiting for a deadline nothing is left to set.
+    echoed(&wired.runtime, b"held-keys").await;
     let (transaction, reason) = loop {
         match wired.next().await {
             ToBridge::LaunchRevoked {

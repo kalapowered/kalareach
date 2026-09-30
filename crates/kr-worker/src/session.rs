@@ -3028,6 +3028,7 @@ impl Session {
     /// for an application that has stopped reading its input. One that asks questions and never
     /// reads the answers stops being answered here rather than growing this queue without limit.
     fn queue_replies(&mut self, replies: Vec<crate::projection::LaneReply>) {
+        let mut queued_bytes = 0_u64;
         for reply in replies {
             let queued = self
                 .queued_input_bytes
@@ -3042,21 +3043,24 @@ impl Session {
             if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
                 || outstanding.saturating_add(reply.bytes.len()) > MAX_QUEUED_INPUT_BYTES
             {
-                return;
+                break;
             }
-            let length = reply.bytes.len() as u64;
+            queued_bytes = queued_bytes.saturating_add(reply.bytes.len() as u64);
             self.queue_input(InputBatch::Reply {
                 bytes: reply.bytes,
                 expires_at_ms: reply.expires_at_ms,
             });
-            // The root editor's machine hears of it, in the order the terminal will: the answer is
-            // queued first, so anything the machine publishes because of it goes behind the bytes
-            // it is about. Every byte the host puts into the terminal is accounted, not only a
-            // person's.
-            if let Some(driver) = self.fence.as_mut() {
-                let effects = driver.host_reply_queued(length);
-                self.apply_fence_effects(effects);
-            }
+        }
+        // The root editor's machine hears of them once, after the whole batch is queued, in the
+        // order the terminal will get them: what the machine publishes because of them goes behind
+        // the bytes they are, and applying its answer drains the lane again, which must find this
+        // batch already in the queue rather than put the rest of the lane in front of it. Every
+        // byte the host puts into the terminal is accounted, not only a person's.
+        if queued_bytes > 0
+            && let Some(driver) = self.fence.as_mut()
+        {
+            let effects = driver.host_reply_queued(queued_bytes);
+            self.apply_fence_effects(effects);
         }
     }
 

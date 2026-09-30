@@ -1315,12 +1315,20 @@ impl FenceMachine {
         }
         // A launch reserved on the fence has the reader's mailbox to decide it, and the reader's
         // queue now holds bytes the launch was not reserved against.
+        let launching = self.launch.is_some();
         self.cancel_launch(LaunchRejectionReason::QueuedPriorInput, actions);
         if self.fence.is_some() {
             self.invalidate_fence(FenceInvalidation::HostReply, actions);
         }
         if self.state == FenceState::Fenced || self.state == FenceState::LaunchReserved {
             self.state = FenceState::Unfenced;
+        }
+        if launching {
+            // The keys typed while the launch held the editor go to the terminal now, in the order
+            // they arrived and behind the answer that is already queued, rather than waiting for a
+            // hold nothing will end: no exchange is asked for until the reader idles.
+            let released = self.release_hold(actions);
+            self.emit_editor_busy(EditorBusyReason::QueuesNotDrained, released, actions);
         }
     }
 
