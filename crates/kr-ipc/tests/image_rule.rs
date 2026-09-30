@@ -22,8 +22,12 @@
 //!
 //! What this reading cannot follow fails it rather than passing over the code: a production `mod`
 //! whose file it does not hold (a `#[path]` out of `crates/*/src` among them), a `cfg_attr` that
-//! names a module's path, an `include!` of source, and a library or program root that is not under
-//! its crate's `src/`.
+//! names a module's path, an `include!` of source or an import of `include` that could rename it,
+//! and a library or program root that is not under its crate's `src/`.
+//!
+//! The `testing` feature makes an item test code, so it must not be one a program turns on: a
+//! normal or build dependency among the host's crates that asks for it, and a default feature that
+//! enables it, fail the guard too.
 //!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
@@ -433,13 +437,29 @@ fn block(
                 {
                     reading.uses.push(tokens[at].line);
                 }
-                if tokens[at].token == Token::Ident("include".to_owned())
-                    && tokens.get(at + 1).map(|next| &next.token) == Some(&Token::Punct('!'))
-                {
-                    reading.unfollowed.push((
-                        tokens[at].line,
-                        "an include! brings in source where this reading does not follow",
-                    ));
+                if tokens[at].token == Token::Ident("include".to_owned()) {
+                    let next = tokens.get(at + 1).map(|next| &next.token);
+                    let after_path = at >= 2
+                        && tokens[at - 1].token == Token::Punct(':')
+                        && tokens[at - 2].token == Token::Punct(':');
+                    if next == Some(&Token::Punct('!')) {
+                        reading.unfollowed.push((
+                            tokens[at].line,
+                            "an include! brings in source where this reading does not follow",
+                        ));
+                    } else if after_path
+                        && matches!(
+                            next,
+                            Some(Token::Ident(word)) if word == "as"
+                        )
+                    {
+                        // `use std::include as load;` renames the macro, and `load!(..)` then
+                        // brings in source under a name this reading does not look for.
+                        reading.unfollowed.push((
+                            tokens[at].line,
+                            "an import of include under another name could bring in source",
+                        ));
+                    }
                 }
             }
             at += 1;
@@ -638,6 +658,60 @@ fn production_roots(metadata: &serde_json::Value, workspace: &Path) -> Roots {
     roots.examined.sort();
     roots.outside.sort();
     roots
+}
+
+/// Where the `testing` feature, whose items this reading passes over as test code, could be turned
+/// on in a program: a normal or build dependency of one of the host's crates that asks for it, and
+/// a default feature that enables it, as `crate: how`.
+fn testing_in_production(metadata: &serde_json::Value, workspace: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for package in metadata["packages"].as_array().into_iter().flatten() {
+        let Some(manifest) = package["manifest_path"].as_str() else {
+            continue;
+        };
+        if !normalise(Path::new(manifest)).starts_with(workspace.join("crates")) {
+            continue;
+        }
+        let name = package["name"].as_str().unwrap_or("a package");
+        for dependency in package["dependencies"].as_array().into_iter().flatten() {
+            let shipped = matches!(dependency["kind"].as_str(), None | Some("build"));
+            let asks = dependency["features"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|feature| feature.as_str() == Some("testing"));
+            if shipped && asks {
+                found.push(format!(
+                    "{name}: a normal or build dependency on {} asks for its testing feature",
+                    dependency["name"].as_str().unwrap_or("a crate")
+                ));
+            }
+        }
+        // What the default features enable, and what those enable in turn.
+        let table = package["features"].as_object();
+        let mut seen = BTreeSet::from(["default".to_owned()]);
+        let mut pending = vec!["default".to_owned()];
+        while let Some(feature) = pending.pop() {
+            let enables = table
+                .and_then(|table| table.get(&feature))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str);
+            for entry in enables {
+                if entry == "testing" || entry.ends_with("/testing") || entry.ends_with("?/testing")
+                {
+                    found.push(format!("{name}: the default features enable {entry}"));
+                } else if table.is_some_and(|table| table.contains_key(entry))
+                    && seen.insert(entry.to_owned())
+                {
+                    pending.push(entry.to_owned());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -866,6 +940,13 @@ fn only_the_install_module_asks_where_its_program_is() {
         "these library and program roots of the host's crates are not under their crate's src/, \
          which this reading covers, so nothing of them was read:\n{}",
         production.outside.join("\n")
+    );
+    let testing = testing_in_production(&metadata, &workspace);
+    assert!(
+        testing.is_empty(),
+        "the testing feature, whose items this reading passes over as test code, could be turned \
+         on in a program:\n{}",
+        testing.join("\n")
     );
     // The control on the real tree: the roots were looked at, the host's own among them.
     for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
@@ -1151,6 +1232,14 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
         unfollowed(&[("src/lib.rs", "fn f() {}\ninclude!(\"generated.rs\");")]),
         vec!["src/lib.rs: line 2: an include! brings in source where this reading does not follow"]
     );
+    // An import of `include` that renames it could bring in source under another name.
+    assert_eq!(
+        unfollowed(&[(
+            "src/lib.rs",
+            "use std::include as load;\nload!(\"../tools/extra.rs\");"
+        )]),
+        vec!["src/lib.rs: line 1: an import of include under another name could bring in source"]
+    );
     // The controls: the same declarations are followed when their files are held, in test code
     // nothing is named, and `include_str!` is data, not source.
     assert!(
@@ -1226,4 +1315,53 @@ fn a_root_outside_the_source_directory_is_named() {
             .outside
             .is_empty()
     );
+}
+
+/// A `testing` feature a program could turn on is named, so the reading's passing over of items
+/// under it as test code cannot be undone by a dependency: a normal or build dependency that asks for
+/// it, and a default feature that enables it, each directly or through another feature.
+#[test]
+fn a_testing_feature_a_program_could_turn_on_is_named() {
+    let metadata = serde_json::json!({ "packages": [
+        {
+            "name": "a",
+            "manifest_path": "/w/crates/a/Cargo.toml",
+            "dependencies": [
+                { "name": "b", "kind": null, "features": ["testing"] },
+                { "name": "c", "kind": "build", "features": ["testing"] },
+                { "name": "d", "kind": "dev", "features": ["testing"] },
+                { "name": "e", "kind": null, "features": ["other"] },
+            ],
+            "features": { "default": ["extra"], "extra": ["b/testing"], "testing": [] },
+        },
+        {
+            "name": "f",
+            "manifest_path": "/w/crates/f/Cargo.toml",
+            "dependencies": [],
+            "features": { "default": ["testing"], "testing": [] },
+        },
+        {
+            "name": "g",
+            "manifest_path": "/w/apps/g/Cargo.toml",
+            "dependencies": [{ "name": "b", "kind": null, "features": ["testing"] }],
+            "features": {},
+        },
+    ]});
+    assert_eq!(
+        testing_in_production(&metadata, Path::new("/w")),
+        vec![
+            "a: a normal or build dependency on b asks for its testing feature",
+            "a: a normal or build dependency on c asks for its testing feature",
+            "a: the default features enable b/testing",
+            "f: the default features enable testing",
+        ]
+    );
+    // The control: dev dependencies and a testing feature that nothing enables by default are fine.
+    let fine = serde_json::json!({ "packages": [{
+        "name": "a",
+        "manifest_path": "/w/crates/a/Cargo.toml",
+        "dependencies": [{ "name": "d", "kind": "dev", "features": ["testing"] }],
+        "features": { "default": [], "testing": [] },
+    }]});
+    assert!(testing_in_production(&fine, Path::new("/w")).is_empty());
 }
