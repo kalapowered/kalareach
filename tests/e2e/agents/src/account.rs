@@ -331,6 +331,10 @@ pub struct Guarded {
     pub sha256: Option<[u8; 32]>,
     /// Whether the bytes hashed held one of the needles.
     pub holds: bool,
+    /// The file's length, where it exists.
+    pub bytes: Option<u64>,
+    /// When it was last modified, in nanoseconds since the epoch, where it exists.
+    pub modified_ns: Option<i128>,
 }
 
 /// Reads each of `files`, relative to `home`, once, for [`Guarded`]: its digest and whether it
@@ -354,11 +358,18 @@ pub fn guarded_files(
                     relative: relative.clone(),
                     sha256: Some(kr_cbor::sha256(&bytes)),
                     holds: holds_any(&bytes, needles),
+                    bytes: Some(bytes.len() as u64),
+                    modified_ns: std::fs::metadata(&path).ok().map(|metadata| {
+                        i128::from(metadata.mtime()) * 1_000_000_000
+                            + i128::from(metadata.mtime_nsec())
+                    }),
                 }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Guarded {
                     relative: relative.clone(),
                     sha256: None,
                     holds: false,
+                    bytes: None,
+                    modified_ns: None,
                 }),
                 Err(error) => Err(format!("~/{relative}: {error}")),
             }
@@ -521,7 +532,7 @@ pub fn line_identity(line: &[u8]) -> (Option<String>, Option<Value>) {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || marks.contains(&character))
     };
-    let id = ["id", "session_id"]
+    let id = ["id", "session_id", "sessionId"]
         .iter()
         .find_map(|key| fields.get(*key))
         .and_then(Value::as_str)
@@ -1097,24 +1108,37 @@ pub fn which_hold(paths: &[PathBuf], needles: &[&str]) -> (Vec<PathBuf>, Vec<Str
     (holding, unread)
 }
 
-/// The identifier of the conversation a file holds: the last identifier shaped like a UUID in its
-/// name, or the name without its extension.
+/// Whether `candidate` is shaped like a UUID: 36 characters, hexadecimal digits and four dashes.
+fn uuid_shaped(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.char_indices().all(|(index, character)| {
+            if [8, 13, 18, 23].contains(&index) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// The identifier of the conversation a file holds: the name of the session directory that holds it
+/// (`session_<uuid>`), where the agent keeps each conversation in a directory of its own; else the
+/// last identifier shaped like a UUID in its name, or the name without its extension.
 #[must_use]
 pub fn conversation_id(file: &Path) -> String {
+    if let Some(session) = file
+        .ancestors()
+        .skip(1)
+        .filter_map(|directory| directory.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .find(|name| name.strip_prefix("session_").is_some_and(uuid_shaped))
+    {
+        return session;
+    }
     let stem = file
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let shaped = |candidate: &str| {
-        candidate.len() == 36
-            && candidate.char_indices().all(|(index, character)| {
-                if [8, 13, 18, 23].contains(&index) {
-                    character == '-'
-                } else {
-                    character.is_ascii_hexdigit()
-                }
-            })
-    };
+    let shaped = uuid_shaped;
     (0..stem.len().saturating_sub(35))
         .rev()
         .filter_map(|start| stem.get(start..start + 36))
@@ -1577,6 +1601,13 @@ mod tests {
         assert_eq!(
             conversation_id(Path::new("/p/session-42.json")),
             "session-42"
+        );
+        assert_eq!(
+            conversation_id(Path::new(&format!(
+                "/p/sessions/wd_w_0123456789ab/session_{uuid}/agents/main/wire.jsonl"
+            ))),
+            format!("session_{uuid}"),
+            "a conversation kept in a session directory of its own is named by the directory"
         );
     }
 }
