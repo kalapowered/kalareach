@@ -18,6 +18,7 @@ mod net_support;
 use kr_controller::config;
 use kr_controller::config::ceilings;
 use kr_crypto::keys::DeviceKeys;
+use kr_protocol::admission::RevocationPolicy;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::hostinfo::HostDoctorResult;
@@ -1457,6 +1458,268 @@ async fn accepted_enrolment_budgets_survive_a_restart_over_a_document_that_decid
             "{state:?}: and acceptance kept it"
         );
     }
+    host.stop().await;
+}
+
+/// The disable policy the admissions this host hands its workers carry, and the one the catalogue
+/// holds.
+async fn policy_in_force(
+    controller: &kr_controller::service::Controller,
+) -> (RevocationPolicy, RevocationPolicy, u64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let snapshot = controller
+        .catalogue()
+        .snapshot_within(&[], deadline)
+        .await
+        .expect("the admissions are computed");
+    let held = controller
+        .catalogue()
+        .disable_policy_in_force()
+        .await
+        .expect("the policy is readable");
+    (snapshot.policy, held, snapshot.revision)
+}
+
+/// The report's row for the disable policy.
+async fn policy_row(
+    controller: &kr_controller::service::Controller,
+) -> kr_protocol::hostinfo::CeilingValue {
+    controller
+        .effective_configuration()
+        .await
+        .ceilings
+        .into_iter()
+        .find(|ceiling| ceiling.key == "disable_policy")
+        .expect("the disable policy ceiling")
+}
+
+/// Has the daemon accept the document on disk, as a report of it does first.
+async fn accept(controller: &kr_controller::service::Controller) {
+    drop(controller.effective_configuration().await);
+}
+
+/// Writes a document naming `policy`, as a person editing their own file would, at the next
+/// revision.
+fn name_the_policy(controller: &kr_controller::service::Controller, policy: Option<&str>) -> u64 {
+    let document = kr_worker::config::document_path(controller.paths());
+    let mut edited: serde_json::Value = match std::fs::read_to_string(&document) {
+        Ok(contents) => serde_json::from_str(&contents).expect("valid JSON"),
+        Err(_) => serde_json::to_value(ConfigurationDocument::empty()).expect("a document"),
+    };
+    let revision = edited["revision"].as_u64().expect("a revision") + 1;
+    edited["revision"] = serde_json::json!(revision);
+    edited["ceilings"]["disable_policy"] =
+        policy.map_or(serde_json::Value::Null, |named| serde_json::json!(named));
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    )
+    .expect("the edited document");
+    revision
+}
+
+/// KR-REQ-25.22: a document that names a disable policy puts it in force, at the next acceptance
+/// and at start, and the admissions every worker is handed carry it, so a binding on a revoked
+/// release is refused its rich admissions from the next one on (the worker's own cases hold that
+/// half). The policy is the catalogue's, recorded with the admission revision it moves, so a
+/// change sends every worker a round and the same document accepted again sends none. The control
+/// is a host with no document, which only warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_naming_a_disable_policy_puts_it_in_force_at_the_next_acceptance_and_at_start() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    // Control: nothing names a policy, so a revoked release only warns.
+    let (carried, held, before) = policy_in_force(controller).await;
+    assert_eq!(carried, RevocationPolicy::WarnOnly);
+    assert_eq!(held, RevocationPolicy::WarnOnly);
+    let row = policy_row(controller).await;
+    assert_eq!(row.source, ValueSource::Default, "{row:?}");
+    assert!(row.value.as_str().starts_with("warn only"), "{row:?}");
+
+    // A person names one in their own file; the next report accepts it first.
+    name_the_policy(controller, Some("disable_at_next_admission"));
+    let row = policy_row(controller).await;
+    assert_eq!(row.source, ValueSource::HostConfiguration, "{row:?}");
+    assert!(
+        row.value
+            .as_str()
+            .starts_with("disable at the next admission"),
+        "{row:?}"
+    );
+    assert!(row.origin.as_ref().is_some(), "the document is its origin");
+    assert_eq!(row.effect, ValueEffect::Immediately);
+    let (carried, held, moved) = policy_in_force(controller).await;
+    assert_eq!(carried, RevocationPolicy::DisableAtNextAdmission);
+    assert_eq!(held, RevocationPolicy::DisableAtNextAdmission);
+    assert_eq!(
+        moved,
+        before + 1,
+        "the policy moved the admission revision once"
+    );
+
+    // The same document accepted again moves nothing.
+    let again = policy_row(controller).await;
+    assert_eq!(again.value, row.value);
+    assert_eq!(policy_in_force(controller).await.2, moved);
+
+    // A daemon that starts over a document naming another policy has it in force from the start.
+    let stopped = host.shut_down().await;
+    let environment = stopped.tree().environment();
+    let mut edited: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(kr_worker::config::document_path(&environment)).expect("the document"),
+    )
+    .expect("valid JSON");
+    edited["revision"] = serde_json::json!(edited["revision"].as_u64().expect("a revision") + 1);
+    edited["ceilings"]["disable_policy"] = serde_json::json!("disable_at_once");
+    write_document_bytes(
+        &environment,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    );
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    accept(host.controller()).await;
+    let (carried, held, _) = policy_in_force(host.controller()).await;
+    assert_eq!(
+        carried,
+        RevocationPolicy::DisableAtOnce,
+        "in force at start"
+    );
+    assert_eq!(held, RevocationPolicy::DisableAtOnce);
+
+    // Naming warn_only is how a document goes back to it.
+    name_the_policy(host.controller(), Some("warn_only"));
+    accept(host.controller()).await;
+    assert_eq!(
+        policy_in_force(host.controller()).await.0,
+        RevocationPolicy::WarnOnly
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-25.22: a document that names no policy, and one this host cannot use (absent,
+/// unreadable, of a version it does not know, invalid), changes nothing: the policy this host holds
+/// stays in force and is reported as the one last accepted, so an administrator's policy is not
+/// lifted because a file lost the line that set it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_names_no_policy_or_cannot_be_used_changes_nothing() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let mut host = Host::start(&owner).await;
+    name_the_policy(host.controller(), Some("disable_at_once"));
+    accept(host.controller()).await;
+    assert_eq!(
+        policy_in_force(host.controller()).await.0,
+        RevocationPolicy::DisableAtOnce
+    );
+    let revision = policy_in_force(host.controller()).await.2;
+    let document = kr_worker::config::document_path(host.controller().paths());
+    let accepted = std::fs::read(&document).expect("the document this host wrote");
+
+    // A document that loads and names no policy.
+    name_the_policy(host.controller(), None);
+    accept(host.controller()).await;
+    let (carried, held, moved) = policy_in_force(host.controller()).await;
+    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
+    assert_eq!(held, RevocationPolicy::DisableAtOnce);
+    assert_eq!(moved, revision, "nothing moved the admission revision");
+    let row = policy_row(host.controller()).await;
+    assert!(
+        row.value.as_str().contains("last accepted"),
+        "the report says whose policy it is: {row:?}"
+    );
+    assert_eq!(row.source, ValueSource::HostConfiguration);
+    assert!(
+        row.origin.as_ref().is_none(),
+        "no document decided it: {row:?}"
+    );
+
+    for state in [
+        DocumentState::Absent,
+        DocumentState::Unreadable,
+        DocumentState::UnknownVersion,
+        DocumentState::Invalid,
+    ] {
+        let _ = std::fs::remove_file(&document);
+        match state {
+            DocumentState::Unreadable => {
+                let bound = usize::try_from(kr_protocol::hostinfo::configuration::MAX_LEN)
+                    .expect("a bound that fits");
+                kr_ipc::paths::write_owner_only_file(&document, &vec![b' '; bound + 1])
+                    .expect("written");
+            }
+            DocumentState::UnknownVersion | DocumentState::Invalid => {
+                let mut edited: serde_json::Value =
+                    serde_json::from_slice(&accepted).expect("valid JSON");
+                if state == DocumentState::UnknownVersion {
+                    edited["version"] = serde_json::json!(u64::from(u32::MAX));
+                } else {
+                    edited["not_a_member"] = serde_json::json!(1);
+                }
+                kr_ipc::paths::write_owner_only_file(
+                    &document,
+                    serde_json::to_string(&edited).expect("JSON").as_bytes(),
+                )
+                .expect("written");
+            }
+            _ => {}
+        }
+        host = host.restart().await;
+        accept(host.controller()).await;
+        let (carried, held, moved) = policy_in_force(host.controller()).await;
+        assert_eq!(
+            carried,
+            RevocationPolicy::DisableAtOnce,
+            "{state:?}: the policy this host accepted is still in force"
+        );
+        assert_eq!(held, RevocationPolicy::DisableAtOnce, "{state:?}");
+        assert_eq!(moved, revision, "{state:?}: and nothing moved the revision");
+        assert!(
+            policy_row(host.controller())
+                .await
+                .value
+                .as_str()
+                .contains("last accepted"),
+            "{state:?}"
+        );
+    }
+    host.stop().await;
+}
+
+/// KR-REQ-25.22: a policy whose record cannot be written with the admission revision it moves does
+/// not change: the policy before it stays in force, the acceptance reports why, and the same
+/// document accepted again puts it in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_that_cannot_be_recorded_with_its_revision_does_not_change() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+    let (_, _, before) = policy_in_force(controller).await;
+
+    controller.catalogue().fail_next_revision_raise();
+    name_the_policy(controller, Some("disable_at_next_admission"));
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective
+            .not_in_force
+            .as_ref()
+            .is_some_and(|why| why.as_str().contains("disable policy did not change")),
+        "{:?}",
+        effective.not_in_force
+    );
+    let (carried, held, moved) = policy_in_force(controller).await;
+    assert_eq!(carried, RevocationPolicy::WarnOnly);
+    assert_eq!(held, RevocationPolicy::WarnOnly);
+    assert_eq!(moved, before, "no half of the change is visible");
+
+    // The record of what was accepted advanced only when every effect landed, so the next
+    // acceptance of the same document tries again and succeeds.
+    let effective = controller.effective_configuration().await;
+    assert!(effective.not_in_force.as_ref().is_none(), "{effective:?}");
+    assert_eq!(
+        policy_in_force(controller).await.0,
+        RevocationPolicy::DisableAtNextAdmission
+    );
     host.stop().await;
 }
 

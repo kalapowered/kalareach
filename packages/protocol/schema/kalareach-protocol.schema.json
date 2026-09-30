@@ -7597,6 +7597,18 @@
       "additionalProperties": false,
       "description": "The ceilings this host configures.\n\nEvery one of them narrows. A configured value above what authority, an organisation\nrestriction, a grant or a hard resource limit already allows is rejected rather than\napplied, which is section 26's second paragraph and why these are not in\n[`PreferenceSet`].",
       "properties": {
+        "disable_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What happens to a live binding whose release its repository revokes: section 25's\nadministrator's explicit disable policy.\n\nAbsent leaves the policy this host already holds, which is warning only until one is\nnamed; present puts the one named in force from the next admission. Removing the member\ndoes not return to warning only: naming `warn_only` does."
+        },
         "enrolment": {
           "anyOf": [
             {
@@ -7648,6 +7660,7 @@
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",
           "default": {
+            "disable_policy": null,
             "enrolment": null,
             "grant_rights": null,
             "session_limit": null
