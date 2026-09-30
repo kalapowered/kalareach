@@ -1196,7 +1196,9 @@ async fn start_one(
             handover::Resumed::Serving => {
                 return match handover::answers_as(store, &environment, current, None).await {
                     Ok(()) => Ok(()),
-                    Err(unanswered) => Err(unanswered_by(store, &environment, unanswered).await),
+                    Err(unanswered) => {
+                        Err(unanswered_by(store, &environment, current, unanswered).await)
+                    }
                 };
             }
             // A daemon that does not listen is starting, or is on its way out: it is waited for
@@ -1207,11 +1209,11 @@ async fn start_one(
                     Ok(handover::Answered::Serving) => return Ok(()),
                     Ok(handover::Answered::Gone) => {}
                     Err(unanswered) => {
-                        return Err(unanswered_by(store, &environment, unanswered).await);
+                        return Err(unanswered_by(store, &environment, current, unanswered).await);
                     }
                 }
             }
-            handover::Resumed::Stopping => handover::gone(store, &environment).await?,
+            handover::Resumed::Stopping => handover::gone(store, &environment, current).await?,
         }
     }
     match &restart.start {
@@ -1243,20 +1245,26 @@ async fn start_one(
     }
 }
 
-/// What it says when a daemon that holds an environment does not answer as the release asked for.
+/// What it says when a daemon that holds an environment does not answer as `expected`.
 ///
 /// A daemon that is starting holds the install lock past its bound, and the look at the environment
-/// says that: it is no daemon of this update's to stop. Otherwise the daemon that still holds the
-/// environment is named, as [`handover::still_running`] names it, or said to have gone.
+/// says that: it is no daemon of this update's to stop. Otherwise what failed comes first, and then
+/// what [`handover::still_running`] finds: the daemon that still holds the environment, named with
+/// how to stop it unless it now answers as `expected`, or said to have gone.
 #[cfg(unix)]
 async fn unanswered_by(
     store: &Store,
     environment: &inventory::Environment,
+    expected: &ReleaseName,
     unanswered: CliError,
 ) -> CliError {
     match unanswered {
         deferred @ CliError::UpdateDeferred(_) => deferred,
-        _ => CliError::Other(handover::still_running(store, environment).await),
+        failed => CliError::Other(shown!(
+            "{}; {}",
+            failed.said(),
+            handover::still_running(store, environment, expected).await
+        )),
     }
 }
 
@@ -1549,7 +1557,8 @@ mod tests {
             environment.environment_id,
         )
         .expect("a daemon holds the environment");
-        let said = handover::still_running(&store, &environment)
+        let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let said = handover::still_running(&store, &environment, &expected)
             .await
             .to_string();
         assert!(
@@ -1557,12 +1566,44 @@ mod tests {
             "the control: a daemon still there is named: {said}"
         );
         drop(daemon);
-        let said = handover::still_running(&store, &environment)
+        let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let said = handover::still_running(&store, &environment, &expected)
             .await
             .to_string();
         assert!(
             said.contains("went away") && !said.contains("kill"),
             "{said}"
+        );
+    }
+
+    /// What is said of a daemon that still holds an environment: gone, or serving as the release
+    /// asked for (it is not to be stopped, whatever it did meanwhile), or named with how to stop it.
+    #[test]
+    fn a_daemon_that_now_answers_as_the_release_asked_for_is_not_named_to_be_killed() {
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let said = |holder| handover::holder_said(environment, holder, &expected).to_string();
+        assert!(said(None).contains("went away"));
+        // A daemon that answers as the release asked for serves: it is not a process to stop.
+        let serving = said(Some((Some(4242), Some("kr-controller/0.2.0+bbbbbbbbbbbb"))));
+        assert!(
+            serving.contains("now answers as a daemon of 0.2.0+bbbbbbbbbbbb")
+                && !serving.contains("kill"),
+            "{serving}"
+        );
+        // The controls: one that answers as another release, and one that does not answer, are
+        // named, or said to be there.
+        let another = said(Some((Some(4242), Some("kr-controller/0.1.0+aaaaaaaaaaaa"))));
+        assert!(
+            another.contains("process 4242") && another.contains("kill 4242"),
+            "{another}"
+        );
+        let silent = said(Some((Some(4242), None)));
+        assert!(silent.contains("kill 4242"), "{silent}");
+        let unnamed = said(Some((None, None)));
+        assert!(
+            unnamed.contains("still running") && !unnamed.contains("kill"),
+            "{unnamed}"
         );
     }
 
