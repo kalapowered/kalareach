@@ -92,8 +92,17 @@ fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Every recorded step named `id`, with the window it was measured in and what the terminal said.
-fn recorded(id: &str) -> Vec<(String, u32, u32, Vec<u8>, (u32, u32))> {
+/// One recorded step: the window it was measured in, the bytes, and what the terminal answered.
+struct Recorded {
+    name: String,
+    cols: u32,
+    rows: u32,
+    bytes: Vec<u8>,
+    terminal: (u32, u32),
+}
+
+/// Every recorded step named `id`, one for each terminal that was measured.
+fn recorded(id: &str) -> Vec<Recorded> {
     let mut found = Vec::new();
     for (name, record) in records() {
         let window = record["window"].as_array().expect("a window");
@@ -106,16 +115,16 @@ fn recorded(id: &str) -> Vec<(String, u32, u32, Vec<u8>, (u32, u32))> {
             .find(|step| step["id"] == id)
             .unwrap_or_else(|| panic!("{name} has no step {id}"));
         let answer = &step["terminal"];
-        found.push((
+        found.push(Recorded {
             name,
             cols,
             rows,
-            hex(step["bytes"].as_str().expect("bytes")),
-            (
+            bytes: hex(step["bytes"].as_str().expect("bytes")),
+            terminal: (
                 u32::try_from(answer["row"].as_u64().expect("a row")).expect("row fits"),
                 u32::try_from(answer["col"].as_u64().expect("a column")).expect("column fits"),
             ),
-        ));
+        });
     }
     assert!(found.len() >= 2, "records of at least two terminals");
     found
@@ -123,7 +132,14 @@ fn recorded(id: &str) -> Vec<(String, u32, u32, Vec<u8>, (u32, u32))> {
 
 #[test]
 fn an_address_past_the_corner_is_answered_as_both_recorded_terminals_answered_it() {
-    for (name, cols, rows, bytes, terminal) in recorded("addressing.clamps-to-the-corner") {
+    for step in recorded("addressing.clamps-to-the-corner") {
+        let Recorded {
+            name,
+            cols,
+            rows,
+            bytes,
+            terminal,
+        } = step;
         assert_eq!(terminal, (rows, cols), "{name} stops on the corner");
         assert_eq!(cursor_after(cols, rows, &bytes), terminal, "{name}");
     }
@@ -131,9 +147,14 @@ fn an_address_past_the_corner_is_answered_as_both_recorded_terminals_answered_it
 
 #[test]
 fn a_wide_character_that_ends_in_the_last_column_is_answered_as_both_recorded_terminals_did() {
-    for (name, cols, rows, bytes, terminal) in
-        recorded("wide.wide-character-two-cells-from-the-edge")
-    {
+    for step in recorded("wide.wide-character-two-cells-from-the-edge") {
+        let Recorded {
+            name,
+            cols,
+            rows,
+            bytes,
+            terminal,
+        } = step;
         assert_eq!(
             terminal,
             (1, cols),
