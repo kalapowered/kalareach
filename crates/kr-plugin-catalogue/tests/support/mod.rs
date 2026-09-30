@@ -26,8 +26,9 @@ use kr_protocol::scalars::TimestampMs;
 use tough::editor::RepositoryEditor;
 use tough::editor::signed::SignedRole;
 use tough::key_source::KeySource;
+use tough::schema::decoded::Decoded;
 use tough::schema::key::Key;
-use tough::schema::{KeyHolder, PathPattern, PathSet, RoleKeys, RoleType, Root, Target};
+use tough::schema::{Hashes, KeyHolder, PathPattern, PathSet, RoleKeys, RoleType, Root, Target};
 use tough::sign::Sign;
 
 /// One signing key, held as its PKCS#8 bytes and never written anywhere.
@@ -179,6 +180,18 @@ pub struct GenerationSpec {
     pub delegation_chain: usize,
     /// Whether the leaf role carries no package targets (for terminating-miss test).
     pub empty_leaf: bool,
+    /// A role the top-level targets role delegates the package's paths to before the role that
+    /// signs the package's targets, and that signs none of them: a role that names no package
+    /// while a later sibling holds it. The value is whether it ends the search where it stands.
+    pub shadow_role: Option<bool>,
+    /// Whether no role signs the package's targets: the index lists the package and the signed
+    /// metadata pins nothing under it, as it does after a newer targets version drops the
+    /// delegation that held them.
+    pub package_unsigned: bool,
+    /// Entries the index lists beyond the package's own. Each is pinned in the signed metadata by
+    /// the digests and sizes it declares, and none has a file behind it: a catalogue whose
+    /// payloads are fetched on demand, most of which nobody has asked for.
+    pub listed_only: Vec<IndexEntry>,
     /// Whether the root publishes consistent snapshots: every metadata document but the timestamp
     /// named with its version in front, and every target with its SHA-256.
     pub consistent_snapshot: bool,
@@ -226,6 +239,9 @@ impl Default for GenerationSpec {
             nested_delegation: false,
             delegation_chain: 0,
             empty_leaf: false,
+            shadow_role: None,
+            package_unsigned: false,
+            listed_only: Vec::new(),
             consistent_snapshot: false,
             root_version: 1,
             previous_keys: None,
@@ -343,6 +359,17 @@ impl Generation {
             expired: true,
             keys: Some(self.keys.clone()),
             ..self.spec.clone()
+        };
+        std::fs::remove_dir_all(&self.directory).expect("removable");
+        write_generation(&self.directory, &self.keys, &spec).await;
+    }
+
+    /// Rebuilds this generation in place from `spec`, signed with the same keys: a repository that
+    /// publishes its next generation at the same location.
+    pub async fn rewrite_with(&self, spec: GenerationSpec) {
+        let spec = GenerationSpec {
+            keys: Some(self.keys.clone()),
+            ..spec
         };
         std::fs::remove_dir_all(&self.directory).expect("removable");
         write_generation(&self.directory, &self.keys, &spec).await;
@@ -620,7 +647,9 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             homepage: "https://reach.kala.to".to_owned(),
             first_party: true,
         }],
-        entries: vec![entry],
+        entries: std::iter::once(entry)
+            .chain(spec.listed_only.iter().cloned())
+            .collect(),
     };
     let index_bytes = index.canonical_json().expect("serialisable").into_bytes();
     std::fs::write(targets.join("index.json"), &index_bytes).expect("writable");
@@ -669,7 +698,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             .map(|level| (format!("level-{level}"), false))
             .collect()
     };
-    if !chain.is_empty() {
+    if !chain.is_empty() || spec.shadow_role.is_some() {
         let index_target = Target::from_path(targets.join("index.json"))
             .await
             .expect("an index target");
@@ -681,48 +710,87 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             editor.add_target(name.as_str(), target).expect("added");
         }
 
-        // Whoever signs the role being edited: the top-level targets key, then each delegate.
-        let mut signer: Option<TestKey> = None;
-        for (role, terminating) in &chain {
-            let delegate = TestKey::generate();
-            let sources: Vec<Box<dyn KeySource>> = vec![Box::new(delegate.clone())];
+        let leaf_sources: Vec<Box<dyn KeySource>> = if let Some(terminating) = spec.shadow_role {
+            // Two sibling roles under the top-level targets role, over the same paths: the first
+            // signs nothing and the second signs the package's targets.
+            let holder = TestKey::generate();
+            for (role, ends, key) in [
+                ("shadow", terminating, TestKey::generate()),
+                ("holder", false, holder.clone()),
+            ] {
+                let sources: Vec<Box<dyn KeySource>> = vec![Box::new(key)];
+                editor
+                    .delegate_role(
+                        role,
+                        &sources,
+                        PathSet::Paths(vec![
+                            PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
+                                .expect("a parsable pattern"),
+                        ]),
+                        ends,
+                        NonZeroU64::new(1).expect("one is not zero"),
+                        expires,
+                        version,
+                    )
+                    .await
+                    .expect("a delegated role");
+            }
             editor
-                .delegate_role(
-                    role,
-                    &sources,
-                    PathSet::Paths(vec![
-                        PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
-                            .expect("a parsable pattern"),
-                    ]),
-                    *terminating,
-                    NonZeroU64::new(1).expect("one is not zero"),
-                    expires,
-                    version,
-                )
+                .sign_targets_editor(&keys.sources())
                 .await
-                .expect("a delegated role");
-            let signing: Vec<Box<dyn KeySource>> = match &signer {
-                None => keys.sources(),
-                Some(key) => vec![Box::new(key.clone())],
-            };
+                .expect("the top-level role signed");
             editor
-                .sign_targets_editor(&signing)
-                .await
-                .expect("the delegating role signed");
-            editor
-                .change_delegated_targets(role)
+                .change_delegated_targets("holder")
                 .expect("the delegated role is editable");
             editor
                 .targets_version(version)
                 .expect("version")
                 .targets_expires(expires)
                 .expect("expiry");
-            signer = Some(delegate);
-        }
-        let leaf_sources: Vec<Box<dyn KeySource>> =
-            vec![Box::new(signer.expect("a chain has a last role"))];
+            vec![Box::new(holder)]
+        } else {
+            // Whoever signs the role being edited: the top-level targets key, then each delegate.
+            let mut signer: Option<TestKey> = None;
+            for (role, terminating) in &chain {
+                let delegate = TestKey::generate();
+                let sources: Vec<Box<dyn KeySource>> = vec![Box::new(delegate.clone())];
+                editor
+                    .delegate_role(
+                        role,
+                        &sources,
+                        PathSet::Paths(vec![
+                            PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
+                                .expect("a parsable pattern"),
+                        ]),
+                        *terminating,
+                        NonZeroU64::new(1).expect("one is not zero"),
+                        expires,
+                        version,
+                    )
+                    .await
+                    .expect("a delegated role");
+                let signing: Vec<Box<dyn KeySource>> = match &signer {
+                    None => keys.sources(),
+                    Some(key) => vec![Box::new(key.clone())],
+                };
+                editor
+                    .sign_targets_editor(&signing)
+                    .await
+                    .expect("the delegating role signed");
+                editor
+                    .change_delegated_targets(role)
+                    .expect("the delegated role is editable");
+                editor
+                    .targets_version(version)
+                    .expect("version")
+                    .targets_expires(expires)
+                    .expect("expiry");
+                signer = Some(delegate);
+            }
+            vec![Box::new(signer.expect("a chain has a last role"))]
+        };
 
-        if !spec.empty_leaf {
+        if !spec.empty_leaf && !spec.package_unsigned {
             for (name, _) in &files {
                 let target_name = format!("{prefix}/{name}");
                 let target_path = targets.join(&prefix).join(name);
@@ -734,6 +802,9 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
                     .add_target(target_name.as_str(), target)
                     .expect("added");
             }
+            for (name, target) in spec.listed_only.iter().flat_map(pinned_targets) {
+                editor.add_target(name.as_str(), target).expect("added");
+            }
         }
 
         editor
@@ -743,14 +814,21 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     } else {
         let mut names: Vec<(String, PathBuf)> =
             vec![("index.json".to_owned(), targets.join("index.json"))];
-        for (name, _) in &files {
-            names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
+        if !spec.package_unsigned {
+            for (name, _) in &files {
+                names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
+            }
         }
         names.extend(extra.iter().cloned());
         names.sort();
         for (name, path) in &names {
             let target = declared(name, Target::from_path(path).await.expect("a target"));
             editor.add_target(name.as_str(), target).expect("added");
+        }
+        if !spec.package_unsigned {
+            for (name, target) in spec.listed_only.iter().flat_map(pinned_targets) {
+                editor.add_target(name.as_str(), target).expect("added");
+            }
         }
 
         for (role, pattern, terminating) in &spec.delegations {
@@ -805,6 +883,35 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     }
 
     manifest_digest
+}
+
+/// Returns the targets an index entry declares, pinned by the digests and sizes the entry states,
+/// for a release published with no file behind it.
+fn pinned_targets(entry: &IndexEntry) -> Vec<(String, Target)> {
+    let prefix = format!(
+        "packages/{}/{}/{}",
+        entry.publisher_id, entry.plugin_name, entry.version
+    );
+    let pinned = |digest: PayloadDigest, length: u64| Target {
+        length,
+        hashes: Hashes {
+            sha256: Decoded::from(digest.as_bytes().to_vec()),
+            _extra: HashMap::new(),
+        },
+        custom: HashMap::new(),
+        _extra: HashMap::new(),
+    };
+    let mut targets = vec![(
+        format!("{prefix}/{}", kr_plugin_sdk::package::MANIFEST_FILE),
+        pinned(entry.manifest_digest, entry.manifest_size_bytes.get()),
+    )];
+    for payload in &entry.payloads {
+        targets.push((
+            format!("{prefix}/{}", payload.path.as_str()),
+            pinned(payload.digest, payload.size_bytes.get()),
+        ));
+    }
+    targets
 }
 
 /// Returns the path, relative to the targets directory, that a location inside it addresses the
