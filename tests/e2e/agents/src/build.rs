@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn a_probe_needs_each_text_and_whole_line_and_none_of_what_it_must_lack() {
-        let servers = owned(&["pushary", "dtt"]);
+        let servers = owned(&["notifier", "lookup"]);
         let answer =
             "hooks        stable   false\nplugins   stable  false\nLogged in using ChatGPT\n";
         assert_eq!(
@@ -880,8 +880,8 @@ mod tests {
             "a text is found with spaces aside"
         );
         assert_eq!(
-            probe(&[], &[], &["{servers}"]).check("uses DTT here", &servers, None),
-            Err("it holds \"dtt\"".to_owned()),
+            probe(&[], &[], &["{servers}"]).check("uses LOOKUP here", &servers, None),
+            Err("it holds \"lookup\"".to_owned()),
             "what it must lack is compared without regard to case"
         );
     }
@@ -901,8 +901,8 @@ mod tests {
 
     #[test]
     fn a_json_answer_is_searched_but_for_the_one_block_that_carries_the_accepted_file() {
-        let servers = owned(&["pushary"]);
-        let file = "Ask me through pushary.";
+        let servers = owned(&["notifier"]);
+        let file = "Ask me through notifier.";
         let answer = |blocks: &[&str]| {
             serde_json::json!([{ "content": blocks.iter().map(|text| serde_json::json!({ "text": text })).collect::<Vec<_>>() }])
                 .to_string()
@@ -910,12 +910,12 @@ mod tests {
         let permissions = "<permissions instructions> Network access is restricted.";
         let good = answer(&[
             permissions,
-            "# AGENTS.md instructions for /\n\n<INSTRUCTIONS>\nAsk me through pushary.\n</INSTRUCTIONS>",
+            "# AGENTS.md instructions for /\n\n<INSTRUCTIONS>\nAsk me through notifier.\n</INSTRUCTIONS>",
         ]);
         assert_eq!(prompt_probe().check(&good, &servers, Some(file)), Ok(()));
         let two = answer(&[
             permissions,
-            "# AGENTS.md instructions Ask me through pushary.",
+            "# AGENTS.md instructions Ask me through notifier.",
             "# AGENTS.md instructions another",
         ]);
         assert_eq!(
@@ -927,11 +927,11 @@ mod tests {
         );
         let more = answer(&[
             permissions,
-            "# AGENTS.md instructions Ask me through pushary. And a pushary tool.",
+            "# AGENTS.md instructions Ask me through notifier. And a notifier tool.",
         ]);
         assert_eq!(
             prompt_probe().check(&more, &servers, Some(file)),
-            Err("it holds \"pushary\"".to_owned()),
+            Err("it holds \"notifier\"".to_owned()),
             "what the block holds besides the file is searched"
         );
         let other = answer(&[permissions, "# AGENTS.md instructions something else"]);
@@ -942,7 +942,7 @@ mod tests {
         );
         let elsewhere = answer(&[
             "<permissions instructions> Network access is enabled.",
-            "# AGENTS.md instructions Ask me through pushary. Network access is restricted",
+            "# AGENTS.md instructions Ask me through notifier. Network access is restricted",
         ]);
         assert_eq!(
             prompt_probe().check(&elsewhere, &servers, Some(file)),
@@ -1038,13 +1038,13 @@ mod tests {
             table: "mcp_servers".to_owned(),
             switch: Vec::new(),
         };
-        let text = "[mcp_servers.peekaboo]\ncommand = \"x\"\n[mcp_servers.\"with.dot\"]\n[mcp_servers.slack]\n[mcp_servers.slack.env]\n[projects.\"/p\"]\n";
+        let text = "[mcp_servers.screens]\ncommand = \"x\"\n[mcp_servers.\"with.dot\"]\n[mcp_servers.chat]\n[mcp_servers.chat.env]\n[projects.\"/p\"]\n";
         assert_eq!(
             switches.names_in(text),
             vec![
-                "peekaboo".to_owned(),
+                "screens".to_owned(),
                 "with.dot".to_owned(),
-                "slack".to_owned()
+                "chat".to_owned()
             ]
         );
     }
