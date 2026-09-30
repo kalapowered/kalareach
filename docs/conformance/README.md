@@ -525,7 +525,7 @@ profile reading the same output.
 | `validity` | `object` (`name` and `within_boot_ms`, `utc_ms` or `owner_grant`), `expect` | The time contract decides the object: `valid`, `expired: continuous_deadline`, `expired: trusted_utc_deadline`, `unproven` or `revalidation owed` |
 | `fill_journal` | `expect`, a protocol code | The session's journal stops growing and takes actions until the store refuses one, with the code named |
 | `journal` | `expect` (`healthy`, `full`, `write_failed`, `corrupt` or `absent`), `rich_work` | The condition the session's journal is in, and whether a rich mutation is admitted in the posture it gives |
-| `release_journal` | `expect`, the fault of the interval recorded or `null` | The journal may grow again and the session tries to leave its fault; the interval it could not write is recorded once |
+| `release_journal` | `expect`, the fault of the interval recorded or `null` | The journal may grow again and the session tries to leave its fault; the interval it could not write is recorded once, and both the session's connection and a reader that opens the file afresh read it |
 | `holds` | `client` | The client holds the session's screen and performed nothing while it was drawn one |
 | `screen` | `active`, `lines`, optional `other` | The session's own screen reads so, trailing blanks dropped |
 | `effects` | `client`, `expect` | Every side effect the client's terminal has performed from the live stream: `bell`, `clipboard write: <content>` and so on |

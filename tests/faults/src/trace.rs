@@ -52,6 +52,7 @@ use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::{ClipboardSelection, SideEffectKind};
 use kr_worker::action::time::{Discontinuity, ExpiringObject, Validity};
+use kr_worker::journal::Journal;
 use kr_worker::persistence::WorkClass;
 use kr_worker::session::InputBatch;
 use serde::{Deserialize, Serialize};
@@ -508,8 +509,10 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         epochs: BTreeMap::new(),
         reference,
         questions: 0,
-        _journal: journal,
+        journal_home: journal,
+        gaps: (0, 0),
     };
+    replay.gaps.0 = replay.stored_gaps().map_or(0, |gaps| gaps.len());
     for (index, step) in trace.steps.iter().enumerate() {
         replay
             .run(step)
@@ -531,7 +534,10 @@ struct Replay {
     /// How many questions the output has asked so far.
     questions: usize,
     /// Where the session's journal was made, kept until the replay ends.
-    _journal: Option<JournalHome>,
+    journal_home: Option<JournalHome>,
+    /// How many intervals the journal held written down when the session opened it, and how many
+    /// this replay has had it record since.
+    gaps: (usize, usize),
 }
 
 /// A kept journal fixture made with its fault in a directory of its own, which goes with this.
@@ -653,22 +659,7 @@ impl Replay {
                     )));
                 }
             }
-            Step::ReleaseJournal { expect } => {
-                let session = self.stage.session();
-                let released = session
-                    .journal_mut()
-                    .ok_or_else(|| malformed("the session has no journal".to_owned()))?
-                    .release_size_cap();
-                released.map_err(|error| malformed(format!("the cap stays: {error}")))?;
-                let gap = session
-                    .recover_journal()
-                    .map(|gap| gap.kind.as_str().to_owned());
-                if gap != *expect {
-                    return Err(unmet(format!(
-                        "the session recorded a gap of {gap:?}, and the trace expects {expect:?}"
-                    )));
-                }
-            }
+            Step::ReleaseJournal { expect } => self.release_journal(expect.as_deref())?,
             Step::Effects { client, expect } => {
                 let index = self.client(client)?;
                 let got: Vec<String> = self
@@ -751,6 +742,64 @@ impl Replay {
             )));
         }
         Ok(())
+    }
+
+    /// Lets the session's journal grow again and has the session try to leave its fault, then
+    /// reads what the store holds: through the session's own connection, and through one opened
+    /// afterwards as a reader of the closed session's journal opens it.
+    fn release_journal(&mut self, expect: Option<&str>) -> StepResult {
+        let session = self.stage.session();
+        let released = session
+            .journal_mut()
+            .ok_or_else(|| malformed("the session has no journal".to_owned()))?
+            .release_size_cap();
+        released.map_err(|error| malformed(format!("the cap stays: {error}")))?;
+        let gap = session
+            .recover_journal()
+            .map(|gap| gap.kind.as_str().to_owned());
+        if gap.as_deref() != expect {
+            return Err(unmet(format!(
+                "the session recorded a gap of {gap:?}, and the trace expects {expect:?}"
+            )));
+        }
+        if gap.is_some() {
+            self.gaps.1 += 1;
+        }
+        let owed = self.gaps.0 + self.gaps.1;
+        let through_the_session = self.stored_gaps().map_err(malformed)?;
+        let path = self
+            .journal_home
+            .as_ref()
+            .map(JournalHome::path)
+            .ok_or_else(|| malformed("the trace opened no kept journal".to_owned()))?;
+        let reopened = Journal::open_read_only(&path)
+            .and_then(|journal| journal.recovery_gaps())
+            .map_err(|error| malformed(format!("the journal could not be reopened: {error}")))?;
+        for (whose, gaps) in [
+            ("the session's own connection", &through_the_session),
+            ("a reader that opens the file afresh", &reopened),
+        ] {
+            let kinds: Vec<&str> = gaps.iter().map(|gap| gap.kind.as_str()).collect();
+            if gaps.len() != owed || (gap.is_some() && kinds.last() != expect.as_ref()) {
+                return Err(unmet(format!(
+                    "{whose} reads {} interval(s) written down, ending {:?}, and the trace \
+                     has had {owed} recorded, the last {expect:?}",
+                    gaps.len(),
+                    kinds.last()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The intervals the session's own connection reads as written down in its journal.
+    fn stored_gaps(&mut self) -> Result<Vec<kr_worker::persistence::fault::RecoveryGap>, String> {
+        self.stage
+            .session()
+            .journal_mut()
+            .ok_or_else(|| "the session has no journal".to_owned())?
+            .recovery_gaps()
+            .map_err(|error| format!("the journal's intervals could not be read: {error}"))
     }
 
     /// Stops the session's journal growing and has it take the fixtures' actions until the store

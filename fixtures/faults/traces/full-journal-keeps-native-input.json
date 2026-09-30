@@ -1,7 +1,7 @@
 {
   "format": "kalareach.trace/1",
   "name": "full-journal-keeps-native-input",
-  "about": "a session's journal fills while a client holds the keys: the store refuses the next durable write, rich work is fenced while the client's typing still reaches the application, and once the store may grow again the interval it could not write is recorded, once",
+  "about": "a session's journal fills while a client holds the keys: the store refuses the next durable write, rich work is fenced while the client's typing is still queued under its lease for the application, and once the store may grow again the interval it could not write is recorded, once, and read back through the session's connection and through a reader that opens the file afresh",
   "columns": 20,
   "rows": 3,
   "wall_ms": 1790000000000,

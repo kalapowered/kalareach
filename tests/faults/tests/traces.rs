@@ -76,8 +76,10 @@ fn a_lone_escape_is_held_only_while_it_could_start_a_paste_and_only_until_its_de
 
 /// KR-REQ-27.05, a full store; KR-REQ-29.03: a session's journal filling while a client holds the
 /// keys, replayed from the retained trace against a kept journal: the store refuses the next
-/// durable write, rich work is fenced and the client's typing still reaches the application, and
-/// the interval is recorded once the store may grow again, and only once.
+/// durable write, rich work is fenced by the posture, the client's typing is still queued under its
+/// lease for the application, and the interval is recorded once the store may grow again, and only
+/// once, as the session and a reader that opens the file afresh both read it. The worker service's
+/// own refusal of a rich mutation is the product's, in the worker's persistence tests.
 #[test]
 fn a_full_journal_fences_rich_work_keeps_native_input_and_records_its_gap_once() {
     replays("full-journal-keeps-native-input");
