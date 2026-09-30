@@ -220,17 +220,22 @@
 
 .m-tab-badge {
   position: absolute;
-  inset-block-start: -2px;
+  /*
+   * Over the glyph's top corner at the base size, and growing up and away from the glyph, which
+   * does not grow with the text: its bottom edge and its left edge stay where they are.
+   */
+  inset-block-start: calc(15px - 1.7em);
   inset-inline-start: 14px;
-  min-inline-size: 17px;
-  block-size: 17px;
-  padding-inline: 4px;
-  border-radius: 9px;
+  /* The circle is measured in its own digits' size, so it grows with them: 17px at the base size. */
+  min-inline-size: 1.7em;
+  block-size: 1.7em;
+  padding-inline: 0.4em;
+  border-radius: 0.9em;
   background: var(--danger);
   color: var(--primary-text);
   font-size: 0.625rem;
   font-weight: 700;
-  line-height: 17px;
+  line-height: 1.7em;
   text-align: center;
 }
 
@@ -259,7 +264,7 @@
 
 .m-tabbar[data-crowded] .m-tab-badge {
   position: static;
-  margin-block-start: -2px;
+  margin-block-start: calc(15px - 1.7em);
   margin-inline-start: 14px;
 }
 
@@ -267,6 +272,8 @@
 
 .m-list {
   display: grid;
+  /* One column that is never wider than the list: a track sized to its widest unbroken word would run past the screen. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gap-3);
   margin: 0;
   padding: 0;
@@ -355,6 +362,13 @@
   font-size: 0.8125rem;
   line-height: 1.45;
   color: var(--muted);
+}
+
+/* A path or a command is one long word: it breaks where the row ends rather than run past it. */
+.m-row-title,
+.m-row-where,
+.m-row-detail {
+  overflow-wrap: anywhere;
 }
 
 .m-row-detail {
@@ -848,6 +862,11 @@
  */
 .m-shell .theme-options {
   grid-template-columns: repeat(auto-fit, minmax(calc(2.75rem + 24px), 1fr));
+}
+
+/* A sheet rests on the bottom edge: what it holds clears a home indicator or a gesture bar. */
+.m-shell .sheet {
+  padding-block-end: var(--safe-bottom);
 }
 
 /* ---- Landscape and larger screens ------------------------------------------------------------ */
