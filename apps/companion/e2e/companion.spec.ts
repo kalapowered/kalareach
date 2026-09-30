@@ -1204,6 +1204,15 @@ test.describe("the program's keyboard", () => {
         await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
       } else {
         await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+        // Where the engine leaves the focus of a pressed button that goes: WebKit never focused
+        // the button, so the page's own main is where a press lands; Chromium had, and has none.
+        expect(
+          await page.evaluate(() =>
+            document.activeElement === document.body
+              ? 'body'
+              : `${document.activeElement?.tagName.toLowerCase()}#${document.activeElement?.id}`
+          )
+        ).toBe(test.info().project.name === 'webkit' ? 'main#main' : 'body')
       }
     })
 
@@ -1230,6 +1239,15 @@ test.describe("the program's keyboard", () => {
         await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
       } else {
         await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+        // Where the engine leaves the focus of a pressed button that goes: WebKit never focused
+        // the button, so the page's own main is where a press lands; Chromium had, and has none.
+        expect(
+          await page.evaluate(() =>
+            document.activeElement === document.body
+              ? 'body'
+              : `${document.activeElement?.tagName.toLowerCase()}#${document.activeElement?.id}`
+          )
+        ).toBe(test.info().project.name === 'webkit' ? 'main#main' : 'body')
       }
     })
   }
