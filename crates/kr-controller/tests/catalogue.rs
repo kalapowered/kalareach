@@ -188,6 +188,7 @@ fn host() -> Host {
         None,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+        None,
     )
     .expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -1201,6 +1202,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         None,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+        None,
     )
     .expect("the catalogue reopens");
     let restarted = reopened
@@ -1600,6 +1602,114 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             .await,
     );
     assert_eq!(expired.code, ErrorCode::PermissionDenied);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The disable policy a host starts with
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-25.22: the disable policy a host's configuration decides is recorded when the catalogue
+/// opens, in the commit that raises the admission revision with it, so the first snapshot computed
+/// carries it. Opening without one leaves the policy recorded, the same policy raises nothing,
+/// another one raises the revision, and a record that cannot be read is replaced by the one the
+/// configuration decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_startup_policy_is_recorded_before_the_first_snapshot_is_computed() {
+    use kr_protocol::admission::RevocationPolicy::{
+        DisableAtNextAdmission, DisableAtOnce, WarnOnly,
+    };
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let open = |policy| {
+        CatalogueModule::open(
+            &environment,
+            None,
+            Arc::new(kr_plugin_catalogue::UnboundBroker),
+            kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            policy,
+        )
+        .expect("an openable catalogue")
+    };
+    let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    let module = open(None);
+    let before = module
+        .admission_revision_within(deadline())
+        .await
+        .expect("a revision");
+    module
+        .snapshot_within(&[], deadline())
+        .await
+        .expect("computed");
+    assert_eq!(module.policies_carried(), [WarnOnly]);
+    drop(module);
+
+    let module = open(Some(DisableAtOnce));
+    let named = module
+        .admission_revision_within(deadline())
+        .await
+        .expect("a revision");
+    assert!(
+        named > before,
+        "the policy moved the revision: {named} {before}"
+    );
+    assert_eq!(module.disable_policy_in_force().await, Ok(DisableAtOnce));
+    let first = module
+        .snapshot_within(&[], deadline())
+        .await
+        .expect("computed");
+    assert_eq!(first.policy, DisableAtOnce);
+    assert_eq!(
+        module.policies_carried(),
+        [DisableAtOnce],
+        "no snapshot was computed before the policy was in force"
+    );
+    drop(module);
+
+    // The same policy, and no policy at all, leave what is recorded and the revision as they are.
+    for policy in [Some(DisableAtOnce), None] {
+        let module = open(policy);
+        assert_eq!(module.disable_policy_in_force().await, Ok(DisableAtOnce));
+        assert_eq!(
+            module.admission_revision_within(deadline()).await,
+            Ok(named),
+            "{policy:?}"
+        );
+    }
+
+    // Another policy replaces it and moves the revision.
+    let module = open(Some(WarnOnly));
+    assert_eq!(module.disable_policy_in_force().await, Ok(WarnOnly));
+    assert!(
+        module
+            .admission_revision_within(deadline())
+            .await
+            .expect("a revision")
+            > named
+    );
+    drop(module);
+
+    // A record that cannot be read is what the configuration's policy replaces.
+    let database = environment
+        .state_dir()
+        .join("catalogue")
+        .join(kr_plugin_catalogue::db::DATABASE_FILE);
+    rusqlite::Connection::open(database)
+        .expect("the catalogue's records")
+        .execute(
+            "INSERT INTO settings (name, value) VALUES ('disable_policy', 'not a policy')
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .expect("the damaged record");
+    let module = open(None);
+    assert!(module.disable_policy_in_force().await.is_err());
+    drop(module);
+    let module = open(Some(DisableAtNextAdmission));
+    assert_eq!(
+        module.disable_policy_in_force().await,
+        Ok(DisableAtNextAdmission)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3149,6 +3259,7 @@ mod native_bridges {
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            None,
         )
         .expect("an openable catalogue");
         let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -3173,6 +3284,7 @@ mod native_bridges {
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            None,
         )
         .expect("an openable catalogue");
     }

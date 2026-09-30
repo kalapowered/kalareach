@@ -318,7 +318,8 @@ What a binding may do follows its installation. A grant the owner withdraws reac
 binding of the package, on every release it holds, and the next action that needs it is refused. A
 grant the owner confirms reaches only bindings on the installed release: a release the installation
 left is held to what it could do when it was left, and never gains. A package disabled or removed,
-or one the organisation's adapter allowlist no longer names, ends its bindings at the next snapshot, each once no request it admitted is still open, and a
+or one the organisation's adapter allowlist no longer names, ends its bindings at the next
+snapshot, each once no request it admitted is still open, and a
 binding is reported as ending until it has closed. A binding closes only at a snapshot, so while a
 worker reports one as ending, the host sends that worker a snapshot every 30 seconds: the binding
 closes within about 30 seconds of its last request finishing, with no other change.
@@ -328,9 +329,10 @@ no installation describes, from reports every worker makes after the read began.
 has not answered, a count is null rather than a guess. It also says whether the admissions in force
 let new bindings use each installation and, where they do not, why: disabled, revoked, not among the
 adapters the organisation allows, not for this host, not whole in the store, past a package limit,
-or a record the host cannot hand to a worker, each by kind and in words that name the package. `plugin.remove` answers with the bindings
-its own refresh found, which are the ones the workers are told to end, and with null when a worker
-did not answer or the admissions moved before the removal committed.
+or a record the host cannot hand to a worker, each by kind and in words that name the package.
+`plugin.remove` answers with the bindings its own refresh found, which are the ones the workers are
+told to end, and with null when a worker did not answer or the admissions moved before the removal
+committed.
 
 ## Revocation
 
@@ -355,9 +357,9 @@ no binding on a revoked release of that package, and the notice that says so res
 travel with the package's name while privacy mode withholds their words, and a notice the session's
 journal cannot write yet is kept, in order, until the journal recovers. `plugin.list` reports which
 installations and live releases are revoked. The policy is set in the host's configuration document
-(`ceilings.disable_policy`, see the host guide) and is in force from the next admission; a host
-that no document has named a policy for warns only, and a document that names none leaves the
-policy the host holds.
+(`ceilings.disable_policy`, see the host guide) and is in force from the next admission; a document
+that names none has the default, which only warns, and a host with no usable document keeps the
+policy it holds.
 
 ## Capabilities and qualification
 

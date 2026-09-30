@@ -144,6 +144,8 @@ impl Controller {
         let sessions_in_force = accepted_configuration.sessions;
         let in_force = crate::config::InForce::of(&startup_configuration);
         let startup_budgets = crate::config::catalogue::budgets_in_force(&startup_configuration);
+        let startup_policy =
+            crate::config::catalogue::disable_policy_in_force(&startup_configuration);
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
         // variable. They apply for as long as this daemon runs.
@@ -162,12 +164,15 @@ impl Controller {
         // and asks this generation's member set what the workers hold before it makes room.
         let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
         // The budgets in force from the start, so the limits they set hold every package from
-        // the catalogue's first check on.
+        // the catalogue's first check on, and the disable policy this reading decides, so the
+        // first round a worker that outlived the last daemon receives carries it: the cadence that
+        // sends it starts below, before the document is accepted.
         let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
             &setup.paths,
             Self::proxy_of(&started)?.as_ref(),
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
             startup_budgets.or(accepted_budgets).unwrap_or_default(),
+            startup_policy,
         )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
