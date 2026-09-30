@@ -32,7 +32,7 @@ async function openExports(person: ReturnType<typeof userEvent.setup>): Promise<
   await person.click(await screen.findByRole('button', { name: 'Export' }))
 }
 
-describe("a session's exports (KR-REQ-25.08)", () => {
+describe("a session's exports (KR-REQ-25.25)", () => {
   it('exports each screen the terminal view drew, when it drew it, at the size it drew it', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()

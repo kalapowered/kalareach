@@ -714,6 +714,7 @@ test.describe('settings over a live session', () => {
     await expect(page.getByTestId('composer')).toBeVisible()
   })
 
+  // KR-REQ-25.08: answering a question is explained before a viewer can be given it, and photographed.
   test('explains what answering means before a viewer can be given it', async ({ page }) => {
     await openSession(page)
     await page.getByTestId('open-settings').click()
@@ -724,6 +725,7 @@ test.describe('settings over a live session', () => {
     await page.screenshot({ path: shot('sharing-25.08'), fullPage: true })
   })
 
+  // KR-REQ-25.08: an invitation shows what it carries before it exists, and issues exactly that.
   test('shows what an invitation carries before it exists, and issues exactly that', async ({
     page
   }) => {
@@ -2669,6 +2671,7 @@ test.describe('a session in a window 320 px wide', () => {
 })
 
 test.describe('packages', () => {
+  // KR-REQ-11.03: the Installed, Catalogue and Repositories views, with offline search, photographed.
   test('searches the catalogue with no network and says so', async ({ page }) => {
     await open(page)
     await page.getByRole('button', { name: 'Plugins' }).click()

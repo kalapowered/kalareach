@@ -174,6 +174,7 @@ describe('the semantic view', () => {
     })
   })
 
+  // KR-REQ-13.12: the composer's slash commands are the ones the agent advertises.
   it('offers the commands the agent advertises when the draft starts with a slash', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     const input = await screen.findByTestId('composer-input')
@@ -496,6 +497,7 @@ describe('the semantic view', () => {
     expect(screen.queryByTestId('insertion-refusal')).toBeNull()
   })
 
+  // KR-REQ-13.12: a pasted file is an attachment, and goes as a dropped one does.
   it('sends a pasted file through the transfer service as a dropped one goes', async () => {
     const { port, controls } = fakeHost()
     render(
@@ -1104,6 +1106,7 @@ describe('the sheet', () => {
     })
   })
 
+  // KR-REQ-25.08: answering a question is explained before a viewer can be given it.
   it('explains what answering means before a viewer can be given it', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('open-settings'))
@@ -1113,6 +1116,7 @@ describe('the sheet', () => {
     expect(explanation.textContent).toMatch(/A form does not reduce that/)
   })
 
+  // KR-REQ-25.08: an invitation shows what it carries before it exists, and issues exactly that.
   it('shows what an invitation carries before it exists, and issues exactly that', async () => {
     const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     const person = userEvent.setup()

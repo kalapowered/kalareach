@@ -1,5 +1,8 @@
 //! A host's events reach the page through Tauri's event IPC.
 //!
+//! KR-REQ-10.01: the web view is given the host's events over IPC, as the native client validated
+//! them.
+//!
 //! Section 10: the web view is given the host's events over IPC, as the native client validated
 //! them. The payload's form has a unit test of its own; this holds the path. A scripted session
 //! worker pushes events on a link the application reached the way it reaches a real worker: the
