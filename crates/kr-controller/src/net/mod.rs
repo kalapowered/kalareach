@@ -18,7 +18,7 @@
 //!
 //! **Admission is atomic with registration, and the registration stays revocable.** The handshake
 //! re-reads the paired record as late as it can, but a revocation that lands between that check and
-//! the first protected read is the host's to fence. [`NetworkHost::admit`] therefore reads the
+//! the first protected read is the host's to fence. `NetworkHost::admit` therefore reads the
 //! device record and writes the connection into the daemon's authority store in one critical
 //! section, in the lock order a revocation also takes, so nothing can be admitted against authority
 //! that has already been replaced. The registration is the daemon's own, shared with its local
@@ -209,7 +209,7 @@ impl NetworkGuard {
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
     /// The selected services are this host's own configuration. The direct addresses are the ones
-    /// this endpoint reports for itself now ([`Self::direct_addresses`]), taken as they stand,
+    /// this endpoint reports for itself now (`Self::direct_addresses`), taken as they stand,
     /// because that is all a hint ever is.
     ///
     /// # Errors

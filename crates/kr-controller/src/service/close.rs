@@ -525,8 +525,8 @@ impl Controller {
     /// recorded, and looks at the sleep setting afterwards.
     ///
     /// This is the entry point for a closure a worker hands over in its answer to a close, on
-    /// either door ([`Self::settle_close_answer`]). It holds the same lock across its check and
-    /// its write as [`Self::record_final`], so a worker's own account of how its session ended can
+    /// either door (`Self::settle_close_answer`). It holds the same lock across its check and
+    /// its write as `Self::record_final`, so a worker's own account of how its session ended can
     /// never be replaced by a later record, whichever path carried it. A session that has ended is
     /// work that has ended, so the setting is looked at once the record is written; the caller's
     /// own answer never waits for that.

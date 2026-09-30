@@ -35,7 +35,7 @@ use crate::error::Result;
 use crate::registry::{LaunchPhase, Registry};
 
 /// How long one worker has to answer its challenge and accept a generation during a rebuild, and
-/// then, separately, to describe its session ([`describe`]).
+/// then, separately, to describe its session (`describe`).
 ///
 /// A silent endpoint is a reason to quarantine one descriptor, never a reason for the daemon not
 /// to finish starting.
@@ -193,7 +193,7 @@ impl Directory {
     /// Proving itself is what admits a worker, because a close has to be able to reach every
     /// worker that has. A worker the rendezvous has just established describes its session in its
     /// ready report. A worker found at a start or recovered later is asked for its description as
-    /// it is admitted ([`describe`]), and may be admitted without one; its answer to a close this
+    /// it is admitted (`describe`), and may be admitted without one; its answer to a close this
     /// daemon passes on describes the session then ([`Self::accepted_close`]).
     pub fn insert(&mut self, worker: KnownWorker, described: Option<SessionSummary>) {
         let session_id = worker.descriptor.session_id;
@@ -221,7 +221,7 @@ impl Directory {
     /// A worker that has left the directory had its closure recorded while it was being asked,
     /// and the record is the answer from then on, so what it said is not kept. Nor is a
     /// description of another session, or one that puts the session earlier in its lifecycle than
-    /// the one kept ([`Heard::keep`]).
+    /// the one kept (`Heard::keep`).
     pub fn heard(&mut self, session_id: SessionId, described: &SessionSummary) {
         if !self.verified.contains_key(&session_id) {
             return;
