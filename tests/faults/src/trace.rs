@@ -12,13 +12,15 @@
 //! whose expectation did not hold. Beside what a trace states, every attach checks the screen the
 //! client is restored to, and no terminal of another size may be handed raw output.
 //!
-//! The session still decides two things on the host's own clock, which a trace does not move: a
+//! The session still decides three things on the host's own clock, which a trace does not move: a
 //! reply to a question the application asks while the person's input is inside a paste or a held
-//! delimiter waits until that closes and is dropped after two seconds, and replies past 256 a
-//! second are dropped. A replay could then turn on how fast the machine ran it, so [`replay`]
-//! refuses a trace that reaches either: an output that asks a question while the input side holds
-//! the reply back, or more than 256 questions in all. The questions are counted by an engine of the
-//! profile reading the same output.
+//! delimiter waits until that closes and is dropped after two seconds, the replies of one read
+//! past a byte budget wait for a later read and are dropped after the same two seconds, and replies
+//! past 256 a second are dropped. A replay could then turn on how fast the machine ran it, so
+//! [`replay`] refuses a trace that reaches any of them: an output that asks a question while the
+//! input side holds the reply back, one that asks for more reply bytes than the session writes in
+//! one read, or more than 256 questions in all. The questions and replies are counted by an engine
+//! of the profile reading the same output.
 //!
 //! [`minimise`] takes a failing trace down to steps from which no single one can be taken and the
 //! trace still fail at the same step, which is the trace worth keeping once the race it shows is
@@ -720,6 +722,24 @@ impl Replay {
                 "this output asks {asked} question(s) while the input side holds a paste or a \
                  delimiter open, and the session keeps the reply until that closes and drops it \
                  after two seconds of the host's own clock, which a trace does not move"
+            )));
+        }
+        // The session writes one read's replies up to a byte budget and keeps the rest for a later
+        // read, which drops them after two seconds of the host's own clock. The reference takes the
+        // same batch off its lane, so what stays in it is what the session would keep waiting.
+        let allowed = kr_term::lane::LaneGate {
+            paste_open: false,
+            backend_handles_paste_interleave: false,
+            human_frame_open: false,
+        };
+        self.reference
+            .lane_mut()
+            .drain(allowed, kr_worker::projection::MAX_REPLY_BYTES, 0);
+        let waiting = self.reference.lane().queued_bytes();
+        if waiting > 0 {
+            return Err(malformed(format!(
+                "this output asks for more reply bytes than the session writes in one read                  ({}), leaves {waiting} bytes waiting for a later read, and drops them after two                  seconds of the host's own clock, which a trace does not move",
+                kr_worker::projection::MAX_REPLY_BYTES
             )));
         }
         self.questions += asked;

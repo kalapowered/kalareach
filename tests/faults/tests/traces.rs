@@ -498,6 +498,30 @@ fn a_question_asked_while_a_paste_holds_its_reply_back_is_refused_as_decided_on_
 }
 
 #[test]
+fn a_trace_whose_replies_are_more_than_one_read_writes_is_refused_and_a_smaller_one_is_not() {
+    let asking = |queries: usize| {
+        let asks: String = (0..queries)
+            .map(|index| format!("\\u001b]4;{index};?\\u0007"))
+            .collect();
+        Trace::parse(&format!(
+            r#"{{"format":"kalareach.trace/1","name":"colours","about":"{queries} palette queries",
+                "columns":20,"rows":3,"wall_ms":1790000000000,
+                "steps":[{{"do":"output","text":"{asks}"}}]}}"#
+        ))
+        .unwrap_or_else(|error| panic!("{error}"))
+    };
+    let stopped = trace::replay(&asking(200)).expect_err("more replies than one read writes");
+    assert_eq!(
+        (stopped.step, stopped.cause),
+        (Some(0), Cause::Malformed),
+        "{stopped}"
+    );
+    assert!(stopped.what.contains("bytes waiting"), "{stopped}");
+    let few = trace::replay(&asking(20));
+    assert!(few.is_ok(), "{few:?}");
+}
+
+#[test]
 fn a_trace_that_asks_more_questions_than_the_session_answers_in_a_second_is_refused() {
     let many = "\\u001b[5n".repeat(257);
     let trace = Trace::parse(&format!(
