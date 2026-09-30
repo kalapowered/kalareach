@@ -487,6 +487,9 @@ function Install-KrObservedHandlers {
     # description a handler carries: a script of theirs can be described by any name at all,
     # including the name of one of the editor's own operations.
     $theirs = Get-KrScriptChords
+    # What every key was bound to before this went in front of any of them, by the key's own name.
+    $before = @{}
+    foreach ($binding in @($bound)) { $before["$($binding.Key)"] = "$($binding.Function)" }
     foreach ($binding in @($bound)) {
         $name = "$($binding.Function)"
         $chord = "$($binding.Key)"
@@ -508,7 +511,40 @@ function Install-KrObservedHandlers {
             Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
         }
     }
+    Restore-KrStrayBindings $wrapped $before $theirs
     $wrapped
+}
+
+# Puts back any key this module bound without having asked to.
+#
+# The editor reads a chord it is given as it can spell the key on this keyboard layout, and a
+# chord that names a shifted character with modifiers in front of it can come out as the plain
+# character: `Ctrl+Alt+?` bound the plain question mark, which then showed the key bindings instead
+# of typing a question mark. A binding that carries this module's own description on a key that was
+# not one of the chords it wrapped is such a case. It is put back to what it was, a function of the
+# editor's or a script of the person's, or taken away where the key had nothing bound, so the
+# character goes into the line as it would without this module.
+function Restore-KrStrayBindings {
+    param($Wrapped, [hashtable]$Before, $Theirs)
+    $asked = @{}
+    foreach ($entry in @($Wrapped)) { $asked["$($entry.Chord)"] = $true }
+    $now = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
+    foreach ($binding in @($now)) {
+        $key = "$($binding.Key)"
+        if ($asked.ContainsKey($key)) { continue }
+        if ("$($binding.Description)" -notlike 'KalaReach: *') { continue }
+        try {
+            if ($Theirs.PSBase.ContainsKey($key)) {
+                Set-PSReadLineKeyHandler -Chord $key -ScriptBlock $Theirs[$key]
+            } elseif ($Before.ContainsKey($key)) {
+                Set-PSReadLineKeyHandler -Chord $key -Function $Before[$key]
+            } else {
+                Remove-PSReadLineKeyHandler -Chord $key
+            }
+        } catch {
+            Write-KrTrace "restore of a stray binding failed $key : $($_.Exception.Message)"
+        }
+    }
 }
 
 # Puts back every operation of the editor's own that this module went in front of.
