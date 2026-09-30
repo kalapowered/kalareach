@@ -5153,12 +5153,7 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
 async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
     // A real child process of this test, on the internal disk, which is what a dedicated backend
     // is: something this host started and can name in full.
-    let mut child = tokio::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("while true; do sleep 1; done")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("the backend starts");
+    let mut child = sleeper();
     let pid = child.id().expect("the child has an identifier");
     let identity =
         kr_ipc::identity::process_start_identity(pid).expect("the kernel names the child");
@@ -5519,15 +5514,198 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A real child process that does nothing until it is ended, on the internal disk.
+/// A real child process that does nothing until it is ended, on the internal disk, and that ends
+/// with its test.
 #[cfg(unix)]
-fn sleeper() -> tokio::process::Child {
-    tokio::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("while true; do sleep 1; done")
-        .current_dir(std::env::temp_dir())
-        .spawn()
-        .expect("the process starts")
+fn sleeper() -> common::Sleeper {
+    common::Sleeper::start()
+}
+
+/// What makes a run of this binary the case whose test stops early: the file it records its
+/// child's identifier in.
+#[cfg(unix)]
+const STOPS_EARLY: &str = "KR_TRANSPORT_STOPS_EARLY";
+
+/// How that case stops: `panic`, or `killed` while it waits for its process to be killed.
+#[cfg(unix)]
+const STOPS_BY: &str = "KR_TRANSPORT_STOPS_BY";
+
+/// Whether a process is running, as `ps` reads it: one that has ended and waits to be collected
+/// is not.
+#[cfg(unix)]
+fn running(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// When a process started, as `ps` reads it, or nothing when there is no such process.
+///
+/// A process identifier is reused once its process is gone, so a test that means to end a process
+/// it did not start itself ends it only while this still says what it said when the process was
+/// recorded.
+#[cfg(unix)]
+fn started_at(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let started = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!started.is_empty()).then_some(started)
+}
+
+/// Waits until a process is not running, within the liveness deadline, and says whether it was not.
+#[cfg(unix)]
+fn ends_within_the_deadline(pid: u32) -> bool {
+    let started = std::time::Instant::now();
+    while running(pid) {
+        if started.elapsed() > LIVENESS_DEADLINE {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
+}
+
+/// A test that starts a child and stops before it ends the child. Run by the test harness with
+/// nothing set, it does nothing; `a_child_started_by_a_test_ends_with_a_test_that_stops_early` runs
+/// it in a process of its own.
+#[cfg(unix)]
+#[test]
+fn a_child_of_a_test_that_stops_early() {
+    let Some(record) = std::env::var_os(STOPS_EARLY) else {
+        return;
+    };
+    let record = std::path::PathBuf::from(record);
+    let by_panic = std::env::var_os(STOPS_BY).is_some_and(|by| by == "panic");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let pid = std::sync::atomic::AtomicU32::new(0);
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let child = sleeper();
+            let id = child.id().expect("the child has an identifier");
+            pid.store(id, std::sync::atomic::Ordering::SeqCst);
+            let staged = record.with_extension("part");
+            std::fs::write(
+                &staged,
+                format!("{id}\n{}\n", started_at(id).expect("the child is running")),
+            )
+            .expect("the record is written");
+            std::fs::rename(&staged, &record).expect("the record is complete");
+            assert!(!by_panic, "this test stops before it ends its child");
+            // Killed while it waits here.
+            tokio::time::sleep(LIVENESS_DEADLINE).await;
+        });
+    }));
+    assert_eq!(stopped.is_err(), by_panic);
+    if by_panic {
+        // The panic is caught here and this binary goes on running, as it does when one test of
+        // its suite fails: the child has to end with its test, not with this process.
+        let ended = ends_within_the_deadline(pid.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::write(
+            record.with_extension("verdict"),
+            if ended { "ended" } else { "left" },
+        )
+        .expect("the verdict is written");
+    }
+}
+
+/// A directory that is removed when the test stops, whatever it stops at.
+#[cfg(unix)]
+struct Removed(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A child of a test that is ended and collected when the test stops, whatever it stops at.
+#[cfg(unix)]
+struct Case(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Case {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A child a test started ends with the test, whether the test stops at a panic or its process is
+/// killed. The child does nothing until it is ended, as the terminals and backends of the tests
+/// below do, and a test that stopped early once left such children running for days.
+#[cfg(unix)]
+#[test]
+fn a_child_started_by_a_test_ends_with_a_test_that_stops_early() {
+    let directory = Removed(private_directory());
+    let mut left = Vec::new();
+    for stops_by in ["panic", "killed"] {
+        let record = directory.0.join(stops_by);
+        let mut case = Case(
+            std::process::Command::new(std::env::current_exe().expect("this test's own binary"))
+                .args([
+                    "--exact",
+                    "a_child_of_a_test_that_stops_early",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(STOPS_EARLY, &record)
+                .env(STOPS_BY, stops_by)
+                .current_dir(&directory.0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the case starts"),
+        );
+        let started = std::time::Instant::now();
+        while !record.exists() && case.0.try_wait().expect("readable").is_none() {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the case started its child within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if stops_by == "killed" {
+            let _ = case.0.kill();
+        }
+        let _ = case.0.wait();
+        let recorded = std::fs::read_to_string(&record).expect("the case recorded its child");
+        let (pid, recorded_start) = recorded
+            .split_once('\n')
+            .expect("the record names the child and when it started");
+        let recorded_start = recorded_start.trim();
+        let pid: u32 = pid.parse().expect("an identifier");
+        let mut ended = ends_within_the_deadline(pid);
+        if stops_by == "panic" {
+            ended &= std::fs::read_to_string(record.with_extension("verdict"))
+                .is_ok_and(|verdict| verdict == "ended");
+        }
+        if !ended {
+            // Left by the case: ended here, so that a failing run leaves nothing behind either, and
+            // only if it is still the process the case recorded.
+            if started_at(pid).as_deref() == Some(recorded_start) {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            left.push(stops_by);
+        }
+    }
+    assert!(
+        left.is_empty(),
+        "a child outlived the test that stopped early by: {left:?}"
+    );
 }
 
 /// KR-REQ-12.11 and KR-REQ-12.13: a committed transition reaches the views attached to the session.

@@ -307,3 +307,69 @@ pub fn refuse_acceptance(
         }
     }
 }
+
+/// A real child process that does nothing until it is ended, on the internal disk, and that ends
+/// with the test that started it.
+///
+/// It stands in for a program this host started and can name in full: a terminal, a backend. It
+/// leads a process group of its own, so what its shell is running goes with the shell, and it
+/// ends in either way a test can stop early. A test that panics drops it while the stack unwinds,
+/// and the drop ends the group. A test binary that is killed drops nothing, so the shell looks for
+/// the test's process once a second and ends itself when that process is gone.
+#[cfg(unix)]
+pub struct Sleeper {
+    child: tokio::process::Child,
+}
+
+#[cfg(unix)]
+impl Sleeper {
+    /// Starts the process.
+    pub fn start() -> Self {
+        // The process to watch is named by this process, not read from the shell's own parent: a
+        // test that dies before the shell has looked would leave the shell's parent to be
+        // whoever adopted it.
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done"#)
+            .arg("sh")
+            .arg(std::process::id().to_string())
+            .current_dir(std::env::temp_dir())
+            .process_group(0)
+            .spawn()
+            .expect("the process starts");
+        Self { child }
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for Sleeper {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for Sleeper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        // A child nobody has collected still owns its identifier, and with it its group's. One a
+        // test collected no longer reports an identifier, and its group's may name anyone.
+        let Some(group) = self
+            .child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return;
+        };
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+}
