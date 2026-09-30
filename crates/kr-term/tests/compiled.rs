@@ -822,6 +822,13 @@ mod tools {
         );
     }
 
+    /// Whether `tput` reads the private entry from `root`: `Tc` is a capability the private entry
+    /// has and a stock `xterm-256color` lacks, so `colors` alone would succeed from the host's own
+    /// database whether or not the private one was found.
+    fn reads_the_private_entry(root: &Path) -> bool {
+        tput(root, &["Tc"]).status.success()
+    }
+
     /// Whichever leaf directory a reading library uses, it finds the entry: the system's `tput`
     /// reads it from a directory that holds only one of the two, when that is the one it looks in.
     #[test]
@@ -842,7 +849,7 @@ mod tools {
             let target = only.path().join(leaf);
             std::fs::create_dir_all(&target).expect("a leaf");
             std::fs::copy(&source, target.join("xterm-256color")).expect("a copy");
-            if tput(only.path(), &["colors"]).status.success() {
+            if reads_the_private_entry(only.path()) {
                 eprintln!(
                     "this host's library reads the entry from the {} directory",
                     leaf.to_string_lossy()
@@ -853,6 +860,18 @@ mod tools {
         assert!(
             found >= 1,
             "the host's library looks in one of the two leaf directories"
+        );
+    }
+
+    /// Control: an empty database directory is not read as the private entry, even though the
+    /// host's own `xterm-256color` answers `colors` from wherever the library falls back to.
+    #[test]
+    fn an_empty_directory_does_not_read_as_the_private_entry() {
+        let empty = Scratch::new("empty");
+        assert!(!reads_the_private_entry(empty.path()));
+        assert!(
+            tput(empty.path(), &["colors"]).status.success(),
+            "the host's own database still answers the ordinary capabilities"
         );
     }
 }

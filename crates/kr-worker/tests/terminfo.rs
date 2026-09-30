@@ -15,7 +15,9 @@ use kr_protocol::ids::{AttachmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, EnvironmentVariable, ShellMode};
 use kr_term::terminfo::Description;
-use kr_worker::environment::{ExecutionContext, LaunchEnvironment, build, materialise_terminfo};
+use kr_worker::environment::{
+    ExecutionContext, LaunchEnvironment, build, materialise_description, materialise_terminfo,
+};
 use kr_worker::output::OutputDelivery;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
@@ -339,6 +341,40 @@ async fn a_creators_database_is_kept_behind_the_private_one_and_reported() {
     );
 }
 
+/// A session started by one build keeps the database its own engine answers from while a worker of
+/// a build with other data writes its own: both sessions are running, and each reads its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_builds_with_other_data_each_keep_their_own_database() {
+    let state = Scratch::new();
+    let work = Scratch::new();
+    let older = Description::pinned();
+    let mut newer = older.clone();
+    newer
+        .strings
+        .insert("cup".to_owned(), "\x1b[%p2%d;%p1%dH".to_owned());
+    let older_directory = materialise_description(&state.0, &older).expect("the older database");
+    let older_environment = launch_environment(&creator(&[]), Some(&older_directory));
+    let asks = "tput -T xterm-256color cup 3 4 | od -An -tx1 | tr -d ' \\n'";
+    // The older session waits for the newer build's database to exist before it asks, so it asks
+    // while both are there.
+    let older_script = format!(
+        "while [ ! -f {go} ]; do sleep 0.1; done\necho \"cup=$({asks})\"",
+        go = work.0.join("go").display()
+    );
+    let (older_ran, newer_ran) = tokio::join!(run(&older_script, &older_environment), async {
+        let newer_directory =
+            materialise_description(&state.0, &newer).expect("the newer database");
+        assert_ne!(newer_directory, older_directory);
+        let newer_environment = launch_environment(&creator(&[]), Some(&newer_directory));
+        let ran = run(&format!("echo \"cup=$({asks})\""), &newer_environment).await;
+        std::fs::write(work.0.join("go"), b"").expect("release the older session");
+        ran
+    });
+    // ESC [ 4 ; 5 H, and with the parameters swapped ESC [ 4 ; 3 H.
+    assert_eq!(value_of(&older_ran, "cup="), "1b5b343b3548");
+    assert_eq!(value_of(&newer_ran, "cup="), "1b5b343b3348");
+}
+
 // ------------------------------------------------------------------ nested and remote
 
 /// The program `name` on this host's search path, or `None` with the reason a test gives for
@@ -491,6 +527,22 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
             compared += 1;
             if tmux_unescape(shown) != capability.value.as_bytes() {
                 changed.push(capability.name);
+                // Whatever tmux chose to write in its place, the engine has to classify it, or the
+                // exemption would let a value the profile does not act on through.
+                let value = String::from_utf8_lossy(&tmux_unescape(shown)).into_owned();
+                let expansion = kr_term::terminfo::expand(&value, capability.arguments);
+                let mut lexer = kr_term::lexer::Lexer::new();
+                let mut events = Vec::new();
+                lexer.feed(&expansion, &mut events);
+                lexer.close(&mut events);
+                assert!(
+                    !events.is_empty()
+                        && events
+                            .iter()
+                            .all(|event| event.class != kr_term::SequenceClass::Extension),
+                    "tmux replaces {} with {value:?}, which the profile does not classify",
+                    capability.name
+                );
             }
         }
     }
@@ -521,42 +573,26 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
         value_of(&outer, "outer_file=").contains(&format!("from file: {private}/")),
         "{outer:?}"
     );
-    // Everything tmux wrote is either a sequence the engine classifies or one tmux chose by its own
-    // rules. It is never one the private database names: a database that advertised a sequence
-    // the profile does not act on would show up here as an unclassified sequence tmux wrote
-    // because it read the capability.
+    // Everything tmux wrote is a sequence the engine classifies, or one of the four modes tmux sets
+    // for any terminal whose name begins with `xterm` (2031 and 7727, on and off). Anything else
+    // the engine does not classify would be a sequence tmux wrote because it read the database, or
+    // one this test has not accounted for.
+    let unexplained = unexplained_unclassified(&ran.raw);
+    assert!(
+        unexplained.is_empty(),
+        "tmux wrote sequences the profile does not classify and tmux's own rules do not explain: \
+         {unexplained:?}"
+    );
     let mut lexer = kr_term::lexer::Lexer::new();
     let mut events = Vec::new();
     lexer.feed(&ran.raw, &mut events);
     lexer.close(&mut events);
-    let named: Vec<Vec<u8>> = kr_term::terminfo::strings()
-        .iter()
-        .filter(|capability| capability.direction == kr_term::terminfo::Direction::Output)
-        .map(|capability| kr_term::terminfo::expand(capability.value, capability.arguments))
-        .collect();
-    let unclassified: Vec<Vec<u8>> = events
+    let counted = events
         .iter()
         .filter(|event| event.class == kr_term::SequenceClass::Extension)
-        .map(|event| AsRef::<[u8]>::as_ref(&event.bytes).to_vec())
-        .collect();
-    eprintln!(
-        "tmux wrote {} events, {} of them unclassified: {:?}",
-        events.len(),
-        unclassified.len(),
-        unclassified
-            .iter()
-            .map(|bytes| String::from_utf8_lossy(bytes).escape_debug().to_string())
-            .collect::<Vec<_>>()
-    );
-    for bytes in &unclassified {
-        assert!(
-            !named.contains(bytes),
-            "the private database names a sequence the profile does not classify: {:?}",
-            String::from_utf8_lossy(bytes)
-        );
-    }
+        .count() as u64;
     assert_eq!(
-        unclassified.len() as u64,
+        counted,
         ran.diagnostics
             .iter()
             .filter(|(kind, _)| *kind == kr_term::diag::DiagnosticKind::UnclassifiedSequence)
@@ -564,6 +600,63 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
             .sum::<u64>(),
         "the engine counted the same sequences the raw output holds: {:?}",
         ran.diagnostics
+    );
+}
+
+/// The DEC private modes tmux sets on a terminal whose name begins with `xterm`, whatever its
+/// database says: theme reports and synchronised-update capability queries.
+const TMUX_OWN_MODES: [&[u8]; 4] = [
+    b"\x1b[?2031h",
+    b"\x1b[?2031l",
+    b"\x1b[?7727h",
+    b"\x1b[?7727l",
+];
+
+/// Every sequence in `raw` that the engine does not classify, is not one of [`TMUX_OWN_MODES`], and
+/// is not one of the individual sequences the database's own output capabilities expand to.
+///
+/// The comparison is between single sequences on both sides: a compound capability such as the one
+/// that shows the cursor is lexed into the sequences it holds, so an unknown sequence inside one
+/// cannot hide in a longer expansion.
+fn unexplained_unclassified(raw: &[u8]) -> Vec<String> {
+    let lex = |bytes: &[u8]| {
+        let mut lexer = kr_term::lexer::Lexer::new();
+        let mut events = Vec::new();
+        lexer.feed(bytes, &mut events);
+        lexer.close(&mut events);
+        events
+    };
+    let named: Vec<Vec<u8>> = kr_term::terminfo::strings()
+        .iter()
+        .filter(|capability| capability.direction == kr_term::terminfo::Direction::Output)
+        .flat_map(|capability| {
+            lex(&kr_term::terminfo::expand(
+                capability.value,
+                capability.arguments,
+            ))
+            .into_iter()
+            .map(|event| AsRef::<[u8]>::as_ref(&event.bytes).to_vec())
+        })
+        .collect();
+    lex(raw)
+        .into_iter()
+        .filter(|event| event.class == kr_term::SequenceClass::Extension)
+        .map(|event| AsRef::<[u8]>::as_ref(&event.bytes).to_vec())
+        .filter(|bytes| !TMUX_OWN_MODES.contains(&bytes.as_slice()) && !named.contains(bytes))
+        .map(|bytes| String::from_utf8_lossy(&bytes).escape_debug().to_string())
+        .collect()
+}
+
+/// Control: an unknown sequence is found wherever it sits, including inside a run that also holds
+/// sequences the profile classifies, as one would inside a compound capability.
+#[test]
+fn an_unknown_sequence_inside_a_compound_capability_is_found() {
+    assert!(unexplained_unclassified(b"\x1b[?2031h\x1b[?7727l").is_empty());
+    let compound = b"\x1b[?12l\x1b[?9999h\x1b[?25h";
+    assert_eq!(unexplained_unclassified(compound), ["\\u{1b}[?9999h"]);
+    assert_eq!(
+        unexplained_unclassified(b"a\x1b[?2031h\x1b[?12l\x1b[?4242l\x1b[?25h"),
+        ["\\u{1b}[?4242l"]
     );
 }
 

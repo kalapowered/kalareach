@@ -48,7 +48,7 @@ pub fn steps(cols: u32, rows: u32) -> Vec<Step> {
     all.extend(margins(rows));
     all.extend(tabs(cols));
     all.extend(widths(last));
-    all.extend(alternate_screen());
+    all.extend(alternate_screen(rows));
     all.extend(controls(rows));
     all
 }
@@ -104,7 +104,7 @@ fn autowrap(cols: u32, rows: u32) -> Vec<Step> {
             "pending-cleared-by-addressing",
             format!("{fill}\x1b[1;{cols}Hb"),
         ),
-        step(g, "pending-survives-erase-line", format!("{fill}\x1b[K")),
+        step(g, "pending-survives-erase-line", format!("{fill}\x1b[Kb")),
         step(
             g,
             "pending-survives-save-and-restore",
@@ -342,7 +342,7 @@ fn widths(last: u32) -> Vec<Step> {
     all
 }
 
-fn alternate_screen() -> Vec<Step> {
+fn alternate_screen(rows: u32) -> Vec<Step> {
     let g = "alternate-screen";
     vec![
         step(
@@ -373,7 +373,7 @@ fn alternate_screen() -> Vec<Step> {
         step(
             g,
             "scrolling-on-the-alternate-screen",
-            "\x1b[?1049h\x1b[24;1H\n",
+            format!("\x1b[?1049h\x1b[{rows};1H\n"),
         ),
         step(
             g,

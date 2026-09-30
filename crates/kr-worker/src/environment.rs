@@ -95,13 +95,16 @@ pub struct EnvironmentSources {
 /// terminal engine answers and acts on. A creator's own `TERMINFO` and `TERMINFO_DIRS` are neither
 /// dropped nor obeyed: they follow the private directory in the session's search, so they still
 /// name the terminals the private database has no entry for, and they are recorded here as what
-/// they were.
+/// they were. When no private database could be supplied they are recorded too, and stay exactly
+/// where the creator put them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminfoSelection {
     /// The private database directory `TERMINFO` names, or none when this session reads whatever
     /// database its host has.
     pub directory: Option<String>,
-    /// The creator's `TERMINFO`, now searched after the private directory.
+    /// Why there is no private database, when there is none.
+    pub unavailable: Option<String>,
+    /// The creator's `TERMINFO`, searched after the private directory when there is one.
     pub creator_terminfo: Option<String>,
     /// The creator's `TERMINFO_DIRS`, kept as it was.
     pub creator_terminfo_dirs: Option<String>,
@@ -112,6 +115,33 @@ impl TerminfoSelection {
     #[must_use]
     pub const fn overridden(&self) -> bool {
         self.creator_terminfo.is_some() || self.creator_terminfo_dirs.is_some()
+    }
+
+    /// The selection as one line of text, for the worker's own log.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut line = match (&self.directory, &self.unavailable) {
+            (Some(directory), _) => format!("terminfo: private database {directory}"),
+            (None, Some(reason)) => {
+                format!("terminfo: no private database ({reason}); the host's own applies")
+            }
+            (None, None) => "terminfo: no private database; the host's own applies".to_owned(),
+        };
+        if self.overridden() {
+            line.push_str("; the creator's");
+            if let Some(directory) = &self.creator_terminfo {
+                line.push_str(&format!(" TERMINFO={directory}"));
+            }
+            if let Some(directories) = &self.creator_terminfo_dirs {
+                line.push_str(&format!(" TERMINFO_DIRS={directories}"));
+            }
+            line.push_str(if self.directory.is_some() {
+                " follow it"
+            } else {
+                " stay as they were"
+            });
+        }
+        line
     }
 }
 
@@ -152,6 +182,8 @@ pub struct ExecutionContext {
     /// A worker that could not write it, and a host with no terminfo library, leave this empty, and
     /// the session then reads whatever database its host has.
     pub terminfo: Option<PathBuf>,
+    /// Why the worker has no private terminfo database, when it has none.
+    pub terminfo_unavailable: Option<String>,
 }
 
 /// The variables a desktop context supplies, in the order a session needs them.
@@ -196,6 +228,7 @@ impl ExecutionContext {
                 .then(desktop_binding),
             variables,
             terminfo: None,
+            terminfo_unavailable: None,
         }
     }
 }
@@ -246,20 +279,23 @@ pub fn build(
             .as_deref()
             .and_then(|directory| directory.to_str())
             .map(str::to_owned),
+        unavailable: context.terminfo_unavailable.clone(),
         ..TerminfoSelection::default()
     };
 
     for variable in snapshot {
-        if terminfo.directory.is_some() && is_terminfo_search(&variable.name) {
-            // A creator's database directories are searched after the private one, which is
-            // decided below once every variable has been seen.
+        if is_terminfo_search(&variable.name) {
             let held = if variable.name == TERMINFO_VARIABLE {
                 &mut terminfo.creator_terminfo
             } else {
                 &mut terminfo.creator_terminfo_dirs
             };
             *held = Some(variable.value.clone());
-            continue;
+            if terminfo.directory.is_some() {
+                // Searched after the private one, which is decided below once every variable has
+                // been seen.
+                continue;
+            }
         }
         if is_terminal_identity(&variable.name) || is_creator_terminal(&variable.name) {
             removed.push(variable.name.clone());
@@ -371,10 +407,12 @@ fn is_terminfo_search(name: &str) -> bool {
 /// Writes the private terminfo database into the worker's state directory and returns where it is.
 ///
 /// The database is the pinned `xterm-256color` entry, compiled from the same data the terminal
-/// engine answers capability queries from. It is written from this build's own data rather than
-/// found on the host, so it cannot drift from the engine, and it is written again only when the
-/// file on disk is not the current one. Workers of several sessions may do this at once: each
-/// replaces a file whole, so none reads a partial one.
+/// engine answers capability queries from. It lives in a directory named by a digest of the
+/// compiled bytes, so a directory is never rewritten with other contents: a worker of a build whose
+/// data differs writes a directory of its own, and a session started by an older build keeps
+/// reading the database its own engine answers from. A directory that already holds the current
+/// bytes is left alone, and a file is replaced whole, so workers of several sessions can do this at
+/// once and none reads a partial file.
 ///
 /// # Errors
 ///
@@ -382,14 +420,37 @@ fn is_terminfo_search(name: &str) -> bool {
 /// directory's path is not text an environment variable can carry.
 #[cfg(unix)]
 pub fn materialise_terminfo(state_dir: &std::path::Path) -> std::io::Result<PathBuf> {
-    let directory = state_dir.join(TERMINFO_DIRECTORY);
+    materialise_description(state_dir, &kr_term::terminfo::Description::pinned())
+}
+
+/// [`materialise_terminfo`] for any description, so the naming can be tested with two.
+///
+/// # Errors
+///
+/// As [`materialise_terminfo`], and when the description cannot be compiled.
+#[cfg(unix)]
+pub fn materialise_description(
+    state_dir: &std::path::Path,
+    description: &kr_term::terminfo::Description,
+) -> std::io::Result<PathBuf> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = description
+        .compile()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let digest = Sha256::digest(&bytes);
+    let name: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let directory = state_dir.join(TERMINFO_DIRECTORY).join(name);
     if directory.to_str().is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "the state directory's path is not valid text",
         ));
     }
-    kr_term::terminfo::write_database(&directory)?;
+    description.install(&directory)?;
     Ok(directory)
 }
 
@@ -622,7 +683,13 @@ mod tests {
             built.variables.get("TERMINFO").map(String::as_str),
             Some("/home/a/.terminfo")
         );
-        assert_eq!(built.sources.terminfo, TerminfoSelection::default());
+        assert_eq!(built.sources.terminfo.directory, None);
+        assert_eq!(
+            built.sources.terminfo.creator_terminfo.as_deref(),
+            Some("/home/a/.terminfo"),
+            "the override is reported even when there is no private database"
+        );
+        assert!(built.sources.terminfo.overridden());
     }
 
     #[cfg(unix)]
@@ -631,7 +698,10 @@ mod tests {
         let state = std::env::temp_dir().join(format!("kr-worker-terminfo-{}", std::process::id()));
         std::fs::create_dir_all(&state).expect("a state directory");
         let directory = materialise_terminfo(&state).expect("the database is written");
-        assert_eq!(directory, state.join(TERMINFO_DIRECTORY));
+        assert_eq!(
+            directory.parent(),
+            Some(state.join(TERMINFO_DIRECTORY).as_path())
+        );
         let description = kr_term::terminfo::Description::pinned();
         for entry in description.entry_paths(&directory) {
             assert_eq!(
@@ -645,5 +715,68 @@ mod tests {
             directory
         );
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A worker of a build whose data differs writes a directory of its own, and the directory an
+    /// older build's sessions read keeps the bytes that build's engine answers from.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_with_other_data_never_rewrites_the_directory_another_build_reads() {
+        let state =
+            std::env::temp_dir().join(format!("kr-worker-terminfo-two-{}", std::process::id()));
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let older = kr_term::terminfo::Description::pinned();
+        let mut newer = older.clone();
+        newer
+            .strings
+            .insert("cup".to_owned(), "\x1b[%p2%d;%p1%dH".to_owned());
+        let first = materialise_description(&state, &older).expect("the older build's database");
+        let second = materialise_description(&state, &newer).expect("the newer build's database");
+        assert_ne!(first, second, "the data differs, so the directory does");
+        assert_eq!(
+            std::fs::read(&older.entry_paths(&first)[0]).expect("the older entry"),
+            older.compile().expect("compiles"),
+            "the older build's directory still holds the older bytes"
+        );
+        assert_eq!(
+            std::fs::read(&newer.entry_paths(&second)[0]).expect("the newer entry"),
+            newer.compile().expect("compiles")
+        );
+        // And the older build writing again finds its own directory current, not the newer one.
+        assert_eq!(
+            materialise_description(&state, &older).expect("again"),
+            first
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_selection_reads_as_one_line_in_each_case() {
+        let private = built_with(
+            &[("TERMINFO", "/home/a/.terminfo")],
+            &with_private_database("/state/terminfo/ab"),
+        );
+        assert_eq!(
+            private.sources.terminfo.describe(),
+            "terminfo: private database /state/terminfo/ab; the creator's \
+             TERMINFO=/home/a/.terminfo follow it"
+        );
+        let failed = built_with(
+            &[("TERMINFO_DIRS", "/opt/one")],
+            &ExecutionContext {
+                terminfo_unavailable: Some("the disk is full".to_owned()),
+                ..ExecutionContext::default()
+            },
+        );
+        assert_eq!(
+            failed.sources.terminfo.describe(),
+            "terminfo: no private database (the disk is full); the host's own applies; the \
+             creator's TERMINFO_DIRS=/opt/one stay as they were"
+        );
+        assert_eq!(
+            failed.variables.get("TERMINFO_DIRS").map(String::as_str),
+            Some("/opt/one"),
+            "a creator's search stays where the creator put it"
+        );
     }
 }

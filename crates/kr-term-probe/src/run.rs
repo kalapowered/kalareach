@@ -22,7 +22,8 @@ pub trait Terminal {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     /// Reads what the terminal answers, up to and including its reply to primary device
-    /// attributes. Returns `None` when the terminal never sent one.
+    /// attributes. Returns `None` when that reply does not arrive within the terminal's deadline or
+    /// the bytes that did arrive pass the size bound first.
     ///
     /// # Errors
     ///
@@ -80,6 +81,8 @@ pub struct Outcome {
     pub canonical: Position,
     /// Whether the canonical grid holds a wrap it has not yet made at the cursor.
     pub canonical_pending_wrap: bool,
+    /// Whether the terminal's reply to primary device attributes, which ends the read, arrived.
+    pub barrier: bool,
     /// Whether the two agree.
     pub agrees: bool,
 }
@@ -135,9 +138,9 @@ pub fn measure(
     sent.extend_from_slice(CURSOR_POSITION);
     sent.extend_from_slice(BARRIER);
     terminal.send(&sent)?;
-    let answered = terminal
-        .receive()?
-        .and_then(|bytes| replies::cursor_position(&bytes));
+    let received = terminal.receive()?;
+    let barrier = received.is_some();
+    let answered = received.and_then(|bytes| replies::cursor_position(&bytes));
     let (canonical, pending) = canonical(cols, rows, &step.bytes);
     Ok(Outcome {
         id: step.id.clone(),
@@ -146,11 +149,28 @@ pub fn measure(
         terminal: answered,
         canonical,
         canonical_pending_wrap: pending,
+        barrier,
         agrees: answered == Some(canonical),
     })
 }
 
-/// Measures every step, in order.
+/// What a run of the corpus produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Measured {
+    /// The steps measured, in order. A run that stopped early holds the steps before the stop and
+    /// the one it stopped at.
+    pub outcomes: Vec<Outcome>,
+    /// Why the run stopped before the end of the corpus, when it did.
+    pub stopped: Option<String>,
+}
+
+/// Measures every step, in order, and stops at the first step whose reply to primary device
+/// attributes never arrives.
+///
+/// The reply to primary device attributes is what ends each step's read. When it does not come the
+/// terminal may still be about to answer, and an answer that arrives during the next step would be
+/// taken for that step's, so the run ends there rather than go on with a stream it can no longer
+/// trust. The step it stopped at is recorded as unanswered.
 ///
 /// # Errors
 ///
@@ -160,12 +180,23 @@ pub fn measure_all(
     steps: &[Step],
     cols: u32,
     rows: u32,
-) -> io::Result<Vec<Outcome>> {
+) -> io::Result<Measured> {
     let mut outcomes = Vec::with_capacity(steps.len());
+    let mut stopped = None;
     for step in steps {
-        outcomes.push(measure(terminal, step, cols, rows)?);
+        let outcome = measure(terminal, step, cols, rows)?;
+        let answered = outcome.barrier;
+        outcomes.push(outcome);
+        if !answered {
+            stopped = Some(format!(
+                "no reply to primary device attributes after {}, so a late reply could be taken \
+                 for the next step's",
+                step.id
+            ));
+            break;
+        }
     }
     // Leave the terminal as a person would want it.
     terminal.send(&[RESET, b"\x1b[?25h"].concat())?;
-    Ok(outcomes)
+    Ok(Measured { outcomes, stopped })
 }
