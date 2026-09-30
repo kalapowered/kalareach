@@ -119,15 +119,17 @@ Only the current release's `kr` updates the host. An update, in order:
    update;
 4. asks each control daemon to prepare, and records how each was started before any is told to
    stop;
-5. takes the install lock, waiting up to thirty seconds for a control daemon that is starting, and
-   only then tells each prepared daemon to stop; one that answers that it does not stop, because
-   its attempt is over, holds the update, and is not waited for. Once every daemon has stopped, it
+5. takes the install lock, waiting up to thirty seconds for a control daemon that is starting;
    reads the store's environments again, so an environment whose daemon started after the first
-   look is found; holds every environment's lock, where a daemon the update did not stop holds the
-   update; and reads every environment's registry, which it does not open where it is not a
-   regular file: a worker at a level the new release does not
-   retain, a worker that does not answer its challenge and has not ended, and a session still being
-   started each hold the update;
+   look is found; and looks at every environment no prepared daemon serves, where a daemon that
+   holds one holds the update, with nothing stopped and each prepared daemon resumed. Only then
+   does it tell each prepared daemon to stop, one after the other. The first that answers that it
+   does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
+   and those already told are waited for to have gone before anything is started again. Once every
+   daemon has stopped, it holds every environment's lock and reads every environment's registry,
+   which it refuses to open where it is not a regular file: a worker at a level the new release
+   does not retain, a worker that does not answer its challenge and has not ended, and a session
+   still being started each hold the update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started
    before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
@@ -213,7 +215,8 @@ An update that starts a stopped daemon again, or settles one an earlier run left
 daemon already holding the environment asks it to resume, naming no attempt, before it takes it
 for the environment's daemon. One that resumes goes on serving, and no stop of any earlier attempt
 can end it; one that has been told to stop is waited for until it has gone, and then the daemon is
-started again as it was recorded.
+started again as it was recorded. One that does not listen is either starting or on its way out:
+it is waited for until it answers, or until it has gone and the recorded daemon is started.
 
 A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
 worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says
