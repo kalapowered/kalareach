@@ -371,7 +371,7 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
     // The kernel moved with the bookkeeping, which is what the application reporting its own size
     // says. The marker carries the whole report, line ending and all, because a report of another
     // size can begin with these digits.
-    produced(&runtime, b"kr-size:30 100\n").await;
+    reported_after_resize(&runtime, session_id, Some(keys), b"kr-size:30 100\n").await;
 
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
@@ -559,7 +559,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
     }
     // The wait is the assertion: the successor's size is what the application was resized to, and
     // a host that resized it to anything else never satisfies it.
-    produced(&runtime, b"kr-size:30 100\n").await;
+    reported_after_resize(&runtime, session_id, None, b"kr-size:30 100\n").await;
 
     // With every eligible claim gone the last geometry is retained rather than reset.
     {
@@ -649,7 +649,16 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     assert_eq!(transferred.geometry.owner.as_ref(), Some(&phone_attachment));
     assert_eq!(transferred.geometry.dimensions, Dimensions::new(48, 16));
     assert_eq!(transferred.geometry.epoch.get(), epoch.get() + 1);
+    assert!(
+        !wired.runtime.session().lease().holder.is_present(),
+        "moving the size is not taking the keys"
+    );
 
+    // The shell was resized rather than replaced: the same application reports the phone's size.
+    // This comes first because an attachment that still holds a direct stream is told its view is
+    // no longer continuous when the application next writes, so a window signal the application
+    // takes late holds that notice back just as it holds back the report.
+    reported_after_resize(&wired.runtime, wired.session_id, None, b"kr-size:16 48\n").await;
     // Both attachments learn, and they learn the same thing: the size changed under all of them,
     // so each is told its view is no longer continuous.
     expect_resynchronised(
@@ -659,12 +668,6 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     )
     .await;
     expect_resynchronised(&mut phone, LIVENESS_DEADLINE, "and neither is the phone's").await;
-    // The shell was resized rather than replaced: the same application reports the phone's size.
-    produced(&wired.runtime, b"kr-size:16 48\n").await;
-    assert!(
-        !wired.runtime.session().lease().holder.is_present(),
-        "moving the size is not taking the keys"
-    );
 
     drop(desk);
     drop(phone);
@@ -932,6 +935,47 @@ impl Typist {
         self.sequence += 1;
         // Outside the session, because the batches go to the terminal while the session is held.
         runtime.flush_input();
+    }
+}
+
+/// Waits until the application has reported `marker`, which it does when the terminal's window
+/// signal reaches it, and asks it for its size again until it has.
+///
+/// A shell runs a trap for a signal that reaches it while it waits for input. A signal that
+/// reaches it just before it starts to wait is held until something wakes the wait, and the kernel
+/// sends a window signal only when the size changes, so there is no second signal to send. A line
+/// typed to the application is what wakes it, and a shell runs a held trap before it answers that
+/// line. So a report not seen within half a second is asked for again with a line of its own, and
+/// the wait ends when the report is in the session's output, however long the application takes.
+/// The keys are taken for the first such line and not before, so a report that arrives at once
+/// costs the session nothing beyond what the test did.
+async fn reported_after_resize(
+    runtime: &SessionRuntime,
+    session_id: SessionId,
+    mut keys: Option<Typist>,
+    marker: &[u8],
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        for _ in 0..25 {
+            if carries(&retained(runtime), marker) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = retained(runtime);
+        if carries(&seen, marker) {
+            return;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for {} in the session's retained output, which ends {}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker).escape_debug(),
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
+        keys.get_or_insert_with(|| Typist::take(runtime, session_id))
+            .release(runtime);
     }
 }
 
