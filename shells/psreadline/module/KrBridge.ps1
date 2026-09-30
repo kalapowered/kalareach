@@ -731,7 +731,9 @@ function Send-KrCommandAccepted {
 function Send-KrHooksActivated {
     param([uint64]$PromptGeneration)
     if (-not $script:Kr.Registered) { return }
+    # This bridge lists no loadable native modules, so the list is empty.
     Send-KrEvent 'hooks_activated' @{
+        modules           = @()
         session_id        = $script:Kr.Session
         prompt_generation = $PromptGeneration
     }

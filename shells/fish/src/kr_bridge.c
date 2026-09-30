@@ -1184,8 +1184,12 @@ kr_bridge_hooks_activated(unsigned long prompt_generation)
     if (!kr.registered) {
         return;
     }
+    /* This shell has no loadable native modules of the kind the report lists, so it lists none;
+     * what that leaves unchecked is stated in the package's documentation. */
     kr_open_event(&writer, "hooks_activated");
-    kr_cbor_map(&writer, 2);
+    kr_cbor_map(&writer, 3);
+    kr_cbor_key(&writer, "modules");
+    kr_cbor_array(&writer, 0);
     kr_cbor_key(&writer, "session_id");
     kr_cbor_bstr(&writer, kr.session, KR_UUID_LEN);
     kr_cbor_key(&writer, "prompt_generation");
