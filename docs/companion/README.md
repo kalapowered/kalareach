@@ -116,6 +116,14 @@ the host presents it: the session's output directly, or a viewport with the host
 host's own words. It reads the summary of its own attachment and no other, and a viewport whose
 worker reported no reason says so, and is never shown as direct.
 
+A view attaches only to a worker whose build it can read. A worker outlives an upgrade, and it
+states its build and protocol version in its answer to the hello, once it has proved who it is. The
+view attaches when that version shares this application's compatibility level (the same major
+number and, below 1.0, the same minor number; the patch number never decides). For a worker of
+another level, or an earlier one that states none, the view asks the session for nothing: it ends,
+names both builds and both versions, and says to close the session or open it with the application
+of the worker's build.
+
 A raw view opens in view mode, which takes nothing from anyone: the program gets nothing from the
 person, and the view moves its window over the session, up into the history, down the live screen,
 and across a session wider than the view. On the desktop the wheel does it (Shift turns a vertical
