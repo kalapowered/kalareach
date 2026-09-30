@@ -2399,6 +2399,120 @@ async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
     shell.close().await;
 }
 
+/// The question a startup file asks, in the shell's own words for reading a line, before the
+/// package's entry: the shell prints what it read put together from two pieces, so its own echo of
+/// the answer cannot make the marker appear.
+#[cfg(unix)]
+fn startup_question(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::Zsh => {
+            "kr_answer=\nvared -p 'ASK> ' kr_answer\nprint -r -- \"kr-answer-<${kr_answer}>\"\n"
+        }
+        _ => "read -r -p 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' \"$kr_answer\"\n",
+    }
+}
+
+/// KR-REQ-07.23: a startup prompt takes its answer through the worker while the session is
+/// authenticated, and the session is ready, and a launch is possible, only after the profile that
+/// asked has finished.
+///
+/// The person's startup asks before the package's entry has run, in a real qualified package
+/// launched by a real worker session. The worker takes the keystrokes because the bridge is
+/// authenticated: a session that refused input until it was ready would leave the profile asking
+/// a question nobody could answer.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile()
+ {
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = installed_package_of(kind);
+        let shell = RealShell::start_with_profile(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+            startup_question(kind),
+            false,
+        )
+        .await;
+        shell.produced(b"ASK>", 1).await;
+        {
+            let session = shell.runtime.session();
+            let phase = session.fence().expect("a driver").phase();
+            assert!(
+                phase.accepts_external_input(),
+                "{kind:?}: the bridge is authenticated before the profile asks, so its answer is taken"
+            );
+            assert!(
+                !phase.reports_ready(),
+                "{kind:?}: the profile has not finished"
+            );
+            assert!(!phase.permits_launch(), "{kind:?}");
+        }
+
+        let mut keys = shell.keys();
+        keys.type_line(&shell, "the-answer");
+        shell.produced(b"kr-answer-<the-answer>", 1).await;
+        // The profile has finished, so the entry's activation is what qualifies the session.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                {
+                    let session = shell.runtime.session();
+                    let phase = session.fence().expect("a driver").phase();
+                    if phase.reports_ready() {
+                        assert!(phase.permits_launch(), "{kind:?}");
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{kind:?}: the session never reported ready after the profile finished")
+        });
+        shell.close().await;
+    }
+}
+
+/// The control for the case above: a profile nobody answers leaves the session authenticated and
+/// not ready, and the session still closes when asked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes() {
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = installed_package_of(kind);
+        let shell = RealShell::start_with_profile(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+            startup_question(kind),
+            false,
+        )
+        .await;
+        shell.produced(b"ASK>", 1).await;
+        {
+            let session = shell.runtime.session();
+            let phase = session.fence().expect("a driver").phase();
+            assert!(phase.accepts_external_input(), "{kind:?}");
+            assert!(
+                !phase.reports_ready(),
+                "{kind:?}: a profile that is still waiting for its answer is not a ready session"
+            );
+            assert!(!phase.permits_launch(), "{kind:?}");
+        }
+        let closed = std::time::Instant::now();
+        shell.close().await;
+        assert!(
+            closed.elapsed() < Duration::from_secs(30),
+            "{kind:?}: the session waiting for its profile did not close within its bound"
+        );
+    }
+}
+
 /// A real qualified package launched as this host's root shell, registered and qualified on the
 /// host's own endpoint.
 struct RealShell {
@@ -2423,6 +2537,23 @@ impl RealShell {
         extra: Vec<(String, String)>,
         fence_hold: Option<FenceHold>,
     ) -> Self {
+        Self::start_with_profile(package, launch_profile, extra, fence_hold, "", true).await
+    }
+
+    /// Launches `package` as [`Self::start`] does, with `after_configuration` running in the
+    /// person's startup file before the package's entry, and returns at once when `wait_ready` is
+    /// false rather than after the entry has qualified the session.
+    ///
+    /// A session that is not waited for is one whose profile may be waiting for something, which
+    /// is what a startup prompt is: the caller decides what to do about it and when.
+    async fn start_with_profile(
+        package: &kr_shell_integration::host::package::ShellPackage,
+        launch_profile: kr_protocol::session::LaunchProfile,
+        extra: Vec<(String, String)>,
+        fence_hold: Option<FenceHold>,
+        after_configuration: &str,
+        wait_ready: bool,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         // The shell's own home, on the internal disk, with the package's guarded entry in the
@@ -2440,7 +2571,7 @@ impl RealShell {
         };
         std::fs::write(
             &startup,
-            format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{entry}"),
+            format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{after_configuration}{entry}"),
         )
         .expect("the startup file");
 
@@ -2523,28 +2654,32 @@ impl RealShell {
         // The package connects to the endpoint it was given, proves itself over the bootstrap
         // secret and is registered; then its own entry reports that the hooks are live after the
         // startup files, which is what qualifies the session.
-        let qualified = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                {
-                    let session = runtime.session();
-                    if let Some(driver) = session.fence()
-                        && driver.phase().reports_ready()
+        let qualified = if wait_ready {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
                     {
-                        return driver.phase().shell();
+                        let session = runtime.session();
+                        if let Some(driver) = session.fence()
+                            && driver.phase().reports_ready()
+                        {
+                            return driver.phase().shell();
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "the {} package at {} did not register and qualify on this host's endpoint at {}",
-                package.kind().as_str(),
-                package.directory.display(),
-                address.path
-            )
-        });
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the {} package at {} did not register and qualify on this host's endpoint at {}",
+                    package.kind().as_str(),
+                    package.directory.display(),
+                    address.path
+                )
+            })
+        } else {
+            None
+        };
         Self {
             _temp: temp,
             _home: home,
@@ -3194,6 +3329,17 @@ fn package_root() -> std::ffi::OsString {
              built package for this check to launch; build the packages and name their root in it"
         )
     })
+}
+
+/// Returns the qualified package of one shell this run named.
+fn installed_package_of(kind: ShellKind) -> kr_shell_integration::host::package::ShellPackage {
+    let root = package_root();
+    let set =
+        kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
+    set.get(kind)
+        .unwrap_or_else(|| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}, which has no {kind:?}"))
+        .clone()
 }
 
 /// Returns the qualified package this run named, the first the installation there has.
