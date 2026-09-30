@@ -1,0 +1,28 @@
+{
+  "format": "kalareach.trace/1",
+  "name": "full-journal-keeps-native-input",
+  "about": "a session's journal fills while a client holds the keys: the store refuses the next durable write, rich work is fenced while the client's typing still reaches the application, and once the store may grow again the interval it could not write is recorded, once",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "journal": "unfinished-actions",
+  "steps": [
+    { "do": "output", "text": "$ " },
+    { "do": "attach", "client": "a", "form": "direct" },
+    { "do": "acquire", "client": "a" },
+    { "do": "journal", "expect": "healthy", "rich_work": true },
+    { "do": "fill_journal", "expect": "STORAGE_UNAVAILABLE" },
+    { "do": "journal", "expect": "full", "rich_work": false },
+    { "do": "input", "client": "a", "text": "ls\r" },
+    {
+      "do": "take_input",
+      "expect": [
+        { "batch": "lease_changed" },
+        { "batch": "input", "client": "a", "text": "ls\r" }
+      ]
+    },
+    { "do": "release_journal", "expect": "full" },
+    { "do": "journal", "expect": "healthy", "rich_work": true },
+    { "do": "release_journal", "expect": null }
+  ]
+}

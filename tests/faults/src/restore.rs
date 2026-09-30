@@ -559,6 +559,7 @@ pub fn run(corpus: &Corpus, strategy: Strategy) -> Result<Outcome, String> {
             corpus.bytes(),
             strategy,
             TimeSources::system(),
+            None,
         )?;
         for (point, leaves) in until.iter().copied().enumerate() {
             if point % stride == first {
@@ -609,16 +610,17 @@ fn stride(until: &[usize], at_once: usize) -> usize {
 }
 
 impl Stage {
-    /// Opens a session of `columns` by `rows` on the clocks `time`; `bytes` is what [`Stage::feed`]
-    /// reads from.
+    /// Opens a session of `columns` by `rows` on the clocks `time`, keeping its journal at
+    /// `journal` when one is named; `bytes` is what [`Stage::feed`] reads from.
     pub(crate) fn open(
         columns: u16,
         rows: u16,
         bytes: Vec<u8>,
         strategy: Strategy,
         time: TimeSources,
+        journal: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
-        let config = crate::session::config(columns, rows, time, None);
+        let config = crate::session::config(columns, rows, time, journal);
         let session_id = config.session_id;
         let mut session =
             Session::open(config).map_err(|error| format!("the session did not open: {error}"))?;

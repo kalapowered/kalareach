@@ -490,8 +490,10 @@ expectation is the session's own screen at the next pause.
 
 `fixtures/faults/traces/*.json`, format `kalareach.trace/1`: an ordering race written as the steps
 that reproduce it. The header gives the session's `columns` and `rows` and the wall clock at the
-start, `wall_ms`. The replayer opens a session in the test's process on a simulated timeline and
-plays its peers from the steps: the application, whose output goes through the read loop's own
+start, `wall_ms`. A trace that gives a `journal` opens its session on the kept journal fixture of
+that name, made with its fault (see Journals below); the others keep an in-memory journal. The
+replayer opens a session in the test's process on a simulated timeline and plays its peers from
+the steps: the application, whose output goes through the read loop's own
 entry, and named clients, which attach and subscribe as the worker's service subscribes one. No step
 waits on a clock. A step that moves time says by how much, and a timer that falls due fires in that
 step, so a race happens in the same order on every run.
@@ -519,6 +521,9 @@ all, counted by an engine of the profile reading the same output.
 | `observe_time` | `expect`, of `suspended`, `rebooted` and `rolled_back` | The session looks at its clocks and says what moved |
 | `revalidated` | | What a discontinuity affected has been rechecked |
 | `validity` | `object` (`name` and `within_boot_ms`, `utc_ms` or `owner_grant`), `expect` | The time contract decides the object: `valid`, `expired: continuous_deadline`, `expired: trusted_utc_deadline`, `unproven` or `revalidation owed` |
+| `fill_journal` | `expect`, a protocol code | The session's journal stops growing and takes actions until the store refuses one, with the code named |
+| `journal` | `expect` (`healthy`, `full`, `write_failed`, `corrupt` or `absent`), `rich_work` | The condition the session's journal is in, and whether a rich mutation is admitted in the posture it gives |
+| `release_journal` | `expect`, the fault of the interval recorded or `null` | The journal may grow again and the session tries to leave its fault; the interval it could not write is recorded once |
 | `holds` | `client` | The client holds the session's screen and performed nothing while it was drawn one |
 | `screen` | `active`, `lines`, optional `other` | The session's own screen reads so, trailing blanks dropped |
 | `effects` | `client`, `expect` | Every side effect the client's terminal has performed from the live stream: `bell`, `clipboard write: <content>` and so on |
@@ -550,9 +555,11 @@ state a damaged page or a torn log.
 | `log_cut_in_last_frame` | The product's journal accepts action `accept`, the database and its log are copied while it still holds them, and the copy of the log is cut inside its last frame | A crash inside a commit |
 
 `tests/faults/tests/journals.rs` opens each through a worker's session, which recovers what it
-finds, and through the journal's own openers that read or recover a closed session's journal. Each
-is also made as its control, the same file without its fault, which must open cleanly at this
-build's schema version. The suite checks that each file's SQL makes a store that reads back as
+finds, through the journal's own openers that read or recover a closed session's journal, and
+through the controller's archive, which reads a crashed session's journal in the host tree it
+was kept in. A trace can open its session on a fixture too, as the one with a full store does.
+Every fixture is also made as its control, the same file without its fault, which must open cleanly
+at this build's schema version. The suite checks that each file's SQL makes a store that reads back as
 exactly that SQL.
 
 A fixture's SQL is never rewritten. When the schema moves on, opening an old fixture is a test of

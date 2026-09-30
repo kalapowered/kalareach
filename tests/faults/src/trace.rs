@@ -50,9 +50,11 @@ use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::{ClipboardSelection, SideEffectKind};
 use kr_worker::action::time::{Discontinuity, ExpiringObject, Validity};
+use kr_worker::persistence::WorkClass;
 use kr_worker::session::InputBatch;
 use serde::{Deserialize, Serialize};
 
+use crate::journal::{JournalFixture, Made};
 use crate::restore::{Form, Stage, Strategy};
 use crate::screen::Line;
 use crate::time::SimulatedTime;
@@ -82,6 +84,10 @@ pub struct Trace {
     pub rows: u16,
     /// The wall clock when the trace begins, in UTC milliseconds.
     pub wall_ms: u64,
+    /// The kept journal fixture the session opens its journal on, made with its fault; an
+    /// in-memory journal when none is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<String>,
     /// The steps, in order.
     pub steps: Vec<Step>,
 }
@@ -193,6 +199,23 @@ pub enum Step {
         /// The other buffer's rows, when the trace says.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         other: Option<Vec<String>>,
+    },
+    /// The session's journal stops growing and takes actions until the store refuses one.
+    FillJournal {
+        /// The protocol code the store's refusal is reported under.
+        expect: String,
+    },
+    /// What the session's journal is able to do.
+    Journal {
+        /// `healthy`, or the fault it is under: `full`, `write_failed`, `corrupt` or `absent`.
+        expect: String,
+        /// Whether a rich mutation is admitted in the posture that condition gives.
+        rich_work: bool,
+    },
+    /// The session's journal may grow again, and the session tries to leave its fault.
+    ReleaseJournal {
+        /// The fault the interval it records was under; none when nothing is recorded.
+        expect: Option<String>,
     },
     /// Every side effect the client's terminal has performed from the live stream so far.
     Effects {
@@ -378,6 +401,7 @@ impl Trace {
             columns: self.columns,
             rows: self.rows,
             wall_ms: self.wall_ms,
+            journal: self.journal.clone(),
             steps,
         }
     }
@@ -452,12 +476,19 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         what,
     };
     let time = SimulatedTime::new(trace.wall_ms);
+    let journal = match trace.journal.as_deref() {
+        Some(name) => {
+            Some(JournalHome::made(name).map_err(|what| stopped(None, Cause::Malformed, what))?)
+        }
+        None => None,
+    };
     let stage = Stage::open(
         trace.columns,
         trace.rows,
         Vec::new(),
         strategy,
         time.worker_sources(),
+        journal.as_ref().map(JournalHome::path),
     )
     .map_err(|what| stopped(None, Cause::Malformed, what))?;
     let reference = Engine::new(EngineConfig {
@@ -475,6 +506,7 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         epochs: BTreeMap::new(),
         reference,
         questions: 0,
+        _journal: journal,
     };
     for (index, step) in trace.steps.iter().enumerate() {
         replay
@@ -496,6 +528,31 @@ struct Replay {
     reference: Engine,
     /// How many questions the output has asked so far.
     questions: usize,
+    /// Where the session's journal was made, kept until the replay ends.
+    _journal: Option<JournalHome>,
+}
+
+/// A kept journal fixture made with its fault in a directory of its own, which goes with this.
+struct JournalHome {
+    directory: tempfile::TempDir,
+}
+
+impl JournalHome {
+    fn made(name: &str) -> Result<Self, String> {
+        let fixture =
+            JournalFixture::load(&crate::journal::directory().join(format!("{name}.json")))?;
+        let directory = tempfile::Builder::new()
+            .prefix("kr-faults-trace-journal-")
+            .tempdir()
+            .map_err(|error| format!("a directory for journal {name}: {error}"))?;
+        let home = Self { directory };
+        fixture.make(&home.path(), Made::WithFault)?;
+        Ok(home)
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.directory.path().join("journal.sqlite3")
+    }
 }
 
 /// The most questions a trace may ask: the session drops replies past this many a second of the
@@ -578,6 +635,38 @@ impl Replay {
                 lines,
                 other,
             } => self.screen(*active, lines, other.as_deref())?,
+            Step::FillJournal { expect } => self.fill_journal(expect)?,
+            Step::Journal { expect, rich_work } => {
+                let posture = self.stage.session().durability_posture();
+                let condition = posture
+                    .fault()
+                    .map_or("healthy", |fault| fault.kind.as_str());
+                let admits = posture.admits(WorkClass::RichMutation);
+                if condition != expect || admits != *rich_work {
+                    return Err(unmet(format!(
+                        "the journal is {condition} and {} rich work, and the trace expects it \
+                         {expect} and {} it",
+                        if admits { "admits" } else { "fences" },
+                        if *rich_work { "admitting" } else { "fencing" }
+                    )));
+                }
+            }
+            Step::ReleaseJournal { expect } => {
+                let session = self.stage.session();
+                let released = session
+                    .journal_mut()
+                    .ok_or_else(|| malformed("the session has no journal".to_owned()))?
+                    .release_size_cap();
+                released.map_err(|error| malformed(format!("the cap stays: {error}")))?;
+                let gap = session
+                    .recover_journal()
+                    .map(|gap| gap.kind.as_str().to_owned());
+                if gap != *expect {
+                    return Err(unmet(format!(
+                        "the session recorded a gap of {gap:?}, and the trace expects {expect:?}"
+                    )));
+                }
+            }
             Step::Effects { client, expect } => {
                 let index = self.client(client)?;
                 let got: Vec<String> = self
@@ -642,6 +731,36 @@ impl Replay {
             )));
         }
         Ok(())
+    }
+
+    /// Stops the session's journal growing and has it take the fixtures' actions until the store
+    /// refuses one, as the worker's own admission would.
+    fn fill_journal(&mut self, expect: &str) -> StepResult {
+        let journal = self
+            .stage
+            .session()
+            .journal_mut()
+            .ok_or_else(|| malformed("the session has no journal".to_owned()))?;
+        journal
+            .cap_at_current_size()
+            .map_err(|error| malformed(format!("the journal could not be capped: {error}")))?;
+        for action in 100..=u8::MAX {
+            let submission = crate::journal::submission(action).map_err(malformed)?;
+            if let Err(error) = journal.accept(&submission) {
+                let code = error.code().as_str();
+                return if code == expect {
+                    Ok(())
+                } else {
+                    Err(unmet(format!(
+                        "the store refused an action with {code} ({error}), and the trace expects \
+                         {expect}"
+                    )))
+                };
+            }
+        }
+        Err(unmet(
+            "the store took every action it was given and never filled".to_owned(),
+        ))
     }
 
     fn client(&self, name: &str) -> Result<usize, (Cause, String)> {

@@ -10,9 +10,10 @@ use kr_faults::trace::{self, Acquired, Batch, Cause, Moved, PasteEdge, Step, Tra
 use kr_protocol::projection::ProjectedBuffer;
 
 /// The kept traces, each with the test below that replays it.
-const KEPT: [&str; 5] = [
+const KEPT: [&str; 6] = [
     "attach-inside-a-1049-switch",
     "clipboard-before-and-after-an-attach",
+    "full-journal-keeps-native-input",
     "lone-escape-and-the-paste-recogniser",
     "takeover-during-a-paste",
     "time-rollback-and-suspension",
@@ -70,6 +71,15 @@ fn a_clipboard_write_before_an_attach_is_never_performed_and_one_after_it_is_onc
 #[test]
 fn a_lone_escape_is_held_only_while_it_could_start_a_paste_and_only_until_its_deadline() {
     replays("lone-escape-and-the-paste-recogniser");
+}
+
+/// KR-REQ-27.05, a full store; KR-REQ-29.03: a session's journal filling while a client holds the
+/// keys, replayed from the retained trace against a kept journal: the store refuses the next
+/// durable write, rich work is fenced and the client's typing still reaches the application, and
+/// the interval is recorded once the store may grow again, and only once.
+#[test]
+fn a_full_journal_fences_rich_work_keeps_native_input_and_records_its_gap_once() {
+    replays("full-journal-keeps-native-input");
 }
 
 #[test]
@@ -203,6 +213,29 @@ fn contradictions(step: &Step) -> Vec<Step> {
                 }
             }
         }
+        Step::FillJournal { expect } => found.push(Step::FillJournal {
+            expect: format!("{expect}X"),
+        }),
+        Step::Journal { expect, rich_work } => {
+            found.push(Step::Journal {
+                expect: if expect == "healthy" {
+                    "full".to_owned()
+                } else {
+                    "healthy".to_owned()
+                },
+                rich_work: *rich_work,
+            });
+            found.push(Step::Journal {
+                expect: expect.clone(),
+                rich_work: !rich_work,
+            });
+        }
+        Step::ReleaseJournal { expect } => found.push(Step::ReleaseJournal {
+            expect: match expect {
+                Some(_) => None,
+                None => Some("full".to_owned()),
+            },
+        }),
         Step::Effects { client, expect } => {
             for changed in rows_contradicted(expect) {
                 found.push(Step::Effects {
