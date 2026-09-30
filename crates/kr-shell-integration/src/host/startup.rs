@@ -476,12 +476,39 @@ fn owns_separator(block: &str) -> bool {
     block.lines().any(|line| line == SEPARATOR_NOTE)
 }
 
+/// Where in a startup file a guarded entry goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// After everything the user wrote, so the entry runs once their configuration has.
+    End,
+    /// Before it, so the entry runs before anything the user wrote can ask a question.
+    Start,
+}
+
+impl Placement {
+    /// Returns where this shell's entry goes.
+    ///
+    /// Most shells load their reader with the shell itself, so their entry only has to say, after
+    /// the user's configuration, that the hooks are live. PowerShell's is a module that opens the
+    /// bridge when the entry runs, and a profile that asks a question before that would ask it of
+    /// a shell whose input the session refuses: so its entry is the first thing in the profile.
+    #[must_use]
+    pub const fn of(kind: ShellKind) -> Self {
+        match kind {
+            ShellKind::PowerShell => Self::Start,
+            ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => Self::End,
+        }
+    }
+}
+
 /// Adds or updates one shell's guarded entry.
 ///
-/// The file is created when it does not exist and appended to when it does. Everything the user
-/// wrote is kept: the entry is delimited by its markers and only the text between them is ever
-/// rewritten. Where the file did not end in a line break, the entry starts on a line of its own and
-/// the entry owns that line break, which the removal takes back with it.
+/// The file is created when it does not exist. A new entry goes where `placement` says, and one
+/// already there is rebuilt where `placement` says as well, so an entry an earlier install put at
+/// the end of a profile that needs it at the start moves. Everything the user wrote is kept: the
+/// entry is delimited by its markers and only the text between them is ever rewritten. Where the
+/// file did not end in a line break and the entry goes at the end, the entry starts on a line of
+/// its own and owns that line break, which the removal takes back with it.
 ///
 /// The lock that holds two writers apart is in `record`'s directory, keyed by the file, so nothing
 /// is written in the person's home but the entry.
@@ -489,12 +516,17 @@ fn owns_separator(block: &str) -> bool {
 /// # Errors
 ///
 /// Returns the underlying failure when the file cannot be read or written.
-pub fn install(path: &Path, body: &str, record: &EntryRecord) -> std::io::Result<Change> {
+pub fn install(
+    path: &Path,
+    body: &str,
+    placement: Placement,
+    record: &EntryRecord,
+) -> std::io::Result<Change> {
     let _writing = writing();
     let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
     let existing = read_or_empty(path)?;
-    let (change, updated) = match strip(&existing) {
-        Some((before, block, after)) => {
+    let (change, updated) = match (strip(&existing), placement) {
+        (Some((before, block, after)), Placement::End) => {
             let body = if owns_separator(&block) {
                 with_separator_note(body)
             } else {
@@ -507,7 +539,15 @@ pub fn install(path: &Path, body: &str, record: &EntryRecord) -> std::io::Result
                 (Change::Replaced, rebuilt)
             }
         }
-        None => {
+        (Some((before, _block, after)), Placement::Start) => {
+            let rebuilt = format!("{body}{before}{after}");
+            if rebuilt == existing {
+                (Change::Unchanged, rebuilt)
+            } else {
+                (Change::Replaced, rebuilt)
+            }
+        }
+        (None, Placement::End) => {
             let mut rebuilt = existing.clone();
             if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
                 rebuilt.push('\n');
@@ -517,6 +557,7 @@ pub fn install(path: &Path, body: &str, record: &EntryRecord) -> std::io::Result
             }
             (Change::Added, rebuilt)
         }
+        (None, Placement::Start) => (Change::Added, format!("{body}{existing}")),
     };
     if change != Change::Unchanged {
         if let Some(parent) = path.parent() {
@@ -1564,7 +1605,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert!(installed(&path));
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
@@ -1636,6 +1680,7 @@ mod tests {
                 install(
                     &target.path,
                     &entry(&target, &package, false).expect("the path is text"),
+                    Placement::End,
                 )
                 .expect("installs");
             }
@@ -1699,8 +1744,8 @@ mod tests {
             .1
     }
 
-    fn install(path: &Path, body: &str) -> std::io::Result<Change> {
-        super::install(path, body, record())
+    fn install(path: &Path, body: &str, placement: Placement) -> std::io::Result<Change> {
+        super::install(path, body, placement, record())
     }
 
     fn remove(path: &Path) -> std::io::Result<Change> {
@@ -1751,7 +1796,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert!(
             std::fs::read_to_string(&path)
                 .expect("reads")
@@ -1843,8 +1891,79 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::of(ShellKind::PowerShell)).expect("installs"),
+            Change::Added
+        );
         assert!(installed(&path));
+    }
+
+    /// KR-REQ-07.23: PowerShell's entry is the first thing in the profile and every other shell's
+    /// is the last, and an entry an earlier install put in the wrong place is moved.
+    ///
+    /// The PowerShell entry loads the module that opens the bridge, so a profile that asks a
+    /// question ahead of it would ask a shell the session does not yet take input for. The other
+    /// shells have their reader with the shell itself, and their entry says after the user's
+    /// configuration that the hooks are live.
+    #[test]
+    fn a_powershell_entry_goes_first_in_the_profile_and_the_others_go_last() {
+        let root = tempfile::tempdir().expect("a directory");
+        let theirs = "$env:EDITOR = 'vim'\nRead-Host 'name'\n";
+        for (kind, file) in [
+            (ShellKind::PowerShell, "profile.ps1"),
+            (ShellKind::Zsh, ".zshrc"),
+            (ShellKind::Bash, ".bashrc"),
+            (ShellKind::Fish, "config.fish"),
+        ] {
+            let path = root.path().join(file);
+            std::fs::write(&path, theirs).expect("writes");
+            let body = entry(&for_shell(kind), Path::new("/opt/kr/entry"), false)
+                .expect("the path is text");
+            assert_eq!(
+                install(&path, &body, Placement::of(kind)).expect("installs"),
+                Change::Added
+            );
+            let written = std::fs::read_to_string(&path).expect("reads");
+            if kind == ShellKind::PowerShell {
+                assert_eq!(written, format!("{body}{theirs}"), "{kind:?}");
+            } else {
+                assert_eq!(written, format!("{theirs}{body}"), "{kind:?}");
+            }
+            assert_eq!(
+                install(&path, &body, Placement::of(kind)).expect("installs"),
+                Change::Unchanged,
+                "{kind:?}: a second install is no change"
+            );
+            assert_eq!(remove(&path).expect("removes"), Change::Removed);
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{kind:?}"
+            );
+        }
+
+        // An entry an earlier install left at the end of a PowerShell profile moves to the start,
+        // with the user's lines in the order they wrote them.
+        let path = root.path().join("earlier.ps1");
+        std::fs::write(&path, theirs).expect("writes");
+        let body = entry(
+            &for_shell(ShellKind::PowerShell),
+            Path::new("/opt/kr/entry"),
+            false,
+        )
+        .expect("the path is text");
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
+        assert_eq!(
+            install(&path, &body, Placement::Start).expect("installs"),
+            Change::Replaced
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            format!("{body}{theirs}")
+        );
     }
 
     /// KR-REQ-07.40: a filesystem whose identity numbers move does not refuse a legitimate write.
@@ -1865,7 +1984,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads"),
@@ -1993,13 +2115,19 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         let after = std::fs::read_to_string(&path).expect("reads");
         assert!(after.starts_with(theirs), "the user's own lines are first");
         assert!(after.contains(MARKER_BEGIN) && after.contains(MARKER_END));
         assert!(installed(&path));
         // A second install is not a second entry.
-        assert_eq!(install(&path, &body).expect("installs"), Change::Unchanged);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Unchanged
+        );
         let updated = entry(
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
@@ -2007,7 +2135,7 @@ mod tests {
         )
         .expect("the path is text");
         assert_eq!(
-            install(&path, &updated).expect("installs"),
+            install(&path, &updated, Placement::End).expect("installs"),
             Change::Replaced
         );
         assert_eq!(
@@ -2043,7 +2171,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&link, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&link, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert!(
             link.symlink_metadata()
                 .expect("reads")
@@ -2084,7 +2215,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&link, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&link, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert_eq!(remove(&link).expect("removes"), Change::Removed);
         assert!(
             link.symlink_metadata()
@@ -2126,7 +2260,7 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(install(&path, &body, Placement::End).expect("installs"), Change::Added);
         assert_eq!(
             names(),
             [".zshrc"],
@@ -2156,10 +2290,10 @@ mod tests {
         .expect("the path is text");
 
         std::fs::write(&path, "export EDITOR=vim").expect("writes");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(install(&path, &body, Placement::End).expect("installs"), Change::Added);
         // Installing again keeps the entry, and what it took with it.
         assert_eq!(
-            install(&path, &body).expect("installs again"),
+            install(&path, &body, Placement::End).expect("installs again"),
             Change::Unchanged
         );
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
@@ -2170,7 +2304,7 @@ mod tests {
 
         // The person wrote a line after the entry, so what was there before it is not at the end.
         std::fs::write(&path, "export EDITOR=vim").expect("writes");
-        install(&path, &body).expect("installs");
+        install(&path, &body, Placement::End).expect("installs");
         let with_more = format!(
             "{}alias ll='ls -l'\n",
             std::fs::read_to_string(&path).expect("reads")
@@ -2184,7 +2318,7 @@ mod tests {
 
         // A file that did end in a line break needs none, and is given back the same.
         std::fs::write(&path, "export EDITOR=vim\n").expect("writes");
-        install(&path, &body).expect("installs");
+        install(&path, &body, Placement::End).expect("installs");
         remove(&path).expect("removes");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads"),
@@ -2211,7 +2345,10 @@ mod tests {
             false,
         )
         .expect("the path is text");
-        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            install(&path, &body, Placement::End).expect("installs"),
+            Change::Added
+        );
         assert_eq!(
             std::fs::read_to_string(&bystander).expect("reads"),
             "not ours\n"
