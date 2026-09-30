@@ -2,10 +2,10 @@
  * What a session's semantic archive carries: every entry of each live agent's history, as the
  * session's own worker gives it, and what the archive leaves out, declared.
  *
- * Section 25's export carries timestamps and declared omissions. Each entry keeps the identity and
- * the time the worker gave it. An entry the host's history filter withheld from this device is not
- * in the archive and is counted; so is an entry whose text did not fit what one read carries, and a
- * range the host no longer kept.
+ * Section 25's export carries timestamps and declared omissions. Each entry keeps the identity, the
+ * time, and the binding revision and turn the worker gave it. An entry the host's history filter
+ * withheld from this device is not in the archive and is counted; so is an entry whose text did not
+ * fit what one read carries, and a range the host no longer kept.
  */
 
 import type { AgentSnapshotResult } from '@kalareach/protocol'
@@ -54,7 +54,11 @@ export async function readSemanticArchive(
             instance: id,
             kind: entry.kind,
             text: entry.text,
-            omitted_text_bytes: entry.omitted_text_bytes
+            omitted_text_bytes: entry.omitted_text_bytes,
+            // What the worker recorded the entry under, which can differ from what it is read
+            // under.
+            binding_revision: entry.binding_revision,
+            turn_id: entry.turn_id
           },
           at_ms: Number(entry.observed_at)
         })

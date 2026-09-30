@@ -14,6 +14,7 @@ import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
+import { readSemanticArchive } from '../src/model/exports'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -125,5 +126,46 @@ describe("a session's exports (KR-REQ-25.08)", () => {
     expect(
       await screen.findByText(`Written to /tmp/session-${SESSION_MAIN}.json, with 1 declared omission.`)
     ).toBeInTheDocument()
+  })
+
+  it('archives the binding revision and the turn each entry was observed under', async () => {
+    const entry = (node: string, revision: string, turn: string | null) => ({
+      node,
+      kind: 'message',
+      text: `entry ${node}`,
+      omitted_text_bytes: '0',
+      observed_at: '10',
+      binding_revision: revision,
+      turn_id: turn
+    })
+    // The history of an agent whose owner changed after its first entry: the read is made under the
+    // second revision, and each entry names the one it was observed under.
+    const port = {
+      sessionAgents: () =>
+        Promise.resolve({
+          instances: {
+            sequence: '1',
+            instances: [{ application_instance_id: 'i-1', ended_at: null }]
+          },
+          resources: []
+        }),
+      agentSnapshot: () =>
+        Promise.resolve({
+          entries: [entry('1', '1', 'turn-1'), entry('2', '2', null)],
+          continuation: null,
+          history_gap: false,
+          withheld_entries: '0'
+        })
+    } as unknown as HostPort
+    const archive = await readSemanticArchive(port, SESSION_MAIN)
+    expect(
+      archive.nodes.map((node) => {
+        const body = node.body as { binding_revision: string; turn_id: string | null }
+        return [body.binding_revision, body.turn_id]
+      })
+    ).toEqual([
+      ['1', 'turn-1'],
+      ['2', null]
+    ])
   })
 })
