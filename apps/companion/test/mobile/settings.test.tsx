@@ -17,6 +17,13 @@ import type { MobilePlatform } from '../../src/mobile/platform'
 
 const SURFACES: readonly MobilePlatform[] = ['ios', 'android']
 
+/** A pointer event at a height, with the time it happened, so a gesture means the same on every machine. */
+function gesture(type: string, clientY: number, timeStamp: number): PointerEvent {
+  const event = new PointerEvent(type, { bubbles: true, clientY })
+  Object.defineProperty(event, 'timeStamp', { value: timeStamp })
+  return event
+}
+
 /** The shell on `surface`, with a person ready to drive it. */
 function start(surface: MobilePlatform) {
   const { port, controls } = fakeHost()
@@ -132,6 +139,52 @@ describe('settings without leaving a live session', () => {
       expect(screen.queryByLabelText('Message this session')).toBeNull()
     })
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Sessions')
+  })
+
+  it('keeps Tab inside the sheet whichever appearance is chosen', async () => {
+    const { person } = start('ios')
+    await inSession(person)
+    await person.click(screen.getByRole('button', { name: 'Settings' }))
+    const sheet = await screen.findByRole('dialog', { name: 'Settings' })
+    for (const choice of ['Dark', 'Light', 'System']) {
+      // A group of radios is one stop for Tab, at the checked one: it is the last stop in the sheet.
+      await person.click(within(sheet).getByRole('radio', { name: choice }))
+      await person.tab()
+      expect(within(sheet).getByRole('button', { name: 'Close settings' }), choice).toHaveFocus()
+      await person.tab({ shift: true })
+      expect(within(sheet).getByRole('radio', { name: choice }), choice).toHaveFocus()
+    }
+  })
+
+  it('carries a sheet that closes under a held grip the rest of the way out, however the hold ends', async () => {
+    for (const end of ['pointerup', 'pointercancel'] as const) {
+      const { person } = start('android')
+      await inSession(person)
+      await person.click(screen.getByRole('button', { name: 'Settings' }))
+      const sheet = await screen.findByRole('dialog', { name: 'Settings' })
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-presentation', 'here')
+      })
+      const grip = screen.getByTestId('sheet-grip')
+      act(() => {
+        grip.dispatchEvent(gesture('pointerdown', 200, 1_000))
+      })
+      // The system's back closes the sheet while a finger holds it.
+      act(() => {
+        window.history.back()
+      })
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-open', 'false')
+      })
+      act(() => {
+        grip.dispatchEvent(gesture(end, 200, 1_300))
+      })
+      await waitFor(() => {
+        expect(screen.queryByTestId('sheet'), end).toBeNull()
+      })
+      expect(screen.getByLabelText('Message this session'), end).toBeInTheDocument()
+      cleanup()
+    }
   })
 
   it('leaves every other destination as it was: no settings on the lists, the inbox, the hosts or the account', async () => {
