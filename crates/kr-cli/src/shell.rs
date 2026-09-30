@@ -17,9 +17,7 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
-use kr_shell_integration::host::startup::{
-    self, Change, EntryRecord, HomeLayout, Placement, RecordError,
-};
+use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
 
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request};
@@ -235,7 +233,8 @@ pub fn install(
         .targets(package.kind())
         .into_iter()
         .map(|target| {
-            startup::entry(&target, &package_entry, nsh_bypass).map(|body| (target.path, body))
+            startup::entry(&target, &package_entry, nsh_bypass)
+                .map(|body| (target.path, body, target.placement))
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|refused| {
@@ -256,30 +255,28 @@ pub fn install(
             .map_err(|error| record_failure(record, &error))?;
         let files = bodies
             .iter()
-            .map(|(file, _)| file.clone())
+            .map(|(file, _, _)| file.clone())
             .collect::<Vec<_>>();
         held.add(package.kind(), &files)
             .map_err(|error| record_failure(record, &error))?;
         Some(held)
     };
     for entry in &mut reported.entries {
-        let Some((_, body)) = bodies.iter().find(|(file, _)| *file == entry.file) else {
+        let Some((_, body, placement)) = bodies.iter().find(|(file, _, _)| *file == entry.file)
+        else {
             continue;
         };
+        let io_failure = |error: std::io::Error| {
+            CliError::Other(shown!(
+                "{}: {}",
+                Shown::root(&entry.file),
+                Shown::io(&error)
+            ))
+        };
         let change = if dry_run {
-            if startup::installed(&entry.file) {
-                Change::Unchanged
-            } else {
-                Change::Added
-            }
+            startup::plan(&entry.file, body, *placement).map_err(io_failure)?
         } else {
-            startup::install(&entry.file, body, Placement::of(package.kind()), record).map_err(|error| {
-                CliError::Other(shown!(
-                    "{}: {}",
-                    Shown::root(&entry.file),
-                    Shown::io(&error)
-                ))
-            })?
+            startup::install(&entry.file, body, *placement, record).map_err(io_failure)?
         };
         entry.change = Some(change);
         // A dry run reports what is there; a real one reports what it just wrote.
@@ -564,6 +561,7 @@ mod tests {
     use super::*;
     use crate::output::planted::{only_asked, only_asked_lines, planted_text};
     use crate::shown::marker::MARKER;
+    use kr_shell_integration::host::startup::Placement;
 
     /// KR-REQ-23.25: text planted in every field a shell's report holds shows only where the person
     /// asked for it, which is every one of them: the package's executable, flags, version, editor

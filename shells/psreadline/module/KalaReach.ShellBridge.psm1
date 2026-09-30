@@ -33,6 +33,7 @@ $script:Hooks = @{
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
     ReadLineInstalled  = $false
+    ReadLineText       = ''
 }
 
 # The operations whose key wait this module observes by wrapping them. Each runs its own read loop
@@ -407,9 +408,12 @@ function Install-KrReadLineWrapper {
     if ($null -ne $existing) { $script:Hooks.InnerReadLine = $existing.ScriptBlock }
     # `$?` is the status of the command the person just ran, and this editor shows it. It is read
     # here, as the host's own entry point does, because anything else run first would replace it.
-    Set-Item -Path function:global:PSConsoleHostReadLine -Value {
+    $wrapper = {
         Invoke-KalaReachReadLine -LastStatus $?
     }
+    Set-Item -Path function:global:PSConsoleHostReadLine -Value $wrapper
+    # What the host calls is this function for as long as its text is this text.
+    $script:Hooks.ReadLineText = "$wrapper"
     $script:Hooks.ReadLineInstalled = $true
 }
 
@@ -424,6 +428,40 @@ function Test-KrInnerReadLine {
 }
 
 # ---- the user-facing hooks, after the profile has run -----------------------------------------------
+
+# Ends activation by name: the integration is lost, the person is told why, and nothing after that
+# claims the hooks are live. The loss closes the session that was being created, and a session being
+# closed is not one a report that the hooks went live could qualify.
+function Stop-KrActivation {
+    param([string]$Reason, [string]$Detail)
+    $script:Hooks.Activated = $true
+    Send-KrIntegrationLost 'post_startup_failure' $Detail
+    Write-KrDiagnostic $Reason $Detail
+}
+
+function Confirm-KalaReachReadLine {
+    <#
+    .SYNOPSIS
+    Checks, once the last profile has run, that the host still calls this module's read-line entry
+    point.
+    .DESCRIPTION
+    The module goes in front of the entry point when it loads, which is the first thing in the first
+    profile so that the bridge is open before anything the person wrote can ask a question. A
+    function of the same name that a later profile defines takes the host's calls away from the
+    module, and the reader would never run: the session would stay authenticated and not ready with
+    nothing to say why. A function that replaces the entry point and one that wraps the function it
+    replaced are both the host's reader being somebody else's rather than the editor the package was
+    qualified against, and both are refused by name.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:Kr.Registered -or $script:Hooks.Activated) { return }
+    if (-not $script:Hooks.ReadLineInstalled) { return }
+    $current = Get-Command -Name 'PSConsoleHostReadLine' -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $current -and "$($current.ScriptBlock)" -eq $script:Hooks.ReadLineText) { return }
+    Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
+}
 
 function Enable-KalaReachHooks {
     <#
@@ -442,18 +480,14 @@ function Enable-KalaReachHooks {
     # is reading now.
     $qualified = Test-KrQualifiedEditor
     if (-not $qualified.Ok) {
-        Send-KrIntegrationLost 'post_startup_failure' $qualified.Detail
-        Write-KrDiagnostic $qualified.Reason $qualified.Detail
-        Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
+        Stop-KrActivation $qualified.Reason $qualified.Detail
         return
     }
 
     if (-not (Test-KrInnerReadLine)) {
         # Somebody else's reader was already the host's entry point, so the editor this package
         # was qualified against is not the one reading this shell.
-        Send-KrIntegrationLost 'post_startup_failure' 'another read-line entry point is installed'
-        Write-KrDiagnostic 'reader_replaced' 'another read-line entry point is installed'
-        Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
+        Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
         return
     }
 
@@ -1112,6 +1146,7 @@ $ExecutionContext.SessionState.Module.OnRemove = { Remove-KalaReachHooks }
 Export-ModuleMember -Function @(
     'Initialize-KalaReachBridge'
     'Enable-KalaReachHooks'
+    'Confirm-KalaReachReadLine'
     'Invoke-KalaReachReadLine'
     'Invoke-KalaReachService'
     'Invoke-KalaReachPending'

@@ -45,6 +45,8 @@ pub struct StartupTarget {
     /// written in the language they all share and does nothing unless the shell reading it is the
     /// one the entry is for.
     pub shared: bool,
+    /// Where in the file the entry goes.
+    pub placement: Placement,
 }
 
 /// What a home directory looks like to setup.
@@ -113,6 +115,7 @@ impl HomeLayout {
                     .join(".zshrc"),
                 reason: "the interactive file this shell actually reads, inside ZDOTDIR when one is set",
                 shared: false,
+                placement: Placement::End,
             }],
             ShellKind::Bash => {
                 let login = self.bash_login_file();
@@ -123,12 +126,14 @@ impl HomeLayout {
                         path: self.home.join(".bashrc"),
                         reason: "the file a non-login interactive Bash reads",
                         shared: false,
+                        placement: Placement::End,
                     },
                     StartupTarget {
                         kind,
                         path: login,
                         reason: "the login file this user has, which a login Bash reads instead",
                         shared,
+                        placement: Placement::End,
                     },
                 ]
             }
@@ -141,38 +146,38 @@ impl HomeLayout {
                     .join("fish/conf.d/kalareach.fish"),
                 reason: "a guarded conf.d entry; it loads before config.fish and defers its own activation until after it",
                 shared: false,
+                placement: Placement::End,
             }],
-            // PowerShell is the one shell whose profile path this host does not derive: where it
+            // PowerShell is the one shell whose profile paths this host does not derive: where it
             // keeps a per-user profile depends on where the platform puts that user's documents,
             // and on Windows that is a known folder a redirection can move. So the shell is asked,
             // and a shell that cannot be asked gets no target rather than an entry written where
             // it will never be read.
+            //
+            // It reads two per-user profiles, the one every host reads and then the one its own
+            // host reads, and the entry is in both. The bridge is opened at the start of the first,
+            // before anything the person wrote there or in the second can ask a question of a shell
+            // whose input the session would refuse; what the second ends with is checked once
+            // everything the person configured has run.
             ShellKind::PowerShell => self
-                .powershell_profile()
-                .map(|path| StartupTarget {
-                    kind,
-                    path,
-                    reason: "the profile this shell itself names, which this entry adds to rather \
-                             than replaces",
-                    shared: false,
-                })
-                .into_iter()
-                .collect(),
+                .powershell_profiles()
+                .map(|(all_hosts, current_host)| powershell_targets(all_hosts, current_host))
+                .unwrap_or_default(),
         }
     }
 
-    /// Returns the profile PowerShell reads on this host.
+    /// Returns the two per-user profiles PowerShell reads on this host, the one every host reads
+    /// and the one its own host reads after it.
     ///
-    /// It is asked for rather than worked out. PowerShell keeps its per-user profile in a
+    /// They are asked for rather than worked out. PowerShell keeps its per-user profiles in a
     /// different place on each platform, in a different place for each edition, and on Windows
     /// under whatever directory the user's documents have been redirected to; a path this host
     /// derived could be a file PowerShell never reads, and an entry in a file nothing reads is an
     /// installation that reports success and integrates nothing.
-    fn powershell_profile(&self) -> Option<PathBuf> {
+    fn powershell_profiles(&self) -> Option<(PathBuf, PathBuf)> {
         let shell = self.powershell.as_ref()?;
         // The shell's own answer, read from a shell started with no profile of its own so that
-        // nothing a user wrote decides where their profile is. `CurrentUserCurrentHost` is the one
-        // `kr shell install` adds to: the per-user file this host's PowerShell reads.
+        // nothing a user wrote decides where their profile is: one path on each of two lines.
         //
         // Bounded, and written to a file rather than a pipe: `kr shell status` runs this, and a
         // shell that will not start must not hold that command open.
@@ -183,11 +188,15 @@ impl HomeLayout {
                 "-NonInteractive",
                 "-NoLogo",
                 "-Command",
-                "$PROFILE.CurrentUserCurrentHost",
+                "$PROFILE.CurrentUserAllHosts; $PROFILE.CurrentUserCurrentHost",
             ],
         )?;
-        let said = said.trim();
-        (!said.is_empty()).then(|| PathBuf::from(said))
+        let mut lines = said.lines().map(str::trim).filter(|line| !line.is_empty());
+        let all_hosts = PathBuf::from(lines.next()?);
+        let current_host = PathBuf::from(lines.next()?);
+        // Two answers that are one file would put two entries in it, and a shell that named no
+        // second profile has named none this host can check a reader at the end of.
+        (all_hosts != current_host && lines.next().is_none()).then_some((all_hosts, current_host))
     }
 
     /// Returns the login file Bash reads for this user, which is the first of three that exists.
@@ -215,6 +224,35 @@ impl HomeLayout {
         }
         self.home.join(".bash_profile")
     }
+}
+
+/// Returns the entries PowerShell's two per-user profiles get, given where it keeps them.
+///
+/// The first profile it reads is the one every host reads, and the entry at its start opens the
+/// bridge before anything the person wrote there or in the second can ask a question of a shell
+/// whose input the session would refuse. The second is the one its own host reads, and the entry at
+/// its end checks the reader once everything the person configured has run.
+#[must_use]
+pub fn powershell_targets(all_hosts: PathBuf, current_host: PathBuf) -> Vec<StartupTarget> {
+    vec![
+        StartupTarget {
+            kind: ShellKind::PowerShell,
+            path: all_hosts,
+            reason: "the profile this shell reads first of the user's own, which opens the bridge \
+                     before anything the user wrote can ask a question; the entry adds to it \
+                     rather than replaces it",
+            shared: false,
+            placement: Placement::Start,
+        },
+        StartupTarget {
+            kind: ShellKind::PowerShell,
+            path: current_host,
+            reason: "the profile this shell reads last, which checks the reader once everything \
+                     the user configured has run; the entry adds to it rather than replaces it",
+            shared: false,
+            placement: Placement::End,
+        },
+    ]
 }
 
 /// How long a shell is given to answer a question about itself.
@@ -339,6 +377,11 @@ fn powershell_on_path() -> Option<PathBuf> {
     })
 }
 
+/// What the entry at the end of a PowerShell profile runs: the module's own check of the reader,
+/// in a shell that loaded the module.
+pub const POWERSHELL_READER_CHECK: &str =
+    "if (Get-Module KalaReach.ShellBridge) { Confirm-KalaReachReadLine }";
+
 /// The variable one shell's entries share, so the integration loads once in each shell.
 pub const ENTRY_GUARD_VARIABLE: &str = "KR_SHELL_ENTRY";
 
@@ -427,14 +470,23 @@ pub fn entry(
             }
             body.push_str(&format!("if test -r {path}; source {path}; end\n"));
         }
-        ShellKind::PowerShell => {
-            if nsh_bypass {
-                body.push_str(&format!(
-                    "if ($env:KR_SHELL_BRIDGE) {{ $env:{NSH_BYPASS_VARIABLE} = '1' }}\n"
-                ));
+        ShellKind::PowerShell => match target.placement {
+            // The first of the user's profiles loads the module that opens the bridge.
+            Placement::Start => {
+                if nsh_bypass {
+                    body.push_str(&format!(
+                        "if ($env:KR_SHELL_BRIDGE) {{ $env:{NSH_BYPASS_VARIABLE} = '1' }}\n"
+                    ));
+                }
+                body.push_str(&format!("if (Test-Path {path}) {{ . {path} }}\n"));
             }
-            body.push_str(&format!("if (Test-Path {path}) {{ . {path} }}\n"));
-        }
+            // The last of them asks the module whether the reader it went in front of is still the
+            // one the host calls. Nothing here is the integration's logic: the module is the one
+            // that knows, and a shell that never loaded it has nothing to ask.
+            Placement::End => {
+                body.push_str(&format!("{POWERSHELL_READER_CHECK}\n"));
+            }
+        },
     }
     body.push_str(MARKER_END);
     body.push('\n');
@@ -485,22 +537,6 @@ pub enum Placement {
     Start,
 }
 
-impl Placement {
-    /// Returns where this shell's entry goes.
-    ///
-    /// Most shells load their reader with the shell itself, so their entry only has to say, after
-    /// the user's configuration, that the hooks are live. PowerShell's is a module that opens the
-    /// bridge when the entry runs, and a profile that asks a question before that would ask it of
-    /// a shell whose input the session refuses: so its entry is the first thing in the profile.
-    #[must_use]
-    pub const fn of(kind: ShellKind) -> Self {
-        match kind {
-            ShellKind::PowerShell => Self::Start,
-            ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => Self::End,
-        }
-    }
-}
-
 /// Adds or updates one shell's guarded entry.
 ///
 /// The file is created when it does not exist. A new entry goes where `placement` says, and one
@@ -525,7 +561,31 @@ pub fn install(
     let _writing = writing();
     let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
     let existing = read_or_empty(path)?;
-    let (change, updated) = match (strip(&existing), placement) {
+    let (change, updated) = planned(&existing, body, placement);
+    if change != Change::Unchanged {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        replace(path, &existing, &updated)?;
+    }
+    Ok(change)
+}
+
+/// Returns what [`install`] would do to a file, and writes nothing.
+///
+/// A dry run says what a real one does, including the move of an entry an earlier install put where
+/// `placement` no longer says, rather than that an entry is there.
+///
+/// # Errors
+///
+/// Returns the underlying failure when the file cannot be read.
+pub fn plan(path: &Path, body: &str, placement: Placement) -> std::io::Result<Change> {
+    Ok(planned(&read_or_empty(path)?, body, placement).0)
+}
+
+/// Returns what installing `body` into a file with these contents does, and the contents it leaves.
+fn planned(existing: &str, body: &str, placement: Placement) -> (Change, String) {
+    match (strip(existing), placement) {
         (Some((before, block, after)), Placement::End) => {
             let body = if owns_separator(&block) {
                 with_separator_note(body)
@@ -548,7 +608,7 @@ pub fn install(
             }
         }
         (None, Placement::End) => {
-            let mut rebuilt = existing.clone();
+            let mut rebuilt = existing.to_owned();
             if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
                 rebuilt.push('\n');
                 rebuilt.push_str(&with_separator_note(body));
@@ -557,15 +617,8 @@ pub fn install(
             }
             (Change::Added, rebuilt)
         }
-        (None, Placement::Start) => (Change::Added, at_the_start(&existing, body)),
-    };
-    if change != Change::Unchanged {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        replace(path, &existing, &updated)?;
+        (None, Placement::Start) => (Change::Added, at_the_start(existing, body)),
     }
-    Ok(change)
 }
 
 /// Puts `body` at the start of a profile: before everything the person wrote that is a statement,
@@ -1832,12 +1885,20 @@ mod tests {
     }
 
     /// A target for one shell, for the tests that only care what an entry contains.
+    ///
+    /// PowerShell's is the one that opens the bridge, at the start of the first profile; the other
+    /// shells' go last.
     fn for_shell(kind: ShellKind) -> StartupTarget {
         StartupTarget {
             kind,
             path: PathBuf::from("/tmp/startup"),
             reason: "a test",
             shared: false,
+            placement: if kind == ShellKind::PowerShell {
+                Placement::Start
+            } else {
+                Placement::End
+            },
         }
     }
 
@@ -1971,7 +2032,7 @@ mod tests {
         )
         .expect("the path is text");
         assert_eq!(
-            install(&path, &body, Placement::of(ShellKind::PowerShell)).expect("installs"),
+            install(&path, &body, Placement::Start).expect("installs"),
             Change::Added
         );
         assert!(installed(&path));
@@ -1996,10 +2057,10 @@ mod tests {
         ] {
             let path = root.path().join(file);
             std::fs::write(&path, theirs).expect("writes");
-            let body = entry(&for_shell(kind), Path::new("/opt/kr/entry"), false)
-                .expect("the path is text");
+            let target = for_shell(kind);
+            let body = entry(&target, Path::new("/opt/kr/entry"), false).expect("the path is text");
             assert_eq!(
-                install(&path, &body, Placement::of(kind)).expect("installs"),
+                install(&path, &body, target.placement).expect("installs"),
                 Change::Added
             );
             let written = std::fs::read_to_string(&path).expect("reads");
@@ -2009,7 +2070,7 @@ mod tests {
                 assert_eq!(written, format!("{theirs}{body}"), "{kind:?}");
             }
             assert_eq!(
-                install(&path, &body, Placement::of(kind)).expect("installs"),
+                install(&path, &body, target.placement).expect("installs"),
                 Change::Unchanged,
                 "{kind:?}: a second install is no change"
             );
@@ -2043,6 +2104,54 @@ mod tests {
             std::fs::read_to_string(&path).expect("reads"),
             format!("{body}{theirs}")
         );
+    }
+
+    /// KR-REQ-07.23: the two PowerShell entries differ by where they go. The one at the start of
+    /// the first profile loads the module that opens the bridge, and the one at the end of the last
+    /// profile asks the module whether the reader it went in front of is still the one the host
+    /// calls, which is a question only the end of the last profile can put.
+    #[test]
+    fn the_powershell_entry_at_the_start_loads_the_bridge_and_the_one_at_the_end_checks_the_reader()
+    {
+        let root = tempfile::tempdir().expect("a directory");
+        let mut load = for_shell(ShellKind::PowerShell);
+        load.placement = Placement::Start;
+        let mut check = for_shell(ShellKind::PowerShell);
+        check.placement = Placement::End;
+        let package = Path::new("/opt/kr/entry");
+
+        let loading = entry(&load, package, false).expect("the path is text");
+        assert!(loading.contains("Test-Path") && loading.contains("/opt/kr/entry"));
+        assert!(!loading.contains("Confirm-KalaReachReadLine"));
+        let checking = entry(&check, package, false).expect("the path is text");
+        assert!(checking.contains("Confirm-KalaReachReadLine"));
+        assert!(
+            !checking.contains("/opt/kr/entry"),
+            "the check copies nothing of the package and names none of it: {checking}"
+        );
+
+        // Each goes where its placement says, into a profile of its own, and removal gives both
+        // files back as they were.
+        let first = root.path().join("profile.ps1");
+        let last = root.path().join("Microsoft.PowerShell_profile.ps1");
+        let theirs = "using namespace System\nRead-Host 'name'\n";
+        for file in [&first, &last] {
+            std::fs::write(file, theirs).expect("writes");
+        }
+        install(&first, &loading, load.placement).expect("installs");
+        install(&last, &checking, check.placement).expect("installs");
+        let first_text = std::fs::read_to_string(&first).expect("reads");
+        assert!(first_text.starts_with("using namespace System\n"));
+        assert!(first_text.contains(&loading) && first_text.ends_with("Read-Host 'name'\n"));
+        assert_eq!(
+            std::fs::read_to_string(&last).expect("reads"),
+            format!("{theirs}{checking}"),
+            "the check is the last thing the last profile does"
+        );
+        for file in [&first, &last] {
+            assert_eq!(remove(file).expect("removes"), Change::Removed);
+            assert_eq!(std::fs::read_to_string(file).expect("reads"), theirs);
+        }
     }
 
     /// KR-REQ-07.23: a PowerShell entry goes below what PowerShell requires to come first, so a
@@ -2166,22 +2275,53 @@ mod tests {
             "a host with no PowerShell has no profile to add an entry to, and none is guessed"
         );
 
-        // A shell that answers: the entry goes where it said, wherever that is.
-        let wanted = root.path().join("Documents/PowerShell/profile.ps1");
+        // A shell that answers: the entries go where it said, wherever that is. The first profile
+        // it reads opens the bridge and the last one checks the reader.
+        let all_hosts = root.path().join("Documents/PowerShell/profile.ps1");
+        let current_host = root
+            .path()
+            .join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1");
         let asking = HomeLayout {
-            powershell: Some(fake_powershell(root.path(), &wanted.display().to_string())),
+            powershell: Some(fake_powershell(
+                root.path(),
+                &format!("{}\n{}", all_hosts.display(), current_host.display()),
+            )),
             ..home.clone()
         };
         let targets = asking.targets(ShellKind::PowerShell);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].path, wanted);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.path.clone(), target.placement))
+                .collect::<Vec<_>>(),
+            [
+                (all_hosts, Placement::Start),
+                (current_host, Placement::End)
+            ]
+        );
 
         // A shell that answers nothing leaves this host with no profile rather than one it made up.
         let silent = HomeLayout {
             powershell: Some(fake_powershell(root.path(), "")),
-            ..home
+            ..home.clone()
         };
         assert!(silent.targets(ShellKind::PowerShell).is_empty());
+
+        // One that names a single profile, or names one file twice, has named no second profile to
+        // check the reader at the end of, and no entry is written for half an answer.
+        let once = HomeLayout {
+            powershell: Some(fake_powershell(root.path(), "/home/a/profile.ps1")),
+            ..home.clone()
+        };
+        assert!(once.targets(ShellKind::PowerShell).is_empty());
+        let twice = HomeLayout {
+            powershell: Some(fake_powershell(
+                root.path(),
+                "/home/a/profile.ps1\n/home/a/profile.ps1",
+            )),
+            ..home
+        };
+        assert!(twice.targets(ShellKind::PowerShell).is_empty());
     }
 
     /// KR-REQ-26.05: asking PowerShell where its profile is leaves nothing of PowerShell's own in
@@ -2240,15 +2380,21 @@ mod tests {
         assert_eq!(told.lines().count(), 2, "both directories are named");
     }
 
-    /// Writes a program that prints one line, which is all this host asks PowerShell for.
+    /// Writes a program that prints what it was given, which is all this host asks PowerShell for.
     ///
     /// Its text is written beside it and placed by a process of its own, so this process never
     /// holds the program open for writing, and a child another test starts is never handed a
     /// descriptor that would keep the program from starting.
     #[cfg(unix)]
     fn fake_powershell(root: &Path, says: &str) -> PathBuf {
-        let path = root.join(format!("pwsh-{}", says.len()));
-        let text = root.join(format!("pwsh-{}.text", says.len()));
+        use std::hash::{Hash as _, Hasher as _};
+
+        // Named by what it says, so two programs that say different things are never one file.
+        let mut name = std::collections::hash_map::DefaultHasher::new();
+        says.hash(&mut name);
+        let name = name.finish();
+        let path = root.join(format!("pwsh-{name:016x}"));
+        let text = root.join(format!("pwsh-{name:016x}.text"));
         std::fs::write(&text, format!("#!/bin/sh\nprintf '%s\\n' '{says}'\n"))
             .expect("writes the program's text");
         // Started once here, where nothing is timed: the first start of a program just written can

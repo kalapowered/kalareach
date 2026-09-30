@@ -53,7 +53,7 @@
   ],
   "startup": {
     "file": "startup/kr-profile.ps1",
-    "target": "$PROFILE.CurrentUserCurrentHost",
+    "target": "$PROFILE.CurrentUserAllHosts",
     "marker": "# >>> kalareach shell integration >>>",
     "end_marker": "# <<< kalareach shell integration <<<"
   },

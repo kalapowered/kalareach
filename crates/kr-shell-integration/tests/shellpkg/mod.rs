@@ -310,9 +310,13 @@ pub struct Profile<'a> {
     pub after_configuration: &'a str,
     /// Whether the package's own marked entry is installed at all.
     pub entry: bool,
-    /// Text that runs once the package's entry has been installed: after it in the file, or at the
-    /// end of a PowerShell profile, whose entry is the first thing in it.
+    /// Text that runs once the package's entry has been installed: after it in the file, or, for
+    /// PowerShell, in the profile its own host reads, which runs after the first profile's entry
+    /// that loads the bridge and before the last profile's entry that checks the reader.
     pub after_entry: &'a str,
+    /// What the person keeps in the PowerShell profile that every host reads, which runs before the
+    /// profile its own host reads. Nothing for the other shells.
+    pub all_hosts: &'a str,
 }
 
 impl Profile<'_> {
@@ -321,6 +325,7 @@ impl Profile<'_> {
         after_configuration: "",
         entry: true,
         after_entry: "",
+        all_hosts: "",
     };
 }
 
@@ -363,25 +368,23 @@ fn install_startup(package: &Package, home: &Path, prompt: &str, profile: Profil
         ShellKind::PowerShell => {
             let config = home.join(".config").join("powershell");
             std::fs::create_dir_all(&config).expect("a configuration directory");
-            let path = config.join("Microsoft.PowerShell_profile.ps1");
-            std::fs::write(&path, &user).expect("the startup file");
+            let all_hosts = config.join("profile.ps1");
+            let current_host = config.join("Microsoft.PowerShell_profile.ps1");
+            // What the person wrote, in both profiles, before the installer has added to either.
+            std::fs::write(&all_hosts, profile.all_hosts).expect("the startup file");
+            std::fs::write(&current_host, format!("{user}{}", profile.after_entry))
+                .expect("the startup file");
             if profile.entry {
-                // The entry goes in as `kr shell install` puts it, which is where the installer
-                // says it belongs: this shell's is the first thing in the profile.
-                let target = startup::StartupTarget {
-                    kind: ShellKind::PowerShell,
-                    path: path.clone(),
-                    reason: "the profile PowerShell reads",
-                    shared: false,
-                };
-                let body = startup::entry(&target, &package.startup_entry, false)
-                    .expect("the package's entry is text");
-                startup::install(&path, &body, startup::Placement::of(ShellKind::PowerShell))
-                    .expect("the entry goes into the profile");
+                // The entries go in as `kr shell install` puts them: the one that opens the bridge
+                // is the first thing in the first profile and the one that checks the reader is the
+                // last thing in the last.
+                for target in startup::powershell_targets(all_hosts, current_host) {
+                    let body = startup::entry(&target, &package.startup_entry, false)
+                        .expect("the package's entry is text");
+                    startup::install(&target.path, &body, target.placement)
+                        .expect("the entry goes into the profile");
+                }
             }
-            let mut written = std::fs::read_to_string(&path).expect("the startup file");
-            written.push_str(profile.after_entry);
-            std::fs::write(&path, written).expect("the startup file");
         }
     }
 }
