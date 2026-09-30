@@ -5,13 +5,19 @@
 //! database serves both here, so an application that reads a capability and an application that
 //! asks for it over the wire get the same answer.
 //!
+//! [`compiled`] writes the same data as the binary file a terminfo library loads, so the managed
+//! environment can point a session's own libraries at it.
+//!
 //! The database is also the input to the class-coverage check: every capability it advertises is
 //! lexed and must land in a supported class. A capability whose sequence would be consumed with a
 //! diagnostic is not advertised, which is why this database is not the stock entry.
 
+mod compile;
 mod data;
 mod expand;
+mod names;
 
+pub use compile::{CompileError, Description, TERMINAL_NAMES, compiled, write_database};
 pub use expand::{Param, expand};
 
 use crate::class::SequenceClass;
