@@ -87,7 +87,8 @@ install checked takes its place, so nothing it was short of, changed in, linked 
 writable survives, and nothing outside the store is touched. A release a running program holds is
 not removed, and the install waits, exit 9. Another release under the same name is refused, and so
 is a directory whose manifest is a link or a pipe, which is not read: the install names the
-directory and says to remove it and run the command again.
+directory and says to make it writable, as a release in the store is not, remove it, and run the
+command again.
 
 An install or an update waits for a control daemon that is starting, which holds the install lock
 while it starts, for at most thirty seconds, and an update does so before it stops anything. A
