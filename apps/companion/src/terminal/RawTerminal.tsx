@@ -21,7 +21,8 @@
  * click on the terminal that selects nothing puts the focus in it, and the terminal shows a focus
  * ring while it has it. What an input method composes is drawn at the cursor's cell in the session's
  * colours until it is committed. When control ends with the focus in it, the focus goes to the mode
- * button, which takes control again.
+ * button, which takes control again; so does the focus of Attach again, pressed from the keyboard,
+ * once the view is open again.
  *
  * The frame is drawn where the moves the page made and native code has not yet settled will put
  * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates. Every change
@@ -64,7 +65,7 @@ import {
   selectionRule,
   type PlacedCursor
 } from './frame'
-import { useFocusWhenControlEnds } from './focus'
+import { useFocusWhenControlEnds, useKeyboardPress } from './focus'
 import { cellUnder, wheelPixels, wheelTurns } from './input'
 import { useProgramKeyboard } from './keyboard'
 import { applePlatform, SENTINEL } from './keys'
@@ -341,13 +342,18 @@ export function RawTerminal({
   const modeButtonId = useId()
   const sentenceId = useId()
   const attachAgainId = useId()
+  const attachAgain = useKeyboardPress(attachAgainId)
 
   // Focus that the program's keyboard or the mode button held when control or the view ends goes to
   // the mode button, which takes control again, or once the view has ended to Attach again: a field
-  // that has gone, or a button that is disabled, is no place to leave it.
+  // that has gone, or a button that is disabled, is no place to leave it. The same goes for Attach
+  // again, pressed from the keyboard, once the view is open again.
   useFocusWhenControlEnds({
     state: ended ? 'ended' : (control?.state ?? 'none'),
-    heldFor: (element) => element?.matches('[data-program-keyboard]') === true || element?.id === modeButtonId,
+    heldFor: (element) =>
+      element?.matches('[data-program-keyboard]') === true ||
+      element?.id === modeButtonId ||
+      attachAgain.held(element),
     destination: () => document.getElementById(ended ? attachAgainId : modeButtonId)
   })
 
@@ -603,7 +609,14 @@ export function RawTerminal({
       {state?.state === 'ended' ? (
         <div className="banner warning row between" role="status" data-testid="terminal-ended">
           <span>{state.reason}</span>
-          <Button id={attachAgainId} data-testid="attach-again" onClick={again}>
+          <Button
+            id={attachAgainId}
+            data-testid="attach-again"
+            onClick={(event) => {
+              attachAgain.press(event)
+              again()
+            }}
+          >
             Attach again
           </Button>
         </div>

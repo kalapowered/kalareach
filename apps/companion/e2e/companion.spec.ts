@@ -1181,6 +1181,59 @@ test.describe("the program's keyboard", () => {
     expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true)
   })
 
+  for (const by of ['pointer', 'keyboard'] as const) {
+    test(`the desktop's focus ${by === 'keyboard' ? 'goes to the mode button' : 'stays where a pointer left it'} when Attach again is pressed from the ${by}`, async ({
+      page
+    }) => {
+      await openSession(page)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+      await page.evaluate(() => {
+        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
+      })
+      const again = page.getByRole('button', { name: 'Attach again' })
+      if (by === 'keyboard') {
+        await again.focus()
+        await page.keyboard.press('Enter')
+      } else {
+        await again.click()
+      }
+      await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Take control' })).toBeEnabled()
+      if (by === 'keyboard') {
+        await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
+      } else {
+        await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+      }
+    })
+
+    test(`the phone's focus ${by === 'keyboard' ? 'goes to the mode button' : 'stays where a pointer left it'} when Attach again is pressed from the ${by}`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await page.evaluate(() => {
+        window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
+      })
+      const again = page.getByRole('button', { name: 'Attach again' })
+      if (by === 'keyboard') {
+        await again.focus()
+        await page.keyboard.press('Enter')
+      } else {
+        await again.click()
+      }
+      await expect(page.getByTestId('attach-again')).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Take control' })).toBeEnabled()
+      if (by === 'keyboard') {
+        await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
+      } else {
+        await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+      }
+    })
+  }
+
   test("the phone's focus goes to the mode button once a software keyboard has gone, when control ends under it", async ({
     page
   }) => {

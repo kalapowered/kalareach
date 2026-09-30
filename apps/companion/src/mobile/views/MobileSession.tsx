@@ -81,7 +81,7 @@ import {
   type HeldDrag,
   type Point
 } from '../../terminal/pan'
-import { useFocusWhenControlEnds } from '../../terminal/focus'
+import { useFocusWhenControlEnds, useKeyboardPress } from '../../terminal/focus'
 import { moveFocus, useProgramKeyboard, type Latched } from '../../terminal/keyboard'
 import { focusEscape, readingOf, SENTINEL } from '../../terminal/keys'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
@@ -556,15 +556,18 @@ export function MobileSession({
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
   // view ends goes to the mode button, which takes control again, or once the view has ended to
   // Attach again: a key that can no longer be pressed, a field that has gone, or a disabled button,
-  // is no place to leave it. While a software keyboard is up the bar holding the mode button is
-  // hidden, and the focus goes there once it is back.
+  // is no place to leave it. The same goes for Attach again, pressed from the keyboard, once the
+  // view is open again. While a software keyboard is up the bar holding the mode button is hidden,
+  // and the focus goes there once it is back.
   const terminalEnded = terminal?.state === 'ended'
+  const attachAgain = useKeyboardPress(attachAgainId)
   useFocusWhenControlEnds({
     state: terminalEnded ? 'ended' : (control?.state ?? 'none'),
     heldFor: (element) =>
       element?.closest('.m-accessory') != null ||
       element?.matches('[data-program-keyboard]') === true ||
-      element?.id === modeButtonId,
+      element?.id === modeButtonId ||
+      attachAgain.held(element),
     destination: () => document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
   })
 
@@ -775,7 +778,14 @@ export function MobileSession({
                 title="This terminal has ended"
                 detail={terminal.reason}
                 action={
-                  <Button id={attachAgainId} data-testid="attach-again" onClick={again}>
+                  <Button
+                    id={attachAgainId}
+                    data-testid="attach-again"
+                    onClick={(event) => {
+                      attachAgain.press(event)
+                      again()
+                    }}
+                  >
                     Attach again
                   </Button>
                 }
