@@ -162,7 +162,7 @@ function play(text: string, columns: number, rows: number): Played {
   }
 }
 
-describe('a screen as a recording draws it (KR-REQ-25.08)', () => {
+describe('a screen as a recording draws it (KR-REQ-25.25)', () => {
   it('draws each piece at its own cells, as the view does, and the cursor where the view drew it', () => {
     const drawnScreen = screenOf(
       12,
@@ -274,7 +274,7 @@ describe('a screen as a recording draws it (KR-REQ-25.08)', () => {
   })
 })
 
-describe('the recording the raw view keeps (KR-REQ-25.08)', () => {
+describe('the recording the raw view keeps (KR-REQ-25.25)', () => {
   const first = screenOf(10, 2, [[piece(0, 'one')]])
   const second = screenOf(10, 2, [[piece(0, 'two')]])
 
