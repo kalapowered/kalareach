@@ -21,6 +21,8 @@ kr-ipc.workspace = true
 kr-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The name of the lock that holds two writers of one startup file apart is a digest of the file.
+sha2.workspace = true
 thiserror.workspace = true
 
 # A startup file is rewritten under a lock the kernel holds, so a `kr` process that dies releases
@@ -38,7 +40,6 @@ hmac.workspace = true
 # holds it open for writing when it is started.
 kr-ipc = { workspace = true, features = ["testing"] }
 portable-pty.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

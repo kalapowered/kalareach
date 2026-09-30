@@ -271,7 +271,7 @@ pub fn install(
                 Change::Added
             }
         } else {
-            startup::install(&entry.file, body).map_err(|error| {
+            startup::install(&entry.file, body, record).map_err(|error| {
                 CliError::Other(shown!(
                     "{}: {}",
                     Shown::root(&entry.file),
@@ -375,7 +375,7 @@ pub fn remove(
                 }
             }
             Some(held) => {
-                let change = startup::remove(&file).map_err(|error| {
+                let change = startup::remove(&file, record).map_err(|error| {
                     CliError::Other(shown!("{}: {}", Shown::root(&file), Shown::io(&error)))
                 })?;
                 held.forget(kind, &file)
@@ -663,7 +663,7 @@ mod tests {
         )
         .expect("the path is text");
         assert_eq!(
-            startup::install(&zshrc, &body).expect("installs"),
+            startup::install(&zshrc, &body, &record).expect("installs"),
             Change::Added
         );
         // The install that wrote it recorded the file.
