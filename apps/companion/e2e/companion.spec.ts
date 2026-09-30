@@ -98,6 +98,8 @@ async function withTextSize(page: Page, size: string): Promise<void> {
       const root = document.documentElement as HTMLElement | null
       if (root === null) return false
       root.style.fontSize = scale
+      // What the page's own scripts found on the root before any of them ran, for a test to say.
+      ;(window as unknown as { krTextSizeAtLoad?: string }).krTextSizeAtLoad = scale
       return true
     }
     if (!apply()) {
@@ -106,6 +108,18 @@ async function withTextSize(page: Page, size: string): Promise<void> {
       }).observe(document, { childList: true })
     }
   }, size)
+}
+
+/**
+ * Holds a test to its text size having been the page's from its first frame: a size set after the
+ * page loaded lays the page out once at the base size first, and a layout that only holds after a
+ * second pass is not the layout a person with the setting opens.
+ */
+async function expectTextSizeFromLoad(page: Page, size: string): Promise<void> {
+  expect(
+    await page.evaluate(() => (window as unknown as { krTextSizeAtLoad?: string }).krTextSizeAtLoad),
+    `the text size ${size} is set before the page loads`
+  ).toBe(size)
 }
 
 /**
@@ -1780,13 +1794,12 @@ test.describe("the phone's room for its terminal", () => {
         test(`keeps the field whole and room for the terminal on ${surface} at ${phone.width}×${phone.height} with text at ${scale}`, async ({
           page
         }) => {
+          await withTextSize(page, scale)
           await page.setViewportSize({ width: phone.width, height: phone.height })
           await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
           await page.getByRole('tab', { name: 'Terminal' }).click()
           await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-          await page.evaluate((size) => {
-            document.documentElement.style.fontSize = size
-          }, scale)
+          await expectTextSizeFromLoad(page, scale)
           const field = page.getByLabel('Message this session')
           await field.fill('ls -la')
           const fits = await field.evaluate((element) => ({
