@@ -540,7 +540,7 @@ pub fn install(
             }
         }
         (Some((before, _block, after)), Placement::Start) => {
-            let rebuilt = format!("{body}{before}{after}");
+            let rebuilt = at_the_start(&format!("{before}{after}"), body);
             if rebuilt == existing {
                 (Change::Unchanged, rebuilt)
             } else {
@@ -557,7 +557,7 @@ pub fn install(
             }
             (Change::Added, rebuilt)
         }
-        (None, Placement::Start) => (Change::Added, format!("{body}{existing}")),
+        (None, Placement::Start) => (Change::Added, at_the_start(&existing, body)),
     };
     if change != Change::Unchanged {
         if let Some(parent) = path.parent() {
@@ -566,6 +566,85 @@ pub fn install(
         replace(path, &existing, &updated)?;
     }
     Ok(change)
+}
+
+/// Puts `body` at the start of a profile: before everything the person wrote that is a statement,
+/// and after the parts PowerShell requires to come first.
+///
+/// A byte-order mark has to stay the first bytes of the file. A `using` statement is accepted only
+/// before every other statement, and a script `param` block only before the script's own
+/// statements, so an entry put ahead of them would make PowerShell refuse the whole profile, in
+/// every shell and not only the ones KalaReach starts. Comments and `#Requires` lines are what
+/// people put above those, and the entry goes below them too.
+fn at_the_start(profile: &str, body: &str) -> String {
+    let at = prologue_end(profile);
+    let (head, rest) = profile.split_at(at);
+    let separator = if head.is_empty() || head.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{head}{separator}{body}{rest}")
+}
+
+/// Returns where the part of a PowerShell profile that has to stay first ends.
+fn prologue_end(profile: &str) -> usize {
+    let mut at = if profile.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut in_block_comment = false;
+    let mut lines = profile[at..].split_inclusive('\n').peekable();
+    while let Some(line) = lines.peek().copied() {
+        let text = line.trim();
+        let lowered = text.to_ascii_lowercase();
+        if in_block_comment {
+            in_block_comment = !text.contains("#>");
+        } else if text.is_empty() || text.starts_with('#') {
+            // A blank line, a comment or a `#Requires` line.
+        } else if text.starts_with("<#") {
+            in_block_comment = !text.contains("#>");
+        } else if lowered.starts_with("using ") {
+            // A `using` statement.
+        } else if lowered.starts_with("[cmdletbinding") || lowered.starts_with("param") {
+            // A script's own parameters: an attribute line and a block that runs to the closing
+            // parenthesis of its first opening one.
+            let mut depth = 0_i32;
+            let mut in_block = false;
+            let mut consumed = 0_usize;
+            for block_line in profile[at..].split_inclusive('\n') {
+                let lowered = block_line.trim().to_ascii_lowercase();
+                if !in_block
+                    && !lowered.starts_with("param")
+                    && !lowered.starts_with("[cmdletbinding")
+                {
+                    break;
+                }
+                consumed += block_line.len();
+                if in_block || lowered.starts_with("param") {
+                    in_block = true;
+                    for character in block_line.chars() {
+                        match character {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    if depth <= 0 && block_line.contains(')') {
+                        break;
+                    }
+                }
+            }
+            at += consumed;
+            return at;
+        } else {
+            break;
+        }
+        at += line.len();
+        lines.next();
+    }
+    at
 }
 
 /// Removes one shell's guarded entry, and nothing else.
@@ -1964,6 +2043,83 @@ mod tests {
             std::fs::read_to_string(&path).expect("reads"),
             format!("{body}{theirs}")
         );
+    }
+
+    /// KR-REQ-07.23: a PowerShell entry goes below what PowerShell requires to come first, so a
+    /// profile that begins with `using` statements, a script `param` block, comments or a
+    /// byte-order mark still parses, in every shell and not only the ones KalaReach starts.
+    #[test]
+    fn a_powershell_entry_stays_below_what_a_profile_must_begin_with() {
+        let root = tempfile::tempdir().expect("a directory");
+        let body = entry(
+            &for_shell(ShellKind::PowerShell),
+            Path::new("/opt/kr/entry"),
+            false,
+        )
+        .expect("the path is text");
+        for (name, theirs, prologue) in [
+            (
+                "using",
+                "using namespace System.Management.Automation\nusing module Foo\n$env:A = 1\n",
+                "using namespace System.Management.Automation\nusing module Foo\n",
+            ),
+            (
+                "comments",
+                "# my profile\n#Requires -Version 7\n\n$env:A = 1\n",
+                "# my profile\n#Requires -Version 7\n\n",
+            ),
+            (
+                "block comment",
+                "<#\n  notes\n#>\nusing namespace System\n$env:A = 1\n",
+                "<#\n  notes\n#>\nusing namespace System\n",
+            ),
+            (
+                "param",
+                "using namespace System\n[CmdletBinding()]\nparam(\n  [string]$Name\n)\n$env:A = 1\n",
+                "using namespace System\n[CmdletBinding()]\nparam(\n  [string]$Name\n)\n",
+            ),
+            (
+                "byte-order mark",
+                "\u{feff}using namespace System\n$env:A = 1\n",
+                "\u{feff}using namespace System\n",
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.ps1"));
+            std::fs::write(&path, theirs).expect("writes");
+            assert_eq!(
+                install(&path, &body, Placement::Start).expect("installs"),
+                Change::Added,
+                "{name}"
+            );
+            let written = std::fs::read_to_string(&path).expect("reads");
+            assert!(written.starts_with(prologue), "{name}: {written:?}");
+            assert_eq!(
+                written,
+                format!("{prologue}{body}{}", &theirs[prologue.len()..]),
+                "{name}: the entry sits directly below the prologue"
+            );
+            // An entry an earlier install put at the end moves below the prologue too, and a
+            // second install is no change.
+            let earlier = root.path().join(format!("{name}-earlier.ps1"));
+            std::fs::write(&earlier, theirs).expect("writes");
+            install(&earlier, &body, Placement::End).expect("installs");
+            assert_eq!(
+                install(&earlier, &body, Placement::Start).expect("moves"),
+                Change::Replaced,
+                "{name}"
+            );
+            assert_eq!(std::fs::read_to_string(&earlier).expect("reads"), written);
+            assert_eq!(
+                install(&earlier, &body, Placement::Start).expect("installs"),
+                Change::Unchanged
+            );
+            assert_eq!(remove(&path).expect("removes"), Change::Removed);
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}"
+            );
+        }
     }
 
     /// KR-REQ-07.40: a filesystem whose identity numbers move does not refuse a legitimate write.
