@@ -133,6 +133,97 @@ fn the_configured_chord_detaches_and_any_other_key_is_the_editors_own() {
     shellpkg::the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_own(PWSH);
 }
 
+/// The editors this suite stands in for the real one with: each is a .NET type with the two fields
+/// the module reads its queue from, or something short of that.
+///
+/// `live` is what the qualified editor looks like from the module's side: a static instance whose
+/// queue holds two keys. The others each leave out one thing a fence rests on, and each was
+/// accepted by a check that only asked whether the two fields existed.
+const STAND_IN_EDITORS: &str = r#"
+using System.Collections.Generic;
+public class KrEditorLive { private static KrEditorLive _singleton = new KrEditorLive(); private Queue<object> _queuedKeys = new Queue<object>(new object[] { 1, 2 }); }
+public class KrEditorRenamed { private static KrEditorRenamed _singleton = new KrEditorRenamed(); private Queue<object> _pendingKeys = new Queue<object>(); }
+public class KrEditorNoInstance { private static KrEditorNoInstance _singleton = null; private Queue<object> _queuedKeys = new Queue<object>(); }
+public class KrEditorNoQueue { private static KrEditorNoQueue _singleton = new KrEditorNoQueue(); private Queue<object> _queuedKeys = null; }
+public class KrEditorNotAQueue { private static KrEditorNotAQueue _singleton = new KrEditorNotAQueue(); private string _queuedKeys = "none"; }
+"#;
+
+/// KR-REQ-07.85: the package qualifies an editor only when the queue a fence rests on answers.
+///
+/// A check that the queue's two fields exist accepts an editor whose instance is not made yet,
+/// whose queue is null or whose field holds something that is not a queue, and the reader would then
+/// report every queue clear because it read nothing. The module reads the live queue instead, through
+/// the function a fence reads it with. Each stand-in editor here is put in the module's place in
+/// turn, and the control is the editor the package was qualified against, which the module read
+/// before any of them was.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
+    let package = shellpkg::Package::built(PWSH);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory");
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition @'{STAND_IN_EDITORS}'@; \
+         $module = Get-Module KalaReach.ShellBridge; \
+         $real = & $module {{ @{{ Reason = (Test-KrQualifiedEditor).Reason; Keys = Get-KrQueuedKeys }} }}; \
+         Write-Output \"kr-queue[real]=[$($real.Reason)] keys=[$($real.Keys)]\"; \
+         foreach ($name in 'KrEditorLive', 'KrEditorRenamed', 'KrEditorNoInstance', 'KrEditorNoQueue', 'KrEditorNotAQueue') {{ \
+             $answer = & $module {{ param($editor) \
+                 $script:SingletonField = $null; $script:QueuedKeysField = $null; $script:Rl = $editor; \
+                 @{{ Reason = (Test-KrQualifiedEditor).Reason; Keys = Get-KrQueuedKeys }} }} ([type]$name); \
+             Write-Output \"kr-queue[$name]=[$($answer.Reason)] keys=[$($answer.Keys)]\" \
+         }}"
+    );
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    let answer = |name: &str| -> (String, String) {
+        let line = said
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("kr-queue[{name}]=[")))
+            .unwrap_or_else(|| panic!("the module said nothing about {name}:\n{said}\n{told}"));
+        let (reason, keys) = line.split_once("] keys=[").expect("the answer's shape");
+        (reason.to_owned(), keys.trim_end_matches(']').to_owned())
+    };
+
+    assert_eq!(
+        answer("real"),
+        (String::new(), "0".to_owned()),
+        "the editor the package was qualified against reads as an empty queue and is accepted"
+    );
+    assert_eq!(
+        answer("KrEditorLive"),
+        (String::new(), "2".to_owned()),
+        "an editor whose queue answers is read for what it holds, not for whether it has fields"
+    );
+    for stand_in in [
+        "KrEditorRenamed",
+        "KrEditorNoInstance",
+        "KrEditorNoQueue",
+        "KrEditorNotAQueue",
+    ] {
+        assert_eq!(
+            answer(stand_in),
+            ("psreadline_queue_unreadable".to_owned(), "0".to_owned()),
+            "{stand_in} keeps no queue the module can read, and the package qualified it anyway"
+        );
+    }
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
