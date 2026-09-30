@@ -41,7 +41,8 @@ say "building the harness bundle"
 ( cd "$companion" && pnpm build:harness ) >"$artefacts/build.log" 2>&1
 
 say "serving it on port $port"
-( cd "$companion" && node scripts/preview-harness.mjs ) >"$artefacts/serve.log" 2>&1 &
+# The server is told this script's process, so a run that is killed leaves no server serving.
+( cd "$companion" && node scripts/preview-harness.mjs "$port" "$$" ) >"$artefacts/serve.log" 2>&1 &
 server=$!
 # Only ever this process: another worker's server on another port is not this script's to stop.
 trap 'kill "$server" 2>/dev/null || true' EXIT

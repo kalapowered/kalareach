@@ -98,7 +98,7 @@ end_tree() {
 
 cleanup() {
     # Only what this run started, and only by the identity this run recorded. The harness server is
-    # a shell, a launcher and the server itself; all three go.
+    # a subshell and the server process it runs; both go.
     if [ "${server:-0}" -ne 0 ]; then
         end_tree "${server:?}"
         wait "${server:?}" 2>/dev/null || true
@@ -168,7 +168,8 @@ if curl -s -o /dev/null "http://localhost:$port/"; then
     exit 2
 fi
 say "serving the harness on port $port"
-( cd "$companion" && PORT="$port" node scripts/preview-harness.mjs ) >"$artefacts/serve.log" 2>&1 &
+# The server is told this script's process, so a run that is killed leaves no server serving.
+( cd "$companion" && node scripts/preview-harness.mjs "$port" "$$" ) >"$artefacts/serve.log" 2>&1 &
 server=$!
 
 ready=0
