@@ -484,6 +484,39 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     );
 }
 
+/// Whether privacy mode's record reports the session's worker as ended.
+fn is_ended(controller: &Controller, session_id: SessionId) -> bool {
+    controller
+        .privacy
+        .status(kr_ipc::now_ms())
+        .sessions
+        .iter()
+        .any(|owed| {
+            owed.session_id == session_id
+                && matches!(
+                    owed.standing,
+                    kr_protocol::privacy::PrivacySessionStanding::WorkerEnded
+                )
+        })
+}
+
+/// Waits until privacy mode's tick has taken every session in `sessions` for ended, and fails the
+/// test when it has not within thirty seconds.
+async fn ended(controller: &Controller, sessions: &[SessionId]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !sessions
+        .iter()
+        .all(|session_id| is_ended(controller, *session_id))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never took the sessions for ended: {:?}",
+            controller.privacy.status(kr_ipc::now_ms()).sessions
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// KR-REQ-24.28: privacy mode's tick takes a session for ended only on the registry's evidence.
 /// Two sessions owe their cleanup and have no worker: one whose launch was claimed, one whose
 /// reservation was fenced. Through every pass of the tick each may still have a worker, so turning
@@ -514,9 +547,15 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
         );
     }
 
-    // One launch is over, and the other may still produce a worker: it holds the change back.
+    // One launch is over, and the other may still produce a worker. The pass that takes the first
+    // for ended is a pass that has read the registry with the second fenced, so once it has been
+    // seen the second is known to have been passed over, and it holds the change back.
     recorded_as(&controller, claimed, LaunchPhase::Failed).await;
-    tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
+    ended(&controller, &[claimed]).await;
+    assert!(
+        !is_ended(&controller, fenced),
+        "the fenced launch may still produce a worker, so its session is not ended"
+    );
     let refused = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
@@ -528,27 +567,7 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
 
     // Both are over: the next pass takes them for ended, and privacy mode is turned off.
     recorded_as(&controller, fenced, LaunchPhase::Failed).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let report = controller.privacy.status(kr_ipc::now_ms());
-        if [claimed, fenced].iter().all(|session_id| {
-            report.sessions.iter().any(|owed| {
-                owed.session_id == *session_id
-                    && matches!(
-                        owed.standing,
-                        kr_protocol::privacy::PrivacySessionStanding::WorkerEnded
-                    )
-            })
-        }) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the tick never took the sessions for ended: {:?}",
-            report.sessions
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    ended(&controller, &[claimed, fenced]).await;
     let off = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
