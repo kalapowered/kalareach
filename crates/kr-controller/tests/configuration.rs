@@ -1579,7 +1579,6 @@ async fn a_document_naming_a_disable_policy_puts_it_in_force_at_the_next_accepta
     );
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
-    accept(host.controller()).await;
     let (carried, held, _) = policy_in_force(host.controller()).await;
     assert_eq!(
         carried,
