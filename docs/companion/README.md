@@ -36,6 +36,12 @@ output is read from its worker while it runs and from the daemon's archive once 
 operation whose parameters or result the protocol does not publish has no command, and the page
 refuses it with `UNSUPPORTED_SCHEMA`.
 
+A failure the page shows says the host's own words and, where its code maps to something the person
+can do, that action after them: pair the device again, sign in, update, wait, refresh, check
+whether it went through, or change a setting. It never says the code. A failure whose code asks
+nothing of the person says the host's words alone. Native code names the action by its key, and the
+page's words for each key are the client library's own.
+
 Native code tells the page about changes through listeners: the connection's state, the host's
 events, where the account stands, pairing, owner confirmations and dropped files. The shell
 registers a listener asynchronously and drops whatever it publishes before then. Each listener
