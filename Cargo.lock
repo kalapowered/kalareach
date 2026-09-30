@@ -4932,6 +4932,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-term-probe"
+version = "0.1.0"
+dependencies = [
+ "kr-term",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kr-transfer"
 version = "0.1.0"
 dependencies = [
