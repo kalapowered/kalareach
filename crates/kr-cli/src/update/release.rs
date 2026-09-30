@@ -251,8 +251,8 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 /// How long the system's own tool that says its version is given.
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How much a tool may print: the tool that says a version prints a line, and one that prints more
-/// is given up on.
+/// How much a tool may print: the tool that says a version prints a short line, and one that prints
+/// more than this is given up on.
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
@@ -278,11 +278,11 @@ fn run_bounded(
         let _ = child.kill();
         let _ = child.wait();
     };
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(mut pipe) = child.stdout.take() else {
         ended(&mut child);
         return None;
     };
-    if rustix::fs::fcntl_setfl(&stdout, rustix::fs::OFlags::NONBLOCK).is_err() {
+    if rustix::fs::fcntl_setfl(&pipe, rustix::fs::OFlags::NONBLOCK).is_err() {
         ended(&mut child);
         return None;
     }
@@ -297,7 +297,7 @@ fn run_bounded(
                 return None;
             }
             let mut buffer = [0_u8; 512];
-            match stdout.read(&mut buffer) {
+            match pipe.read(&mut buffer) {
                 Ok(0) => open = false,
                 Ok(read) => {
                     printed.extend_from_slice(&buffer[..read]);
@@ -308,7 +308,11 @@ fn run_bounded(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => open = false,
+                // A pipe that cannot be read says nothing of where the output ended.
+                Err(_) => {
+                    ended(&mut child);
+                    return None;
+                }
             }
         }
         if status.is_none() {
