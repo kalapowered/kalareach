@@ -4,7 +4,20 @@ use std::path::Path;
 
 fn main() {
     ensure_frontend_placeholder();
+    align_the_android_library_for_large_pages();
     tauri_build::try_build(attributes()).expect("the Tauri build step");
+}
+
+/// Aligns the Android library's load segments to 16 KB.
+///
+/// Android 15 and later can run with 16 KB memory pages, and a library whose segments are aligned
+/// to 4 KB is refused there, or run through a compatibility mode with a notice. The linker of the
+/// newest toolchain aligns to 16 KB by default and an older one does not, and the toolchain a build
+/// finds is whichever the machine names, so the alignment is stated here rather than left to it.
+fn align_the_android_library_for_large_pages() {
+    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "android") {
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-z,max-page-size=16384");
+    }
 }
 
 /// Tauri's build attributes, with the Windows application manifest in every binary.
