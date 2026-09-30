@@ -266,3 +266,17 @@ fn a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagn
 fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate() {
     shellpkg::an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(PWSH);
 }
+
+/// KR-REQ-01.06
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn ordinary_commands_and_agent_names_run_as_they_do_without_the_integration() {
+    shellpkg::ordinary_commands_and_agent_names_run_as_in_an_unmanaged_shell(PWSH);
+}
+
+/// KR-REQ-01.06
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_alias_that_changes_an_agent_name_is_reported_by_the_comparison() {
+    shellpkg::a_planted_alias_that_changes_an_agent_name_is_reported_not_hidden(PWSH);
+}

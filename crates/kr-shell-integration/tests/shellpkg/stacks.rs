@@ -1208,6 +1208,7 @@ impl Session {
             stepping: true,
             last_entry: None,
             stream,
+            _bridge_peer: None,
             shut: false,
             peer_write_gone: false,
             peer_read_gone: false,

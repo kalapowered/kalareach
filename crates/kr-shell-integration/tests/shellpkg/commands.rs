@@ -1163,3 +1163,738 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         "each request the reader held was answered once, in the order it came"
     );
 }
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-01.06: ordinary commands and agent names run in a managed session as they do in the
+// same shell without KalaReach.
+// --------------------------------------------------------------------------------------------
+
+/// The six agents the bundled adapters cover, by the command a person types for each.
+const AGENT_NAMES: [&str; 6] = ["codex", "claude", "opencode", "gemini", "kimi", "qodercli"];
+
+/// The marker each line of the corpus ends by printing, put together by the shell from two pieces
+/// so a terminal echoing the line cannot produce it.
+const ITEM_DONE: &str = "kr-item-done";
+
+/// What a comparison between a managed shell and an ordinary one runs against: programs on the
+/// search path, a script and directories the two share, and a place of its own for each shell to
+/// leave what it saw.
+struct Corpus {
+    _directory: tempfile::TempDir,
+    root: PathBuf,
+}
+
+/// What one shell left behind: the files its corpus wrote, and every start of each agent.
+struct Observed {
+    files: BTreeMap<String, String>,
+    starts: BTreeMap<String, Vec<ProbeRun>>,
+}
+
+impl Corpus {
+    /// Makes the directory, one recording program per agent name on its search path, a script that
+    /// runs one of them and a directory to move to.
+    fn new() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("kr-corpus-")
+            .tempdir()
+            .expect("a directory on the internal disk");
+        let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
+        std::fs::create_dir_all(root.join("bin")).expect("a directory for the programs");
+        std::fs::create_dir_all(root.join("dirs").join("one")).expect("a directory to move to");
+        for name in AGENT_NAMES {
+            // Every variable it was started with, so an environment that differs anywhere shows.
+            let script = format!(
+                "#!/bin/sh\n\
+                 {{\n\
+                 printf 'run\\n'\n\
+                 for word in \"$@\"; do printf 'arg %s\\n' \"$word\"; done\n\
+                 env | LC_ALL=C sort | while IFS= read -r line; do printf 'env %s\\n' \"$line\"; done\n\
+                 printf 'end\\n'\n\
+                 }} >> \"$CASE_RECORD/{name}.record\"\n\
+                 printf '%s%s\\n' '{name}-' 'ran'\n"
+            );
+            let program = root.join("bin").join(name);
+            place(&program, script.as_bytes());
+            // Started once here, outside every timed wait, with somewhere to record.
+            let scratch = root.join("scratch");
+            std::fs::create_dir_all(&scratch).expect("a scratch directory");
+            let status = std::process::Command::new(&program)
+                .env("CASE_RECORD", &scratch)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("the program starts");
+            assert!(status.success());
+        }
+        std::fs::write(root.join("script.sh"), "claude from-a-script\n").expect("a script");
+        Self {
+            _directory: directory,
+            root,
+        }
+    }
+
+    /// What a shell is started with: the search path with the agents' stand-ins first, and where
+    /// this shell leaves what it saw. The names carry no `KR_` prefix, so a comparison that
+    /// leaves out the reserved variables leaves out none of these.
+    fn environment(&self, arena: &Path) -> Vec<(String, String)> {
+        std::fs::create_dir_all(arena.join("out")).expect("somewhere to leave files");
+        std::fs::create_dir_all(arena.join("records")).expect("somewhere to record starts");
+        let inherited = std::env::var("PATH").expect("a search path that is text");
+        vec![
+            (
+                "PATH".to_owned(),
+                format!("{}:{inherited}", told(&self.root.join("bin"))),
+            ),
+            ("CASE_OUT".to_owned(), told(&arena.join("out"))),
+            ("CASE_RECORD".to_owned(), told(&arena.join("records"))),
+            ("CASE_DIRS".to_owned(), told(&self.root.join("dirs"))),
+            ("CASE_BIN".to_owned(), told(&self.root.join("bin"))),
+            ("CASE_SCRIPT".to_owned(), told(&self.root.join("script.sh"))),
+        ]
+    }
+}
+
+/// One thing the corpus does, in one shell's words. Every line leaves what it saw in a file of its
+/// own under `$CASE_OUT` rather than on the terminal, where the editor's drawing would be part of
+/// what is compared.
+struct Item {
+    name: &'static str,
+    lines: Vec<String>,
+}
+
+fn item(name: &'static str, lines: &[&str]) -> Item {
+    Item {
+        name,
+        lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+    }
+}
+
+/// The ordinary commands: pipes, redirects, moving about, aliases, functions, `exec`, exit
+/// statuses and signals, and what the shell says about itself.
+fn ordinary_items(kind: ShellKind) -> Vec<Item> {
+    match kind {
+        ShellKind::Zsh | ShellKind::Bash => vec![
+            item(
+                "pipe",
+                &["printf 'a\\nb\\nc\\n' | tr a-c A-C | sort -r > \"$CASE_OUT/pipe\""],
+            ),
+            item(
+                "redirect",
+                &[
+                    "{ printf x; printf y; } > \"$CASE_OUT/redirect\" 2> \"$CASE_OUT/redirect.err\"; printf z >> \"$CASE_OUT/redirect\"; ls /kr-no-such-path 2>> \"$CASE_OUT/redirect.err\"; printf 'ls=%s' $? >> \"$CASE_OUT/redirect\"",
+                ],
+            ),
+            item(
+                "cd",
+                &[
+                    "cd \"$CASE_DIRS/one\" && pwd -P > \"$CASE_OUT/cd\"; cd \"$CASE_DIRS\" && pwd -P >> \"$CASE_OUT/cd\"; cd \"$HOME\"",
+                ],
+            ),
+            item(
+                "alias",
+                &[
+                    "alias kr_alias='printf alias-%s'",
+                    "kr_alias ran > \"$CASE_OUT/alias\"; type kr_alias >> \"$CASE_OUT/alias\" 2>&1; unalias kr_alias",
+                ],
+            ),
+            item(
+                "function",
+                &[
+                    "kr_fn() { printf 'fn-%s' \"$1\"; }",
+                    "kr_fn arg > \"$CASE_OUT/function\"; type kr_fn >> \"$CASE_OUT/function\" 2>&1; unset -f kr_fn",
+                ],
+            ),
+            item(
+                "exec",
+                &[
+                    "(exec printf 'exec-%s' ran) > \"$CASE_OUT/exec\"; printf ' status=%s' $? >> \"$CASE_OUT/exec\"",
+                ],
+            ),
+            item(
+                "status",
+                &[
+                    "(exit 3); printf 'a=%s ' $? > \"$CASE_OUT/status\"; false; printf 'b=%s ' $? >> \"$CASE_OUT/status\"; sh -c 'exit 7'; printf 'c=%s ' $? >> \"$CASE_OUT/status\"; true; printf 'd=%s' $? >> \"$CASE_OUT/status\"",
+                ],
+            ),
+            item(
+                "signals",
+                &[
+                    "sh -c 'kill -TERM $$'; printf 'term=%s ' $? > \"$CASE_OUT/signals\"; sh -c 'kill -HUP $$'; printf 'hup=%s ' $? >> \"$CASE_OUT/signals\"; sh -c 'kill -KILL $$'; printf 'kill=%s' $? >> \"$CASE_OUT/signals\"",
+                ],
+            ),
+            item(
+                "self",
+                &[
+                    "{ printf '%s\\n' \"$0\"; command -v ls; command -v sh; command -v kr-no-such; printf 'st=%s\\n' $?; } > \"$CASE_OUT/self\" 2>&1",
+                ],
+            ),
+        ],
+        ShellKind::Fish => vec![
+            item(
+                "pipe",
+                &["printf 'a\\nb\\nc\\n' | tr a-c A-C | sort -r > $CASE_OUT/pipe"],
+            ),
+            item(
+                "redirect",
+                &[
+                    "begin; printf x; printf y; end > $CASE_OUT/redirect 2> $CASE_OUT/redirect.err; printf z >> $CASE_OUT/redirect; ls /kr-no-such-path 2>> $CASE_OUT/redirect.err; printf 'ls=%s' $status >> $CASE_OUT/redirect",
+                ],
+            ),
+            item(
+                "cd",
+                &[
+                    "cd $CASE_DIRS/one; and pwd -P > $CASE_OUT/cd; cd $CASE_DIRS; and pwd -P >> $CASE_OUT/cd; cd $HOME",
+                ],
+            ),
+            item(
+                "alias",
+                &[
+                    "alias kr_alias 'printf alias-%s'",
+                    "kr_alias ran > $CASE_OUT/alias; type kr_alias >> $CASE_OUT/alias 2>&1; functions -e kr_alias",
+                ],
+            ),
+            item(
+                "function",
+                &[
+                    "function kr_fn; printf 'fn-%s' $argv[1]; end",
+                    "kr_fn arg > $CASE_OUT/function; type kr_fn >> $CASE_OUT/function 2>&1; functions -e kr_fn",
+                ],
+            ),
+            item(
+                "exec",
+                &[
+                    "sh -c 'exec printf exec-%s ran' > $CASE_OUT/exec; printf ' status=%s' $status >> $CASE_OUT/exec",
+                ],
+            ),
+            item(
+                "status",
+                &[
+                    "sh -c 'exit 3'; printf 'a=%s ' $status > $CASE_OUT/status; false; printf 'b=%s ' $status >> $CASE_OUT/status; sh -c 'exit 7'; printf 'c=%s ' $status >> $CASE_OUT/status; true; printf 'd=%s' $status >> $CASE_OUT/status",
+                ],
+            ),
+            item(
+                "signals",
+                &[
+                    "sh -c 'kill -TERM $$'; printf 'term=%s ' $status > $CASE_OUT/signals; sh -c 'kill -HUP $$'; printf 'hup=%s ' $status >> $CASE_OUT/signals; sh -c 'kill -KILL $$'; printf 'kill=%s' $status >> $CASE_OUT/signals",
+                ],
+            ),
+            item(
+                "self",
+                &[
+                    "begin; status is-interactive; printf 'interactive=%s\\n' $status; command -v ls; command -v sh; command -v kr-no-such; printf 'st=%s\\n' $status; end > $CASE_OUT/self 2>&1",
+                ],
+            ),
+        ],
+        ShellKind::PowerShell => vec![
+            item(
+                "pipe",
+                &[
+                    "'a','b','c' | ForEach-Object { $_.ToUpper() } | Sort-Object -Descending | Set-Content \"$env:CASE_OUT/pipe\"",
+                ],
+            ),
+            item(
+                "redirect",
+                &[
+                    "'x' | Out-File \"$env:CASE_OUT/redirect\"; 'y' | Out-File -Append \"$env:CASE_OUT/redirect\"; Get-Item /kr-no-such-path 2> \"$env:CASE_OUT/redirect.err\"; \"ls=$($?)\" | Out-File -Append \"$env:CASE_OUT/redirect\"",
+                ],
+            ),
+            item(
+                "cd",
+                &[
+                    "Set-Location \"$env:CASE_DIRS/one\"; (Get-Location).Path | Out-File \"$env:CASE_OUT/cd\"; Set-Location \"$env:CASE_DIRS\"; (Get-Location).Path | Out-File -Append \"$env:CASE_OUT/cd\"; Set-Location $HOME",
+                ],
+            ),
+            item(
+                "alias",
+                &[
+                    "Set-Alias kr_alias Write-Output",
+                    "kr_alias alias-ran | Out-File \"$env:CASE_OUT/alias\"; (Get-Command kr_alias).Definition | Out-File -Append \"$env:CASE_OUT/alias\"; Remove-Item alias:kr_alias",
+                ],
+            ),
+            item(
+                "function",
+                &[
+                    "function kr_fn { 'fn-' + $args[0] }",
+                    "kr_fn arg | Out-File \"$env:CASE_OUT/function\"; (Get-Command kr_fn).CommandType | Out-File -Append \"$env:CASE_OUT/function\"; Remove-Item function:kr_fn",
+                ],
+            ),
+            item(
+                "exec",
+                &[
+                    "& sh -c 'exec printf exec-%s ran' | Out-File \"$env:CASE_OUT/exec\"; \"status=$LASTEXITCODE\" | Out-File -Append \"$env:CASE_OUT/exec\"",
+                ],
+            ),
+            item(
+                "status",
+                &[
+                    "& sh -c 'exit 3'; \"a=$LASTEXITCODE\" | Out-File \"$env:CASE_OUT/status\"; & sh -c 'exit 7'; \"c=$LASTEXITCODE\" | Out-File -Append \"$env:CASE_OUT/status\"; & true; \"d=$LASTEXITCODE\" | Out-File -Append \"$env:CASE_OUT/status\"",
+                ],
+            ),
+            item(
+                "signals",
+                &[
+                    "& sh -c 'kill -TERM $$'; \"term=$LASTEXITCODE\" | Out-File \"$env:CASE_OUT/signals\"; & sh -c 'kill -HUP $$'; \"hup=$LASTEXITCODE\" | Out-File -Append \"$env:CASE_OUT/signals\"; & sh -c 'kill -KILL $$'; \"kill=$LASTEXITCODE\" | Out-File -Append \"$env:CASE_OUT/signals\"",
+                ],
+            ),
+            // `?` is `Where-Object`, and a character that goes into the line like any other.
+            item(
+                "question-mark",
+                &["1..3 | ? { $_ -gt 1 } | Out-File \"$env:CASE_OUT/question-mark\""],
+            ),
+            item(
+                "self",
+                &[
+                    "$PSVersionTable.PSEdition | Out-File \"$env:CASE_OUT/self\"; (Get-Command ls).Source | Out-File -Append \"$env:CASE_OUT/self\"; (Get-Command sh).Source | Out-File -Append \"$env:CASE_OUT/self\"; [bool](Get-Command kr-no-such -ErrorAction SilentlyContinue) | Out-File -Append \"$env:CASE_OUT/self\"",
+                ],
+            ),
+        ],
+    }
+}
+
+/// The agent names typed the way a person types them, an absolute path and a script.
+fn agent_items(kind: ShellKind) -> Vec<Item> {
+    let mut items = Vec::new();
+    for name in AGENT_NAMES {
+        let line = match kind {
+            ShellKind::Zsh | ShellKind::Bash => format!(
+                "command -v {name} > \"$CASE_OUT/{name}.path\"; {name} 'two words' -- last > \"$CASE_OUT/{name}.out\""
+            ),
+            ShellKind::Fish => format!(
+                "command -v {name} > $CASE_OUT/{name}.path; {name} 'two words' -- last > $CASE_OUT/{name}.out"
+            ),
+            ShellKind::PowerShell => format!(
+                "(Get-Command {name}).Source | Out-File \"$env:CASE_OUT/{name}.path\"; & {name} 'two words' -- last | Out-File \"$env:CASE_OUT/{name}.out\""
+            ),
+        };
+        items.push(Item {
+            name: Box::leak(format!("agent-{name}").into_boxed_str()),
+            lines: vec![line],
+        });
+    }
+    let (absolute, script) = match kind {
+        ShellKind::Zsh | ShellKind::Bash => (
+            "\"$CASE_BIN/claude\" absolute > \"$CASE_OUT/absolute.out\"".to_owned(),
+            "sh \"$CASE_SCRIPT\" > \"$CASE_OUT/script.out\"".to_owned(),
+        ),
+        ShellKind::Fish => (
+            "$CASE_BIN/claude absolute > $CASE_OUT/absolute.out".to_owned(),
+            "sh $CASE_SCRIPT > $CASE_OUT/script.out".to_owned(),
+        ),
+        ShellKind::PowerShell => (
+            "& \"$env:CASE_BIN/claude\" absolute | Out-File \"$env:CASE_OUT/absolute.out\""
+                .to_owned(),
+            "& sh $env:CASE_SCRIPT | Out-File \"$env:CASE_OUT/script.out\"".to_owned(),
+        ),
+    };
+    items.push(Item {
+        name: "absolute",
+        lines: vec![absolute],
+    });
+    items.push(Item {
+        name: "script",
+        lines: vec![script],
+    });
+    items
+}
+
+/// Runs one item's lines at a shell's prompt, each to its end.
+fn run_item(session: &mut Session, kind: ShellKind, item: &Item) {
+    let done = print_assembled(kind, ITEM_DONE);
+    for line in &item.lines {
+        assert!(
+            session.run(&format!("{line}; {done}"), ITEM_DONE),
+            "{}: {line:?} did not finish:\n{}",
+            item.name,
+            session.terminal_output()
+        );
+    }
+}
+
+/// What a shell left behind, with the places that differ between two shells named the same way.
+fn observe(arena: &Path, replacing: &[(String, &'static str)]) -> Observed {
+    let normalise = |text: &str| {
+        let mut text = text.to_owned();
+        for (from, to) in replacing {
+            text = text.replace(from.as_str(), to);
+        }
+        text
+    };
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(arena.join("out")).expect("the files it left") {
+        let path = entry.expect("an entry").path();
+        let name = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        let text = String::from_utf8_lossy(&std::fs::read(&path).expect("a file")).into_owned();
+        files.insert(name, normalise(&text));
+    }
+    let mut starts: BTreeMap<String, Vec<ProbeRun>> = BTreeMap::new();
+    for name in AGENT_NAMES {
+        let runs = read_runs(&arena.join("records").join(format!("{name}.record")))
+            .into_iter()
+            .map(|run| ProbeRun {
+                arguments: run.arguments.iter().map(|word| normalise(word)).collect(),
+                // The reserved variables are the one declared difference between a managed shell
+                // and an ordinary one.
+                environment: run
+                    .environment
+                    .into_iter()
+                    .filter(|(name, _)| !name.starts_with("KR_"))
+                    .map(|(name, value)| (name, normalise(&value)))
+                    .collect(),
+            })
+            .collect();
+        starts.insert(name.to_owned(), runs);
+    }
+    Observed { files, starts }
+}
+
+/// Every place two shells' observations differ, each named by the file or the agent it is about.
+fn differences(managed: &Observed, ordinary: &Observed) -> Vec<String> {
+    let mut found = Vec::new();
+    let names: std::collections::BTreeSet<_> = managed
+        .files
+        .keys()
+        .chain(ordinary.files.keys())
+        .cloned()
+        .collect();
+    for name in names {
+        if managed.files.get(&name) != ordinary.files.get(&name) {
+            found.push(format!(
+                "{name}: the managed shell left {:?} and the ordinary one {:?}",
+                managed.files.get(&name),
+                ordinary.files.get(&name)
+            ));
+        }
+    }
+    for (name, runs) in &managed.starts {
+        let others = &ordinary.starts[name];
+        if runs.len() != others.len() {
+            found.push(format!(
+                "{name}: the managed shell started it {} times and the ordinary one {}",
+                runs.len(),
+                others.len()
+            ));
+            continue;
+        }
+        for (index, (ours, theirs)) in runs.iter().zip(others).enumerate() {
+            if ours.arguments != theirs.arguments {
+                found.push(format!(
+                    "{name}, start {index}: the arguments were {:?} and {:?}",
+                    ours.arguments, theirs.arguments
+                ));
+            }
+            let variables: std::collections::BTreeSet<_> = ours
+                .environment
+                .keys()
+                .chain(theirs.environment.keys())
+                .collect();
+            for variable in variables {
+                if ours.environment.get(variable) != theirs.environment.get(variable) {
+                    found.push(format!(
+                        "{name}, start {index}: {variable} was {:?} and {:?}",
+                        ours.environment.get(variable),
+                        theirs.environment.get(variable)
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// One managed shell and one ordinary shell of the same package, having run the same items.
+struct Pair {
+    managed: Session,
+    ordinary: Session,
+    corpus: Corpus,
+    arenas: (tempfile::TempDir, tempfile::TempDir),
+}
+
+impl Pair {
+    fn start(package: &Package) -> Self {
+        let corpus = Corpus::new();
+        let arenas = (
+            tempfile::Builder::new()
+                .prefix("kr-managed-")
+                .tempdir()
+                .expect("a directory"),
+            tempfile::Builder::new()
+                .prefix("kr-ordinary-")
+                .tempdir()
+                .expect("a directory"),
+        );
+        let managed_arena = std::fs::canonicalize(arenas.0.path()).expect("resolves");
+        let ordinary_arena = std::fs::canonicalize(arenas.1.path()).expect("resolves");
+        let mut managed = Session::start_with(package, &corpus.environment(&managed_arena));
+        managed.first_prompt();
+        managed.forget_events();
+        assert!(
+            managed.answered("kr-ready"),
+            "the managed shell did not answer:\n{}",
+            managed.terminal_output()
+        );
+        // The same binary, the same configuration and no entry: what the person has without us.
+        let mut ordinary = Session::start_unmanaged(
+            package,
+            &corpus.environment(&ordinary_arena),
+            Profile {
+                entry: false,
+                ..Profile::ORDINARY
+            },
+        );
+        assert!(
+            ordinary.answered("kr-ready"),
+            "the ordinary shell did not answer:\n{}",
+            ordinary.terminal_output()
+        );
+        Self {
+            managed,
+            ordinary,
+            corpus,
+            arenas: (arenas.0, arenas.1),
+        }
+    }
+
+    fn run(&mut self, kind: ShellKind, items: &[Item]) {
+        for item in items {
+            run_item(&mut self.managed, kind, item);
+            run_item(&mut self.ordinary, kind, item);
+        }
+    }
+
+    fn observed(&self) -> (Observed, Observed) {
+        let managed = std::fs::canonicalize(self.arenas.0.path()).expect("resolves");
+        let ordinary = std::fs::canonicalize(self.arenas.1.path()).expect("resolves");
+        // The place a shell was given as its home and the place the kernel names it by, which are
+        // two spellings on a platform whose temporary directory is a link.
+        let names = |arena: &Path, session: &Session| {
+            vec![
+                (told(arena), "<arena>"),
+                (told(&session._directory.path().join("home")), "<home>"),
+                (told(&session.home()), "<home>"),
+            ]
+        };
+        (
+            observe(&managed, &names(&managed, &self.managed)),
+            observe(&ordinary, &names(&ordinary, &self.ordinary)),
+        )
+    }
+}
+
+/// KR-REQ-01.06: with command integration off, ordinary commands and the six agent names resolve
+/// and run in a managed session as they do in the same shell without KalaReach.
+///
+/// The same package's shell is started twice, once as a session's root shell and once as a person's
+/// own, with the same configuration, the same search path and the same files to leave things in.
+/// Both run the same corpus: pipes, redirects, moving about, aliases, functions, `exec`, exit
+/// statuses, signals and what the shell says about itself, then each agent name, an absolute path
+/// and a script. What each saw is compared: what `command -v` names, `$0`, the argument vector each
+/// program started with, its environment other than the reserved variables, and the status.
+pub fn ordinary_commands_and_agent_names_run_as_in_an_unmanaged_shell(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut pair = Pair::start(&package);
+    let mut items = ordinary_items(kind);
+    items.extend(agent_items(kind));
+    pair.run(kind, &items);
+    let (managed, ordinary) = pair.observed();
+    // Something was observed, or two empty results would agree.
+    assert!(
+        managed.files.len() >= items.len(),
+        "{:?}",
+        managed.files.keys()
+    );
+    for name in AGENT_NAMES {
+        assert_eq!(
+            ordinary.starts[name].len(),
+            if name == "claude" { 3 } else { 1 },
+            "{name}: the corpus started it the same number of times in the ordinary shell"
+        );
+    }
+    let differences = differences(&managed, &ordinary);
+    assert!(
+        differences.is_empty(),
+        "a managed session ran something differently from the same shell without KalaReach:\n{}\n\
+         the managed terminal:\n{}\nthe ordinary terminal:\n{}",
+        differences.join("\n"),
+        pair.managed.terminal_output(),
+        pair.ordinary.terminal_output()
+    );
+}
+
+/// The control for the case above: an alias planted in the managed shell alone, which changes what
+/// an agent name runs, is reported by the comparison and not hidden by it.
+pub fn a_planted_alias_that_changes_an_agent_name_is_reported_not_hidden(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut pair = Pair::start(&package);
+    let plant = match kind {
+        ShellKind::Zsh | ShellKind::Bash => "alias claude=codex",
+        ShellKind::Fish => "alias claude codex",
+        ShellKind::PowerShell => "Set-Alias claude codex",
+    };
+    let done = print_assembled(kind, ITEM_DONE);
+    assert!(
+        pair.managed.run(&format!("{plant}; {done}"), ITEM_DONE),
+        "{}",
+        pair.managed.terminal_output()
+    );
+    let items = agent_items(kind)
+        .into_iter()
+        .filter(|item| item.name == "agent-claude" || item.name == "agent-codex")
+        .collect::<Vec<_>>();
+    pair.run(kind, &items);
+    let (managed, ordinary) = pair.observed();
+    let found = differences(&managed, &ordinary);
+    assert!(
+        found
+            .iter()
+            .any(|difference| difference.starts_with("claude")),
+        "an alias that made `claude` start another program went unreported:\n{found:?}"
+    );
+    // The program the alias names is the one that ran, in the shell that has the alias.
+    assert_eq!(
+        managed.starts["codex"].len(),
+        2,
+        "the alias made `claude` start codex as well as codex's own start"
+    );
+    assert_eq!(ordinary.starts["codex"].len(), 1);
+}
+
+/// KR-REQ-01.06, KR-REQ-12.07: with the integration for one agent enabled, its flags are added to
+/// that agent's interactive invocation and to nothing else.
+///
+/// The worker's own decision is played with a backend it can establish. `claude` is enabled with a
+/// flag; a typed `claude` runs through the launcher with the flag, and then each of these runs as
+/// typed: an absolute path to the same program, another agent, the same name inside a script, and
+/// in a pipeline. An alias planted for the name changes what the shell asks about, and the
+/// request says so: it names the program the alias makes it run, which is not the enabled one, so
+/// it gets no flag either.
+///
+/// Zsh and Bash only: those are the packages whose executor asks the worker before a command
+/// starts.
+pub fn an_enabled_integration_adds_its_flags_only_to_the_agents_interactive_invocation(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let corpus = Corpus::new();
+    let probes = Probes::new();
+    let arena = tempfile::Builder::new()
+        .prefix("kr-enabled-")
+        .tempdir()
+        .expect("a directory");
+    let arena_path = std::fs::canonicalize(arena.path()).expect("resolves");
+    let mut session = Session::start_with(&package, &corpus.environment(&arena_path));
+    session.first_prompt();
+    session.forget_events();
+    assert!(
+        session.answered("kr-ready"),
+        "{}",
+        session.terminal_output()
+    );
+    let integrations = vec![CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+            .expect("a plugin identifier"),
+        command: "claude".to_owned(),
+        flags: vec!["--kr-flag".to_owned()],
+        enabled: true,
+    }];
+    session.commands.policy = ResolvePolicy::Establishing {
+        integrations: integrations.clone(),
+        launcher: told(&probes.launcher()),
+        environment: Vec::new(),
+    };
+    let starts = |name: &str| read_runs(&arena_path.join("records").join(format!("{name}.record")));
+    let run = |session: &mut Session, line: &str| {
+        let done = print_assembled(kind, ITEM_DONE);
+        session.run_asking(&format!("{line}; {done}"), ITEM_DONE)
+    };
+
+    // The named agent, typed at the prompt: asked once, and run through the launcher in the
+    // program's place with the flag added after what was typed.
+    let asked = run(&mut session, "claude one 'two words' > /dev/null");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].argv, ["claude", "one", "two words"]);
+    let launches = probes.launches();
+    assert_eq!(launches.len(), 1, "the launcher started once: {launches:?}");
+    assert_eq!(
+        launches[0].arguments,
+        [
+            "launch",
+            "--",
+            told(&corpus.root.join("bin").join("claude")).as_str(),
+            "claude",
+            "one",
+            "two words",
+            "--kr-flag"
+        ],
+        "the flag is added to the interactive invocation of the named agent"
+    );
+    assert!(
+        starts("claude").is_empty(),
+        "the launcher runs in its place"
+    );
+
+    // Everything below runs as typed, and none of it gets the flag.
+    let asked = run(&mut session, "\"$CASE_BIN/claude\" absolute > /dev/null");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        worker_decision(&integrations, &asked[0]).bypass.0,
+        Some(CommandBypassReason::AbsolutePath),
+        "the name is the enabled one, and a path is the documented bypass"
+    );
+    let asked = run(&mut session, "codex other > /dev/null");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let asked = run(&mut session, "sh \"$CASE_SCRIPT\" > /dev/null");
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| request.argv[0].as_str())
+            .collect::<Vec<_>>(),
+        ["sh"],
+        "the script is asked about as the command it is, and nothing its own commands do"
+    );
+    let asked = run(&mut session, "claude piped | cat > /dev/null");
+    assert!(asked.is_empty(), "a pipeline asked: {asked:?}");
+    let claude = starts("claude");
+    assert_eq!(
+        claude
+            .iter()
+            .map(|run| run.arguments.clone())
+            .collect::<Vec<_>>(),
+        [
+            vec!["absolute".to_owned()],
+            vec!["from-a-script".to_owned()],
+            vec!["piped".to_owned()]
+        ],
+        "an absolute path, a script and a pipeline run claude exactly as typed"
+    );
+    assert_eq!(starts("codex")[0].arguments, ["other"]);
+    assert_eq!(
+        probes.launches().len(),
+        1,
+        "no other launch: {:?}",
+        probes.launches()
+    );
+
+    // The control: an alias that makes `claude` run another program is what the shell asks about,
+    // and the enabled agent's flag stays with the enabled agent.
+    let planted = run(&mut session, "alias claude=codex");
+    assert!(planted.is_empty(), "{planted:?}");
+    let asked = run(&mut session, "claude via-alias > /dev/null");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        asked[0].argv,
+        ["codex", "via-alias"],
+        "the request reports what the alias makes the shell run"
+    );
+    assert_eq!(
+        probes.launches().len(),
+        1,
+        "no flag went to the aliased command"
+    );
+    assert_eq!(
+        starts("codex").last().map(|run| run.arguments.clone()),
+        Some(vec!["via-alias".to_owned()])
+    );
+}
