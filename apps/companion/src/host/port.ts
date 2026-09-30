@@ -1238,12 +1238,35 @@ export function isHostError(value: unknown): value is HostError {
 }
 
 /**
+ * What a person can do about a failure, in words, for each action native code names a code's by.
+ *
+ * Section 23 has the interface translate a code into a direct action rather than show the code.
+ * Native code attaches the key of the action a code maps to (`UserAction::as_str` in the client
+ * library) to every failure it answers with, and these are the words for each key, the library's own
+ * (`UserAction::message`). `nothing` has none: the host's words are all there is to say.
+ */
+export const USER_ACTIONS: Readonly<Record<string, string>> = {
+  pair_again: 'Pair this device with the host again.',
+  sign_in: 'Sign in to your account.',
+  update: 'Update this app or the host: their versions do not agree.',
+  wait: 'Wait a moment and try again.',
+  resync: 'Refresh: this view has fallen behind.',
+  check_the_outcome: 'Check whether this went through before trying it again.',
+  fix_configuration: 'Change a setting on this device or on the host.'
+}
+
+/**
  * The message to show for a failure, whatever shape it arrived in, and never an empty one: a
- * failure that came with no words of its own is still a failure, and says so in these.
+ * failure that came with no words of its own is still a failure, and says so in these. A host
+ * failure whose code maps to something the person can do says that after the host's words, and
+ * never the code.
  */
 export function failureMessage(value: unknown): string {
   const own = isHostError(value) || value instanceof Error ? value.message : ''
-  return own.trim().length > 0 ? own : 'Something went wrong.'
+  const said = own.trim().length > 0 ? own : 'Something went wrong.'
+  const key = isHostError(value) ? value.user_action : undefined
+  const action = typeof key === 'string' && Object.hasOwn(USER_ACTIONS, key) ? USER_ACTIONS[key] : undefined
+  return action === undefined ? said : `${said} ${action}`
 }
 
 /** The protocol code of a failure, or null when it did not carry one. */
