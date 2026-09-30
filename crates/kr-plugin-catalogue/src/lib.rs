@@ -1199,16 +1199,8 @@ impl Catalogue {
         };
         authority.check()?;
 
-        // The index is kept in its canonical rendering, named by that rendering's digest, which is
-        // also what one generation number is compared by.
-        let rendered = verified
-            .index
-            .canonical_json()
-            .map_err(|source| CatalogueError::Integrity {
-                detail: format!("the index could not be rendered: {source}"),
-            })?
-            .into_bytes();
-        let index_digest = PayloadDigest::of(&rendered);
+        let rendered = &verified.rendered;
+        let index_digest = verified.rendered_digest;
         let arriving = Retained {
             generation: verified.generation.get(),
             index_bytes: rendered.len() as u64,
@@ -1297,7 +1289,7 @@ impl Catalogue {
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
         // and the receipt says so.
         let (digest, bytes) = committed(authority, &Effect::Index(id.clone()), |permit| {
-            store.write_index(permit, &rendered)
+            store.write_index(permit, rendered)
         })?;
         let checkpoint = store.checkpoint_bytes()?;
         let synced = committing(&mut self.db, &*self.broker, change, |changes| {
