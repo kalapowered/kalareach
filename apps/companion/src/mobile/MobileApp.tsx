@@ -1,9 +1,10 @@
 /**
  * The phone's shell.
  *
- * Four destinations along the bottom, one screen at a time, and settings over whatever is showing.
- * Navigation is used dozens of times a day, so nothing about it animates: a transition between
- * tabs is a delay between a person deciding and the interface agreeing.
+ * Four destinations along the bottom, one screen at a time, and settings over a session, so a person
+ * who changes how the application looks has not left it. Navigation is used dozens of times a day,
+ * so nothing about it animates: a transition between tabs is a delay between a person deciding and
+ * the interface agreeing.
  *
  * The shell owns the connection state and the lifecycle, because both are facts about the device
  * rather than about a screen, and both are what the recovery banner and the inbox are drawn from.
@@ -22,6 +23,7 @@ import {
   AttentionGlyph,
   HostsGlyph,
   SessionsGlyph,
+  SettingsButton,
   TabBar,
   TopBar,
   type Destination
@@ -30,6 +32,7 @@ import { Account } from './views/Account'
 import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
+import { MobileSettings } from './views/Settings'
 import type { Channel } from '../model/account'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
@@ -38,10 +41,14 @@ import './mobile.css'
 /** The four destinations. */
 type Tab = 'attention' | 'sessions' | 'hosts' | 'account'
 
-/** Where the shell is: a destination, and the session open inside it when there is one. */
+/**
+ * Where the shell is: a destination, and the session open inside it when there is one, and whether
+ * the settings are open over that session.
+ */
 interface Place {
   readonly tab: Tab
   readonly sessionId?: string
+  readonly settings?: boolean
 }
 
 const TABS: readonly Tab[] = ['attention', 'sessions', 'hosts', 'account']
@@ -166,6 +173,7 @@ export function MobileApp({
   }, [])
 
   const inSession = place.tab === 'sessions' && place.sessionId !== undefined
+  const settingsOpen = inSession && place.settings === true
   const title = inSession
     ? 'Session'
     : place.tab === 'attention'
@@ -176,19 +184,32 @@ export function MobileApp({
           ? 'Hosts'
           : 'Account'
 
+  const setSettings = useCallback((open: boolean) => {
+    setPlace((current) => ({ ...current, settings: open }))
+  }, [])
+
   // Android's system back leaves a session the same way the bar's control does, so the two are one
-  // behaviour rather than two.
+  // behaviour rather than two. It closes what is over the session first: with the settings open, a
+  // back closes them, the session keeps its place in the history, and the next back leaves it.
+  useEffect(() => {
+    if (!inSession) return
+    window.history.pushState({ kr: 'session' }, '')
+  }, [inSession])
   useEffect(() => {
     if (!inSession) return
     const onPop = () => {
-      setPlace({ tab: 'sessions' })
+      if (settingsOpen) {
+        setSettings(false)
+        window.history.pushState({ kr: 'session' }, '')
+      } else {
+        setPlace({ tab: 'sessions' })
+      }
     }
-    window.history.pushState({ kr: 'session' }, '')
     window.addEventListener('popstate', onPop)
     return () => {
       window.removeEventListener('popstate', onPop)
     }
-  }, [inSession])
+  }, [inSession, settingsOpen, setSettings])
 
   const shell = (
     <div className="m-shell" data-surface={resolved}>
@@ -204,6 +225,16 @@ export function MobileApp({
             : undefined
         }
         backLabel="Back to sessions"
+        action={
+          inSession ? (
+            <SettingsButton
+              surface={resolved}
+              onPress={() => {
+                setSettings(true)
+              }}
+            />
+          ) : undefined
+        }
       />
 
       <main className="m-main" id="main" tabIndex={-1}>
@@ -233,6 +264,15 @@ export function MobileApp({
           setPlace({ tab: id as Tab })
         }}
       />
+
+      {inSession ? (
+        <MobileSettings
+          open={settingsOpen}
+          onClose={() => {
+            setSettings(false)
+          }}
+        />
+      ) : null}
 
       <Toast message={toast} onDismiss={dismissToast} />
     </div>
