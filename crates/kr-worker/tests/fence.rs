@@ -5026,9 +5026,10 @@ async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() 
         wired.runtime.state(),
         kr_protocol::session::SessionState::Closed
     );
-    let session = wired.runtime.session();
-    assert!(!session.fence().expect("a driver").phase().reports_ready());
-    drop(session);
+    {
+        let session = wired.runtime.session();
+        assert!(!session.fence().expect("a driver").phase().reports_ready());
+    }
     // The answer survives the closure: asking again names the same refusal.
     let again = wired
         .runtime

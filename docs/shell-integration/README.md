@@ -191,8 +191,8 @@ The phases advance on what the bridge reports, never on a guess. The handshake a
 session qualified. `integration_lost` says the ground has gone, and the worker infers the same when
 the bridge's connection ends.
 
-The handshake is made before any startup file runs, so a native module a startup file loads is not
-in the declaration. `hooks_activated` carries the dynamic modules the shell holds by then, and the
+The handshake is made when the editor is set up, which can be before a startup file has run, so a
+native module a startup file loads may not be in the declaration. `hooks_activated` carries the dynamic modules the shell holds by then, and the
 worker judges them before the session qualifies: a module that imports a name the running reader
 does not provide, or that the bridge could not read, refuses the session with
 `module_tree_unsupported`, and the create answers `SHELL_INTEGRATION_UNSUPPORTED` with that reason,

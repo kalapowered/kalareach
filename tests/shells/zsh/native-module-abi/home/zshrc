@@ -11,6 +11,9 @@ typeset -g KR_TEST_USER_CONFIGURATION=1
 # Native modules of the person's own, built against the shell's headers and ahead of the shell's
 # own module path. Which ones this home loads is the test's choice.
 module_path=("$HOME/modules" $module_path)
+# A module of the editor binds to the editor's own variables when it loads, so the editor is loaded
+# first, as a person's startup file does before it loads one.
+zmodload zsh/zle
 for module in ${=KR_TEST_USER_MODULES}; do
   if zmodload "$module" 2>>"$HOME/module-error"; then
     print -r -- kr-module-loaded >> "$KR_TEST_ORDER"

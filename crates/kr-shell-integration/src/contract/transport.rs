@@ -734,7 +734,8 @@ pub fn decide_handshake(
 /// Judges the modules a shell holds when its hooks go live.
 ///
 /// This is the second half of the module-tree check. [`decide_handshake`] judges the tree the
-/// package declares, before any startup file has run; a module a startup file loads is not there
+/// package declares, when the editor is set up, which can be before a startup file has run; a module
+/// a startup file loads may not be there
 /// yet, so it is judged here, from what the bridge read of the modules the shell holds by then,
 /// before the session qualifies. The two take different inputs and share no code: one compares the
 /// editor ABI a declaration names, the other takes the bridge's verdict on what a module imports.
