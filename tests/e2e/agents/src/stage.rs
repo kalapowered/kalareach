@@ -34,22 +34,25 @@ use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-use crate::provenance::{EXPORTED_FILE, Expected, PATH_FILE, Provenance};
+use crate::provenance::{EXPORTED_FILE, Expected, PATH_FILE, Provenance, STARTED_FILE};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
 pub const PROMPT: &str = "kr-agents$ ";
 
-/// The run's own startup file for the session's shell: a prompt, a hook that writes the PATH the
-/// shell searches, and the names of the variables it exports, to the run's home before each prompt,
-/// and nothing of anybody's own. `kr shell install` adds the marked entry that loads the package's
-/// integration after it.
+/// The run's own startup file for the session's shell: a prompt, hooks that write the PATH the
+/// shell searches, and the names of the variables it exports, to the run's home before each
+/// prompt, and the names again just before each command line runs, and nothing of anybody's own.
+/// `kr shell install` adds the marked entry that loads the package's integration after it.
 #[must_use]
 pub fn startup_file() -> String {
     format!(
-        "PROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\nunsetopt prompt_sp\n\
+        "zmodload zsh/parameter 2>/dev/null\nPROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\n\
+         unsetopt prompt_sp\n\
          kr_agents_path() {{ print -r -- \"$PATH\" >| \"$ZDOTDIR/{PATH_FILE}\"; \
          print -rl -- ${{(k)parameters[(R)*export*]}} >| \"$ZDOTDIR/{EXPORTED_FILE}\" }}\n\
-         precmd_functions+=(kr_agents_path)\n"
+         kr_agents_started() {{ print -rl -- ${{(k)parameters[(R)*export*]}} >| \"$ZDOTDIR/{STARTED_FILE}\" }}\n\
+         precmd_functions+=(kr_agents_path)\n\
+         preexec_functions+=(kr_agents_started)\n"
     )
 }
 
@@ -882,6 +885,11 @@ pub fn launch(
         );
         std::panic::resume_unwind(panic);
     }
+    // The shell wrote the names it exported just before it ran the agent's line: the environment
+    // the agent has, checked before anything is typed to it.
+    provenance
+        .check_cleared_at_start()
+        .unwrap_or_else(|why| panic!("{why}"));
     let started = Instant::now();
     let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
@@ -1402,18 +1410,19 @@ mod tests {
     use super::*;
     use crate::provenance::exported_clear;
 
-    /// The startup file's hook writes the names a session's shell exports and never a value: a
-    /// variable the shell was started with is named, one it only set is not, and the check the
-    /// launch makes refuses the first and passes the second.
+    /// The startup file's hooks write the names a session's shell exports and never a value: at the
+    /// prompt, and again just before a command line runs, so that what the agent's line started
+    /// with is what the second names. A variable exported after the prompt is only in the second, a
+    /// variable that is only set is in neither, and the check refuses the one and passes the other.
     #[test]
-    fn the_startup_files_hook_writes_the_names_a_shell_exports_and_never_a_value() {
+    fn the_startup_files_hooks_write_the_names_a_shell_exports_and_never_a_value() {
         let shell = match kr_e2e_m1b::shells::managed_zsh() {
             Ok(shell) => shell,
             Err(why) if kr_e2e_m1b::shells::required() => {
-                panic!("the startup file's hook needs the managed shell: {why}")
+                panic!("the startup file's hooks need the managed shell: {why}")
             }
             Err(why) => {
-                eprintln!("skipping: the startup file's hook: {why}");
+                eprintln!("skipping: the startup file's hooks: {why}");
                 return;
             }
         };
@@ -1430,7 +1439,8 @@ mod tests {
             .args([
                 "-f",
                 "-c",
-                ". \"$ZDOTDIR/.zshrc\"; KR_SET_ONLY=1; kr_agents_path",
+                ". \"$ZDOTDIR/.zshrc\"; KR_SET_ONLY=1; kr_agents_path; \
+                 export KR_EXPORTED_LATE=1; kr_agents_started",
             ])
             .env_clear()
             .env("ZDOTDIR", &directory)
@@ -1438,28 +1448,53 @@ mod tests {
             .env("KR_CLEARED_HERE", value)
             .output()
             .expect("the managed shell runs");
-        assert!(output.status.success(), "the hook runs: {output:?}");
-        let written = std::fs::read_to_string(directory.join(EXPORTED_FILE))
-            .expect("the hook wrote the exported names");
-        let path =
-            std::fs::read_to_string(directory.join(PATH_FILE)).expect("the hook wrote the PATH");
+        assert!(output.status.success(), "the hooks run: {output:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "the startup file prints nothing to the session: {output:?}"
+        );
+        let read = |file: &str| {
+            std::fs::read_to_string(directory.join(file)).expect("the hook wrote its names")
+        };
+        let (prompt, started) = (read(EXPORTED_FILE), read(STARTED_FILE));
+        let path = read(PATH_FILE);
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
+        for names in [&prompt, &started] {
+            assert!(
+                names.lines().any(|line| line == "KR_CLEARED_HERE")
+                    && names.lines().any(|line| line == "PATH"),
+                "an exported variable is named: {names}"
+            );
+            assert!(
+                !names.lines().any(|line| line == "KR_SET_ONLY"),
+                "a variable that is set and not exported is not: {names}"
+            );
+            assert!(
+                !names.contains(value),
+                "no value is written with the names: {names}"
+            );
+        }
         assert!(
-            written.lines().any(|line| line == "KR_CLEARED_HERE"),
-            "an exported variable is named: {written}"
-        );
-        assert!(
-            !written.lines().any(|line| line == "KR_SET_ONLY"),
-            "a variable that is set and not exported is not: {written}"
-        );
-        assert!(
-            !written.contains(value),
-            "no value is written with the names: {written}"
+            !prompt.lines().any(|line| line == "KR_EXPORTED_LATE")
+                && started.lines().any(|line| line == "KR_EXPORTED_LATE"),
+            "the second list is the one written just before the command line"
         );
         assert_eq!(path.trim_end(), "/usr/bin:/bin");
         let cleared = ["KR_CLEARED_HERE".to_owned(), "KR_SET_ONLY".to_owned()];
-        let refused = exported_clear(&written, &cleared).expect_err("the exported name is refused");
+        let refused =
+            exported_clear(&started, &cleared, &[]).expect_err("the exported name is refused");
         assert!(refused.contains("KR_CLEARED_HERE") && !refused.contains("KR_SET_ONLY"));
-        assert_eq!(exported_clear(&written, &cleared[1..]), Ok(()));
+        assert_eq!(exported_clear(&started, &cleared[1..], &[]), Ok(()));
+        assert_eq!(
+            exported_clear(
+                &started,
+                &["KR_*".to_owned()],
+                &["KR_CLEARED_HERE".to_owned()]
+            ),
+            Err(format!(
+                "{} the session's shell exports KR_EXPORTED_LATE, which the build list clears",
+                crate::provenance::ENVIRONMENT_NOT_CLEAR
+            ))
+        );
     }
 }

@@ -41,7 +41,8 @@ use kr_e2e_agents::observe::{
 };
 use kr_e2e_agents::outcome::{Failure, Outcome};
 use kr_e2e_agents::provenance::{
-    ENVIRONMENT_NOT_CLEAR, Expected, NOT_PINNED, Provenance, StopSampling, beneath_parent,
+    ENVIRONMENT_NOT_CLEAR, ENVIRONMENT_NOT_READ, Expected, NOT_PINNED, Provenance, StopSampling,
+    beneath_parent,
 };
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
@@ -768,6 +769,9 @@ fn staged(
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
+    if needs_login {
+        provenance.require_cleared();
+    }
     let closed = std::sync::atomic::AtomicBool::new(false);
     let held = std::sync::atomic::AtomicBool::new(false);
     let declined = std::sync::Mutex::new(Vec::new());
@@ -1145,15 +1149,19 @@ fn staged(
                     evidence.insert("stop_agent".to_owned(), json!(true));
                 }
                 let evidence = serde_json::Value::Object(evidence);
-                // The session ran something other than the build, or held a variable the build
-                // list clears, so the part did not test it: not run, as the harness records such
-                // a part.
+                // The session ran something other than the build, held a variable the build list
+                // clears, or its names could not be read, so the part did not test it: not run,
+                // as the harness records such a part.
                 let not_run = said
                     .find(NOT_PINNED)
                     .map(|at| (at, Failure::NotPinned))
                     .or_else(|| {
-                        said.find(ENVIRONMENT_NOT_CLEAR)
-                            .map(|at| (at, Failure::EnvironmentNotClear))
+                        said.starts_with(ENVIRONMENT_NOT_CLEAR)
+                            .then_some((0, Failure::EnvironmentNotClear))
+                    })
+                    .or_else(|| {
+                        said.starts_with(ENVIRONMENT_NOT_READ)
+                            .then_some((0, Failure::EnvironmentNotRead))
                     });
                 let mut failures = if class.is_none() {
                     vec![Failure::PartFailed]
@@ -2412,6 +2420,9 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
                 let tools = stub.finish()?;
                 let text = tools.join("\n");
                 let checked = probe.check(&text, &servers, accepted.as_deref());
+                // Whether the text the control names is one of the person's servers (the first
+                // that `{servers}` stands for) or one the build list names.
+                let of_a_server = probe.lacks.first().is_some_and(|lack| lack == "{servers}");
                 let lacking = probe
                     .lacks
                     .iter()
@@ -2432,7 +2443,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
                     .offered
                     .lock()
                     .map_err(|_| "the offered tools' record is poisoned".to_owned())?
-                    .push(json!({ "probe": probe.arguments, "tools": tools, "check": checked.as_ref().err().cloned().unwrap_or_else(|| "passed".to_owned()), "control": { "added": format!("nested control/{lacking}"), "rejected": rejected } }));
+                    .push(json!({ "probe": probe.arguments, "tools": tools, "check": checked.as_ref().err().cloned().unwrap_or_else(|| "passed".to_owned()), "control": { "added": format!("nested control/{lacking}"), "server": of_a_server && !servers.is_empty(), "rejected": rejected } }));
                 checked?;
                 if rejected {
                     Ok(())
@@ -3286,7 +3297,7 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
                 "what": "the agent ended by its recorded identities",
                 "breaks_property": true,
                 "after": gone.detection.evidence(),
-                "check": ended_check.err(),
+                "check": ended_check.err().map(|undetected| undetected.why),
                 "instance_ended": ended_instance.is_ok(),
             },
         });
@@ -3329,7 +3340,7 @@ fn under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_ref
                 let why = detected
                     .as_ref()
                     .err()
-                    .cloned()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| "the binding could not be read".to_owned());
                 let evidence = json!({
                     "detection": shown.detection.evidence(),
@@ -4374,11 +4385,14 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             );
             codes.push(Failure::UploadTransferredAnotherImage);
         }
-        if let Err(why) = &detected {
-            failures.push(format!("the host did not detect the manual launch: {why}"));
+        if let Err(undetected) = &detected {
+            failures.push(format!(
+                "the host did not detect the manual launch: {undetected}"
+            ));
             codes.push(Failure::LaunchNotDetected {
                 session: None,
-                announced: shown.detection.instances.len(),
+                cause: undetected.cause,
+                announced: undetected.announced,
             });
         }
         let outcome =
@@ -5908,14 +5922,12 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         let mut codes = Vec::new();
         if let (Ok(_), Ok(_)) = (&detected_first, &detected_second) {
         } else {
-            for (session, detected, shown) in [
-                ("A", &detected_first, &shown_first),
-                ("B", &detected_second, &shown_second),
-            ] {
-                if detected.is_err() {
+            for (session, detected) in [("A", &detected_first), ("B", &detected_second)] {
+                if let Err(undetected) = detected {
                     codes.push(Failure::LaunchNotDetected {
                         session: Some(session),
-                        announced: shown.detection.instances.len(),
+                        cause: undetected.cause,
+                        announced: undetected.announced,
                     });
                 }
             }
@@ -5923,10 +5935,10 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
                 "the host did not detect each launch as section 12 requires: A {}, B {}",
                 detected_first
                     .as_ref()
-                    .map_or_else(Clone::clone, |_| "detected".to_owned()),
+                    .map_or_else(ToString::to_string, |_| "detected".to_owned()),
                 detected_second
                     .as_ref()
-                    .map_or_else(Clone::clone, |_| "detected".to_owned())
+                    .map_or_else(ToString::to_string, |_| "detected".to_owned())
             ));
         }
         if account.resume_forks {

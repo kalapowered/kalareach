@@ -30,11 +30,14 @@ pub enum Failure {
     /// A paired device's `upload.begin` was accepted, and the image given was not the one it
     /// transferred.
     UploadTransferredAnotherImage,
-    /// The host did not detect a manual launch as section 12 requires: `announced` live instances
-    /// were announced where one was wanted. `session` names the launch where a part has two.
+    /// The host did not detect a manual launch as section 12 requires, for `cause` (one of
+    /// [`crate::detect::Undetected::CAUSES`]) with `announced` live instances announced. `session`
+    /// names the launch where a part has two.
     LaunchNotDetected {
         /// Which launch, `A` or `B`, where the part made two.
         session: Option<&'static str>,
+        /// Why it was not detected.
+        cause: &'static str,
         /// How many live instances the host announced.
         announced: usize,
     },
@@ -48,6 +51,9 @@ pub enum Failure {
     NotPinned,
     /// The session's environment held a variable the build list clears.
     EnvironmentNotClear,
+    /// The names of the variables the session's shell exports could not be read, so that none the
+    /// build list clears is exported was not established.
+    EnvironmentNotRead,
     /// The directory that held the login's key was not searched whole, or is not gone.
     KeyScanIncomplete,
     /// The part stopped on a check whose text is in its log.
@@ -65,13 +71,18 @@ impl Failure {
             Self::UploadTransferredAnotherImage => {
                 json!({ "code": "upload_transferred_another_image" })
             }
-            Self::LaunchNotDetected { session, announced } => {
-                json!({ "code": "launch_not_detected", "session": session, "announced": announced })
+            Self::LaunchNotDetected {
+                session,
+                cause,
+                announced,
+            } => {
+                json!({ "code": "launch_not_detected", "session": session, "cause": cause, "announced": announced })
             }
             Self::ResumeForks => json!({ "code": "resume_forks" }),
             Self::ReplyBeforeRecord => json!({ "code": "reply_before_record" }),
             Self::NotPinned => json!({ "code": "not_pinned" }),
             Self::EnvironmentNotClear => json!({ "code": "environment_not_clear" }),
+            Self::EnvironmentNotRead => json!({ "code": "environment_not_read" }),
             Self::KeyScanIncomplete => json!({ "code": "key_scan_incomplete" }),
             Self::PartFailed => json!({ "code": "part_failed" }),
             Self::AgentStops(class) => json!({ "code": "agent_stops", "class": class }),
@@ -192,6 +203,7 @@ mod tests {
             Failure::UploadRefused("INVALID_ARGUMENT".to_owned()),
             Failure::LaunchNotDetected {
                 session: None,
+                cause: "not_one_instance",
                 announced: 0,
             },
         ])
@@ -202,7 +214,7 @@ mod tests {
                 "login_held": true,
                 "failure_codes": [
                     { "code": "upload_refused", "refused": "INVALID_ARGUMENT" },
-                    { "code": "launch_not_detected", "session": null, "announced": 0 }
+                    { "code": "launch_not_detected", "session": null, "cause": "not_one_instance", "announced": 0 }
                 ]
             })
         );

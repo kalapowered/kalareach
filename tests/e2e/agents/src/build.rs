@@ -466,9 +466,11 @@ pub struct Account {
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
     /// Variables of the person's own sessions and settings that would steer the agent's model or
-    /// its account, or move its home, and that the agent's session must not export: the shell
-    /// writes the names it exports before each prompt, and a part whose shell exports one of these
-    /// does not start the agent.
+    /// its account, or move its home, and that the agent's session must not export, each a name or
+    /// a prefix that ends in `*`, but for the names the build list sets itself (`environment`,
+    /// `variables` and the configuration directory's variable): the shell writes the names it
+    /// exports before each prompt and before it runs a command line, and a part whose shell
+    /// exports one of these does not start the agent, or does not go on with it.
     #[serde(default)]
     pub cleared: Vec<String>,
     /// The name of the login's keychain item, whose modification time says whether the agent
