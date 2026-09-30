@@ -306,6 +306,7 @@ fn the_archive_finds_no_trace_of_a_commit_cut_in_its_log_and_its_control_holds_i
 /// unfinished, an intent with no marker and a marker with no answer, as an incomplete record; once
 /// it owns the dead worker's stores, recovery leaves the marker unknown and rejects the intent, and
 /// the record is complete in that respect. A journal whose actions all ended has none to count.
+#[cfg(unix)]
 #[test]
 fn the_archive_counts_what_a_worker_left_unfinished_and_recovery_settles_it() {
     let (host, session_id) = in_a_host("unfinished-actions", Made::WithFault);
@@ -337,17 +338,32 @@ fn the_archive_counts_what_a_worker_left_unfinished_and_recovery_settles_it() {
     assert_eq!(unfinished(&archive_of(&control, session_id)), None);
 }
 
+/// A child this test started, ended and collected however the test ends.
+#[cfg(unix)]
+struct Child(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// A process that has ended, as the kernel described it while it ran: the worker a recovery
 /// takes ownership after.
+#[cfg(unix)]
 fn ended_process() -> kr_protocol::identity::ProcessStartIdentity {
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("starts a process");
+    let mut child = Child(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("starts a process"),
+    );
     let identity =
-        kr_ipc::identity::process_start_identity(child.id()).expect("the kernel describes it");
-    child.kill().expect("ends it");
-    child.wait().expect("collects it");
+        kr_ipc::identity::process_start_identity(child.0.id()).expect("the kernel describes it");
+    child.0.kill().expect("ends it");
+    child.0.wait().expect("collects it");
     identity
 }
 
