@@ -18,14 +18,16 @@
 //!    (exit 9) and says why.
 //! 4. Each daemon is asked to prepare, and how each was started is recorded durably before any is
 //!    told to stop. A daemon that does not prepare holds the update: the others resume.
-//! 5. The install lock is taken, waiting a bound for a control daemon that is starting, and only
-//!    then is any daemon told to stop: a wait that runs out costs the update nothing, since each
-//!    daemon prepared resumes and the update waits. Once every daemon has stopped, the
-//!    environments are read again, so a daemon that started after the first look is found: it
-//!    holds the update. Every environment's lock is held, and every record of every registry is
-//!    classed ([`inventory::classify`]). Anything that holds the update, a daemon that refused to
-//!    stop among it, restarts the daemons it stopped, from the release still current, and the
-//!    update waits.
+//! 5. The install lock is taken, waiting a bound for a control daemon that is starting. The
+//!    environments are read again, so a daemon that started after the first look is found, and
+//!    each environment that no prepared daemon serves is looked at: a daemon that holds one holds
+//!    the update, with nothing stopped and each daemon prepared resumed. Only then is any daemon
+//!    told to stop, in turn. The first that answers that it does not stop ends the telling: the
+//!    daemons not yet told resume, and those told are waited for to have gone, up to thirty
+//!    seconds from the last telling, before anything is started again. Every environment's lock is
+//!    held, and every record of every registry is classed ([`inventory::classify`]). Anything
+//!    that holds the update restarts the daemons it stopped, from the release still current, and
+//!    the update waits.
 //! 6. `current` is switched in one rename, the locks are let go, each daemon is started as it was
 //!    before, from the new release, and each is waited for to answer as a daemon of it.
 //! 7. Releases nothing needs are removed: not the current one, not the previous one, not one
@@ -990,6 +992,7 @@ async fn hand_over(
     // the daemons not yet told resume, and the ones told are waited for to have gone, before
     // anything is started again, so that no daemon is met on its way out.
     let mut told = Vec::new();
+    let mut last_told = tokio::time::Instant::now();
     let mut refused: Option<Shown> = None;
     for (environment, daemon) in prepared {
         if refused.is_some() {
@@ -997,7 +1000,10 @@ async fn hand_over(
             continue;
         }
         match handover::stop(daemon, environment, &target.release).await {
-            handover::Stop::Told => told.push(environment),
+            handover::Stop::Told => {
+                told.push(environment);
+                last_told = tokio::time::Instant::now();
+            }
             handover::Stop::Refused(said) => {
                 refused = Some(shown!(
                     "the control daemon of environment {} did not stop: {}",
@@ -1007,8 +1013,9 @@ async fn hand_over(
             }
         }
     }
-    // Every daemon told is given the same thirty seconds, from the last telling, to have gone.
-    let gone_by = tokio::time::Instant::now() + handover::DAEMON_STOP;
+    // Every daemon told is given the same thirty seconds, from the last telling, to have gone: the
+    // resumes of the daemons not told, which follow a refusal, do not shorten them.
+    let gone_by = last_told + handover::DAEMON_STOP;
     if let Some(said) = refused {
         for environment in told {
             let _ = handover::hold(environment, Some(gone_by)).await;
@@ -1187,20 +1194,21 @@ async fn start_one(
     if handover::held(store, &environment, handover::INSTALL_LOCK_WAIT).await? {
         match handover::resume_holder(&environment, target).await? {
             handover::Resumed::Serving => {
-                return handover::answers_as(store, &environment, current, None)
-                    .await
-                    .map_err(|_| CliError::Other(handover::still_running(&environment)));
+                return match handover::answers_as(store, &environment, current, None).await {
+                    Ok(()) => Ok(()),
+                    Err(unanswered) => Err(unanswered_by(store, &environment, unanswered).await),
+                };
             }
             // A daemon that does not listen is starting, or is on its way out: it is waited for
             // until it answers, which ends the matter, or has gone, when the recorded daemon is
             // started below.
             handover::Resumed::NotListening => {
-                match handover::answers_as_or_gone(store, &environment, current, None, true)
-                    .await
-                    .map_err(|_| CliError::Other(handover::still_running(&environment)))?
-                {
-                    handover::Answered::Serving => return Ok(()),
-                    handover::Answered::Gone => {}
+                match handover::answers_as_or_gone(store, &environment, current, None, true).await {
+                    Ok(handover::Answered::Serving) => return Ok(()),
+                    Ok(handover::Answered::Gone) => {}
+                    Err(unanswered) => {
+                        return Err(unanswered_by(store, &environment, unanswered).await);
+                    }
                 }
             }
             handover::Resumed::Stopping => handover::gone(store, &environment).await?,
@@ -1232,6 +1240,23 @@ async fn start_one(
             let _ = child.try_wait();
             answered
         }
+    }
+}
+
+/// What it says when a daemon that holds an environment does not answer as the release asked for.
+///
+/// A daemon that is starting holds the install lock past its bound, and the look at the environment
+/// says that: it is no daemon of this update's to stop. Otherwise the daemon that still holds the
+/// environment is named, as [`handover::still_running`] names it, or said to have gone.
+#[cfg(unix)]
+async fn unanswered_by(
+    store: &Store,
+    environment: &inventory::Environment,
+    unanswered: CliError,
+) -> CliError {
+    match unanswered {
+        deferred @ CliError::UpdateDeferred(_) => deferred,
+        _ => CliError::Other(handover::still_running(store, environment).await),
     }
 }
 
@@ -1512,25 +1537,77 @@ mod tests {
     }
 
     /// A daemon still there is named with the process its lock names, and one that has gone since
-    /// is said to have gone: the lock names a process only while it is held.
-    #[test]
-    fn a_daemon_that_has_gone_is_not_named_to_be_killed() {
+    /// is said to have gone: the lock names a process only while it is held. Where a daemon that is
+    /// starting holds the install lock past its bound, the environment cannot be looked at, and no
+    /// process is named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_has_gone_is_not_named_to_be_killed() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (_store, environment) = store_and_environment(&temp);
+        let (store, environment) = store_and_environment(&temp);
         let daemon = kr_controller::singleton::SingletonLock::acquire(
             &environment.paths.singleton_lock(),
             environment.environment_id,
         )
         .expect("a daemon holds the environment");
-        let said = handover::still_running(&environment).to_string();
+        let said = handover::still_running(&store, &environment)
+            .await
+            .to_string();
         assert!(
             said.contains(&format!("process {}", std::process::id())) && said.contains("kill"),
             "the control: a daemon still there is named: {said}"
         );
         drop(daemon);
-        let said = handover::still_running(&environment).to_string();
+        let said = handover::still_running(&store, &environment)
+            .await
+            .to_string();
         assert!(
             said.contains("went away") && !said.contains("kill"),
+            "{said}"
+        );
+    }
+
+    /// A daemon that holds an environment and does not listen is waited for, and where another
+    /// daemon of the store starts meanwhile and holds the install lock past its bound, the update
+    /// says so and names no process to stop: the daemon that holds the environment is not one it
+    /// told to stop, and it could not be looked at.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_holder_that_does_not_listen_is_not_blamed_while_another_daemon_starts() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (store, environment) = store_and_environment(&temp);
+        let _holder = kr_controller::singleton::SingletonLock::acquire(
+            &environment.paths.singleton_lock(),
+            environment.environment_id,
+        )
+        .expect("a daemon holds the environment");
+        let text = |path: &std::path::Path| path.to_str().expect("text").to_owned();
+        let restart = Restart {
+            environment: environment.environment_id,
+            runtime_root: text(temp.paths().runtime_root()),
+            state_root: text(temp.paths().state_root()),
+            start: Start::Service,
+        };
+        let current = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
+        let target = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let (settled, done) = tokio::sync::oneshot::channel();
+        let settling = async {
+            let outcome = start_one(&store, &restart, &current, &target).await;
+            let _ = settled.send(());
+            outcome
+        };
+        // Another environment's daemon starts once the wait has begun, and holds the start lock
+        // until the wait has ended.
+        let starting = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let start = store.lock_start().expect("the start lock");
+            let _ = done.await;
+            drop(start);
+        };
+        let (outcome, ()) = tokio::join!(settling, starting);
+        let refused = outcome.expect_err("the daemon that holds the environment never answers");
+        assert_eq!(refused.exit_code(), 9, "{refused}");
+        let said = refused.to_string();
+        assert!(
+            said.contains("has held its start lock") && !said.contains("kill"),
             "{said}"
         );
     }
