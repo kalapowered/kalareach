@@ -1,0 +1,18 @@
+[package]
+name = "kr-width"
+description = "The kr-vt/1 width model: how many cells a scalar or a run of text occupies, on every platform the client builds for"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The pinned terminal library's own cell crate, which holds the width function and its tables. It is
+# the small part of that library that builds for Apple's mobile systems: the crates around it pull
+# in a terminal-mode dependency that has no target for them.
+wezterm-cell = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

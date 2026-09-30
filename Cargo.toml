@@ -31,6 +31,7 @@ members = [
     "crates/kr-transfer",
     "crates/kr-transport",
     "crates/kr-voice",
+    "crates/kr-width",
     "crates/kr-worker",
     "tests/conformance",
     "tests/e2e/agents",
@@ -129,6 +130,7 @@ kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }
 kr-transport = { path = "crates/kr-transport", version = "=0.1.0" }
 kr-voice = { path = "crates/kr-voice", version = "=0.1.0" }
+kr-width = { path = "crates/kr-width", version = "=0.1.0" }
 kr-worker = { path = "crates/kr-worker", version = "=0.1.0" }
 # The kernel's own filesystem and network confinement, which the project service encloses every Git
 # invocation in. A safe wrapper over three system calls; the ruleset is built from opened directory
@@ -231,6 +233,9 @@ vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497f
 # The component engine, pinned to one exact release. A compiled-code cache entry is only valid for
 # the version that produced it, so the pin is part of the cache key rather than a convenience.
 wasmtime = { version = "=48.0.3", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
+# The pinned terminal library's cell crate, which holds the width function. The width model takes it
+# directly so a client that builds for Apple's mobile systems measures text with the same tables.
+wezterm-cell = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb", features = ["std"] }
 wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }

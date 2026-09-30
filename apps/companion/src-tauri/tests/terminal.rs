@@ -1359,8 +1359,7 @@ async fn control_characters_never_reach_the_page() {
     link.attach().await;
     let text = "a\u{7}b\u{1b}[6nc";
     let mut hostile = row(0, text);
-    hostile.runs[0].cells =
-        kr_protocol::scalars::U64::new(kr_term::unicode::cells_for(text) as u64);
+    hostile.runs[0].cells = kr_protocol::scalars::U64::new(kr_width::cells_for(text) as u64);
     screen(&mut link, 1, 40, vec![hostile], 0).await;
     let shown = page_view.state(3, 1).await;
     let drawn = text_of(&shown).join("");

@@ -1321,9 +1321,9 @@ dependencies = [
  "kr-ipc",
  "kr-pairing",
  "kr-protocol",
- "kr-term",
  "kr-transport",
  "kr-voice",
+ "kr-width",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",
@@ -4393,6 +4393,7 @@ dependencies = [
  "kr-protocol",
  "kr-term",
  "kr-transport",
+ "kr-width",
  "rcgen",
  "reqwest",
  "rustls",
@@ -4922,6 +4923,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "kr-protocol",
+ "kr-width",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -5004,6 +5006,13 @@ dependencies = [
  "kr-protocol",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "kr-width"
+version = "0.1.0"
+dependencies = [
+ "wezterm-cell",
 ]
 
 [[package]]

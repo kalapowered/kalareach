@@ -31,7 +31,7 @@ use kr_protocol::projection::{
     CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign,
     ProjectedBuffer, ProjectedRow,
 };
-use kr_term::unicode;
+use kr_width as unicode;
 
 use super::Screen;
 
