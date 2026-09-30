@@ -5530,45 +5530,89 @@ async fn kr_req_11_04_a_signed_ten_thousand_entry_snapshot_syncs_and_serves_offl
     );
 }
 
-/// What a probe on the runtime sees of a sync: how many times a task that only yields ran once
-/// the index of the repository had been delivered.
+/// How many times the probe runs after the index arrives before the blocking pool is let go.
+const PROBE_TURNS: u64 = 20;
+
+/// A task that only yields to the runtime, and the pool it holds, for a sync to be watched with.
+///
+/// From the last byte of the index the runtime's one blocking thread is kept busy, so what a sync
+/// sends to the pool waits. The probe runs each time the sync gives the runtime back, and lets the
+/// pool go after [`PROBE_TURNS`] turns of its own. A sync that hands its work to the pool is still
+/// waiting when the pool is let go, so it finishes after; one that does the work on the runtime's
+/// thread finishes without ever waiting, so it finishes before. The condition is which came first,
+/// not how long anything took.
 #[derive(Clone, Debug, Default)]
 struct RuntimeProbe {
     ticks: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     at_index: Arc<std::sync::atomic::AtomicU64>,
     delivered: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    hold: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 impl RuntimeProbe {
-    /// Starts the task that yields to the runtime, counting each time it runs.
+    /// Starts the task that yields to the runtime, counting each turn it takes, and lets the pool
+    /// go once it has taken enough of them since the index arrived.
     fn start(&self) -> tokio::task::JoinHandle<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        let (ticks, stop) = (Arc::clone(&self.ticks), Arc::clone(&self.stop));
+        let probe = self.clone();
         tokio::spawn(async move {
-            while !stop.load(Relaxed) {
+            while !probe.stop.load(Relaxed) {
                 tokio::task::yield_now().await;
-                ticks.fetch_add(1, Relaxed);
+                let ticks = probe.ticks.fetch_add(1, Relaxed) + 1;
+                if probe.delivered.load(Relaxed)
+                    && ticks.saturating_sub(probe.at_index.load(Relaxed)) >= PROBE_TURNS
+                {
+                    probe.release();
+                }
             }
         })
     }
 
-    /// Notes that the last byte of the index has been delivered.
+    /// Notes that the last byte of the index has been delivered, and keeps the pool's one thread
+    /// busy from here.
     fn index_delivered(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        *self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
         self.at_index.store(self.ticks.load(Relaxed), Relaxed);
         self.delivered.store(true, Relaxed);
+        // The wait is a safety net for a run that stops before it lets the pool go, not a limit
+        // anything is measured against.
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = held.recv_timeout(std::time::Duration::from_secs(120));
+        }));
     }
 
-    /// Returns how many times the probe ran since the index was delivered, and stops it.
-    fn finish(&self) -> u64 {
+    /// Lets the pool's thread go.
+    fn release(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.stop.store(true, Relaxed);
+        if let Some(release) = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.released.store(true, Relaxed);
+            let _ = release.send(());
+        }
+    }
+
+    /// Stops the probe, and returns whether the pool had been let go when this was asked.
+    fn finish(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         assert!(
             self.delivered.load(Relaxed),
             "the index was never delivered"
         );
-        self.ticks.load(Relaxed) - self.at_index.load(Relaxed)
+        let released = self.released.load(Relaxed);
+        self.stop.store(true, Relaxed);
+        self.release();
+        released
     }
 }
 
@@ -5598,35 +5642,41 @@ impl tough::Transport for Announcing {
     }
 }
 
-/// Runs `work` on a current-thread runtime, where a task that must run and the work share the one
-/// thread, and returns how many times that task ran after the index arrived.
-fn ticks_after_the_index<F, Fut>(work: F) -> u64
+/// Runs `work` on a current-thread runtime with one blocking thread, where a probe and the work
+/// share the one thread, and returns whether the pool had been let go when the work finished.
+fn finished_after_the_pool_was_let_go<F, Fut>(work: F) -> bool
 where
     F: FnOnce(RuntimeProbe) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .max_blocking_threads(1)
         .build()
         .expect("a runtime")
         .block_on(async {
             let probe = RuntimeProbe::default();
             let ticker = probe.start();
             work(probe.clone()).await;
-            let ticks = probe.finish();
+            let released = probe.finish();
             ticker.await.expect("the probe finished");
-            ticks
+            released
         })
 }
 
-/// A synchronisation hands the runtime back once the index has arrived, so a task that has to run
-/// between its awaits (a terminal's input, on the thread the sync shares) runs before the sync is
-/// over, for a catalogue of any size. The control is a stand-in that reads the same index without
-/// awaiting, which the probe sees as never having run.
+/// A synchronisation hands its work on the index to the blocking pool and gives the runtime back
+/// until it has the result, so a task that has to run between its awaits (a terminal's input, on
+/// the thread the sync shares) runs while that work is pending, for a catalogue of any size. The
+/// control is a stand-in that parses the same index on the runtime's thread, which finishes before
+/// the pool is let go.
+///
+/// What this shows is that work on the index is off the runtime's thread and that the sync does
+/// not finish until it is done. It does not show how long any later stretch on the calling thread
+/// runs.
 #[test]
-fn kr_ac_017_a_sync_hands_the_runtime_back_after_the_index_arrives() {
-    // Control: parsing the index inline, with no await after it arrives, leaves the probe no turn.
-    let control = ticks_after_the_index(|probe| async move {
+fn kr_ac_017_a_sync_hands_the_runtime_back_while_its_work_on_the_index_is_pending() {
+    // Control: parsing the index on the runtime's thread finishes without waiting for the pool.
+    let waited = finished_after_the_pool_was_let_go(|probe| async move {
         let home = tempfile::tempdir().expect("a temporary directory");
         let generation = ten_thousand_entries(home.path()).await;
         let bytes = std::fs::read(generation.targets_dir().join("index.json")).expect("an index");
@@ -5635,10 +5685,13 @@ fn kr_ac_017_a_sync_hands_the_runtime_back_after_the_index_arrives() {
             serde_json::from_slice(&bytes).expect("an index");
         assert_eq!(index.entries.len(), 10_000);
     });
-    assert_eq!(control, 0, "an inline parse leaves the task no turn");
+    assert!(
+        !waited,
+        "an inline parse finished after the pool was let go, so the probe cannot tell it apart"
+    );
 
     for entries in [1usize, 10_000] {
-        let ticks = ticks_after_the_index(|probe| async move {
+        let waited = finished_after_the_pool_was_let_go(|probe| async move {
             let home = tempfile::tempdir().expect("a temporary directory");
             let generation = if entries == 1 {
                 Generation::build(home.path(), GenerationSpec::default()).await
@@ -5657,9 +5710,9 @@ fn kr_ac_017_a_sync_hands_the_runtime_back_after_the_index_arrives() {
             assert_eq!(outcome.entries, entries);
         });
         assert!(
-            ticks >= 1,
-            "{entries} entries: the task that must run never ran between the index arriving and \
-             the sync finishing"
+            waited,
+            "{entries} entries: the sync finished before the pool was let go, so its work on the \
+             index ran on the runtime's own thread"
         );
     }
 }
