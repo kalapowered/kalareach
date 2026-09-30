@@ -1106,21 +1106,65 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.16: the arguments an interactive root shell is launched with, for every shell
+    /// this host qualifies and both startup modes.
+    ///
+    /// Section 7 states them: Zsh with `-l -i` on macOS and Bash and Zsh with `-i` on Linux, a
+    /// Linux profile that asks for login startup adds `-l`, Fish uses `--interactive` and adds
+    /// `--login` for a login profile, and PowerShell 7 starts with `-NoLogo` and has no login
+    /// mode. The host holds this table because a package records what it was built from, not how a
+    /// session starts it.
     #[test]
-    fn the_arguments_are_the_platforms_and_a_login_profile_adds_to_them() {
-        // Section 7: the packaged Zsh with `-l -i` on macOS, the packaged shell with `-i` on
-        // Linux, and a Linux profile may ask for login startup.
+    fn every_shell_is_launched_with_the_arguments_section_seven_states_for_its_startup_mode() {
+        let root = tempfile::tempdir().expect("a directory");
+        for kind in ShellKind::ALL {
+            install(root.path(), *kind, false);
+        }
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let expected = |kind: ShellKind, mode: StartupMode| -> Vec<&'static str> {
+            match (kind, mode) {
+                (ShellKind::Zsh | ShellKind::Bash, StartupMode::Interactive) => vec!["-i"],
+                (ShellKind::Zsh | ShellKind::Bash, StartupMode::Login) => vec!["-l", "-i"],
+                (ShellKind::Fish, StartupMode::Interactive) => vec!["--interactive"],
+                (ShellKind::Fish, StartupMode::Login) => vec!["--login", "--interactive"],
+                (ShellKind::PowerShell, _) => vec!["-NoLogo"],
+            }
+        };
+        for kind in ShellKind::ALL {
+            let package = set.get(*kind).expect("the package");
+            for mode in [StartupMode::Interactive, StartupMode::Login] {
+                assert_eq!(
+                    package.arguments(mode),
+                    expected(*kind, mode),
+                    "{} in {mode:?} startup",
+                    kind.as_str()
+                );
+            }
+            assert_eq!(
+                package.interactive_flags(),
+                package.arguments(StartupMode::for_host()),
+                "{}: the default is this platform's",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// KR-REQ-07.16: what a session with no profile is launched with is the platform's own default
+    /// from section 7: Zsh with `-l -i` on macOS, the packaged shell with `-i` on Linux, and
+    /// PowerShell 7 with `-NoLogo` everywhere it runs, which is the whole of its default on Windows.
+    #[test]
+    fn a_session_with_no_profile_is_launched_as_section_seven_defaults_this_platform() {
         let root = tempfile::tempdir().expect("a directory");
         install(root.path(), ShellKind::Zsh, false);
+        install(root.path(), ShellKind::PowerShell, false);
         let set = PackageSet::discover(root.path()).expect("reads the packages");
-        let package = set.get(ShellKind::Zsh).expect("the package");
-        assert_eq!(package.arguments(StartupMode::Interactive), vec!["-i"]);
-        assert_eq!(package.arguments(StartupMode::Login), vec!["-l", "-i"]);
-        assert_eq!(
-            package.interactive_flags(),
-            package.arguments(StartupMode::for_host()),
-            "the default is this platform's"
-        );
+        let default = |kind: ShellKind| set.get(kind).expect("the package").interactive_flags();
+        if cfg!(target_os = "macos") {
+            assert_eq!(default(ShellKind::Zsh), vec!["-l", "-i"]);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(default(ShellKind::Zsh), vec!["-i"]);
+        }
+        assert_eq!(default(ShellKind::PowerShell), vec!["-NoLogo"]);
     }
 
     #[test]
