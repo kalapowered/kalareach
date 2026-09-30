@@ -696,13 +696,16 @@ fn installing_over_each_plugin_stack_adds_only_the_marked_entry_and_removes_clea
 #[test]
 #[ignore = "needs this tree's built shell packages and a built kr; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() {
+    /// The files a home starts with: each one's name and its text.
+    type StartupFiles<'a> = Vec<(&'a str, &'a str)>;
+
     let kr = Kr::new();
     // A file shaped like the one iTerm2 installs for zsh: it defines hooks and prints its own escape
     // sequences, and the installer reads none of it. It is here to show that the installer leaves
     // it, and the line that sources it, exactly as they are.
     let iterm2 = "# iTerm2 shell integration\nif [[ -o interactive ]]; then\n  iterm2_hostname=$(hostname)\n  \
                   precmd_functions+=(iterm2_precmd)\n  iterm2_precmd() { printf '\\033]1337;RemoteHost=%s\\a' \"$USER@$iterm2_hostname\"; }\nfi\n";
-    let homes: [(&str, ShellKind, Vec<(&str, &str)>); 3] = [
+    let homes: [(&str, ShellKind, StartupFiles); 3] = [
         (
             "zsh with iTerm2's shell integration",
             ShellKind::Zsh,
