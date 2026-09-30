@@ -68,8 +68,8 @@ pub const STARTED_FILE: &str = ".kr-agents-started";
 const EXPORTED_WITNESS: &str = "PATH";
 
 /// The last line of every list the shell writes, after the names: a list that does not end with it
-/// was read while it was being written, or not written whole.
-pub const LIST_END: &str = "KR_AGENTS_END";
+/// was read while it was being written, or not written whole. It cannot be a variable's name.
+pub const LIST_END: &str = "-- end of the names --";
 
 /// Whether `name` is one `pattern` names: a name, or a prefix when the pattern ends in `*`.
 fn names_of(pattern: &str, name: &str) -> bool {
@@ -464,11 +464,17 @@ impl Provenance {
     ///
     /// Returns why, as [`forget_names`] does.
     pub fn forget_started(&self) -> Result<(), String> {
-        if self.cleared_required.load(Ordering::SeqCst) {
+        if self.checks_names() {
             forget_names(&self.started_file)
         } else {
             Ok(())
         }
+    }
+
+    /// Whether the launch checks the names the shell exports: the build list clears some, and the
+    /// part has a login.
+    fn checks_names(&self) -> bool {
+        !self.cleared.is_empty() && self.cleared_required.load(Ordering::SeqCst)
     }
 
     /// Checks the same names as the shell wrote them just before it ran the command line typed
@@ -479,7 +485,7 @@ impl Provenance {
     ///
     /// Returns why, as [`wait_for_names`] does.
     pub fn check_cleared_at_start(&self, within: Duration) -> Result<(), String> {
-        if self.cleared.is_empty() || !self.cleared_required.load(Ordering::SeqCst) {
+        if !self.checks_names() {
             return Ok(());
         }
         wait_for_names(&self.started_file, within, &self.cleared, &self.allowed)
@@ -492,7 +498,7 @@ impl Provenance {
     }
 
     fn check_names(&self, file: &Path) -> Result<(), String> {
-        if self.cleared.is_empty() || !self.cleared_required.load(Ordering::SeqCst) {
+        if !self.checks_names() {
             return Ok(());
         }
         let exported = std::fs::read_to_string(file).map_err(|error| {
@@ -1392,6 +1398,8 @@ mod tests {
             list(&["HOME", "TERM"]),
             "PATH\nHOME\n".to_owned(),
             "PATH\nCLAUDE_CODE_SUBAGENT_MODEL\n".to_owned(),
+            // The mark cannot be a name, and a name that looks like a mark is not one.
+            "PATH\nKR_AGENTS_END\n".to_owned(),
         ] {
             let refused = exported_clear(&unwritten, &cleared, &[]).expect_err("not whole");
             assert!(refused.starts_with(ENVIRONMENT_NOT_READ), "{refused}");
@@ -1443,6 +1451,12 @@ mod tests {
             let found = wait_for_names(&file, Duration::from_secs(5), &cleared, &[]);
             writer.join().expect("the writer ends");
             assert_eq!(found.is_ok(), clear, "{found:?}");
+            if let Err(refused) = &found {
+                assert!(
+                    refused.starts_with(ENVIRONMENT_NOT_CLEAR),
+                    "a refusal, not a timeout: {refused}"
+                );
+            }
             forget_names(&file).expect("removes it");
         }
         // A file that cannot be removed says so.
