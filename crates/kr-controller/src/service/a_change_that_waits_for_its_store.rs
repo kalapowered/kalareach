@@ -98,7 +98,7 @@ async fn arrival(arrived: std::sync::mpsc::Receiver<()>) {
 
 /// A daemon on a tree of its own, on a continuous clock the test moves, with a supervisor that
 /// starts nothing.
-pub(super) async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
+async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
