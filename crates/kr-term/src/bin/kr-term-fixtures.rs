@@ -3,6 +3,9 @@
 //! Run with no arguments to write `fixtures/terminal/`, and with `--check` to fail when a committed
 //! file differs from what the engine produces now. Continuous integration runs the second form, so
 //! a change in behaviour has to arrive together with the fixture that records it.
+//!
+//! With `--terminfo <directory>` it writes the compiled terminfo database into that directory
+//! instead, in the layout a terminfo library reads, for a release tree that carries one.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +20,21 @@ use kr_term::unicode::{LIBRARY, UnicodeModel};
 use serde_json::{Value, json};
 
 fn main() -> ExitCode {
-    let check = std::env::args().any(|arg| arg == "--check");
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(at) = arguments.iter().position(|arg| arg == "--terminfo") {
+        let Some(directory) = arguments.get(at + 1) else {
+            eprintln!("--terminfo needs a directory");
+            return ExitCode::FAILURE;
+        };
+        return match terminfo::write_database(Path::new(directory)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{directory}: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let check = arguments.iter().any(|arg| arg == "--check");
     let root = fixtures_root();
     let files = [
         ("classes.json", classes()),
@@ -245,6 +262,7 @@ fn profile() -> Value {
 }
 
 fn terminfo_database() -> Value {
+    let compiled = terminfo::compiled().expect("the pinned database compiles");
     let coverage: Vec<Value> = terminfo::coverage()
         .into_iter()
         .map(|entry| {
@@ -280,6 +298,14 @@ fn terminfo_database() -> Value {
                 terminfo::Param::Text(text) => json!({ "text": text }),
             }).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
+        "compiled": {
+            "description": "The binary file a terminfo library loads, from the same data. \
+                            Numbers are 16 bits wide, and the capabilities the library does not \
+                            predefine follow the predefined ones in an extended section.",
+            "names": terminfo::TERMINAL_NAMES,
+            "size": compiled.len(),
+            "bytes": hex(&compiled),
+        },
         "coverage": coverage,
     })
 }

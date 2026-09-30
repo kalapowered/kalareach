@@ -89,6 +89,19 @@ fn width_fixture_is_current() {
     }
 }
 
+/// The committed compiled database is the one the crate compiles now.
+#[test]
+fn terminfo_fixture_holds_the_compiled_database() {
+    let fixture = load("terminfo-xterm-256color.json");
+    let compiled = kr_term::terminfo::compiled().expect("the pinned database compiles");
+    assert_eq!(fixture["compiled"]["size"], compiled.len());
+    assert_eq!(
+        fixture["compiled"]["bytes"].as_str(),
+        Some(kr_term::conformance::hex(&compiled).as_str()),
+        "run `cargo run -p kr-term --bin kr-term-fixtures` and commit the result"
+    );
+}
+
 #[test]
 fn snapshot_fixture_is_current() {
     let fixture = load("snapshot.json");
