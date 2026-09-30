@@ -411,6 +411,14 @@ pub enum ResolvePolicy {
     Refuse,
     /// No answer, and the endpoint closed, as by a worker that went while the shell asked.
     CloseEndpoint,
+    /// The worker's own decision for a session with integrations, with a backend it can
+    /// establish: an integrated invocation is answered with `launcher`, `environment` and the flags
+    /// its integration adds, and every other invocation as the decision says, which is as typed.
+    Establishing {
+        integrations: Vec<kr_protocol::session::CommandIntegration>,
+        launcher: String,
+        environment: Vec<kr_protocol::session::EnvironmentVariable>,
+    },
     /// A backend the worker established: the answer names `launcher`, adds `environment` for the
     /// one invocation and appends `added` to the vector.
     Backend {
@@ -571,6 +579,8 @@ pub struct Session {
     /// False while what is being written is not something the reader is waiting for.
     stepping: bool,
     stream: UnixStream,
+    /// The other end of the stream of a session that is not managed, held so it stays open.
+    _bridge_peer: Option<UnixStream>,
     /// True once this side shut the endpoint, after which nothing is written or read.
     shut: bool,
     /// True once a write found the bridge's side of the endpoint gone.
@@ -682,6 +692,41 @@ impl Session {
         gesture: kr_shell_integration::contract::events::EofGesture,
         profile: Profile<'_>,
     ) -> Self {
+        Self::start_as(package, environment, gesture, profile, true)
+    }
+
+    /// Starts the packaged shell as an ordinary shell of a person's: the same binary, the same
+    /// startup, and nothing exported that tells it to connect to a bridge.
+    ///
+    /// It is the baseline a managed session's behaviour is compared with. Nothing here reads or
+    /// writes a bridge, so the events, the fences and the frames of a managed session are not
+    /// available on it; what it offers is a terminal to type at and read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell cannot be started.
+    #[must_use]
+    pub fn start_unmanaged(
+        package: &Package,
+        environment: &[(String, String)],
+        profile: Profile<'_>,
+    ) -> Self {
+        Self::start_as(
+            package,
+            environment,
+            kr_shell_integration::contract::events::EofGesture::default(),
+            profile,
+            false,
+        )
+    }
+
+    fn start_as(
+        package: &Package,
+        environment: &[(String, String)],
+        gesture: kr_shell_integration::contract::events::EofGesture,
+        profile: Profile<'_>,
+        managed: bool,
+    ) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-shell-")
             .tempdir()
@@ -752,15 +797,17 @@ impl Session {
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
         command.env("LANG", "C");
-        command.env("KR_SESSION", session_id.to_string());
-        command.env("KR_SHELL_BRIDGE", &endpoint.path);
-        command.env(
-            "KR_SHELL_BRIDGE_SECRET",
-            kr_protocol::scalars::to_base64url(&secret),
-        );
-        // A run that asked a package for diagnostics passes that through to the shell it starts.
-        if let Some(trace) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
-            command.env("KR_SHELL_BRIDGE_TRACE", trace);
+        if managed {
+            command.env("KR_SESSION", session_id.to_string());
+            command.env("KR_SHELL_BRIDGE", &endpoint.path);
+            command.env(
+                "KR_SHELL_BRIDGE_SECRET",
+                kr_protocol::scalars::to_base64url(&secret),
+            );
+            // A run that asked a package for diagnostics passes that through to the shell it starts.
+            if let Some(trace) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
+                command.env("KR_SHELL_BRIDGE_TRACE", trace);
+            }
         }
         // What the case itself names goes last, so a case that sets one of these is the one heard.
         for (name, value) in environment {
@@ -802,8 +849,18 @@ impl Session {
             drop(finished_reading);
         });
 
-        let stream = accept_within(&listener, REPLY)
-            .expect("the shell connects to the endpoint it was given");
+        // A shell that is not managed connects to nothing. The stream a session reads is then one
+        // whose other end this session holds and never writes to, so a read finds nothing.
+        let (stream, bridge_peer) = if managed {
+            (
+                accept_within(&listener, REPLY)
+                    .expect("the shell connects to the endpoint it was given"),
+                None,
+            )
+        } else {
+            let (ours, theirs) = UnixStream::pair().expect("a stream that connects to nothing");
+            (ours, Some(theirs))
+        };
         stream
             .set_nonblocking(true)
             .expect("a non-blocking connection");
@@ -819,6 +876,7 @@ impl Session {
             stepping: true,
             last_entry: None,
             stream,
+            _bridge_peer: bridge_peer,
             shut: false,
             peer_write_gone: false,
             peer_read_gone: false,
@@ -840,6 +898,9 @@ impl Session {
             _directory: directory,
         };
 
+        if !managed {
+            return session;
+        }
         let hello = match session.read_frame(REPLY).expect("the opening frame") {
             BridgeFrame::Hello(hello) => hello,
             other => panic!("the bridge opened with {other:?}"),
@@ -1254,6 +1315,31 @@ impl Session {
                 self.commands.resolves.push(params.clone());
                 let answer = match &self.commands.policy {
                     ResolvePolicy::Decide(integrations) => worker_decision(integrations, params),
+                    ResolvePolicy::Establishing {
+                        integrations,
+                        launcher,
+                        environment,
+                    } => {
+                        use kr_shell_integration::host::command::{InvocationContext, resolve};
+
+                        let resolution = resolve(
+                            integrations,
+                            InvocationContext {
+                                managed_root_shell: true,
+                                interactive: params.interactive,
+                            },
+                            &params.argv,
+                        );
+                        let backend = resolution.establishes_backend().then(|| {
+                            kr_protocol::root::CommandBackend {
+                                session_id: params.session_id,
+                                prompt_generation: params.prompt_generation,
+                                environment: environment.clone(),
+                                launcher: launcher.clone(),
+                            }
+                        });
+                        resolution.to_answer(backend)
+                    }
                     ResolvePolicy::Silent => return None,
                     ResolvePolicy::CloseEndpoint => {
                         self.commands.close_requested = true;
