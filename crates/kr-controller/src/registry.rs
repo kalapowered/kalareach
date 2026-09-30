@@ -222,6 +222,78 @@ impl Registry {
         Self::prepare(connection, environment_id)
     }
 
+    /// Takes into a registry's own file what a write-ahead log or a rollback journal beside it
+    /// holds, as the daemon's clean stop does, and says whether it did.
+    ///
+    /// What a daemon that ended by a signal leaves behind: the records are in the log, and
+    /// [`Registry::open_to_read`] refuses to read a file that has not taken them in. This changes no
+    /// record, migrates nothing and settles nothing: the log is checkpointed and the file closed,
+    /// which removes it. The caller holds the environment's singleton lock, so no daemon writes
+    /// meanwhile. Only a log or a journal that is a regular file with something in it is opened for;
+    /// the file itself must be a regular file, and not a link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the file is not a regular file or is
+    /// a link, when a log or a journal beside it is not a regular file, and when the log cannot be
+    /// taken in.
+    pub fn take_in_its_log(path: impl AsRef<std::path::Path>) -> Result<bool> {
+        let path = path.as_ref();
+        let refuse = |detail: String| ControllerError::RegistryUnavailable { detail };
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(refuse("this registry is not a regular file".to_owned())),
+            Err(error) => {
+                return Err(refuse(format!(
+                    "this registry could not be looked at: {error}"
+                )));
+            }
+        }
+        let mut holds = false;
+        for suffix in ["-wal", "-journal"] {
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(suffix);
+            match std::fs::symlink_metadata(&beside) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(metadata) if metadata.is_file() => holds |= metadata.len() > 0,
+                Ok(_) => {
+                    return Err(refuse(format!(
+                        "what is beside this registry under the name {} is not a regular file",
+                        beside.to_string_lossy()
+                    )));
+                }
+                Err(error) => {
+                    return Err(refuse(format!(
+                        "what is beside this registry could not be looked at: {error}"
+                    )));
+                }
+            }
+        }
+        if !holds {
+            return Ok(false);
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ControllerError::registry)?;
+        // A journal that a stopped writer left is rolled back by the first read; a log is taken in
+        // by the checkpoint, and refused if a reader keeps it from being.
+        let _: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+            .map_err(ControllerError::registry)?;
+        let blocked: i64 = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(ControllerError::registry)?;
+        if blocked != 0 {
+            return Err(refuse(
+                "this registry's write-ahead log could not be taken in while something reads it"
+                    .to_owned(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Opens a registry that already exists, to read what it records and nothing else.
     ///
     /// Nothing is created, brought forward, repaired or settled, and nothing is written, not even
@@ -2647,5 +2719,32 @@ mod tests {
             "a refusal changes nothing"
         );
         drop(writer);
+    }
+
+    /// What a daemon that ended by a signal leaves, a log that holds its last writes, is taken into
+    /// the file, and then read: the records are the ones the daemon wrote, and nothing else changed.
+    #[test]
+    fn a_log_a_daemon_left_is_taken_in_and_then_read() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        assert!(
+            !Registry::take_in_its_log(&path).expect("nothing to take in"),
+            "a closed registry holds no log"
+        );
+        // A daemon ended by a signal: its connection is never closed, and its log holds the write.
+        let mut daemon = Registry::open(&path, environment()).expect("a registry");
+        daemon
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        daemon.advance_generation().expect("a write the log holds");
+        let refused = Registry::open_to_read(&path, environment()).expect_err("the log holds it");
+        assert!(refused.to_string().contains("write-ahead log"), "{refused}");
+        assert!(Registry::take_in_its_log(&path).expect("taken in"));
+        let read = Registry::open_to_read(&path, environment()).expect("read after it");
+        assert_eq!(read.generation().expect("reads").get(), 1);
+        drop(read);
+        std::mem::forget(daemon);
     }
 }

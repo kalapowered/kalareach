@@ -130,9 +130,12 @@ Only the current release's `kr` updates the host. An update, in order:
    does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
    and those already told are waited for to have gone, up to thirty seconds from the last telling,
    before anything is started again. Once every daemon has stopped, it holds every environment's
-   lock and reads every environment's registry, which it refuses to open where it is not a regular
-   file: a worker at a level the new release does not retain, a worker that does not answer its
-   challenge and has not ended, and a session still being started each hold the update;
+   lock and reads every environment's registry as it is. A log that a daemon ended by a signal
+   left beside the registry is taken into its file first, as the daemon's own stop would have; a
+   registry that is a link, or is not a regular file, is refused before anything is opened, and the
+   run then starts again what it stopped and exits with 1. A worker at a level the new release does
+   not retain, a worker that does not answer its challenge and has not ended, and a session still
+   being started each hold the update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started
    before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
