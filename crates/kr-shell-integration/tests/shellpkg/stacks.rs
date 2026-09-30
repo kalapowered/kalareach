@@ -817,6 +817,32 @@ impl CaseSetup {
     /// corpus fault rather than a package one.
     #[must_use]
     pub fn prepare(case: &QualificationCase, package: &Package, stacks: &StackIndex) -> Self {
+        Self::prepare_with(case, package, stacks, Some(package_entry(package)))
+    }
+
+    /// Writes the person's own startup files as the case has them, with no entry of the
+    /// package's: the home as it is before `kr shell install` has been run on it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a file the case names is missing or its path climbs out of the home.
+    #[must_use]
+    pub fn before_install(
+        case: &QualificationCase,
+        package: &Package,
+        stacks: &StackIndex,
+    ) -> Self {
+        Self::prepare_with(case, package, stacks, None)
+    }
+
+    /// The home's files, and what goes where a case put the entry token: the package's own marked
+    /// block, or nothing at all, the token's line included.
+    fn prepare_with(
+        case: &QualificationCase,
+        package: &Package,
+        stacks: &StackIndex,
+        entry: Option<String>,
+    ) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-qualification-")
             .tempdir()
@@ -830,7 +856,6 @@ impl CaseSetup {
         let order = directory.path().join("order");
         std::fs::write(&order, "").expect("the order record");
 
-        let entry = package_entry(package);
         let mut entry_written = false;
         for file in &case.home {
             let source = case.directory.join("home").join(&file.file);
@@ -845,13 +870,22 @@ impl CaseSetup {
             let body = match std::str::from_utf8(&body) {
                 Ok(text) if text.contains(ENTRY_TOKEN) => {
                     entry_written = true;
-                    text.replace(ENTRY_TOKEN, &entry).into_bytes()
+                    match &entry {
+                        Some(entry) => text.replace(ENTRY_TOKEN, entry).into_bytes(),
+                        // The person's file, as it was before anything was installed: the line
+                        // that stands for the entry is not one of theirs.
+                        None => text
+                            .split_inclusive('\n')
+                            .filter(|line| line.trim_end_matches('\n') != ENTRY_TOKEN)
+                            .collect::<String>()
+                            .into_bytes(),
+                    }
                 }
                 _ => body,
             };
             std::fs::write(&destination, body).expect("a startup file");
         }
-        if !entry_written {
+        if let (false, Some(entry)) = (entry_written, entry) {
             // This shell activates the integration from a file of its own rather than from inside
             // the person's, which is what its own configuration layout asks for.
             let destination = home_path(&home, default_entry_path(case.shell));
