@@ -3475,6 +3475,24 @@ test.describe("the phone's settings over a live session", () => {
       })
     }
 
+    test(`rest clear of the bottom safe area on ${surface}`, async ({ page }) => {
+      await onPhone(page, surface, { width: 390, height: 844, scale: '100%' }, `&session=${SESSION}`)
+      // A home indicator or a gesture bar 34 px high, as the platform reports it.
+      await page.evaluate(() => {
+        document.documentElement.style.setProperty('--safe-bottom', '34px')
+      })
+      await page.getByRole('button', { name: 'Settings' }).click()
+      await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+        timeout: PRESENTATION_DEADLINE
+      })
+      const clear = await page.getByTestId('sheet').evaluate((sheet) => {
+        const last = Array.from(sheet.querySelectorAll<HTMLElement>('.theme-caption')).at(-1)
+        return last === undefined ? null : sheet.getBoundingClientRect().bottom - last.getBoundingClientRect().bottom
+      })
+      expect(clear, 'the last choice is above the indicator').not.toBeNull()
+      expect(clear ?? 0).toBeGreaterThanOrEqual(34)
+    })
+
     test(`close by the system's back first, and leave the session by the next, on ${surface}`, async ({
       page
     }) => {
@@ -3494,5 +3512,95 @@ test.describe("the phone's settings over a live session", () => {
       await expect(page.getByLabel('Message this session')).toHaveCount(0)
       await expect(page.getByRole('heading', { level: 1 })).toHaveText('Sessions')
     })
+  }
+})
+
+// KR-REQ-13.19: the inbox's rows stay inside the screen at a person's own text size, and the count
+// on the Attention tab is a circle that holds its digits at any size. At the base text size neither
+// moves.
+test.describe("the phone's inbox and tab count at a person's own text size", () => {
+  const SIZES: readonly Seen[] = [
+    { width: 320, height: 720, scale: '200%' },
+    { width: 320, height: 720, scale: '150%' },
+    { width: 320, height: 720, scale: '100%' },
+    { width: 390, height: 844, scale: '200%' },
+    { width: 390, height: 844, scale: '100%' }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const seen of SIZES) {
+      test(`keeps every row inside the screen on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen)
+        await page.locator('.m-row').first().waitFor()
+        const placed = await page.evaluate(() => {
+          const main = document.querySelector<HTMLElement>('.m-main')
+          if (main === null) throw new Error('the shell has no main area')
+          const style = getComputedStyle(main)
+          const frame = main.getBoundingClientRect()
+          const left = frame.left + parseFloat(style.paddingLeft)
+          const right = frame.right - parseFloat(style.paddingRight)
+          const rows = Array.from(document.querySelectorAll<HTMLElement>('.m-row')).map((row) => {
+            const box = row.getBoundingClientRect()
+            return { left: box.left, right: box.right }
+          })
+          // Anything else in the main area that ends past the screen, but the filters, which scroll
+          // along their own strip.
+          const outside = Array.from(main.querySelectorAll<HTMLElement>('*'))
+            .filter((element) => element.closest('.m-filters') === null)
+            .filter((element) => element.getBoundingClientRect().right > window.innerWidth + 0.5)
+            .map((element) => `${element.tagName.toLowerCase()}.${String(element.className)}`)
+          return { left, right, rows, outside, sideways: main.scrollWidth - main.clientWidth }
+        })
+        expect(placed.rows.length).toBeGreaterThan(0)
+        expect(placed.sideways, 'nothing makes the main area scroll sideways').toBeLessThanOrEqual(1)
+        expect(placed.outside, 'nothing ends past the screen').toEqual([])
+        for (const [index, row] of placed.rows.entries()) {
+          expect(row.left, `row ${index} starts inside the gutter`).toBeGreaterThanOrEqual(placed.left - 0.5)
+          expect(row.right, `row ${index} ends inside the gutter`).toBeLessThanOrEqual(placed.right + 0.5)
+          // A row takes the whole width there is.
+          expect(row.right - row.left, `row ${index} takes the whole width`).toBeCloseTo(placed.right - placed.left, 0)
+        }
+        await still(page, `inbox-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
+      })
+
+      test(`holds the count's digits in its circle on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen)
+        const badge = page.locator('.m-tab-badge')
+        await expect(badge).toBeVisible()
+        for (const count of [null, '99+']) {
+          const measured = await badge.evaluate((element, text) => {
+            if (text !== null) element.textContent = text
+            const box = element.getBoundingClientRect()
+            const range = document.createRange()
+            range.selectNodeContents(element)
+            const digits = range.getBoundingClientRect()
+            const style = getComputedStyle(element)
+            return {
+              width: box.width,
+              height: box.height,
+              digitsWidth: digits.width,
+              digitsHeight: digits.height,
+              padding: parseFloat(style.paddingLeft),
+              root: parseFloat(getComputedStyle(document.documentElement).fontSize)
+            }
+          }, count)
+          const label = `${count ?? 'the count'}`
+          expect(measured.height, `${label}: the circle is as tall as its digits`).toBeGreaterThanOrEqual(measured.digitsHeight - 0.5)
+          expect(measured.width, `${label}: the circle is as wide as its digits and their room`).toBeGreaterThanOrEqual(
+            measured.digitsWidth + 2 * measured.padding - 0.5
+          )
+          expect(measured.width, `${label}: it is a circle or a pill, never narrower than tall`).toBeGreaterThanOrEqual(measured.height - 0.5)
+          if (count === null && seen.scale === '100%') {
+            // At the base text size the circle is what it was.
+            expect(measured.width).toBeCloseTo(17, 0)
+            expect(measured.height).toBeCloseTo(17, 0)
+          }
+        }
+      })
+    }
   }
 })
