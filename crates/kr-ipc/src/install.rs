@@ -1208,6 +1208,94 @@ mod tests {
         assert!(made.success(), "a pipe is made at {}", path.display());
     }
 
+    /// How long a test waits for a release to be let go of before it says what still holds it.
+    ///
+    /// A release is let go of when every descriptor of its hold is closed, and a program that another
+    /// test starts at the moment the hold is dropped keeps a copy of the descriptor until its own
+    /// program takes over. The wait ends when the release is free, so this is only the bound of a
+    /// failure.
+    const RELEASE_WAIT: Duration = Duration::from_secs(60);
+
+    /// Asks `released` again until it answers yes, for as long as `within`, and on failure says which
+    /// processes still have `manifest` open.
+    fn wait_for_release(
+        manifest: &Path,
+        within: Duration,
+        mut released: impl FnMut() -> bool,
+    ) -> std::result::Result<(), String> {
+        let deadline = Instant::now() + within;
+        while !released() {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{} is still held by: {}",
+                    manifest.display(),
+                    holders_of(manifest)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// Fails the test, saying what still holds the release, unless `released` answers yes within
+    /// [`RELEASE_WAIT`].
+    fn assert_released(manifest: &Path, what: &str, released: impl FnMut() -> bool) {
+        if let Err(held) = wait_for_release(manifest, RELEASE_WAIT, released) {
+            panic!("{what}: {held}");
+        }
+    }
+
+    /// The processes that have `path` open, each by its number and its program's name.
+    #[cfg(target_os = "linux")]
+    fn holders_of(path: &Path) -> String {
+        let Ok(path) = std::fs::canonicalize(path) else {
+            return format!("{} is not there", path.display());
+        };
+        let mut holders = Vec::new();
+        for process in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(number) = process
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let opens = std::fs::read_dir(process.path().join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|to| to == path));
+            if opens {
+                let program = std::fs::read_to_string(process.path().join("comm"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                holders.push(format!("process {number} ({program})"));
+            }
+        }
+        if holders.is_empty() {
+            "no process that can be seen".to_owned()
+        } else {
+            holders.join(", ")
+        }
+    }
+
+    /// The processes that have `path` open, each by its number and its program's name.
+    #[cfg(not(target_os = "linux"))]
+    fn holders_of(path: &Path) -> String {
+        match std::process::Command::new("/usr/sbin/lsof")
+            .args(["-F", "pc", "--"])
+            .arg(path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).replace('\n', " ")
+            }
+            Ok(_) => "no process that can be seen".to_owned(),
+            Err(error) => format!("lsof did not run: {error}"),
+        }
+    }
+
     fn manifest_of(release: &ReleaseName) -> String {
         let manifest = ReleaseManifest {
             kind: ManifestKind::Release,
@@ -1276,9 +1364,10 @@ mod tests {
             "the program holds its release"
         );
         drop(running);
-        assert!(
-            !test.store.held(&one).expect("asks"),
-            "the hold goes with the program"
+        assert_released(
+            &test.store.manifest(&one),
+            "the hold goes with the program",
+            || !test.store.held(&one).expect("asks"),
         );
 
         // The control: the same layout with no store record is not a store.
@@ -1314,9 +1403,10 @@ mod tests {
         );
         assert!(test.store.manifest(&one).is_file());
         drop(running);
-        assert!(
-            test.store.retire(&one, &update).expect("removes"),
-            "the control: nobody holds it now, and it goes"
+        assert_released(
+            &test.store.manifest(&one),
+            "the control: nobody holds it now, and it goes",
+            || test.store.retire(&one, &update).expect("removes"),
         );
         assert!(!test.store.release_directory(&one).exists());
         assert_eq!(
@@ -1326,6 +1416,74 @@ mod tests {
             0,
             "nothing of it is left in the trash"
         );
+    }
+
+    /// A program a test starts, ended and reaped when the test ends, however it ends.
+    struct Sleeper(std::process::Child);
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A program started while a hold is open has a copy of its descriptor, and the release stays
+    /// held for as long as that program keeps the copy, however the holder lets go; once the program
+    /// has, the release goes.
+    #[test]
+    fn a_release_stays_held_while_a_program_started_with_its_hold_keeps_a_copy() {
+        use std::process::Stdio;
+
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let image = install(&test.store, &one);
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let running = Running::of_image(&image).expect("held");
+        let Running::Installed(installed) = &running else {
+            panic!("a release of the store");
+        };
+        let copy = installed
+            ._hold
+            .try_clone()
+            .expect("the descriptor is copied");
+        let program = Sleeper(
+            std::process::Command::new("sleep")
+                .arg("3600")
+                .stdin(Stdio::from(copy))
+                .spawn()
+                .expect("the program starts"),
+        );
+        drop(running);
+
+        assert!(
+            test.store.held(&one).expect("asks"),
+            "the program's copy holds the release"
+        );
+        assert!(
+            !test.store.retire(&one, &update).expect("asks"),
+            "a held release stays"
+        );
+        // The wait ends at its bound while the copy lives, and names the program that keeps it.
+        let manifest = test.store.manifest(&one);
+        let still = wait_for_release(&manifest, Duration::from_millis(100), || {
+            test.store.retire(&one, &update).expect("asks")
+        })
+        .expect_err("the copy is still there");
+        assert!(still.contains(&program.0.id().to_string()), "{still}");
+        assert!(manifest.is_file(), "nothing of the release was removed");
+
+        drop(program);
+        assert_released(
+            &manifest,
+            "the control: the program has let go, and the release goes",
+            || test.store.retire(&one, &update).expect("removes"),
+        );
+        assert!(!test.store.release_directory(&one).exists());
     }
 
     /// Removing a release follows no link: a name that is a link is taken away and what it pointed

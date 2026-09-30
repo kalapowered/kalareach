@@ -2633,6 +2633,17 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
     );
     assert_eq!(host.store.current().expect("reads"), None);
     drop(running);
+    // A program another test starts while the hold is open keeps a copy of it until its own program
+    // takes over, so the install is run again once no copy is left.
+    let started = Instant::now();
+    while host.store.held(one.name()).expect("asks") {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "release {} is still held",
+            one.name()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     host.install(&one);
     assert_eq!(
         host.store.current().expect("reads"),
