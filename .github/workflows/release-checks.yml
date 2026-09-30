@@ -1,0 +1,71 @@
+name: release-checks
+
+# Checks on what a release ships, run on every change so a fault is found where it was made and not
+# at the release.
+#
+# `secrets` reads every tracked file for a private key or an official push credential: the release's
+# signing keys live in hardware-backed services and its channel roots on offline media, and an
+# independently signed app supplies its own credentials, so none of them has a place in a
+# repository. `mobile-graph` holds the companion's dependency graph on each mobile target to the
+# client's own crates: the host's packages are separate build products and never link into a phone
+# build. Each check is put through a planted fault before it is trusted with the tree.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  secrets:
+    name: no private keys or official credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Test the scan
+        run: python3 scripts/check-release-secrets.py self-test
+
+      - name: Scan the tracked files
+        run: python3 scripts/check-release-secrets.py scan --tracked .
+
+  mobile-graph:
+    name: the companion links no host crate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # rust-toolchain.toml pins the exact toolchain.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-tree-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Test the graph check
+        run: python3 scripts/check-mobile-graph.py self-test
+
+      - name: Read the companion's graph on each mobile target
+        run: python3 scripts/check-mobile-graph.py check --locked
