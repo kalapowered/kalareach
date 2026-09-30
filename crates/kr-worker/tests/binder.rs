@@ -9,6 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.13 | a binding is made only from the admissions held, at their frame, for a package they admit, and carries its release, origin, frame, program and version, which stays; a binding stays on its hash across an upgrade and new bindings take the new one; an instance no package recognised is bound once one that recognises it is admitted, and only a matching, admitted package binds; a disabled or removed package's bindings end at the next snapshot; a write that fails leaves no binding; a launch given back takes its binding and its row, the row as soon as the store takes writes again or at the next process's open; a native exit removes the rows; the actions a package declares that cannot be registered are reported by name |
+//! | KR-REQ-27.09 | an executable no signed build names has no version: the package that recognises it is still admitted and bound, its bridge channel is not served for that program, and the channel of a build a record names opens |
 //! | KR-REQ-11.24 | the grants are the installation's effective capabilities through the runtime's map; a confirmed widening reaches a binding on the installed hash with its actions and its fault state kept, and never a retired release's; a withdrawal reaches every release of the package, a skipped revision's too |
 //! | KR-REQ-11.25 | the decoding trust is the admitted connector's, with the answer right only beside the decoding right |
 //! | KR-REQ-25.22 | a revoked release's binding is warned about once and served under the policy that only warns, refused every rich admission under the policy that disables at the next admission until the revocation is lifted, and ended under the policy that disables at once as soon as the request it admitted completes; the release's state is found by its origin, so a revocation reaches a binding on a release from another repository |
@@ -435,6 +436,95 @@ fn kr_req_11_13_a_binding_keeps_the_version_it_was_bound_with() {
         Some("2.1.278"),
         "and so does its row"
     );
+}
+
+/// KR-REQ-27.09: an executable no signed build names has no version, so the package that
+/// recognises it keeps the terminal as its route and no typed action is advertised through it.
+/// The package is still admitted and a binding is still made for the program, with no version;
+/// the connector's table is qualified against a version, so its channel is not served for that
+/// program, and the same package's channel opens for the build a signed record names.
+#[test]
+fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and_no_typed_action() {
+    let worker = Worker::open();
+    let mut source = worker.claude_code();
+    source.qualified = vec![build_named(fixture::QUALIFIED_VERSION)];
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker
+        .broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(2)),
+        )
+        .expect("the launched instance is registered");
+    worker.register(3);
+
+    let matched = worker
+        .broker
+        .admitted_match(&program().path)
+        .expect("the admitted package recognises the program");
+    let named = program().digest;
+    let unnamed = Digest256::from_bytes([0x5a; 32]);
+    assert_eq!(matched.version_of(&named), Some(fixture::QUALIFIED_VERSION));
+    assert_eq!(
+        matched.version_of(&unnamed),
+        None,
+        "a build no signed record names has no version"
+    );
+
+    // The program is still bound to the package that recognises it, with no version.
+    worker
+        .broker
+        .bind(
+            binding(3),
+            instance(3),
+            source.package_digest,
+            frame,
+            MatchedExecutable {
+                path: program().path,
+                digest: unnamed,
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("an unnamed build is still bound to the package that recognises it");
+    let bound = worker
+        .broker
+        .binding_record(binding(3))
+        .and_then(|record| record.executable)
+        .expect("the binding carries its program");
+    assert_eq!(bound.version, None);
+
+    // Its channel is not served, so nothing typed is offered through it.
+    let connector = worker
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+    let bridge = BridgeProcess {
+        identity: ProcessStartIdentity::new(2_002, ProcessStartSource::MacosProcBsdInfo, 901),
+        starter: Some(launched()),
+        started: None,
+    };
+    let refusal = worker
+        .broker
+        .open_bridge_channel(
+            instance(2),
+            &bridge,
+            &connector,
+            matched.version_of(&unnamed),
+        )
+        .expect_err("no channel for a build no record names");
+    assert!(
+        matches!(&refusal, BrokerError::UnsupportedCapability { detail }
+            if detail.contains("no signed qualification record names the executable")),
+        "{refusal:?}"
+    );
+
+    // Control: the same package, the same instance and bridge, for the build a record names.
+    worker
+        .broker
+        .open_bridge_channel(instance(2), &bridge, &connector, matched.version_of(&named))
+        .expect("the channel opens for the build a signed record names");
 }
 
 /// KR-REQ-11.24 and KR-REQ-11.25: `bind` derives a binding's grants from the installation's
