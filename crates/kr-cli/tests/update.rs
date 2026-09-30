@@ -478,6 +478,162 @@ fn writable(root: &Path) {
     }
 }
 
+/// Hands over and stops whatever daemon serves `tree`'s environment, through its own door, and says
+/// whether none is left serving it.
+async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
+    let environment = tree.environment();
+    let Ok(endpoint) = environment.controller_endpoint() else {
+        return true;
+    };
+    if let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+        let target = release("0.0.0+000000000000");
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(60),
+            handover_step_of(
+                tree.environment_id(),
+                &mut client,
+                HandoverStep::Prepare,
+                None,
+                &target,
+            ),
+        )
+        .await;
+        // The stop names the attempt the daemon began, which is the only one it stops under.
+        if let Ok(Ok(answered)) = prepared
+            && let Ok(answer) = answered.to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(60),
+                handover_step_of(
+                    tree.environment_id(),
+                    &mut client,
+                    HandoverStep::Stop,
+                    answer.attempt.0,
+                    &target,
+                ),
+            )
+            .await;
+        }
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        if kr_controller::singleton::SingletonLock::hold(
+            &environment.singleton_lock(),
+            tree.environment_id(),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A second environment of a host's store: a tree of its own, and a daemon of the store's current
+/// release serving it. Whatever daemon serves it when the test ends, the one this started or one an
+/// update started in its place, is stopped through its own door before the tree goes.
+struct Second {
+    daemon: Option<std::process::Child>,
+    tree: teardown::Tree,
+}
+
+impl Second {
+    /// Starts `program`, a daemon of the store, in a new tree, and waits for it to answer.
+    async fn start(program: &Path) -> Self {
+        let tree = teardown::Tree::create();
+        let log = tree.root().join("daemon.log");
+        let file = std::fs::File::create(&log).expect("the daemon's log");
+        let runtime = tree.paths().runtime_root().display().to_string();
+        let state = tree.paths().state_root().display().to_string();
+        let child = Command::new(program)
+            .args([
+                "--runtime-dir",
+                &runtime,
+                "--state-dir",
+                &state,
+                "--secret-store",
+                "file",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("KR_RUNTIME_DIR", &runtime)
+            .env("KR_STATE_DIR", &state)
+            .current_dir(tree.root())
+            .stdin(Stdio::null())
+            .stdout(file.try_clone().expect("duplicates the log"))
+            .stderr(file)
+            .spawn()
+            .expect("the daemon starts");
+        let second = Self {
+            daemon: Some(child),
+            tree,
+        };
+        let endpoint = second
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let started = Instant::now();
+        while LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .is_err()
+        {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the daemon did not answer; its log says: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        second
+    }
+
+    /// What this environment's daemon states about its build.
+    async fn build(&self) -> String {
+        let endpoint = self
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the daemon");
+        client
+            .acknowledgement()
+            .build
+            .as_ref()
+            .map(|build| build.build_id.as_str().to_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Second {
+    fn drop(&mut self) {
+        let stopped = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()
+                        .map(|runtime| runtime.block_on(stop_daemon_of(&self.tree)))
+                })
+                .join()
+                .ok()
+                .flatten()
+        });
+        if stopped == Some(false) {
+            self.tree
+                .hold("a daemon serving this environment could not be stopped".to_owned());
+        }
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+    }
+}
+
 impl Host {
     /// A tree with an empty store.
     fn create() -> Self {
@@ -666,49 +822,7 @@ impl Host {
     /// Hands over and stops whatever daemon serves this host, through its own door, and says
     /// whether none is left serving it.
     async fn stop_the_daemon(&self) -> bool {
-        let environment = self.tree.environment();
-        let Ok(endpoint) = environment.controller_endpoint() else {
-            return true;
-        };
-        if let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
-        {
-            let target = release("0.0.0+000000000000");
-            let prepared = tokio::time::timeout(
-                Duration::from_secs(60),
-                handover_step(self, &mut client, HandoverStep::Prepare, None, &target),
-            )
-            .await;
-            // The stop names the attempt the daemon began, which is the only one it stops under.
-            if let Ok(Ok(answered)) = prepared
-                && let Ok(answer) =
-                    answered.to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
-            {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    handover_step(
-                        self,
-                        &mut client,
-                        HandoverStep::Stop,
-                        answer.attempt.0,
-                        &target,
-                    ),
-                )
-                .await;
-            }
-        }
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(30) {
-            if kr_controller::singleton::SingletonLock::hold(
-                &environment.singleton_lock(),
-                self.tree.environment_id(),
-            )
-            .is_ok()
-            {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        false
+        stop_daemon_of(&self.tree).await
     }
 
     /// Creates a session with a release's `kr`, and returns its display number and identifier.
@@ -809,6 +923,39 @@ impl Host {
     fn record(&self) -> Value {
         serde_json::from_slice(&std::fs::read(self.store.record()).expect("the record"))
             .expect("the record is JSON")
+    }
+
+    /// What a run that stopped after its switch leaves: `two` current, no daemon running, and the
+    /// update recorded as switched, with the daemon of this host to be started as it was.
+    fn record_a_switched_update(&mut self, one: &Assembled, two: &Assembled) {
+        for mut daemon in self.daemons.drain(..) {
+            daemon.kill().expect("stops");
+            daemon.wait().expect("ends");
+        }
+        self.switch(two.name());
+        let restart = serde_json::json!({
+            "environment": self.tree.environment_id(),
+            "runtime_root": self.tree.paths().runtime_root(),
+            "state_root": self.tree.paths().state_root(),
+            "start": {
+                "arguments": {
+                    "arguments": self.daemon_arguments(),
+                    "working_directory": self.tree.root(),
+                }
+            },
+        });
+        let record = serde_json::json!({
+            "format": 1,
+            "previous": null,
+            "staged": two.name().as_str(),
+            "update": {
+                "source": one.name().as_str(),
+                "target": two.name().as_str(),
+                "state": "switched",
+                "restarts": [restart],
+            },
+        });
+        std::fs::write(self.store.record(), record.to_string()).expect("the record");
     }
 
     /// Installs a first release with the unpacked release's own `kr`, and starts its programs once.
@@ -1247,30 +1394,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
         daemon.kill().expect("stops");
         daemon.wait().expect("ends");
     }
-    host.switch(two.name());
-    let restart = serde_json::json!({
-        "environment": host.tree.environment_id(),
-        "runtime_root": host.tree.paths().runtime_root(),
-        "state_root": host.tree.paths().state_root(),
-        "start": {
-            "arguments": {
-                "arguments": host.daemon_arguments(),
-                "working_directory": host.tree.root(),
-            }
-        },
-    });
-    let record = serde_json::json!({
-        "format": 1,
-        "previous": null,
-        "staged": two.name().as_str(),
-        "update": {
-            "source": one.name().as_str(),
-            "target": two.name().as_str(),
-            "state": "switched",
-            "restarts": [restart],
-        },
-    });
-    std::fs::write(host.store.record(), record.to_string()).expect("the record");
+    host.record_a_switched_update(&one, &two);
 
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
@@ -1296,6 +1420,62 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
+/// daemon that does not listen, one on its way out: it waits for that daemon to have gone, and then
+/// starts the daemon it recorded, where it used to wait for an answer that could not come.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    host.put(&two);
+    host.record_a_switched_update(&one, &two);
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    // A daemon that has stopped listening and not yet let go of its environment.
+    let going = kr_controller::singleton::SingletonLock::acquire(
+        &host.tree.environment().singleton_lock(),
+        host.tree.environment_id(),
+    )
+    .expect("holds the environment");
+    let began = Instant::now();
+    let update = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "update", "--archive", &archive, "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    drop(going);
+
+    let output = update.wait_with_output().expect("kr ends");
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(55),
+        "the wait ended when the daemon had gone, not at the bound for a daemon to start"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the recorded daemon was started from the release current names"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
 }
 
 /// KR-REQ-26.09: a daemon the update stopped that does not start from the new release keeps the
@@ -1457,11 +1637,22 @@ async fn handover_step(
     attempt: Option<Uuid>,
     target: &ReleaseName,
 ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    handover_step_of(host.tree.environment_id(), client, step, attempt, target).await
+}
+
+/// Sends one step of the handover to the daemon of `environment` on `client`.
+async fn handover_step_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
     client
         .mutate(
             Method::HostUpdateHandover,
             ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.tree.environment_id()),
+            ActionTarget::environment(environment),
             &HostUpdateHandoverParams {
                 step,
                 target: target.clone(),
@@ -1760,7 +1951,13 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
     assert_eq!(
         host.daemon_build().await,
         format!("kr-controller/{}", one.name()),
-        "the daemon it stopped was started again from the release still current"
+        "the daemon it prepared serves from the release still current"
+    );
+    assert!(
+        host.daemons
+            .iter_mut()
+            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+        "the daemon this test started was never stopped: the holder was found before any stop"
     );
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
@@ -1930,6 +2127,120 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
     let kr = host.store.stable(Program::Kr);
     let (display, _) = host.new_session(&kr);
     host.close(&kr, &display);
+}
+
+/// KR-REQ-26.09: with two environments, one whose daemon answers that it does not stop and one that
+/// stopped, the update waits for the one it stopped to have gone before it starts it again: nothing
+/// is met on its way out, nobody is told to kill anything, the update exits 9, and both daemons
+/// serve.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let second = Second::start(&controller).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+    // The update tells the daemons in the order of their environments' identities, so the daemon
+    // whose attempt is superseded is the last one: the one before it accepts its stop first.
+    let (last_environment, last_endpoint) = {
+        let ours = host.tree.environment_id();
+        let theirs = second.tree.environment_id();
+        if ours.to_string() > theirs.to_string() {
+            (
+                ours,
+                host.tree
+                    .environment()
+                    .controller_endpoint()
+                    .expect("an endpoint"),
+            )
+        } else {
+            (
+                theirs,
+                second
+                    .tree
+                    .environment()
+                    .controller_endpoint()
+                    .expect("an endpoint"),
+            )
+        }
+    };
+
+    let starting = host.store.lock_start().expect("the start lock");
+    let update = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "update", "--archive", &archive, "--json"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("kr runs");
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        let state = std::fs::read(host.store.record())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map(|record| record["update"]["state"].clone());
+        if state == Some(Value::from("handing_over")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update did not reach its handover"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut client = LocalClient::connect(&last_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    handover_step_of(
+        last_environment,
+        &mut client,
+        HandoverStep::Prepare,
+        None,
+        two.name(),
+    )
+    .await
+    .expect("the daemon begins another attempt");
+    drop(starting);
+
+    let output = update.wait_with_output().expect("kr ends");
+    let said: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("did not stop:") && !message.contains("kill"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the first environment's daemon serves"
+    );
+    assert_eq!(
+        second.build().await,
+        format!("kr-controller/{}", one.name()),
+        "and so does the second's"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["staged"], two.name().as_str(), "{record}");
 }
 
 /// KR-REQ-26.09: an install stopped between putting its release in the store and making it

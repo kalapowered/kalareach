@@ -954,37 +954,70 @@ async fn hand_over(
         .iter()
         .map(|(environment, _)| environment.environment_id)
         .collect();
-    let mut refused: Option<Shown> = None;
-    for (environment, daemon) in prepared {
-        if let handover::Stop::Refused(said) =
-            handover::stop(daemon, environment, &target.release).await
-        {
-            refused.get_or_insert_with(|| {
-                shown!(
-                    "the control daemon of environment {} did not stop: {}",
-                    environment.environment_id,
-                    said
-                )
-            });
-        }
-    }
-    // A daemon that answered that it does not stop goes on serving: nothing is waited for, and what
-    // was stopped runs again.
-    if let Some(said) = refused {
-        drop(install);
-        return Err(undo(store, record, deferred(target, said)).await);
-    }
-    // The environments again, now that no daemon can start: one whose daemon started after the
-    // first look recorded its roots before it took its environment, and was never asked to make
-    // way. Each environment's lock, in the order of their identities.
+    // The environments again, before anything is stopped: no daemon can start while the lock is
+    // held, so a daemon holding an environment that nobody prepared started after the first look,
+    // or was not listening then, and was never asked to make way. It holds the update while
+    // nothing has been stopped, and each daemon prepared resumes.
     let again = match inventory::environments(store) {
         Ok(again) => again,
         Err(error) => {
             drop(install);
-            return Err(undo(store, record, error).await);
+            for (environment, daemon) in prepared {
+                handover::resume(daemon, environment, &target.release).await;
+            }
+            forget_update(store, record);
+            return Err(error);
         }
     };
     let every = every_environment(environments, &again);
+    for environment in &every {
+        if stopped.contains(&environment.environment_id) {
+            continue;
+        }
+        let held_by = match handover::hold(environment, None).await {
+            Ok(_) => continue,
+            Err(CliError::UpdateDeferred(said)) => deferred(target, said),
+            Err(error) => error,
+        };
+        drop(install);
+        for (environment, daemon) in prepared {
+            handover::resume(daemon, environment, &target.release).await;
+        }
+        forget_update(store, record);
+        return Err(held_by);
+    }
+    // Each daemon is told in turn. The first that answers that it does not stop ends the telling:
+    // the daemons not yet told resume, and the ones told are waited for to have gone, before
+    // anything is started again, so that no daemon is met on its way out.
+    let mut told = Vec::new();
+    let mut refused: Option<Shown> = None;
+    for (environment, daemon) in prepared {
+        if refused.is_some() {
+            handover::resume(daemon, environment, &target.release).await;
+            continue;
+        }
+        match handover::stop(daemon, environment, &target.release).await {
+            handover::Stop::Told => told.push(environment),
+            handover::Stop::Refused(said) => {
+                refused = Some(shown!(
+                    "the control daemon of environment {} did not stop: {}",
+                    environment.environment_id,
+                    said
+                ));
+            }
+        }
+    }
+    // Every daemon told is given the same thirty seconds, from the last telling, to have gone.
+    let gone_by = tokio::time::Instant::now() + handover::DAEMON_STOP;
+    if let Some(said) = refused {
+        for environment in told {
+            let _ = handover::hold(environment, Some(gone_by)).await;
+        }
+        drop(install);
+        return Err(undo(store, record, deferred(target, said)).await);
+    }
+    // Each environment's lock, in the order of their identities: the daemons told to stop are
+    // waited for, and any other holder was looked for above.
     let mut held = Vec::new();
     let mut holding: Option<Shown> = None;
     let mut failed: Option<CliError> = None;
@@ -992,7 +1025,7 @@ async fn hand_over(
     // it stopped is started again once it has gone.
     for environment in &every {
         let told_to_stop = stopped.contains(&environment.environment_id);
-        match handover::hold(environment, told_to_stop).await {
+        match handover::hold(environment, told_to_stop.then_some(gone_by)).await {
             Ok(lock) => held.push(lock),
             Err(CliError::UpdateDeferred(said)) => {
                 holding.get_or_insert(said);
@@ -1153,10 +1186,22 @@ async fn start_one(
     };
     if handover::held(store, &environment, handover::INSTALL_LOCK_WAIT).await? {
         match handover::resume_holder(&environment, target).await? {
-            handover::Resumed::Serving | handover::Resumed::NotListening => {
+            handover::Resumed::Serving => {
                 return handover::answers_as(store, &environment, current, None)
                     .await
                     .map_err(|_| CliError::Other(handover::still_running(&environment)));
+            }
+            // A daemon that does not listen is starting, or is on its way out: it is waited for
+            // until it answers, which ends the matter, or has gone, when the recorded daemon is
+            // started below.
+            handover::Resumed::NotListening => {
+                match handover::answers_as_or_gone(store, &environment, current, None, true)
+                    .await
+                    .map_err(|_| CliError::Other(handover::still_running(&environment)))?
+                {
+                    handover::Answered::Serving => return Ok(()),
+                    handover::Answered::Gone => {}
+                }
             }
             handover::Resumed::Stopping => handover::gone(store, &environment).await?,
         }
@@ -1403,6 +1448,90 @@ mod tests {
             !handover::held(&store, &environment, std::time::Duration::from_secs(30))
                 .await
                 .expect("looks")
+        );
+    }
+
+    /// A daemon found holding an environment that does not listen is either starting or on its way
+    /// out, and which is known only when it answers or has gone: once its lock is let go the wait
+    /// ends, and the recorded daemon is started in its place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_holder_that_does_not_listen_is_waited_for_until_it_has_gone() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (store, environment) = store_and_environment(&temp);
+        let daemon = kr_controller::singleton::SingletonLock::acquire(
+            &environment.paths.singleton_lock(),
+            environment.environment_id,
+        )
+        .expect("a daemon holds the environment");
+        let target = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
+        let waiting = handover::answers_as_or_gone(&store, &environment, &target, None, true);
+        let leaves = async {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            drop(daemon);
+        };
+        let began = std::time::Instant::now();
+        let (answered, ()) = tokio::join!(waiting, leaves);
+        assert!(
+            matches!(answered, Ok(handover::Answered::Gone)),
+            "the wait ends when the daemon has gone"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(30),
+            "long before the wait for a daemon to start would have"
+        );
+    }
+
+    /// A daemon told to stop that has not gone is said not to have stopped, and nobody is told to
+    /// kill a process for it: the process the lock names may not be the daemon that was told, which
+    /// may have ended, or another may have started since. The update starts it again, and a daemon
+    /// found still stopping then is named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_told_to_stop_that_has_not_gone_is_not_named_as_a_process_to_kill() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_store, environment) = store_and_environment(&temp);
+        let daemon = kr_controller::singleton::SingletonLock::acquire(
+            &environment.paths.singleton_lock(),
+            environment.environment_id,
+        )
+        .expect("a daemon holds the environment");
+        let refused = handover::hold(&environment, Some(tokio::time::Instant::now()))
+            .await
+            .err()
+            .expect("the daemon has not gone");
+        assert_eq!(refused.exit_code(), 9, "{refused}");
+        let said = refused.to_string();
+        assert!(
+            said.contains("did not stop within") && !said.contains("kill"),
+            "{said}"
+        );
+        // The control: once it has gone, the environment is taken.
+        drop(daemon);
+        handover::hold(&environment, Some(tokio::time::Instant::now()))
+            .await
+            .expect("the environment is free");
+    }
+
+    /// A daemon still there is named with the process its lock names, and one that has gone since
+    /// is said to have gone: the lock names a process only while it is held.
+    #[test]
+    fn a_daemon_that_has_gone_is_not_named_to_be_killed() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_store, environment) = store_and_environment(&temp);
+        let daemon = kr_controller::singleton::SingletonLock::acquire(
+            &environment.paths.singleton_lock(),
+            environment.environment_id,
+        )
+        .expect("a daemon holds the environment");
+        let said = handover::still_running(&environment).to_string();
+        assert!(
+            said.contains(&format!("process {}", std::process::id())) && said.contains("kill"),
+            "the control: a daemon still there is named: {said}"
+        );
+        drop(daemon);
+        let said = handover::still_running(&environment).to_string();
+        assert!(
+            said.contains("went away") && !said.contains("kill"),
+            "{said}"
         );
     }
 

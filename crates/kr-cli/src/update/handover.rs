@@ -42,7 +42,7 @@ use crate::error::{CliError, Result};
 const DAEMON_ANSWER: Duration = Duration::from_secs(5);
 
 /// How long a daemon's process is given to end once it has been told to stop.
-const DAEMON_STOP: Duration = Duration::from_secs(30);
+pub const DAEMON_STOP: Duration = Duration::from_secs(30);
 
 /// How long a daemon of the new release is given to answer once it has been started.
 pub const DAEMON_START: Duration = Duration::from_secs(60);
@@ -122,7 +122,9 @@ pub enum Stop {
     /// written, so a lost answer is not a refusal.
     Told,
     /// It answered that it does not stop, and why: its attempt is over, its hold lapsed, or it
-    /// was not prepared. It goes on serving, so nothing is waited for.
+    /// was not prepared. It has not taken the stop, so nothing is waited for; a daemon whose
+    /// answer failed after it took the step is met by recovery, which asks it to resume and
+    /// waits for it if it answers that it is stopping.
     Refused(Shown),
 }
 
@@ -385,23 +387,22 @@ async fn step(
     }
 }
 
-/// Takes an environment's lock: once its daemon's process has gone, waiting up to [`DAEMON_STOP`],
-/// where the update `told_to_stop` its daemon, and at once where it told none.
+/// Takes an environment's lock: once its daemon's process has gone, waiting until `gone_by`, where
+/// the update told its daemon to stop, and at once where `gone_by` is `None` because it told none.
 ///
 /// # Errors
 ///
-/// Returns a refusal naming the process the lock names when a daemon the update stopped has not
-/// gone by then, and one saying a daemon holds the environment where the update stopped none: it
-/// started after the update asked each daemon to make way, or was not listening then, and was
-/// never asked.
-pub async fn hold(environment: &Environment, told_to_stop: bool) -> Result<SingletonLock> {
+/// Returns a refusal saying a daemon the update told to stop has not gone by then, which the update
+/// answers by starting it again, and one saying a daemon holds the environment where the update
+/// stopped none: it started after the update asked each daemon to make way, or was not listening
+/// then, and was never asked.
+pub async fn hold(
+    environment: &Environment,
+    gone_by: Option<tokio::time::Instant>,
+) -> Result<SingletonLock> {
     let path = environment.paths.singleton_lock();
-    let deadline = tokio::time::Instant::now()
-        + if told_to_stop {
-            DAEMON_STOP
-        } else {
-            Duration::ZERO
-        };
+    let told_to_stop = gone_by.is_some();
+    let deadline = gone_by.unwrap_or_else(tokio::time::Instant::now);
     loop {
         match SingletonLock::hold(&path, environment.environment_id) {
             Ok(held) => return Ok(held),
@@ -411,7 +412,12 @@ pub async fn hold(environment: &Environment, told_to_stop: bool) -> Result<Singl
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(kr_controller::ControllerError::AlreadyRunning { .. }) if told_to_stop => {
-                return Err(CliError::UpdateDeferred(still_running(environment)));
+                return Err(CliError::UpdateDeferred(shown!(
+                    "the control daemon of environment {} did not stop within {} seconds of being \
+                     told to",
+                    environment.environment_id,
+                    DAEMON_STOP.as_secs()
+                )));
             }
             Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
                 return Err(CliError::UpdateDeferred(shown!(
@@ -431,9 +437,22 @@ pub async fn hold(environment: &Environment, told_to_stop: bool) -> Result<Singl
     }
 }
 
-/// What a daemon that is still there says: the process its lock names, and how to stop it.
+/// What a daemon that is still there says: the process its lock names, and how to stop it. A daemon
+/// that has gone since is said to have gone: the lock names a process only while it is held.
 #[must_use]
 pub fn still_running(environment: &Environment) -> Shown {
+    if SingletonLock::hold(
+        &environment.paths.singleton_lock(),
+        environment.environment_id,
+    )
+    .is_ok()
+    {
+        return shown!(
+            "the control daemon of environment {} went away while the update waited for it; run \
+             kr host update again",
+            environment.environment_id
+        );
+    }
     match SingletonLock::holder(&environment.paths.singleton_lock()) {
         Ok(Some(pid)) => shown!(
             "the control daemon of environment {} (process {}) is still running and does not \
@@ -450,6 +469,14 @@ pub fn still_running(environment: &Environment) -> Shown {
     }
 }
 
+/// What waiting for an environment's daemon found.
+pub enum Answered {
+    /// A daemon answered as a daemon of the release asked for.
+    Serving,
+    /// No daemon holds the environment any more: the one that was there has gone.
+    Gone,
+}
+
 /// Waits up to [`DAEMON_START`] for an environment's daemon to answer as a daemon of `target`.
 ///
 /// `started` is the process this run started to be that daemon, where it started one: once it has
@@ -464,8 +491,27 @@ pub async fn answers_as(
     store: &Store,
     environment: &Environment,
     target: &ReleaseName,
-    mut started: Option<&mut std::process::Child>,
+    started: Option<&mut std::process::Child>,
 ) -> Result<()> {
+    answers_as_or_gone(store, environment, target, started, false)
+        .await
+        .map(|_| ())
+}
+
+/// [`answers_as`], and with `or_gone` the wait also ends when no daemon holds the environment
+/// any more: a daemon found holding it that does not listen is either starting or on its way out,
+/// and which is only known when it answers or goes.
+///
+/// # Errors
+///
+/// Returns a failure naming what answered instead, or that nothing did.
+pub async fn answers_as_or_gone(
+    store: &Store,
+    environment: &Environment,
+    target: &ReleaseName,
+    mut started: Option<&mut std::process::Child>,
+    or_gone: bool,
+) -> Result<Answered> {
     let endpoint = environment.paths.controller_endpoint()?;
     let expected = format!("kr-controller/{target}");
     let deadline = tokio::time::Instant::now() + DAEMON_START;
@@ -485,7 +531,7 @@ pub async fn answers_as(
                 .as_ref()
                 .is_some_and(|build_id| build_id.as_str() == expected)
             {
-                return Ok(());
+                return Ok(Answered::Serving);
             }
             return Err(CliError::Other(shown!(
                 "the control daemon of environment {} answers as {}, not as a daemon of {}",
@@ -520,6 +566,9 @@ pub async fn answers_as(
             // Another daemon holds the environment, which is why this one ended: that one is
             // waited for.
             started = None;
+        }
+        if or_gone && !held(store, environment, INSTALL_LOCK_WAIT).await? {
+            return Ok(Answered::Gone);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CliError::Other(shown!(
