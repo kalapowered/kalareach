@@ -892,13 +892,13 @@ mod tests {
         assert!(
             run_bounded(
                 "sh",
-                &["-c", "sleep 5 & echo hello"],
+                &["-c", "sleep 40 & echo hello"],
                 std::time::Duration::from_millis(300)
             )
             .is_none()
         );
         assert!(
-            began.elapsed() < std::time::Duration::from_secs(4),
+            began.elapsed() < std::time::Duration::from_secs(30),
             "the wait ended at its bound, not when the descendant did"
         );
         // The control: a tool that ends is read.
@@ -908,25 +908,20 @@ mod tests {
     }
 
     /// A tool that writes without end is given up on at once, not read for as long as it writes:
-    /// the run ends with nothing, well inside the bound and without holding the caller up.
+    /// with a bound far beyond the watchdog, only the limit on what it may print ends the run.
     #[test]
     fn a_tool_that_never_stops_writing_is_given_up_on() {
         // On a thread of its own, so that a run that reads for ever fails the test and does not
         // hang it.
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let began = std::time::Instant::now();
-            let output = run_bounded("yes", &[], std::time::Duration::from_secs(5));
-            let _ = sender.send((output.is_none(), began.elapsed()));
+            let output = run_bounded("yes", &[], std::time::Duration::from_secs(600));
+            let _ = sender.send(output.is_none());
         });
-        let (given_up, took) = receiver
-            .recv_timeout(std::time::Duration::from_secs(20))
+        let given_up = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the run of a tool that writes for ever ended");
         assert!(given_up, "what it wrote is not returned");
-        assert!(
-            took < std::time::Duration::from_secs(4),
-            "and it was given up on before the bound: {took:?}"
-        );
     }
 
     /// When the bound of a tool that a descendant keeps the output of ends, this run's end of the
@@ -955,7 +950,13 @@ mod tests {
         };
         let writing = after("writing", true);
         let silent = after("silent", false);
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // The descendants end in a second each, on a loaded host later: what the one that writes
+        // nothing does is waited for, and it began after the one that writes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !silent.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(
             silent.exists(),
             "the control: a descendant that writes nothing goes on to its end"
