@@ -3,18 +3,21 @@
 //! The control daemon runs in this test's process, as the host suites run it, and starts each
 //! session's worker as a detached process of its own: the real `kr-worker` this workspace builds,
 //! checked to be this build and copied to the internal disk with everything else a launched
-//! process touches. The session's root program asks for bracketed paste, writes a numbered line
-//! every twentieth of a second, and records every byte of input it reads, as it reads it, in a file
-//! of its own, so what reached the application is read from the application's own record. A
-//! terminal is a local client on the worker's own endpoint, as a person's is; a client that is to
-//! be killed is this test binary run again, as a process of its own, in a mode where it does that
-//! and nothing else.
+//! process touches. The session's root program asks for bracketed paste, records every byte of
+//! input it reads, as it reads it, in a file of its own, so what reached the application is read
+//! from the application's own record, and writes a numbered line every twentieth of a second once
+//! the test releases it. A terminal is a local client on the worker's own endpoint, as a person's
+//! is; a client that is to be killed is this test binary run again, as a process of its own, in a
+//! mode where it does that and nothing else.
 //!
-//! A kill happens only at a named point, a state the peers hold still and prove: a paste is open
-//! once the program's record holds the paste's start and the first half of what was pasted, and
-//! output is flowing once a terminal has been shown three of its lines. A signal goes only to a
-//! process this test started and has not collected. The root program is ended by its own child,
-//! from a file this test creates, so nothing is signalled by a number this test does not hold.
+//! A kill happens only at a named point that the peers prove. A paste is open once the program's
+//! record holds the paste's start and the first half of what was pasted. Output is flowing once the
+//! program has been released, which the test does only after every terminal has subscribed, and a
+//! terminal has been shown three of its lines whole: a terminal that subscribed later would be
+//! painted the screen instead, and would never see them. A signal goes only to a process this test
+//! started and has not collected. The root program ends itself, by a signal to its own process
+//! number, when this test creates a file it watches for, so nothing is signalled by a number
+//! this test does not hold.
 //!
 //! Each fault has its control: the same run without the fault, in which what the fault causes is
 //! absent.
@@ -70,20 +73,23 @@ const RESTART_WATCH: Duration = Duration::from_secs(3);
 /// The session's root program.
 ///
 /// The terminal is put into raw mode first, so every byte of input reaches the record as it was
-/// written and nothing is echoed. The output loop is the program's own child: creating `kr-die`
-/// in the working directory has it kill the program, which is how a test ends the root program
-/// without signalling a process it did not start.
+/// written and nothing is echoed. Its reader, a child that copies the terminal's input into the
+/// record, starts before anything is written. It writes nothing until the test creates
+/// `kr-flow-go`, once every terminal has subscribed, and ends itself by a signal to its own process
+/// number when the test creates `kr-die`.
 const ROOT_PROGRAM: &str = r#"#!/bin/sh
 stty raw -echo -opost 2>/dev/null
 printf '\033[?2004h'
-root=$$
-printf '%s\n' "$root" > root.pid
-(n=0; while :; do
-  if [ -e kr-die ]; then kill -KILL "$root"; exit 0; fi
+printf '%s\n' "$$" > root.pid
+exec 3<&0
+cat <&3 > input.record 3<&- &
+printf '%s\n' "$!" > reader.pid
+while [ ! -e kr-flow-go ]; do sleep 0.05; done
+n=0
+while :; do
+  if [ -e kr-die ]; then kill -KILL "$$"; fi
   n=$((n + 1)); printf 'kr-flow-%d\r\n' "$n"; sleep 0.05
-done) &
-printf '%s\n' "$!" > flow.pid
-exec cat > input.record
+done
 "#;
 
 /// What a paste's start and the first half of what was pasted look like, as a terminal sends them.
@@ -147,7 +153,6 @@ struct Host {
     tree: teardown::Tree,
     environment_id: EnvironmentId,
     root_program: PathBuf,
-    half: PathBuf,
     _controller: Arc<Controller>,
 }
 
@@ -179,11 +184,6 @@ impl Host {
         std::fs::write(&root_program, ROOT_PROGRAM).expect("writes the root program");
         std::fs::set_permissions(&root_program, std::fs::Permissions::from_mode(0o700))
             .expect("the root program runs");
-        let half = tree.root().join("kr-kill-client-half");
-        kr_ipc::testing::place_program(
-            &std::env::current_exe().expect("this test's own executable"),
-            &half,
-        );
         let secrets = environment.secrets_dir();
         let controller = Controller::start(ControllerSetup {
             paths: environment.clone(),
@@ -216,7 +216,6 @@ impl Host {
             tree,
             environment_id,
             root_program,
-            half,
             _controller: controller,
         }
     }
@@ -230,6 +229,12 @@ impl Host {
         let work = self.tree.root().join(name);
         std::fs::create_dir_all(&work).expect("a working directory");
         work
+    }
+
+    /// Lets the root program of the session working in `work` write. Every terminal that is to see
+    /// its output live has subscribed by now, so what they are shown are whole lines.
+    fn release_output(&self, work: &Path) {
+        std::fs::write(work.join("kr-flow-go"), b"").expect("releases the root program");
     }
 
     fn target(&self, session_id: SessionId) -> ActionTarget {
@@ -253,7 +258,7 @@ impl Host {
     }
 
     /// Creates a session running the root program in `work`, and waits until the program is
-    /// running: its output loop has started and its record is open.
+    /// running: its reader has started and its record is open. It writes nothing yet.
     async fn create(&self, work: &Path) -> (SessionId, Dimensions) {
         let created: SessionCreateResult = self
             .daemon()
@@ -285,7 +290,10 @@ impl Host {
             .to_typed()
             .expect("decodes the create");
         until("the root program to start", || {
-            (work.join("flow.pid").is_file() && work.join("input.record").is_file()).then_some(())
+            ["root.pid", "reader.pid", "input.record"]
+                .iter()
+                .all(|file| work.join(file).is_file())
+                .then_some(())
         })
         .await;
         (created.session.session_id, created.session.dimensions)
@@ -381,11 +389,18 @@ impl Host {
     }
 
     /// Starts the client half: a process of its own that attaches to the session, takes the input
-    /// lease, writes `bytes`, and waits to be killed.
+    /// lease, writes `bytes`, and waits to be killed. It is this test binary, copied to the
+    /// internal disk with everything else a launched process touches.
     async fn client_half(&self, session_id: SessionId, work: &Path, bytes: &[u8]) -> Half {
+        let program = self.tree.root().join("kr-kill-client-half");
+        kr_ipc::testing::place_program(
+            &std::env::current_exe().expect("this test's own executable"),
+            &program,
+        );
         let ready = work.join("client-half.ready");
-        let log = std::fs::File::create(work.join("client-half.log")).expect("the half's log");
-        let child = std::process::Command::new(&self.half)
+        let log_path = work.join("client-half.log");
+        let log = std::fs::File::create(&log_path).expect("the half's log");
+        let child = std::process::Command::new(&program)
             .args([
                 "--exact",
                 CLIENT_HALF,
@@ -405,9 +420,21 @@ impl Host {
             .stderr(log)
             .spawn()
             .expect("starts the client half");
-        let half = Half { child: Some(child) };
+        let mut half = Half { child: Some(child) };
         until("the client half to write what it was given", || {
-            ready.is_file().then_some(())
+            if ready.is_file() {
+                return Some(());
+            }
+            let ended = half
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten());
+            assert!(
+                ended.is_none(),
+                "the client half ended ({ended:?}) before it wrote what it was given: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            None
         })
         .await;
         half
@@ -778,7 +805,7 @@ fn serve_a_client_half_for_the_kill_stage() {
 }
 
 /// KR-REQ-27.05, a worker killed on its own: the worker is killed while a paste is open at the
-/// application and output is flowing. The root program and its child end with it, every
+/// application and output is flowing. The root program and its reader end with it, every
 /// terminal's connection ends with no closure (a killed worker says nothing), the daemon records
 /// the closure the worker could not and serves it with no worker, and nothing starts again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -790,13 +817,14 @@ async fn a_worker_killed_with_a_paste_open_and_output_flowing_ends_its_session_a
     let mut holder = Terminal::attach(&environment, session_id, dimensions).await;
     holder.acquire().await;
     let mut onlooker = Terminal::attach(&environment, session_id, dimensions).await;
-    onlooker.until_shown("kr-flow-3\r\n").await;
     holder.write(PASTE_OPEN).await;
     recorded(&work, PASTE_OPEN).await;
-    let (worker, root, child) = (
+    host.release_output(&work);
+    onlooker.until_shown("kr-flow-3\r\n").await;
+    let (worker, root, reader) = (
         host.worker_of(session_id).await,
         process(&work, "root.pid"),
-        process(&work, "flow.pid"),
+        process(&work, "reader.pid"),
     );
 
     let status = kill_worker(&worker).await;
@@ -806,7 +834,7 @@ async fn a_worker_killed_with_a_paste_open_and_output_flowing_ends_its_session_a
         "the kill is what ended the worker: {status:?}"
     );
     ended(&root, "the root program").await;
-    ended(&child, "the root program's output loop").await;
+    ended(&reader, "the root program's reader").await;
     for terminal in [&mut holder, &mut onlooker] {
         let how = terminal.until_ended().await;
         assert!(
@@ -830,9 +858,10 @@ async fn a_session_closed_on_request_is_not_ended_as_a_killed_worker_ends_one() 
     let mut holder = Terminal::attach(&environment, session_id, dimensions).await;
     holder.acquire().await;
     let mut onlooker = Terminal::attach(&environment, session_id, dimensions).await;
-    onlooker.until_shown("kr-flow-3\r\n").await;
     holder.write(PASTE_OPEN).await;
     recorded(&work, PASTE_OPEN).await;
+    host.release_output(&work);
+    onlooker.until_shown("kr-flow-3\r\n").await;
     let worker = host.worker_of(session_id).await;
 
     host.close(session_id).await;
@@ -861,9 +890,10 @@ async fn a_client_killed_with_a_paste_open_has_it_closed_once_and_the_next_holde
     let work = host.work("client-killed");
     let (session_id, dimensions) = host.create(&work).await;
     let mut next = Terminal::attach(&host.environment(), session_id, dimensions).await;
-    next.until_shown("kr-flow-3\r\n").await;
     let mut half = host.client_half(session_id, &work, PASTE_OPEN).await;
     recorded(&work, PASTE_OPEN).await;
+    host.release_output(&work);
+    next.until_shown("kr-flow-3\r\n").await;
     let (worker, root) = (host.worker_of(session_id).await, process(&work, "root.pid"));
 
     let status = half.kill();
@@ -910,9 +940,10 @@ async fn a_client_killed_with_no_paste_open_has_no_paste_closed() {
     let work = host.work("client-killed-typing");
     let (session_id, dimensions) = host.create(&work).await;
     let mut next = Terminal::attach(&host.environment(), session_id, dimensions).await;
-    next.until_shown("kr-flow-3\r\n").await;
     let mut half = host.client_half(session_id, &work, b"kr-typed-").await;
     recorded(&work, b"kr-typed-").await;
+    host.release_output(&work);
+    next.until_shown("kr-flow-3\r\n").await;
     let worker = host.worker_of(session_id).await;
 
     let _ = half.kill();
@@ -956,8 +987,17 @@ async fn until_alone(terminal: &mut Terminal) -> EventsSnapshotResult {
     }
 }
 
-/// KR-REQ-27.05, the root program killed on its own: the root program is killed while its output
-/// flows. The session closes with the signal that ended it, every terminal is told so, the worker
+/// Whether a closure record names the kill signal, which the platform spells in its own words.
+fn names_the_kill(closure: &ClosureRecord) -> bool {
+    closure
+        .root_signal
+        .0
+        .as_ref()
+        .is_some_and(|signal| signal.to_ascii_lowercase().contains("kill"))
+}
+
+/// KR-REQ-27.05, the root program killed on its own: the root program kills itself while its
+/// output flows. The session closes with the kill signal that ended it, every terminal is told so, the worker
 /// ends by itself, the record stays with the daemon, and nothing starts again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_root_program_killed_during_output_closes_its_session_with_the_signal_and_tells_everyone()
@@ -968,16 +1008,18 @@ async fn a_root_program_killed_during_output_closes_its_session_with_the_signal_
     let environment = host.environment();
     let mut first = Terminal::attach(&environment, session_id, dimensions).await;
     let mut second = Terminal::attach(&environment, session_id, dimensions).await;
+    host.release_output(&work);
     first.until_shown("kr-flow-3\r\n").await;
     let (worker, root) = (host.worker_of(session_id).await, process(&work, "root.pid"));
 
-    std::fs::write(work.join("kr-die"), b"").expect("asks the root program's loop to kill it");
+    std::fs::write(work.join("kr-die"), b"").expect("asks the root program to kill itself");
     ended(&root, "the root program").await;
     for terminal in [&mut first, &mut second] {
         let how = terminal.until_ended().await;
         assert!(
-            matches!(&how, Ended::Closed(closure) if closure.reason == ClosureReason::RootSignal),
-            "each terminal is told a signal ended the root program: {how:?}"
+            matches!(&how, Ended::Closed(closure)
+                if closure.reason == ClosureReason::RootSignal && names_the_kill(closure)),
+            "each terminal is told the kill signal ended the root program: {how:?}"
         );
     }
     let status = collect_worker(&worker).await;
@@ -985,8 +1027,8 @@ async fn a_root_program_killed_during_output_closes_its_session_with_the_signal_
     let closure = host.closure(session_id).await;
     assert_eq!(closure.reason, ClosureReason::RootSignal, "{closure:?}");
     assert!(
-        closure.root_signal.0.is_some(),
-        "the record names the signal: {closure:?}"
+        names_the_kill(&closure),
+        "the record names the kill signal: {closure:?}"
     );
     host.nothing_restarts(session_id).await;
 }
@@ -998,6 +1040,7 @@ async fn a_root_program_nobody_kills_goes_on_writing() {
     let work = host.work("root-kept");
     let (session_id, dimensions) = host.create(&work).await;
     let mut first = Terminal::attach(&host.environment(), session_id, dimensions).await;
+    host.release_output(&work);
     first.until_shown("kr-flow-3\r\n").await;
     let (worker, root) = (host.worker_of(session_id).await, process(&work, "root.pid"));
     first.until_shown("kr-flow-9\r\n").await;
