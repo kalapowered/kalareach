@@ -873,9 +873,12 @@ pub struct HostUpdateHandoverResult {
     pub release: Nullable<ReleaseName>,
     /// Its process identifier.
     pub pid: U64,
-    /// The arguments it was started with, its program's own name left out.
+    /// The arguments it was started with, its program's own name left out. Only a `prepare` answers
+    /// how the daemon was started, and refuses where it cannot say; a `stop` or a `resume` answers
+    /// this empty in that case.
     pub arguments: Vec<String>,
-    /// The directory it was started in.
+    /// The directory it was started in; empty as `arguments` is where a `stop` or a `resume` cannot
+    /// say.
     pub working_directory: String,
 }
 

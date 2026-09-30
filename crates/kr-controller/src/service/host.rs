@@ -922,9 +922,17 @@ impl Controller {
                 )
             })?;
         let working_directory = std::env::current_dir()
-            .ok()
-            .and_then(|directory| directory.into_os_string().into_string().ok())
-            .ok_or_else(|| {
+            .map_err(|_| {
+                ControllerError::InvalidArgument(
+                    "this daemon's working directory no longer exists or cannot be read, so a \
+                     daemon of another release cannot be started like it; stop this daemon, or \
+                     start it again from a directory that exists, and run the update again"
+                        .to_owned(),
+                )
+            })?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| {
                 ControllerError::InvalidArgument(
                     "this daemon's working directory cannot be read as text, so a daemon of \
                      another release cannot be started like it"

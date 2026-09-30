@@ -1832,6 +1832,14 @@ async fn a_daemon_that_cannot_say_how_it_was_started_is_refused_before_its_gate_
         .await
         .expect_err("a daemon that cannot say how it was started does not prepare");
     assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message.contains("no longer exists")
+            && refused
+                .message
+                .contains("start it again from a directory that exists"),
+        "the refusal says what happened and what to do: {}",
+        refused.message
+    );
     let (display, _) = host.new_session(&kr);
     host.close(&kr, &display);
 
