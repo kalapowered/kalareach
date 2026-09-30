@@ -448,21 +448,50 @@ pub enum Change {
     Absent,
 }
 
+/// The line that says a marked block began on a line of its own because the file it was added to
+/// did not end in one. The block owns that line break: the removal takes it back with the block, so
+/// a file that had no final line break is given back exactly as it was.
+const SEPARATOR_NOTE: &str = "# The file above did not end in a line break, so this entry began on a line of its own; \
+                              `kr shell remove` takes that line break out again.";
+
+/// The block with the separator note as its second line.
+fn with_separator_note(body: &str) -> String {
+    body.replacen(
+        &format!("{MARKER_BEGIN}\n"),
+        &format!("{MARKER_BEGIN}\n{SEPARATOR_NOTE}\n"),
+        1,
+    )
+}
+
+/// Whether a block owns the line break that stands before it.
+fn owns_separator(block: &str) -> bool {
+    block.lines().any(|line| line == SEPARATOR_NOTE)
+}
+
 /// Adds or updates one shell's guarded entry.
 ///
 /// The file is created when it does not exist and appended to when it does. Everything the user
 /// wrote is kept: the entry is delimited by its markers and only the text between them is ever
-/// rewritten.
+/// rewritten. Where the file did not end in a line break, the entry starts on a line of its own and
+/// the entry owns that line break, which the removal takes back with it.
+///
+/// The lock that holds two writers apart is in `record`'s directory, keyed by the file, so nothing
+/// is written in the person's home but the entry.
 ///
 /// # Errors
 ///
 /// Returns the underlying failure when the file cannot be read or written.
-pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
+pub fn install(path: &Path, body: &str, record: &EntryRecord) -> std::io::Result<Change> {
     let _writing = writing();
-    let _held = FileLock::take(path)?;
+    let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
     let existing = read_or_empty(path)?;
     let (change, updated) = match strip(&existing) {
-        Some((before, after)) => {
+        Some((before, block, after)) => {
+            let body = if owns_separator(&block) {
+                with_separator_note(body)
+            } else {
+                body.to_owned()
+            };
             let rebuilt = format!("{before}{body}{after}");
             if rebuilt == existing {
                 (Change::Unchanged, rebuilt)
@@ -474,8 +503,10 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
             let mut rebuilt = existing.clone();
             if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
                 rebuilt.push('\n');
+                rebuilt.push_str(&with_separator_note(body));
+            } else {
+                rebuilt.push_str(body);
             }
-            rebuilt.push_str(body);
             (Change::Added, rebuilt)
         }
     };
@@ -493,12 +524,20 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
 /// # Errors
 ///
 /// Returns the underlying failure when the file cannot be read or written.
-pub fn remove(path: &Path) -> std::io::Result<Change> {
+pub fn remove(path: &Path, record: &EntryRecord) -> std::io::Result<Change> {
     let _writing = writing();
-    let _held = FileLock::take(path)?;
+    let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
     let existing = read_or_empty(path)?;
-    let Some((before, after)) = strip(&existing) else {
+    let Some((before, block, after)) = strip(&existing) else {
         return Ok(Change::Absent);
+    };
+    // The line break the entry took with it goes with it, where the entry is still the last thing in
+    // the file. Where the person has written after it, the file is no longer the one that was there,
+    // and the line break stays.
+    let before = if owns_separator(&block) && after.is_empty() {
+        before.strip_suffix('\n').unwrap_or(&before).to_owned()
+    } else {
+        before
     };
     let rebuilt = format!("{before}{after}");
     // A file this entry created and nothing else ever wrote to goes with it. One the user owns
@@ -585,6 +624,13 @@ impl EntryRecord {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory the locks that hold two writers of one startup file apart are kept in, beside
+    /// the record: a lock is the installation's, and nothing of it is written in the person's home.
+    #[must_use]
+    pub fn lock_directory(&self) -> PathBuf {
+        self.directory.join("entry-locks")
     }
 
     /// The files the record names for `kind`, in the order they were recorded, as the record is
@@ -806,6 +852,32 @@ impl FileLock {
         Ok(directory.join(format!(".{name}.kalareach-lock")))
     }
 
+    /// Takes the lock for one startup file, kept in `locks` under a name made from where the file
+    /// is, waiting for a holder that is still working.
+    ///
+    /// Nothing is written beside the startup file: the lock is the installation's own, in its own
+    /// directory, and two installs of one file, whatever the link it was reached through, name the
+    /// same lock because the name is made from the file the path resolves to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying failure, or a timeout when another writer held it throughout.
+    fn take_for_startup_file(path: &Path, locks: &Path) -> std::io::Result<Self> {
+        use sha2::{Digest as _, Sha256};
+
+        let target = resolved(path)?;
+        // The installation's state directory is the root, made this user's own like everything
+        // under it, and the lock directory is inside it.
+        kr_ipc::paths::create_private_tree(locks.parent().unwrap_or(locks), locks)
+            .map_err(std::io::Error::other)?;
+        let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
+        let name = digest.iter().fold(String::new(), |mut name, byte| {
+            name.push_str(&format!("{byte:02x}"));
+            name
+        });
+        Self::acquire(locks.join(format!("{name}.lock")), path)
+    }
+
     /// Takes the lock for one startup file, waiting for a holder that is still working.
     ///
     /// # Errors
@@ -813,7 +885,12 @@ impl FileLock {
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     #[cfg(unix)]
     fn take(path: &Path) -> std::io::Result<Self> {
-        let lock = Self::beside(path)?;
+        Self::acquire(Self::beside(path)?, path)
+    }
+
+    /// Takes the lock held at `lock` on behalf of the file `path`.
+    #[cfg(unix)]
+    fn acquire(lock: PathBuf, path: &Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -856,6 +933,12 @@ impl FileLock {
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     #[cfg(not(unix))]
     fn take(path: &Path) -> std::io::Result<Self> {
+        Self::acquire(Self::beside(path)?, path)
+    }
+
+    /// Takes the lock held at `lock` on behalf of the file `path`.
+    #[cfg(not(unix))]
+    fn acquire(lock: PathBuf, path: &Path) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// What Windows says when another handle holds the file.
@@ -863,7 +946,6 @@ impl FileLock {
         /// What it says when a region of it is locked.
         const ERROR_LOCK_VIOLATION: i32 = 33;
 
-        let lock = Self::beside(path)?;
         let deadline = std::time::Instant::now() + LOCK_PATIENCE;
         loop {
             match std::fs::OpenOptions::new()
@@ -910,8 +992,8 @@ impl Drop for FileLock {
         // The file stays. A waiter is holding the same name open and waiting on the operating
         // system's own lock, and removing the name would let a third process create another file
         // with it: two writers would then hold two different locks and write over each other.
-        // Closing the file is what releases the lock, and the empty file left beside the startup
-        // file costs nothing.
+        // Closing the file is what releases the lock, and the empty file left in the
+        // installation's own lock directory costs nothing.
         let _ = &self.path;
         drop(self.held.take());
     }
@@ -937,8 +1019,9 @@ pub fn installed(path: &Path) -> bool {
     read_or_empty(path).is_ok_and(|contents| strip(&contents).is_some())
 }
 
-/// Splits a file around its KalaReach entry.
-fn strip(contents: &str) -> Option<(String, String)> {
+/// Splits a file around its KalaReach entry: what comes before it, the entry itself, and what comes
+/// after it.
+fn strip(contents: &str) -> Option<(String, String, String)> {
     // Whole lines, not text that happens to hold the marker. A person's own file can print the
     // marker, or talk about it, and neither is this host's entry: removing what stands between
     // two such lines would take their own configuration with it.
@@ -954,7 +1037,11 @@ fn strip(contents: &str) -> Option<(String, String)> {
     };
     let (begin, _) = line_at(0, MARKER_BEGIN)?;
     let (_, after) = line_at(begin, MARKER_END)?;
-    Some((contents[..begin].to_owned(), contents[after..].to_owned()))
+    Some((
+        contents[..begin].to_owned(),
+        contents[begin..after].to_owned(),
+        contents[after..].to_owned(),
+    ))
 }
 
 /// Writes a startup file by replacing it, never by truncating it.
@@ -1533,6 +1620,28 @@ mod tests {
         std::fs::read(loaded).map(|read| read.len()).unwrap_or(0)
     }
 
+    /// The record every test here writes through: the locks are in its directory, apart from the
+    /// files under test.
+    fn record() -> &'static EntryRecord {
+        static RECORD: std::sync::OnceLock<(tempfile::TempDir, EntryRecord)> =
+            std::sync::OnceLock::new();
+        &RECORD
+            .get_or_init(|| {
+                let directory = tempfile::tempdir().expect("a directory");
+                let record = EntryRecord::in_state_directory(&directory.path().join("state"));
+                (directory, record)
+            })
+            .1
+    }
+
+    fn install(path: &Path, body: &str) -> std::io::Result<Change> {
+        super::install(path, body, record())
+    }
+
+    fn remove(path: &Path) -> std::io::Result<Change> {
+        super::remove(path, record())
+    }
+
     /// A target for one shell, for the tests that only care what an entry contains.
     fn for_shell(kind: ShellKind) -> StartupTarget {
         StartupTarget {
@@ -1551,16 +1660,24 @@ mod tests {
 
         // A lock is taken for the whole read-rebuild-write, so a writer that is not this process
         // is kept out rather than racing the rename.
-        let lock = FileLock::beside(&path).expect("names the lock");
-        let held = FileLock::take(&path).expect("takes the lock");
-        assert!(lock.is_file(), "the lock is beside the file it is about");
+        let locks = record().lock_directory();
+        let held = FileLock::take_for_startup_file(&path, &locks).expect("takes the lock");
+        assert!(
+            std::fs::read_dir(&locks)
+                .expect("the lock directory")
+                .count()
+                >= 1,
+            "the lock is in the installation's own directory"
+        );
         // A second attempt waits for the first and gives up rather than writing beside it.
-        let refused = FileLock::take(&path).expect_err("one writer at a time");
+        let refused =
+            FileLock::take_for_startup_file(&path, &locks).expect_err("one writer at a time");
         assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
         drop(held);
         // The name stays where a waiter can be holding the same file open; what the drop releases
         // is the kernel's lock, which the next writer takes at once.
-        let after = FileLock::take(&path).expect("the next writer takes it straight away");
+        let after = FileLock::take_for_startup_file(&path, &locks)
+            .expect("the next writer takes it straight away");
         drop(after);
 
         let body = entry(
@@ -1583,13 +1700,12 @@ mod tests {
     fn a_profile_in_a_directory_that_is_not_there_yet_is_written_under_a_lock() {
         let root = tempfile::tempdir().expect("a directory");
         let path = root.path().join("config/powershell/profile.ps1");
-        let lock = FileLock::beside(&path).expect("names the lock");
+        let locks = record().lock_directory();
+        let held = FileLock::take_for_startup_file(&path, &locks).expect("takes the lock");
         assert!(
-            lock.parent().expect("a directory").is_dir(),
-            "the directory the lock lives in is created before the lock is taken"
+            !path.parent().expect("a directory").exists(),
+            "a lock in a directory of the person's home is never what makes the directory"
         );
-        let held = FileLock::take(&path).expect("takes the lock");
-        assert!(lock.is_file());
         drop(held);
 
         let body = entry(
@@ -1791,6 +1907,100 @@ mod tests {
         assert!(
             !installed(&real),
             "and the file it names no longer holds the entry"
+        );
+    }
+
+    /// KR-REQ-26.05: the install and the removal write nothing in the startup file's directory but
+    /// the file itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_and_a_removal_leave_nothing_in_the_files_directory_but_the_file() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        std::fs::write(&path, "export EDITOR=vim\n").expect("writes");
+        let names = || {
+            let mut names: Vec<String> = std::fs::read_dir(root.path())
+                .expect("lists")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        )
+        .expect("the path is text");
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            names(),
+            [".zshrc"],
+            "the install left something beside the file"
+        );
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            names(),
+            [".zshrc"],
+            "the removal left something beside the file"
+        );
+    }
+
+    /// KR-REQ-26.05: a file that did not end in a line break is given back exactly as it was. The
+    /// entry begins on a line of its own, and the line break that took is the entry's, so the
+    /// removal takes it back; where the person has written after the entry since, the file is no
+    /// longer the one that was there and the break stays.
+    #[test]
+    fn a_file_with_no_final_line_break_is_given_back_exactly() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        )
+        .expect("the path is text");
+
+        std::fs::write(&path, "export EDITOR=vim").expect("writes");
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        // Installing again keeps the entry, and what it took with it.
+        assert_eq!(
+            install(&path, &body).expect("installs again"),
+            Change::Unchanged
+        );
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "export EDITOR=vim"
+        );
+
+        // The person wrote a line after the entry, so what was there before it is not at the end.
+        std::fs::write(&path, "export EDITOR=vim").expect("writes");
+        install(&path, &body).expect("installs");
+        let with_more = format!(
+            "{}alias ll='ls -l'\n",
+            std::fs::read_to_string(&path).expect("reads")
+        );
+        std::fs::write(&path, with_more).expect("writes");
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "export EDITOR=vim\nalias ll='ls -l'\n"
+        );
+
+        // A file that did end in a line break needs none, and is given back the same.
+        std::fs::write(&path, "export EDITOR=vim\n").expect("writes");
+        install(&path, &body).expect("installs");
+        remove(&path).expect("removes");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "export EDITOR=vim\n"
         );
     }
 
