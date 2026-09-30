@@ -84,8 +84,8 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
 pub use crate::admission::{
-    AdmissionPlan, Admissions, AdmittedComponent, AdmittedPackage, AllowedAdapters, LiveRelease,
-    NotAdmitted, NotAdmittedReason, PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
+    AdmissionPlan, Admissions, AdmittedComponent, AdmittedPackage, LiveRelease, NotAdmitted,
+    NotAdmittedReason, PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
 };
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
@@ -324,8 +324,10 @@ pub struct Catalogue {
     /// The limits in force, read at every use: every package's, and what one synchronisation may
     /// transfer.
     limits: LimitsInForce,
-    /// The adapters an organisation's policy allows, read at every admission.
-    allowed_adapters: AllowedAdapters,
+    /// The adapters an organisation's policy allows, where one applies; every adapter the host
+    /// qualifies where none does. It is not kept in the records: the host that holds the policy
+    /// puts it in force again when it starts.
+    allowed_adapters: Option<BTreeSet<PluginId>>,
 }
 
 impl Catalogue {
@@ -374,7 +376,7 @@ impl Catalogue {
             broker,
             transport,
             limits: LimitsInForce::default(),
-            allowed_adapters: AllowedAdapters::default(),
+            allowed_adapters: None,
         })
     }
 
@@ -771,11 +773,37 @@ impl Catalogue {
         &self.limits
     }
 
-    /// Returns the adapters an organisation's policy allows, which every admission reads: nothing
-    /// is allowed or refused by it until a host puts a set in force.
+    /// Returns the adapters an organisation's policy allows, which every admission reads, or
+    /// `None` where every adapter the host qualifies is allowed.
     #[must_use]
-    pub const fn allowed_adapters(&self) -> &AllowedAdapters {
-        &self.allowed_adapters
+    pub const fn allowed_adapters(&self) -> Option<&BTreeSet<PluginId>> {
+        self.allowed_adapters.as_ref()
+    }
+
+    /// Puts the adapters an organisation's policy allows in force from the next admission, or
+    /// every adapter with `None`, and returns whether that changed what was in force.
+    ///
+    /// A set narrows admission to the adapters it names, never past what an installation, its
+    /// grants and its package already allow. Admissions carry the set, so a change raises the
+    /// admission revision first, and the set is in force only once that has committed: a revision
+    /// that could not be raised leaves the set that was in force, and the same call again tries
+    /// again. A set equal to the one in force changes nothing and raises nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the authority refused, and [`CatalogueError::StorageUnavailable`] when the
+    /// revision cannot be raised.
+    pub fn set_allowed_adapters(
+        &mut self,
+        allowed: Option<BTreeSet<PluginId>>,
+        authority: &dyn Authority,
+    ) -> CatalogueResult<bool> {
+        if self.allowed_adapters == allowed {
+            return Ok(false);
+        }
+        self.raise_admission_revision(authority)?;
+        self.allowed_adapters = allowed;
+        Ok(true)
     }
 
     /// Raises the admission revision under `authority`, for something the admissions carry that
@@ -807,7 +835,7 @@ impl Catalogue {
         host: &HostPlatform,
     ) -> CatalogueResult<AdmissionPlan> {
         let limits = self.limits.get().package;
-        let allowed = self.allowed_adapters.get();
+        let allowed = self.allowed_adapters.as_ref();
         self.read_kept(|records| {
             admission::plan(
                 &self.root,
@@ -816,7 +844,7 @@ impl Catalogue {
                 live,
                 host,
                 limits,
-                allowed.as_ref(),
+                allowed,
             )
         })
     }

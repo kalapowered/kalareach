@@ -317,8 +317,8 @@ signed record named then; a later record for the same program changes no live bi
 What a binding may do follows its installation. A grant the owner withdraws reaches every live
 binding of the package, on every release it holds, and the next action that needs it is refused. A
 grant the owner confirms reaches only bindings on the installed release: a release the installation
-left is held to what it could do when it was left, and never gains. A package disabled or removed
-ends its bindings at the next snapshot, each once no request it admitted is still open, and a
+left is held to what it could do when it was left, and never gains. A package disabled or removed,
+or one the organisation's adapter allowlist no longer names, ends its bindings at the next snapshot, each once no request it admitted is still open, and a
 binding is reported as ending until it has closed. A binding closes only at a snapshot, so while a
 worker reports one as ending, the host sends that worker a snapshot every 30 seconds: the binding
 closes within about 30 seconds of its last request finishing, with no other change.
@@ -326,9 +326,9 @@ closes within about 30 seconds of its last request finishing, with no other chan
 `plugin.list` counts each installation's live bindings, and every release a worker still holds that
 no installation describes, from reports every worker makes after the read began. While a worker
 has not answered, a count is null rather than a guess. It also says whether the admissions in force
-let new bindings use each installation and, where they do not, why: disabled, revoked, not for this
-host, not whole in the store, past a package limit, or a record the host cannot hand to a worker,
-each by kind and in words that name the package. `plugin.remove` answers with the bindings
+let new bindings use each installation and, where they do not, why: disabled, revoked, not among the
+adapters the organisation allows, not for this host, not whole in the store, past a package limit,
+or a record the host cannot hand to a worker, each by kind and in words that name the package. `plugin.remove` answers with the bindings
 its own refresh found, which are the ones the workers are told to end, and with null when a worker
 did not answer or the admissions moved before the removal committed.
 

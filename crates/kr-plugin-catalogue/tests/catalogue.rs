@@ -5506,7 +5506,6 @@ async fn kr_req_11_04_a_signed_ten_thousand_entry_snapshot_syncs_and_serves_offl
         });
         assert_eq!(found.len(), 1, "agent-{ordinal}");
     }
-
     // The package that was published with its files is matched as well: ten thousand entries.
     let found = lookup.candidates(&Observation {
         executable_path: "/usr/local/bin/example-agent".to_owned(),
@@ -5738,9 +5737,12 @@ fn kr_ac_017_a_sync_hands_the_runtime_back_while_its_work_on_the_index_is_pendin
 
 /// An organisation's allowlist narrows what admission lets new bindings use: an installed, enabled
 /// package it does not name is not admitted, says why, and ends a binding at its next admission
-/// boundary, while the installation itself stays. A set that names it admits it again, and so does
-/// no set at all. The set here is one a test makes; how a signed policy reaches a host is not this
-/// crate's.
+/// boundary, while the installation itself stays. A release a worker reports live that no
+/// installation describes ends the same way. A set that names the package admits it again, and so
+/// does no set at all. A change of the set raises the admission revision once and a set equal to
+/// the one in force raises nothing. A release the allowlist and its repository both leave out is
+/// reported as revoked. The set here is one a test makes; how a signed policy reaches a host is not
+/// this crate's.
 #[tokio::test]
 async fn kr_req_18_06_an_installation_outside_the_organisations_allowlist_is_not_admitted() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -5753,22 +5755,39 @@ async fn kr_req_18_06_an_installation_outside_the_organisations_allowlist_is_not
     )
     .await;
     installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
-    let admitted = |catalogue: &Catalogue| {
+    let origin = origin_of(&catalogue);
+    let admitted = |catalogue: &Catalogue, live: &[LiveRelease]| {
         catalogue
-            .admissions(environment(), &[], &this_host())
+            .admissions(environment(), live, &this_host())
             .expect("readable")
     };
+    let owner = Owner::acting();
 
     // Control: with no allowlist in force, the adapters the host qualifies are all admitted.
-    let everyone = admitted(&catalogue);
+    let everyone = admitted(&catalogue, &[]);
     assert_eq!(everyone.packages.len(), 1, "{everyone:?}");
     assert!(!everyone.releases[0].ends_at_next_boundary);
+    let revision = catalogue.admission_revision().expect("readable");
+    assert!(
+        !catalogue
+            .set_allowed_adapters(None, &owner)
+            .expect("nothing to change"),
+        "no set is what is in force"
+    );
+    assert_eq!(catalogue.admission_revision().expect("readable"), revision);
 
     let another = PluginId::new("kalareach/another-adapter").expect("a valid plugin identifier");
-    catalogue
-        .allowed_adapters()
-        .put(Some(BTreeSet::from([another])));
-    let narrowed = admitted(&catalogue);
+    assert!(
+        catalogue
+            .set_allowed_adapters(Some(BTreeSet::from([another.clone()])), &owner)
+            .expect("in force")
+    );
+    assert_eq!(
+        catalogue.admission_revision().expect("readable"),
+        revision + 1,
+        "admissions carry the set, so a change raises the revision"
+    );
+    let narrowed = admitted(&catalogue, &[]);
     assert!(narrowed.packages.is_empty(), "{narrowed:?}");
     assert_eq!(narrowed.not_admitted.len(), 1);
     assert_eq!(
@@ -5789,13 +5808,72 @@ async fn kr_req_18_06_an_installation_outside_the_organisations_allowlist_is_not
         .expect("readable")
         .expect("the installation stays");
     assert!(installation.enabled, "the installation is not touched");
+    assert!(
+        !catalogue
+            .set_allowed_adapters(Some(BTreeSet::from([another.clone()])), &owner)
+            .expect("nothing to change"),
+        "the same set changes nothing"
+    );
+    assert_eq!(
+        catalogue.admission_revision().expect("readable"),
+        revision + 1
+    );
+
+    // A release a worker holds that no installation describes: another hash of the package, from
+    // the same origin. The set leaves it out as it leaves the installation out.
+    let elsewhere = live(
+        PayloadDigest::of(b"a release nobody installed"),
+        "0.0.9",
+        origin,
+    );
+    let held = admitted(&catalogue, std::slice::from_ref(&elsewhere));
+    let state = held
+        .releases
+        .iter()
+        .find(|state| state.package_digest == elsewhere.package_digest)
+        .expect("the live release has a state");
+    assert!(state.ends_at_next_boundary, "{state:?}");
+    catalogue
+        .set_allowed_adapters(Some(BTreeSet::from([plugin()])), &owner)
+        .expect("in force");
+    assert_eq!(admitted(&catalogue, &[]).packages.len(), 1);
+    let held = admitted(&catalogue, std::slice::from_ref(&elsewhere));
+    let state = held
+        .releases
+        .iter()
+        .find(|state| state.package_digest == elsewhere.package_digest)
+        .expect("the live release has a state");
+    assert!(
+        !state.ends_at_next_boundary,
+        "a set that names the package keeps it: {state:?}"
+    );
+
+    // Revoked and left out by the set: the revocation is what is reported.
+    let revoking = same_package_again(home.path(), &generation, 2, Some(revoke)).await;
+    generation.replace_with(&revoking);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the revoking generation");
+    catalogue
+        .set_allowed_adapters(Some(BTreeSet::from([another])), &owner)
+        .expect("in force");
+    let both = admitted(&catalogue, &[]);
+    assert!(
+        matches!(&both.not_admitted[0].reason, NotAdmittedReason::Revoked(_)),
+        "{both:?}"
+    );
 
     catalogue
-        .allowed_adapters()
-        .put(Some(BTreeSet::from([plugin()])));
-    assert_eq!(admitted(&catalogue).packages.len(), 1);
-    catalogue.allowed_adapters().put(None);
-    assert_eq!(admitted(&catalogue).packages.len(), 1);
+        .set_allowed_adapters(None, &owner)
+        .expect("in force");
+    assert!(
+        matches!(
+            &admitted(&catalogue, &[]).not_admitted[0].reason,
+            NotAdmittedReason::Revoked(_)
+        ),
+        "with no set the revocation still leaves it out"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
