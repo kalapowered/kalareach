@@ -5,7 +5,7 @@
 //! are verified TLS, bounded while the room answers the upgrade, and bounded in how much of the
 //! room's traffic can wait for them once they are open.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -160,6 +160,15 @@ impl LoopbackRoom {
         let _ = tokio::time::timeout(WATCHDOG, stream.read_u8()).await;
     }
 }
+
+/// A loopback address that nothing answers at, whatever else is running beside a test.
+///
+/// A port a test frees is one another program can be given before the test connects to it. This
+/// one is not: the ports a program is given when it asks for any free port begin far above port 1
+/// unless the machine is set up to hand it out, so nothing listens there unless a program was put
+/// there on purpose, and a connection to it is refused. A machine where that does not hold fails
+/// `nothing_answers_at_the_unanswered_address`, which names the address.
+const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
 
 fn locator() -> Locator {
     Locator::new("abcd").expect("a locator")
@@ -349,12 +358,7 @@ async fn a_room_whose_certificate_is_not_trusted_is_refused() {
 /// A room nobody answers for is unreachable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_room_nobody_answers_for_is_unreachable() {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = listener.local_addr().expect("an address").port();
-    drop(listener);
-    let origin = RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin");
+    let origin = RendezvousOrigin::new(format!("https://{UNANSWERED}")).expect("an origin");
     let opened = tokio::time::timeout(
         WATCHDOG,
         Authority::new("rendezvous test authority")
@@ -364,7 +368,10 @@ async fn a_room_nobody_answers_for_is_unreachable() {
     .await
     .expect("the attempt ends");
     assert!(
-        matches!(opened, Err(RoomError::Unreachable { .. })),
+        matches!(
+            &opened,
+            Err(RoomError::Unreachable { reason, .. }) if reason.contains("the connection failed")
+        ),
         "{opened:?}"
     );
 }
@@ -385,6 +392,21 @@ async fn room_heard_nothing(room: &LoopbackRoom) {
             .await
             .is_err(),
         "the attempt reached the room without the proxy"
+    );
+}
+
+/// The address the tests name as unanswered refuses a connection. A machine that answers there
+/// fails this test, which names the address, as well as the tests that rely on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_answers_at_the_unanswered_address() {
+    let refused = tokio::time::timeout(WATCHDOG, TcpStream::connect(UNANSWERED))
+        .await
+        .expect("the connection ends")
+        .expect_err("nothing listens");
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{refused:?}"
     );
 }
 
@@ -446,13 +468,8 @@ async fn a_proxy_that_refuses_the_tunnel_ends_the_attempt() {
 async fn a_proxy_that_cannot_be_reached_is_not_gone_around() {
     let authority = Authority::new("rendezvous test authority");
     let room = LoopbackRoom::start(&authority).await;
-    let closed = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = closed.local_addr().expect("an address").port();
-    drop(closed);
     let connector = authority.trusted_by().through(Some(
-        format!("http://127.0.0.1:{port}")
+        format!("http://{UNANSWERED}")
             .parse::<ProxyUrl>()
             .expect("a proxy address"),
     ));
