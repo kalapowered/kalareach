@@ -5697,6 +5697,106 @@ fn kr_req_11_15_the_runtime_state_vocabulary_is_one_vocabulary() {
     }
 }
 
+/// Adds a grant to the first build an entry names, as no record of a catalogue may.
+fn adds_a_grant_to_a_build(index: &mut serde_json::Value) {
+    index["entries"][0]["builds"][0]["grant"] =
+        serde_json::json!({ "capabilities": ["filesystem.read"] });
+}
+
+/// A qualification artifact carries a state, a source, a digest and a statement, and nothing that
+/// could create an effect or raise a grant: a record with a `capabilities` or a `grant` member is
+/// not one this host reads, on its own or in a signed index, and nothing of such an index is
+/// activated. The same records without the member read, and the same generation without it is
+/// accepted.
+#[tokio::test]
+async fn kr_req_11_18_a_record_with_a_capabilities_or_a_grant_member_is_refused() {
+    use kr_plugin_catalogue::evidence;
+
+    let mut entry = support::example_entry();
+    let requested = entry.capabilities[0].capability;
+    builds_here_and_elsewhere(&mut entry);
+    entry.qualification = vec![QualificationResult {
+        capability_id: evidence::capability_id(requested).expect("an identifier"),
+        capability_version: PackageVersion::parse("1.0.0").expect("a valid version"),
+        subject: Label::new("ExternalApp 1.4").expect("a valid label"),
+        state: CapabilityState::VersionQualified,
+        source: EvidenceSource::SignedRecord,
+        profile_digest: PayloadDigest::of(b"profile"),
+        statement: Summary::new("Qualified against ExternalApp 1.4").expect("a valid statement"),
+    }];
+    let plain = serde_json::to_value(&entry).expect("serialisable");
+    assert_eq!(
+        serde_json::from_value::<kr_plugin_sdk::catalogue::IndexEntry>(plain.clone())
+            .expect("the records as they are read"),
+        entry
+    );
+    for place in ["qualification", "builds"] {
+        for member in ["capabilities", "grant"] {
+            let mut altered = plain.clone();
+            altered[place][0][member] = serde_json::json!({ "capabilities": ["process.spawn"] });
+            let refusal = serde_json::from_value::<kr_plugin_sdk::catalogue::IndexEntry>(altered)
+                .expect_err("a member no record carries");
+            assert!(
+                refusal.to_string().contains("unknown field"),
+                "{place} {member}: {refusal}"
+            );
+        }
+    }
+
+    // In a signed generation the same member refuses the whole index.
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            edit_entry: Some(builds_here_and_elsewhere),
+            edit_index_json: Some(adds_a_grant_to_a_build),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("an index whose build carries a grant");
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+    assert!(refusal.to_string().contains("unknown field"), "{refusal}");
+    assert!(catalogue.index(&repository()).is_err(), "nothing activated");
+
+    let control = tempfile::tempdir().expect("a temporary directory");
+    let clean = Generation::build(
+        control.path(),
+        GenerationSpec {
+            edit_entry: Some(builds_here_and_elsewhere),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        control.path(),
+        &clean,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the same generation without the member");
+    assert_eq!(
+        catalogue.index(&repository()).expect("activated").entries[0]
+            .builds
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
     use kr_plugin_catalogue::evidence;
