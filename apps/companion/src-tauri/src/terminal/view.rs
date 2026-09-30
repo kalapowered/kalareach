@@ -29,7 +29,7 @@ use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Notification, Outcome, ParamsValue, Request,
     Response,
 };
-use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
+use kr_protocol::hello::PACKAGE_VERSION;
 use kr_protocol::ids::{ActionId, BuildId, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
 use kr_protocol::local::LocalBuild;
@@ -253,11 +253,13 @@ async fn open(
 /// A worker outlives an upgrade, so the application can meet a worker of an earlier build, or of a
 /// later one. It reads a worker's screens when the worker states, in its answer to the hello, a
 /// build whose protocol version shares this build's compatibility level
-/// ([`PackageVersion::shares_frames_with`]). A worker that states no build is of a build before
-/// that statement. Attaching to either of the others would wait on screens the view cannot draw.
+/// ([`kr_protocol::hello::PackageVersion::shares_frames_with`]). A worker that states no build is
+/// of a build before that statement. Attaching to either of the others would wait on screens the
+/// view cannot draw.
 ///
-/// The refusal is an unsupported schema, said as the action it maps to: the words name both builds
-/// and both protocol versions and say what to do, and no protocol code.
+/// The refusal is an unsupported schema by kind, and the page is given words and not the code: they
+/// name this build and the worker's, with both protocol versions where the worker states its own,
+/// and say what to do.
 fn check_build(stated: Option<&LocalBuild>) -> Result<(), String> {
     let worker = match stated {
         Some(build) if build.protocol_version.shares_frames_with(PACKAGE_VERSION) => {
@@ -266,7 +268,7 @@ fn check_build(stated: Option<&LocalBuild>) -> Result<(), String> {
         Some(build) => format!(
             "runs on {} with protocol {}",
             build_name(&build.build_id),
-            version(build.protocol_version)
+            build.protocol_version
         ),
         None => "runs on a worker of an earlier build, which does not state its build or its \
                  protocol version"
@@ -278,7 +280,7 @@ fn check_build(stated: Option<&LocalBuild>) -> Result<(), String> {
          cannot show a session whose worker speaks another protocol version. Close the session, \
          or open it with the application of the worker's build.",
         build_name(&ours),
-        version(PACKAGE_VERSION)
+        PACKAGE_VERSION
     ))
 }
 
@@ -308,11 +310,6 @@ fn build_name(build_id: &BuildId) -> &str {
     } else {
         "[a build this application does not name]"
     }
-}
-
-/// A protocol package version, as a refusal says it.
-fn version(version: PackageVersion) -> String {
-    format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
 /// What a link that failed part way says.
@@ -1014,5 +1011,41 @@ impl View {
         let state = state_of(&self.attachment, screen, self.told, self.lease.control());
         self.last = Some(state.clone());
         (self.publish)(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_name;
+    use kr_protocol::ids::BuildId;
+
+    /// A build identifier is said when it is a program's name and a release, and any other text a
+    /// worker states is replaced rather than repeated.
+    #[test]
+    fn a_build_identifier_is_said_only_when_it_is_a_name_and_a_release() {
+        let long = format!("kr-worker/{}1", "1.".repeat(40));
+        for text in [
+            "kr-worker/0.1.0\u{202e}",
+            "kr-worker/0.1.0 with protocol 9.9.9",
+            "../kr-worker/0.1.0",
+            "Kr-Worker/0.1.0",
+            "kr-worker/0.1.0-rc.1",
+            "kr-worker/",
+            "kr-worker/0..1",
+            "1kr/0.1.0",
+            "kr-worker",
+            long.as_str(),
+        ] {
+            let id = BuildId::new(text).expect("a build identifier");
+            assert_eq!(
+                build_name(&id),
+                "[a build this application does not name]",
+                "{text:?}"
+            );
+        }
+        for text in ["kr-worker/0.1.0", "kalareach-companion/0.49.0"] {
+            let id = BuildId::new(text).expect("a build identifier");
+            assert_eq!(build_name(&id), text);
+        }
     }
 }
