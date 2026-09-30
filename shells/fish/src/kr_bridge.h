@@ -138,6 +138,26 @@ int kr_shell_veof(void);
 /* Removes one variable from the shell's own exported environment. */
 void kr_shell_unexport(const char *name);
 
+/* One dynamic module the shell has loaded. Allocated with malloc, and freed by the bridge. */
+typedef struct {
+    /* The name the shell loaded it by. */
+    char *name;
+    /* The file the loader took it from, as the loader names it, or NULL when it does not say. */
+    char *path;
+    /* The loader's handle for it, valid while the module stays loaded. */
+    void *handle;
+    /* Where the loader mapped its image, which says which slice of a file it was. */
+    const void *header;
+} kr_loaded_module;
+
+/*
+ * Set by a shell that loads native modules of its own, and left NULL by one that does not. It
+ * fills `out` and `count` with every dynamic module the shell has loaded; a module the shell links
+ * into itself has no file and is not listed. The list is whole or is not made: it returns 0 when it
+ * could not be, and the bridge says so rather than taking it for an empty one.
+ */
+extern int (*kr_loaded_modules_hook)(kr_loaded_module **out, size_t *count);
+
 /* ---- what the bridge supplies -------------------------------------------------------------- */
 
 /* Non-zero once the handshake has been accepted. */

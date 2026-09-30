@@ -49,8 +49,7 @@ impl Told {
 
 /// Runs `script` in `zsh`, with the tree at `hidden` unreadable to it where the platform can say so.
 fn run(zsh: &Path, hidden: Option<&Path>, script: &str) -> Told {
-    let mut command = if cfg!(target_os = "macos") && hidden.is_some() {
-        let hidden = hidden.expect("checked");
+    let mut command = if let (true, Some(hidden)) = (cfg!(target_os = "macos"), hidden) {
         let profile = format!(
             "(version 1)(allow default)(deny file-read* (subpath \"{}\"))",
             hidden.display()
