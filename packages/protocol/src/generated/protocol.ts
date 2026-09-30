@@ -569,6 +569,10 @@ export type ChangeSetId = string
  */
 export type ChangeSetVersion = string
 /**
+ * What the administrator's policy does to a live binding whose release is revoked.
+ */
+export type RevocationPolicy = 'warn_only' | 'disable_at_next_admission' | 'disable_at_once'
+/**
  * The owner's sleep-inhibition choice.
  *
  * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
@@ -10019,6 +10023,15 @@ export interface ConfigurationDocument {
  * The ceilings this host configures. They intersect; they never raise anything.
  */
 export interface ConfigurationCeilings {
+  /**
+   * What happens to a live binding whose release its repository revokes: section 25's
+   * administrator's explicit disable policy.
+   *
+   * Absent leaves the policy this host already holds, which is warning only until one is
+   * named; present puts the one named in force from the next admission. Removing the member
+   * does not return to warning only: naming `warn_only` does.
+   */
+  disable_policy?: RevocationPolicy | null
   /**
    * The repository enrolment budgets section 11 calls configuration.
    */

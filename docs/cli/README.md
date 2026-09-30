@@ -772,6 +772,7 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
+  disable_policy ceiling warn only: a live binding on a revoked release keeps serving, and says so
   grant_rights ceiling every right the grant and the host policy allow
 ok             The runtime directory is owner-only
 warning        Every published descriptor answered its challenge

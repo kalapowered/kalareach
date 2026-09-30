@@ -354,8 +354,9 @@ raises the trusted adapter item for the session, which escalates and repeats unt
 no binding on a revoked release of that package, and the notice that says so resolves it. Both
 travel with the package's name while privacy mode withholds their words, and a notice the session's
 journal cannot write yet is kept, in order, until the journal recovers. `plugin.list` reports which
-installations and live releases are revoked. No method sets the policy yet, so every catalogue warns
-only.
+installations and live releases are revoked. The policy is set in the host's configuration document
+(`ceilings.disable_policy`, see the host guide) and is in force from the next admission; a host
+whose document names none warns only.
 
 ## Capabilities and qualification
 
