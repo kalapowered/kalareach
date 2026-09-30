@@ -255,12 +255,20 @@ fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
         let _ = std::fs::remove_dir_all(&directory);
         return None;
     };
-    let started = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(to))
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // A shell keeps a cache, an identifier and a module directory under the home's XDG directories
+    // whenever it starts, and answering a question must not put them in the person's home. They go
+    // under this call's own directory and leave with it.
+    #[cfg(unix)]
+    command
+        .env("XDG_CACHE_HOME", directory.join("cache"))
+        .env("XDG_DATA_HOME", directory.join("data"));
+    let started = command.spawn();
     let mut child = match started {
         Ok(child) => child,
         Err(_) => {
@@ -1775,6 +1783,62 @@ mod tests {
             ..home
         };
         assert!(silent.targets(ShellKind::PowerShell).is_empty());
+    }
+
+    /// KR-REQ-26.05: asking PowerShell where its profile is leaves nothing of PowerShell's own in
+    /// the person's home.
+    ///
+    /// PowerShell keeps a cache, a telemetry identifier and a module directory under the home's
+    /// XDG directories whenever it starts, so the shell this host asks for its profile is pointed
+    /// at directories of the question's own, which go with it. The program here writes where
+    /// PowerShell writes, under a home of its own, and says what it was told.
+    #[cfg(unix)]
+    #[test]
+    fn asking_powershell_for_its_profile_leaves_the_home_as_it_was() {
+        let root = tempfile::tempdir().expect("a directory");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).expect("a home");
+        let seen = root.path().join("seen");
+        let program = root.path().join("pwsh-writes");
+        let text = root.path().join("pwsh-writes.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\nHOME='{home}'\n\
+                 cache=\"${{XDG_CACHE_HOME:-$HOME/.cache}}/powershell\"\n\
+                 data=\"${{XDG_DATA_HOME:-$HOME/.local/share}}/powershell/Modules\"\n\
+                 mkdir -p \"$cache\" \"$data\" && : > \"$cache/StartupProfileData-NonInteractive\"\n\
+                 printf '%s\\n%s\\n' \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" > '{seen}'\n\
+                 printf '%s\\n' '{profile}'\n",
+                home = home.display(),
+                seen = seen.display(),
+                profile = home.join(".config/powershell/profile.ps1").display(),
+            ),
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_program(&text, &program);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+
+        let asking = HomeLayout {
+            powershell: Some(program),
+            ..layout(&home)
+        };
+        let targets = asking.targets(ShellKind::PowerShell);
+        assert_eq!(targets.len(), 1, "the shell's answer is taken");
+        assert_eq!(
+            std::fs::read_dir(&home).expect("the home reads").count(),
+            0,
+            "the question left something of the shell's own in the home"
+        );
+        let told = std::fs::read_to_string(&seen).expect("the program saw its environment");
+        let ours = std::env::temp_dir().join("kr-shell-ask-");
+        for directory in told.lines() {
+            assert!(
+                directory.starts_with(&*ours.to_string_lossy()),
+                "{directory:?} is not a directory of the question's own"
+            );
+        }
+        assert_eq!(told.lines().count(), 2, "both directories are named");
     }
 
     /// Writes a program that prints one line, which is all this host asks PowerShell for.
