@@ -306,6 +306,7 @@ pub fn wire(
             reason: match refused.reason {
                 NotAdmittedReason::Disabled => PluginLeftOutReason::Disabled,
                 NotAdmittedReason::Revoked(_) => PluginLeftOutReason::Revoked,
+                NotAdmittedReason::NotAllowed => PluginLeftOutReason::NotAllowed,
                 NotAdmittedReason::Unsupported { .. } => PluginLeftOutReason::Unsupported,
                 NotAdmittedReason::Incomplete(_) => PluginLeftOutReason::Incomplete,
                 NotAdmittedReason::PastALimit(_) => PluginLeftOutReason::PastALimit,
