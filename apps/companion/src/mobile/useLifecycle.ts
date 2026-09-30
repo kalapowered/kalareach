@@ -175,19 +175,27 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
 }
 
 /**
- * How much of the screen the software keyboard covers, as a CSS length on the document.
+ * How much of the height a software keyboard takes, and how far the platform has panned the page,
+ * both as CSS lengths on the document.
  *
- * The visual viewport shrinks when the keyboard comes up, and the difference between it and the
- * layout viewport is exactly what is hidden. Measuring it is the only way to keep a composer above
- * the keyboard on both platforms; a guessed height is wrong on every device it was not measured on.
+ * The visual viewport shrinks when the keyboard comes up, and the layout viewport keeps its height:
+ * the difference is what the keyboard takes, measured, since a guessed height is wrong on every
+ * device it was not measured on. Where the platform then pans the page to keep a focused field in
+ * sight, the visual viewport is scrolled down inside the layout viewport by its `offsetTop`, and
+ * whatever of the shell is above that is above the screen. The shell goes with the visual viewport
+ * (`--pan`), so what it holds stays where the person sees it, and the keyboard is at its foot
+ * whether or not the page was panned.
  */
 export function useKeyboardInset(): void {
   useEffect(() => {
     const viewport = window.visualViewport
     if (!viewport) return
+    const root = document.documentElement
     const measure = () => {
-      const covered = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop)
-      document.documentElement.style.setProperty('--keyboard', `${Math.round(covered)}px`)
+      const taken = Math.max(0, window.innerHeight - viewport.height)
+      const panned = Math.max(0, viewport.offsetTop)
+      root.style.setProperty('--keyboard', `${Math.round(taken)}px`)
+      root.style.setProperty('--pan', `${Math.round(panned)}px`)
     }
     measure()
     viewport.addEventListener('resize', measure)
@@ -195,7 +203,8 @@ export function useKeyboardInset(): void {
     return () => {
       viewport.removeEventListener('resize', measure)
       viewport.removeEventListener('scroll', measure)
-      document.documentElement.style.removeProperty('--keyboard')
+      root.style.removeProperty('--keyboard')
+      root.style.removeProperty('--pan')
     }
   }, [])
 }
