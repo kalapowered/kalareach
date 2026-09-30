@@ -34,7 +34,7 @@ use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-use crate::provenance::{EXPORTED_FILE, Expected, PATH_FILE, Provenance, STARTED_FILE};
+use crate::provenance::{EXPORTED_FILE, Expected, LIST_END, PATH_FILE, Provenance, STARTED_FILE};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
 pub const PROMPT: &str = "kr-agents$ ";
@@ -49,8 +49,8 @@ pub fn startup_file() -> String {
         "zmodload zsh/parameter 2>/dev/null\nPROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\n\
          unsetopt prompt_sp\n\
          kr_agents_path() {{ print -r -- \"$PATH\" >| \"$ZDOTDIR/{PATH_FILE}\"; \
-         print -rl -- ${{(k)parameters[(R)*export*]}} >| \"$ZDOTDIR/{EXPORTED_FILE}\" }}\n\
-         kr_agents_started() {{ print -rl -- ${{(k)parameters[(R)*export*]}} >| \"$ZDOTDIR/{STARTED_FILE}\" }}\n\
+         print -rl -- ${{(k)parameters[(R)*export*]}} {LIST_END} >| \"$ZDOTDIR/{EXPORTED_FILE}\" }}\n\
+         kr_agents_started() {{ print -rl -- ${{(k)parameters[(R)*export*]}} {LIST_END} >| \"$ZDOTDIR/{STARTED_FILE}\" }}\n\
          precmd_functions+=(kr_agents_path)\n\
          preexec_functions+=(kr_agents_started)\n"
     )
@@ -854,14 +854,23 @@ pub fn launch(
     // The last look before the agent's command is typed, once the session is set up.
     between();
     let typed_at = session.window.mark();
-    provenance.forget_started();
+    provenance
+        .forget_started()
+        .unwrap_or_else(|why| panic!("{why}"));
     session.window.type_text(format!("{line}\r").as_bytes());
     // The shell writes the names it exports just before it runs the line: what the agent starts
-    // with, checked before anything is typed to it. An agent that started with a name the build
-    // list clears is ended with the part, having been sent nothing.
-    provenance
-        .check_cleared_at_start(Duration::from_secs(10))
-        .unwrap_or_else(|why| panic!("{why}"));
+    // with, checked before anything is typed to it. What the shell started for the line is
+    // recorded with the run before the part stops, so an agent that started with a name the build
+    // list clears is ended with everything else, having been sent nothing.
+    if let Err(why) = provenance.check_cleared_at_start(Duration::from_secs(10)) {
+        let began = Instant::now();
+        while beneath(run, &session.root_shell, "the agent").is_empty()
+            && began.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{why}");
+    }
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let waited = Instant::now();
         loop {
@@ -1485,6 +1494,11 @@ mod tests {
             !prompt.lines().any(|line| line == "KR_EXPORTED_LATE")
                 && started.lines().any(|line| line == "KR_EXPORTED_LATE"),
             "the second list is the one written just before the command line"
+        );
+        assert!(
+            prompt.ends_with(&format!("{LIST_END}\n"))
+                && started.ends_with(&format!("{LIST_END}\n")),
+            "each list ends with its mark: {prompt} {started}"
         );
         assert_eq!(path.trim_end(), "/usr/bin:/bin");
         let cleared = ["KR_CLEARED_HERE".to_owned(), "KR_SET_ONLY".to_owned()];
