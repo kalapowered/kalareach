@@ -228,3 +228,26 @@ fn every_committed_scenario_naming_zsh_holds_against_the_contract() {
 fn the_shell_independent_bridge_is_the_same_source_in_both_packages() {
     shellpkg::the_bridge_core_is_identical_in_both_packages();
 }
+
+/// KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_startup_prompt_reads_its_answer_and_the_session_is_ready_only_after_the_profile() {
+    shellpkg::a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(ZSH);
+}
+
+/// KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_startup_prompt_nobody_answers_holds_readiness_without_hanging_the_shell() {
+    shellpkg::a_startup_prompt_nobody_answers_holds_readiness_and_does_not_hang_the_shell(ZSH);
+}
+
+/// KR-REQ-07.22, KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagnostics() {
+    shellpkg::a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagnostics(
+        ZSH,
+    );
+}

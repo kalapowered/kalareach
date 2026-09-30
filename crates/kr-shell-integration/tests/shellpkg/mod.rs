@@ -40,6 +40,7 @@ use kr_shell_integration::contract::transport::{
     BridgeHello, EventOutcome, HandshakeOutcome, ObservedPeer, ProofVerdict, WorkerExpectation,
     bootstrap_transcript, decide_handshake, frame_codec,
 };
+use kr_shell_integration::host::startup;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// How long a reader is given to answer before a test calls it a failure.
@@ -301,11 +302,44 @@ fn user_configuration(kind: ShellKind, prompt: &str) -> String {
     }
 }
 
+/// What a case adds to the person's own startup, beside the configuration every case has.
+#[derive(Clone, Copy)]
+pub struct Profile<'a> {
+    /// Text that runs after the person's own configuration and before the package's entry, in
+    /// the file that configuration is in.
+    pub after_configuration: &'a str,
+    /// Whether the package's own marked entry is installed at all.
+    pub entry: bool,
+    /// Text that runs once the package's entry has been installed: after it in the file, or at the
+    /// end of a PowerShell profile, whose entry is the first thing in it.
+    pub after_entry: &'a str,
+}
+
+impl Profile<'_> {
+    /// The startup every case without a profile of its own has: the configuration and the entry.
+    pub const ORDINARY: Profile<'static> = Profile {
+        after_configuration: "",
+        entry: true,
+        after_entry: "",
+    };
+}
+
 /// Writes the person's configuration and the package's own marked entry where the shell reads
 /// them, in the layout the package's manifest names.
-fn install_startup(package: &Package, home: &Path, prompt: &str) {
-    let user = user_configuration(package.kind, prompt);
-    let entry = startup_entry(package);
+fn install_startup(package: &Package, home: &Path, prompt: &str, profile: Profile<'_>) {
+    let user = format!(
+        "{}{}",
+        user_configuration(package.kind, prompt),
+        profile.after_configuration
+    );
+    let entry = if package.kind == ShellKind::PowerShell {
+        // Written below through the installer, which is how this shell's entry gets in.
+        String::new()
+    } else if profile.entry {
+        format!("{}{}", startup_entry(package), profile.after_entry)
+    } else {
+        profile.after_entry.to_owned()
+    };
     match package.kind {
         ShellKind::Zsh => {
             std::fs::write(home.join(".zshrc"), format!("{user}{entry}"))
@@ -321,17 +355,33 @@ fn install_startup(package: &Package, home: &Path, prompt: &str) {
             let config = home.join(".config").join("fish");
             std::fs::create_dir_all(config.join("conf.d")).expect("a configuration directory");
             std::fs::write(config.join("config.fish"), user).expect("the startup file");
-            std::fs::write(config.join("conf.d").join("kr-kalareach.fish"), entry)
-                .expect("the startup entry");
+            if profile.entry {
+                std::fs::write(config.join("conf.d").join("kr-kalareach.fish"), entry)
+                    .expect("the startup entry");
+            }
         }
         ShellKind::PowerShell => {
             let config = home.join(".config").join("powershell");
             std::fs::create_dir_all(&config).expect("a configuration directory");
-            std::fs::write(
-                config.join("Microsoft.PowerShell_profile.ps1"),
-                format!("{user}{entry}"),
-            )
-            .expect("the startup file");
+            let path = config.join("Microsoft.PowerShell_profile.ps1");
+            std::fs::write(&path, &user).expect("the startup file");
+            if profile.entry {
+                // The entry goes in as `kr shell install` puts it, which is where the installer
+                // says it belongs: this shell's is the first thing in the profile.
+                let target = startup::StartupTarget {
+                    kind: ShellKind::PowerShell,
+                    path: path.clone(),
+                    reason: "the profile PowerShell reads",
+                    shared: false,
+                };
+                let body = startup::entry(&target, &package.startup_entry, false)
+                    .expect("the package's entry is text");
+                startup::install(&path, &body, startup::Placement::of(ShellKind::PowerShell))
+                    .expect("the entry goes into the profile");
+            }
+            let mut written = std::fs::read_to_string(&path).expect("the startup file");
+            written.push_str(profile.after_entry);
+            std::fs::write(&path, written).expect("the startup file");
         }
     }
 }
@@ -591,6 +641,24 @@ impl Session {
             package,
             environment,
             kr_shell_integration::contract::events::EofGesture::default(),
+            Profile::ORDINARY,
+        )
+    }
+
+    /// Starts the packaged shell with `profile` in the person's startup, and completes the
+    /// handshake.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Session::start`] does, and so does a shell whose startup asks for input before
+    /// its bridge has connected: nothing here types until the handshake is done.
+    #[must_use]
+    pub fn start_with_profile(package: &Package, profile: Profile<'_>) -> Self {
+        Self::start_configured(
+            package,
+            &[],
+            kr_shell_integration::contract::events::EofGesture::default(),
+            profile,
         )
     }
 
@@ -605,13 +673,14 @@ impl Session {
         package: &Package,
         gesture: kr_shell_integration::contract::events::EofGesture,
     ) -> Self {
-        Self::start_configured(package, &[], gesture)
+        Self::start_configured(package, &[], gesture, Profile::ORDINARY)
     }
 
     fn start_configured(
         package: &Package,
         environment: &[(String, String)],
         gesture: kr_shell_integration::contract::events::EofGesture,
+        profile: Profile<'_>,
     ) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-shell-")
@@ -642,7 +711,7 @@ impl Session {
             .map(|i| (i as u8).wrapping_mul(7))
             .collect();
 
-        install_startup(package, &home, &prompt);
+        install_startup(package, &home, &prompt, profile);
 
         let pty = native_pty_system()
             .openpty(PtySize {
