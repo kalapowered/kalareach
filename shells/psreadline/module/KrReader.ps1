@@ -65,28 +65,42 @@ function Get-KrKeymap {
 $script:QueuedKeysField = $null
 $script:SingletonField = $null
 
-# How many keys the reader has taken and not yet acted on.
+# The editor's own queue of keys it has taken and not yet acted on, or nothing when this editor
+# keeps none this package can read.
 #
 # The editor reads keys on a thread of its own and holds them in its own queue, and it publishes no
 # count of them. The queue itself is what a fence rests on, so it is read directly, under the
 # version range this package was qualified against; asking the console whether a key is available
 # instead would take the lock the editor's own read is holding, and the reader would wait for
 # itself.
-function Get-KrQueuedKeys {
+#
+# Nothing is assumed of the editor beyond what is read here: the two fields exist, the editor has
+# an instance, the instance has a queue, and the queue answers with a count. Any of those failing
+# is an editor that cannot prove its queue is clear.
+function Read-KrQueuedKeys {
     try {
-        if ($null -eq $script:SingletonField) {
+        if ($null -eq $script:SingletonField -or $null -eq $script:QueuedKeysField) {
             $script:SingletonField = $script:Rl.GetField('_singleton', 'NonPublic,Static')
             $script:QueuedKeysField = $script:Rl.GetField('_queuedKeys', 'NonPublic,Instance')
         }
-        if ($null -eq $script:SingletonField -or $null -eq $script:QueuedKeysField) { return [uint64]0 }
+        if ($null -eq $script:SingletonField -or $null -eq $script:QueuedKeysField) { return $null }
         $singleton = $script:SingletonField.GetValue($null)
-        if ($null -eq $singleton) { return [uint64]0 }
+        if ($null -eq $singleton) { return $null }
         $queue = $script:QueuedKeysField.GetValue($singleton)
-        if ($null -eq $queue) { return [uint64]0 }
-        return [uint64]$queue.Count
+        if ($null -eq $queue) { return $null }
+        # A collection and not anything that merely answers to `Count`: a scalar has one too.
+        if ($queue -isnot [System.Collections.ICollection]) { return $null }
+        return [uint64]([System.Collections.ICollection]$queue).Count
     } catch {
-        return [uint64]0
+        return $null
     }
+}
+
+# How many keys the reader has taken and not yet acted on.
+function Get-KrQueuedKeys {
+    $queued = Read-KrQueuedKeys
+    if ($null -eq $queued) { return [uint64]0 }
+    $queued
 }
 
 $script:SearchCountField = $null
@@ -118,15 +132,12 @@ function Get-KrEditorModes {
     $modes
 }
 
-# Whether the editor's own key queue can be read at all, which is what a fence rests on here.
+# Whether the editor's own key queue can be read, which is what a fence rests on here.
+#
+# It reads the live queue through the function a fence reads it with, so a build whose queue is
+# renamed, absent, not yet made or not a queue at all is refused here rather than read as empty.
 function Test-KrQueueReadable {
-    try {
-        $singleton = $script:Rl.GetField('_singleton', 'NonPublic,Static')
-        $queued = $script:Rl.GetField('_queuedKeys', 'NonPublic,Instance')
-        return ($null -ne $singleton -and $null -ne $queued)
-    } catch {
-        return $false
-    }
+    $null -ne (Read-KrQueuedKeys)
 }
 
 # One revision per observed change, counted where it is read.
