@@ -491,6 +491,12 @@ function Enable-KalaReachHooks {
         return
     }
 
+    $spelling = Test-KrKeySpelling
+    if (-not $spelling.Ok) {
+        Stop-KrActivation $spelling.Reason $spelling.Detail
+        return
+    }
+
     $installed = Install-KrObservedHandlers
     Write-KrTrace ("wrapped " + ((@($installed) | ForEach-Object { "$($_.Chord)=$($_.Function)" }) -join ' '))
     $gesture = Install-KrGestureHandler
@@ -512,6 +518,37 @@ function Enable-KalaReachHooks {
 # reader's own thread, with the editor between operations. The few operations that run an inner
 # read loop also record the state they wait in. A handler the person wrote themselves is left
 # exactly as it is.
+# How the editor stores a binding made with this chord, or nothing when it does not say.
+#
+# The editor keys its table by the key a terminal sends, which is not always the chord as it is
+# spelled: `Ctrl+Alt+?` is stored as the plain question mark, because that is what a terminal sends
+# for it. Binding such a chord binds the other key, and whatever was on that one is gone.
+function Get-KrBoundSpelling {
+    param([string]$Chord)
+    try {
+        $assembly = $script:Rl.Assembly
+        $keys = $assembly.GetType('Microsoft.PowerShell.ConsoleKeyChordConverter').GetMethod(
+            'Convert', [type[]]@([string])).Invoke($null, @($Chord))
+        $method = $assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
+            'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo]))
+        $spelled = foreach ($key in @($keys)) { $method.Invoke($null, @($key)).ToString() }
+        $spelled -join ','
+    } catch { $null }
+}
+
+# Whether the editor says how it spells a chord, which binding only the chords it stores as spelled
+# rests on.
+function Test-KrKeySpelling {
+    if ('Ctrl+d' -ceq (Get-KrBoundSpelling 'Ctrl+d')) {
+        return @{ Ok = $true; Reason = ''; Detail = '' }
+    }
+    @{
+        Ok     = $false
+        Reason = 'psreadline_key_spelling_unreadable'
+        Detail = 'PSReadLine does not say how it spells a key binding, so no chord can be bound safely'
+    }
+}
+
 function Install-KrObservedHandlers {
     $wrapped = [System.Collections.Generic.List[hashtable]]::new()
     $bound = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
@@ -521,14 +558,14 @@ function Install-KrObservedHandlers {
     # description a handler carries: a script of theirs can be described by any name at all,
     # including the name of one of the editor's own operations.
     $theirs = Get-KrScriptChords
-    # What every key was bound to before this went in front of any of them, by the key's own name.
-    $before = @{}
-    foreach ($binding in @($bound)) { $before["$($binding.Key)"] = "$($binding.Function)" }
     foreach ($binding in @($bound)) {
         $name = "$($binding.Function)"
         $chord = "$($binding.Key)"
         if ([string]::IsNullOrEmpty($name) -or $name -eq 'CustomAction') { continue }
         if ($theirs.PSBase.ContainsKey($chord)) { continue }
+        # A chord the editor stores as another key would bind that key, and whatever the person put
+        # on it would go. The key it stands for is wrapped by its own entry, if it is bound at all.
+        if ($chord -cne (Get-KrBoundSpelling $chord)) { continue }
         if ($null -eq [Microsoft.PowerShell.PSConsoleReadLine].GetMethod(
                 $name, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))) {
             # Not one of this editor's own operations, whatever it is called.
@@ -545,40 +582,7 @@ function Install-KrObservedHandlers {
             Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
         }
     }
-    Restore-KrStrayBindings $wrapped $before $theirs
     $wrapped
-}
-
-# Puts back any key this module bound without having asked to.
-#
-# The editor reads a chord it is given as it can spell the key on this keyboard layout, and a
-# chord that names a shifted character with modifiers in front of it can come out as the plain
-# character: `Ctrl+Alt+?` bound the plain question mark, which then showed the key bindings instead
-# of typing a question mark. A binding that carries this module's own description on a key that was
-# not one of the chords it wrapped is such a case. It is put back to what it was, a function of the
-# editor's or a script of the person's, or taken away where the key had nothing bound, so the
-# character goes into the line as it would without this module.
-function Restore-KrStrayBindings {
-    param($Wrapped, [hashtable]$Before, $Theirs)
-    $asked = @{}
-    foreach ($entry in @($Wrapped)) { $asked["$($entry.Chord)"] = $true }
-    $now = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
-    foreach ($binding in @($now)) {
-        $key = "$($binding.Key)"
-        if ($asked.ContainsKey($key)) { continue }
-        if ("$($binding.Description)" -notlike 'KalaReach: *') { continue }
-        try {
-            if ($Theirs.PSBase.ContainsKey($key)) {
-                Set-PSReadLineKeyHandler -Chord $key -ScriptBlock $Theirs[$key]
-            } elseif ($Before.ContainsKey($key)) {
-                Set-PSReadLineKeyHandler -Chord $key -Function $Before[$key]
-            } else {
-                Remove-PSReadLineKeyHandler -Chord $key
-            }
-        } catch {
-            Write-KrTrace "restore of a stray binding failed $key : $($_.Exception.Message)"
-        }
-    }
 }
 
 # Puts back every operation of the editor's own that this module went in front of.
@@ -610,6 +614,12 @@ function Install-KrGestureHandler {
     if ($null -eq $chord) {
         return @{ Ok = $false; Reason = 'gesture_unmappable'
                   Detail = "the configured gesture has no chord on this editor" }
+    }
+    # A chord the editor stores as another key would put the detach on that key, in place of what
+    # the person had there.
+    if ($chord -cne (Get-KrBoundSpelling $chord)) {
+        return @{ Ok = $false; Reason = 'gesture_chord_unbindable'
+                  Detail = "the configured gesture's chord $chord is stored by the editor as another key" }
     }
 
     $previous = try { Get-PSReadLineKeyHandler -Chord $chord -ErrorAction SilentlyContinue } catch { $null }
