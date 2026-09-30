@@ -95,14 +95,13 @@ pub fn budgets_in_force(resolver: &kr_worker::config::Resolver) -> Option<Enrolm
 }
 
 /// Returns the disable policy a reading of this host's configuration puts in force, or `None`
-/// when it puts none.
+/// when it decides nothing.
 ///
-/// A policy is put in force only by a document this host loaded and that names one. A document
-/// that names none leaves the policy this host already holds, as does one that is absent,
-/// unreadable, of a version this build does not know or invalid: an administrator's policy is
-/// never lifted because a file lost the line that set it, and going back to warning only is a
-/// thing a document says by naming `warn_only`. One rule for the daemon's startup and every
-/// acceptance after it.
+/// The rule the enrolment budgets follow: a document this host loaded decides the policy, whether
+/// it names one or leaves it to the default, which is warning only; one that is absent,
+/// unreadable, of a version this build does not know or invalid decides nothing, and the policy
+/// already in force stays as it is. One rule for the daemon's startup and every acceptance after
+/// it.
 #[must_use]
 pub fn disable_policy_in_force(
     resolver: &kr_worker::config::Resolver,
@@ -110,7 +109,7 @@ pub fn disable_policy_in_force(
     if resolver.status().state != kr_protocol::hostinfo::configuration::DocumentState::Loaded {
         return None;
     }
-    resolver.ceilings().disable_policy.0
+    Some(super::ceilings::disable_policy(&resolver.ceilings()).value)
 }
 
 /// Builds the catalogue diagnostic from whatever evidence is registered.

@@ -213,11 +213,11 @@ impl Accepted {
         );
         let disable_policy = catalogue::disable_policy_in_force(&resolver).map_or(
             EnforcedDisablePolicy {
-                value: kr_protocol::admission::RevocationPolicy::WarnOnly,
+                value: Some(kr_protocol::admission::RevocationPolicy::WarnOnly),
                 from_document: false,
             },
             |value| EnforcedDisablePolicy {
-                value,
+                value: Some(value),
                 from_document: true,
             },
         );
@@ -263,10 +263,10 @@ pub struct EnforcedBudgets {
 /// The disable policy the catalogue enforces, and where it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnforcedDisablePolicy {
-    /// What happens to a live binding whose release is revoked, right now.
-    pub value: kr_protocol::admission::RevocationPolicy,
-    /// True when the document this report describes named it and it is in force. A document that
-    /// names none leaves the policy this host holds where it is, and then this is false.
+    /// What happens to a live binding whose release is revoked, right now, or `None` where this
+    /// host holds a policy it could not read.
+    pub value: Option<kr_protocol::admission::RevocationPolicy>,
+    /// True when the document this report describes decided it and it is in force.
     pub from_document: bool,
 }
 
@@ -592,27 +592,40 @@ pub fn effective(
         )
     };
 
-    // The disable policy: what the document names, and the policy in force. The two differ where
-    // this reading named none, and then the policy in force is the one this host last accepted.
-    let policy = accepted.disable_policy;
-    let (policy_source, policy_origin) = if policy.from_document {
+    // The disable policy, as the budgets are reported: where this reading decided nothing, the
+    // policy in force is the one this host last accepted, and no document in front of this report
+    // is its origin.
+    let disable_policy = ceilings::enforced_disable_policy(
+        ceilings::disable_policy(&ceilings),
+        accepted.disable_policy,
+    );
+    let (policy_source, policy_origin) = if !accepted.disable_policy.from_document {
+        (
+            if disable_policy.value == Some(kr_protocol::admission::RevocationPolicy::WarnOnly) {
+                configuration::ValueSource::Default
+            } else {
+                configuration::ValueSource::HostConfiguration
+            },
+            None,
+        )
+    } else if ceilings.disable_policy.is_some() {
         (
             configuration::ValueSource::HostConfiguration,
             Some(doc_path.clone()),
         )
-    } else if policy.value == kr_protocol::admission::RevocationPolicy::WarnOnly {
-        (configuration::ValueSource::Default, None)
     } else {
-        (configuration::ValueSource::HostConfiguration, None)
+        (configuration::ValueSource::Default, None)
     };
-    let policy_line = |policy: kr_protocol::admission::RevocationPolicy| match policy {
-        kr_protocol::admission::RevocationPolicy::WarnOnly => Sentence::new()
+    let policy_line = |policy: &Option<kr_protocol::admission::RevocationPolicy>| match policy {
+        None => Sentence::new().stated("not known: the policy this host holds could not be read"),
+        Some(kr_protocol::admission::RevocationPolicy::WarnOnly) => Sentence::new()
             .stated("warn only: a live binding on a revoked release keeps serving, and says so"),
-        kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission => Sentence::new().stated(
-            "disable at the next admission: a live binding on a revoked release keeps observing \
-             and admits nothing more",
-        ),
-        kr_protocol::admission::RevocationPolicy::DisableAtOnce => Sentence::new().stated(
+        Some(kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission) => Sentence::new()
+            .stated(
+                "disable at the next admission: a live binding on a revoked release keeps \
+                 observing and admits nothing more",
+            ),
+        Some(kr_protocol::admission::RevocationPolicy::DisableAtOnce) => Sentence::new().stated(
             "disable at once: a live binding on a revoked release closes at its next admission \
              boundary",
         ),
@@ -736,26 +749,14 @@ pub fn effective(
                     }
                 },
             ),
-            kr_protocol::hostinfo::CeilingValue {
-                key: "disable_policy".to_owned(),
-                configured: kr_protocol::scalars::Nullable(
-                    ceilings.disable_policy.0.map(policy_line),
-                ),
-                value: if policy.from_document
-                    || policy.value == kr_protocol::admission::RevocationPolicy::WarnOnly
-                {
-                    policy_line(policy.value)
-                } else {
-                    policy_line(policy.value).stated(
-                        "; the policy this host last accepted, because this document did not decide it",
-                    )
-                },
-                source: policy_source,
-                origin: kr_protocol::scalars::Nullable(policy_origin),
-                effect: configuration::ValueEffect::Immediately,
-                narrowed_by: kr_protocol::scalars::Nullable(None),
-                refused: false,
-            },
+            ceilings::report(
+                "disable_policy",
+                &disable_policy,
+                policy_source,
+                policy_origin,
+                configuration::ValueEffect::Immediately,
+                policy_line,
+            ),
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),
                 configured: kr_protocol::scalars::Nullable(

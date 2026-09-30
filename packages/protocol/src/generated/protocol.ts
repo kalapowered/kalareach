@@ -10027,9 +10027,10 @@ export interface ConfigurationCeilings {
    * What happens to a live binding whose release its repository revokes: section 25's
    * administrator's explicit disable policy.
    *
-   * Absent leaves the policy this host already holds, which is warning only until one is
-   * named; present puts the one named in force from the next admission. Removing the member
-   * does not return to warning only: naming `warn_only` does.
+   * Absent is warning only, as every ceiling left out of a loaded document is its default;
+   * present puts the one named in force from the next admission. A document that does not
+   * use the setting writes no member for it, so a daemon built before the setting still
+   * reads it.
    */
   disable_policy?: RevocationPolicy | null
   /**

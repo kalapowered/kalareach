@@ -1508,8 +1508,16 @@ fn name_the_policy(controller: &kr_controller::service::Controller, policy: Opti
     };
     let revision = edited["revision"].as_u64().expect("a revision") + 1;
     edited["revision"] = serde_json::json!(revision);
-    edited["ceilings"]["disable_policy"] =
-        policy.map_or(serde_json::Value::Null, |named| serde_json::json!(named));
+    match policy {
+        Some(named) => edited["ceilings"]["disable_policy"] = serde_json::json!(named),
+        // A document that does not use the setting has no member for it.
+        None => {
+            edited["ceilings"]
+                .as_object_mut()
+                .expect("a ceilings section")
+                .remove("disable_policy");
+        }
+    }
     kr_ipc::paths::write_owner_only_file(
         &document,
         serde_json::to_string(&edited).expect("JSON").as_bytes(),
@@ -1587,7 +1595,7 @@ async fn a_document_naming_a_disable_policy_puts_it_in_force_at_the_next_accepta
     );
     assert_eq!(held, RevocationPolicy::DisableAtOnce);
 
-    // Naming warn_only is how a document goes back to it.
+    // Naming warn_only is one way a document goes back to it.
     name_the_policy(host.controller(), Some("warn_only"));
     accept(host.controller()).await;
     assert_eq!(
@@ -1597,12 +1605,71 @@ async fn a_document_naming_a_disable_policy_puts_it_in_force_at_the_next_accepta
     host.stop().await;
 }
 
-/// KR-REQ-25.22: a document that names no policy, and one this host cannot use (absent,
-/// unreadable, of a version it does not know, invalid), changes nothing: the policy this host holds
-/// stays in force and is reported as the one last accepted, so an administrator's policy is not
-/// lifted because a file lost the line that set it.
+/// KR-REQ-25.22: a loaded document decides the policy, as it decides every other ceiling: one that
+/// names none has the default, warning only, whatever policy was in force before, and the report
+/// says the default is what it is. A policy that came from a document goes away with the line that
+/// named it, at the next acceptance and at start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_document_that_names_no_policy_or_cannot_be_used_changes_nothing() {
+async fn a_loaded_document_that_names_no_policy_has_the_default() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    name_the_policy(host.controller(), Some("disable_at_once"));
+    accept(host.controller()).await;
+    let (carried, _, revision) = policy_in_force(host.controller()).await;
+    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
+
+    // The same file without the line: the next acceptance decides warn only.
+    name_the_policy(host.controller(), None);
+    let row = policy_row(host.controller()).await;
+    assert_eq!(row.source, ValueSource::Default, "{row:?}");
+    assert!(row.value.as_str().starts_with("warn only"), "{row:?}");
+    assert!(
+        !row.value.as_str().contains("last accepted"),
+        "a default is not a retained policy: {row:?}"
+    );
+    assert!(row.origin.as_ref().is_none(), "no line names it: {row:?}");
+    assert!(row.narrowed_by.as_ref().is_none(), "{row:?}");
+    let (carried, held, moved) = policy_in_force(host.controller()).await;
+    assert_eq!(carried, RevocationPolicy::WarnOnly);
+    assert_eq!(held, RevocationPolicy::WarnOnly);
+    assert_eq!(
+        moved,
+        revision + 1,
+        "the policy moved the admission revision"
+    );
+
+    // A daemon that starts over a document that names none has the default from the start.
+    name_the_policy(host.controller(), Some("disable_at_once"));
+    accept(host.controller()).await;
+    let stopped = host.shut_down().await;
+    let environment = stopped.tree().environment();
+    let mut edited: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(kr_worker::config::document_path(&environment)).expect("the document"),
+    )
+    .expect("valid JSON");
+    edited["revision"] = serde_json::json!(edited["revision"].as_u64().expect("a revision") + 1);
+    edited["ceilings"]
+        .as_object_mut()
+        .expect("a ceilings section")
+        .remove("disable_policy");
+    write_document_bytes(
+        &environment,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    );
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let (carried, held, _) = policy_in_force(host.controller()).await;
+    assert_eq!(carried, RevocationPolicy::WarnOnly, "at start");
+    assert_eq!(held, RevocationPolicy::WarnOnly);
+    host.stop().await;
+}
+
+/// KR-REQ-25.22: a document this host cannot use (absent, unreadable, of a version it does not
+/// know, invalid) decides nothing: the policy this host holds stays in force and is reported as
+/// the one last accepted, so an administrator's policy is not lifted because a file went missing
+/// or was damaged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_this_host_cannot_use_leaves_the_policy_in_force() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let mut host = Host::start(&owner).await;
     name_the_policy(host.controller(), Some("disable_at_once"));
@@ -1614,24 +1681,6 @@ async fn a_document_that_names_no_policy_or_cannot_be_used_changes_nothing() {
     let revision = policy_in_force(host.controller()).await.2;
     let document = kr_worker::config::document_path(host.controller().paths());
     let accepted = std::fs::read(&document).expect("the document this host wrote");
-
-    // A document that loads and names no policy.
-    name_the_policy(host.controller(), None);
-    accept(host.controller()).await;
-    let (carried, held, moved) = policy_in_force(host.controller()).await;
-    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
-    assert_eq!(held, RevocationPolicy::DisableAtOnce);
-    assert_eq!(moved, revision, "nothing moved the admission revision");
-    let row = policy_row(host.controller()).await;
-    assert!(
-        row.value.as_str().contains("last accepted"),
-        "the report says whose policy it is: {row:?}"
-    );
-    assert_eq!(row.source, ValueSource::HostConfiguration);
-    assert!(
-        row.origin.as_ref().is_none(),
-        "no document decided it: {row:?}"
-    );
 
     for state in [
         DocumentState::Absent,
@@ -1673,15 +1722,79 @@ async fn a_document_that_names_no_policy_or_cannot_be_used_changes_nothing() {
         );
         assert_eq!(held, RevocationPolicy::DisableAtOnce, "{state:?}");
         assert_eq!(moved, revision, "{state:?}: and nothing moved the revision");
+        let row = policy_row(host.controller()).await;
+        assert!(row.value.as_str().contains("disable at once"), "{state:?}");
         assert!(
-            policy_row(host.controller())
-                .await
-                .value
-                .as_str()
-                .contains("last accepted"),
-            "{state:?}"
+            row.narrowed_by
+                .as_ref()
+                .is_some_and(|why| why.as_str().contains("last accepted")),
+            "{state:?}: and the report says whose policy it is: {row:?}"
+        );
+        assert_eq!(row.source, ValueSource::HostConfiguration, "{state:?}");
+        assert!(
+            row.origin.as_ref().is_none(),
+            "{state:?}: no document decided it: {row:?}"
         );
     }
+    host.stop().await;
+}
+
+/// Writes a policy the catalogue's records cannot read, as a damaged record would hold it.
+fn damage_the_recorded_policy(controller: &kr_controller::service::Controller) {
+    let database = controller
+        .paths()
+        .state_dir()
+        .join("catalogue")
+        .join(kr_plugin_catalogue::db::DATABASE_FILE);
+    let connection = rusqlite::Connection::open(database).expect("the catalogue's records");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    connection
+        .execute(
+            "INSERT INTO settings (name, value) VALUES ('disable_policy', 'not a policy')
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .expect("the damaged record");
+}
+
+/// KR-REQ-25.22: a policy this host holds and cannot read is reported as unknown, never as the
+/// default that nothing is enforcing, and the acceptance says it is not in force; a document this
+/// host can use then decides the policy and replaces the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_this_host_cannot_read_is_reported_as_unknown_until_a_document_decides_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+    name_the_policy(controller, Some("disable_at_once"));
+    accept(controller).await;
+    damage_the_recorded_policy(controller);
+
+    // A reading that decides nothing has to report the policy it holds, which it cannot read.
+    let document = kr_worker::config::document_path(controller.paths());
+    let good = std::fs::read(&document).expect("the document");
+    kr_ipc::paths::write_owner_only_file(&document, b"{ not a document").expect("written");
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective
+            .not_in_force
+            .as_ref()
+            .is_some_and(|why| why.as_str().contains("disable policy this host holds")),
+        "the failure is reported: {:?}",
+        effective.not_in_force
+    );
+    let row = policy_row(controller).await;
+    assert!(row.value.as_str().starts_with("not known"), "{row:?}");
+    assert!(!row.value.as_str().contains("warn only"), "{row:?}");
+
+    // A document this host can use decides the policy, whatever the record held.
+    kr_ipc::paths::write_owner_only_file(&document, &good).expect("written");
+    let effective = controller.effective_configuration().await;
+    assert!(effective.not_in_force.as_ref().is_none(), "{effective:?}");
+    let (carried, held, _) = policy_in_force(controller).await;
+    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
+    assert_eq!(held, RevocationPolicy::DisableAtOnce);
     host.stop().await;
 }
 
