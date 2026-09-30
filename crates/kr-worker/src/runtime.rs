@@ -184,6 +184,15 @@ fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
     );
 }
 
+/// Returns whether an answer's lane deadline has passed before any of it reached the application.
+///
+/// It is asked before every attempt to write, so an answer that waits for room in a terminal that
+/// has none is dropped once it has lapsed. One that has begun is finished: half an answer is worse
+/// than either.
+fn answer_lapsed(expires_at_ms: Option<u64>, delivered: usize, now_ms: u64) -> bool {
+    delivered == 0 && expires_at_ms.is_some_and(|deadline| now_ms > deadline)
+}
+
 /// What became of a batch the writer offered the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Delivery {
@@ -577,6 +586,7 @@ impl SessionRuntime {
         let gate = session.input_gate();
         let queued_input = session.queued_input_bytes();
         let dropped_replies = session.dropped_replies();
+        let unwritten_replies = session.unwritten_replies();
         let queued_lease = session.queued_lease_bytes();
         let delivered_paste_open = session.delivered_paste_open();
         let lease_change_queued = session.lease_change_queued();
@@ -696,6 +706,7 @@ impl SessionRuntime {
         let writer_gate = Arc::clone(&gate);
         let writer_queued = Arc::clone(&queued_input);
         let writer_dropped_replies = Arc::clone(&dropped_replies);
+        let writer_unwritten_replies = Arc::clone(&unwritten_replies);
         let writer_lease = Arc::clone(&queued_lease);
         let writer_paste_open = Arc::clone(&delivered_paste_open);
         let writer_lease_change = Arc::clone(&lease_change_queued);
@@ -779,6 +790,7 @@ impl SessionRuntime {
                     InputBatch::Reply { expires_at_ms, .. } => *expires_at_ms,
                     _ => None,
                 };
+                let is_reply = matches!(batch, InputBatch::Reply { .. });
                 // A second fence, independent of the lease's. The lease says who may write; this
                 // says how long what they wrote stays admissible. A batch the session accepted a
                 // moment before its caller's grant ran out can wait here, for the terminal and for
@@ -812,13 +824,18 @@ impl SessionRuntime {
                     &mut || {
                         epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire))
                             || expired(writer_clock.as_ref())
-                            || (delivered_so_far.get() == 0
-                                && lane_deadline
-                                    .is_some_and(|deadline| kr_ipc::now_ms().get() > deadline))
+                            || answer_lapsed(
+                                lane_deadline,
+                                delivered_so_far.get(),
+                                kr_ipc::now_ms().get(),
+                            )
                     },
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
                         release(&writer_queued, written);
+                        if is_reply {
+                            release(&writer_unwritten_replies, written);
+                        }
                         // The lease's share only while these bytes are still the current lease's.
                         // The epoch travels with the count, so a lease change that happened while
                         // this write was in the terminal leaves nothing here to subtract from.
@@ -867,6 +884,9 @@ impl SessionRuntime {
                     // application has, and a takeover reports the remainder as discarded.
                     let remainder = bytes.len().saturating_sub(delivered);
                     release(&writer_queued, remainder);
+                    if is_reply {
+                        release(&writer_unwritten_replies, remainder);
+                    }
                     if lane_deadline.is_some() && delivered == 0 {
                         writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
                     }
@@ -1630,7 +1650,7 @@ pub fn start_or_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{Delivery, Terminal, WRITE_PIECE_BYTES, write_batch};
+    use super::{Delivery, Terminal, WRITE_PIECE_BYTES, answer_lapsed, write_batch};
     use crate::input::{Delimiter, PASTE_START};
     use crate::session::PasteTransition;
 
@@ -1682,6 +1702,139 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A terminal that takes `first` bytes of the first write, then has no room for `refusals`
+    /// attempts, each of which moves a clock the test reads forward, and then takes everything.
+    ///
+    /// The clock is the test's own and moves only when the terminal refuses, so when the deadline
+    /// is reached is decided by what the terminal did and never by how long anything took.
+    struct NoRoomFor {
+        taken: Vec<u8>,
+        first: usize,
+        refusals: u32,
+        clock: std::rc::Rc<std::cell::Cell<u64>>,
+        per_refusal_ms: u64,
+        first_done: bool,
+    }
+
+    impl std::io::Write for NoRoomFor {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.first_done && self.first > 0 {
+                self.first_done = true;
+                let takes = bytes.len().min(self.first);
+                self.taken.extend_from_slice(&bytes[..takes]);
+                return Ok(takes);
+            }
+            self.first_done = true;
+            if self.refusals > 0 {
+                self.refusals -= 1;
+                self.clock.set(self.clock.get() + self.per_refusal_ms);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.taken.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writes `bytes` as an answer with the given lane deadline into a terminal that has no room
+    /// for a while, deciding when to stop the way the writer does: before every attempt.
+    fn an_answer_into(
+        terminal: &mut NoRoomFor,
+        bytes: &[u8],
+        deadline: Option<u64>,
+    ) -> (usize, Delivery, usize) {
+        let delivered_so_far = std::cell::Cell::new(0_usize);
+        let clock = std::rc::Rc::clone(&terminal.clock);
+        let (delivered, delivery) = write_batch(
+            &mut Terminal {
+                writer: terminal,
+                room: None,
+            },
+            bytes,
+            &PasteTransition::default(),
+            &std::sync::Mutex::new(()),
+            &mut || answer_lapsed(deadline, delivered_so_far.get(), clock.get()),
+            &mut |count| delivered_so_far.set(delivered_so_far.get() + count),
+        );
+        (delivered, delivery, delivered_so_far.get())
+    }
+
+    /// KR-REQ-08.49: an answer whose lane deadline passes while the terminal has no room for its
+    /// first byte is dropped, and nothing of it is written.
+    #[test]
+    fn an_answer_that_lapses_while_the_terminal_has_no_room_is_dropped_whole() {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(100));
+        let mut terminal = NoRoomFor {
+            taken: Vec::new(),
+            first: 0,
+            refusals: 5,
+            clock: std::rc::Rc::clone(&clock),
+            per_refusal_ms: 60,
+            first_done: false,
+        };
+        let (delivered, delivery, written) =
+            an_answer_into(&mut terminal, b"\x1b[?62;22c", Some(150));
+
+        assert_eq!(delivery, Delivery::Abandoned);
+        assert_eq!(delivered, 0);
+        assert_eq!(written, 0);
+        assert!(
+            terminal.taken.is_empty(),
+            "the terminal was given nothing of an answer nobody is waiting for"
+        );
+        assert_eq!(
+            terminal.refusals, 4,
+            "it stopped at the attempt after the first refusal moved the clock past the deadline, not at the end of the refusals"
+        );
+    }
+
+    /// The control: the same terminal and the same refusals, with the deadline further off than the
+    /// refusals reach, gets the whole answer.
+    #[test]
+    fn an_answer_within_its_deadline_waits_for_room_and_is_written_whole() {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(100));
+        let mut terminal = NoRoomFor {
+            taken: Vec::new(),
+            first: 0,
+            refusals: 5,
+            clock: std::rc::Rc::clone(&clock),
+            per_refusal_ms: 60,
+            first_done: false,
+        };
+        let (delivered, delivery, written) =
+            an_answer_into(&mut terminal, b"\x1b[?62;22c", Some(10_000));
+
+        assert_eq!(delivery, Delivery::Complete);
+        assert_eq!(delivered, 9);
+        assert_eq!(written, 9);
+        assert_eq!(terminal.taken, b"\x1b[?62;22c");
+    }
+
+    /// An answer that has begun is finished after its deadline: half of one is worse than the
+    /// whole or none.
+    #[test]
+    fn an_answer_whose_first_byte_reached_the_application_is_finished_past_its_deadline() {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(100));
+        let mut terminal = NoRoomFor {
+            taken: Vec::new(),
+            first: 3,
+            refusals: 5,
+            clock: std::rc::Rc::clone(&clock),
+            per_refusal_ms: 60,
+            first_done: false,
+        };
+        let (delivered, delivery, written) =
+            an_answer_into(&mut terminal, b"\x1b[?62;22c", Some(150));
+
+        assert_eq!(delivery, Delivery::Complete);
+        assert_eq!(delivered, 9);
+        assert_eq!(written, 9);
+        assert_eq!(terminal.taken, b"\x1b[?62;22c");
     }
 
     /// A batch that ends with a paste start a write of `WRITE_PIECE_BYTES` stops in the middle of.

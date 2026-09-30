@@ -366,6 +366,10 @@ pub struct FenceDriver {
     /// How many bytes of the host's own answers to the application the machine has been told
     /// were queued for the terminal, whatever it did about them.
     host_reply_bytes: u64,
+    /// The bytes of those answers the terminal's writer has neither written nor dropped, which the
+    /// session's writer keeps and the driver only reads. A driver with no session has no writer, so
+    /// it starts with a counter of its own that nothing ever raises.
+    unwritten_replies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The transaction the reader is deciding now, and the ones whose callers are still waiting
     /// for a confirmation that may never come. Both follow the machine's own actions.
     live_launch: Option<LaunchTransactionId>,
@@ -436,6 +440,7 @@ impl FenceDriver {
             handed: 0,
             published: None,
             host_reply_bytes: 0,
+            unwritten_replies: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             live_launch: None,
             awaiting: VecDeque::new(),
             receipt: None,
@@ -760,6 +765,15 @@ impl FenceDriver {
             }),
             Context::Other,
         )
+    }
+
+    /// Reads the count of the host's answers the terminal's writer has yet to write from the
+    /// session's writer, in place of the driver's own.
+    pub fn watch_unwritten_replies(
+        &mut self,
+        unwritten: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.unwritten_replies = unwritten;
     }
 
     /// Returns how many bytes of the host's own answers to the application have been queued for
@@ -1144,6 +1158,31 @@ impl FenceDriver {
         for action in &outcome.actions {
             let produced = self.carry_out(action, context, outcome.state);
             effects.merge(produced);
+        }
+        // An exchange that begins while an answer the host queued earlier is still on its way to
+        // the terminal has the same flaw as one the answer arrived in the middle of: the reader
+        // takes its snapshot before the bytes reach it, so nothing it reports proves anything
+        // about them. The machine learned of those bytes when they were queued, and what it learned
+        // then belonged to the exchange that was running, not to this one.
+        if outcome
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::AskFence(_)))
+        {
+            let owed = self
+                .unwritten_replies
+                .load(std::sync::atomic::Ordering::Acquire);
+            if owed > 0 {
+                let produced = self.apply(
+                    &Stimulus::HostReplyQueued(
+                        kr_shell_integration::contract::fence::HostReplyQueued {
+                            bytes: U64::new(owed as u64),
+                        },
+                    ),
+                    Context::Other,
+                );
+                effects.merge(produced);
+            }
         }
         self.waker.notify_one();
         effects
