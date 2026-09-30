@@ -1594,6 +1594,20 @@ fn a_testing_feature_a_program_could_turn_on_is_named() {
             "b: the testing feature of b is turned on by its default features",
         ]
     );
+    // The same with the entry that has them first, so that the last entry does not decide.
+    assert_eq!(
+        testing_in_production(
+            &defaults_of(
+                dependency("b", serde_json::json!("build"), &[]),
+                without_defaults(serde_json::Value::Null)
+            ),
+            Path::new("/w")
+        ),
+        vec![
+            "a: the testing feature of b is turned on by a normal or build dependency on b",
+            "b: the testing feature of b is turned on by its default features",
+        ]
+    );
     assert_eq!(
         testing_in_production(
             &defaults_of(
