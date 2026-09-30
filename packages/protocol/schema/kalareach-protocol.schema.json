@@ -7606,8 +7606,7 @@
               "type": "null"
             }
           ],
-          "default": null,
-          "description": "What happens to a live binding whose release its repository revokes: section 25's\nadministrator's explicit disable policy.\n\nAbsent leaves the policy this host already holds, which is warning only until one is\nnamed; present puts the one named in force from the next admission. Removing the member\ndoes not return to warning only: naming `warn_only` does."
+          "description": "What happens to a live binding whose release its repository revokes: section 25's\nadministrator's explicit disable policy.\n\nAbsent is warning only, as every ceiling left out of a loaded document is its default;\npresent puts the one named in force from the next admission. A document that does not\nuse the setting writes no member for it, so a daemon built before the setting still\nreads it."
         },
         "enrolment": {
           "anyOf": [
@@ -7660,7 +7659,6 @@
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",
           "default": {
-            "disable_policy": null,
             "enrolment": null,
             "grant_rights": null,
             "session_limit": null

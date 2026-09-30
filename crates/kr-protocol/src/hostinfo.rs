@@ -1736,10 +1736,12 @@ pub mod configuration {
         /// What happens to a live binding whose release its repository revokes: section 25's
         /// administrator's explicit disable policy.
         ///
-        /// Absent leaves the policy this host already holds, which is warning only until one is
-        /// named; present puts the one named in force from the next admission. Removing the member
-        /// does not return to warning only: naming `warn_only` does.
-        pub disable_policy: Nullable<crate::admission::RevocationPolicy>,
+        /// Absent is warning only, as every ceiling left out of a loaded document is its default;
+        /// present puts the one named in force from the next admission. A document that does not
+        /// use the setting writes no member for it, so a daemon built before the setting still
+        /// reads it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub disable_policy: Option<crate::admission::RevocationPolicy>,
     }
 
     impl Default for ConfigurationCeilings {
@@ -1749,7 +1751,7 @@ pub mod configuration {
                 session_limit: Nullable::null(),
                 grant_rights: Nullable::null(),
                 enrolment: Nullable::null(),
-                disable_policy: Nullable::null(),
+                disable_policy: None,
             }
         }
     }
@@ -8166,6 +8168,35 @@ mod tests {
         assert_eq!(
             loaded.ceilings().enrolment_budgets().metadata_entries,
             100_000
+        );
+    }
+
+    /// KR-REQ-25.22: a document writes no member for a setting it does not use, so a daemon built
+    /// before the disable policy still reads every document that leaves the policy out, however
+    /// the document was last edited; naming the policy writes it, and it reads back as written.
+    #[test]
+    fn a_document_that_names_no_disable_policy_writes_no_member_for_it() {
+        let loaded = configuration::load(None);
+        let edited = configuration::edit(&loaded, &Change::SessionLimit(Some(4)))
+            .expect("an edit of another ceiling");
+        assert!(
+            !edited.contents.contains("disable_policy"),
+            "no member is written for a policy nobody named: {}",
+            edited.contents
+        );
+
+        let mut document = edited.document;
+        document.ceilings.disable_policy = Some(crate::admission::RevocationPolicy::DisableAtOnce);
+        let text = configuration::contents(&document);
+        assert!(
+            text.contains("\"disable_policy\": \"disable_at_once\"")
+                || text.contains("\"disable_policy\":\"disable_at_once\""),
+            "{text}"
+        );
+        let reread = configuration::load(Some(text.as_bytes()));
+        assert_eq!(
+            reread.ceilings().disable_policy,
+            Some(crate::admission::RevocationPolicy::DisableAtOnce)
         );
     }
 
