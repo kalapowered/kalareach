@@ -783,6 +783,9 @@ fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
     ))
 }
 
+/// The characters tar's entry kinds are written with, from `!` to `~`.
+const GRAPHIC: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
 /// The refusal of an entry that is neither a file nor a directory, saying which kind it is by the
 /// character tar gives it, with its usual name: `2` is a symbolic link, `1` a hard link.
 fn refused_kind(archive: &Path, kind: u8) -> CliError {
@@ -800,6 +803,11 @@ fn refused_kind(archive: &Path, kind: u8) -> CliError {
         b'3' => said(Shown::said("3, a character device")),
         b'4' => said(Shown::said("4, a block device")),
         b'6' => said(Shown::said("6, a pipe")),
+        // A kind with no usual name is shown as tar writes it: by its character where it has one.
+        other if other.is_ascii_graphic() => {
+            let at = usize::from(other - b'!');
+            said(Shown::said(&GRAPHIC[at..=at]))
+        }
         other => said(shown!("{}", other)),
     })
 }
