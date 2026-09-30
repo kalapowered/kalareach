@@ -14,6 +14,7 @@
     FunctionsToExport    = @(
         'Initialize-KalaReachBridge'
         'Enable-KalaReachHooks'
+        'Confirm-KalaReachReadLine'
         'Invoke-KalaReachReadLine'
         'Invoke-KalaReachService'
         'Invoke-KalaReachPending'

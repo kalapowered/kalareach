@@ -463,13 +463,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
             )
             .expect("the path is text");
             assert_eq!(
-                startup::install(
-                    &target.path,
-                    &body,
-                    startup::Placement::of(package.kind()),
-                    &record
-                )
-                .expect("installs"),
+                startup::install(&target.path, &body, target.placement, &record).expect("installs"),
                 Change::Added
             );
         }
@@ -534,6 +528,7 @@ fn a_known_auto_wrapper_gets_its_documented_session_local_bypass() {
         path: std::path::PathBuf::from("/home/someone/.zshrc"),
         reason: "a test",
         shared: false,
+        placement: startup::Placement::End,
     };
     let with = startup::entry(&target, Path::new("/opt/kr/entry"), true).expect("the path is text");
     assert!(with.contains(startup::NSH_BYPASS_VARIABLE));

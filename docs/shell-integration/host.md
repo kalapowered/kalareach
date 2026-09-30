@@ -259,7 +259,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the one login file Bash reads |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
-| PowerShell | the profile that PowerShell itself names, added to rather than replaced; the entry is the first thing in it |
+| PowerShell | the two per-user profiles that PowerShell itself names, added to rather than replaced: the entry that opens the bridge is the first thing in the profile every host reads, and the entry that checks the reader is the last thing in the profile its own host reads |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
 integration <<<`, and its body is one line that sources the package's own file. Nothing of the
@@ -267,23 +267,33 @@ integration's logic is copied into the user's configuration, so upgrading the pa
 runs without rewriting anything they own. Nothing replaces `.bashrc`, points a shell at another
 `ZDOTDIR`, substitutes an `--rcfile` or disables a profile.
 
-PowerShell's entry loads the module that opens the bridge, and the session takes no input from
+PowerShell's first entry loads the module that opens the bridge, and the session takes no input from
 outside until the bridge has authenticated, so a profile that asks a question ahead of the entry
 would ask one nobody could answer. The entry therefore goes first: `kr shell install` puts it at
-the start of the profile, below what PowerShell requires to come first (a byte-order mark, comments,
-`#Requires` lines, `using` statements and a script `param` block), and moves an entry an earlier
-install left at the end. The entry is in the profile PowerShell names for this user and host, which
-PowerShell reads after the all-users profiles and the per-user `profile.ps1`: a question asked in one
-of those runs before the bridge exists and cannot be answered. Every other
-shell's reader comes with the shell itself and its entry only says, after the user's
-configuration, that the hooks are live, so those entries stay last. The module qualifies the
-editor when it loads and again when the hooks activate after the profile, because a profile that
-runs in between can import another one.
+the start of the per-user profile that every host reads, below what PowerShell requires to come first
+(a byte-order mark, comments, `#Requires` lines, `using` statements and a script `param` block), so
+that a question the person's own profiles ask, in that file or in the one their host reads after it,
+is asked of a shell whose bridge is open. It moves an entry an earlier install left somewhere else. A
+question asked in an all-users profile, which an administrator owns and PowerShell reads before any of
+the user's, still runs before the bridge exists and cannot be answered. Every other shell's reader
+comes with the shell itself and its entry only says, after the user's configuration, that the hooks
+are live, so those entries stay last.
 
-PowerShell's profile path differs by edition, by platform and by whether the user's Documents
-directory is redirected, so it is not derived: the shell this host would launch is asked for
-`$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host where no PowerShell answers has no
-profile to add an entry to rather than one this host guessed.
+The second entry is the last thing in the profile PowerShell's own host reads, which is the last
+profile it runs. It asks the module whether the module's read-line entry point is still the one the
+host calls. The module goes in front of that entry point when it loads, so a function of the same
+name that a later profile defines, whether it replaces the entry point or wraps the one before it,
+takes the host's calls away from the module: the session would stay authenticated and not ready with
+nothing to say why. The second entry refuses it by name, as `reader_replaced`, through an integration
+loss that closes the session being created, and nothing the reader sends after a loss that closes the
+session says the hooks are live. A profile that leaves the entry point alone is never asked anything.
+The module qualifies the editor when it loads and again when the hooks activate after the profile,
+because a profile that runs in between can import another one.
+
+PowerShell's profile paths differ by edition, by platform and by whether the user's Documents
+directory is redirected, so they are not derived: the shell this host would launch is asked for
+`$PROFILE.CurrentUserAllHosts` and `$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host
+where no PowerShell answers has no profile to add an entry to rather than one this host guessed.
 
 `kr shell install --nsh-bypass` adds the documented session-local bypass for a known auto-wrapper:
 `NSH_NO_WRAP=1`, set only where the worker exported the bridge, which is a KalaReach-created shell.

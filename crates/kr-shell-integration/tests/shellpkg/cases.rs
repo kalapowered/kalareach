@@ -2396,18 +2396,21 @@ fn failing_after_startup(kind: ShellKind) -> Profile<'static> {
             after_configuration: "builtin kr-bridge lost post-startup-failure 'the profile failed after its startup files'\n",
             entry: false,
             after_entry: "",
+            all_hosts: "",
         },
         // The fish reader is only there once the first prompt is, and the entry waits for it.
         ShellKind::Fish => Profile {
             after_configuration: "function __kr_fail --on-event fish_prompt\n    functions --erase __kr_fail\n    builtin kr-bridge lost post-startup-failure 'the profile failed after its startup files'\nend\n",
             entry: false,
             after_entry: "",
+            all_hosts: "",
         },
         // The module is loaded by the entry, so the report follows it.
         ShellKind::PowerShell => Profile {
             after_configuration: "",
             entry: true,
             after_entry: "Write-KalaReachLoss -Loss post_startup_failure -Detail 'the profile failed after its startup files'\n",
+            all_hosts: "",
         },
     }
 }
@@ -2457,6 +2460,7 @@ pub fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(kind:
             entry: true,
             after_entry: "Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition 'public class KrEditorGone { }'\n\
                           & (Get-Module KalaReach.ShellBridge) { param($editor) $script:SingletonField = $null; $script:QueuedKeysField = $null; $script:Rl = $editor } ([KrEditorGone])\n",
+            all_hosts: "",
         },
     );
     let mut phase = PhaseGate::unauthenticated();
@@ -2474,6 +2478,167 @@ pub fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(kind:
         lost.detail
     );
     assert!(phase.lost(lost.loss).closes_session);
+    // The loss closes the session that was being created, so nothing the reader says after it
+    // claims the hooks are live. What it sent before its first step is what the session was told
+    // after the loss.
+    let hooks = std::cell::Cell::new(false);
+    session.expect_event("the first editor entry", |event| {
+        hooks.set(hooks.get() || matches!(event, BridgeEvent::HooksActivated(_)));
+        matches!(event, BridgeEvent::EditorEnter(_))
+    });
+    assert!(
+        !hooks.get(),
+        "the hooks were reported live after a loss that closes the session"
+    );
+}
+
+/// KR-REQ-07.23: a question the profile every host reads asks takes its answer through the worker,
+/// which is the first profile PowerShell runs of the person's own.
+///
+/// The bridge has to be open before anything in that profile asks, and the entry that opens it is
+/// the first thing in it, below what PowerShell requires to come first. The question is the person's
+/// own, asked before the profile of the host the shell runs in has been read, and the answer has to
+/// reach it while the session is authenticated and not yet ready.
+pub fn a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_worker(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            all_hosts: startup_question(kind),
+            ..Profile::ORDINARY
+        },
+    );
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(
+        phase.authenticated(kind),
+        "the bridge authenticated while the first profile was waiting for its answer"
+    );
+    assert!(
+        session.drew_after(0, "ASK>", REPLY).was_drawn(),
+        "the question was not drawn:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !phase.reports_ready(),
+        "a session whose profile is waiting for an answer reported ready"
+    );
+    session.type_bytes(b"the-answer\r");
+    assert!(
+        session
+            .drew_after(0, "kr-answer-<the-answer>", REPLY)
+            .was_drawn(),
+        "the answer did not reach the question the first profile asked:\n{}",
+        session.terminal_output()
+    );
+    // Both profiles have finished, so the hooks activate and the reader is the first one.
+    session.first_prompt();
+    assert!(phase.qualified());
+    assert!(phase.reports_ready());
+}
+
+/// The profile text that changes what the host calls to read a line, in each shape a person writes
+/// it in.
+#[derive(Clone, Copy)]
+pub enum ReadLineChange {
+    /// The profile leaves the host's entry point alone.
+    None,
+    /// A function of the same name that reads a line some other way.
+    Replaced,
+    /// A function of the same name that calls what was there before it.
+    Wrapped,
+}
+
+impl ReadLineChange {
+    fn profile(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Replaced => "function PSConsoleHostReadLine { [Console]::ReadLine() }\n",
+            Self::Wrapped => {
+                "$kr_inner = ${function:PSConsoleHostReadLine}\n\
+                 function PSConsoleHostReadLine { & $kr_inner }\n"
+            }
+        }
+    }
+}
+
+/// KR-REQ-07.23, KR-REQ-07.85: a profile that changes the host's read-line entry point is diagnosed
+/// by name at the end of the last profile, and one that leaves it alone is not.
+///
+/// The module goes in front of the entry point when it loads, first in the first profile, so a
+/// function of the same name that a later profile defines takes the host's calls away from it and
+/// the reader never runs: nothing would say so, and the session would stay authenticated and not
+/// ready. The entry at the end of the last profile asks the module whether its own function is still
+/// the one the host calls. A function that replaces it and one that wraps the one before it are both
+/// the host's reader being somebody else's rather than the editor the package was qualified
+/// against, and both are refused by the name the integration loss carries; the session that was
+/// being created closes with it, and is never reported to have its hooks live afterwards.
+pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kind: ShellKind) {
+    let package = Package::built(kind);
+
+    // The control: a profile that leaves it alone activates, and nothing is lost.
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_entry: ReadLineChange::None.profile(),
+            ..Profile::ORDINARY
+        },
+    );
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(phase.authenticated(kind));
+    let lost = std::cell::Cell::new(false);
+    session.expect_event("hooks_activated", |event| {
+        lost.set(lost.get() || matches!(event, BridgeEvent::IntegrationLost(_)));
+        matches!(event, BridgeEvent::HooksActivated(_))
+    });
+    assert!(
+        !lost.get(),
+        "a profile that left the read-line entry point alone was diagnosed"
+    );
+    drop(session);
+
+    for change in [ReadLineChange::Replaced, ReadLineChange::Wrapped] {
+        let mut session = Session::start_with_profile(
+            &package,
+            Profile {
+                after_entry: change.profile(),
+                ..Profile::ORDINARY
+            },
+        );
+        let mut phase = PhaseGate::unauthenticated();
+        assert!(phase.authenticated(kind));
+        let (_, event) = session.expect_event("integration_lost", |event| {
+            matches!(event, BridgeEvent::IntegrationLost(_))
+        });
+        let BridgeEvent::IntegrationLost(lost) = event else {
+            unreachable!()
+        };
+        assert_eq!(lost.loss, IntegrationLoss::PostStartupFailure);
+        assert!(
+            lost.detail.contains("read-line entry point"),
+            "the diagnostics name what changed: {}",
+            lost.detail
+        );
+        assert!(
+            phase.lost(lost.loss).closes_session,
+            "a loss before the session qualified closes the session that was being created"
+        );
+        if matches!(change, ReadLineChange::Wrapped) {
+            // The module's own function still runs, inside the profile's, and its reader goes on to
+            // its first step. Everything it sent before that step is what the session was told
+            // after the loss, and none of it says the hooks are live.
+            let hooks = std::cell::Cell::new(false);
+            session.expect_event("the first editor entry", |event| {
+                hooks.set(hooks.get() || matches!(event, BridgeEvent::HooksActivated(_)));
+                matches!(event, BridgeEvent::EditorEnter(_))
+            });
+            assert!(
+                !hooks.get(),
+                "the hooks were reported live after a loss that closes the session"
+            );
+        }
+    }
 }
 
 /// A writer that keeps what it is given, for a case that reads what the terminal answered.

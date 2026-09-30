@@ -267,6 +267,20 @@ fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate() {
     shellpkg::an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(PWSH);
 }
 
+/// KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_worker() {
+    shellpkg::a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_worker(PWSH);
+}
+
+/// KR-REQ-07.23, KR-REQ-07.85
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name() {
+    shellpkg::a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(PWSH);
+}
+
 /// The cursor position query the editor asks at every prompt reaches the terminal in pieces on a
 /// loaded machine, and the editor waits for its answer before it reads a key.
 #[test]
