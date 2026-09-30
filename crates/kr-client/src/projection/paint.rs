@@ -31,7 +31,7 @@ use kr_protocol::projection::{
     CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign,
     ProjectedBuffer, ProjectedRow,
 };
-use kr_width as unicode;
+use kr_width::{cells_for, is_zero_width};
 
 use super::Screen;
 
@@ -1075,7 +1075,7 @@ pub fn place(run: &CellRun, window: Window) -> Placement {
     // The width the profile's pinned model gives this text, against the cell span the session
     // says it occupies. A disagreement means the text cannot be placed at canonical positions,
     // and drawing it anyway is what would move everything after it.
-    let measured = unicode::cells_for(&run.text) as u64;
+    let measured = cells_for(&run.text) as u64;
     if measured == cells {
         let mut column = start;
         for cluster in clusters(&run.text) {
@@ -1179,7 +1179,7 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
     let mut has_cell = false;
     for scalar in text.chars() {
         let width = scalar.len_utf8();
-        if unicode::is_zero_width(scalar) {
+        if is_zero_width(scalar) {
             index += width;
             continue;
         }
@@ -1188,7 +1188,7 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
             out.push(Cluster {
                 text: piece,
                 cells: if has_cell {
-                    unicode::cells_for(piece) as u64
+                    cells_for(piece) as u64
                 } else {
                     0
                 },
@@ -1202,7 +1202,7 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
         let piece = &text[start..index];
         out.push(Cluster {
             text: piece,
-            cells: unicode::cells_for(piece) as u64,
+            cells: cells_for(piece) as u64,
         });
     }
     out
@@ -1243,7 +1243,7 @@ fn specification(colour: kr_protocol::projection::Rgb) -> Vec<u8> {
 pub fn row_encodes_exactly(row: &ProjectedRow) -> bool {
     row.runs
         .iter()
-        .all(|run| unicode::cells_for(&run.text) as u64 == run.cells.get())
+        .all(|run| cells_for(&run.text) as u64 == run.cells.get())
 }
 
 #[cfg(test)]
@@ -1394,7 +1394,7 @@ mod tests {
         assert_eq!(pieces[0].cells, 2);
         assert_eq!(pieces[1].cells, 2);
         let total: u64 = pieces.iter().map(|piece| piece.cells).sum();
-        assert_eq!(total, unicode::cells_for(text) as u64);
+        assert_eq!(total, cells_for(text) as u64);
     }
 
     #[test]
@@ -2151,7 +2151,7 @@ mod fixtures {
         // Control characters inside a run whose cells are what the pinned model measures, so the
         // run is placed rather than replaced: each control is a cluster of no cells of its own.
         if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 7)) {
-            let measured = unicode::cells_for(&row.runs[0].text) as u64;
+            let measured = cells_for(&row.runs[0].text) as u64;
             row.runs[0].cells = U64::new(measured);
         }
         vec![
@@ -2879,7 +2879,7 @@ mod safety {
                     runs: vec![CellRun {
                         column: U64::ZERO,
                         cells: U64::new(
-                            u64::try_from(unicode::cells_for(text)).unwrap_or_default(),
+                            u64::try_from(cells_for(text)).unwrap_or_default(),
                         ),
                         text: text.to_owned(),
                         rendition: CellRendition::PLAIN,
