@@ -32,7 +32,15 @@ wasmtime.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[features]
+# What this crate's own tests use to hold the engine's epoch still and advance it one tick at a
+# time. It compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [dev-dependencies]
+# This crate's own tests, with the held epoch reachable: a deadline is reached when a test advances
+# the epoch, never because the machine was slow.
+kr-plugin-runtime = { path = ".", features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 

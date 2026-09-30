@@ -65,16 +65,25 @@ fn engine() -> RuntimeEngine {
 /// The binding lifecycle is exercised separately; these tests want the calls themselves, where the
 /// bound that stopped one is the return value rather than an event.
 fn instance(wasm: &[u8], plugin: &str, fuel_rate: u64) -> (tempfile::TempDir, Instance) {
+    instance_on(&engine(), wasm, plugin, fuel_rate)
+}
+
+/// As [`instance`], on an engine the test holds, so it can read what the engine's epoch did.
+fn instance_on(
+    engine: &RuntimeEngine,
+    wasm: &[u8],
+    plugin: &str,
+    fuel_rate: u64,
+) -> (tempfile::TempDir, Instance) {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let engine = engine();
     let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(
         directory.path().join("plugin-cache"),
     )
     .expect("a cache");
-    let compiled = compile_or_load(&engine, &cache, wasm, CompileBudget::defaults())
+    let compiled = compile_or_load(engine, &cache, wasm, CompileBudget::defaults())
         .expect("the component compiles");
     let instance = Instance::new(
-        &engine,
+        engine,
         &compiled.component,
         components::facts(plugin),
         InstanceLimiter::defaults(),
@@ -85,11 +94,27 @@ fn instance(wasm: &[u8], plugin: &str, fuel_rate: u64) -> (tempfile::TempDir, In
 }
 
 fn bound(wasm: &[u8], plugin: &str) -> (tempfile::TempDir, Instance) {
-    let (directory, mut instance) = instance(
+    bound_on(&engine(), wasm, plugin)
+}
+
+/// As [`bound`], on an engine the test holds.
+fn bound_on(engine: &RuntimeEngine, wasm: &[u8], plugin: &str) -> (tempfile::TempDir, Instance) {
+    bound_at(
+        engine,
         wasm,
         plugin,
         kr_plugin_runtime::runtime::budget::FUEL_PER_DEADLINE_MS,
-    );
+    )
+}
+
+/// As [`bound_on`], with a fuel rate the test chooses.
+fn bound_at(
+    engine: &RuntimeEngine,
+    wasm: &[u8],
+    plugin: &str,
+    fuel_rate: u64,
+) -> (tempfile::TempDir, Instance) {
+    let (directory, mut instance) = instance_on(engine, wasm, plugin, fuel_rate);
     let target = kr_plugin_runtime::runtime::bindings::Binding {
         plugin_id: format!("kalareach/{plugin}"),
         binding_revision: 3,
@@ -262,15 +287,16 @@ fn kr_req_11_40_fuel_and_deadlines_are_separate_bounds() {
     assert!(!text.contains(" ms"));
     assert!(!text.contains("cpu"));
 
-    // With the ordinary rate the same loop runs past its elapsed deadline instead, and it is
-    // stopped within a small multiple of the 10 ms the deadline allows rather than eventually.
-    let (_directory, mut ordinary) = bound(&wasm, "infinite-loop");
-    let started = std::time::Instant::now();
-    let error = failed(
-        ordinary.observe(components::scrape("se-1", "anything")),
-        "an unbounded loop returned",
-    );
-    let elapsed = started.elapsed();
+    // With a rate no loop reaches the end of, the same loop runs into its elapsed deadline
+    // instead, and the deadline is what stops it.
+    let engine = held_engine();
+    let (_directory, mut ordinary) = bound_at(&engine, &wasm, "infinite-loop", FUEL_NEVER_ENDS);
+    let (error, ticks) = ticks_until_stopped(&engine, || {
+        failed(
+            ordinary.observe(components::scrape("se-1", "anything")),
+            "an unbounded loop returned",
+        )
+    });
     assert_eq!(
         error,
         RuntimeError::Exhausted {
@@ -279,13 +305,61 @@ fn kr_req_11_40_fuel_and_deadlines_are_separate_bounds() {
         },
         "an ordinary call reported {error}"
     );
-    assert!(
-        elapsed >= core::time::Duration::from_millis(9),
-        "the 10 ms deadline stopped the call after only {elapsed:?}"
+    assert_stopped_after_its_ticks(CallKind::Observe, ticks);
+}
+
+/// A fuel rate no call reaches the end of, so that a call that does not return can be stopped only
+/// by its deadline.
+const FUEL_NEVER_ENDS: u64 = 1 << 52;
+
+/// An engine whose epoch time does not advance: the only thing that moves it is what a test asks
+/// of it, so a deadline is reached when the test says and never because the machine was slow.
+fn held_engine() -> RuntimeEngine {
+    RuntimeEngine::with_epoch_held().expect("an engine")
+}
+
+/// Runs `call` on a thread of its own and advances the engine's epoch one tick at a time until it
+/// has returned, and says what it returned and how many ticks the epoch advanced meanwhile.
+///
+/// The epoch is the engine's, not the clock's: this is what a deadline is a count of. A call that
+/// nothing stops is a test that never ends, because the call runs on a thread this test cannot
+/// end and so cannot fail it with a bound of its own: the run's own limit is what ends it.
+fn ticks_until_stopped<T: Send>(
+    engine: &RuntimeEngine,
+    call: impl FnOnce() -> T + Send,
+) -> (T, u64) {
+    let before = engine.ticks();
+    std::thread::scope(|scope| {
+        let running = scope.spawn(call);
+        while !running.is_finished() {
+            engine.advance_epoch();
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+        let outcome = running.join().expect("the call returned");
+        (outcome, engine.ticks().saturating_sub(before))
+    })
+}
+
+/// Checks that a call stopped by its deadline was given the ticks section 11's deadline is worth.
+///
+/// A deadline of *n* milliseconds is *n* ticks and one more: a call that starts part way through a
+/// tick would otherwise be cut short by up to a whole one. `ticks` is what the epoch advanced from
+/// before the call was started until it had returned, which is the ticks the call was stopped
+/// after, any that came before it began to run and any that came while it was returning. It is at
+/// least the first, so a call that was stopped after fewer ticks than it is owed passes only if
+/// those others made up the rest: on a slow machine this can let a call stopped a little early
+/// pass, and on no machine can it fail a call that was stopped on time.
+fn assert_stopped_after_its_ticks(kind: CallKind, ticks: u64) {
+    let deadline_ms = kind.deadline_ms().expect("the call has a deadline");
+    let owed = CallBudget::of(kind).epoch_ticks(kr_plugin_runtime::runtime::engine::EPOCH_TICK_MS);
+    assert_eq!(
+        owed,
+        Some(deadline_ms / kr_plugin_runtime::runtime::engine::EPOCH_TICK_MS + 1),
+        "{kind:?} is not given the ticks its deadline is worth"
     );
     assert!(
-        elapsed < core::time::Duration::from_millis(500),
-        "the 10 ms deadline took {elapsed:?} to stop the call"
+        Some(ticks) >= owed,
+        "{kind:?} was stopped after {ticks} epoch ticks, before the {owed:?} its deadline is worth"
     );
 }
 
@@ -295,12 +369,14 @@ fn kr_req_11_38_every_export_is_stopped_by_its_own_deadline() {
     let Some(wasm) = components::component("infinite-loop") else {
         return;
     };
-    let (_directory, mut instance) = bound(&wasm, "infinite-loop");
+    let engine = held_engine();
+    let (_directory, mut instance) = bound_at(&engine, &wasm, "infinite-loop", FUEL_NEVER_ENDS);
 
-    // Every export that has a deadline, each stopped by its own. The lower bound is what shows the
-    // deadline applied rather than a shorter one; the upper bound is generous because a shared
-    // machine schedules the epoch thread when it pleases.
-    type Call = Box<dyn Fn(&mut Instance) -> RuntimeError>;
+    // Every export that has a deadline, each stopped by its own. What shows the deadline applied
+    // rather than a shorter one is the ticks the engine's epoch advanced before the call was
+    // stopped, which a test advances one at a time and so counts, as the check below says, to
+    // within the ticks that came before the call began to run and while it returned.
+    type Call = Box<dyn Fn(&mut Instance) -> RuntimeError + Send + Sync>;
     let cases: Vec<(CallKind, u64, Call)> = vec![
         (
             CallKind::Observe,
@@ -375,9 +451,7 @@ fn kr_req_11_38_every_export_is_stopped_by_its_own_deadline() {
         if instance.faulted() {
             instance.replace().expect("the replacement binds");
         }
-        let started = std::time::Instant::now();
-        let error = call(&mut instance);
-        let elapsed = started.elapsed();
+        let (error, ticks) = ticks_until_stopped(&engine, || call(&mut instance));
         assert_eq!(
             error,
             RuntimeError::Exhausted {
@@ -386,17 +460,7 @@ fn kr_req_11_38_every_export_is_stopped_by_its_own_deadline() {
             },
             "{kind:?} reported {error}"
         );
-        assert!(
-            elapsed >= core::time::Duration::from_millis(deadline_ms - 1),
-            "{kind:?} was stopped after {elapsed:?}, before its {deadline_ms} ms deadline"
-        );
-        // Generous, and deliberately so: what this bound catches is a call that was never stopped
-        // at all. The epoch thread is one thread among whatever else the machine is running, and a
-        // build host running several jobs at once schedules it when it pleases.
-        assert!(
-            elapsed < core::time::Duration::from_millis(deadline_ms * 20 + 2_000),
-            "{kind:?} took {elapsed:?} against a {deadline_ms} ms deadline"
-        );
+        assert_stopped_after_its_ticks(kind, ticks);
     }
 }
 
@@ -1350,45 +1414,45 @@ fn the_budgets_come_from_the_published_limits() {
     );
 }
 
-// A component that spends most of a call and still answers: the shape a test about what happens
-// *while* a component is running needs, because a component that faults is one that is soon
+// A component that spends a good part of a call and still answers: the shape a test about what
+// happens *while* a component is running needs, because a component that faults is one that is soon
 // disabled and no longer running at all.
+//
+// How much a call spends is decided by the fuel it uses, which is the same on every machine, and
+// not by how long it takes, which is the machine's. The engine's epoch is held, so no time a
+// loaded machine takes counts towards the deadline, and every call is left to answer.
 #[test]
 fn a_slow_component_spends_its_call_and_still_answers() {
     let Some(wasm) = components::component("slow-observe") else {
         return;
     };
-    let (_directory, mut instance) = bound(&wasm, "slow-observe");
+    let engine = held_engine();
+    let (_directory, mut instance) = bound_on(&engine, &wasm, "slow-observe");
+    let allowance = CallBudget::of(CallKind::Observe).fuel;
 
-    let mut spent = Vec::new();
-    for _ in 0..(FAULTS_BEFORE_DISABLE + 5) {
-        let started = std::time::Instant::now();
+    // As many calls as it takes a component that faults to be disabled, and a few more: this one
+    // does not fault, so every one of them answers.
+    for call in 0..FAULTS_BEFORE_DISABLE + 5 {
         let outcome = instance.observe(components::scrape("se-1", "output"));
-        spent.push(started.elapsed());
-        outcome
-            .result
-            .expect("the call did not fault")
-            .expect("the component did not decline");
+        assert!(
+            matches!(outcome.result, Ok(Ok(()))),
+            "call {call} did not answer: {:?}",
+            outcome.result
+        );
         assert!(
             !outcome.nodes.is_empty(),
             "the call drew nothing, so nothing can see that it happened"
         );
+        // Long enough to be worth queueing against: a call that did nothing would not keep a
+        // binding's thread occupied, which is the whole reason this fixture exists. And short
+        // enough to leave room to return: a call that used its whole allowance would be a fault,
+        // and a fault is what this component exists not to be.
+        assert!(
+            outcome.fuel_used >= allowance / 100 && outcome.fuel_used < allowance / 2,
+            "call {call} used {} of its {allowance} fuel",
+            outcome.fuel_used
+        );
     }
-
-    // Long enough to be worth queueing against, and short enough that it is not the deadline
-    // stopping it: a call the deadline stopped would be a fault, and there were none.
-    let longest = spent.iter().max().copied().unwrap_or_default();
-    assert!(
-        longest < core::time::Duration::from_millis(10),
-        "the slowest call took {longest:?}, which is the observe deadline rather than the work"
-    );
-    // And it is work rather than nothing: a component that returned at once would not keep a
-    // binding's thread occupied, which is the whole reason this fixture exists.
-    let total: core::time::Duration = spent.iter().sum();
-    assert!(
-        total > core::time::Duration::from_millis(1),
-        "eight calls took {total:?} between them"
-    );
 }
 
 // A document the caller never received leaves a stale view, and the answer is the one a lost

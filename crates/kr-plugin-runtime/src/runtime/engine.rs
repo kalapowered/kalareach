@@ -82,6 +82,51 @@ trait EpochClock: core::fmt::Debug + Send + Sync + 'static {
 
     /// Waits for one tick of the epoch.
     fn wait(&self, tick: core::time::Duration);
+
+    /// Lets a wait that would never end return, because the engine this clock serves has gone.
+    ///
+    /// The machine's clock has nothing to release: its waits are one tick long.
+    fn release(&self) {}
+}
+
+/// A clock that stays where it is, for the tests of what a call does with the time it is given.
+///
+/// The epoch thread makes the one pass a call's first appearance starts, and waits after it until
+/// the engine goes. Nothing then advances the epoch but [`RuntimeEngine::advance_epoch`], so a
+/// deadline is reached exactly when a test says so and never because the machine was slow.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct StillClock {
+    released: Mutex<bool>,
+    moved: Condvar,
+}
+
+#[cfg(feature = "testing")]
+impl EpochClock for StillClock {
+    fn elapsed(&self) -> core::time::Duration {
+        core::time::Duration::ZERO
+    }
+
+    fn wait(&self, _tick: core::time::Duration) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*released {
+            released = self
+                .moved
+                .wait(released)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.moved.notify_all();
+    }
 }
 
 /// The machine's own monotonic clock.
@@ -158,6 +203,22 @@ impl RuntimeEngine {
         }))
     }
 
+    /// Builds the engine with an epoch that time does not advance.
+    ///
+    /// For the tests of what a component does with the call it is given: a call is stopped by its
+    /// deadline only when [`Self::advance_epoch`] has been called as many times as the deadline is
+    /// worth, and a machine that stalls the call for as long as it likes cannot reach a deadline
+    /// that no time counts towards. Apart from the one tick the epoch thread makes when the first
+    /// call appears, nothing else moves it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::new`] does.
+    #[cfg(feature = "testing")]
+    pub fn with_epoch_held() -> RuntimeResult<Self> {
+        Self::on_clock(Arc::new(StillClock::default()))
+    }
+
     /// Builds the engine with its epoch thread reading the given clock.
     fn on_clock(clock: Arc<dyn EpochClock>) -> RuntimeResult<Self> {
         let mut config = wasmtime::Config::new();
@@ -178,11 +239,11 @@ impl RuntimeEngine {
 
         let engine = wasmtime::Engine::new(&config).map_err(RuntimeError::engine)?;
         let compatibility = compatibility_of(&engine);
-        let ticker = EpochTicker::start(&engine, clock);
+        let ticker = EpochTicker::start(&engine, Arc::clone(&clock));
         Ok(Self {
             engine,
             ticker: Arc::clone(&ticker),
-            shutdown: Arc::new(TickerShutdown(ticker)),
+            shutdown: Arc::new(TickerShutdown { ticker, clock }),
             compatibility,
         })
     }
@@ -283,17 +344,23 @@ impl Drop for InFlight {
 /// thread woken exactly when the last engine goes. The thread's own strong reference to the ticker
 /// is therefore not what keeps it alive.
 #[derive(Debug)]
-struct TickerShutdown(Arc<EpochTicker>);
+struct TickerShutdown {
+    ticker: Arc<EpochTicker>,
+    clock: Arc<dyn EpochClock>,
+}
 
 impl Drop for TickerShutdown {
     fn drop(&mut self) {
-        self.0.stopping.store(true, Ordering::Release);
+        self.ticker.stopping.store(true, Ordering::Release);
         // Taken under the lock, so a thread between checking the flag and waiting cannot miss it.
-        if let Ok(_state) = self.0.state.lock() {
-            self.0.wake.notify_all();
+        if let Ok(_state) = self.ticker.state.lock() {
+            self.ticker.wake.notify_all();
         } else {
-            self.0.wake.notify_all();
+            self.ticker.wake.notify_all();
         }
+        // A clock that waits for ever is what the thread may be inside, and that is not the wait
+        // above.
+        self.clock.release();
     }
 }
 
@@ -559,6 +626,29 @@ mod tests {
             advanced, 200,
             "200 ms passed over two wakeups and the epoch advanced {advanced} times"
         );
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn an_engine_with_its_epoch_held_advances_only_when_told_and_ends_its_thread_with_it() {
+        let engine = RuntimeEngine::with_epoch_held().expect("an engine");
+        let ended = engine.ticker_ended();
+        let guard = engine.in_flight();
+        // The one tick the thread's first pass makes for a call that has appeared.
+        until("the epoch thread made no pass for the call", || {
+            engine.ticks() == 1
+        });
+        // However long the call goes on, time moves nothing. Only a look that finds the epoch
+        // moved can fail here, so a machine that is slow to look cannot.
+        std::thread::sleep(core::time::Duration::from_millis(250));
+        assert_eq!(engine.ticks(), 1, "the epoch moved with time");
+        engine.advance_epoch();
+        assert_eq!(engine.ticks(), 2, "and it moves when it is told to");
+        drop(guard);
+        drop(engine);
+        until("the epoch thread outlived its engine", || {
+            ended.load(Ordering::Acquire)
+        });
     }
 
     #[test]
