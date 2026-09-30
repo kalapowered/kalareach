@@ -345,7 +345,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // hooks live, this session is authenticated rather than qualified, and it reports nothing
     // ready. A failure here closes the session that was being created and records why.
     if bridge_server.is_some()
-        && let Err(error) = await_qualification(&runtime, QUALIFICATION_DEADLINE).await
+        && let Err(error) = runtime.await_qualification(QUALIFICATION_DEADLINE).await
     {
         // The failure is reported if it can be, and the session is closed either way: a create that
         // could not deliver the managed contract leaves a closure record rather than a shell nobody
@@ -447,51 +447,6 @@ async fn finish(
 /// startup files are done, and this is only what stops a profile that blocks forever from leaving
 /// a create request unanswered.
 const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Waits until the root integration has qualified, or says why it did not.
-///
-/// Waiting is on the phase rather than on a timer: the session is asked what it is, and a session
-/// that has closed in the meantime answers immediately rather than holding this for the bound.
-async fn await_qualification(
-    runtime: &Arc<kr_worker::runtime::SessionRuntime>,
-    within: std::time::Duration,
-) -> std::result::Result<(), ProtocolError> {
-    let deadline = tokio::time::Instant::now() + within;
-    loop {
-        {
-            let session = runtime.session();
-            if let Some(driver) = session.fence() {
-                if driver.phase().reports_ready() {
-                    return Ok(());
-                }
-                if !driver.phase().consumes_eligible_eof() {
-                    return Err(ProtocolError::new(
-                        ErrorCode::ShellIntegrationUnsupported,
-                        "the root shell was replaced by something this build cannot qualify, so \
-                         this session claims none of the managed contract",
-                    ));
-                }
-            }
-            if session.state() != kr_protocol::session::SessionState::Live {
-                return Err(ProtocolError::new(
-                    ErrorCode::ShellIntegrationUnsupported,
-                    "the session ended before its root integration qualified",
-                ));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ProtocolError::new(
-                ErrorCode::ShellIntegrationUnsupported,
-                format!(
-                    "the root integration did not qualify within {} seconds; the session is closed \
-                     and an explicit compatibility retry is a new create request",
-                    within.as_secs()
-                ),
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
 
 /// Reads the parts of the first snapshot of plugin admissions a specification announced, each of
 /// its frame and in its order.

@@ -1198,6 +1198,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         .send_event(BridgeEvent::HooksActivated(HooksActivated {
             session_id,
             prompt_generation: kr_protocol::root::PromptGeneration::new(1),
+            modules: Vec::new(),
         }))
         .await
         .expect("reports");

@@ -445,6 +445,7 @@ mod tests {
             .send_event(BridgeEvent::HooksActivated(HooksActivated {
                 session_id,
                 prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
             }))
             .await
             .expect("reports");

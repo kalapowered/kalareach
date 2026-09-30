@@ -39,7 +39,7 @@ use kr_protocol::root::{
 use kr_protocol::scalars::{Bytes, DurationMs};
 use serde::{Deserialize, Serialize};
 
-use crate::contract::events::{BridgeEvent, EofGesture};
+use crate::contract::events::{BridgeEvent, EofGesture, LoadedModule, ModuleImports};
 use crate::contract::qualification::{BridgeAbi, QualificationReason, ShellKind, qualify};
 use crate::contract::requests::{
     BridgeAnswer, LaunchRejectionReason, LaunchTransactionId, WorkerRequest,
@@ -731,6 +731,55 @@ pub fn decide_handshake(
     })
 }
 
+/// Judges the modules a shell holds when its hooks go live.
+///
+/// This is the second half of the module-tree check. [`decide_handshake`] judges the tree the
+/// package declares, before any startup file has run; a module a startup file loads is not there
+/// yet, so it is judged here, from what the bridge read of the modules the shell holds by then,
+/// before the session qualifies. The two take different inputs and share no code: one compares the
+/// editor ABI a declaration names, the other takes the bridge's verdict on what a module imports.
+///
+/// The person has to act on a module that does not fit, so the first one whose import is missing is
+/// named, whatever precedes it. Where none is, the first module that could not be read is named:
+/// an inspection that is not whole is not a pass.
+///
+/// # Errors
+///
+/// Returns the refusal, with reason [`QualificationReason::ModuleTreeUnsupported`], for the first
+/// module that does not bind, or failing that the first that was not read.
+pub fn decide_activated_modules(
+    reader_abi: &str,
+    modules: &[LoadedModule],
+) -> Result<(), BridgeRefused> {
+    let missing = modules.iter().find_map(|module| match &module.imports {
+        ModuleImports::Missing(import) => Some((module, import)),
+        ModuleImports::Bound | ModuleImports::NotRead(_) => None,
+    });
+    if let Some((module, import)) = missing {
+        return Err(BridgeRefused::new(
+            QualificationReason::ModuleTreeUnsupported,
+            format!(
+                "module {} imports {import}, which this reader ({reader_abi}) does not provide",
+                module.name
+            ),
+        ));
+    }
+    let unread = modules.iter().find_map(|module| match &module.imports {
+        ModuleImports::NotRead(why) => Some((module, why)),
+        ModuleImports::Bound | ModuleImports::Missing(_) => None,
+    });
+    if let Some((module, why)) = unread {
+        return Err(BridgeRefused::new(
+            QualificationReason::ModuleTreeUnsupported,
+            format!(
+                "module {} could not be checked against this reader ({reader_abi}): {why}",
+                module.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the bootstrap variables a completed handshake removes from the exported environment.
 #[must_use]
 pub fn unexported_variables() -> Vec<String> {
@@ -1041,6 +1090,93 @@ mod tests {
         assert_eq!(
             unidentified.refusal(),
             Some(QualificationReason::PeerUnidentified)
+        );
+    }
+
+    fn loaded(name: &str, imports: ModuleImports) -> LoadedModule {
+        LoadedModule {
+            name: name.to_owned(),
+            path: format!("/home/person/modules/{name}.so"),
+            imports,
+        }
+    }
+
+    /// KR-REQ-07.87
+    #[test]
+    fn modules_that_bind_leave_the_session_free_to_qualify() {
+        assert_eq!(decide_activated_modules("zle-5.9", &[]), Ok(()));
+        assert_eq!(
+            decide_activated_modules(
+                "zle-5.9",
+                &[
+                    loaded("zsh/complete", ModuleImports::Bound),
+                    loaded("kr_user", ModuleImports::Bound)
+                ]
+            ),
+            Ok(())
+        );
+    }
+
+    /// KR-REQ-07.87, KR-REQ-07.88
+    #[test]
+    fn a_module_that_imports_what_this_reader_lacks_is_a_named_refusal() {
+        let refused = decide_activated_modules(
+            "zle-5.9",
+            &[
+                loaded("zsh/complete", ModuleImports::Bound),
+                loaded(
+                    "kr_user",
+                    ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
+                ),
+            ],
+        )
+        .expect_err("a module that cannot bind is refused");
+        assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
+        assert_eq!(refused.code(), ErrorCode::ShellIntegrationUnsupported);
+        assert_eq!(
+            refused.error.message,
+            "module kr_user imports zle_abi_newer_entry, which this reader (zle-5.9) does not \
+             provide"
+        );
+    }
+
+    /// An inspection that is not whole is not a pass: a module this could not read is refused, and
+    /// by a message that says it could not be checked rather than that it does not fit.
+    #[test]
+    fn a_module_that_could_not_be_read_is_refused_and_not_passed() {
+        let refused = decide_activated_modules(
+            "zle-5.9",
+            &[loaded(
+                "odd",
+                ModuleImports::NotRead("its format is not one this reads".to_owned()),
+            )],
+        )
+        .expect_err("a module nothing could check is not qualified");
+        assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
+        assert_eq!(
+            refused.error.message,
+            "module odd could not be checked against this reader (zle-5.9): its format is not one \
+             this reads"
+        );
+    }
+
+    /// A module that does not fit is what the person has to act on, so it is named before one that
+    /// could not be read, whichever comes first in the list.
+    #[test]
+    fn a_missing_import_is_named_before_an_unread_module() {
+        let refused = decide_activated_modules(
+            "zle-5.9",
+            &[
+                loaded("odd", ModuleImports::NotRead("unreadable".to_owned())),
+                loaded("kr_user", ModuleImports::Missing("zle_x".to_owned())),
+            ],
+        )
+        .expect_err("refused");
+        assert!(
+            refused
+                .error
+                .message
+                .starts_with("module kr_user imports zle_x")
         );
     }
 

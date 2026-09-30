@@ -18,7 +18,9 @@ use kr_protocol::root::{
     RootEofDetachParams, ShellLaunchParams, ShellLaunchResult, WithheldReason,
 };
 use kr_protocol::scalars::{Nullable, U64};
-use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
+use kr_shell_integration::contract::events::{
+    BridgeEvent, LoadedModule, ModuleImports, ReaderIdle,
+};
 use kr_shell_integration::contract::fence::{
     Action, ContinuousMs, DetachRejection, DetachTarget, EditorEntered, FenceInvalidation,
     FenceMachine, InputArrived, InputRef, InputRefusal, InterruptRequested, LaunchRequested,
@@ -28,7 +30,9 @@ use kr_shell_integration::contract::qualification::{IntegrationLoss, ShellKind};
 use kr_shell_integration::contract::requests::{
     BridgeAnswer, LaunchRejectionReason, LaunchTransactionId, WorkerRequest,
 };
-use kr_shell_integration::contract::transport::EventOutcome;
+use kr_shell_integration::contract::transport::{
+    BridgeRefused, EventOutcome, decide_activated_modules,
+};
 use kr_shell_integration::host::phase::PhaseGate;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
@@ -311,11 +315,32 @@ struct LineCapability {
     prompt_generation: PromptGeneration,
 }
 
+/// Why this session's root integration was refused, kept for the answer to the create that is
+/// waiting on it.
+///
+/// It is stored when the refusal happens and kept through the session's closure and the
+/// connection's end, so the create says why it failed instead of that the session ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualificationRefusal {
+    /// The contract's refusal: its reason, and the error a create answers with.
+    pub refused: BridgeRefused,
+    /// What the host records about it beyond the answer: the module and where it was loaded from.
+    pub diagnostic: String,
+}
+
 /// The worker's side of the root-editor contract, driven against a real clock.
 pub struct FenceDriver {
     session_id: SessionId,
     machine: FenceMachine,
     phase: PhaseGate,
+    /// The editor ABI the bridge's declaration was accepted under, which the modules its shell
+    /// holds when the hooks go live are judged against.
+    reader_abi: String,
+    /// Why the root integration was refused, once it has been.
+    refusal: Option<QualificationRefusal>,
+    /// Whether a loss has ended this session's creation. There is no phase for a session that is
+    /// closing, so nothing that arrives afterwards may qualify it.
+    closing: bool,
     clock: std::sync::Arc<dyn ContinuousClock>,
     anchor: ContinuousInstant,
     hold: BTreeMap<InputRef, Held>,
@@ -396,6 +421,9 @@ impl FenceDriver {
             session_id,
             machine: FenceMachine::new(session_id, lease),
             phase: PhaseGate::unauthenticated(),
+            reader_abi: String::new(),
+            refusal: None,
+            closing: false,
             clock,
             anchor,
             hold: BTreeMap::new(),
@@ -634,8 +662,34 @@ impl FenceDriver {
     ///
     /// Returns false when this session had already authenticated one, which is not a promotion: a
     /// session that lost its integration does not get it back by registering again.
-    pub const fn registered(&mut self, kind: ShellKind) -> bool {
-        self.phase.authenticated(kind)
+    pub fn registered(&mut self, kind: ShellKind, editor_abi: &str) -> bool {
+        let moved = self.phase.authenticated(kind);
+        if moved {
+            editor_abi.clone_into(&mut self.reader_abi);
+        }
+        moved
+    }
+
+    /// Records a bridge the handshake refused, where the refusal is about what the shell can do.
+    ///
+    /// A refusal about who connected is not kept: the process that connected may be a child of the
+    /// root shell, and the root shell can still register. A refusal of the shell's own capability
+    /// (its editor ABI, its integration version, its module tree, the package it declares) is the
+    /// root shell's, so it is kept, and the create that is waiting on it answers with it rather
+    /// than waiting out its bound.
+    pub fn handshake_refused(&mut self, refused: &BridgeRefused) {
+        if refused.code() == ErrorCode::ShellIntegrationUnsupported && self.refusal.is_none() {
+            self.refusal = Some(QualificationRefusal {
+                refused: refused.clone(),
+                diagnostic: "refused at the handshake".to_owned(),
+            });
+        }
+    }
+
+    /// Why the root integration was refused, once it has been.
+    #[must_use]
+    pub const fn qualification_refusal(&self) -> Option<&QualificationRefusal> {
+        self.refusal.as_ref()
     }
 
     /// Returns the current reading of the session's continuous clock.
@@ -748,6 +802,7 @@ impl FenceDriver {
         let decision = self.phase.lost(loss);
         if decision.closes_session {
             effects.close_session = Some(loss);
+            self.closing = true;
         }
         // A session that can no longer hold a fence has no reader it can speak for, so the machine
         // is told the reader has gone. Without it the machine would keep a registered editor and
@@ -841,9 +896,29 @@ impl FenceDriver {
                 }
                 self.command_hook(CommandHook::Block(params.clone()))
             }
-            BridgeEvent::HooksActivated(_) => {
-                let _ = self.phase.qualified();
-                self.received()
+            BridgeEvent::HooksActivated(activated) => {
+                // Nothing qualifies a session that has been refused or whose creation a loss has
+                // ended: a report that follows either is about a session that is going.
+                if self.refusal.is_some() || self.closing {
+                    return self.received();
+                }
+                match decide_activated_modules(&self.reader_abi, &activated.modules) {
+                    Ok(()) => {
+                        let _ = self.phase.qualified();
+                        self.received()
+                    }
+                    Err(refused) => {
+                        let diagnostic = refused_module(&activated.modules);
+                        self.refusal = Some(QualificationRefusal {
+                            refused,
+                            diagnostic,
+                        });
+                        let mut effects =
+                            self.integration_lost(IntegrationLoss::PostStartupFailure);
+                        self.answer(&mut effects, EventOutcome::Received);
+                        effects
+                    }
+                }
             }
             BridgeEvent::GestureChanged(_) | BridgeEvent::PreEofConsumed(_) => self.received(),
             BridgeEvent::IntegrationLost(report) => {
@@ -1324,6 +1399,28 @@ fn detach_error(rejection: DetachRejection) -> ProtocolError {
     ProtocolError::new(rejection.code(), detail)
 }
 
+/// The module a refusal was about, as the host records it: its name, where it was loaded from and
+/// what was found. Mirrors the order [`decide_activated_modules`] names them in: a missing import
+/// first, then a module that was not read.
+fn refused_module(modules: &[LoadedModule]) -> String {
+    let named = modules
+        .iter()
+        .find(|module| matches!(module.imports, ModuleImports::Missing(_)))
+        .or_else(|| {
+            modules
+                .iter()
+                .find(|module| matches!(module.imports, ModuleImports::NotRead(_)))
+        });
+    named.map_or_else(String::new, |module| {
+        let found = match &module.imports {
+            ModuleImports::Missing(import) => format!("imports {import}"),
+            ModuleImports::NotRead(why) => format!("could not be read: {why}"),
+            ModuleImports::Bound => "binds".to_owned(),
+        };
+        format!("module {} ({}): {found}", module.name, module.path)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1334,7 +1431,8 @@ mod tests {
         KeyQueueSnapshot, LaunchCommand, PendingReaderInput, ReaderContext,
     };
     use kr_protocol::scalars::Uuid;
-    use kr_shell_integration::contract::events::HooksActivated;
+    use kr_shell_integration::contract::events::{HooksActivated, LoadedModule, ModuleImports};
+    use kr_shell_integration::contract::qualification::QualificationReason;
     use kr_transport::clock::ManualClock;
 
     use super::*;
@@ -1396,16 +1494,150 @@ mod tests {
     /// exchange that has not been answered.
     fn qualified(clock: &Arc<ManualClock>) -> FenceDriver {
         let mut driver = FenceDriver::new(session(), lease(), Arc::clone(clock) as Arc<_>);
-        assert!(driver.registered(ShellKind::Zsh));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
         let _ = driver.bridge_event(
             RequestId::new(1),
             &BridgeEvent::HooksActivated(HooksActivated {
                 session_id: session(),
                 prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
             }),
         );
         assert!(driver.phase().retains_fence());
         driver
+    }
+
+    fn activation(modules: Vec<LoadedModule>) -> BridgeEvent {
+        BridgeEvent::HooksActivated(HooksActivated {
+            session_id: session(),
+            prompt_generation: PromptGeneration::new(1),
+            modules,
+        })
+    }
+
+    fn a_module_that_needs(import: &str) -> LoadedModule {
+        LoadedModule {
+            name: "kr_user".to_owned(),
+            path: "/home/person/modules/kr_user.so".to_owned(),
+            imports: ModuleImports::Missing(import.to_owned()),
+        }
+    }
+
+    /// KR-REQ-07.87: modules that bind qualify the session as they always did.
+    #[test]
+    fn modules_that_bind_qualify_the_session() {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+        let effects = driver.bridge_event(
+            RequestId::new(1),
+            &activation(vec![LoadedModule {
+                name: "zsh/complete".to_owned(),
+                path: "/opt/kalareach/lib/zsh/5.9/zsh/complete.so".to_owned(),
+                imports: ModuleImports::Bound,
+            }]),
+        );
+        assert!(driver.phase().reports_ready());
+        assert!(effects.close_session.is_none());
+        assert!(driver.qualification_refusal().is_none());
+    }
+
+    /// KR-REQ-07.87, KR-REQ-07.88: a module that cannot bind is refused by name before the session
+    /// qualifies, and the session is closed with the refusal kept for the create answer.
+    #[test]
+    fn a_module_that_cannot_bind_is_refused_before_the_session_qualifies() {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+        let effects = driver.bridge_event(
+            RequestId::new(1),
+            &activation(vec![a_module_that_needs("zle_abi_newer_entry")]),
+        );
+        assert!(
+            !driver.phase().reports_ready(),
+            "a session with a module that cannot bind never reports ready"
+        );
+        assert_eq!(
+            effects.close_session,
+            Some(IntegrationLoss::PostStartupFailure),
+            "the creating session is closed"
+        );
+        let refusal = driver.qualification_refusal().expect("the refusal is kept");
+        assert_eq!(
+            refusal.refused.reason,
+            QualificationReason::ModuleTreeUnsupported
+        );
+        assert_eq!(
+            refusal.refused.error.message,
+            "module kr_user imports zle_abi_newer_entry, which this reader (zle-5.9) does not \
+             provide"
+        );
+        assert_eq!(
+            refusal.diagnostic,
+            "module kr_user (/home/person/modules/kr_user.so): imports zle_abi_newer_entry"
+        );
+    }
+
+    /// A session that has been refused, or has lost what it stood on and is closing, is not
+    /// promoted by a later report that the hooks are live.
+    #[test]
+    fn a_later_report_does_not_qualify_a_session_that_was_refused_or_is_closing() {
+        let mut refused = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(refused.registered(ShellKind::Zsh, "zle-5.9"));
+        let _ = refused.bridge_event(
+            RequestId::new(1),
+            &activation(vec![a_module_that_needs("zle_x")]),
+        );
+        let _ = refused.bridge_event(RequestId::new(2), &activation(Vec::new()));
+        assert!(!refused.phase().reports_ready());
+
+        let mut closing = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(closing.registered(ShellKind::PowerShell, "psreadline-2.3.4"));
+        let effects = closing.integration_lost(IntegrationLoss::PostStartupFailure);
+        assert!(effects.close_session.is_some());
+        let _ = closing.bridge_event(RequestId::new(1), &activation(Vec::new()));
+        assert!(
+            !closing.phase().reports_ready(),
+            "a session that is being closed is not qualified by a report that follows its loss"
+        );
+    }
+
+    /// A module that could not be read is not a pass either.
+    #[test]
+    fn a_module_that_could_not_be_read_is_refused_too() {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+        let effects = driver.bridge_event(
+            RequestId::new(1),
+            &activation(vec![LoadedModule {
+                name: "odd".to_owned(),
+                path: "/home/person/modules/odd.so".to_owned(),
+                imports: ModuleImports::NotRead("its file is not there".to_owned()),
+            }]),
+        );
+        assert!(!driver.phase().reports_ready());
+        assert!(effects.close_session.is_some());
+    }
+
+    /// A refusal at the handshake for what the package cannot do is kept for the create answer as
+    /// well; one that is about who connected is not, because the root shell may still register.
+    #[test]
+    fn only_a_refusal_about_the_shells_own_capability_is_kept_from_the_handshake() {
+        use kr_shell_integration::contract::transport::BridgeRefused;
+
+        let mut driver = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        driver.handshake_refused(&BridgeRefused::new(
+            QualificationReason::ProcessMismatch,
+            "a child shell",
+        ));
+        assert!(driver.qualification_refusal().is_none());
+        driver.handshake_refused(&BridgeRefused::new(
+            QualificationReason::EditorAbiUnsupported,
+            "editor ABI zle-5.8 is not one this build was qualified against",
+        ));
+        let kept = driver.qualification_refusal().expect("kept");
+        assert_eq!(
+            kept.refused.reason,
+            QualificationReason::EditorAbiUnsupported
+        );
     }
 
     #[test]

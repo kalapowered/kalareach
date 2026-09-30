@@ -111,7 +111,14 @@ impl BridgeServer {
             }
             let HandshakeOutcome::Accepted(accepted) = &outcome else {
                 // A refused bridge is told why and the connection ends. It is not a loss: nothing
-                // was registered, so there is nothing for the session to lose.
+                // was registered, so there is nothing for the session to lose. What the shell
+                // cannot do is kept for the create that is waiting on it, which then says why.
+                if let HandshakeOutcome::Refused(refused) = &outcome {
+                    let _ = self.runtime.drive_fence(|driver| {
+                        driver.handshake_refused(refused);
+                        crate::fence::Effects::default()
+                    });
+                }
                 continue;
             };
             let Some(observed) = observe(&peer).process else {
@@ -124,7 +131,7 @@ impl BridgeServer {
             {
                 let mut session = self.runtime.session();
                 if let Some(driver) = session.fence_mut() {
-                    let _ = driver.registered(hello.shell.kind);
+                    let _ = driver.registered(hello.shell.kind, &accepted.editor_abi);
                     driver.send_through(outbound);
                 }
                 session.record_root_integration(Registration::new(
@@ -497,7 +504,7 @@ mod tests {
             LeaseView::unheld(kr_protocol::ids::InputLeaseEpoch::new(0)),
             clock,
         );
-        assert!(driver.registered(ShellKind::Zsh));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
         session.install_fence(driver);
         session
     }
@@ -636,6 +643,7 @@ mod tests {
                 &BridgeEvent::HooksActivated(HooksActivated {
                     session_id,
                     prompt_generation: PromptGeneration::new(1),
+                    modules: Vec::new(),
                 }),
             );
             let _ = driver.bridge_event(
@@ -760,6 +768,7 @@ mod tests {
                 &BridgeEvent::HooksActivated(HooksActivated {
                     session_id,
                     prompt_generation: PromptGeneration::new(1),
+                    modules: Vec::new(),
                 }),
             );
             let entered = driver.bridge_event(
