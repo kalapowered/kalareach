@@ -251,10 +251,13 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 /// How long the system's own tool that says its version is given.
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How much of what a tool prints is kept.
+const TOOL_OUTPUT: usize = 4096;
+
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
-/// `within`, in which case it is ended. What it prints is read on a thread of its own, at most a
-/// few thousand bytes of it, so that a descendant that keeps the pipe open after the tool has
-/// exited holds the run for the bound and no longer.
+/// `within`, in which case it is ended. Its output is read without blocking, in the loop that waits
+/// for it to end, so that a descendant that keeps the pipe open after the tool has exited holds the
+/// run for the bound and no longer, and the pipe is closed with the run.
 fn run_bounded(
     program: &str,
     arguments: &[&str],
@@ -269,35 +272,61 @@ fn run_bounded(
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let stdout = child.stdout.take()?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.take(4096).read_to_end(&mut bytes);
-        let _ = sender.send(bytes);
-    });
+    let ended = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        ended(&mut child);
+        return None;
+    };
+    if rustix::fs::fcntl_setfl(&stdout, rustix::fs::OFlags::NONBLOCK).is_err() {
+        ended(&mut child);
+        return None;
+    }
     let deadline = std::time::Instant::now() + within;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+    let mut printed = Vec::new();
+    let mut status = None;
+    let mut open = true;
+    loop {
+        while open {
+            let mut buffer = [0_u8; 512];
+            match stdout.read(&mut buffer) {
+                Ok(0) => open = false,
+                Ok(read) => {
+                    let room = TOOL_OUTPUT.saturating_sub(printed.len());
+                    printed.extend_from_slice(&buffer[..read.min(room)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => open = false,
             }
         }
-    };
-    let printed = receiver
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .ok()?;
-    Some(std::process::Output {
-        status,
-        stdout: printed,
-        stderr: Vec::new(),
-    })
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(finished)) => status = Some(finished),
+                Ok(None) => {}
+                Err(_) => {
+                    ended(&mut child);
+                    return None;
+                }
+            }
+        }
+        if let Some(status) = status
+            && !open
+        {
+            return Some(std::process::Output {
+                status,
+                stdout: printed,
+                stderr: Vec::new(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            ended(&mut child);
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// This host's version of what a floor is a version of, where it can be read.
@@ -855,6 +884,43 @@ mod tests {
         let output = run_bounded("echo", &["hello"], std::time::Duration::from_secs(20))
             .expect("echo ends and says something");
         assert_eq!(output.stdout, b"hello\n");
+    }
+
+    /// When the bound of a tool that a descendant keeps the output of ends, this run's end of the
+    /// pipe is closed: nothing of it stays open, on a thread or otherwise, until the descendant
+    /// ends. A descendant that writes to it afterwards is ended by the broken pipe.
+    #[test]
+    fn a_tool_s_pipe_is_closed_when_its_bound_ends() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let after = |name: &str, writes: bool| {
+            let flag = directory.path().join(name);
+            let script = if writes {
+                "(sleep 1; echo late; : > \"$1\") & echo hello"
+            } else {
+                "(sleep 1; : > \"$1\") & echo hello"
+            };
+            assert!(
+                run_bounded(
+                    "sh",
+                    &["-c", script, "sh", &flag.display().to_string()],
+                    std::time::Duration::from_millis(300)
+                )
+                .is_none(),
+                "the descendant holds the pipe past the bound"
+            );
+            flag
+        };
+        let writing = after("writing", true);
+        let silent = after("silent", false);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(
+            silent.exists(),
+            "the control: a descendant that writes nothing goes on to its end"
+        );
+        assert!(
+            !writing.exists(),
+            "a descendant that writes to the pipe finds it closed"
+        );
     }
 
     /// A release's manifest that is a pipe is refused at once, and one that is a link is not
