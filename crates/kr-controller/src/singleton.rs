@@ -81,15 +81,27 @@ impl SingletonLock {
     ///
     /// Returns [`ControllerError::Ipc`] naming the file when it cannot be read.
     pub fn holder(path: &Path) -> Result<Option<u32>> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Ok(text.trim().parse().ok()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(ControllerError::Ipc(kr_ipc::IpcError::io(
-                "read the singleton lock",
-                path,
-                error,
-            ))),
-        }
+        let read = |error: std::io::Error| {
+            ControllerError::Ipc(kr_ipc::IpcError::io("read the singleton lock", path, error))
+        };
+        // Read without following a link or waiting for a writer, so that a pipe planted under the
+        // lock's name holds nothing up. The lock file is not one of the owner-only files: it is
+        // opened by every daemon and by an update, and its mode is not what makes it trusted.
+        #[cfg(unix)]
+        let bytes = match kr_ipc::install::read_regular_file(path, 64) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(read(error)),
+        };
+        #[cfg(not(unix))]
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(read(error)),
+        };
+        Ok(String::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok()))
     }
 
     /// Writes this process's identifier into the lock file, in place of whatever it held.
@@ -149,14 +161,30 @@ impl SingletonLock {
 
     #[cfg(unix)]
     fn open(path: &Path, _environment_id: EnvironmentId) -> Result<File> {
-        std::fs::OpenOptions::new()
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let opened = |error: std::io::Error| {
+            ControllerError::Ipc(kr_ipc::IpcError::io("open the singleton lock", path, error))
+        };
+        // Neither a link followed nor a pipe waited for: a pipe under this name would otherwise
+        // hold a daemon's start, or an update that holds the store's install lock, for as long as
+        // nothing read from it. The file is checked to be a regular one once it is open.
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
             .open(path)
-            .map_err(|error| {
-                ControllerError::Ipc(kr_ipc::IpcError::io("open the singleton lock", path, error))
-            })
+            .map_err(opened)?;
+        if !file.metadata().map_err(opened)?.is_file() {
+            return Err(opened(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "it is not a regular file",
+            )));
+        }
+        Ok(file)
     }
 
     #[cfg(unix)]
@@ -451,5 +479,63 @@ mod tests {
             "no daemon takes an environment an update holds"
         );
         drop(update);
+    }
+
+    /// A pipe or a link under the lock file's name is refused, and never waited for: nothing that
+    /// reads or takes the lock holds up a daemon's start, or an update that holds the store's
+    /// install lock, for as long as nothing writes to a pipe.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_a_link_under_the_lock_s_name_is_refused_and_not_waited_for() {
+        /// What `call` returns, or `None` when it has not returned within twenty seconds: a call
+        /// that waits for a writer never does.
+        fn within_twenty_seconds<T: Send + 'static>(
+            call: impl FnOnce() -> T + Send + 'static,
+        ) -> Option<T> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(call());
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .ok()
+        }
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment_id = host.environment_id();
+        let path = host.environment().singleton_lock();
+        let pipe = path.with_file_name("pipe.lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe is made");
+        let read = pipe.clone();
+        assert_eq!(
+            within_twenty_seconds(move || SingletonLock::holder(&read).is_err()),
+            Some(true),
+            "the holder is not read from a pipe, and the read does not wait for a writer"
+        );
+        let taken = pipe.clone();
+        assert_eq!(
+            within_twenty_seconds(move || SingletonLock::hold(&taken, environment_id).is_err()),
+            Some(true),
+            "an update does not hold an environment by a pipe"
+        );
+        let taken = pipe.clone();
+        assert_eq!(
+            within_twenty_seconds(move || SingletonLock::acquire(&taken, environment_id).is_err()),
+            Some(true),
+            "nor does a daemon take one by it"
+        );
+        // A link is not followed to a file elsewhere.
+        let elsewhere = path.with_file_name("elsewhere.lock");
+        std::fs::write(&elsewhere, b"").expect("a file elsewhere");
+        let link = path.with_file_name("link.lock");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("a link");
+        assert!(SingletonLock::hold(&link, environment_id).is_err());
+        assert!(SingletonLock::acquire(&link, environment_id).is_err());
+        // The control: a file of its own is held.
+        SingletonLock::hold(&path, environment_id).expect("a regular file is held");
     }
 }

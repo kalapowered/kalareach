@@ -171,8 +171,24 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
 /// Returns the failure to read the registry.
 pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Result<Vec<Holding>> {
     let database = environment.paths.registry_database();
-    if !database.exists() {
-        return Ok(Vec::new());
+    // Only a regular file is opened: a pipe under the registry's name would hold the update, which
+    // holds the install lock, for as long as nothing wrote to it.
+    match std::fs::symlink_metadata(&database) {
+        Ok(about) if about.is_file() => {}
+        Ok(_) => {
+            return Err(CliError::Other(shown!(
+                "environment {}'s registry is not a regular file",
+                environment.environment_id
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CliError::Other(shown!(
+                "environment {}'s registry could not be read: {}",
+                environment.environment_id,
+                Shown::io(&error)
+            )));
+        }
     }
     let (spawned, running, workers) = {
         let registry =

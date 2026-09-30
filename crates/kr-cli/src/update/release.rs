@@ -251,13 +251,17 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 /// How long the system's own tool that says its version is given.
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Runs `program` and returns what it printed, or nothing when it does not end within `within`,
-/// in which case it is ended. What it prints is short: a tool that fills its pipe is given up on.
+/// Runs `program` and returns what it printed, or nothing when it does not end and say it within
+/// `within`, in which case it is ended. What it prints is read on a thread of its own, at most a
+/// few thousand bytes of it, so that a descendant that keeps the pipe open after the tool has
+/// exited holds the run for the bound and no longer.
 fn run_bounded(
     program: &str,
     arguments: &[&str],
     within: std::time::Duration,
 ) -> Option<std::process::Output> {
+    use std::io::Read as _;
+
     let mut child = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
@@ -265,10 +269,17 @@ fn run_bounded(
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(4096).read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
     let deadline = std::time::Instant::now() + within;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -278,7 +289,15 @@ fn run_bounded(
                 return None;
             }
         }
-    }
+    };
+    let printed = receiver
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok()?;
+    Some(std::process::Output {
+        status,
+        stdout: printed,
+        stderr: Vec::new(),
+    })
 }
 
 /// This host's version of what a floor is a version of, where it can be read.
@@ -769,6 +788,21 @@ mod tests {
         assert!(
             began.elapsed() < std::time::Duration::from_secs(20),
             "the wait ended at its bound"
+        );
+        // A tool that ends while a descendant of it keeps its output open is not waited for past
+        // the bound either: the pipe stays open until the descendant ends.
+        let began = std::time::Instant::now();
+        assert!(
+            run_bounded(
+                "sh",
+                &["-c", "sleep 5 & echo hello"],
+                std::time::Duration::from_millis(300)
+            )
+            .is_none()
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(4),
+            "the wait ended at its bound, not when the descendant did"
         );
         // The control: a tool that ends is read.
         let output = run_bounded("echo", &["hello"], std::time::Duration::from_secs(20))
