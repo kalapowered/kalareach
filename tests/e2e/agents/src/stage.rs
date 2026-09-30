@@ -854,7 +854,14 @@ pub fn launch(
     // The last look before the agent's command is typed, once the session is set up.
     between();
     let typed_at = session.window.mark();
+    provenance.forget_started();
     session.window.type_text(format!("{line}\r").as_bytes());
+    // The shell writes the names it exports just before it runs the line: what the agent starts
+    // with, checked before anything is typed to it. An agent that started with a name the build
+    // list clears is ended with the part, having been sent nothing.
+    provenance
+        .check_cleared_at_start(Duration::from_secs(10))
+        .unwrap_or_else(|why| panic!("{why}"));
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let waited = Instant::now();
         loop {
@@ -885,11 +892,6 @@ pub fn launch(
         );
         std::panic::resume_unwind(panic);
     }
-    // The shell wrote the names it exported just before it ran the agent's line: the environment
-    // the agent has, checked before anything is typed to it.
-    provenance
-        .check_cleared_at_start()
-        .unwrap_or_else(|why| panic!("{why}"));
     let started = Instant::now();
     let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
@@ -1439,8 +1441,8 @@ mod tests {
             .args([
                 "-f",
                 "-c",
-                ". \"$ZDOTDIR/.zshrc\"; KR_SET_ONLY=1; kr_agents_path; \
-                 export KR_EXPORTED_LATE=1; kr_agents_started",
+                ". \"$ZDOTDIR/.zshrc\"; print -r -- \"${(j:,:)precmd_functions}:${(j:,:)preexec_functions}\"; \
+                 KR_SET_ONLY=1; kr_agents_path; export KR_EXPORTED_LATE=1; kr_agents_started",
             ])
             .env_clear()
             .env("ZDOTDIR", &directory)
@@ -1452,6 +1454,11 @@ mod tests {
         assert!(
             output.stderr.is_empty(),
             "the startup file prints nothing to the session: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "kr_agents_path:kr_agents_started\n",
+            "each hook is registered where the shell runs it, and the startup file prints nothing else"
         );
         let read = |file: &str| {
             std::fs::read_to_string(directory.join(file)).expect("the hook wrote its names")

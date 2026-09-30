@@ -1944,10 +1944,16 @@ impl Logged {
             Self::reach_composer(stage, variables, what, part, extra, ready)
         }))
         .unwrap_or_else(|panic| {
-            panic!(
-                "{LOGIN_UNPROVEN} the agent did not reach its composer with it: {}",
-                panic_text(&*panic)
-            )
+            // A session that ran something other than the build, or whose exported names refuse
+            // or could not be read, says so and is not a login that cannot be established.
+            let said = panic_text(&*panic);
+            if [NOT_PINNED, ENVIRONMENT_NOT_CLEAR, ENVIRONMENT_NOT_READ]
+                .iter()
+                .any(|prefix| said.starts_with(prefix))
+            {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("{LOGIN_UNPROVEN} the agent did not reach its composer with it: {said}")
         });
         // The composer's own screen says so where the agent found no login, before any turn.
         let account = stage.login.expect("a part with a login").account();
@@ -2443,7 +2449,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
                     .offered
                     .lock()
                     .map_err(|_| "the offered tools' record is poisoned".to_owned())?
-                    .push(json!({ "probe": probe.arguments, "tools": tools, "check": checked.as_ref().err().cloned().unwrap_or_else(|| "passed".to_owned()), "control": { "added": format!("nested control/{lacking}"), "server": of_a_server && !servers.is_empty(), "rejected": rejected } }));
+                    .push(json!({ "probe": probe.arguments, "tools": tools, "check": checked.as_ref().err().cloned().unwrap_or_else(|| "passed".to_owned()), "control": if of_a_server && !servers.is_empty() { json!({ "server": true, "rejected": rejected }) } else { json!({ "added": format!("nested control/{lacking}"), "server": false, "rejected": rejected }) } }));
                 checked?;
                 if rejected {
                     Ok(())

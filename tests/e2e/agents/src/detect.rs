@@ -723,6 +723,9 @@ fn stand_in_instance(plugin: &str) -> AgentInstanceSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::agent::AgentBindingState;
+    use kr_protocol::broker::CapabilityMap;
+    use kr_protocol::ids::LaunchProfileId;
 
     fn shown_with(instances: Vec<AgentInstanceSummary>) -> Shown {
         Shown {
@@ -786,6 +789,59 @@ mod tests {
         assert_eq!(
             cause(&launched(true), &shown_with(vec![instance()])),
             "no_binding"
+        );
+        // A binding a device can read, and each way it does not fit the instance.
+        let with_binding = |mode: IntegrationMode, profile: &str, live: Option<u64>| {
+            let mut announced = instance();
+            announced.profile_id = Nullable::some(LaunchProfileId::new("lp-1").expect("valid"));
+            let mut shown = shown_with(vec![announced]);
+            shown.binding = Some(AgentCapabilitiesResult {
+                binding: AgentBindingState {
+                    binding_revision: AgentBindingRevision::new(1),
+                    thread_id: Nullable::null(),
+                    turn_id: Nullable::null(),
+                    profile_id: Nullable::some(LaunchProfileId::new(profile).expect("valid")),
+                    mode,
+                    rich_mutations_suspended: false,
+                    suspension_reason: Nullable::null(),
+                },
+                capabilities: CapabilityMap {
+                    records: Vec::new(),
+                },
+            });
+            shown.live_bindings = live;
+            shown
+        };
+        assert_eq!(
+            cause(
+                &launched(true),
+                &with_binding(IntegrationMode::Gateway, "lp-1", Some(1))
+            ),
+            "binding_not_native_terminal"
+        );
+        assert_eq!(
+            cause(
+                &launched(true),
+                &with_binding(IntegrationMode::NativeTerminal, "lp-2", Some(1))
+            ),
+            "binding_profile"
+        );
+        for live in [None, Some(0)] {
+            assert_eq!(
+                cause(
+                    &launched(true),
+                    &with_binding(IntegrationMode::NativeTerminal, "lp-1", live)
+                ),
+                "no_live_binding"
+            );
+        }
+        assert!(
+            check_detected(
+                &launched(true),
+                &with_binding(IntegrationMode::NativeTerminal, "lp-1", Some(1))
+            )
+            .is_ok(),
+            "an instance that fits every check is detected"
         );
         let undetected = check_detected(&launched(true), &shown_with(vec![instance(), instance()]))
             .expect_err("two instances");
