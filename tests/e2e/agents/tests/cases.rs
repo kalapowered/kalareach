@@ -2692,6 +2692,11 @@ impl Logged {
         }
         confine_checks(stage, &mut logged);
         guards_hold(stage);
+        assert!(
+            !account.stop_before_turns,
+            "the part stops once the agent is up and the checks before its first turn have passed, \
+             as the build list asks: no turn was started"
+        );
         logged
     }
 
