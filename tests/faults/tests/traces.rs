@@ -39,11 +39,12 @@ fn a_takeover_during_a_paste_closes_it_and_refuses_the_rest_of_it() {
     replays("takeover-during-a-paste");
 }
 
-/// KR-REQ-27.05, expired grants and clock rollback; KR-REQ-29.03: a suspension between two expiry
-/// reads and two wall-clock rollbacks, replayed from their retained trace on simulated time: the
-/// sleep counts against a continuous deadline whichever read sees it first, a rollback inside the
-/// tolerance gives a UTC deadline nothing back, one past it leaves UTC deadlines unproven, and
-/// nothing expired revives.
+/// KR-REQ-27.05, clock rollback; KR-REQ-29.03: a suspension between two expiry reads and two
+/// wall-clock rollbacks, replayed from their retained trace on simulated time: the sleep counts
+/// against a continuous deadline whichever read sees it first, a rollback inside the tolerance
+/// gives a UTC deadline nothing back, one past it leaves UTC deadlines unproven, and nothing
+/// expired revives. The objects are the time contract's own; a grant store's expiry is the
+/// product's grant tests'.
 #[test]
 fn a_suspension_between_expiry_reads_and_a_rollback_past_the_tolerance() {
     replays("time-rollback-and-suspension");
@@ -65,8 +66,8 @@ fn a_clipboard_write_before_an_attach_is_never_performed_and_one_after_it_is_onc
     replays("clipboard-before-and-after-an-attach");
 }
 
-/// KR-REQ-27.05, a timeout; KR-REQ-29.03: a lone escape and the paste recogniser, replayed from the
-/// retained trace on simulated time: forwarded at once while the application has not asked for
+/// KR-REQ-29.03: a lone escape and the paste recogniser, replayed from the retained trace on
+/// simulated time: forwarded at once while the application has not asked for
 /// bracketed paste, and held after it has until the recogniser's deadline passes, then released by
 /// its timer with no further keystroke.
 #[test]
