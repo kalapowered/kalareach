@@ -970,6 +970,198 @@ async fn kr_req_11_08_an_older_generation_is_a_rollback_and_the_current_one_stay
     );
 }
 
+/// A role that ends the search names no package, and a later sibling over the same paths holds
+/// one: the client stops at the first role, so the package resolves through none and the generation
+/// is refused. The same generation with a first role that does not end the search resolves the
+/// package through the sibling, so the refusal is the terminating role's and not the layout's.
+#[tokio::test]
+async fn kr_req_11_08_a_terminating_role_ends_a_search_a_later_sibling_could_answer() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let ending = Generation::build(
+        home.path(),
+        GenerationSpec {
+            shadow_role: Some(true),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &ending,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("the first role ends the search before the sibling that holds the package");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
+    assert!(
+        refusal
+            .to_string()
+            .contains("could not be resolved through delegation"),
+        "{refusal}"
+    );
+    assert!(
+        catalogue.index(&repository()).is_err(),
+        "nothing is activated when a package resolves through no role"
+    );
+
+    let other = tempfile::tempdir().expect("a temporary directory");
+    let passing = Generation::build(
+        other.path(),
+        GenerationSpec {
+            shadow_role: Some(false),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        other.path(),
+        &passing,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("the search goes on to the sibling that holds the package");
+    let roles: BTreeSet<&str> = outcome
+        .delegations
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect();
+    assert_eq!(roles, BTreeSet::from(["shadow", "holder"]));
+    catalogue
+        .activate_package(
+            &repository(),
+            &plugin(),
+            &version(),
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect("the package resolves through the later sibling");
+}
+
+/// A newer targets version that no longer carries the delegation that signed a package is not
+/// accepted, and the generation this host accepted before it stays active with its installed
+/// package. Under the same root the client refuses it as a rollback of the role the older snapshot
+/// listed. Under a rotated root, which starts the snapshot's versions again, the metadata is
+/// accepted and the refusal is that the index lists a package no role signs. The same newer
+/// generation that keeps the delegation is accepted, so the refusal is the removal's.
+#[tokio::test]
+async fn kr_req_11_08_a_delegation_a_newer_targets_version_removes_stops_resolving_its_packages() {
+    for rotated in [false, true] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(
+            home.path(),
+            GenerationSpec {
+                delegation_chain: 1,
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.sync(&repository()).await.expect("generation one");
+        catalogue
+            .install(
+                &repository(),
+                environment(),
+                &plugin(),
+                &version(),
+                generation.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await
+            .expect("installed out of the accepted generation");
+
+        // A rotated root is the same root for both of generation two's publications.
+        let next_keys = KeySet::generate();
+        // Generation two lists the package and names no role that signs it.
+        let removed = GenerationSpec {
+            generation: 2,
+            package_unsigned: true,
+            root_version: if rotated { 2 } else { 1 },
+            keys: rotated.then(|| next_keys.clone()),
+            ..GenerationSpec::default()
+        };
+        if rotated {
+            generation.rotate_to(removed).await;
+        } else {
+            generation.rewrite_with(removed).await;
+        }
+        let refusal = catalogue
+            .sync(&repository())
+            .await
+            .expect_err("the delegation is gone");
+        assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted, "{rotated}");
+        let expected = if rotated {
+            "could not be resolved through delegation"
+        } else {
+            "appears in snapshot version 1 but not version 2"
+        };
+        assert!(
+            refusal.to_string().contains(expected),
+            "rotated {rotated}: {refusal}"
+        );
+        assert_eq!(
+            catalogue
+                .index(&repository())
+                .expect("activated")
+                .generation
+                .get(),
+            1,
+            "rotated {rotated}: the accepted generation stays active"
+        );
+        let store = catalogue.store(&repository()).expect("enrolled");
+        assert!(complete(&store, generation.manifest_digest()));
+        catalogue
+            .activate_package(
+                &repository(),
+                &plugin(),
+                &version(),
+                FetchReason::ExplicitInstall,
+            )
+            .await
+            .expect("the accepted generation still resolves its package through its delegation");
+
+        // Control: generation two that keeps the delegation is accepted.
+        let kept = GenerationSpec {
+            generation: 2,
+            delegation_chain: 1,
+            root_version: if rotated { 2 } else { 1 },
+            keys: rotated.then_some(next_keys),
+            ..GenerationSpec::default()
+        };
+        if rotated {
+            generation.rotate_to(kept).await;
+        } else {
+            generation.rewrite_with(kept).await;
+        }
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a newer generation that keeps the delegation");
+        assert_eq!(
+            catalogue
+                .index(&repository())
+                .expect("activated")
+                .generation
+                .get(),
+            2,
+            "rotated {rotated}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-11.09: expiry blocks new generations; pinned packages stay usable offline
 // ---------------------------------------------------------------------------------------------
@@ -5002,6 +5194,131 @@ async fn kr_ac_017_catalogue_search_does_not_hold_the_runtime_a_terminal_shares(
     assert_eq!(searched.await.expect("the search finished"), 2_000);
     ticker.await.expect("the ticker finished");
     assert_eq!(ticks.load(std::sync::atomic::Ordering::Relaxed), 200);
+}
+
+/// A signed generation whose index lists ten thousand entries: the example package, published
+/// with its files, and 9,999 definitions pinned by their declared digests with no file behind them.
+async fn ten_thousand_entries(home: &std::path::Path) -> Generation {
+    Generation::build(
+        home,
+        GenerationSpec {
+            listed_only: support::synthetic_index(9_999).entries,
+            ..GenerationSpec::default()
+        },
+    )
+    .await
+}
+
+/// A repository of ten thousand entries is synchronised as one signed snapshot under the default
+/// budgets, and then, with the repository out of reach, the whole index is searched and matched,
+/// a payload nobody has fetched is unavailable offline, and the one package that was installed is
+/// fetched by its hash and enabled without the repository.
+#[tokio::test]
+async fn kr_req_11_04_a_signed_ten_thousand_entry_snapshot_syncs_and_serves_offline() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = ten_thousand_entries(home.path()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("a signed ten-thousand-entry generation under the default budgets");
+    assert_eq!(outcome.generation.get(), 1);
+    assert_eq!(outcome.entries, 10_000);
+    assert_eq!(outcome.mirrored_payloads, 0);
+    assert!(
+        outcome.index_bytes > 10 * 1024 * 1024,
+        "the index is {} bytes",
+        outcome.index_bytes
+    );
+    // The snapshot is metadata: the index and the signed documents, and no payload of any entry.
+    assert_eq!(metered.fetches("/index.json"), 1);
+    assert_eq!(
+        metered.fetches("/packages/"),
+        0,
+        "a sync fetches no payload"
+    );
+
+    // A payload is fetched by its hash when the owner installs it, and only that one.
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the installed package is fetched by its hash");
+    assert!(metered.fetches("/packages/kalareach/example-declarative/0.1.0/") >= 1);
+    assert_eq!(
+        metered.fetches("/packages/") - metered.fetches("/packages/kalareach/example-declarative/"),
+        0,
+        "no other package was fetched"
+    );
+    let fetches = metered.fetches("/");
+
+    generation.take_offline();
+
+    // The whole index is searched and matched offline.
+    let index = catalogue.index(&repository()).expect("the index is here");
+    assert_eq!(index.entries.len(), 10_000);
+    assert_eq!(support::search_len(&index, "agent-7421"), 1);
+    assert_eq!(support::search_len(&index, "agent-"), 9_999);
+    assert_eq!(support::search_len(&index, "nothing here"), 0);
+    assert_eq!(
+        catalogue
+            .search(&repository(), "agent-9998", 10)
+            .expect("offline")
+            .len(),
+        1
+    );
+    let lookup = MatchIndex::build(&index);
+    for ordinal in 0..9_999u32 {
+        let found = lookup.candidates(&Observation {
+            executable_path: format!("/usr/local/bin/agent-{ordinal}"),
+            distribution: None,
+        });
+        assert_eq!(found.len(), 1, "agent-{ordinal}");
+    }
+
+    // A payload that was never fetched is unavailable, not a capability this host invented.
+    let uncached = PluginId::new("kalareach/agent-7421").expect("a valid plugin identifier");
+    let refusal = catalogue
+        .activate_package(
+            &repository(),
+            &uncached,
+            &version(),
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect_err("nothing to fetch it from");
+    assert_eq!(refusal.code(), ErrorCode::PackageUnavailableOffline);
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(absent(&store, PayloadDigest::of(b"agent-7421")));
+
+    // What was installed is here, at the hash it was installed at, and enables without the
+    // repository.
+    assert!(complete(&store, generation.manifest_digest()));
+    let enabled = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("what is installed enables offline");
+    assert!(enabled.enabled);
+    assert_eq!(
+        metered.fetches("/"),
+        fetches,
+        "nothing was fetched after the repository went away"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
