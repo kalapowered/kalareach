@@ -728,7 +728,6 @@ impl Host {
         path
     }
 
-    /// Runs a program with this host's roots and nothing of this test's own environment.
     /// Runs a program with this host's roots and nothing of this test's own environment, and fails
     /// the test, ending the program, when it has not ended within five minutes: a program that
     /// waits for a writer for ever does not hang the suite.
@@ -1669,8 +1668,8 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
         message.contains(&format!(
             "environment {}'s registry could not be read: ",
             other.environment_id()
-        )),
-        "{said}"
+        )) && message.contains("not a file"),
+        "the pipe is refused by the reader, and never opened: {said}"
     );
     assert!(
         message.contains("A control daemon the update stopped did not start again"),
