@@ -11,6 +11,11 @@ name: package-npm
 # organisation, the package's trusted publisher for this workflow file) belongs to the person who
 # owns the organisation.
 #
+# The bytes are bound end to end: the check job records the sha512 of the archive it approved, and
+# the publish job downloads the release again after the approval and refuses any archive whose
+# sha512 is not that one. Both refuse a release that is not immutable, so an asset cannot be
+# replaced between the check and the publish.
+#
 # A run started by hand rehearses everything up to that gate: it packs the checked-out commit with
 # the release script, checks and dry-runs the result, and reaches the gated job, which refuses to
 # publish anything that is not a tagged release.
@@ -37,6 +42,8 @@ jobs:
     name: check the archive
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      sha512: ${{ steps.approved.outputs.sha512 }}
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -75,30 +82,34 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       # A tagged run takes the archive the release published, once the release is public: the
-      # release workflow runs beside this one on the same tag, so it may not exist yet. What was
-      # downloaded is held to the release's own sha512 before anything reads it.
+      # release workflow runs beside this one on the same tag, so it may not exist yet. Each attempt
+      # downloads into a directory of its own, so a partial file never blocks the next one. What was
+      # downloaded is held to the release's own sha512 before anything reads it, and the release has
+      # to be immutable, so its assets cannot be replaced afterwards.
       - name: Take the archive from the release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
           attempt=1
-          until gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --dir "$RUNNER_TEMP/release" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS; do
-            if [ "$attempt" -ge 60 ]; then
-              echo "$GITHUB_REF_NAME has no published release with the SDK archive after thirty minutes." >&2
+          until directory="$(mktemp -d "$RUNNER_TEMP/release.XXXXXX")" &&
+              gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --dir "$directory" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS; do
+            if [ "$attempt" -ge 100 ]; then
+              echo "$GITHUB_REF_NAME has no published release with the SDK archive after fifty minutes." >&2
               exit 1
             fi
             attempt=$((attempt + 1))
             sleep 30
           done
-          cd "$RUNNER_TEMP/release"
+          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .immutable)"
+          [ "$immutable" = true ] || { echo "The release for $GITHUB_REF_NAME is not immutable." >&2; exit 1; }
+          cd "$directory"
           set -- kalareach-plugin-sdk-*.tgz
           [ "$#" -eq 1 ] || { echo "Expected one SDK archive, found: $*" >&2; exit 1; }
           grep -v '^#' SHA512SUMS | grep -F -- "  $1" | sha512sum -c -
-          echo "ARCHIVE=$RUNNER_TEMP/release/$1" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$directory/$1" >> "$GITHUB_ENV"
 
       # A rehearsal packs this commit as a release would, with the release's own script.
       - name: Pack the archive from this commit
@@ -120,6 +131,11 @@ jobs:
 
       - name: Hold the archive to npm's own pack
         run: python3 scripts/check-release-npm.py check --archive "$ARCHIVE"
+
+      # What the publish job will be held to.
+      - name: Record the approved archive's digest
+        id: approved
+        run: echo "sha512=$(sha512sum "$ARCHIVE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Ask npm what publishing would do
         run: npm publish "$ARCHIVE" --dry-run --access public
@@ -152,19 +168,31 @@ jobs:
       - name: Install npm
         run: npm install --global "npm@$NPM_VERSION"
 
-      - name: Take the archive from the release
+      # After the approval, the release is read again, and what is published is the archive the
+      # check approved: any other digest ends the job before npm is asked anything.
+      - name: Take the approved archive from the release
         env:
           GH_TOKEN: ${{ github.token }}
+          APPROVED_SHA512: ${{ needs.check.outputs.sha512 }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
+          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .immutable)"
+          [ "$immutable" = true ] || { echo "The release for $GITHUB_REF_NAME is not immutable." >&2; exit 1; }
+          directory="$(mktemp -d "$RUNNER_TEMP/release.XXXXXX")"
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --dir "$RUNNER_TEMP/release" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS
-          cd "$RUNNER_TEMP/release"
+            --dir "$directory" --pattern 'kalareach-plugin-sdk-*.tgz' --pattern SHA512SUMS
+          cd "$directory"
           set -- kalareach-plugin-sdk-*.tgz
           [ "$#" -eq 1 ] || { echo "Expected one SDK archive, found: $*" >&2; exit 1; }
           grep -v '^#' SHA512SUMS | grep -F -- "  $1" | sha512sum -c -
-          echo "ARCHIVE=$RUNNER_TEMP/release/$1" >> "$GITHUB_ENV"
+          case "$APPROVED_SHA512" in
+            *[!0-9a-f]* | '') echo "The check job recorded no digest." >&2; exit 1 ;;
+          esac
+          [ "$(sha512sum "$1" | cut -d' ' -f1)" = "$APPROVED_SHA512" ] || {
+            echo "This archive is not the one the check job approved." >&2
+            exit 1
+          }
+          echo "ARCHIVE=$directory/$1" >> "$GITHUB_ENV"
 
       - name: Publish with provenance
         run: npm publish "$ARCHIVE" --provenance --access public
