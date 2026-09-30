@@ -1259,10 +1259,103 @@ kind is rate limited to one per second and the suppressed count travels with the
 through. A suppressed diagnostic is still counted, because "this happened 40,000 times" is the
 interesting part.
 
+## Physical terminals compared with the grid
+
+Direct mode hands a physical terminal the session's own bytes, so it holds only where the terminal
+puts its cursor where the canonical grid does. `kr-term-probe` measures that. It runs in the window
+it is started in, and for each of 136 steps it writes a full reset, the step's bytes and a cursor
+position report, and compares the answer with the cursor a canonical grid of the same size holds
+after the same bytes. The steps cover cursor addressing, delayed wrap at the last column, scroll
+regions and left and right margins, tabs, backspace at the edges, wide characters, combining marks,
+emoji sequences, ambiguous-width characters, the alternate screen and the control characters that
+move the cursor. Each answer is read up to the reply to primary device attributes, which every
+terminal gives last, so a terminal that ignores the report is recorded as silent and not taken for
+one that answers wrongly.
+
+Each run writes a record to `fixtures/terminal/physical/<terminal>-<version>.json`: the launcher's
+own reading of the application (its bundle, its version, its profile settings and the environment
+its window started programs with), the terminal's answers to the version query and the device
+attributes, and for every step the bytes, the terminal's position, the grid's and whether they
+agree. A test holds each record to the corpus and to the grid as it is now, so a change to either
+has to arrive with a new record.
+
+Two terminals were measured on macOS 26.6 (`arm64`), each in a window it opened for a script the
+test made, with no Apple Event sent:
+
+| Terminal | Version | Window | Steps | Agree | Differ | Silent |
+| --- | --- | --- | --- | --- | --- | --- |
+| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 115 | 21 | 0 |
+| iTerm2 | 3.7.1 | 179 by 39 | 136 | 121 | 15 | 0 |
+
+The table lists every step on which either terminal differs. A cell gives the grid's position, then
+the terminal's in bold, as row and column; `agrees` means the two match. The grid is not changed to
+follow a terminal, and a difference is a finding, not a fault in either side.
+
+| Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 39 |
+| --- | --- | --- | --- |
+| `addressing.clamps-to-the-corner` | `\e[9999;9999H` | 24;81 / **24;80** | 39;180 / **39;179** |
+| `addressing.save-and-restore-csi` | `\e[5;6H\e[s\e[1;1H\e[u` | 5;6 / **1;1** | agrees |
+| `autowrap.pending-then-left` | `a×80\e[D` | 1;79 / **1;80** | 1;178 / **1;179** |
+| `autowrap.pending-survives-save-and-restore` | `a×80\e7\e[H\e8x` | 2;2 / **1;80** | 2;2 / **1;179** |
+| `autowrap.last-row-scrolls` | `\e[24;1Ha×81` | 24;2 / **24;80** | agrees |
+| `autowrap.insert-mode-at-the-edge` | `\e[4h\e[1;80Hxy` | 2;2 / **1;80** | agrees |
+| `margins.reverse-index-at-the-top-of-the-screen` | `\e[5;10r\e[1;3H\eM` | 1;3 / **24;3** | agrees |
+| `margins.down-stops-at-the-bottom-margin` | `\e[5;10r\e[6;3H\e[99B` | 10;3 / **24;3** | agrees |
+| `margins.up-stops-at-the-top-margin` | `\e[5;10r\e[8;3H\e[99A` | 5;3 / **1;3** | agrees |
+| `margins.left-and-right-margins-wrap` | `\e[?69h\e[5;20s\e[1;5H01234567890123456789x` | 2;10 / **1;26** | agrees |
+| `margins.left-and-right-margins-clamp` | `\e[?69h\e[5;20s\e[1;7H\e[99C` | 1;20 / **1;80** | agrees |
+| `margins.return-goes-to-the-left-margin` | `\e[?69h\e[5;20s\e[1;9H\r` | 1;5 / **1;1** | agrees |
+| `wide.wide-character-one-cell-from-the-edge` | `a×79\u3042` | agrees | 1;179 / **2;3** |
+| `wide.wide-character-two-cells-from-the-edge` | `a×78\u3042` | 1;79 / **1;80** | 1;178 / **1;179** |
+| `combining.at-the-start-of-a-line` | `\u0301` | agrees | 1;1 / **1;2** |
+| `combining.devanagari-conjunct` | `\u0915\u094D\u0937\u093F` | 1;3 / **1;4** | 1;3 / **1;4** |
+| `combining.zero-width-space` | `a\u200Bb` | 1;3 / **1;4** | 1;3 / **1;4** |
+| `combining.zero-width-joiner-between-latin` | `a\u200Db` | 1;3 / **1;4** | agrees |
+| `combining.soft-hyphen` | `a\u00ADb` | 1;3 / **1;4** | agrees |
+| `emoji.text-default-with-emoji-selector` | `\u2764\uFE0F` | agrees | 1;2 / **1;3** |
+| `emoji.keycap-sequence` | `1\uFE0F\u20E3` | 1;2 / **1;3** | agrees |
+| `emoji.regional-indicator-pair` | `\u1F1FA\u1F1F8` | agrees | 1;3 / **1;5** |
+| `emoji.two-flags-back-to-back` | `\u1F1FA\u1F1F8\u1F1EC\u1F1E7` | agrees | 1;5 / **1;9** |
+| `emoji.joined-family` | `\u1F468\u200D\u1F469\u200D\u1F467` | 1;7 / **1;9** | 1;7 / **1;3** |
+| `emoji.joined-family-then-ascii` | `\u1F468\u200D\u1F469\u200D\u1F467a` | 1;8 / **1;10** | 1;8 / **1;4** |
+| `emoji.emoji-one-cell-from-the-edge` | `a×79\u1F600` | agrees | 1;179 / **2;3** |
+| `alternate-screen.save-and-restore-by-mode` | `\e[5;6H\e[?1048h\e[1;1H\e[?1048l` | 5;6 / **1;1** | agrees |
+| `controls.line-feed-mode-adds-a-return` | `\e[20habc\n` | agrees | 2;1 / **2;4** |
+
+What the records show:
+
+- **Both terminals answer alike and the grid differs.** A column past the right edge in `CSI H`
+  leaves the grid's cursor one column beyond the last, where both terminals answer the last column
+  (`addressing.clamps-to-the-corner`). A wide character that ends exactly at the last column leaves
+  the grid's cursor one column short of the last where both answer the last
+  (`wide.wide-character-two-cells-from-the-edge`). A cursor-left after a full row moves the grid's
+  cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A zero-width space
+  and a Devanagari conjunct take a cell more in both than the grid's width model gives them. In
+  these the two terminals agree with each other and the grid is the one apart; which of them
+  is right is a question for the profile, not something the records decide.
+- **Terminal.app alone differs on** the save and restore forms `CSI s`, `CSI u` and mode 1048, on
+  left and right margins (mode 69), on cursor movement inside a scroll region, on reverse index at
+  the top of the screen when a region is set, on a wrap on the last row and in insert mode, on the
+  zero-width joiner, the soft hyphen and the keycap sequence.
+- **iTerm2 alone differs on** a wide character or an emoji one column from the edge, which it wraps
+  as xterm does where the grid and Terminal.app leave it on the last row; on a combining mark at
+  the start of a line, which it gives a cell of its own; on the emoji presentation selector, which
+  makes U+2764 two cells; on regional-indicator pairs and flags, which it draws four cells wide
+  where the grid and Terminal.app draw two; on a joined family, which it draws as one cluster of
+  two cells where the grid gives six and Terminal.app eight; and on line-feed mode, which it does
+  not apply.
+
+The remainder of the matrix in section 27 (Ghostty, WezTerm, VS Code's terminal, a VTE terminal and
+Windows Terminal) has not been measured here. `QUALIFIED_TERMINALS` stays a list of `TERM` names
+the client reports: a `TERM` names an entry, not a build or a configuration, and these records show
+that two builds that both report `xterm-256color` disagree with each other and with the grid on
+rules a direct attachment depends on.
+
 ## Fixtures
 
 `fixtures/terminal/` holds eight files, generated from the corpus in
-`crates/kr-term/src/conformance.rs`.
+`crates/kr-term/src/conformance.rs`, and the records of physical terminals measured with
+`kr-term-probe`.
 
 | File | What it pins | Requirements |
 | --- | --- | --- |
@@ -1274,6 +1367,7 @@ interesting part.
 | `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves, the same on every supported host | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
+| `physical/*.json` | One physical terminal build's cursor answers to the probe corpus, beside the grid's | KR-REQ-08.03 |
 
 Every case records the classes, the dispositions, the spans, the forwarded byte ranges, the replies,
 the side effects and the diagnostics. Three assertions hold across the whole corpus: the grid
