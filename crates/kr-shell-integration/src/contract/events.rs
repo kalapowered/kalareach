@@ -457,9 +457,9 @@ pub struct LoadedModule {
 /// arrives, rich launch and a ready or create success stay disabled, because a startup file could
 /// still replace the reader or fail.
 ///
-/// It also carries the dynamic modules the shell holds by then. The handshake is made before any
-/// startup file runs, so a module a startup file loads is not there to be judged when the
-/// declaration is; here it is, and [`decide_activated_modules`](crate::contract::transport::decide_activated_modules)
+/// It also carries the dynamic modules the shell holds by then. The handshake is made when the
+/// editor is set up, which can be before a startup file has run, so a module a startup file loads
+/// may not be there to be judged when the declaration is; here every one of them is, and [`decide_activated_modules`](crate::contract::transport::decide_activated_modules)
 /// judges the list before the session qualifies. A shell with nothing to say about its modules
 /// sends none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

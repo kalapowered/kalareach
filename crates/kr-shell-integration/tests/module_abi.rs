@@ -7,9 +7,10 @@
 //! (`tests/shells/zsh/native-module-abi/`), and each is loaded by a startup file into the packaged
 //! shell.
 //!
-//! The bridge makes its handshake when the editor module is set up, before any startup file runs,
-//! so a module a startup file loads is not yet there to be judged. It is judged where qualification
-//! completes, after the startup files: the report that the hooks are live lists each dynamic module
+//! The bridge makes its handshake when the editor module is set up, which a shell does on demand:
+//! before a startup file that loads the editor first, after one that does not. A module a startup
+//! file loads may therefore not be there yet to be judged when the declaration is made. It is judged
+//! where qualification completes, after every startup file: the report that the hooks are live lists each dynamic module
 //! the shell holds and says whether the running shell provides every name it imports, and the
 //! worker's contract decision refuses the session on the first that does not. A module built
 //! against a newer editor calls a function this one does not have; the shell loads it without

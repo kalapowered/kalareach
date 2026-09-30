@@ -859,8 +859,8 @@ kr_open_answer(kr_cbor_writer *writer, unsigned long long id, const char *name)
  * editor is one whose imports this reader does not provide: a function it has never had or has
  * since renamed. The shell loads modules lazily, so such a module loads without complaint and
  * fails at the first call that needs the missing name, which is a shell that ends in the middle of
- * a command. The handshake is made before any startup file has run, so it cannot see a module a
- * startup file loads. When the user-facing hooks are reported live, which is after the person's
+ * a command. The handshake is made when the editor is set up, which can be before a startup file has
+ * run, so it may not see a module a startup file loads. When the user-facing hooks are reported live, which is after the person's
  * startup files, this reads the imports of every dynamic module the shell holds that did not come
  * with the package, and the report says for each whether every name it imports is provided.
  *
