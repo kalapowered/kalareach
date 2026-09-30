@@ -19,7 +19,12 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    /// Builds a failure with an explicit code.
+    /// Builds a failure with an explicit code, and the action the code maps to.
+    ///
+    /// The code says what a host, or this application, refused. What the person can do about it is
+    /// what the code alone supports, which is right for a host's refusal and for a failure with no
+    /// cause of this application's own. A refusal whose cause this application knows is built
+    /// with [`Self::stated`] instead.
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -29,25 +34,42 @@ impl CommandError {
         }
     }
 
+    /// Builds a failure this application refuses with, for a cause it knows, in words that say what
+    /// is wrong.
+    ///
+    /// The action a code maps to is written for a host's refusal: an invalid argument there is two
+    /// builds that disagree, so it names an update. Here the words already say what is wrong (which
+    /// limit, which file, which input the program cannot read), and nothing they say is helped by
+    /// an update, a wait or a change of setting, so the person is asked nothing more.
+    #[must_use]
+    pub fn stated(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            user_action: kr_client::retry::UserAction::Nothing.as_str().into(),
+        }
+    }
+
     /// The failure for a request this application refuses to make at all.
     #[must_use]
     pub fn refused(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::PermissionDenied, message)
+        Self::stated(ErrorCode::PermissionDenied, message)
     }
 
     /// The failure for a parameter that cannot be what it claims to be.
     #[must_use]
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::InvalidArgument, message)
+        Self::stated(ErrorCode::InvalidArgument, message)
     }
 
     /// The failure for a request that exceeded a bound this application applies.
     ///
     /// `QUOTA_EXCEEDED` is the protocol's word for an exhausted allowance, and the import limit is
-    /// one: the same request will not succeed until the allowance changes.
+    /// one: the same request will not succeed until the allowance changes, so waiting is not what
+    /// the person is asked to do.
     #[must_use]
     pub fn too_large(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::QuotaExceeded, message)
+        Self::stated(ErrorCode::QuotaExceeded, message)
     }
 
     /// The failure for an operation that needs a host connection this application does not have.
@@ -119,5 +141,85 @@ mod tests {
     fn a_size_refusal_is_an_exhausted_allowance_rather_than_an_internal_failure() {
         let error = CommandError::too_large("the image exceeds the import limit");
         assert_eq!(error.code, ErrorCode::QuotaExceeded);
+    }
+
+    /// The action a failure names, as the page reads it.
+    fn action(error: &CommandError) -> &str {
+        &error.user_action
+    }
+
+    /// A file above the size limit is a limit that does not move: waiting does not lift it, and
+    /// the words already say what to do.
+    #[test]
+    fn a_file_above_the_size_limit_asks_nothing_more_of_the_person() {
+        let error = crate::transfers::HandedFile::new(
+            vec![0; crate::transfers::MAX_HANDED_BYTES + 1],
+            "movie.mov",
+        )
+        .expect_err("above the limit");
+        assert_eq!(error.code, ErrorCode::QuotaExceeded);
+        assert_eq!(action(&error), "nothing");
+        assert_eq!(
+            action(&CommandError::too_large("the image exceeds the limit")),
+            "nothing"
+        );
+    }
+
+    /// A dropped folder is not a file, and the words say so: an update would not change it.
+    #[test]
+    fn a_dropped_folder_asks_nothing_more_of_the_person() {
+        let folder = tempfile::tempdir().expect("a folder");
+        let error = crate::transfers::DroppedFile::open(folder.path()).expect_err("not a file");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(action(&error), "nothing");
+    }
+
+    /// The application's own refusal of what it was handed says what is wrong in its words.
+    #[test]
+    fn a_refusal_the_application_makes_itself_asks_nothing_more_of_the_person() {
+        let invalid = CommandError::invalid("that is not a session identifier");
+        assert_eq!(
+            (invalid.code, action(&invalid)),
+            (ErrorCode::InvalidArgument, "nothing")
+        );
+        let refused = CommandError::refused("the scheme is not one this application opens");
+        assert_eq!(
+            (refused.code, action(&refused)),
+            (ErrorCode::PermissionDenied, "nothing")
+        );
+    }
+
+    /// Controls: a failure with no cause of the application's own keeps the action its code maps
+    /// to, whether a host sent it or the application named the code without a cause.
+    #[test]
+    fn a_failure_with_no_cause_of_its_own_keeps_the_action_its_code_maps_to() {
+        for (code, expected) in [
+            (ErrorCode::QuotaExceeded, "wait"),
+            (ErrorCode::InvalidArgument, "update"),
+            (ErrorCode::PermissionDenied, "fix_configuration"),
+            (ErrorCode::InputIncompatible, "update"),
+            (ErrorCode::OutcomeUnknown, "check_the_outcome"),
+        ] {
+            assert_eq!(
+                action(&CommandError::new(code, "a plain message")),
+                expected,
+                "{code:?}"
+            );
+            let host = kr_protocol::error::ProtocolError::new(code, "the host's words");
+            assert_eq!(
+                action(&CommandError::from(host)),
+                expected,
+                "a host's {code:?}"
+            );
+        }
+        assert_eq!(
+            action(&CommandError::local_failure("a step did not finish")),
+            "wait"
+        );
+        assert_eq!(
+            action(&CommandError::unavailable("the host is not in contact")),
+            "wait"
+        );
+        assert_eq!(action(&CommandError::not_connected()), "fix_configuration");
     }
 }
