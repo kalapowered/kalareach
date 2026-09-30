@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use kr_client::shown;
-use kr_client::shown::Shown;
+use kr_client::shown::{Said as _, Shown};
 use kr_controller::singleton::SingletonLock;
 use kr_ipc::client::LocalClient;
 use kr_ipc::install::Store;
@@ -312,7 +312,7 @@ pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
     let deadline = tokio::time::Instant::now() + DAEMON_STOP;
     while held(store, environment, INSTALL_LOCK_WAIT).await? {
         if tokio::time::Instant::now() >= deadline {
-            return Err(CliError::Other(still_running(environment)));
+            return Err(CliError::Other(still_running(store, environment).await));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -437,35 +437,35 @@ pub async fn hold(
     }
 }
 
-/// What a daemon that is still there says: the process its lock names, and how to stop it. A daemon
-/// that has gone since is said to have gone: the lock names a process only while it is held.
-#[must_use]
-pub fn still_running(environment: &Environment) -> Shown {
-    if SingletonLock::hold(
-        &environment.paths.singleton_lock(),
-        environment.environment_id,
-    )
-    .is_ok()
-    {
-        return shown!(
+/// What a daemon that is still there says: the process its lock names, and how to stop it.
+///
+/// Whether a daemon still holds the environment is asked as [`held`] asks, under the install lock,
+/// so that no daemon part way through taking the environment meets the look and exits. A daemon
+/// that has gone since is said to have gone, since the lock names a process only while it is held;
+/// where a daemon that is starting holds the install lock past its bound, the environment is not
+/// looked at and no process is named.
+pub async fn still_running(store: &Store, environment: &Environment) -> Shown {
+    match held(store, environment, INSTALL_LOCK_WAIT).await {
+        Ok(false) => shown!(
             "the control daemon of environment {} went away while the update waited for it; run \
              kr host update again",
             environment.environment_id
-        );
-    }
-    match SingletonLock::holder(&environment.paths.singleton_lock()) {
-        Ok(Some(pid)) => shown!(
-            "the control daemon of environment {} (process {}) is still running and does not \
-             answer; stop it with `kill {}` and run kr host update again",
-            environment.environment_id,
-            pid,
-            pid
         ),
-        _ => shown!(
-            "the control daemon of environment {} is still running and does not answer; stop it \
-             and run kr host update again",
-            environment.environment_id
-        ),
+        Ok(true) => match SingletonLock::holder(&environment.paths.singleton_lock()) {
+            Ok(Some(pid)) => shown!(
+                "the control daemon of environment {} (process {}) is still running and does not \
+                 answer; stop it with `kill {}` and run kr host update again",
+                environment.environment_id,
+                pid,
+                pid
+            ),
+            _ => shown!(
+                "the control daemon of environment {} is still running and does not answer; stop \
+                 it and run kr host update again",
+                environment.environment_id
+            ),
+        },
+        Err(error) => error.said(),
     }
 }
 
@@ -501,6 +501,9 @@ pub async fn answers_as(
 /// [`answers_as`], and with `or_gone` the wait also ends when no daemon holds the environment
 /// any more: a daemon found holding it that does not listen is either starting or on its way out,
 /// and which is only known when it answers or goes.
+///
+/// The bound is looked at between looks, and one look may itself wait, each for its own bound: for
+/// a connection, and for the start lock of a daemon that is starting.
 ///
 /// # Errors
 ///
