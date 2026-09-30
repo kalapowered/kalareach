@@ -30,19 +30,20 @@ fn replays(name: &str) {
     }
 }
 
-/// KR-REQ-29.03: a takeover during a bracketed paste, replayed from its retained trace with both
-/// clients scripted: the paste is reported closed and its unwritten bytes counted, the first
-/// client's rest of the paste is refused, and the second client's keys are queued under its own
-/// lease with no paste delimiter.
+/// KR-REQ-27.05, an ownership transfer during a paste; KR-REQ-29.03: a takeover during a bracketed
+/// paste, replayed from its retained trace with both clients scripted: the paste is reported closed
+/// and its unwritten bytes counted, the first client's rest of the paste is refused, and the second
+/// client's keys are queued under its own lease with no paste delimiter.
 #[test]
 fn a_takeover_during_a_paste_closes_it_and_refuses_the_rest_of_it() {
     replays("takeover-during-a-paste");
 }
 
-/// KR-REQ-29.03: a suspension between two expiry reads and two wall-clock rollbacks, replayed
-/// from their retained trace on simulated time: the sleep counts against a continuous deadline
-/// whichever read sees it first, a rollback inside the tolerance gives a UTC deadline nothing back,
-/// one past it leaves UTC deadlines unproven, and nothing expired revives.
+/// KR-REQ-27.05, expired grants and clock rollback; KR-REQ-29.03: a suspension between two expiry
+/// reads and two wall-clock rollbacks, replayed from their retained trace on simulated time: the
+/// sleep counts against a continuous deadline whichever read sees it first, a rollback inside the
+/// tolerance gives a UTC deadline nothing back, one past it leaves UTC deadlines unproven, and
+/// nothing expired revives.
 #[test]
 fn a_suspension_between_expiry_reads_and_a_rollback_past_the_tolerance() {
     replays("time-rollback-and-suspension");
@@ -64,10 +65,10 @@ fn a_clipboard_write_before_an_attach_is_never_performed_and_one_after_it_is_onc
     replays("clipboard-before-and-after-an-attach");
 }
 
-/// KR-REQ-29.03: a lone escape and the paste recogniser, replayed from the retained trace on
-/// simulated time: forwarded at once while the application has not asked for bracketed paste, and
-/// held after it has until the recogniser's deadline passes, then released by its timer with no
-/// further keystroke.
+/// KR-REQ-27.05, a timeout; KR-REQ-29.03: a lone escape and the paste recogniser, replayed from the
+/// retained trace on simulated time: forwarded at once while the application has not asked for
+/// bracketed paste, and held after it has until the recogniser's deadline passes, then released by
+/// its timer with no further keystroke.
 #[test]
 fn a_lone_escape_is_held_only_while_it_could_start_a_paste_and_only_until_its_deadline() {
     replays("lone-escape-and-the-paste-recogniser");
