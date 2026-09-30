@@ -1852,7 +1852,24 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
             .release_size_cap()
             .expect("the store may grow again");
     }
-    host.service.recover_storage_now();
+    // The broker's half of a recovery writes with the store's lock taken only if it is free, and a
+    // pass that finds another connection writing leaves what remains to the next one. The host's
+    // own maintenance is such a connection, on its first pass or when a pass of its own meets
+    // this one, so this asks again, as the next pass does, until the recovery has finished.
+    let started = std::time::Instant::now();
+    loop {
+        host.service.recover_storage_now();
+        if broker.mode() == kr_protocol::gateway::GatewayMode::Normal {
+            break;
+        }
+        assert!(
+            started.elapsed() < common::LIVENESS_DEADLINE,
+            "with nothing owed, rich work is back: the gateway is still {} after {:?}",
+            broker.mode(),
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     assert!(
         broker.recovery_generation() > before,
@@ -1862,11 +1879,6 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
         broker.recorded_gaps().expect("the ledger reads").len(),
         1,
         "and wrote its own gap down"
-    );
-    assert_eq!(
-        broker.mode(),
-        kr_protocol::gateway::GatewayMode::Normal,
-        "with nothing owed, rich work is back"
     );
 }
 
