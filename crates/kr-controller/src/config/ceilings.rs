@@ -11,6 +11,7 @@
 //! them: the rights intersection is [`crate::grants::decide`]'s, called rather than copied, and
 //! this file only narrows what that returned.
 
+use kr_protocol::admission::RevocationPolicy;
 use kr_protocol::grant::Grant;
 use kr_protocol::hostinfo::CeilingValue;
 use kr_protocol::hostinfo::configuration::{ConfigurationCeilings, EnrolmentBudgets};
@@ -171,6 +172,56 @@ pub fn enforced_budgets(
                  did not decide them",
             )
         }),
+        refused: false,
+    }
+}
+
+/// Returns the disable policy a document asks for: the one it names, or warning only.
+///
+/// Nothing narrows it and nothing refuses it: it is the administrator's own setting for what a
+/// live binding on a revoked release does, not a limit on anything a device may ask for.
+#[must_use]
+pub fn disable_policy(ceilings: &ConfigurationCeilings) -> Ceiling<RevocationPolicy> {
+    Ceiling {
+        configured: ceilings.disable_policy,
+        value: ceilings
+            .disable_policy
+            .unwrap_or(RevocationPolicy::WarnOnly),
+        narrowed_by: None,
+        refused: false,
+    }
+}
+
+/// Replaces the policy a document asks for with the policy in force, where this reading did not
+/// decide it, as [`enforced_budgets`] does for the enrolment budgets. A policy that is `None` is
+/// one this host holds and could not read.
+#[must_use]
+pub fn enforced_disable_policy(
+    intersected: Ceiling<RevocationPolicy>,
+    policy: crate::config::EnforcedDisablePolicy,
+) -> Ceiling<Option<RevocationPolicy>> {
+    if policy.from_document {
+        return Ceiling {
+            configured: intersected.configured.map(Some),
+            value: Some(intersected.value),
+            narrowed_by: None,
+            refused: false,
+        };
+    }
+    Ceiling {
+        configured: intersected.configured.map(Some),
+        value: policy.value,
+        narrowed_by: match policy.value {
+            None => Some(Sentence::new().stated(
+                "this host could not read the policy it holds, so the policy in force is not \
+                 known",
+            )),
+            Some(RevocationPolicy::WarnOnly) => None,
+            Some(_) => Some(Sentence::new().stated(
+                "this host is still enforcing the policy it last accepted, because this document \
+                 did not decide it",
+            )),
+        },
         refused: false,
     }
 }

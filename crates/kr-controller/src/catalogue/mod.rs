@@ -226,6 +226,10 @@ pub struct CatalogueModule {
     /// build.
     #[cfg(feature = "testing")]
     raise_fault: std::sync::atomic::AtomicBool,
+    /// The disable policy each snapshot this module computed carried, in the order they were
+    /// computed, for this host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    policies_carried: Arc<std::sync::Mutex<Vec<kr_protocol::admission::RevocationPolicy>>>,
 }
 
 /// Where a test may hold a computation of this module.
@@ -269,15 +273,23 @@ impl CatalogueModule {
     /// host's configuration document selected when the daemon started, or directly when it
     /// selected none; a directory on this host is read where it is.
     ///
+    /// `budgets` and `policy` are what this host's configuration puts in force when the daemon
+    /// starts: the limits the budgets set hold every package from the first check on, and the
+    /// disable policy is recorded, with the admission revision it moves, before any snapshot is
+    /// computed, so the first round a worker that outlived the last daemon receives carries it.
+    /// `None` leaves the policy this catalogue already records.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::ControllerError::RegistryUnavailable`] when the catalogue's directory or
-    /// its records cannot be opened.
+    /// its records cannot be opened, or when the policy cannot be recorded: a host that cannot
+    /// put its administrator's policy in force does not start without saying so.
     pub fn open(
         paths: &kr_ipc::paths::EnvironmentPaths,
         proxy: Option<&kr_transport::config::ProxyUrl>,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+        policy: Option<kr_protocol::admission::RevocationPolicy>,
     ) -> crate::Result<Self> {
         Self::open_with(
             paths,
@@ -285,16 +297,17 @@ impl CatalogueModule {
             native_bridge::BridgeHost::discover(paths.state_dir()),
             broker,
             budgets,
+            policy,
         )
     }
 
     /// Opens the environment's catalogue, applying native bridges where `bridges` says, and asking
     /// `broker` what the workers hold live whenever a reclaim needs room.
     ///
-    /// `budgets` are the enrolment budgets in force when the daemon starts, and the limits they set
-    /// hold every package from the first check on. Before this daemon serves anything, every
-    /// package's bridge is brought to what its installation wants: a recipe an earlier daemon left
-    /// part way is finished or undone, and one whose package is no longer installed is taken out.
+    /// `budgets` and `policy` are what [`Self::open`] describes. Before this daemon serves
+    /// anything, every package's bridge is brought to what its installation wants: a recipe an
+    /// earlier daemon left part way is finished or undone, and one whose package is no longer
+    /// installed is taken out.
     ///
     /// # Errors
     ///
@@ -305,6 +318,7 @@ impl CatalogueModule {
         bridges: native_bridge::BridgeHost,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+        policy: Option<kr_protocol::admission::RevocationPolicy>,
     ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
@@ -316,6 +330,10 @@ impl CatalogueModule {
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
+        if let Some(policy) = policy {
+            record_disable_policy(&mut catalogue, admissions::disable_policy_of(policy))
+                .map_err(unavailable)?;
+        }
         let limits = kr_plugin_catalogue::LimitsInForce::default();
         limits.put(limits_of(&budgets));
         catalogue.read_limits_from(limits.clone());
@@ -335,6 +353,8 @@ impl CatalogueModule {
             testing_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "testing")]
             raise_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            policies_carried: Arc::default(),
         })
     }
 
@@ -412,12 +432,19 @@ impl CatalogueModule {
         let snapshots = Arc::clone(&self.snapshots);
         #[cfg(feature = "testing")]
         let hook = self.testing_hook();
+        #[cfg(feature = "testing")]
+        let carried = Arc::clone(&self.policies_carried);
         let second = tokio::task::spawn_blocking(move || -> Answer<admissions::Snapshot> {
             #[cfg(feature = "testing")]
             if let Some(hook) = hook {
                 (hook.0)(TestingPoint::PackageChecks);
             }
             let snapshot = planned.complete().map_err(ProtocolError::from)?;
+            #[cfg(feature = "testing")]
+            carried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(snapshot.policy);
             *snapshots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedSnapshot {
@@ -439,6 +466,17 @@ impl CatalogueModule {
     pub fn fail_next_revision_raise(&self) {
         self.raise_fault
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns the disable policy each snapshot this module computed carried, oldest first, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn policies_carried(&self) -> Vec<kr_protocol::admission::RevocationPolicy> {
+        self.policies_carried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Runs `hook` at each [`TestingPoint`] a computation of this module reaches.
@@ -516,14 +554,15 @@ impl CatalogueModule {
         Ok(moved)
     }
 
-    /// Puts the disable policy this host's configuration names in force for the admissions that
+    /// Puts the disable policy this host's configuration decides in force for the admissions that
     /// follow, and returns true when that changed what was in force, so the caller sends every
     /// worker a round.
     ///
     /// The policy is part of what the admissions carry, so the admission revision rises with it,
     /// in the same commit that records the policy, under the catalogue's own lock: no read of the
     /// catalogue sees the new policy at the old revision. A policy equal to the one in force
-    /// changes nothing and raises nothing.
+    /// changes nothing and raises nothing, and a record that cannot be read is replaced by the
+    /// policy the configuration decides.
     ///
     /// # Errors
     ///
@@ -536,7 +575,7 @@ impl CatalogueModule {
     ) -> Answer<bool> {
         let mut catalogue = self.catalogue.lock().await;
         let wanted = admissions::disable_policy_of(policy);
-        if catalogue.disable_policy().map_err(ProtocolError::from)? == wanted {
+        if matches!(catalogue.disable_policy(), Ok(held) if held == wanted) {
             return Ok(false);
         }
         #[cfg(feature = "testing")]
@@ -549,10 +588,7 @@ impl CatalogueModule {
                 "the admission revision could not be written",
             ));
         }
-        catalogue
-            .set_disable_policy(wanted)
-            .map_err(ProtocolError::from)?;
-        Ok(true)
+        record_disable_policy(&mut catalogue, wanted).map_err(ProtocolError::from)
     }
 
     /// Returns the disable policy in force.
@@ -1611,6 +1647,20 @@ enum WantedBridge {
     /// The installed package is not whole here, or is past a package limit in force and so not
     /// used, so what it wants is not read, and its bridge is left as it is.
     Unknown,
+}
+
+/// Records `policy` as the disable policy, in the commit that raises the admission revision with
+/// it, and returns true when that changed what was recorded. A record that cannot be read is
+/// replaced, since the policy in force is the one this records.
+fn record_disable_policy(
+    catalogue: &mut Catalogue,
+    policy: kr_plugin_catalogue::DisablePolicy,
+) -> CatalogueResult<bool> {
+    if matches!(catalogue.disable_policy(), Ok(held) if held == policy) {
+        return Ok(false);
+    }
+    catalogue.set_disable_policy(policy)?;
+    Ok(true)
 }
 
 /// The limits a set of enrolment budgets puts in force: each package limit no larger than the
