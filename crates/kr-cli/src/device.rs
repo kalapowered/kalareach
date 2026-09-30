@@ -15,7 +15,6 @@ use kr_protocol::sharing::{
     DeviceListParams, DeviceListResult, DeviceRevokeParams, DeviceSummary, RevocationResult,
 };
 
-use kr_client::error::refusal;
 use kr_protocol::error::ErrorCode;
 
 use crate::cli::{DeviceCommand, DeviceListArguments, DeviceRevokeArguments};
@@ -103,13 +102,13 @@ async fn revoke(
         .iter()
         .any(|summary| summary.device_id == device)
     {
-        return Err(CliError::Refused(refusal(
+        return Err(CliError::refused_in_its_own_words(
             ErrorCode::ResourceUnavailable,
             shown!(
                 "no device {} has been paired with this host, so nothing was revoked",
                 device
             ),
-        )));
+        ));
     }
     let revoked: RevocationResult = daemon
         .mutate(

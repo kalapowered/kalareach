@@ -269,17 +269,26 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
     );
     let delivery = workers.delivery();
     let failure = workers.failure();
-    match error {
-        AnswerError::Host(
-            ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
-        ) => CliError::Refused(kr_client::error::refusal(
+    let kept = |refusal: &kr_protocol::error::ProtocolError| {
+        kr_client::error::refusal(
             refusal.code,
             shown!(
                 "{}; {}",
-                Shown::protocol(&refusal),
-                retained(delivery, retention)
+                Shown::protocol(refusal),
+                retained(delivery, retention.clone())
             ),
-        )),
+        )
+    };
+    match error {
+        AnswerError::Host(ClientError::Host(refusal)) => CliError::Refused(kept(&refusal)),
+        AnswerError::Host(ClientError::Refused {
+            error: refusal,
+            action,
+            ..
+        }) => CliError::ServiceRefused {
+            error: kept(&refusal),
+            action,
+        },
         other => {
             let why = failure.map_or_else(|| shown!("{}", other), |failure| failure.why);
             CliError::AnswerKept {
@@ -555,9 +564,15 @@ fn answer_failure(error: AnswerError) -> CliError {
                 retired_because(reason)
             ),
         )),
-        AnswerError::Host(
-            ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
-        ) => CliError::Refused(refusal),
+        AnswerError::Host(ClientError::Host(refusal)) => CliError::Refused(refusal),
+        AnswerError::Host(ClientError::Refused {
+            error: refusal,
+            action,
+            ..
+        }) => CliError::ServiceRefused {
+            error: refusal,
+            action,
+        },
         AnswerError::Host(ClientError::Ipc(failure)) => CliError::Refused(
             kr_client::error::refusal(failure.code(), Shown::ipc(&failure)),
         ),

@@ -3,6 +3,7 @@
 //! Exit codes are part of the command's contract: a script can tell a usage mistake from a session
 //! that does not exist from a host that is not running, without parsing text.
 
+use kr_client::retry::UserAction;
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
 
@@ -36,7 +37,23 @@ pub enum CliError {
     /// The outer terminal did not complete the bounded capability handshake.
     TerminalProbeFailed(Shown),
     /// The host refused the request.
+    ///
+    /// A person is told what the host said and the direct action its code calls for, and not the
+    /// code: section 23 has the interface translate codes into actions and keep protocol internals
+    /// out of what it shows. The code is in [`CliError::code`] and in a `--json` failure.
     Refused(kr_protocol::error::ProtocolError),
+    /// A refusal that says itself what a person does about it, and the action it names is the one
+    /// said, not the one the code calls for.
+    ///
+    /// A managed service knows more about its refusal than the code carries. A refusal this command
+    /// makes in words that already say what to do is also said this way, with no action after it:
+    /// [`CliError::refused_in_its_own_words`].
+    ServiceRefused {
+        /// What the service said was wrong.
+        error: kr_protocol::error::ProtocolError,
+        /// What a person does about it.
+        action: kr_client::retry::UserAction,
+    },
     /// The attached session closed, and not cleanly: its shell failed or something ended it.
     ///
     /// The attachment itself did what it was for, so this is no refusal and no lost host. It is
@@ -93,9 +110,23 @@ impl Said for CliError {
                 Shown::said("this command needs a session; run it inside one or name the session")
             }
             Self::NotATerminal => Shown::said("this command needs a terminal"),
-            Self::Refused(error) => shown!("{}: {}", error.code, Shown::protocol(error)),
+            Self::Refused(error) => refusal_said(error, kr_client::retry::user_action(error.code)),
+            Self::ServiceRefused { error, action } => refusal_said(error, *action),
             Self::Ipc(error) => Shown::ipc(error),
         }
+    }
+}
+
+/// What a person is told of a refusal: what the refuser said, and the direct action after it where
+/// there is one. A code that calls for nothing is said by its message alone.
+fn refusal_said(error: &kr_protocol::error::ProtocolError, action: UserAction) -> Shown {
+    match action {
+        UserAction::Nothing => Shown::protocol(error),
+        action => shown!(
+            "{}\n{}",
+            Shown::protocol(error),
+            Shown::said(action.message())
+        ),
     }
 }
 
@@ -113,6 +144,39 @@ impl From<kr_ipc::IpcError> for CliError {
 }
 
 impl CliError {
+    /// Builds a refusal this command made itself, in words that already say what a person does
+    /// about it.
+    ///
+    /// A host's refusal knows nothing more than its code, so a person is also told the action the
+    /// code calls for. A refusal made here is worded for the case it refuses, and adding an
+    /// action chosen by its code would put a second, general instruction after the specific one.
+    /// It is said by those words alone, and `--json` still carries its code.
+    #[must_use]
+    pub fn refused_in_its_own_words(
+        code: kr_protocol::error::ErrorCode,
+        message: impl Into<Shown>,
+    ) -> Self {
+        Self::ServiceRefused {
+            error: kr_client::error::refusal(code, message.into()),
+            action: UserAction::Nothing,
+        }
+    }
+
+    /// Returns what a `--json` failure carries as its `message`.
+    ///
+    /// What a person is told of a refusal leaves its code out, and a script reads the code as a
+    /// field beside the message. The message it has always been given for a refusal begins with
+    /// that code, and is kept as it was.
+    #[must_use]
+    pub fn machine_message(&self) -> Shown {
+        match self {
+            Self::Refused(error) | Self::ServiceRefused { error, .. } => {
+                shown!("{}: {}", error.code, Shown::protocol(error))
+            }
+            other => other.said(),
+        }
+    }
+
     /// Returns the exit code this failure produces.
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
@@ -124,7 +188,7 @@ impl CliError {
             Self::ShellIntegrationUnsupported(_) => 2,
             Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => 6,
             Self::TerminalUnavailable(_) => 7,
-            Self::Refused(_) => 8,
+            Self::Refused(_) | Self::ServiceRefused { .. } => 8,
             Self::UpdateDeferred(_) => 9,
             Self::Ipc(_) | Self::AnswerKept { .. } => 3,
             Self::SessionClosed(_) | Self::Unfinished { .. } | Self::Other(_) => 1,
@@ -149,7 +213,7 @@ impl CliError {
                 kr_protocol::error::ErrorCode::TerminalProbeFailed
             }
             Self::TerminalUnavailable(_) => kr_protocol::error::ErrorCode::TerminalUnavailable,
-            Self::Refused(error) => error.code,
+            Self::Refused(error) | Self::ServiceRefused { error, .. } => error.code,
             Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed,
             Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => *code,
             Self::UpdateDeferred(_) | Self::Other(_) => {

@@ -9,7 +9,7 @@
 //! Ctrl-D and one that does not.
 
 use kr_client::shown;
-use kr_client::shown::{Said, Shown};
+use kr_client::shown::Shown;
 use kr_protocol::attachment::{AttachMode, AttachmentSummary, TerminalPresentationMode};
 use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
@@ -42,7 +42,7 @@ pub fn failure(error: &CliError) -> Document {
     Document::new()
         .with("ok", false)
         .with("code", output::said(&error.code()))
-        .with("message", error.said())
+        .with("message", error.machine_message())
         .with("exit_code", error.exit_code())
 }
 
@@ -660,6 +660,7 @@ pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Shown
 
 #[cfg(test)]
 mod tests {
+    use kr_client::shown::Said as _;
     use serde_json::{Value, json};
 
     use super::*;
@@ -676,6 +677,26 @@ mod tests {
         assert_eq!(value["code"], json!("AMBIGUOUS_SESSION"));
         assert_eq!(value["message"], json!(error.said().as_str()));
         assert_eq!(value["exit_code"], json!(5));
+    }
+
+    /// KR-REQ-23.57: what a person is told of a refusal leaves the code out, and a `--json` failure
+    /// keeps it, in its own field and in the message it has always carried.
+    #[test]
+    fn a_refusal_keeps_its_code_and_its_message_in_a_json_failure() {
+        let error = CliError::Refused(kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::PairingRejected,
+            "that invitation has ended",
+        ));
+        let value = failure(&error).json();
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["code"], json!("PAIRING_REJECTED"));
+        assert_eq!(
+            value["message"],
+            json!("PAIRING_REJECTED: that invitation has ended")
+        );
+        assert_eq!(value["exit_code"], json!(8));
+        let said = error.said();
+        assert!(!said.as_str().contains("PAIRING_REJECTED"), "{said}");
     }
 
     #[test]

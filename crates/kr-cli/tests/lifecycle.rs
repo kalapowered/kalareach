@@ -2310,8 +2310,8 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     );
     let said = refused.screen.since(0);
     assert!(
-        contains(&said, b"SESSION_CLOSED") && contains(&said, b"has closed"),
-        "and said so: {}",
+        !contains(&said, b"SESSION_CLOSED") && contains(&said, b"has closed"),
+        "and said so, without the protocol's code: {}",
         String::from_utf8_lossy(&said).escape_debug()
     );
     assert!(
@@ -3751,7 +3751,7 @@ fn kr_names_a_worker_of_an_earlier_build_and_stops_rather_than_waiting_on_its_sc
     says_each(
         &shown,
         &[
-            "UNSUPPORTED_SCHEMA",
+            "Update this app or the host",
             "session 900",
             "an earlier build",
             "kr close 900",
@@ -3785,7 +3785,7 @@ fn kr_names_a_worker_of_another_protocol_version_and_both_builds_and_stops() {
     says_each(
         &shown,
         &[
-            "UNSUPPORTED_SCHEMA",
+            "Update this app or the host",
             &format!("session 900 runs on kr-worker/0.1.0 with protocol {theirs}"),
             &format!(
                 "this is {} with protocol {ours}",

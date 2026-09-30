@@ -43,7 +43,7 @@ use kr_protocol::confirmation::{
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::HistoryScope;
-use kr_protocol::ids::{ActionId, BuildId, InvitationId};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
@@ -131,6 +131,10 @@ async fn invite(
             &invited,
             kr_ipc::now_ms().get(),
             true,
+            arguments
+                .environment
+                .is_some()
+                .then_some(environment.environment_id),
         )?);
     }
     Ok(())
@@ -652,6 +656,8 @@ fn device_name(candidate: &PairCandidateView) -> Asked {
 /// Describes an issued invitation for a person, with its QR code when `draw` says to.
 ///
 /// The code, the QR text and the QR code drawn from it are the invitation the person asked for.
+/// `environment` is the environment the person named when they issued it, and the commands the
+/// text offers name it too: without it they would act in this installation's own.
 ///
 /// # Errors
 ///
@@ -660,6 +666,7 @@ pub fn describe_invitation(
     invited: &PairInviteResult,
     now_ms: u64,
     draw: bool,
+    environment: Option<EnvironmentId>,
 ) -> Result<Vec<Line>> {
     let mut lines = vec![stdout_line!(
         "Invitation {}, open {}.",
@@ -677,6 +684,21 @@ pub fn describe_invitation(
                 Asked::text(Request::Invitation, code.as_str()),
                 Shown::address(rendezvous_origin.as_str())
             ));
+            lines.push(match environment {
+                Some(environment) => stdout_line!(
+                    "To reserve a code at another rendezvous origin, cancel this invitation with \
+                     kr pair cancel {} --environment {}, then run kr pair invite again with \
+                     --origin <address> --environment {}.",
+                    invited.invitation_id,
+                    environment,
+                    environment
+                ),
+                None => stdout_line!(
+                    "To reserve a code at another rendezvous origin, cancel this invitation with \
+                     kr pair cancel {}, then run kr pair invite again with --origin <address>.",
+                    invited.invitation_id
+                ),
+            });
             lines.push(stdout_line!(
                 "Enter the code on the new device, or scan this QR code with it:"
             ));
@@ -697,7 +719,14 @@ pub fn describe_invitation(
     lines.push(stdout_line!(
         "When the new device shows its verification value, approve it with:"
     ));
-    lines.push(stdout_line!("  kr pair confirm {}", invited.invitation_id));
+    lines.push(match environment {
+        Some(environment) => stdout_line!(
+            "  kr pair confirm {} --environment {}",
+            invited.invitation_id,
+            environment
+        ),
+        None => stdout_line!("  kr pair confirm {}", invited.invitation_id),
+    });
     Ok(lines)
 }
 
@@ -960,7 +989,7 @@ fn decode<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> Result<T> {
 }
 
 fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
-    CliError::Refused(kr_client::error::refusal(code, message.into()))
+    CliError::refused_in_its_own_words(code, message)
 }
 
 fn not_confirmed(message: &'static str) -> CliError {
@@ -1068,7 +1097,7 @@ mod tests {
                 qr_text: QrText::new(text.as_str()).expect("QR text"),
             },
         };
-        let shown = describe_invitation(&invited, now, true)
+        let shown = describe_invitation(&invited, now, true, None)
             .expect("a description")
             .iter()
             .map(|line| line.text().to_owned())
@@ -1089,6 +1118,68 @@ mod tests {
         assert_eq!(document["mode"], "code");
         assert_eq!(document["code"], "4XkP-Qm7-Zr2");
         assert_eq!(document["rendezvous_origin"], "https://reach.kala.to");
+    }
+
+    /// KR-REQ-10.18: the issuing text shows the rendezvous origin with the action that changes it.
+    #[test]
+    fn the_issuing_text_names_the_action_that_changes_the_origin() {
+        let now = 1_764_000_000_000;
+        let origin = RendezvousOrigin::new("https://reach.kala.to").expect("an origin");
+        let code = ShortCode::new("4XkP-Qm7-Zr2").expect("a code");
+        let text = QrPayload::Code(CodeQrPayload {
+            rendezvous_origin: origin.clone(),
+            code: code.clone(),
+        })
+        .to_text()
+        .expect("the payload's text");
+        let invited = PairInviteResult {
+            invitation_id: InvitationId::new(Uuid::from_bytes([9; 16])),
+            expires_at_ms: TimestampMs::new(now + 5 * 60_000),
+            entry: InviteEntry::Code {
+                rendezvous_origin: origin,
+                code,
+                qr_text: QrText::new(text.as_str()).expect("QR text"),
+            },
+        };
+        let shown = describe_invitation(&invited, now, false, None)
+            .expect("a description")
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("--origin"), "{shown}");
+        // The invitation stays open for five minutes, so a second `kr pair invite` is refused
+        // until this one is cancelled: the text says to cancel it, by the identifier it was given.
+        assert!(
+            shown.contains(&format!("kr pair cancel {}", invited.invitation_id)),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("--environment"),
+            "an environment nobody named is not named: {shown}"
+        );
+        // Issued in an environment the person named, the commands the text offers name it too: a
+        // cancel or a confirm without it would look in this installation's own.
+        let environment = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+        let named = describe_invitation(&invited, now, false, Some(environment))
+            .expect("a description")
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for command in [
+            format!(
+                "kr pair cancel {} --environment {environment}",
+                invited.invitation_id
+            ),
+            format!(
+                "kr pair confirm {} --environment {environment}",
+                invited.invitation_id
+            ),
+            format!("--origin <address> --environment {environment}"),
+        ] {
+            assert!(named.contains(&command), "{command}: {named}");
+        }
     }
 
     /// KR-REQ-23.25: text planted in every leaf of an invitation's status that can hold free text

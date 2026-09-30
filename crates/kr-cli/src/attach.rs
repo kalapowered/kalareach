@@ -717,6 +717,9 @@ mod a_worker_of_another_build {
     use kr_protocol::local::LocalBuild;
     use kr_protocol::session::DisplayNumber;
 
+    /// The action the refusal's code calls for.
+    const UPDATE: &str = "Update this app or the host: their versions do not agree.";
+
     fn stated(build_id: &str, protocol_version: PackageVersion) -> LocalBuild {
         LocalBuild {
             build_id: BuildId::new(build_id).expect("a build identifier"),
@@ -733,7 +736,8 @@ mod a_worker_of_another_build {
         }
     }
 
-    /// What a refusal says, with its code and its exit status, which are the refused request's.
+    /// What a refusal says to a person, with its code and its exit status, which are the refused
+    /// request's: the sentence, then the direct action its code calls for.
     fn refused(stated: Option<&LocalBuild>) -> String {
         let refusal = check_build(stated, DisplayNumber::new(3)).expect_err("refused");
         assert!(
@@ -742,6 +746,10 @@ mod a_worker_of_another_build {
         );
         assert_eq!(refusal.code(), ErrorCode::UnsupportedSchema);
         assert_eq!(refusal.exit_code(), 8);
+        assert_eq!(
+            kr_client::retry::user_action(ErrorCode::UnsupportedSchema).message(),
+            UPDATE
+        );
         refusal.to_string()
     }
 
@@ -770,10 +778,10 @@ mod a_worker_of_another_build {
         assert_eq!(
             refused(Some(&stated("kr-worker/0.1.0", theirs))),
             format!(
-                "UNSUPPORTED_SCHEMA: session 3 runs on kr-worker/0.1.0 with protocol {theirs}, and \
-                 this is {} with protocol {PACKAGE_VERSION}: this kr cannot show a session whose \
-                 worker speaks another protocol version. Close the session with `kr close 3`, or \
-                 attach with a kr of the worker's build",
+                "session 3 runs on kr-worker/0.1.0 with protocol {theirs}, and this is {} with \
+                 protocol {PACKAGE_VERSION}: this kr cannot show a session whose worker speaks \
+                 another protocol version. Close the session with `kr close 3`, or attach with a \
+                 kr of the worker's build\n{UPDATE}",
                 crate::build_id().as_str()
             )
         );
@@ -785,11 +793,10 @@ mod a_worker_of_another_build {
         assert_eq!(
             refused(None),
             format!(
-                "UNSUPPORTED_SCHEMA: session 3 runs on a worker of an earlier build, which does \
-                 not state its build or its protocol version, and this is {} with protocol \
-                 {PACKAGE_VERSION}: this kr cannot show a session whose worker speaks another \
-                 protocol version. Close the session with `kr close 3`, or attach with a kr of the \
-                 worker's build",
+                "session 3 runs on a worker of an earlier build, which does not state its build \
+                 or its protocol version, and this is {} with protocol {PACKAGE_VERSION}: this kr \
+                 cannot show a session whose worker speaks another protocol version. Close the \
+                 session with `kr close 3`, or attach with a kr of the worker's build\n{UPDATE}",
                 crate::build_id().as_str()
             )
         );

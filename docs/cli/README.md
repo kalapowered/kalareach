@@ -209,7 +209,7 @@ control daemon is restarting.
 
 A session's descriptor goes when the session closes. With no descriptor to read, `kr attach` asks
 the environment's control daemon, whose registry keeps each closure, and starts nothing either way.
-A session that has closed is refused with `SESSION_CLOSED` and exit code 8, naming how it closed,
+A session that has closed is refused with exit code 8 (`SESSION_CLOSED` in `--json`), naming how it closed,
 and `--json` carries its closure record as `closure` beside `session_id`. A session the registry
 never held is `UNKNOWN_SESSION`. When no daemon is running for the environment, the command says
 so and exits with 3: what cannot be asked is never reported as a closure.
@@ -219,13 +219,14 @@ its build in its answer to the hello: its build identifier and the version of th
 it was built from. `kr attach` reads the worker's screens when that version shares its own
 compatibility level, which below `1.0.0` is the minor number and from `1.0.0` the major number; the
 patch number never decides. Any other worker, and one that states no build because it is of a build
-before the statement, is refused with `UNSUPPORTED_SCHEMA` and exit code 8 before the session is
+before the statement, is refused with exit code 8 (`UNSUPPORTED_SCHEMA` in `--json`) before the session is
 asked for anything: nothing is attached, no size is claimed and no input lease is taken. The
 refusal names both builds, both versions and what to do, and `kr-worker --version` names the
 worker's protocol version too:
 
 ```text
-kr: UNSUPPORTED_SCHEMA: session 3 runs on kr-worker/0.1.0 with protocol 0.45.0, and this is kr/0.1.0 with protocol 0.46.0: this kr cannot show a session whose worker speaks another protocol version. Close the session with `kr close 3`, or attach with a kr of the worker's build
+kr: session 3 runs on kr-worker/0.1.0 with protocol 0.45.0, and this is kr/0.1.0 with protocol 0.46.0: this kr cannot show a session whose worker speaks another protocol version. Close the session with `kr close 3`, or attach with a kr of the worker's build
+Update this app or the host: their versions do not agree.
 ```
 
 Direct mode puts the outer terminal into raw mode and writes what the host sends it, in order.
@@ -720,7 +721,15 @@ bound to the session this process is running in. Outside a session every tool an
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the
 session closes](#when-the-session-closes) says which closure is which.
 
-A `--json` failure carries the same information:
+A refusal by the host is said as the reason for the refusal as said by the host followed by a new
+line and a description of the action that needs to be taken as indicated by the code, such as
+pairing again, waiting, or changing a setting. The protocol code is not in it. If the code indicates
+no action should be taken then only the reason for the refusal as given by the host is shown. Where
+the refuser itself says what a person does about its refusal, as a managed service does, that action
+is said instead of the code's.
+
+A `--json` failure carries the same information, and the protocol code with it. A refusal's
+`message` begins with its code:
 
 ```json
 { "ok": false, "code": "AMBIGUOUS_SESSION", "message": "...", "exit_code": 5 }

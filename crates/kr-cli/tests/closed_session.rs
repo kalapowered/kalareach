@@ -489,7 +489,7 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
     let said = host.kr(&["attach", &session]);
     assert_eq!(said.status.code(), Some(8));
     let said = String::from_utf8_lossy(&said.stderr);
-    assert!(said.contains("SESSION_CLOSED"), "{said}");
+    assert!(!said.contains("SESSION_CLOSED"), "{said}");
     assert!(said.contains("it was closed on request"), "{said}");
 
     // Nothing was started for any of it.
