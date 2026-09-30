@@ -917,7 +917,7 @@ impl Replay {
                         .collect(),
                 }
             }
-            InputBatch::Reply { bytes } => {
+            InputBatch::Reply { bytes, .. } => {
                 let (text, hex) = spell(&bytes);
                 Batch::Reply { text, hex }
             }
