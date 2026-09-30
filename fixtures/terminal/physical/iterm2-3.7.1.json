@@ -108,11 +108,11 @@
       },
       "canonical": {
         "row": 37,
-        "col": 180
+        "col": 179
       },
       "canonical_pending_wrap": false,
       "barrier": true,
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "addressing.default-is-home",
@@ -1180,11 +1180,11 @@
       },
       "canonical": {
         "row": 1,
-        "col": 178
+        "col": 179
       },
       "canonical_pending_wrap": true,
       "barrier": true,
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "wide.overwrite-the-right-half",
@@ -2262,8 +2262,8 @@
   "stopped": null,
   "summary": {
     "steps": 136,
-    "agree": 121,
-    "differ": 15,
+    "agree": 123,
+    "differ": 13,
     "unanswered": 0
   }
 }

@@ -1308,16 +1308,16 @@ test made, with no Apple Event sent:
 
 | Terminal | Version | Window | Steps | Agree | Differ | Silent |
 | --- | --- | --- | --- | --- | --- | --- |
-| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 114 | 22 | 0 |
-| iTerm2 | 3.7.1 | 179 by 37 | 136 | 121 | 15 | 0 |
+| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 116 | 20 | 0 |
+| iTerm2 | 3.7.1 | 179 by 37 | 136 | 123 | 13 | 0 |
 
 The table lists every step on which either terminal differs. A cell gives the grid's position, then
-the terminal's in bold, as row and column; `agrees` means the two match. The grid is not changed to
-follow a terminal, and a difference is a finding, not a fault in either side.
+the terminal's in bold, as row and column; `agrees` means the two match. A difference is a finding,
+not a fault in either side. The grid changes only where it left its own edge, as in the two steps
+described below the table.
 
 | Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 37 |
 | --- | --- | --- | --- |
-| `addressing.clamps-to-the-corner` | `\e[9999;9999H` | 24;81 / **24;80** | 37;180 / **37;179** |
 | `addressing.save-and-restore-csi` | `\e[5;6H\e[s\e[1;1H\e[u` | 5;6 / **1;1** | agrees |
 | `autowrap.pending-then-left` | `a×80\e[D` | 1;79 / **1;80** | 1;178 / **1;179** |
 | `autowrap.pending-survives-erase-line` | `a×80\e[Kb` | 2;2 / **1;80** | agrees |
@@ -1331,7 +1331,6 @@ follow a terminal, and a difference is a finding, not a fault in either side.
 | `margins.left-and-right-margins-clamp` | `\e[?69h\e[5;20s\e[1;7H\e[99C` | 1;20 / **1;80** | agrees |
 | `margins.return-goes-to-the-left-margin` | `\e[?69h\e[5;20s\e[1;9H\r` | 1;5 / **1;1** | agrees |
 | `wide.wide-character-one-cell-from-the-edge` | `a×79\u3042` | agrees | 1;179 / **2;3** |
-| `wide.wide-character-two-cells-from-the-edge` | `a×78\u3042` | 1;79 / **1;80** | 1;178 / **1;179** |
 | `combining.at-the-start-of-a-line` | `\u0301` | agrees | 1;1 / **1;2** |
 | `combining.devanagari-conjunct` | `\u0915\u094D\u0937\u093F` | 1;3 / **1;4** | 1;3 / **1;4** |
 | `combining.zero-width-space` | `a\u200Bb` | 1;3 / **1;4** | 1;3 / **1;4** |
@@ -1356,15 +1355,19 @@ shows where that character went.
 
 What the records show:
 
-- **Both terminals answer alike and the grid differs.** A column past the right edge in `CSI H`
-  leaves the grid's cursor one column beyond the last, where both terminals answer the last column
-  (`addressing.clamps-to-the-corner`). A wide character that ends exactly at the last column leaves
-  the grid's cursor one column short of the last where both answer the last
-  (`wide.wide-character-two-cells-from-the-edge`). A cursor-left after a full row moves the grid's
-  cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A zero-width space
-  and a Devanagari conjunct take a cell more in both than the grid's width model gives them. In
-  these the two terminals agree with each other and the grid is the one apart; which of them
-  is right is a question for the profile, not something the records decide.
+- **Both terminals answer alike and the grid differs.** A cursor-left after a full row moves the
+  grid's cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A
+  zero-width space and a Devanagari conjunct take a cell more in both than the grid's width model
+  gives them. In these the two terminals agree with each other and the grid is the one apart; which
+  of them is right is a question for the profile, not something the records decide.
+- **The grid followed both terminals on two steps.** An absolute column past the right edge (in
+  `CSI H`, `CSI f`, `CSI G` or ``CSI ` ``) left the grid's cursor one column beyond the last, where
+  both terminals stop on the last column, and a wide character that ends exactly at the last column
+  left it one column short of the last, where both answer the last. The grid now holds the cursor on
+  the last column in both, and the records above were measured with that change
+  (`addressing.clamps-to-the-corner` and `wide.wide-character-two-cells-from-the-edge` agree in
+  both). A wide character that starts on the last column is the separate case below, and stays
+  as it was.
 - **Terminal.app alone differs on** the save and restore forms `CSI s`, `CSI u` and mode 1048, on
   left and right margins (mode 69), on cursor movement inside a scroll region, on reverse index at
   the top of the screen when a region is set, on a wrap on the last row and in insert mode, on
