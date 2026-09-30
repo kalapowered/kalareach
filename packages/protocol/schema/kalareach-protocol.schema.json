@@ -14886,7 +14886,7 @@
       "description": "`host.update.handover` result: how the daemon was started, which a daemon of the release that\nreplaces it is started like, and the attempt the step was for.",
       "properties": {
         "arguments": {
-          "description": "The arguments it was started with, its program's own name left out.",
+          "description": "The arguments it was started with, its program's own name left out. Only a `prepare` answers\nhow the daemon was started, and refuses where it cannot say; a `stop` or a `resume` answers\nthis empty in that case.",
           "items": {
             "type": "string"
           },
@@ -14919,7 +14919,7 @@
           "description": "The release this daemon runs, where it runs an installed one."
         },
         "working_directory": {
-          "description": "The directory it was started in.",
+          "description": "The directory it was started in; empty as `arguments` is where a `stop` or a `resume` cannot\nsay.",
           "type": "string"
         }
       },
