@@ -5,8 +5,14 @@
 //! removed rather than passed through, because a shell that believes it is inside iTerm2 will
 //! enable features this terminal does not supply. Reserved KalaReach values come only from the
 //! worker, so a caller cannot smuggle one in through its own environment.
+//!
+//! The terminal identity is `xterm-256color`, and the database that names it is the worker's own:
+//! [`materialise_terminfo`] writes the pinned entry into the worker's state directory and `build`
+//! points the session's terminfo library at it. A creator's own database directories are kept
+//! behind it and reported, so they still serve every other terminal name.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use kr_protocol::session::EnvironmentVariable;
 
@@ -18,6 +24,15 @@ pub const COLORTERM: &str = "truecolor";
 
 /// The terminal program every KalaReach session declares.
 pub const TERM_PROGRAM: &str = "KalaReach";
+
+/// The variable a terminfo library reads its first database directory from.
+pub const TERMINFO_VARIABLE: &str = "TERMINFO";
+
+/// The variable that lists the database directories a terminfo library reads after its first.
+pub const TERMINFO_DIRS_VARIABLE: &str = "TERMINFO_DIRS";
+
+/// The directory inside a worker's state directory that holds the private terminfo database.
+pub const TERMINFO_DIRECTORY: &str = "terminfo";
 
 /// The variable that names the session a command is running inside.
 ///
@@ -70,6 +85,34 @@ pub struct EnvironmentSources {
     pub locale: &'static str,
     /// Where the working directory came from.
     pub cwd: &'static str,
+    /// Which terminfo database the session reads `TERM` from, and what it was given instead.
+    pub terminfo: TerminfoSelection,
+}
+
+/// The terminfo database a session reads its terminal's capabilities from.
+///
+/// The private database comes first, so the capabilities an application reads are the ones the
+/// terminal engine answers and acts on. A creator's own `TERMINFO` and `TERMINFO_DIRS` are neither
+/// dropped nor obeyed: they follow the private directory in the session's search, so they still
+/// name the terminals the private database has no entry for, and they are recorded here as what
+/// they were.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminfoSelection {
+    /// The private database directory `TERMINFO` names, or none when this session reads whatever
+    /// database its host has.
+    pub directory: Option<String>,
+    /// The creator's `TERMINFO`, now searched after the private directory.
+    pub creator_terminfo: Option<String>,
+    /// The creator's `TERMINFO_DIRS`, kept as it was.
+    pub creator_terminfo_dirs: Option<String>,
+}
+
+impl TerminfoSelection {
+    /// Whether the creator supplied a database directory of its own.
+    #[must_use]
+    pub const fn overridden(&self) -> bool {
+        self.creator_terminfo.is_some() || self.creator_terminfo_dirs.is_some()
+    }
 }
 
 /// The environment a root shell is launched with, and where it came from.
@@ -104,6 +147,11 @@ pub struct ExecutionContext {
     pub variables: BTreeMap<String, String>,
     /// The login session a desktop-bound worker is tied to.
     pub desktop: Option<kr_protocol::identity::DesktopBinding>,
+    /// The directory of the private terminfo database this worker wrote, when it wrote one.
+    ///
+    /// A worker that could not write it, and a host with no terminfo library, leave this empty, and
+    /// the session then reads whatever database its host has.
+    pub terminfo: Option<PathBuf>,
 }
 
 /// The variables a desktop context supplies, in the order a session needs them.
@@ -147,6 +195,7 @@ impl ExecutionContext {
             desktop: (profile == kr_protocol::identity::WorkerProfile::DesktopBound)
                 .then(desktop_binding),
             variables,
+            terminfo: None,
         }
     }
 }
@@ -191,8 +240,27 @@ pub fn build(
     let mut removed = Vec::new();
     let mut path_from_snapshot = false;
     let mut locale_from_snapshot = false;
+    let mut terminfo = TerminfoSelection {
+        directory: context
+            .terminfo
+            .as_deref()
+            .and_then(|directory| directory.to_str())
+            .map(str::to_owned),
+        ..TerminfoSelection::default()
+    };
 
     for variable in snapshot {
+        if terminfo.directory.is_some() && is_terminfo_search(&variable.name) {
+            // A creator's database directories are searched after the private one, which is
+            // decided below once every variable has been seen.
+            let held = if variable.name == TERMINFO_VARIABLE {
+                &mut terminfo.creator_terminfo
+            } else {
+                &mut terminfo.creator_terminfo_dirs
+            };
+            *held = Some(variable.value.clone());
+            continue;
+        }
         if is_terminal_identity(&variable.name) || is_creator_terminal(&variable.name) {
             removed.push(variable.name.clone());
             continue;
@@ -246,6 +314,21 @@ pub fn build(
     variables.insert("COLORTERM".to_owned(), COLORTERM.to_owned());
     variables.insert("TERM_PROGRAM".to_owned(), TERM_PROGRAM.to_owned());
     variables.insert("TERM_PROGRAM_VERSION".to_owned(), release.to_owned());
+    if let Some(directory) = &terminfo.directory {
+        variables.insert(TERMINFO_VARIABLE.to_owned(), directory.clone());
+        // The library reads `TERMINFO` first and `TERMINFO_DIRS` after it, so what the creator
+        // had in the first goes at the front of the second and keeps its place in the search.
+        let fallback: Vec<&str> = [
+            terminfo.creator_terminfo.as_deref(),
+            terminfo.creator_terminfo_dirs.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !fallback.is_empty() {
+            variables.insert(TERMINFO_DIRS_VARIABLE.to_owned(), fallback.join(":"));
+        }
+    }
     // A child invocation of this path is not a second active root integration; `SHELL` names the
     // executable that was actually launched.
     variables.insert("SHELL".to_owned(), shell_path.to_owned());
@@ -264,6 +347,7 @@ pub fn build(
             path: path_source,
             locale: locale_source,
             cwd: "create request",
+            terminfo,
         },
         removed,
     }
@@ -278,6 +362,35 @@ fn is_terminal_identity(name: &str) -> bool {
 
 fn is_creator_terminal(name: &str) -> bool {
     CREATOR_TERMINAL_VARIABLES.contains(&name)
+}
+
+fn is_terminfo_search(name: &str) -> bool {
+    name == TERMINFO_VARIABLE || name == TERMINFO_DIRS_VARIABLE
+}
+
+/// Writes the private terminfo database into the worker's state directory and returns where it is.
+///
+/// The database is the pinned `xterm-256color` entry, compiled from the same data the terminal
+/// engine answers capability queries from. It is written from this build's own data rather than
+/// found on the host, so it cannot drift from the engine, and it is written again only when the
+/// file on disk is not the current one. Workers of several sessions may do this at once: each
+/// replaces a file whole, so none reads a partial one.
+///
+/// # Errors
+///
+/// Returns an error when the directory or a file in it cannot be written, or when the state
+/// directory's path is not text an environment variable can carry.
+#[cfg(unix)]
+pub fn materialise_terminfo(state_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let directory = state_dir.join(TERMINFO_DIRECTORY);
+    if directory.to_str().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state directory's path is not valid text",
+        ));
+    }
+    kr_term::terminfo::write_database(&directory)?;
+    Ok(directory)
 }
 
 #[cfg(test)]
@@ -398,5 +511,139 @@ mod tests {
         );
         assert!(!built.variables.contains_key("KR_SESSION_TOKEN"));
         assert!(built.removed.iter().any(|name| name == "KR_SESSION_TOKEN"));
+    }
+
+    fn with_private_database(directory: &str) -> ExecutionContext {
+        ExecutionContext {
+            terminfo: Some(PathBuf::from(directory)),
+            ..ExecutionContext::default()
+        }
+    }
+
+    fn built_with(creator: &[(&str, &str)], context: &ExecutionContext) -> LaunchEnvironment {
+        build(
+            &snapshot(creator),
+            context,
+            "/bin/zsh",
+            "0.1.0",
+            test_session(),
+        )
+    }
+
+    #[test]
+    fn the_private_terminfo_database_is_the_first_one_a_session_reads() {
+        let built = built_with(
+            &[("PATH", "/usr/bin")],
+            &with_private_database("/state/terminfo"),
+        );
+        assert_eq!(
+            built.variables.get("TERMINFO").map(String::as_str),
+            Some("/state/terminfo")
+        );
+        assert!(
+            !built.variables.contains_key("TERMINFO_DIRS"),
+            "a creator with no database directories leaves the search as it was"
+        );
+        assert_eq!(
+            built.sources.terminfo.directory.as_deref(),
+            Some("/state/terminfo")
+        );
+        assert!(!built.sources.terminfo.overridden());
+        assert_eq!(built.variables.get("TERM").map(String::as_str), Some(TERM));
+    }
+
+    #[test]
+    fn a_creators_database_directories_follow_the_private_one_and_are_reported() {
+        let built = built_with(
+            &[
+                ("TERMINFO", "/home/a/.terminfo"),
+                ("TERMINFO_DIRS", "/opt/one:/opt/two"),
+            ],
+            &with_private_database("/state/terminfo"),
+        );
+        // The private directory is read first, and the creator's own `TERMINFO` keeps the place it
+        // had ahead of its `TERMINFO_DIRS`.
+        assert_eq!(
+            built.variables.get("TERMINFO").map(String::as_str),
+            Some("/state/terminfo")
+        );
+        assert_eq!(
+            built.variables.get("TERMINFO_DIRS").map(String::as_str),
+            Some("/home/a/.terminfo:/opt/one:/opt/two")
+        );
+        let selection = &built.sources.terminfo;
+        assert!(selection.overridden());
+        assert_eq!(
+            selection.creator_terminfo.as_deref(),
+            Some("/home/a/.terminfo")
+        );
+        assert_eq!(
+            selection.creator_terminfo_dirs.as_deref(),
+            Some("/opt/one:/opt/two")
+        );
+    }
+
+    #[test]
+    fn either_of_a_creators_database_variables_alone_is_kept_too() {
+        let only_dirs = built_with(
+            &[("TERMINFO_DIRS", "/opt/one")],
+            &with_private_database("/state/terminfo"),
+        );
+        assert_eq!(
+            only_dirs.variables.get("TERMINFO_DIRS").map(String::as_str),
+            Some("/opt/one")
+        );
+        assert!(only_dirs.sources.terminfo.overridden());
+
+        let only_first = built_with(
+            &[("TERMINFO", "/home/a/.terminfo")],
+            &with_private_database("/state/terminfo"),
+        );
+        assert_eq!(
+            only_first
+                .variables
+                .get("TERMINFO_DIRS")
+                .map(String::as_str),
+            Some("/home/a/.terminfo")
+        );
+        assert_eq!(
+            only_first.variables.get("TERMINFO").map(String::as_str),
+            Some("/state/terminfo")
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_private_database_reads_what_its_creator_named() {
+        let built = built_with(
+            &[("TERMINFO", "/home/a/.terminfo")],
+            &ExecutionContext::default(),
+        );
+        assert_eq!(
+            built.variables.get("TERMINFO").map(String::as_str),
+            Some("/home/a/.terminfo")
+        );
+        assert_eq!(built.sources.terminfo, TerminfoSelection::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_private_database_is_written_inside_the_state_directory() {
+        let state = std::env::temp_dir().join(format!("kr-worker-terminfo-{}", std::process::id()));
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let directory = materialise_terminfo(&state).expect("the database is written");
+        assert_eq!(directory, state.join(TERMINFO_DIRECTORY));
+        let description = kr_term::terminfo::Description::pinned();
+        for entry in description.entry_paths(&directory) {
+            assert_eq!(
+                std::fs::read(&entry).expect("an entry"),
+                kr_term::terminfo::compiled().expect("compiles")
+            );
+        }
+        // Writing it again, as the next session's worker does, changes nothing.
+        assert_eq!(
+            materialise_terminfo(&state).expect("the database is current"),
+            directory
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
