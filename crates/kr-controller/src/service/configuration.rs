@@ -129,6 +129,41 @@ impl Controller {
                 from_document: false,
             },
         };
+        // The disable policy the catalogue enforces: put in force when this reading loaded a
+        // document that names one, and left as it is otherwise. It is recorded with the admission
+        // revision it moves, so a change sends every worker a round.
+        let mut policy_failure = None;
+        let disable_policy = match crate::config::catalogue::disable_policy_in_force(&resolver) {
+            Some(policy) => match self.catalogue.put_disable_policy_in_force(policy).await {
+                Ok(moved) => {
+                    if moved {
+                        self.admissions_due();
+                    }
+                    crate::config::EnforcedDisablePolicy {
+                        value: policy,
+                        from_document: true,
+                    }
+                }
+                Err(error) => {
+                    policy_failure = Some(
+                        Sentence::new()
+                            .stated(
+                                "the disable policy did not change, because it could not be \
+                                 recorded with the admission revision it moves: ",
+                            )
+                            .withheld(ContentClass::Message, &error.message),
+                    );
+                    crate::config::EnforcedDisablePolicy {
+                        value: self.retained_disable_policy().await,
+                        from_document: false,
+                    }
+                }
+            },
+            None => crate::config::EnforcedDisablePolicy {
+                value: self.retained_disable_policy().await,
+                from_document: false,
+            },
+        };
         // The rights ceiling a paired device's request is decided against, from this reading when
         // it produced a document and as it was when it did not. Before the fence below, so a
         // narrower ceiling decides every request from here on while the work admitted under the
@@ -206,7 +241,10 @@ impl Controller {
         owed.fences_dispatch = owes_own || owed_elsewhere;
         let fence_now = owed.fences_dispatch;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
-        for problem in [ceiling_failure, budget_failure].into_iter().flatten() {
+        for problem in [ceiling_failure, budget_failure, policy_failure]
+            .into_iter()
+            .flatten()
+        {
             failure = Some(match failure {
                 Some(earlier) => earlier.stated("; ").sentence(&problem),
                 None => problem,
@@ -350,6 +388,7 @@ impl Controller {
             resolver,
             sessions,
             budgets,
+            disable_policy,
             owed,
             barrier,
             fence_owed,
@@ -357,6 +396,15 @@ impl Controller {
             not_in_force: failure,
             rights,
         }
+    }
+
+    /// The disable policy already in force, for a reading that decided none. A policy that cannot
+    /// be read is reported as the product's own, and the acceptance says why it could not be.
+    async fn retained_disable_policy(&self) -> kr_protocol::admission::RevocationPolicy {
+        self.catalogue
+            .disable_policy_in_force()
+            .await
+            .unwrap_or(kr_protocol::admission::RevocationPolicy::WarnOnly)
     }
 
     /// Puts the document's session ceiling where admission reads it, and returns what is in force.

@@ -1733,6 +1733,13 @@ pub mod configuration {
         pub grant_rights: Nullable<Vec<String>>,
         /// The repository enrolment budgets section 11 calls configuration.
         pub enrolment: Nullable<ConfiguredEnrolmentBudgets>,
+        /// What happens to a live binding whose release its repository revokes: section 25's
+        /// administrator's explicit disable policy.
+        ///
+        /// Absent leaves the policy this host already holds, which is warning only until one is
+        /// named; present puts the one named in force from the next admission. Removing the member
+        /// does not return to warning only: naming `warn_only` does.
+        pub disable_policy: Nullable<crate::admission::RevocationPolicy>,
     }
 
     impl Default for ConfigurationCeilings {
@@ -1742,6 +1749,7 @@ pub mod configuration {
                 session_limit: Nullable::null(),
                 grant_rights: Nullable::null(),
                 enrolment: Nullable::null(),
+                disable_policy: Nullable::null(),
             }
         }
     }
@@ -4220,7 +4228,12 @@ pub mod configuration {
     }
 
     /// The ceilings a report names, which are the ceilings a document may carry.
-    pub const CEILINGS: [&str; 3] = ["session_limit", "enrolment", "grant_rights"];
+    pub const CEILINGS: [&str; 4] = [
+        "session_limit",
+        "enrolment",
+        "grant_rights",
+        "disable_policy",
+    ];
 
     /// The repository enrolment budgets a document may name.
     pub const BUDGETS: [&str; 10] = [
@@ -8293,8 +8306,14 @@ mod tests {
         }
         for preference in &configuration::PREFERENCES {
             assert!(
-                !["session_limit", "grant_rights", "enrolment", "authority"]
-                    .contains(&preference.key),
+                ![
+                    "session_limit",
+                    "grant_rights",
+                    "enrolment",
+                    "disable_policy",
+                    "authority"
+                ]
+                .contains(&preference.key),
                 "{} is a ceiling, not an ordinary preference",
                 preference.key
             );

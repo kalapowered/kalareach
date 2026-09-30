@@ -96,6 +96,8 @@ pub struct Accepted {
     pub sessions: Enforced,
     /// The enrolment budgets the catalogue enforces.
     pub budgets: EnforcedBudgets,
+    /// The disable policy the catalogue enforces.
+    pub disable_policy: EnforcedDisablePolicy,
     /// What this document owed beyond the registry write.
     pub owed: configuration::Owed,
     /// The fence this acceptance raised, when the document's authority ceiling moved.
@@ -209,10 +211,21 @@ impl Accepted {
                 from_document: true,
             },
         );
+        let disable_policy = catalogue::disable_policy_in_force(&resolver).map_or(
+            EnforcedDisablePolicy {
+                value: kr_protocol::admission::RevocationPolicy::WarnOnly,
+                from_document: false,
+            },
+            |value| EnforcedDisablePolicy {
+                value,
+                from_document: true,
+            },
+        );
         Self {
             resolver,
             sessions,
             budgets,
+            disable_policy,
             owed: configuration::Owed::default(),
             barrier: None,
             fence_owed: None,
@@ -244,6 +257,16 @@ pub struct EnforcedBudgets {
     pub value: configuration::EnrolmentBudgets,
     /// True when the document this report describes decided them. A document that decided
     /// nothing leaves the budgets the owner accepted where they were, and then this is false.
+    pub from_document: bool,
+}
+
+/// The disable policy the catalogue enforces, and where it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnforcedDisablePolicy {
+    /// What happens to a live binding whose release is revoked, right now.
+    pub value: kr_protocol::admission::RevocationPolicy,
+    /// True when the document this report describes named it and it is in force. A document that
+    /// names none leaves the policy this host holds where it is, and then this is false.
     pub from_document: bool,
 }
 
@@ -569,6 +592,32 @@ pub fn effective(
         )
     };
 
+    // The disable policy: what the document names, and the policy in force. The two differ where
+    // this reading named none, and then the policy in force is the one this host last accepted.
+    let policy = accepted.disable_policy;
+    let (policy_source, policy_origin) = if policy.from_document {
+        (
+            configuration::ValueSource::HostConfiguration,
+            Some(doc_path.clone()),
+        )
+    } else if policy.value == kr_protocol::admission::RevocationPolicy::WarnOnly {
+        (configuration::ValueSource::Default, None)
+    } else {
+        (configuration::ValueSource::HostConfiguration, None)
+    };
+    let policy_line = |policy: kr_protocol::admission::RevocationPolicy| match policy {
+        kr_protocol::admission::RevocationPolicy::WarnOnly => Sentence::new()
+            .stated("warn only: a live binding on a revoked release keeps serving, and says so"),
+        kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission => Sentence::new().stated(
+            "disable at the next admission: a live binding on a revoked release keeps observing \
+             and admits nothing more",
+        ),
+        kr_protocol::admission::RevocationPolicy::DisableAtOnce => Sentence::new().stated(
+            "disable at once: a live binding on a revoked release closes at its next admission \
+             boundary",
+        ),
+    };
+
     // What the document asks for, and the ceiling a paired device's request is decided against.
     // They are the same on an ordinary host. Where this reading decided nothing - no document, one
     // this build cannot read, one at a version it does not know - the ceiling this host last
@@ -687,6 +736,26 @@ pub fn effective(
                     }
                 },
             ),
+            kr_protocol::hostinfo::CeilingValue {
+                key: "disable_policy".to_owned(),
+                configured: kr_protocol::scalars::Nullable(
+                    ceilings.disable_policy.0.map(policy_line),
+                ),
+                value: if policy.from_document
+                    || policy.value == kr_protocol::admission::RevocationPolicy::WarnOnly
+                {
+                    policy_line(policy.value)
+                } else {
+                    policy_line(policy.value).stated(
+                        "; the policy this host last accepted, because this document named none",
+                    )
+                },
+                source: policy_source,
+                origin: kr_protocol::scalars::Nullable(policy_origin),
+                effect: configuration::ValueEffect::Immediately,
+                narrowed_by: kr_protocol::scalars::Nullable(None),
+                refused: false,
+            },
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),
                 configured: kr_protocol::scalars::Nullable(

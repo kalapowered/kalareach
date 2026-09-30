@@ -516,6 +516,60 @@ impl CatalogueModule {
         Ok(moved)
     }
 
+    /// Puts the disable policy this host's configuration names in force for the admissions that
+    /// follow, and returns true when that changed what was in force, so the caller sends every
+    /// worker a round.
+    ///
+    /// The policy is part of what the admissions carry, so the admission revision rises with it,
+    /// in the same commit that records the policy, under the catalogue's own lock: no read of the
+    /// catalogue sees the new policy at the old revision. A policy equal to the one in force
+    /// changes nothing and raises nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when the policy could not be recorded, and then the
+    /// policy in force is the one before: the next acceptance of the same configuration tries
+    /// again.
+    pub async fn put_disable_policy_in_force(
+        &self,
+        policy: kr_protocol::admission::RevocationPolicy,
+    ) -> Answer<bool> {
+        let mut catalogue = self.catalogue.lock().await;
+        let wanted = admissions::disable_policy_of(policy);
+        if catalogue.disable_policy().map_err(ProtocolError::from)? == wanted {
+            return Ok(false);
+        }
+        #[cfg(feature = "testing")]
+        if self
+            .raise_fault
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "the admission revision could not be written",
+            ));
+        }
+        catalogue
+            .set_disable_policy(wanted)
+            .map_err(ProtocolError::from)?;
+        Ok(true)
+    }
+
+    /// Returns the disable policy in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when the setting cannot be read.
+    pub async fn disable_policy_in_force(
+        &self,
+    ) -> Answer<kr_protocol::admission::RevocationPolicy> {
+        let catalogue = self.catalogue.lock().await;
+        catalogue
+            .disable_policy()
+            .map(admissions::revocation_policy_of)
+            .map_err(ProtocolError::from)
+    }
+
     /// Returns the enrolment budgets in force.
     #[must_use]
     pub fn budgets_in_force(&self) -> kr_protocol::hostinfo::configuration::EnrolmentBudgets {
