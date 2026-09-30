@@ -391,15 +391,44 @@ impl Provenance {
         self.check_names(&self.exported_file)
     }
 
-    /// Checks the same names as the shell wrote them just before it ran its last command line,
-    /// which is the agent's: what the agent started with, and not what the shell had at the
-    /// prompt before it.
+    /// Removes the names the shell wrote before an earlier command line, so that the list the
+    /// next line writes is the only one [`Provenance::check_cleared_at_start`] can read.
+    pub fn forget_started(&self) {
+        if self.cleared_required.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&self.started_file);
+        }
+    }
+
+    /// Checks the same names as the shell wrote them just before it ran the command line typed
+    /// since [`Provenance::forget_started`], which is the agent's: what the agent started with,
+    /// and not what the shell had at the prompt before it. Waits at most `within` for the list.
     ///
     /// # Errors
     ///
-    /// Returns why, as [`Provenance::check_cleared`] does.
-    pub fn check_cleared_at_start(&self) -> Result<(), String> {
-        self.check_names(&self.started_file)
+    /// Returns why, as [`Provenance::check_cleared`] does, and beginning with
+    /// [`ENVIRONMENT_NOT_READ`] when no list, or one without `PATH`, was written in time.
+    pub fn check_cleared_at_start(&self, within: Duration) -> Result<(), String> {
+        if self.cleared.is_empty() || !self.cleared_required.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + within;
+        loop {
+            match std::fs::read_to_string(&self.started_file) {
+                Ok(names) if names.lines().any(|line| line == EXPORTED_WITNESS) => {
+                    return exported_clear(&names, &self.cleared, &self.allowed);
+                }
+                other if Instant::now() >= deadline => {
+                    return Err(format!(
+                        "{ENVIRONMENT_NOT_READ} the session's shell wrote no complete list of \
+                         the names it exports before it ran the agent's line to {}: {}",
+                        self.started_file.display(),
+                        other
+                            .map_or_else(|error| error.to_string(), |_| "no PATH in it".to_owned())
+                    ));
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 
     /// Makes the launch check the variables the build list clears: the parts that run with the
