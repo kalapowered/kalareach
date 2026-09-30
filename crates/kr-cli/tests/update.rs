@@ -530,6 +530,23 @@ async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
     false
 }
 
+/// Makes every directory under `root`, and `root`, read-only, as a release in the store is.
+fn seal_directories(root: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a directory") {
+            let entry = entry.expect("an entry");
+            if entry.file_type().expect("a type").is_dir() {
+                pending.push(entry.path());
+            }
+        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555))
+            .expect("sealed");
+    }
+}
+
 /// A second environment of a host's store: a tree of its own, and a daemon of the store's current
 /// release serving it. Whatever daemon serves it when the test ends, the one this started or one an
 /// update started in its place, is stopped through its own door before the tree goes.
@@ -2570,8 +2587,6 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
 /// has been removed the install goes through.
 #[test]
 fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     // What is put where the kept release's manifest is, given the manifest's path and a directory
     // outside the store.
@@ -2605,6 +2620,8 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
         one.write(&kept);
         let outside = host.scratch("outside");
         instead(&host.store.manifest(one.name()), &outside);
+        // As a release in the store is: every directory read-only.
+        seal_directories(&kept);
         let store = host.store.root().display().to_string();
         let unpacked = host.scratch("unpacked").join(one.name().as_str());
         one.write(&unpacked);
@@ -2615,7 +2632,9 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
         assert_eq!(refused.status.code(), Some(1), "{what}");
         let said = String::from_utf8_lossy(&refused.stderr).into_owned();
         assert!(
-            said.contains(&kept.display().to_string()) && said.contains("kr host install again"),
+            said.contains(&kept.display().to_string())
+                && said.contains("chmod -R u+w")
+                && said.contains("kr host install again"),
             "{what}: {said}"
         );
         assert!(
@@ -2624,8 +2643,18 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
         );
         assert_eq!(host.store.current().expect("reads"), None, "{what}");
 
-        // The control: with the directory removed, the install goes through.
-        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).expect("opens");
+        // The control: as the refusal says, the directory is made writable and removed, and the
+        // install goes through. Removed as it is, it would not be.
+        assert!(
+            std::fs::remove_dir_all(&kept).is_err(),
+            "{what}: a sealed directory is not removed as it is"
+        );
+        let opened = Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&kept)
+            .status()
+            .expect("chmod runs");
+        assert!(opened.success(), "{what}: the directory is made writable");
         std::fs::remove_dir_all(&kept).expect("removes");
         host.install(&one);
         assert_eq!(

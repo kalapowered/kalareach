@@ -605,8 +605,8 @@ fn replace_kept(
         let kept = release::manifest_document(&directory).map_err(|_| {
             CliError::Other(shown!(
                 "the store holds a directory for release {} whose manifest is not a file this host \
-                 reads, a link or a pipe among the possible causes: remove {} and run kr host {} \
-                 again",
+                 reads, a link or a pipe among the possible causes: make {} writable with `chmod -R \
+                 u+w`, remove it, and run kr host {} again",
                 crate::shown::release(&manifest.release),
                 Shown::root(&directory),
                 command
