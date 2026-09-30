@@ -17,11 +17,14 @@ use kr_shell_integration::contract::events::{
     PressedKey,
 };
 use kr_shell_integration::contract::fixtures::{PreEofStep, Script};
-use kr_shell_integration::contract::qualification::{BridgeAbi, DetachExclusion, ShellKind};
+use kr_shell_integration::contract::qualification::{
+    BridgeAbi, DetachExclusion, IntegrationLoss, ShellKind,
+};
 use kr_shell_integration::contract::requests::{
     BridgeAnswer, CancelKeyWait, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason,
     LaunchTransactionId, WorkerRequest,
 };
+use kr_shell_integration::host::phase::PhaseGate;
 
 use super::*;
 
@@ -2236,6 +2239,241 @@ pub fn the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_
         session.no_managed_decision_before(0),
         "the terminal's byte was decided on as if it were the configured chord {other}"
     );
+}
+
+/// The question a person's own startup asks before anything of the package's entry has run, in the
+/// shell's own words for reading a line, and the words it prints once it has an answer.
+///
+/// `read` in Bash and Fish, `vared` in Zsh, whose line editor is what a startup prompt would use,
+/// and `Read-Host` in PowerShell. The marker is put together by the shell from what it read, so
+/// the terminal echoing the answer cannot make it appear.
+fn startup_question(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::Zsh => {
+            "kr_answer=\nvared -p 'ASK> ' kr_answer\nprint -r -- \"kr-answer-<${kr_answer}>\"\n"
+        }
+        ShellKind::Bash => {
+            "read -r -p 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' \"$kr_answer\"\n"
+        }
+        ShellKind::Fish => "read -P 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' $kr_answer\n",
+        ShellKind::PowerShell => {
+            "$kr_answer = Read-Host 'ASK>'\nWrite-Host \"kr-answer-<$kr_answer>\"\n"
+        }
+    }
+}
+
+/// KR-REQ-07.23: a startup prompt reads its answer once the bridge is authenticated, and the
+/// session reports ready only after the profile that asked has finished.
+///
+/// Section 7 lets a native startup prompt receive normal input in its own non-primary context
+/// while the profiles run, and forbids the deadlock a worker would make of a profile that asks a
+/// question: rich launch and a ready session wait for full qualification after the profile. Here
+/// the person's startup asks before the package's entry has run. The bridge must already be
+/// connected and its handshake accepted, or nothing here could type the answer; the phase the
+/// worker holds is then authenticated, which takes input and neither launches nor reports ready;
+/// the answer reaches the prompt; and the entry's activation, which is the profile having
+/// finished, is what qualifies the session.
+pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: startup_question(kind),
+            ..Profile::ORDINARY
+        },
+    );
+    // Authenticated and ABI-checked: the handshake this returns from is the worker's own decision
+    // over the hello, and the reader it declared is the one the package's record names.
+    assert_eq!(
+        session.hello.shell.editor_abi,
+        package.record["shell"]["editor_abi"]
+            .as_str()
+            .expect("the package records its editor ABI"),
+        "the bridge declared a reader other than the one the package was built as"
+    );
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(
+        !phase.accepts_external_input(),
+        "input is refused before the bridge has authenticated"
+    );
+    assert!(phase.authenticated(kind));
+    assert!(phase.accepts_external_input());
+    assert!(!phase.reports_ready());
+    assert!(!phase.permits_launch());
+
+    // The prompt is on the terminal, waiting, and the profile that asked has not finished, so the
+    // activation that follows it cannot have come.
+    assert!(
+        session.drew_after(0, "ASK>", REPLY).was_drawn(),
+        "the startup prompt was not drawn:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::HooksActivated(_)
+        )),
+        "the hooks were reported live while the profile was still waiting for its answer"
+    );
+    assert!(!phase.reports_ready());
+
+    session.type_bytes(b"the-answer\r");
+    assert!(
+        session
+            .drew_after(0, "kr-answer-<the-answer>", REPLY)
+            .was_drawn(),
+        "the answer did not reach the startup prompt:\n{}",
+        session.terminal_output()
+    );
+
+    // The profile has finished, so the activation comes, and then the first reader of the shell.
+    let entry = session.first_prompt();
+    assert!(
+        phase.qualified(),
+        "the activation qualifies an authenticated session"
+    );
+    assert!(phase.reports_ready());
+    assert!(phase.permits_launch());
+    assert_eq!(
+        entry.reader_context,
+        kr_protocol::root::ReaderContext::Primary
+    );
+    assert!(session.alive());
+}
+
+/// KR-REQ-07.23: a profile that asks and is never answered leaves the session authenticated and
+/// not ready, and the shell can be ended within its bound rather than left hanging.
+///
+/// Nothing here decides by how long the shell was left. The prompt is drawn, so the profile is
+/// waiting for its answer, and a shell waiting for input cannot go on to activate anything: what is
+/// asserted is that the phase is what it was and the shell ends when asked.
+pub fn a_startup_prompt_nobody_answers_holds_readiness_and_does_not_hang_the_shell(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: startup_question(kind),
+            ..Profile::ORDINARY
+        },
+    );
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(phase.authenticated(kind));
+    assert!(session.drew_after(0, "ASK>", REPLY).was_drawn());
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::HooksActivated(_)
+        )),
+        "a profile nobody answered went on to report the hooks live"
+    );
+    assert!(
+        !phase.reports_ready(),
+        "an unanswered profile reported ready"
+    );
+    assert!(!phase.permits_launch());
+    assert!(
+        phase.accepts_external_input(),
+        "and it still takes the answer"
+    );
+    assert!(session.alive());
+
+    // The shell ends when asked, inside the harness's own bound for a shell to stop.
+    let ending = Deadline::after(REPLY);
+    drop(session);
+    assert!(
+        !ending.passed(),
+        "the shell that was waiting for an answer did not stop within its bound"
+    );
+}
+
+/// The report a profile makes when it fails after the startup files, in the shell's own words: the
+/// package's own report, which is what its entry makes when the integration cannot go on.
+fn failing_after_startup(kind: ShellKind) -> Profile<'static> {
+    match kind {
+        ShellKind::Zsh | ShellKind::Bash => Profile {
+            after_configuration: "builtin kr-bridge lost post-startup-failure 'the profile failed after its startup files'\n",
+            entry: false,
+            after_entry: "",
+        },
+        // The fish reader is only there once the first prompt is, and the entry waits for it.
+        ShellKind::Fish => Profile {
+            after_configuration: "function __kr_fail --on-event fish_prompt\n    functions --erase __kr_fail\n    builtin kr-bridge lost post-startup-failure 'the profile failed after its startup files'\nend\n",
+            entry: false,
+            after_entry: "",
+        },
+        // The module is loaded by the entry, so the report follows it.
+        ShellKind::PowerShell => Profile {
+            after_configuration: "",
+            entry: true,
+            after_entry: "Write-KalaReachLoss -Loss post_startup_failure -Detail 'the profile failed after its startup files'\n",
+        },
+    }
+}
+
+/// KR-REQ-07.23, KR-REQ-07.22: a profile that fails after the startup files closes the session that
+/// was being created, and carries its diagnostics.
+pub fn a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagnostics(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(&package, failing_after_startup(kind));
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(phase.authenticated(kind));
+    let (_, event) = session.expect_event("integration_lost", |event| {
+        matches!(event, BridgeEvent::IntegrationLost(_))
+    });
+    let BridgeEvent::IntegrationLost(lost) = event else {
+        unreachable!()
+    };
+    assert_eq!(lost.loss, IntegrationLoss::PostStartupFailure);
+    assert_eq!(
+        lost.detail, "the profile failed after its startup files",
+        "the diagnostics the session closes with"
+    );
+    let decision = phase.lost(lost.loss);
+    assert!(
+        decision.closes_session,
+        "a loss before the session qualified must close the session that was being created"
+    );
+    assert!(!phase.reports_ready());
+}
+
+/// KR-REQ-07.23, KR-REQ-07.85: an editor that is no longer the qualified one when the profile has
+/// finished is diagnosed at activation, rather than reported live on the strength of the editor the
+/// module found when it loaded.
+///
+/// The module loads first in the profile so that the bridge is open before the profile asks
+/// anything, which leaves the profile free to change the editor afterwards. The profile here does:
+/// it puts an editor in the module's place that keeps no key queue the module can read, and the
+/// session says the integration failed after the startup files instead of activating.
+pub fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "",
+            entry: true,
+            after_entry: "Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition 'public class KrEditorGone { }'\n\
+                          & (Get-Module KalaReach.ShellBridge) { param($editor) $script:SingletonField = $null; $script:QueuedKeysField = $null; $script:Rl = $editor } ([KrEditorGone])\n",
+        },
+    );
+    let mut phase = PhaseGate::unauthenticated();
+    assert!(phase.authenticated(kind));
+    let (_, event) = session.expect_event("integration_lost", |event| {
+        matches!(event, BridgeEvent::IntegrationLost(_))
+    });
+    let BridgeEvent::IntegrationLost(lost) = event else {
+        unreachable!()
+    };
+    assert_eq!(lost.loss, IntegrationLoss::PostStartupFailure);
+    assert!(
+        lost.detail.contains("keeps no reader queue"),
+        "the diagnostics name what changed: {}",
+        lost.detail
+    );
+    assert!(phase.lost(lost.loss).closes_session);
 }
 
 /// Removes the per-package licence paragraph, which is the one part that differs on purpose.

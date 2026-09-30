@@ -236,3 +236,33 @@ fn the_package_declares_the_qualified_baseline_and_its_reproducible_identity() {
 fn every_committed_scenario_naming_powershell_holds_against_the_contract() {
     shellpkg::every_scenario_naming_this_shell_holds(PWSH);
 }
+
+/// KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_startup_prompt_reads_its_answer_and_the_session_is_ready_only_after_the_profile() {
+    shellpkg::a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(PWSH);
+}
+
+/// KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_startup_prompt_nobody_answers_holds_readiness_without_hanging_the_shell() {
+    shellpkg::a_startup_prompt_nobody_answers_holds_readiness_and_does_not_hang_the_shell(PWSH);
+}
+
+/// KR-REQ-07.22, KR-REQ-07.23
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagnostics() {
+    shellpkg::a_profile_that_fails_after_startup_closes_the_creating_session_with_its_diagnostics(
+        PWSH,
+    );
+}
+
+/// KR-REQ-07.23, KR-REQ-07.85
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate() {
+    shellpkg::an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(PWSH);
+}
