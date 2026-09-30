@@ -60,10 +60,14 @@ fn environment() -> Vec<(String, String)> {
 
 /// Builds the command that runs one POSIX script as a session's root shell.
 ///
+/// On Windows the first call in a process also starts the copy of the shell that process keeps
+/// running, as [`posix_shell`] says.
+///
 /// # Panics
 ///
-/// Panics when this machine has no POSIX shell, naming what to install. A test that quietly did
-/// nothing instead would report a pass it never earned.
+/// Panics when this machine has no POSIX shell, naming what to install, and on Windows when the
+/// copy to be kept does not start. A test that quietly did nothing instead would report a pass it
+/// never earned.
 #[must_use]
 pub fn posix_script(script: &str) -> ShellCommand {
     ShellCommand {
@@ -76,18 +80,97 @@ pub fn posix_script(script: &str) -> ShellCommand {
 
 /// Returns the path of this machine's POSIX shell.
 ///
+/// On Windows the first call in a process also starts one copy of the shell and keeps it running
+/// until the process ends: the shells a test starts together then find the table of mounts they
+/// share already made.
+///
 /// # Panics
 ///
-/// Panics when there is none, naming what to install.
+/// Panics when there is none, naming what to install, and on Windows when the copy to be kept does
+/// not start.
 #[must_use]
 pub fn posix_shell() -> String {
-    find_posix_shell().unwrap_or_else(|| {
+    let shell = find_posix_shell().unwrap_or_else(|| {
         panic!(
             "this machine has no POSIX shell to run a test script with. On Windows the one these \
              tests use is the shell Git for Windows installs, at \
              C:\\Program Files\\Git\\usr\\bin\\sh.exe; install Git for Windows or put an sh.exe \
              on PATH. See docs/host/README.md."
         )
+    });
+    #[cfg(windows)]
+    keep_one_shell_running(&shell);
+    shell
+}
+
+/// The copy of the POSIX shell a test process keeps running, once it has started one.
+#[cfg(windows)]
+static KEPT_SHELL: std::sync::OnceLock<std::sync::Mutex<std::process::Child>> =
+    std::sync::OnceLock::new();
+
+/// Starts one copy of the POSIX shell, alone, and keeps it running for as long as this process
+/// does, so that a test process that starts many sessions at once does not start them into a
+/// Windows that has no copy running.
+///
+/// Git for Windows' shell keeps the table of its mounts in memory every copy of it shares. The
+/// first copy to start makes the table and the last to end takes it away. When a dozen sessions
+/// start their shells together and no copy is running, some of the shells stop about fifteen
+/// seconds after they start, with `add_item ... failed, errno 1` as all they write and none of
+/// their script run. Starting a dozen plain copies together with none running did not do this, so
+/// something of how a session starts its shell is part of it. A copy started first, on its own,
+/// leaves every later one to find the table made.
+///
+/// The copy waits for a line its parent never sends. It ends when this process does, by whatever
+/// way that is, because the pipe it reads closes with it.
+///
+/// # Panics
+///
+/// Panics, with what the copy wrote, when it does not start.
+#[cfg(windows)]
+fn keep_one_shell_running(shell: &str) {
+    use std::io::BufRead as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    KEPT_SHELL.get_or_init(|| {
+        let mut child = std::process::Command::new(shell)
+            .args(["-c", "echo kept; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("the shell {shell} would not start: {error}"));
+        let stdout = child.stdout.take().expect("the shell's output is piped");
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        match received.recv_timeout(Duration::from_secs(60)) {
+            Ok(line) if line.trim() == "kept" => std::sync::Mutex::new(child),
+            _ => {
+                let _ = child.kill();
+                let said = child
+                    .wait_with_output()
+                    .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+                    .unwrap_or_default();
+                panic!("the shell {shell} did not start and keep running: {said}");
+            }
+        }
+    });
+}
+
+/// Whether the copy of the shell this process keeps is running.
+#[cfg(all(windows, test))]
+#[must_use]
+fn kept_shell_is_running() -> bool {
+    KEPT_SHELL.get().is_some_and(|child| {
+        child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait()
+            .is_ok_and(|status| status.is_none())
     })
 }
 
@@ -264,6 +347,18 @@ mod tests {
         assert!(
             std::path::Path::new(&shell).exists(),
             "{shell} is a path that exists"
+        );
+    }
+
+    /// A process that starts shells keeps one copy running beside them, so that the copies it
+    /// starts together find the shell's shared tables made.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_that_starts_shells_keeps_one_copy_of_the_shell_running() {
+        let _ = posix_shell();
+        assert!(
+            kept_shell_is_running(),
+            "no copy of the shell is kept running"
         );
     }
 
