@@ -2533,9 +2533,6 @@ async fn closing_a_controlling_view_detaches_and_writes_nothing_after() {
     assert_eq!(detach.attachment_id.0, Some(holder));
 }
 
-/// Input to a view that has ended, closed by the page or by its link, or to a view that was never
-/// open, is refused as control that has ended, and nothing of it reaches a session: the page is
-/// never told that input was taken when it was not.
 /// What native code says of an input it cannot read, or that it reads: the words the scripted host
 /// is held to, in the fixture the page's tests read the same cases from.
 #[test]
@@ -2646,6 +2643,9 @@ async fn a_wheel_that_turns_no_times_is_refused_in_the_decoders_words() {
     assert_eq!(refusal["user_action"], "nothing");
 }
 
+/// Input to a view that has ended, closed by the page or by its link, or to a view that was never
+/// open, is refused as control that has ended, and nothing of it reaches a session: the page is
+/// never told that input was taken when it was not.
 #[tokio::test(flavor = "multi_thread")]
 async fn input_to_a_view_that_has_ended_or_was_never_open_is_refused() {
     let refused_as_ended = |page: &Page, view: &str| {
