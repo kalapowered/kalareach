@@ -903,7 +903,7 @@ pub async fn voice_start(
         prepared,
         expected_rate_version,
     );
-    Err(CommandError::unavailable(
+    Err(CommandError::unsupported(
         "this application cannot open a voice call on this device",
     ))
 }

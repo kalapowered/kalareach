@@ -43,7 +43,7 @@ pub async fn confirm_voice_action(
         CeremonyOutcome::NotConfirmed => Err(CommandError::refused(
             "the unlocked-screen ceremony was not completed",
         )),
-        CeremonyOutcome::Unavailable => Err(CommandError::unavailable(
+        CeremonyOutcome::Unavailable => Err(CommandError::unsupported(
             "this device has no user-verification ceremony; confirm from a separately paired \
              owner device",
         )),

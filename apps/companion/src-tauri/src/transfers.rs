@@ -53,6 +53,19 @@ pub struct HandedFile {
     media_type: String,
 }
 
+/// What is said of a pasted or picked file above the size limit. The limit is said in megabytes,
+/// which is what a person reads. A desktop window takes a larger file dropped on it and a phone has
+/// no window to drop on, so only the desktop is told so.
+fn too_large_to_hand() -> String {
+    let megabytes = MAX_HANDED_BYTES / (1024 * 1024);
+    let said = format!("a pasted or picked file is at most {megabytes} MiB");
+    if cfg!(mobile) {
+        said
+    } else {
+        format!("{said}; drop a larger one on the window")
+    }
+}
+
 impl HandedFile {
     /// Takes the bytes the page handed over and the name the platform gave the file.
     ///
@@ -64,9 +77,7 @@ impl HandedFile {
     /// Returns `QUOTA_EXCEEDED` when the file is larger than [`MAX_HANDED_BYTES`].
     pub fn new(bytes: Vec<u8>, name: &str) -> Result<Self> {
         if bytes.len() > MAX_HANDED_BYTES {
-            return Err(CommandError::too_large(format!(
-                "a pasted or picked file is at most {MAX_HANDED_BYTES} bytes; drop a larger one on the window"
-            )));
+            return Err(CommandError::too_large(too_large_to_hand()));
         }
         let name = handed_name(name);
         let media_type = media_type_of(Path::new(&name));

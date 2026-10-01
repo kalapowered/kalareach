@@ -194,7 +194,7 @@ impl DesktopVoiceCall {
             return Err(CommandError::refused("the call has already been stopped"));
         }
 
-        Err(CommandError::unavailable(
+        Err(CommandError::unsupported(
             "this desktop application cannot open a voice call",
         ))
     }
@@ -233,7 +233,14 @@ impl DesktopVoiceCall {
         }
 
         let _parsed = RTCSessionDescription::answer(answer_sdp.to_owned())
-            .map_err(|error| CommandError::invalid(format!("invalid SDP answer: {error}")))?;
+            // The answer came from the host's provider: a disagreement with it is the two builds',
+            // which a person may mend by updating, so it keeps the action its code maps to.
+            .map_err(|error| {
+                CommandError::new(
+                    kr_protocol::error::ErrorCode::InvalidArgument,
+                    format!("invalid SDP answer: {error}"),
+                )
+            })?;
 
         let mut lock = self
             .answer_sdp
