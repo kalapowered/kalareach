@@ -157,10 +157,10 @@ nothing.
 ## Coming back
 
 A phone suspends an application, terminates it in the background, changes its network underneath it
-and restarts it cold. In each case any drafts that were being worked on will still be there.
-Whenever the shell is in contact with the host, it asks the host where each detached draft's
-conversation stands, even for drafts in a session that is not on screen. Each draft is then offered
-its rebind. Two rules keep the rest honest.
+and restarts it cold. The draft survives all four. When contact with the host starts, and each time
+the application comes to the front, the shell asks the host where each detached draft's conversation
+stands, even if the draft is in a different session than the one currently displayed. Each draft is
+then offered its rebind. Two rules keep the rest honest.
 
 **The draft is durable and the association is not.** A draft is this device's own record with its
 own identity and revision. The attachment that presents it in an editor belongs to the connection,
@@ -169,13 +169,15 @@ offers a rebind, and only the same authorised device against an unchanged target
 changed application or binding revision is a conflict the person resolves, and a session that has
 gone orphans the draft. Nothing is ever submitted automatically.
 
-Contact with the host drives the rebind, not the connection changing. Every time the shell is in
-contact with the host and there is a detached draft, the shell will read the session of that draft
-and attempt to bind the draft to the conversation again if the conversation is the same. This can
-happen either when coming in to contact with the host, or when bringing the application to the front
-over a connection that never dropped. Only a detached draft is offered a rebind. If the host does
-not know the session the drafts will be orphaned, if it isn't the same conversation they will be
-conflicted, and if the read fails they will stay detached until the next time.
+Note that contact starting here means that contact has started with a host, and not merely that the
+connection has changed. Any time the application comes to the front, even if it never lost
+connection, the shell reads each detached draft's session and rebinds the draft if its conversation
+has not changed. If a draft is empty, or was created when the device was unaware of any
+conversation, it is rebound to whatever the current conversation is. Only drafts which are detached
+are offered a rebind. If the host does not know a draft's session, or holds it only as closed, the
+draft is orphaned. If a draft's conversation has changed, the draft is marked as conflicted. If the
+shell is unable to read for any detached draft, for whatever reason, that draft stays detached until
+contact with the host starts again or the application next comes to the front.
 
 **The connection coming back is not an outcome.** A submission in flight when contact was lost is
 unresolved until a receipt says otherwise. Queued, sent and applied are three different states and
@@ -210,10 +212,10 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 
 The iOS Notification Service Extension and the Android messaging service are started by the system,
 with no application and no JavaScript context anywhere. Each makes one decision, which has its own
-tests; neither is connected to a registration with the gateway. The message format for push messages
-only allows string data. Thus, the extension on iOS reads the sealed preview as the JSON text the
-gateway puts in the `preview` field, while the receiver on Android reads the same fields from
-separate keys. Both make the same decision in the same order:
+tests; neither is connected to a registration with the gateway. A push message carries only strings,
+so the iOS extension reads the sealed preview as the JSON text the gateway puts under `preview`. On
+Android, the receiver reads from keys which are not sent by the gateway, so it always shows the
+generic alert. Both make the same decision in the same order:
 
 On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
 where the payload alone decides the content; work it hands to the scheduler finishes without
