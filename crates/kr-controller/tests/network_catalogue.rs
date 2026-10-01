@@ -233,7 +233,11 @@ fn add_params(host: &Host, owner: &DeviceKeys, published: &Published) -> wire::C
         root: base64::engine::general_purpose::STANDARD.encode(&root),
         budgets: budgets(),
         ceiling: Vec::new(),
-        owner_confirmation: host.confirm(owner, SensitiveAction::TrustRepositoryRoot, digest),
+        owner_confirmation: Nullable::some(host.confirm(
+            owner,
+            SensitiveAction::TrustRepositoryRoot,
+            digest,
+        )),
     }
 }
 

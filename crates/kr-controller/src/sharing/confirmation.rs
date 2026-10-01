@@ -130,6 +130,10 @@ pub struct PluginInstallPlan {
     pub package_digest: String,
     /// The capabilities the installation is granted, as a whole set.
     pub grant: CanonicalSet<String>,
+    /// What the release's manifest says a native bridge it installs does, which the owner reads
+    /// before confirming. It is in the digest, so a confirmation shown one statement cannot
+    /// install a release whose manifest says another.
+    pub grant_statement: Option<String>,
 }
 
 impl PluginInstallPlan {
@@ -146,7 +150,7 @@ impl PluginInstallPlan {
     /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
     pub fn action_digest(&self) -> Result<Digest256> {
         digest_of(&(
-            "kr-plugin-install/1",
+            "kr-plugin-install/2",
             self.environment_id,
             &self.catalogue_id,
             &self.ceiling,
@@ -154,6 +158,7 @@ impl PluginInstallPlan {
             &self.version,
             &self.package_digest,
             &self.grant,
+            &self.grant_statement,
         ))
     }
 }
@@ -305,6 +310,24 @@ pub trait OwnerConfirmations: Send + Sync {
         proof: &OwnerConfirmationProof,
     ) -> Result<ConfirmedAction>;
 
+    /// Spends, once, the oldest answer an owner device recorded to a challenge this host issued
+    /// for exactly this action, and returns the evidence of it.
+    ///
+    /// This is how a caller that has no owner key of its own, a terminal, has an owner's
+    /// confirmation spent: it asked the host for the challenge, an owner device answered it, and
+    /// the effect it repeats spends that answer. An answer whose signer has lost its authority is
+    /// passed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` while no answered challenge equals this action, so a
+    /// caller can ask again until the challenge's deadline.
+    fn accept_recorded(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+    ) -> Result<ConfirmedAction>;
+
     /// The host a confirmation accepted here is about.
     fn host_device_id(&self) -> DeviceId;
 
@@ -387,6 +410,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             package_digest: "sha256:bb".to_owned(),
             grant: CanonicalSet::new(),
+            grant_statement: Some("Installs three registration files".to_owned()),
         }
     }
 
@@ -427,6 +451,14 @@ mod tests {
                 grant: ["terminal.input".to_owned()]
                     .into_iter()
                     .collect::<CanonicalSet<_>>(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant_statement: Some("Installs three other files".to_owned()),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant_statement: None,
                 ..install_plan()
             },
         ];
