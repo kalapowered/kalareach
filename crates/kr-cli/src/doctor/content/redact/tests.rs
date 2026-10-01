@@ -340,16 +340,19 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
-    // The shell's two ways of writing an apostrophe inside single quotes, and a value of a
-    // credential name whose argument opened before an apostrophe in a path. Read as the word it is,
-    // the value of the first two ends after the quote that closes the argument, which goes with it.
+    // The shell's two ways of writing an apostrophe inside single quotes: the argument's own quote
+    // is the one that is followed by whitespace or the end, and the value runs to it.
     for (text, expected) in [
         (
             format!("env 'TOKEN=it'\\''s {MARKER}' cmd"),
-            "env 'TOKEN=[redacted] cmd".to_owned(),
+            "env 'TOKEN=[redacted]' cmd".to_owned(),
         ),
-        // An apostrophe in a path, balanced by a later one, is two quotes around text that is not
-        // an assignment; the credential after it is read as before.
+        (
+            format!("env 'TOKEN=it'\"'\"'s {MARKER}' cmd"),
+            "env 'TOKEN=[redacted]' cmd".to_owned(),
+        ),
+        // Apostrophes in a path that balance each other leave no quote open where a value starts,
+        // so the credential after them is read as a word.
         (
             format!("/Users/Tom's Tools/o'neil/run TOKEN='abc {MARKER} def'"),
             "/Users/Tom's Tools/o'neil/run TOKEN=[redacted]".to_owned(),
@@ -358,29 +361,17 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
             format!("/Users/Tom's Tools/o'neil/run --password 'abc {MARKER}'"),
             "/Users/Tom's Tools/o'neil/run --password [redacted]".to_owned(),
         ),
-        // Stray apostrophes in a path that balance each other put the quote state where a quoted
-        // value starts the other way round: the value is also read as the word it is, and ends
-        // where the later of the two readings ends.
         (
-            format!("/Users/Tom's x TOKEN='abc {MARKER}' y/o'neil"),
-            "/Users/Tom's x TOKEN=[redacted] y/o'neil".to_owned(),
-        ),
-        (
-            format!("/Users/Tom's x --password 'abc {MARKER}' y/o'neil"),
-            "/Users/Tom's x --password [redacted] y/o'neil".to_owned(),
-        ),
-        (
-            format!("/Users/Tom's x TOKEN=a'b {MARKER}'c y/o'neil"),
-            "/Users/Tom's x TOKEN=[redacted] y/o'neil".to_owned(),
+            format!("-e \"PASSWORD=\"{MARKER} img"),
+            "-e \"PASSWORD=[redacted] img".to_owned(),
         ),
     ] {
         let said = redacted(&text);
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
-    // Quotes inside the script of `sh -c`, escaped and of the other kind, and quotes that stray
-    // apostrophes in a path balance among themselves: the value runs to the quote that closes the
-    // argument it is in, so nothing of it is left.
+    // Quotes inside the script of `sh -c`, escaped and of the other kind: the value runs to the
+    // quote that closes the argument it is in, so nothing of it is left and nothing after it goes.
     for (text, expected) in [
         (
             format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
@@ -398,56 +389,20 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
             format!("sh -c \"tool --password \\\"a {MARKER}\\\"\" tail"),
             "sh -c \"tool --password [redacted]\" tail".to_owned(),
         ),
+        // The argument's own quote closes in the middle of it, and the text ends there.
         (
-            format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y/o'neil"),
-            "/Users/Tom's x \"PASSWORD=[redacted]".to_owned(),
+            format!("-e \"PASSWORD=\"{MARKER}"),
+            "-e \"PASSWORD=[redacted]".to_owned(),
         ),
-        // An escaped quote is not an opening one: the value is the quoted word after it.
         (
-            format!("\\\"TOKEN=\"abc {MARKER}\""),
-            "\\\"TOKEN=[redacted]".to_owned(),
+            format!("env 'TOKEN=a'{MARKER}"),
+            "env 'TOKEN=[redacted]".to_owned(),
         ),
-    ] {
-        let said = redacted(&text);
-        assert_eq!(said, expected, "{text}");
-        assert!(!said.contains(MARKER), "{said}");
-    }
-    // An apostrophe nothing closes, with a credential name after it: where the value ends cannot be
-    // told, so the field is withheld. Without a credential name it is untouched.
-    for text in [
-        format!("/Users/Tom's Tools/run TOKEN='abc {MARKER} def'"),
-        format!("/Users/Tom's Tools/run --password 'abc {MARKER}'"),
-        format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y"),
-    ] {
-        assert_eq!(
-            redacted(&text),
-            format!("[withheld: {} characters]", text.chars().count()),
-            "{text}"
-        );
-    }
-    assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
-    // A value that starts with a quote that either closes the quote an earlier part of the text
-    // opened or opens one that nothing closes: the two readings differ and the second finds no end
-    // inside the first's value, so the field is withheld, whichever reading is the right one.
-    for text in [
-        format!("-e \"PASSWORD=\"{MARKER}"),
-        format!("-e \"PASSWORD=\"{MARKER} img"),
-        format!("env 'TOKEN=a'{MARKER}"),
-        // The shell's other spelling of an apostrophe inside single quotes: read as the word it
-        // starts, the value leaves a quote open, so the two readings cannot be told apart.
-        format!("env 'TOKEN=it'\"'\"'s {MARKER}' cmd"),
-        format!("/Users/Tom's x TOKEN='abc {MARKER} y/o"),
-        format!("/Users/Tom's x --password 'abc {MARKER} y/o"),
-    ] {
-        assert_eq!(
-            redacted(&text),
-            format!("[withheld: {} characters]", text.chars().count()),
-            "{text}"
-        );
-    }
-    // The quote the second reading finds open is the argument's own closing quote: nothing is
-    // ambiguous and the value is replaced.
-    for (text, expected) in [
+        // The argument ends at its own closing quote, whatever follows it.
+        (
+            format!("env \"TOKEN={MARKER}\" keep \"two words\""),
+            "env \"TOKEN=[redacted]\" keep \"two words\"".to_owned(),
+        ),
         (
             format!("curl \"https://h/a?token={MARKER}\" next"),
             "curl \"https://h/a?token=[redacted]\" next".to_owned(),
@@ -456,11 +411,47 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
             format!("sh -c \"tool --password {MARKER}\""),
             "sh -c \"tool --password [redacted]\"".to_owned(),
         ),
+        // An escaped quote is not an opening one: the value is the quoted word after it.
+        (
+            format!("\\\"TOKEN=\"abc {MARKER}\""),
+            "\\\"TOKEN=[redacted]".to_owned(),
+        ),
+        // An assignment after the `=` of another opens an argument too.
+        (
+            format!("FOO=\"TOKEN=a {MARKER}\" next"),
+            "FOO=\"TOKEN=[redacted]\" next".to_owned(),
+        ),
     ] {
         let said = redacted(&text);
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
+    // A quote that no argument opened, an apostrophe in a word such as `Tom's`, still open where a
+    // credential's value starts: the text after it reads the other way round and where the value
+    // ends cannot be told, so the field is withheld, whatever the later quotes do. Without a
+    // credential name the text is untouched.
+    for text in [
+        format!("/Users/Tom's Tools/run TOKEN='abc {MARKER} def'"),
+        format!("/Users/Tom's Tools/run --password 'abc {MARKER}'"),
+        format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y"),
+        format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y/o'neil"),
+        format!("/Users/Tom's x TOKEN='abc {MARKER}' y/o'neil"),
+        format!("/Users/Tom's x --password 'abc {MARKER}' y/o'neil"),
+        format!("/Users/Tom's x TOKEN=a'b {MARKER}'c y/o'neil"),
+        format!("/Users/Tom's x TOKEN='abc {MARKER} y/o"),
+        format!("/Users/Tom's x --password 'abc {MARKER} y/o"),
+        format!("/Users/Tom's x TOKEN=abc' {MARKER} y/o"),
+        format!("/Users/Tom's x TOKEN=' {MARKER} y/o"),
+        format!("/Users/Tom's x --password abc' {MARKER} y/o"),
+        format!("a\"b TOKEN=x {MARKER}\""),
+    ] {
+        assert_eq!(
+            redacted(&text),
+            format!("[withheld: {} characters]", text.chars().count()),
+            "{text}"
+        );
+    }
+    assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
     // A quote that is never closed around the assignment withholds the field.
     let unclosed = format!("run -e \"PASSWORD=two {MARKER}");
     assert_eq!(
