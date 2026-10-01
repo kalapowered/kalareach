@@ -241,19 +241,28 @@ export function definedClasses(dex) {
   return classes
 }
 
+/**
+ * Opens the archive at `path` and hands `visit` its members and a reader of one member's bytes.
+ * The archive is closed when `visit` returns.
+ */
+export function withArchive(path, visit) {
+  const handle = openSync(path, 'r')
+  try {
+    return visit(members(handle, statSync(path).size), (member) => contents(handle, member))
+  } finally {
+    closeSync(handle)
+  }
+}
+
 /** The application's dex files in the packaged artefact at `path`, each as its bytes. */
 export function applicationDex(path) {
   const application = DEX_MEMBER[extname(path).toLowerCase()]
   if (!application) throw new Error(`${extname(path)} is not a packaged Android application`)
-  const handle = openSync(path, 'r')
-  try {
-    const size = statSync(path).size
-    const dexes = members(handle, size).filter((member) => application.test(member.name))
+  return withArchive(path, (all, read) => {
+    const dexes = all.filter((member) => application.test(member.name))
     if (dexes.length === 0) throw new Error('the artefact carries no application dex file')
-    return dexes.map((member) => contents(handle, member))
-  } finally {
-    closeSync(handle)
-  }
+    return dexes.map((member) => read(member))
+  })
 }
 
 /** Every class the packaged artefact at `path` defines as application code. */
@@ -268,7 +277,7 @@ function packagedClasses(path) {
 // -- the check --------------------------------------------------------------------------------
 
 /** Every APK and AAB under a directory. */
-function artefacts(root) {
+export function artefacts(root) {
   const found = []
   const walk = (directory) => {
     let entries
