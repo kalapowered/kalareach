@@ -114,6 +114,17 @@ enum PlanFor {
 use crate::seams::{ActionSubmitter, Admission, ContextRequest, ContextSource, VoiceAuthority};
 use crate::session::{NewVoiceSession, VoiceSessions};
 
+/// A call this host could not end at the provider that created it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnclosedCall {
+    /// The call, as the provider names it.
+    pub call_id: String,
+    /// The provider that created it, as it describes itself.
+    pub provider: String,
+    /// Why it could not be ended.
+    pub error: String,
+}
+
 /// What the coordinator asks the host to do.
 ///
 /// It is a proposal and nothing more. The host resolves it to one of its own methods and runs
@@ -168,9 +179,13 @@ enum Proposed {
     NeedsConfirmation(Box<VoiceConfirmationRequest>),
 }
 
+/// Where a call this host could not end is reported.
+type UnclosedReport = Arc<dyn Fn(&UnclosedCall) + Send + Sync>;
+
 /// Everything the coordinator holds.
-#[derive(Debug)]
 pub struct Coordinator {
+    /// Where a call this host could not end is reported.
+    unclosed: Mutex<UnclosedReport>,
     context: Arc<dyn ContextSource>,
     authority: Arc<dyn VoiceAuthority>,
     submitter: Arc<dyn ActionSubmitter>,
@@ -185,6 +200,16 @@ pub struct Coordinator {
     broker_origin: String,
     patterns: SecretPatterns,
     state: Mutex<State>,
+}
+
+impl std::fmt::Debug for Coordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Coordinator")
+            .field("host_device_id", &self.host_device_id)
+            .field("environment_id", &self.environment_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +265,13 @@ impl Coordinator {
         broker_origin: impl Into<String>,
     ) -> Self {
         Self {
+            unclosed: Mutex::new(Arc::new(|call| {
+                eprintln!(
+                    "kr-voice: the call {} could not be ended at {}, so it may still be \
+                     metered until its own deadline: {}",
+                    call.call_id, call.provider, call.error
+                );
+            })),
             context,
             authority,
             submitter,
@@ -260,6 +292,21 @@ impl Coordinator {
     pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
         *self.provider.get_mut().expect("the coordinator's provider") = provider;
         self
+    }
+
+    /// Says where a call this host could not end is reported, in place of this process's standard
+    /// error.
+    ///
+    /// A call is ended through the provider that created it, and one that cannot be reached leaves
+    /// the call to its own deadline. Nothing here retries it and no answer to a caller fails
+    /// because of it: the failure is told to this, so that somebody can see which call is still
+    /// running.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's reporter panicked.
+    pub fn report_unclosed_calls_to(&self, report: UnclosedReport) {
+        *self.unclosed.lock().expect("the coordinator's reporter") = report;
     }
 
     /// Replaces the provider on a coordinator that is already running.
@@ -1001,9 +1048,17 @@ impl Coordinator {
     ///
     /// Told, not waited on, and a service that cannot be reached is not an error the caller sees:
     /// the caller's own answer is already decided, and the service's deadline closes the call in
-    /// any case. Nothing here retries creation.
+    /// any case. The failure is reported ([`Self::report_unclosed_calls_to`]) and nothing else
+    /// changes. Nothing here retries creation.
     async fn close_unbound(&self, provider: &Arc<dyn ManagedVoiceService>, call_id: &str) {
-        let _ = provider.close(call_id).await;
+        if let Err(error) = provider.close(call_id).await {
+            let report = Arc::clone(&self.unclosed.lock().expect("the coordinator's reporter"));
+            report(&UnclosedCall {
+                call_id: call_id.to_owned(),
+                provider: provider.provider(),
+                error: error.to_string(),
+            });
+        }
     }
 
     /* ---------------------------------------------------------------- */
