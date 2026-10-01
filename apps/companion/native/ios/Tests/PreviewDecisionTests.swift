@@ -283,3 +283,13 @@ private func base64URL(_ data: Data) -> String {
         .replacingOccurrences(of: "/", with: "_")
         .replacingOccurrences(of: "=", with: "")
 }
+
+/// What a decision is called when a device check asks the extension to say.
+final class PreviewDecisionNameTests: XCTestCase {
+    func testEveryDecisionHasAStableName() {
+        XCTAssertEqual(PreviewDecision.reveal("text").reasonName, "revealed")
+        XCTAssertEqual(PreviewDecision.generic(.noPreview).reasonName, "no_preview")
+        XCTAssertEqual(PreviewDecision.generic(.lockedBeforeFirstUnlock).reasonName, "locked_before_first_unlock")
+        XCTAssertEqual(PreviewDecision.generic(.timedOut).reasonName, "timed_out")
+    }
+}
