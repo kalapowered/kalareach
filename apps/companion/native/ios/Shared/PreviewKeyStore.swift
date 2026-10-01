@@ -49,7 +49,7 @@ struct PreviewKeyLocation {
     /// the build wrote rather than written here and silently left unexpanded.
     static let shared = PreviewKeyLocation(
         accessGroup: resolvedGroup(),
-        service: "to.kala.reach.companion.notification-preview"
+        service: "to.kala.reach.notification-preview"
     )
 
     /// Reads the group the build resolved, refusing anything still carrying a build variable.

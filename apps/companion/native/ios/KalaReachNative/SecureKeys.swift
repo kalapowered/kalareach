@@ -17,9 +17,9 @@ import Security
 /// What a stored key is for.
 enum StoredKeyPurpose: String {
     /// The limited key the notification extension reads.
-    case notificationPreview = "to.kala.reach.companion.notification-preview"
+    case notificationPreview = "to.kala.reach.notification-preview"
     /// This device's own authorisation key, which the extension is not entitled to.
-    case deviceAuthorisation = "to.kala.reach.companion.device-authorisation"
+    case deviceAuthorisation = "to.kala.reach.device-authorisation"
 }
 
 /// Writes and removes keys the application owns.

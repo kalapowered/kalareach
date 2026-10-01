@@ -356,14 +356,14 @@ mod tests {
     #[test]
     fn the_private_group_is_the_expanded_one_and_never_the_shared_one() {
         assert_eq!(
-            private_group(Some("JT6GW3W9W6.to.kala.reach")).expect("a group"),
-            "JT6GW3W9W6.to.kala.reach"
+            private_group(Some("L775WGST9V.to.kala.reach")).expect("a group"),
+            "L775WGST9V.to.kala.reach"
         );
         for refused in [
             None,
             Some(""),
             Some("$(AppIdentifierPrefix)to.kala.reach"),
-            Some("JT6GW3W9W6.to.kala.reach.shared"),
+            Some("L775WGST9V.to.kala.reach.shared"),
         ] {
             assert!(private_group(refused).is_err(), "{refused:?}");
         }
@@ -426,20 +426,20 @@ mod tests {
     #[test]
     fn a_keychain_item_is_private_this_device_only_and_not_synchronised() {
         let name = SecretName::new("account/session").expect("a name");
-        let item = keychain_item("JT6GW3W9W6.to.kala.reach", &name);
+        let item = keychain_item("L775WGST9V.to.kala.reach", &name);
         assert_eq!(
             item,
             KeychainItem {
                 service: "KalaReach Companion".to_owned(),
                 account: "account/session".to_owned(),
-                access_group: "JT6GW3W9W6.to.kala.reach".to_owned(),
+                access_group: "L775WGST9V.to.kala.reach".to_owned(),
                 after_first_unlock_this_device_only: true,
                 synchronised: false,
             }
         );
         assert_ne!(
             item,
-            keychain_item("JT6GW3W9W6.to.kala.reach.shared", &name),
+            keychain_item("L775WGST9V.to.kala.reach.shared", &name),
             "the shared group is another item"
         );
     }

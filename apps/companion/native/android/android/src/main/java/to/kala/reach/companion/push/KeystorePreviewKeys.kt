@@ -59,6 +59,6 @@ class KeystorePreviewKeys(private val context: Context) : PreviewKeyReading {
     }
 
     private companion object {
-        const val STORE = "to.kala.reach.companion.preview-keys"
+        const val STORE = "to.kala.reach.preview-keys"
     }
 }
