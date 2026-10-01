@@ -11,8 +11,9 @@
 //            (a simulator build keeps them in the executable, a signed build in its signature), and
 //            every file in the bundle, for a name an earlier identifier or team left behind.
 //   Android  the package the packaged manifest declares (an APK's, or a bundle's own), the
-//            authorities and permissions it defines for itself, the strings in the application's
-//            dex files, and the assets, resources and native libraries, for the same leftovers.
+//            authorities and permissions it defines for itself and every other name in it, the
+//            strings and classes of the application's dex files, and the assets, resources, native
+//            libraries and the files a build keeps under `META-INF`, for the same leftovers.
 //
 // The team prefix of a keychain group comes from the Apple team the iOS project names. A build
 // that resolved its team from whoever happened to be signed in to Xcode would pass a check that
@@ -101,26 +102,36 @@ const isNameByte = (byte) =>
 /** The same without the dot: what may not follow a name for it to be that name and not a longer word. */
 const isWordByte = (byte) => byte !== 0x2e && isNameByte(byte)
 
-/** The longest name a token is read to, so that one long run of name characters costs no more than its length. */
-const TOKEN_REACH = 200
+/**
+ * The longest name a token is read to, in characters, so that one long run of name characters
+ * costs no more than its length. A name cut off here is marked, and a marked name is never taken
+ * for a class the application defines.
+ */
+const TOKEN_REACH = 1024
 
 /**
  * The whole dotted names in `bytes` that contain a name of an earlier identifier, each read out to
  * the name it sits in: `content://` followed by `to.kala.reach.companion.share` answers
  * `to.kala.reach.companion.share`. A name that only begins like one (`to.kala.reach.companionship`)
- * is not one. Linear in the length of `bytes`.
+ * is not one. Linear in the length of `bytes`. `wide` reads the names as UTF-16, which is how a
+ * compiled resource table keeps a string.
  */
-function retiredNamesIn(bytes) {
+function retiredNamesIn(bytes, wide = false) {
+  const unit = wide ? 2 : 1
+  const nameAt = (at) =>
+    at >= 0 && at + unit <= bytes.length && isNameByte(bytes[at]) && (!wide || bytes[at + 1] === 0)
+  const wordAt = (at) => nameAt(at) && bytes[at] !== 0x2e
   const found = new Set()
   for (const name of RETIRED_NAMES) {
-    const wanted = Buffer.from(name)
+    const wanted = Buffer.from(name, wide ? 'utf16le' : 'utf8')
     for (let at = bytes.indexOf(wanted); at !== -1; at = bytes.indexOf(wanted, at + 1)) {
       let to = at + wanted.length
-      if (to < bytes.length && isWordByte(bytes[to])) continue
+      if (wordAt(to)) continue
       let from = at
-      while (from > 0 && at - from < TOKEN_REACH && isNameByte(bytes[from - 1])) from -= 1
-      while (to < bytes.length && to - at < TOKEN_REACH && isNameByte(bytes[to])) to += 1
-      found.add(bytes.toString('latin1', from, to))
+      while (at - from < TOKEN_REACH * unit && nameAt(from - unit)) from -= unit
+      while (to - at < TOKEN_REACH * unit && nameAt(to)) to += unit
+      const cut = nameAt(from - unit) || nameAt(to) ? '\u2026' : ''
+      found.add(bytes.toString(wide ? 'utf16le' : 'latin1', from, to) + cut)
     }
   }
   return [...found]
@@ -167,10 +178,15 @@ function retiredJni(bytes) {
  * may be.
  */
 function retiredInBytes(bytes, { classes = new Set(), jni = false } = {}) {
-  const found = retiredNamesIn(bytes).filter((name) => !isKeptClass(name, classes))
-  for (const team of RETIRED_TEAMS) if (bytes.includes(team)) found.push(team)
-  for (const name of [...RETIRED_NAMES, ...RETIRED_TEAMS]) {
-    if (bytes.includes(Buffer.from(name, 'utf16le'))) found.push(`${name} (as UTF-16)`)
+  const found = []
+  for (const wide of [false, true]) {
+    const note = wide ? ' (as UTF-16)' : ''
+    for (const name of retiredNamesIn(bytes, wide)) {
+      if (!isKeptClass(name, classes)) found.push(`${name}${note}`)
+    }
+    for (const team of RETIRED_TEAMS) {
+      if (bytes.includes(Buffer.from(team, wide ? 'utf16le' : 'utf8'))) found.push(`${team}${note}`)
+    }
   }
   if (jni) found.push(...retiredJni(bytes))
   return found
@@ -428,7 +444,9 @@ export function attributesFromTree(tree) {
       element = started[1]
       continue
     }
-    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="([^"]*)"/.exec(line)
+    // The value runs to the quote before the raw text aapt2 prints after it, so a value that holds
+    // quotes of its own is read whole.
+    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="(.*?)"(?: \(Raw: .*\))?$/.exec(line)
     if (attribute && element) values.push([element, attribute[1], attribute[2]])
   }
   return values
@@ -582,6 +600,12 @@ function definedAcross(dexFiles) {
 export function problemsInDex(dexFiles) {
   const classes = definedAcross(dexFiles)
   const stale = new Set()
+  // A class is a descriptor in a dex file, not a dotted string, so a class defined under an
+  // earlier identifier is found here and not among the strings.
+  for (const name of classes) {
+    const earlier = RETIRED_NAMES.filter((each) => each !== KEPT_NAMESPACE)
+    if (earlier.some((each) => name === each || name.startsWith(`${each}.`))) stale.add(name)
+  }
   for (const dex of dexFiles) {
     for (const text of definedStrings(dex)) {
       for (const token of retiredTokens(text)) if (!isKeptClass(token, classes)) stale.add(token)

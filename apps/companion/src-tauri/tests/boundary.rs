@@ -833,7 +833,10 @@ fn may_hold_the_namespace(file: &str, line: &str) -> bool {
         let name = dotted_name_at(line, at);
         if file == MANIFEST {
             // A component's name, on a line that holds nothing else.
-            trimmed.starts_with("android:name=\"") && names_a_class(name, KEPT_NAMESPACE, false)
+            let alone = trimmed
+                .strip_prefix("android:name=\"")
+                .and_then(|rest| rest.strip_suffix('"'));
+            alone == Some(name) && names_a_class(name, KEPT_NAMESPACE, false)
         } else {
             NAMES_CLASSES.contains(&file) && names_a_class(name, KEPT_NAMESPACE, true)
         }
@@ -856,6 +859,7 @@ fn the_namespace_is_held_only_where_it_names_a_class_or_a_package() {
         "android:authorities=\"to.kala.reach.companion.fileprovider\"",
         "<meta-data android:value=\"to.kala.reach.companion.push.Alerts\" />",
         "android:name=\"to.kala.reach.companion.voice.START\"",
+        "android:name=\"to.kala.reach.companion.Bridge\" android:authorities=\"to.kala.reach.companion.push.Share\"",
     ] {
         assert!(!may_hold_the_namespace(MANIFEST, refused), "{refused}");
     }
