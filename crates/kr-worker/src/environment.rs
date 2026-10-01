@@ -118,22 +118,27 @@ impl TerminfoSelection {
     }
 
     /// The selection as one line of text, for the worker's own log.
+    ///
+    /// What the creator supplied is the creator's text, so a control character in it, a line break
+    /// above all, is written as its escape: a value cannot end the line and begin another that
+    /// reads as the worker's.
     #[must_use]
     pub fn describe(&self) -> String {
         let mut line = match (&self.directory, &self.unavailable) {
-            (Some(directory), _) => format!("terminfo: private database {directory}"),
-            (None, Some(reason)) => {
-                format!("terminfo: no private database ({reason}); the host's own applies")
-            }
+            (Some(directory), _) => format!("terminfo: private database {}", one_line(directory)),
+            (None, Some(reason)) => format!(
+                "terminfo: no private database ({}); the host's own applies",
+                one_line(reason)
+            ),
             (None, None) => "terminfo: no private database; the host's own applies".to_owned(),
         };
         if self.overridden() {
             line.push_str("; the creator's");
             if let Some(directory) = &self.creator_terminfo {
-                line.push_str(&format!(" TERMINFO={directory}"));
+                line.push_str(&format!(" TERMINFO={}", one_line(directory)));
             }
             if let Some(directories) = &self.creator_terminfo_dirs {
-                line.push_str(&format!(" TERMINFO_DIRS={directories}"));
+                line.push_str(&format!(" TERMINFO_DIRS={}", one_line(directories)));
             }
             line.push_str(if self.directory.is_some() {
                 " follow it"
@@ -143,6 +148,19 @@ impl TerminfoSelection {
         }
         line
     }
+}
+
+/// `text` with every control character written as its escape, so it stays on one line.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
 }
 
 /// The environment a root shell is launched with, and where it came from.
@@ -748,6 +766,44 @@ mod tests {
             first
         );
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A creator's values are the creator's text: a line break in one cannot start a line of the
+    /// worker's own.
+    #[test]
+    fn a_creators_value_cannot_end_the_line_the_worker_logs() {
+        let hostile = built_with(
+            &[
+                (
+                    "TERMINFO",
+                    "/x\nkr-worker: session s: terminfo: private database /evil",
+                ),
+                ("TERMINFO_DIRS", "/a\r\u{1b}[31m:/b\u{85}c"),
+            ],
+            &with_private_database("/state/terminfo/ab"),
+        );
+        let line = hostile.sources.terminfo.describe();
+        assert!(
+            !line.chars().any(char::is_control),
+            "the line holds a control character: {line:?}"
+        );
+        assert!(
+            line.contains(r"TERMINFO=/x\nkr-worker: session s:"),
+            "{line}"
+        );
+        assert!(line.contains(r"\r\u{1b}[31m"), "{line}");
+        let plain = built_with(
+            &[("TERMINFO", "/home/a/\u{e9}.terminfo")],
+            &with_private_database("/state/terminfo/ab"),
+        );
+        assert!(
+            plain
+                .sources
+                .terminfo
+                .describe()
+                .contains("/home/a/\u{e9}.terminfo"),
+            "text that is not a control character is written as it is"
+        );
     }
 
     #[test]
