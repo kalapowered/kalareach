@@ -23,7 +23,8 @@ use kr_e2e_agents::account::{
     AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
     conversation_id, files_holding, guarded_files, holds_any, key_from_descriptor,
     keychain_item_modified, line_identity, now_ms, read_if_there, record_guarded, record_key_scan,
-    remove_appended_lines, remove_created, snapshot, which_hold,
+    record_rewrites, remove_appended_lines, remove_created, reported_rewrites, snapshot,
+    which_hold,
 };
 use kr_e2e_agents::build::{
     Account, AccountHome, Action, Build, Inputs, Launch, quote, with_dates,
@@ -91,9 +92,22 @@ const LOGIN_UNPROVEN: &str = "the agent's login is not established:";
 const ISOLATION_UNPROVEN: &str =
     "the agent's isolation from the person's own servers is not established:";
 
-/// How a part says a file of the person's that no part may change changed while it ran. A part
-/// that says so does nothing more, and its agent stops.
-const GUARD_CHANGED: &str = "a file of the person's that no part may change changed:";
+/// How a part says its guards found what stops it while it ran: a file of the person's that no
+/// part may change changed, or the agent started a subagent. A part that says so does nothing
+/// more, and its agent stops.
+const GUARD_CHANGED: &str = "the part's guards found what stops it:";
+
+/// What a guard says of a subagent's start, which the part's turn ledger cannot count.
+const SUBAGENT_STARTED: &str = "a subagent started:";
+
+/// The class a guard's text stops the agent for.
+fn guard_class(what: &str) -> &'static str {
+    if what.contains(SUBAGENT_STARTED) {
+        "subagent_started"
+    } else {
+        "guarded_file_changed"
+    }
+}
 
 /// The directory of the run's own an agent keeps its configuration in, where its build list entry
 /// names one, in the run's directory.
@@ -171,6 +185,9 @@ struct Guards {
     /// The list of workspaces the agent keeps in the person's data directory, as the part found it:
     /// it may only gain the run's own folder.
     workspaces: Option<Workspaces>,
+    /// The run's directory of sessions in the person's data directory, where a subagent's start
+    /// stops the part: its requests to the model are not turns the ledger counts.
+    subagents: Option<PathBuf>,
     /// When the files were last read.
     read_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// What changed, once a look found a change: the part stops on it.
@@ -267,6 +284,13 @@ impl Guards {
                 }
                 Err(error) => return Some(format!("~/{}: {error}", workspaces.relative)),
             }
+        }
+        if let Some(why) = self
+            .subagents
+            .as_deref()
+            .and_then(confine::subagent_started)
+        {
+            return Some(format!("{SUBAGENT_STARTED} {why}"));
         }
         self.before.iter().zip(&now).find_map(|(first, second)| {
             let changed = first.sha256 != second.sha256;
@@ -812,6 +836,42 @@ fn confine_close(
     let trust_left = confine::trust_records_for(&trust, &folder);
     let bucket = data.join("sessions").join(confine::workdir_key(&folder));
     let bucket_existed = bucket.exists();
+    // The strings of the login's files are searched for in what the run holds and in what the agent
+    // wrote of the run into the person's data directory: the run's own conversation, whose wire
+    // file the agent writes, and the files that record it, before the conversation is removed.
+    // The login in use is read again, since the agent may have refreshed it while it ran.
+    let mut values = setup.secrets.clone();
+    let mut unread_login = None;
+    match confine::current_secrets(&data, &setup.slot) {
+        Ok(now) => values.extend(now),
+        Err(why) => unread_login = Some(why),
+    }
+    values.sort();
+    values.dedup();
+    let in_data: Vec<PathBuf> = std::iter::once(bucket.clone())
+        .chain(
+            login
+                .account
+                .recorded
+                .iter()
+                .chain(&login.account.append_only)
+                .map(|relative| login.person_home.join(relative)),
+        )
+        // The files that keep the login itself are the strings' source, not a place they must not be.
+        .filter(|place| {
+            place.exists()
+                && !place.starts_with(data.join("credentials"))
+                && !place.starts_with(data.join("oauth"))
+        })
+        .collect();
+    let data_scans: Vec<_> = values
+        .iter()
+        .flat_map(|value| {
+            in_data
+                .iter()
+                .map(move |place| files_holding(place, value.as_bytes()))
+        })
+        .collect();
     if ended && bucket_existed {
         let _ = std::fs::remove_dir_all(&bucket);
     }
@@ -865,20 +925,27 @@ fn confine_close(
     {
         let _ = std::fs::remove_file(path);
     }
-    let scans: Vec<_> = setup
-        .secrets
+    let scans: Vec<_> = values
         .iter()
         .map(|secret| files_holding(root, secret.as_bytes()))
         .collect();
     let found = scans.iter().filter(|scan| !scan.held_by.is_empty()).count();
-    let complete = scans.iter().all(|scan| scan.complete());
-    if found > 0 || !complete {
+    let found_in_data = data_scans
+        .iter()
+        .filter(|scan| !scan.held_by.is_empty())
+        .count();
+    let complete = unread_login.is_none()
+        && scans.iter().all(|scan| scan.complete())
+        && data_scans.iter().all(|scan| scan.complete());
+    if found > 0 || found_in_data > 0 || !complete {
         stop.push((
             "secret_found",
             format!(
-                "{found} string(s) of the login's files were found in the run's directory, and the \
-                 search was {}complete",
-                if complete { "" } else { "not " }
+                "{found} string(s) of the login's files were found in the run's directory and \
+                 {found_in_data} in what the agent wrote into the person's data directory, and the \
+                 search was {}complete{}",
+                if complete { "" } else { "not " },
+                unread_login.map_or_else(String::new, |why| format!(" ({why})"))
             ),
         ));
     }
@@ -908,7 +975,7 @@ fn confine_close(
             "servers_switched_off": setup.servers.len(),
             "left_in_data": { "trust_records_removed": trust_removed, "trust_records_left": trust_left, "sessions_bucket_existed": bucket_existed, "sessions_bucket_left": bucket_left },
             "workspaces": workspaces.map(|(additive, restored)| json!({ "additive": additive, "restored": restored })),
-            "secrets": { "strings": setup.secrets.len(), "found_in_run": found, "complete": complete },
+            "secrets": { "strings": values.len(), "found_in_run": found, "found_in_data": found_in_data, "places_in_data": in_data.len(), "complete": complete },
             "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
         }),
         stop,
@@ -1401,6 +1468,16 @@ fn staged(
             shared: login.account.shared.clone(),
             append_only: lines.clone(),
             workspaces,
+            subagents: login.account.confinement.as_ref().map(|confinement| {
+                let folder = std::fs::canonicalize(run.work()).unwrap_or_else(|error| {
+                    panic!("the run's folder as the system names it: {error}")
+                });
+                login
+                    .person_home
+                    .join(&confinement.data)
+                    .join("sessions")
+                    .join(confine::workdir_key(&folder))
+            }),
             read_at: std::sync::Mutex::new(None),
             changed: std::sync::Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
@@ -1482,7 +1559,7 @@ fn staged(
             (&directories, &removable),
             &mark,
             &root,
-            writers.is_ok(),
+            (part, writers.is_ok()),
         )
     });
     let scan = login
@@ -1691,7 +1768,7 @@ fn staged(
     stop.extend(confinement_stop);
     if let Some(what) = &guard_change {
         stop.push((
-            "guarded_file_changed",
+            guard_class(what),
             format!(
                 "{GUARD_CHANGED} {what}; the part then sent nothing more and tried to stop and kill \
                  every process it could reach (the probe that ran, the run's recorded processes, the \
@@ -1756,7 +1833,7 @@ fn staged(
                 } else if said.starts_with(ISOLATION_UNPROVEN) {
                     Some("isolation_not_established")
                 } else if said.starts_with(GUARD_CHANGED) && guard_change.is_none() {
-                    Some("guarded_file_changed")
+                    Some(guard_class(&said))
                 } else {
                     None
                 };
@@ -1917,7 +1994,7 @@ fn person_home_report(
     (directories, removable): (&[String], &[PathBuf]),
     mark: &str,
     root: &Path,
-    settled: bool,
+    (part, settled): (&str, bool),
 ) -> (serde_json::Value, DirectoryCounts, bool, Vec<String>) {
     let after = snapshot(&login.person_home, directories, HASH_LIMIT);
     let found = changes(before, &after);
@@ -1976,9 +2053,17 @@ fn person_home_report(
             .map(PathBuf::as_path)
             .filter(|path| !upkeep(path)),
     );
-    (
-        json!({
-            "created_and_removed": home(&removed),
+    // What the agent's own upkeep rewrote, by listed path: sizes, times and digests only, with the
+    // files themselves in the part's private evidence.
+    let upkeep_report = login.account.confinement.as_ref().map(|confinement| {
+        let data = login.person_home.join(&confinement.data);
+        let (published, private) =
+            reported_rewrites(&data, &confinement.reported, (before, &after), &found);
+        record_rewrites(part, &private);
+        published
+    });
+    let mut report = json!({
+        "created_and_removed": home(&removed),
             "created_and_left": home(&left),
             "appended": home(&found.appended),
             "rewritten": home(&found.rewritten),
@@ -1986,9 +2071,14 @@ fn person_home_report(
             "removed_by_something_else": home(&found.removed),
             "left_holding_the_part": home(&holding),
             "left_unsearched": unsearched,
-            "read_whole_after": after.whole(),
-            "unread_after": after.unread(),
-        }),
+        "read_whole_after": after.whole(),
+        "unread_after": after.unread(),
+    });
+    if let (Some(upkeep_report), Some(object)) = (upkeep_report, report.as_object_mut()) {
+        object.insert("upkeep".to_owned(), json!(upkeep_report));
+    }
+    (
+        report,
         rewrites,
         after.whole(),
         removed.iter().map(|file| conversation_id(file)).collect(),

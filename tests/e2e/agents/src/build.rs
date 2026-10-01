@@ -434,6 +434,38 @@ pub struct Confinement {
     pub reported: Vec<String>,
 }
 
+impl Confinement {
+    /// Why the paths whose rewrite is only reported are not safe to report, where they are not:
+    /// each must lie inside the data directory and none may hold a credential, since a rewrite
+    /// that is not a stop is recorded by its size, time and digest alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first path that is absolute, climbs out of the directory, is the directory
+    /// itself, or lies in or holds a credential's directory.
+    pub fn check_reported(&self) -> Result<(), String> {
+        for path in &self.reported {
+            let parts: Vec<&str> = path.split('/').collect();
+            if path.is_empty()
+                || path.starts_with('/')
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || *part == "." || *part == "..")
+            {
+                return Err(format!(
+                    "the reported path {path:?} is not a path inside the data directory"
+                ));
+            }
+            if matches!(parts[0], "credentials" | "oauth") {
+                return Err(format!(
+                    "the reported path {path:?} lies where the agent keeps a credential"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Where the agent reads its servers and how a project switches each off.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -880,6 +912,14 @@ impl Inputs {
             return None;
         };
         let build = read_build(&build);
+        if let Some(confinement) = build
+            .account
+            .as_ref()
+            .and_then(|account| account.confinement.as_ref())
+            && let Err(why) = confinement.check_reported()
+        {
+            panic!("the build file's confinement: {why}");
+        }
         Some(Self {
             build,
             generation,
@@ -924,6 +964,39 @@ mod tests {
             lacks: owned(lacks),
             accepted: None,
             shows_within: None,
+        }
+    }
+
+    #[test]
+    fn a_reported_rewrite_lies_inside_the_data_directory_and_holds_no_credential() {
+        let confinement = |reported: &[&str]| -> Confinement {
+            serde_json::from_value(serde_json::json!({
+                "profile": "/p.sb", "data": ".agent", "variable": "HOME_VARIABLE",
+                "hosts": ["api.example"], "proxy_variables": ["HTTPS_PROXY"],
+                "provider": "providers.x",
+                "servers": {"source": "mcp.json", "member": "servers", "file": ".agent/mcp.json", "entry": {}},
+                "unasked_tools": [], "reported": reported,
+            }))
+            .expect("a confinement")
+        };
+        assert_eq!(
+            confinement(&["cache", "logs/agent.log", "sessions/.index-dirty"]).check_reported(),
+            Ok(())
+        );
+        for bad in [
+            "/etc",
+            "../outside",
+            "cache/../../x",
+            "",
+            "cache//x",
+            "credentials",
+            "credentials/slot.json",
+            "oauth/key",
+        ] {
+            assert!(
+                confinement(&[bad]).check_reported().is_err(),
+                "{bad:?} is not reportable"
+            );
         }
     }
 

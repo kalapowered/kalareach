@@ -210,8 +210,8 @@ impl KeyScan {
     }
 }
 
-/// Searches every regular file under `root` for `value`, and returns where it was and what could
-/// not be read. Nothing of the value is returned or printed.
+/// Searches every regular file under `root`, or `root` itself where it is one, for `value`, and
+/// returns where it was and what could not be read. Nothing of the value is returned or printed.
 ///
 /// # Panics
 ///
@@ -222,13 +222,36 @@ pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
         value.len() >= 8,
         "a key shorter than eight bytes cannot be searched for"
     );
+    let single = std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_file());
     let relative = |path: &Path| {
+        if single {
+            return path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        }
         path.strip_prefix(root)
             .unwrap_or(path)
             .display()
             .to_string()
     };
     let mut scan = KeyScan::default();
+    if single {
+        let mut bytes = Vec::new();
+        match std::fs::File::open(root).and_then(|mut file| file.read_to_end(&mut bytes)) {
+            Ok(_) => {
+                if bytes.windows(value.len()).any(|window| window == value) {
+                    scan.held_by.push(KeyHolder {
+                        path: relative(root),
+                        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        created_ms: None,
+                        modified_ms: None,
+                    });
+                }
+            }
+            Err(error) => scan.unread.push(format!("{}: {error}", relative(root))),
+        }
+        return scan;
+    }
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let entries = match std::fs::read_dir(&directory) {
@@ -378,8 +401,8 @@ pub fn guarded_files(
 }
 
 /// Appends one line to the file beside the key-scan file the harness named: the part, and each
-/// guarded file's SHA-256 before and after, in hexadecimal, so the comparison can be checked
-/// without the files; the record itself says only whether each changed.
+/// guarded file's SHA-256, size and modification time before and after, so the comparison can be
+/// checked without the files; the record itself says only whether each changed.
 ///
 /// # Panics
 ///
@@ -403,7 +426,18 @@ pub fn record_guarded(part: &str, before: &[Guarded], after: &[Guarded]) {
         .iter()
         .zip(after)
         .map(|(first, second)| {
-            json!({ "file": format!("~/{}", first.relative), "before": hex(&first.sha256), "after": hex(&second.sha256) })
+            let millis = |nanoseconds: Option<i128>| {
+                nanoseconds.and_then(|ns| i64::try_from(ns / 1_000_000).ok())
+            };
+            json!({
+                "file": format!("~/{}", first.relative),
+                "before": hex(&first.sha256),
+                "after": hex(&second.sha256),
+                "bytes_before": first.bytes,
+                "bytes_after": second.bytes,
+                "modified_ms_before": millis(first.modified_ns),
+                "modified_ms_after": millis(second.modified_ns),
+            })
         })
         .collect();
     let mut line = serde_json::to_vec(&json!({ "part": part, "files": files }))
@@ -986,6 +1020,107 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
     changes
 }
 
+/// What the agent's own upkeep rewrote, by listed path: for each of `listed` (files or directories,
+/// relative to `data`, the person's data directory), how many of its files the part found rewritten
+/// and created, the rewritten files' sizes together, the latest time one was modified, and a
+/// SHA-256 over the rewritten files' names and digests, so a rewrite shows without a name or a
+/// byte of what it holds. The second list has one entry for each rewritten file, with its size,
+/// time and digest before and after, for the part's private evidence.
+#[must_use]
+pub fn reported_rewrites(
+    data: &Path,
+    listed: &[String],
+    (before, after): (&Snapshot, &Snapshot),
+    found: &Changes,
+) -> (Vec<Value>, Vec<Value>) {
+    let hex = |digest: Option<[u8; 32]>| {
+        digest.map(|bytes| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+    };
+    let millis = |nanoseconds: i128| i64::try_from(nanoseconds / 1_000_000).ok();
+    let mut private = Vec::new();
+    let published = listed
+        .iter()
+        .map(|member| {
+            let root = data.join(member);
+            let mut rewritten: Vec<&PathBuf> = found
+                .rewritten
+                .iter()
+                .chain(&found.changed_uncompared)
+                .filter(|path| path.starts_with(&root))
+                .collect();
+            rewritten.sort();
+            let created = found
+                .created
+                .iter()
+                .filter(|path| path.starts_with(&root))
+                .count();
+            let mut bytes = 0_u64;
+            let mut latest: Option<i128> = None;
+            let mut names = String::new();
+            for path in &rewritten {
+                let (Some(old), Some(new)) = (before.files.get(*path), after.files.get(*path))
+                else {
+                    continue;
+                };
+                bytes += new.bytes;
+                latest = latest.max(Some(new.modified_ns));
+                let relative = path.strip_prefix(data).unwrap_or(path).display().to_string();
+                names.push_str(&format!(
+                    "{relative}\t{}\n",
+                    hex(new.digest).unwrap_or_else(|| "unhashed".to_owned())
+                ));
+                private.push(json!({
+                    "file": relative,
+                    "bytes_before": old.bytes,
+                    "bytes_after": new.bytes,
+                    "modified_ms_after": millis(new.modified_ns),
+                    "sha256_before": hex(old.digest),
+                    "sha256_after": hex(new.digest),
+                }));
+            }
+            json!({
+                "path": member,
+                "rewritten": rewritten.len(),
+                "created": created,
+                "bytes": bytes,
+                "modified_ms": latest.and_then(millis),
+                "sha256": (!rewritten.is_empty()).then(|| hex(Some(kr_cbor::sha256(names.as_bytes())))),
+            })
+        })
+        .collect();
+    (published, private)
+}
+
+/// Appends one line to the file beside the key-scan file the harness named: the part and what the
+/// agent's own upkeep rewrote, each file with its size, time and digest before and after. It names
+/// the person's files, so it stays with the run's private evidence and is never published.
+///
+/// # Panics
+///
+/// Panics when the harness named a file that cannot be written.
+pub fn record_rewrites(part: &str, files: &[Value]) {
+    let Some(path) = std::env::var_os(KEY_SCAN_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(value).with_file_name("rewritten-upkeep.jsonl"))
+    else {
+        return;
+    };
+    let mut line = serde_json::to_vec(&json!({ "part": part, "files": files }))
+        .expect("the rewritten files are JSON");
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&line))
+        .unwrap_or_else(|error| panic!("the rewritten-files file {}: {error}", path.display()));
+}
+
 /// Removes each file the part created inside one of `removable`, the directories whose files
 /// belong to one conversation or run each, that holds one of `marks` (the part's own marker, or the
 /// run's own directory, which the agent writes as the working directory), and then each directory
@@ -1240,6 +1375,48 @@ mod tests {
         assert_eq!(found.rewritten, vec![agent.join("settings")]);
         assert_eq!(found.changed_uncompared, vec![agent.join("large")]);
         assert!(found.removed.is_empty());
+    }
+
+    #[test]
+    fn what_the_upkeep_rewrote_is_listed_by_path_with_size_time_and_digest_and_no_content() {
+        let scratch = Scratch::new("upkeep");
+        let home = &scratch.0;
+        let data = home.join(".agent");
+        std::fs::create_dir_all(data.join("cache")).expect("the cache");
+        std::fs::create_dir_all(data.join("index")).expect("the index");
+        std::fs::write(data.join("list.json"), "{\"a\":1}").expect("the list");
+        std::fs::write(data.join("cache").join("one"), "first").expect("a cache file");
+        std::fs::write(data.join("cache").join("two"), "second").expect("a cache file");
+        let directories = vec![".agent".to_owned()];
+        let before = snapshot(home, &directories, 1 << 20);
+        std::fs::write(data.join("list.json"), "{\"a\":1,\"b\":2}").expect("a rewrite");
+        std::fs::write(data.join("cache").join("one"), "FIRST!").expect("a rewrite");
+        std::fs::write(data.join("cache").join("three"), "third").expect("a new file");
+        let after = snapshot(home, &directories, 1 << 20);
+        let found = changes(&before, &after);
+        let listed = ["list.json", "cache", "index"].map(str::to_owned);
+        let (published, private) = reported_rewrites(&data, &listed, (&before, &after), &found);
+        assert_eq!(published.len(), 3, "each listed path has an entry");
+        assert_eq!(published[0]["path"], "list.json");
+        assert_eq!(published[0]["rewritten"], 1);
+        assert_eq!(published[0]["bytes"], 13);
+        assert!(published[0]["modified_ms"].is_i64());
+        assert_eq!(published[0]["sha256"].as_str().map(str::len), Some(64));
+        assert_eq!(published[1]["path"], "cache");
+        assert_eq!(published[1]["rewritten"], 1);
+        assert_eq!(published[1]["created"], 1);
+        assert_eq!(published[2]["rewritten"], 0);
+        assert!(published[2]["sha256"].is_null() && published[2]["modified_ms"].is_null());
+        assert_eq!(private.len(), 2);
+        let text = serde_json::to_string(&published).expect("JSON");
+        assert!(
+            !text.contains("FIRST") && !text.contains("\"b\""),
+            "no content in what is published"
+        );
+        assert_eq!(private[0]["file"], "list.json");
+        assert_eq!(private[1]["file"], "cache/one");
+        assert_eq!(private[1]["bytes_before"], 5);
+        assert_eq!(private[1]["bytes_after"], 6);
     }
 
     #[test]

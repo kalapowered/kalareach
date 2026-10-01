@@ -220,6 +220,86 @@ pub fn workspaces_verdict(before: &str, after: &str, folder: &Path) -> Result<()
     Ok(())
 }
 
+/// The tools through which the agent starts a subagent. Its requests to the model are not turns
+/// the part's ledger counts, so the part stops at the first sign of one.
+const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "AgentSwarm"];
+
+/// Whether one line of a conversation's wire file starts a subagent: a call of one of
+/// [`SUBAGENT_TOOLS`], or a record of a subagent's own, at the line's top level or in its event.
+fn line_starts_a_subagent(line: &str) -> bool {
+    if !line.contains("tool.call") && !line.contains("subagent.") {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    let kind = |holder: &Value| {
+        holder
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let event = value.get("event").unwrap_or(&Value::Null);
+    [kind(&value), kind(event)]
+        .into_iter()
+        .flatten()
+        .any(|kind| kind.starts_with("subagent."))
+        || (kind(event).as_deref() == Some("tool.call")
+            && event
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| SUBAGENT_TOOLS.contains(&name)))
+}
+
+/// Whether a subagent has started in any conversation of `bucket`, the run's directory of
+/// sessions: a directory under a session's `agents` other than the main agent's, or a line of the
+/// main agent's wire file that calls one of [`SUBAGENT_TOOLS`] or records a subagent. A bucket that
+/// is not there yet holds none. It names what it saw by kind, never a path or a line.
+#[must_use]
+pub fn subagent_started(bucket: &Path) -> Option<String> {
+    let sessions = match std::fs::read_dir(bucket) {
+        Ok(sessions) => sessions,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(format!("the run's sessions cannot be listed: {error}"));
+        }
+    };
+    for session in sessions.flatten() {
+        let agents = session.path().join("agents");
+        let entries = match std::fs::read_dir(&agents) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Some(format!("a conversation's agents cannot be listed: {error}"));
+            }
+        };
+        if entries.flatten().any(|entry| entry.file_name() != "main") {
+            return Some(
+                "an agent other than the main one has a directory in a conversation".to_owned(),
+            );
+        }
+        match std::fs::read(agents.join("main").join("wire.jsonl")) {
+            Ok(bytes) => {
+                if String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .any(line_starts_a_subagent)
+                {
+                    return Some(
+                        "the main agent's conversation records a subagent start".to_owned(),
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Some(format!(
+                    "a conversation's wire file cannot be read: {error}"
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// The strings of at least sixteen characters a JSON document holds, at any depth: what a login
 /// file keeps of its tokens. They are searched for, never printed.
 #[must_use]
@@ -240,6 +320,24 @@ pub fn secret_values(text: &str) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// The strings the login in use keeps now, which differ from those read before a part where the
+/// agent refreshed its token while it ran: both are searched for. Read again from `data` (the
+/// person's data directory), never printed.
+///
+/// # Errors
+///
+/// Returns why the credentials file cannot be read or holds no string.
+pub fn current_secrets(data: &Path, slot: &str) -> Result<Vec<String>, String> {
+    let path = data.join("credentials").join(format!("{slot}.json"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("the login's file cannot be read again: {error}"))?;
+    let values = secret_values(&text);
+    if values.is_empty() {
+        return Err("the login's file holds no token now".to_owned());
+    }
+    Ok(values)
 }
 
 /// The files of the two login slots as the configuration names them: the credentials file and the
@@ -698,5 +796,76 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("a .git");
         assert_eq!(git_above(&folder), Some(root.clone()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_subagent_start_is_seen_by_a_directory_or_by_a_line_of_the_main_wire_file() {
+        let bucket = std::env::temp_dir().join(format!("kr-confine-sub-{}", kr_ipc::new_uuid()));
+        assert_eq!(subagent_started(&bucket), None, "no bucket holds none");
+        let agents = bucket.join("session_a").join("agents");
+        std::fs::create_dir_all(agents.join("main")).expect("directories");
+        let wire = agents.join("main").join("wire.jsonl");
+        // The prompt that tells the model about the tool, a snapshot that lists it, and a call of
+        // a tool that is not one of the two are not a start.
+        let quiet = concat!(
+            r#"{"type":"profile.bind","systemPrompt":"use Agent(subagent_type=\"explore\") to look"}"#,
+            "\n",
+            r#"{"type":"llm.tools_snapshot","tools":[{"name":"Agent"},{"name":"AgentSwarm"}]}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Read","args":{}}}"#,
+            "\n",
+            "a line cut off mid-wri",
+        );
+        std::fs::write(&wire, quiet).expect("write");
+        assert_eq!(subagent_started(&bucket), None);
+        for call in ["Agent", "AgentSwarm"] {
+            let line = format!(
+                "{quiet}\n{{\"type\":\"context.append_loop_event\",\"event\":{{\"type\":\"tool.call\",\"name\":\"{call}\",\"args\":{{}}}}}}\n"
+            );
+            std::fs::write(&wire, line).expect("write");
+            assert!(subagent_started(&bucket).is_some(), "a call of {call}");
+        }
+        std::fs::write(
+            &wire,
+            format!("{quiet}\n{{\"type\":\"subagent.spawned\",\"subagentId\":\"x\"}}\n"),
+        )
+        .expect("write");
+        assert!(
+            subagent_started(&bucket).is_some(),
+            "a record of a subagent"
+        );
+        std::fs::write(&wire, quiet).expect("write");
+        assert_eq!(subagent_started(&bucket), None);
+        std::fs::create_dir_all(agents.join("sub_1")).expect("a subagent's directory");
+        assert!(
+            subagent_started(&bucket).is_some(),
+            "a directory of another agent"
+        );
+        let _ = std::fs::remove_dir_all(&bucket);
+    }
+
+    #[test]
+    fn the_login_in_use_is_read_again_for_the_strings_a_refresh_changed() {
+        let data = std::env::temp_dir().join(format!("kr-confine-login-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(data.join("credentials")).expect("directories");
+        assert!(
+            current_secrets(&data, "slot-a").is_err(),
+            "a file that is not there"
+        );
+        std::fs::write(
+            data.join("credentials/slot-a.json"),
+            r#"{"access":"abcdefghijklmnopqrstuvwxyz"}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            current_secrets(&data, "slot-a"),
+            Ok(vec!["abcdefghijklmnopqrstuvwxyz".to_owned()])
+        );
+        std::fs::write(data.join("credentials/slot-a.json"), r#"{"n":1}"#).expect("write");
+        assert!(
+            current_secrets(&data, "slot-a").is_err(),
+            "no string at all"
+        );
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
