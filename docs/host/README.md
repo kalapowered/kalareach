@@ -1945,7 +1945,8 @@ for one question outside that scope is refused rather than answered empty. The d
 worker's answer on as the worker gave it, and sends a question read with a scope only to a worker
 that says, in its answer to the daemon's hello, that it holds one to it: a worker of an earlier
 build answered with every question it held, so a device's question read to one is refused as
-`UNSUPPORTED_CAPABILITY` before anything reaches it. The agent reads name their session inside the
+`UNSUPPORTED_CAPABILITY` before anything reaches it. A read of a retained receipt is held the same
+way. The agent reads name their session inside the
 subject they read, and that session is the one the grant is checked against and the read is routed
 to. `agent.snapshot` and `agent.approval.inspect` carry retained content, so each goes to the worker
 with the history scope of the device's grant, and the worker holds the answer to it through the
@@ -2060,9 +2061,8 @@ budget refuses the size the next claim would take, is recorded as an outcome nob
 The local owner keeps its cross-window detach, because it is the operating-system user the listener
 authenticated, acting under no grant; any other caller, one the daemon heard on its local socket
 under a grant included, detaches only what its own connection made. An `action.read` names an
-action rather than a session, so it goes to the
-session the device's connection is already serving, which is where its actions on this host were
-performed.
+action rather than a session, so it is decided over the session the daemon recorded the action's
+route to, and goes to that session's worker, which is where the action was performed.
 
 Remote dispatch needs a live lease, and a lease is renewed only after the worker has acknowledged
 the authority revision in force. A worker starts having acknowledged nothing, so the daemon asks
@@ -2286,6 +2286,18 @@ single-session host and the per-host bound is the stricter of the two once a hos
 
 Raw input is not in these tables. Section 9 makes it a separate ordered stream keyed by connection,
 lease epoch and sequence, with nothing replayed on reconnection.
+
+### What a reader is shown of a retained answer
+
+The worker retains a copy of anything that it produces when it performs an action, so that it can answer duplicate requests and `action.read` without changing what’s stored (since the payload digest, the receipt’s revision and the rule that an identifier is settled once all rest on those stored bytes). What a reader is shown is decided when it asks, and for that reader alone.
+
+Owning an action identifier names a receipt. It does not keep access once the grant behind it is narrowed or revoked. A paired device can only read a retained answer if it still holds `session.view` for the session on which the action was performed. The daemon decides that again where it writes the answer, so a lease that drops the right while the answer waits gets a refusal instead. Content is filtered based on the shared history filter, using the content dates rather than the receipt date, so a question asked at or after the moment the grant reaches back to is allowed. A question the grant names is shown only while it is open, so the device that answered it sees it in the first answer and not in a retry made after it ended.
+
+The state of the action is always shown: its outcome, its identifiers and its revision. Where content has been withheld it will be marked. For a question, the resolution carries `question: null`. For a receipt error, the error code, retry category, and diagnostic identifier will be present, but the message will be replaced and `error_withheld` set; the message is withheld because it may quote an upstream or the session, and it has no date to hold to a bound. A caller that arrives with no history scope will only see the state of an action; only the local owner will see everything.
+
+Answering a question needs more than the right to answer. The worker will refuse a question the caller’s history does not reach, with the refusal it gives for a question it does not hold, and so says nothing about the question’s state or text.
+
+In the archive, receipts for a closed session will be shown in full to the owner at this machine, but only the state to any other reader. The description of the close will be sent to a device only if its history reaches back to the start of the session, but the daemon keeps the whole description for its own directory. Workers from older builds keep answers in full and are sent no scope. The daemon uses what such a worker kept, then refuses the device by name rather than show it, and a device can neither answer nor cancel a question there, nor read a receipt.
 
 ### What each store promises
 
