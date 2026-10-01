@@ -169,4 +169,20 @@ enum DeliveredMarks {
         return (matching, other)
     }
 }
+
+/// A report that can be made once.
+///
+/// A check that waits on something with a timeout can hear from it after the timeout has reported.
+/// Whichever comes first claims the report, and what the second would have left behind is never
+/// left.
+struct OneReport {
+    private(set) var claimed = false
+
+    /// True for the first call and false after.
+    mutating func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
 #endif

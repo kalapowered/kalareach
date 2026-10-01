@@ -31,12 +31,7 @@ final class KRNativeLaunch: NSObject {
             return
         }
         UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let permission: PushPermission
-            switch settings.authorizationStatus {
-            case .authorized, .provisional, .ephemeral: permission = .granted
-            case .denied: permission = .refused
-            default: permission = .unknown
-            }
+            let permission = PushPermission(status: settings.authorizationStatus)
             let plan = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, permission: permission)
             DispatchQueue.main.async {
                 PushRegistration.shared.permissionKnown(permission)
