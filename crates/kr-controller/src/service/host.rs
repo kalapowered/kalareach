@@ -456,6 +456,7 @@ impl Controller {
                  confirmed ended.",
             ),
         ));
+        checks.push(self.descriptions.doctor_check(&self.description_settings()));
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
         // working from.
