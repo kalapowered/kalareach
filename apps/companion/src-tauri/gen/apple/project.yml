@@ -37,6 +37,16 @@ settingGroups:
     base:
       PRODUCT_NAME: KalaReach
       PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach
+  # Who signs a build, and with what, is the signer's choice and not this project's. Each value is
+  # read from a build setting that is undefined until whoever builds defines it (in `Local.xcconfig`
+  # or in the environment), and then means what it did before: automatic signing with the iPhone
+  # Developer identity, no named profile and no extra flags. It applies to a device build only, so
+  # a simulator build is unchanged.
+  signing:
+    base:
+      "CODE_SIGN_STYLE[sdk=iphoneos*]": $(KR_SIGN_STYLE:default=Automatic)
+      "CODE_SIGN_IDENTITY[sdk=iphoneos*]": $(KR_SIGN_IDENTITY:default=iPhone Developer)
+      "OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]": $(inherited) $(KR_SIGN_FLAGS)
 targetTemplates:
   app:
     type: application
@@ -87,6 +97,8 @@ targets:
         PRODUCT_NAME: KalaReachNotificationService
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications
         SKIP_INSTALL: true
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": $(KR_EXTENSION_PROFILE)
+      groups: [signing]
 
   # The native decisions, built and run without the application, so the four cases the
   # specification names are exercised by a test rather than by a device nobody has.
@@ -112,6 +124,26 @@ targets:
     scheme:
       testTargets:
         - KalaReachNativeTests
+
+  # Drives the installed application the way a person does, on a real phone: it answers the
+  # application's own permission prompts, turns the phone, and reads what the application shows. It
+  # names no target application, so building it never builds or installs a second copy of the
+  # application it drives; the application under test is installed on its own, by its own identifier.
+  KalaReachUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ../../../native/ios/UITests
+    settings:
+      base:
+        PRODUCT_NAME: KalaReachUITests
+        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.uitests
+        GENERATE_INFOPLIST_FILE: true
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": $(KR_RUNNER_PROFILE)
+      groups: [signing]
+    scheme:
+      testTargets:
+        - KalaReachUITests
 
   companion-tauri_iOS:
     type: application
@@ -217,7 +249,8 @@ targets:
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
-      groups: [app]
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": $(KR_APP_PROFILE)
+      groups: [app, signing]
     dependencies:
       - framework: libapp.a
         embed: false
