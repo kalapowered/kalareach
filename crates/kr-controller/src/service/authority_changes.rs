@@ -916,7 +916,7 @@ impl Controller {
                 params.device_id,
                 params.notification_preview,
                 params.revision,
-                &admitted,
+                admitted,
             )?
         };
         drop(registry);
