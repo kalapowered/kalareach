@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use kr_client::services::http::{HttpDeadlines, HttpService, ResponseLimits};
 use kr_client::services::relay::ServiceHttp;
+use kr_ipc::testing::UNANSWERED;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
@@ -202,13 +203,10 @@ async fn no_proxy_variable_moves_a_client_this_product_builds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_client_does_not_go_around_a_proxy_that_cannot_be_reached() {
     let gateway = Gateway::start().await;
-    let closed = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = closed.local_addr().expect("an address").port();
-    drop(closed);
+    // An address nothing answers at: a port this test freed could be handed to another test before
+    // the request is sent, and that test's server would answer as a proxy.
     let service = gateway.client(
-        &format!("http://127.0.0.1:{port}")
+        &format!("http://{UNANSWERED}")
             .parse()
             .expect("a proxy address"),
     );

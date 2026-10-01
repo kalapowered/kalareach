@@ -986,6 +986,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
 
+    use kr_ipc::testing::UNANSWERED;
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     };
@@ -2889,32 +2890,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_connection_that_is_never_established_is_reported_as_unreached() {
-        // A port nothing is listening on, inside the configured origin.
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .await
-            .expect("a loopback port");
-        let port = listener.local_addr().expect("an address").port();
-        drop(listener);
-
-        let origin = GatewayOrigin::new(format!("https://localhost:{port}")).expect("an origin");
+        // An address nothing answers at, inside the configured origin: a port this test freed could
+        // be handed to another test before the connection is made, and something would answer.
+        let origin = GatewayOrigin::new(format!("https://{UNANSWERED}")).expect("an origin");
         // Out of reach, like every other transport here that is not the subject of a deadline: what
         // ends this exchange is the connector reporting that nothing is there, and a deadline that
-        // could reach it first would be this test measuring the machine.
+        // could reach it first would be this test measuring the machine. Windows reports a refused
+        // connection after its own retries, about two seconds for each attempt the transport makes,
+        // which the watchdog allows for.
         let transport = HttpService::with(origin, out_of_reach(), ResponseLimits::default())
             .expect("a transport");
-        // The watchdog is a watchdog rather than a claim: the port was released before this call,
-        // so something else could in principle be listening on it by now, and a call that then hung
-        // would hang for thirty days. A minute turns that into a failure that says what happened.
+        // The watchdog is a watchdog rather than a claim: a call that hung would hang for thirty
+        // days, and a minute turns that into a failure that says what happened.
         let error = tokio::time::timeout(
             WATCHDOG,
             transport.post_json(
-                &format!("https://localhost:{port}/api/mailbox/read"),
+                &format!("https://{UNANSWERED}/api/mailbox/read"),
                 b"{}",
                 &[],
             ),
         )
         .await
-        .expect("something answered on the port this test took and held the call")
+        .expect("the connection to an address nothing answers at did not end")
         .expect_err("nothing is listening");
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
         assert!(error.to_string().contains("could not be reached"));

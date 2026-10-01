@@ -1155,18 +1155,14 @@ fn a_chat_services_answer_is_read_as_what_it_says() {
     }
 
     // No service at all: nothing was sent, and the transport's own message, which names the
-    // address and so the credential, is not repeated either.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    // address and so the credential, is not repeated either. The address is one nothing answers
+    // at: a port this test freed could be handed to another test's service before the send.
     let unreachable = StandIn {
-        origin: format!(
-            "http://127.0.0.1:{}",
-            closed.local_addr().expect("an address").port()
-        ),
+        origin: format!("http://{}", kr_ipc::testing::UNANSWERED),
         received: Arc::new(std::sync::Mutex::new(Vec::new())),
         stop: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         port: 0,
     };
-    drop(closed);
     let sender = chat_sender(&runtime, ToStandIns::default().with(TELEGRAM, &unreachable));
     let outcome = sender.send(
         &external(DestinationKind::Telegram, "123456789"),
