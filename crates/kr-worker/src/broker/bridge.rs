@@ -795,7 +795,37 @@ impl crate::broker::Broker {
             now,
             under,
         )?;
+        drop(state);
+        self.note_thread_change(&thread, observation);
         Ok((thread, cursor))
+    }
+
+    /// Records a selection or an ending an observation made in the session's description facts. A
+    /// report that changed nothing, a stale or indirect one, a tool and a notification record
+    /// nothing: only the thread the application itself selected, and the end of it, are facts.
+    fn note_thread_change(&self, change: &ThreadChange, observation: &Observation) {
+        use kr_protocol::describe::DescriptionEventKind;
+
+        let Some(facts) = self.description_facts.get() else {
+            return;
+        };
+        match change {
+            ThreadChange::Selected(_) => {
+                facts.note_thread(Some(observation.thread.as_str()));
+                facts.note_event(
+                    DescriptionEventKind::TaskStarted,
+                    observation.detail.as_deref().unwrap_or("a thread started"),
+                );
+            }
+            ThreadChange::Ended(_) => {
+                facts.note_thread(None);
+                facts.note_event(
+                    DescriptionEventKind::TaskCompleted,
+                    observation.detail.as_deref().unwrap_or("a thread ended"),
+                );
+            }
+            _ => {}
+        }
     }
 
     /// Returns the thread every report of one contact request names, when the reports agree.
@@ -1515,6 +1545,67 @@ mod tests {
         }
         assert_eq!(revision(&broker, id), at);
         assert!(!suspended(&broker, id));
+    }
+
+    /// A thread the application selects, and the end of it, reach the session's description facts
+    /// as the selected thread and as events, newest first; a compaction, a stale report, a tool and a
+    /// notification record nothing, and nothing is recorded while privacy mode is on.
+    #[test]
+    fn a_selected_thread_and_its_end_reach_the_description_facts() {
+        use kr_protocol::describe::DescriptionEventKind;
+
+        let id = instance(2);
+        let broker = broker_with(&[id]);
+        let facts = crate::description_facts::DescriptionFacts::new(
+            false,
+            crate::privacy::PrivacyGeneration::new(0),
+        );
+        broker.set_description_facts(facts.clone());
+        let read = || facts.read(0, Some(0)).facts;
+        assert_eq!(read(), None);
+
+        apply(&broker, id, 10, &start("t1"));
+        let selected_facts = read().expect("facts after a selection");
+        assert_eq!(selected_facts.thread.0.as_deref(), Some("t1"));
+        assert_eq!(selected_facts.events.len(), 1);
+        assert_eq!(
+            selected_facts.events[0].kind,
+            DescriptionEventKind::TaskStarted
+        );
+        let revision = selected_facts.revision;
+
+        // A compaction, a stale start, a tool and a notification say nothing about a thread.
+        apply(&broker, id, 11, &continued("t1"));
+        apply(&broker, id, 5, &start("t0"));
+        for event in [
+            ObservedEvent::ToolFinished,
+            ObservedEvent::ToolFailed,
+            ObservedEvent::Notification,
+        ] {
+            apply(&broker, id, 12, &observed(event, "t1"));
+        }
+        assert_eq!(
+            read().expect("facts").revision,
+            revision,
+            "none of them moved the facts"
+        );
+
+        apply(&broker, id, 20, &end("t1"));
+        let ended_facts = read().expect("facts after the end");
+        assert_eq!(ended_facts.thread.0, None);
+        assert_eq!(
+            ended_facts.events[0].kind,
+            DescriptionEventKind::TaskCompleted
+        );
+        assert_eq!(
+            ended_facts.events[1].kind,
+            DescriptionEventKind::TaskStarted
+        );
+
+        // Privacy mode records nothing.
+        facts.fence(crate::privacy::PrivacyGeneration::new(1));
+        apply(&broker, id, 30, &start("t2"));
+        assert_eq!(facts.read(0, Some(1)).facts, None);
     }
 
     fn suspension(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {

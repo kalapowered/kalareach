@@ -1152,7 +1152,7 @@ impl Broker {
         } else {
             ("agent.prompt", RichOperation::PromptSubmit)
         };
-        self.admit_mutation(
+        let admitted = self.admit_mutation(
             caller,
             &params.target,
             capability,
@@ -1163,7 +1163,16 @@ impl Broker {
                 text: params.text.as_ref().map(|text| text.as_str().to_owned()),
             },
             now,
-        )
+        )?;
+        // What an agent was last asked to do is what the session is doing, once the admission
+        // has accepted it: a prompt that was refused, one that was only queued and one that names
+        // a draft rather than carrying text say nothing here.
+        if !queued
+            && let (Some(facts), Some(text)) = (self.description_facts.get(), params.text.as_ref())
+        {
+            facts.note_intent(text.as_str());
+        }
+        Ok(admitted)
     }
 
     /// Admits `agent.turn.steer`.
