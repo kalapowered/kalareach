@@ -291,7 +291,8 @@ const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
 /// once at least, because the host may hold an answer it has not spent, and never after the
 /// deadline: the host cannot spend an answer to a challenge that has ended. A request the host
 /// did not answer may have been performed, so its end says the outcome is not known and never that
-/// nothing was changed.
+/// nothing was changed. That is no refusal, because the host refused nothing: it ends the command
+/// as an unfinished request.
 async fn wait_for_an_owner_device<T>(
     deadline: tokio::time::Instant,
     grace: tokio::time::Duration,
@@ -302,13 +303,13 @@ async fn wait_for_an_owner_device<T>(
         let answered = tokio::time::timeout_at(deadline + grace, ask()).await;
         match answered {
             Err(_) => {
-                return Err(CliError::Refused(refusal(
-                    ErrorCode::OutcomeUnknown,
-                    Shown::said(
+                return Err(CliError::Unfinished {
+                    code: ErrorCode::OutcomeUnknown,
+                    message: Shown::said(
                         "the host did not answer the request, so whether it was performed is not \
                          known: look at what the host lists before asking again",
                     ),
-                )));
+                });
             }
             Ok(Ok(answer)) => return Ok(answer),
             Ok(Err(CliError::Refused(refused)))
@@ -342,14 +343,14 @@ async fn wait_for_an_owner_device<T>(
             // performed the request.
             Ok(Err(error @ CliError::Refused(_))) => return Err(error),
             Ok(Err(_)) => {
-                return Err(CliError::Refused(refusal(
-                    ErrorCode::OutcomeUnknown,
-                    Shown::said(
+                return Err(CliError::Unfinished {
+                    code: ErrorCode::OutcomeUnknown,
+                    message: Shown::said(
                         "the connection to the host ended before it answered the request, so \
                          whether it was performed is not known: look at what the host lists before \
                          asking again",
                     ),
-                )));
+                });
             }
         }
     }
@@ -374,15 +375,11 @@ where
     P: serde::Serialize + ?Sized,
     T: kr_protocol::wire::WireMessage,
 {
-    let asked = tokio::time::timeout(
-        ASK_WITHIN,
-        daemon.mutate::<_, OwnerConfirmationRequestResult>(
-            Method::OwnerConfirmationRequest,
-            &OwnerConfirmationRequestParams { subject },
-        ),
-    )
-    .await;
-    let challenge = asked.map_err(|_| host_did_not_answer())??;
+    let challenge = ask_within(daemon.mutate::<_, OwnerConfirmationRequestResult>(
+        Method::OwnerConfirmationRequest,
+        &OwnerConfirmationRequestParams { subject },
+    ))
+    .await?;
     if challenge.initial_bootstrap {
         return Err(CliError::Refused(refusal(
             ErrorCode::OwnerConfirmationRequired,
@@ -396,15 +393,11 @@ where
     let expires_at_ms = challenge.request.expires_at_ms.get();
     let deadline = tokio::time::Instant::now() + time_left(expires_at_ms, kr_ipc::now_ms().get());
     if !json {
-        let read = tokio::time::timeout(
-            ASK_WITHIN,
-            daemon.read::<_, OwnerConfirmationPendingResult>(
-                Method::OwnerConfirmationPending,
-                &OwnerConfirmationPendingParams {},
-            ),
-        )
-        .await;
-        let pending = read.map_err(|_| host_did_not_answer())??;
+        let pending = ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
+            Method::OwnerConfirmationPending,
+            &OwnerConfirmationPendingParams {},
+        ))
+        .await?;
         if let Some(listed) = pending
             .pending
             .iter()
@@ -423,6 +416,14 @@ where
         })
         .await?;
     Ok((answer, challenge.request))
+}
+
+/// What the host answers to a request that changes nothing, or the command's word that it did not
+/// answer within [`ASK_WITHIN`].
+async fn ask_within<T>(request: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(ASK_WITHIN, request)
+        .await
+        .map_err(|_| host_did_not_answer())?
 }
 
 /// What the command says when the host does not answer a request that changes nothing.
@@ -637,14 +638,13 @@ async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: b
     // What this host says a repository may ask for. It is what the host enforces, which a document
     // on disk may no longer say, so it is read from the host: a request for more is refused, and
     // this command has no option to ask for less.
-    let listed: CatalogueListResult = daemon
-        .read(
-            Method::CatalogueList,
-            &CatalogueListParams {
-                environment_id: daemon.environment_id(),
-            },
-        )
-        .await?;
+    let listed: CatalogueListResult = ask_within(daemon.read(
+        Method::CatalogueList,
+        &CatalogueListParams {
+            environment_id: daemon.environment_id(),
+        },
+    ))
+    .await?;
     let params = CatalogueAddParams {
         environment_id: daemon.environment_id(),
         catalogue_id: arguments.catalogue.clone(),
@@ -991,11 +991,12 @@ mod tests {
             std::future::pending,
         )
         .await;
-        let Err(CliError::Refused(refused)) = silent else {
-            panic!("a refusal");
+        let Err(unknown @ CliError::Unfinished { .. }) = silent else {
+            panic!("an unfinished request, which the host did not refuse");
         };
-        assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
-        let said = &refused.message;
+        assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown);
+        assert_eq!(unknown.exit_code(), 1, "the host refused nothing");
+        let said = unknown.to_string();
         assert!(said.contains("not known"), "{said}");
         assert!(!said.contains("Nothing was changed"), "{said}");
 
@@ -1020,6 +1021,29 @@ mod tests {
         assert_eq!(asks.count(), 1);
     }
 
+    /// KR-REQ-07.47: a request that changes nothing, the challenge's own among them, ends at the
+    /// bound the command allows the host with its word that nothing was changed, and an answer
+    /// that comes in time is the host's own.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_changes_nothing_is_given_up_when_the_host_does_not_answer() {
+        let silent: Result<u32> = ask_within(std::future::pending()).await;
+        let Err(unavailable @ CliError::HostUnavailable(_)) = silent else {
+            panic!("the host did not answer");
+        };
+        let said = unavailable.to_string();
+        assert!(said.contains("Nothing was changed"), "{said}");
+        let answered: Result<u32> = ask_within(async { Ok(7) }).await;
+        assert_eq!(answered.expect("answered"), 7);
+        let refused: Result<u32> = ask_within(async {
+            Err(CliError::Refused(refusal(
+                ErrorCode::QuotaExceeded,
+                Shown::said("past a budget"),
+            )))
+        })
+        .await;
+        assert!(matches!(refused, Err(CliError::Refused(_))));
+    }
+
     /// KR-REQ-07.47: a connection that ends after a request was sent, or an answer that cannot be
     /// read, leaves the outcome as unknown as a host that said nothing: the host may have
     /// performed the request, so the command does not say it did not. A host's own refusal is the
@@ -1039,16 +1063,14 @@ mod tests {
         for failure in failures {
             let ended: Result<u32> =
                 wait_for_an_owner_device(deadline, short(), short(), async || Err(failure())).await;
-            let Err(CliError::Refused(refused)) = ended else {
-                panic!("a refusal that says the outcome is not known");
+            let Err(unknown @ CliError::Unfinished { .. }) = ended else {
+                panic!("an unfinished request that says the outcome is not known");
             };
-            assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
-            assert!(refused.message.contains("not known"), "{}", refused.message);
-            assert!(
-                !refused.message.contains("Nothing was changed"),
-                "{}",
-                refused.message
-            );
+            assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown);
+            assert_eq!(unknown.exit_code(), 1, "the host refused nothing");
+            let said = unknown.to_string();
+            assert!(said.contains("not known"), "{said}");
+            assert!(!said.contains("Nothing was changed"), "{said}");
         }
         let other: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
             Err(CliError::Refused(refusal(

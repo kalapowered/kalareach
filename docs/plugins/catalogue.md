@@ -524,8 +524,10 @@ forwarder it is expected to start.
 name, an application's name and any note by class and length only. The row also contains the state
 of the bridge, the number of files the host published for the bridge and each file's digest. The row
 emits a warning when the bridge is applying, removing or unsettled, or when it is applied and its
-files no longer match what was applied. If the host refused a recipe, the row reports it as refused
-and emits no warning. On Windows the host refuses every recipe, and the row says so.
+files no longer match what was applied, or when it was removed and something a removal left in
+place is still there. If the host refused a recipe and nothing of it is in place, the row reports
+it as refused and emits no warning; a refusal that had to leave something in place is unsettled. On
+Windows the host refuses every recipe, and the row says so.
 
 ## The transport, and the broker
 
