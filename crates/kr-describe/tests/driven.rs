@@ -2212,3 +2212,63 @@ fn inference_failed(service: &DescriptionService) -> bool {
         }
     )
 }
+
+/// What privacy mode has the service forget, with nothing in the store touched: every queued job,
+/// every retained context and event, and what waits behind a job, for every session. The service
+/// goes on working afterwards: a change captured after it is described as any is. The control is a
+/// description already in the store, which stays, because removing a row is the store's own step.
+#[test]
+fn forgetting_content_clears_the_queue_and_the_contexts_and_leaves_the_store_alone() {
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    queue(&mut service, &session(2), "crates", at(0));
+    service.session_opened(session(3), SessionEpoch::V1, binding());
+    change(&mut service, &session(3), "tests", at(0));
+    assert!(service.settle_due_ms().is_some(), "a change is pending");
+    assert_eq!(service.scheduler().queued(), 2);
+
+    // A published description is the control.
+    let (now, id, request) = next_job(&mut service, at(3_000));
+    assert!(matches!(
+        service
+            .finished(id, produced(&request.prompt, 0), now)
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
+    let published = [session(1), session(2)]
+        .iter()
+        .filter(|session_id| {
+            service
+                .store()
+                .generated(session_id)
+                .expect("a read")
+                .is_some()
+        })
+        .count();
+    assert_eq!(published, 1, "one job ran");
+
+    let forgotten = service.forget_content();
+    assert_eq!(forgotten, 2, "the queued job and the pending change");
+    assert_eq!(service.scheduler().queued(), 0);
+    assert_eq!(service.settle_due_ms(), None);
+    let still = [session(1), session(2)]
+        .iter()
+        .filter(|session_id| {
+            service
+                .store()
+                .generated(session_id)
+                .expect("a read")
+                .is_some()
+        })
+        .count();
+    assert_eq!(still, 1, "the store is not touched");
+
+    // Still working: a change after it is described.
+    change(&mut service, &session(3), "after", at(10_000));
+    assert!(
+        service
+            .settle(&session(3), Priority::Ordinary, at(12_000))
+            .is_some()
+    );
+    assert_eq!(service.scheduler().queued(), 1);
+}
