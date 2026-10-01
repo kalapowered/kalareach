@@ -14,10 +14,10 @@
 //!
 //! Every window the session decides is on the continuous clock the replay moves, so a trace says
 //! exactly what it expects of each: a reply to a question the application asks while the person's
-//! input is inside a paste waits until that closes and is dropped after two seconds, the replies of
-//! one read past a byte budget wait for a later read and are dropped after the same two seconds, and
-//! replies past 256 a second are dropped until the clock has moved on. A step of the wall clock
-//! moves none of them.
+//! input is inside a paste or a held delimiter waits until that closes and is dropped after two
+//! seconds, the replies one drain of the response lane writes past a byte budget wait for a later
+//! drain and are dropped after the same two seconds, and replies past 256 a second are dropped until
+//! the clock has moved on. A step of the wall clock moves none of them.
 //!
 //! [`minimise`] takes a failing trace down to steps from which no single one can be taken and the
 //! trace still fail at the same step, which is the trace worth keeping once the race it shows is
