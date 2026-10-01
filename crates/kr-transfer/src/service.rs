@@ -147,6 +147,125 @@ pub struct Action {
     pub method: String,
     /// The digest of the payload it was submitted with.
     pub payload_digest: Digest256,
+    /// What the host asks of it where it begins an effect.
+    pub admission: Admission,
+}
+
+/// What a host asks of a mutation where it begins a new effect.
+///
+/// The service takes its own lock and opens its own transaction, after whatever the host checked
+/// before calling it, and either can wait. So the host's question is asked here, inside the lock,
+/// at each place a mutation begins an effect that is new: before its first write, and again around
+/// the commit that makes the effect durable. An answer a call has already given, from the record
+/// an earlier attempt left, is not a new effect, and neither is finishing a publication or a
+/// cancellation whose claim is already committed: those carry out what an admission that stood
+/// then began, and a registration withdrawn since is withdrawn by the barrier that follows it.
+///
+/// The service has one connection to its store, held behind its own lock, and opened only by the
+/// daemon that holds the environment; no other writer can hold the store while a call holds that
+/// lock, so the wait for the store's transaction is the wait for the lock this asks inside.
+pub trait AdmissionHook: Send + Sync {
+    /// Asks whether the admission the mutation arrived under still stands, before its first write.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the host's check gave: nothing has been written.
+    fn ask(&self) -> std::result::Result<(), kr_protocol::error::ProtocolError>;
+
+    /// Runs `commit`, which makes one new effect durable, with the admission held standing across
+    /// it, or refuses without running it.
+    ///
+    /// `commit` is short, synchronous and takes no lock of the host's, and nothing else is asked
+    /// of the hook from inside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the host's check gave: `commit` did not run.
+    fn run(
+        &self,
+        commit: &mut dyn FnMut(),
+    ) -> std::result::Result<(), kr_protocol::error::ProtocolError>;
+}
+
+/// The question a host asks of a mutation ([`AdmissionHook`]), or none.
+#[derive(Clone, Default)]
+pub struct Admission(Option<Arc<dyn AdmissionHook>>);
+
+impl Admission {
+    /// An admission that asks the host `hook`.
+    #[must_use]
+    pub fn new(hook: Arc<dyn AdmissionHook>) -> Self {
+        Self(Some(hook))
+    }
+
+    /// An admission that asks nothing, for a caller whose action carries none.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Asks before the first write of a new effect.
+    fn ask(&self) -> Result<()> {
+        match &self.0 {
+            Some(hook) => hook.ask().map_err(TransferError::NotAdmitted),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs the one commit of a new effect with the admission held across it.
+    fn commit<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(hook) = &self.0 else {
+            return work();
+        };
+        let mut work = Some(work);
+        let mut outcome: Option<Result<T>> = None;
+        hook.run(&mut || {
+            if let Some(work) = work.take() {
+                outcome = Some(work());
+            }
+        })
+        .map_err(TransferError::NotAdmitted)?;
+        outcome.unwrap_or_else(|| {
+            Err(TransferError::store(
+                "the commit of an admitted effect did not run",
+            ))
+        })
+    }
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Admission")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for Admission {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(held), Some(other)) => Arc::ptr_eq(held, other),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Admission {}
+
+/// Asks the admission `action` carries, before the first write of a new effect. A call that
+/// carries no action asks nothing.
+fn ask_admission(action: Option<&Action>) -> Result<()> {
+    action.map_or(Ok(()), |action| action.admission.ask())
+}
+
+/// Runs the commit of a new effect under the admission `action` carries.
+fn commit_admitted<T>(action: Option<&Action>, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    match action {
+        Some(action) => action.admission.commit(work),
+        None => work(),
+    }
 }
 
 impl Action {
@@ -584,6 +703,13 @@ impl TransferService {
             drop(store);
             return self.refuse_unless_performed(action, refusal);
         }
+        // Everything above wrote nothing. A repeat of an action this service already performed is
+        // answered from its record, which is no new effect, and anything else asks the host here,
+        // under the lock, before the staging file is created: the file is the first write.
+        if let Recorded::Answered(answered) = recorded_with(&store, action)? {
+            return Ok(answered);
+        }
+        ask_admission(action)?;
         // The payload file exists before the row does, so a row can never name a file that was
         // refused, and the exclusive create is what proves the name was unused.
         let incomplete = storage.incomplete()?;
@@ -631,7 +757,7 @@ impl TransferService {
             published_at_ms: None,
             submitted_at_ms: None,
         };
-        match store.insert_upload(&row, retained.as_ref()) {
+        match commit_admitted(action, || store.insert_upload(&row, retained.as_ref())) {
             // Another attempt at the same action won the transaction. Nothing was written, so the
             // file this attempt created goes with it and the caller is answered from the record.
             Ok(ActionOutcome::AlreadyPerformed) => {
@@ -755,6 +881,10 @@ impl TransferService {
             Recorded::Answered(answered) => return Ok(answered),
             Recorded::Claimed | Recorded::Absent => {}
         }
+        // From here the call writes: the host's question is asked now, under the lock and after the
+        // record that would have answered the call. An expiry the check above found is the host's
+        // own decision and not this action's, so it is written whatever the admission says.
+        ask_admission(action)?;
         let mut duplicate = false;
         if let Some(recorded) = store.chunk(params.transfer_id, index)? {
             if recorded.digest == digest && recorded.byte_len == params.chunk.byte_len {
@@ -764,13 +894,15 @@ impl TransferService {
                     "chunk {index} arrived twice with different content, so this upload cannot be \
                      completed under the same identifier"
                 );
-                store.close_upload(
-                    params.transfer_id,
-                    UploadState::Invalidated,
-                    Some(&reason),
-                    now,
-                    None,
-                )?;
+                commit_admitted(action, || {
+                    store.close_upload(
+                        params.transfer_id,
+                        UploadState::Invalidated,
+                        Some(&reason),
+                        now,
+                        None,
+                    )
+                })?;
                 drop(store);
                 self.discard_payloads(&row)?;
                 return Err(TransferError::integrity(reason));
@@ -813,7 +945,9 @@ impl TransferService {
         // verification trust a hole. The action is claimed in the same transaction as the row, so
         // a second copy of this action finds it claimed and answers from the record rather than
         // computing its own answer.
-        match store.record_chunk(params.transfer_id, params.chunk, now, retained.as_ref())? {
+        match commit_admitted(action, || {
+            store.record_chunk(params.transfer_id, params.chunk, now, retained.as_ref())
+        })? {
             ActionOutcome::Committed => Ok(result),
             ActionOutcome::AlreadyPerformed => {
                 drop(store);
@@ -905,6 +1039,9 @@ impl TransferService {
                 }
                 _ => {}
             }
+            // The answers a record or a state gives are behind this; what follows can write, an
+            // expiry first, so the host's question is asked under the lock before it.
+            ask_admission(action)?;
             self.check_live(&mut store, &row, "it cannot be finished")?;
             check_declaration(&row, params)?;
             let layout = ChunkLayout::for_length(row.declared_byte_len);
@@ -987,14 +1124,21 @@ impl TransferService {
             let payloads = self.payloads.lock().map_err(|_| poisoned())?;
             // Conditional on the state this call read before it spent time verifying the file. A
             // cancellation that landed in between has already closed this transfer and removed
-            // its payload, and that terminal state is not this failure's to overwrite.
-            let moved = self.locked()?.close_upload_from(
-                row.transfer_id,
-                row.state,
-                UploadState::Invalidated,
-                Some(&reason),
-                now,
-            )?;
+            // its payload, and that terminal state is not this failure's to overwrite. The host's
+            // question is asked again here: verifying the file took as long as the file is large,
+            // and what the invalidation writes is this action's effect.
+            let mut store = self.locked()?;
+            ask_admission(action)?;
+            let moved = commit_admitted(action, || {
+                store.close_upload_from(
+                    row.transfer_id,
+                    row.state,
+                    UploadState::Invalidated,
+                    Some(&reason),
+                    now,
+                )
+            })?;
+            drop(store);
             if moved {
                 self.discard_payloads(&row)?;
             }
@@ -1066,17 +1210,22 @@ impl TransferService {
         // this action finds the claim and resolves the same publication rather than starting
         // another one.
         let claim = action.map(|action| action.claimed_for(row.transfer_id, now));
-        let claim_outcome = store.begin_publish(
-            row.transfer_id,
-            &crate::store::Publication {
-                content_digest: digest,
-                payload_identity,
-                preview: encoded_preview.as_deref(),
-                preview_unavailable: preview_unavailable.as_deref(),
-            },
-            now,
-            claim.as_ref(),
-        )?;
+        // Verifying the file waited without the lock, so the host's question is asked again now,
+        // before the claim that makes this publication this action's.
+        ask_admission(action)?;
+        let claim_outcome = commit_admitted(action, || {
+            store.begin_publish(
+                row.transfer_id,
+                &crate::store::Publication {
+                    content_digest: digest,
+                    payload_identity,
+                    preview: encoded_preview.as_deref(),
+                    preview_unavailable: preview_unavailable.as_deref(),
+                },
+                now,
+                claim.as_ref(),
+            )
+        })?;
         drop(store);
         drop(file);
         if claim_outcome == ActionOutcome::AlreadyPerformed {
@@ -1464,15 +1613,19 @@ impl TransferService {
         }
         // The action is claimed in the same transaction as the close, and claimed *without* a
         // result: the bytes are not released until the payload is gone, and a reply that said they
-        // were would be wrong. The result is recorded once the release has actually happened.
+        // were would be wrong. The result is recorded once the release has actually happened. The
+        // answers a record or a state gives are behind this, so the host's question is asked now.
+        ask_admission(action)?;
         let claim = action.map(|action| action.claimed_for(row.transfer_id, now));
-        let outcome = store.close_upload(
-            row.transfer_id,
-            UploadState::Cancelled,
-            None,
-            now,
-            claim.as_ref(),
-        )?;
+        let outcome = commit_admitted(action, || {
+            store.close_upload(
+                row.transfer_id,
+                UploadState::Cancelled,
+                None,
+                now,
+                claim.as_ref(),
+            )
+        })?;
         drop(store);
         if outcome == ActionOutcome::AlreadyPerformed {
             // Another copy of this action closed it. That copy owns the payload removal and the
@@ -1600,7 +1753,15 @@ impl TransferService {
             )),
             None => None,
         };
-        let outcome = self.locked()?.insert_draft(&row, retained.as_ref())?;
+        let mut store = self.locked()?;
+        // A repeat of an action this service already performed is answered from its record, which
+        // is no new effect; anything else asks the host before the draft is written.
+        if let Recorded::Answered(answered) = recorded_with(&store, action)? {
+            return Ok(answered);
+        }
+        ask_admission(action)?;
+        let outcome = commit_admitted(action, || store.insert_draft(&row, retained.as_ref()))?;
+        drop(store);
         match outcome {
             // The guard above is dropped with the statement, so reading the retained record does
             // not take the same lock twice.
@@ -1658,13 +1819,17 @@ impl TransferService {
             )),
             None => None,
         };
-        match store.update_draft(
-            params.draft_id,
-            params.expected_revision,
-            &params.text,
-            now,
-            retained.as_ref(),
-        )? {
+        // The reads above wrote nothing, and the refusal for a stale revision is behind them.
+        ask_admission(action)?;
+        match commit_admitted(action, || {
+            store.update_draft(
+                params.draft_id,
+                params.expected_revision,
+                &params.text,
+                now,
+                retained.as_ref(),
+            )
+        })? {
             Some(_) => Ok(result),
             None => {
                 drop(store);
@@ -1840,13 +2005,18 @@ impl TransferService {
             )),
             None => None,
         };
-        match store.bind_attachment(
-            &binding,
-            params.expected_revision,
-            grant.as_ref(),
-            retained.as_ref(),
-            session_for_attachment,
-        )? {
+        // Everything above read, or built a row nothing has written: the binding is the first
+        // write, and the host's question is asked under the lock before it.
+        ask_admission(action)?;
+        match commit_admitted(action, || {
+            store.bind_attachment(
+                &binding,
+                params.expected_revision,
+                grant.as_ref(),
+                retained.as_ref(),
+                session_for_attachment,
+            )
+        })? {
             Some(_) => Ok(result),
             None => {
                 drop(store);

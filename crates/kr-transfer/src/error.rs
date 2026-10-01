@@ -131,6 +131,14 @@ pub enum TransferError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The admission the mutation arrived under no longer stands, and nothing was written.
+    ///
+    /// The host decided it, under its own code: a fence this host owes, a registration it has
+    /// withdrawn or replaced, or a deadline that has passed. It is a statement about this attempt
+    /// and not about the action, so it is never kept as the action's answer: the same action
+    /// submitted again under an admission that stands is decided again.
+    #[error("{}", .0.message)]
+    NotAdmitted(ProtocolError),
 }
 
 impl TransferError {
@@ -204,6 +212,7 @@ impl TransferError {
             Self::Retained { code, .. } => *code,
             Self::Ipc(error) => error.code(),
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::NotAdmitted(refusal) => refusal.code,
         }
     }
 
