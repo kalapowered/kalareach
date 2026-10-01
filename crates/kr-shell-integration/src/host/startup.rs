@@ -590,6 +590,10 @@ fn owns_separator(block: &str) -> bool {
     block.lines().any(|line| line == SEPARATOR_NOTE)
 }
 
+/// The line a signed PowerShell script's signature block begins with. The script that refuses a
+/// signed profile reads the same text.
+const SIGNATURE_BEGIN: &str = "# SIG # Begin signature block";
+
 /// Where in a startup file a guarded entry goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -606,14 +610,15 @@ pub enum Placement {
     /// or a semicolon is left on the line the prologue ends on, because an entry cannot be put in
     /// the middle of a line without moving what is after it. The profile is then parsed again with
     /// the entry in it, and the entry is refused unless every statement between its markers is a
-    /// whole statement of the profile's own top level and everything else is as it was.
+    /// whole statement of the profile's own top level, every statement of the profile's own comes
+    /// after the entry, and everything else is as it was.
     AfterPrologue {
         /// The PowerShell that answers, which is the one this profile belongs to.
         shell: PathBuf,
     },
     /// After everything the user wrote, in a PowerShell profile: the same end as `End`, checked the
     /// same way as `AfterPrologue` is, so that an entry can never land inside a statement the
-    /// profile leaves open.
+    /// profile leaves open, and every statement of the profile's own comes before it.
     Last {
         /// The PowerShell that answers, which is the one this profile belongs to.
         shell: PathBuf,
@@ -627,6 +632,14 @@ impl Placement {
         match self {
             Self::End | Self::AfterPrologue { .. } => (MARKER_BEGIN, MARKER_END),
             Self::Last { .. } => (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
+        }
+    }
+
+    /// Returns the PowerShell that places and checks an entry put this way, when it takes one.
+    fn shell(&self) -> Option<&Path> {
+        match self {
+            Self::End => None,
+            Self::AfterPrologue { shell } | Self::Last { shell } => Some(shell),
         }
     }
 }
@@ -687,6 +700,15 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
         || existing.to_owned(),
         |(before, _block, after)| format!("{before}{after}"),
     );
+    // A signed profile cannot change without losing its signature. One that already holds exactly
+    // this entry needs no change, which is not a refusal.
+    if !matches!(placement, Placement::End)
+        && existing.contains(SIGNATURE_BEGIN)
+        && let Some((before, after)) = &stripped
+        && format!("{before}{body}{after}") == existing
+    {
+        return Ok((Change::Unchanged, existing.to_owned()));
+    }
     let rebuilt = match placement {
         Placement::End => match stripped {
             Some((before, block, after)) => {
@@ -703,12 +725,12 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
             None => appended(existing, body),
         },
         Placement::AfterPrologue { shell } => {
-            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, (begin, end))?;
+            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement)?;
             rebuilt
         }
-        Placement::Last { shell } => {
+        Placement::Last { .. } => {
             let rebuilt = appended(&theirs, body);
-            checked(shell, &theirs, &rebuilt, (begin, end))?;
+            checked(&theirs, &rebuilt, placement)?;
             rebuilt
         }
     };
@@ -740,49 +762,71 @@ fn after_the_prologue(
     shell: &Path,
     theirs: &str,
     body: &str,
-    markers: (&str, &str),
+    placement: &Placement,
 ) -> std::io::Result<(String, usize)> {
+    if second_mark(theirs) {
+        return Err(cannot_take_the_entry(
+            "it begins with a second byte-order mark",
+        ));
+    }
     let (mark, text) = match theirs.strip_prefix('\u{feff}') {
         Some(text) => ("\u{feff}", text),
         None => ("", theirs),
     };
     let at = prologue_end(shell, text)?;
     let (head, rest) = text.split_at(at);
-    // The prologue runs to the end of the file with no final line end. Nothing follows, so this
-    // is an entry added at the end, and it is added the way one is.
+    // The prologue's line is the last of a file with no final line end, and PowerShell has said
+    // that nothing but whitespace, a semicolon or a comment follows the prologue on it. This is an
+    // entry added at the end, and it is added the way one is.
     let rebuilt = if rest.is_empty() && !head.is_empty() && !head.ends_with('\n') {
         format!("{mark}{}", appended(head, body))
     } else {
         format!("{mark}{head}{body}{rest}")
     };
-    checked(shell, theirs, &rebuilt, markers)?;
+    checked(theirs, &rebuilt, placement)?;
     Ok((rebuilt, at))
 }
 
 /// Refuses an entry PowerShell would not read as part of the profile it was added to.
-fn checked(shell: &Path, old: &str, new: &str, markers: (&str, &str)) -> std::io::Result<()> {
-    match entry_refused(shell, old, new, markers)? {
+fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
+    match entry_refused(old, new, placement)? {
         None => Ok(()),
-        Some(why) => Err(std::io::Error::other(format!(
-            "this profile cannot take the entry: {why}, so nothing was written"
-        ))),
+        Some(why) => Err(cannot_take_the_entry(&why)),
     }
 }
 
 /// The question both scripts ask first about a profile's text: whether an entry can be added to it
 /// at all.
 ///
-/// A profile the entry would damage is refused by name and left as it is: one that is signed, whose
-/// line ends cannot be told from each other, or that begins with a second byte-order mark.
+/// A profile the entry would damage is refused by name and left as it is: one that is signed, or
+/// whose line ends cannot be told from each other. A profile that begins with a second byte-order
+/// mark is refused before either script is asked, by [`second_mark`], because reading a file takes
+/// one mark off it and the question could not see the second.
 macro_rules! unsafe_profile {
     () => {
         "function Unsafe($text) { \
-            if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { return 'it begins with a second byte-order mark' }; \
             if ($text -match \"`r(?!`n)\") { return 'it has a line end that is a carriage return alone' }; \
             if ($text.Contains('# SIG # Begin signature block')) { return 'it is signed, and any change to it breaks its signature' }; \
             $null \
         }; "
     };
+}
+
+/// Whether a profile's text begins with a second byte-order mark, after the one that is the file's
+/// encoding.
+///
+/// The first mark belongs to no line, and a second one would be read as part of the first token, so
+/// PowerShell already fails on such a profile and an entry's offsets would be one character short.
+fn second_mark(text: &str) -> bool {
+    text.strip_prefix('\u{feff}')
+        .is_some_and(|rest| rest.starts_with('\u{feff}'))
+}
+
+/// The refusal of a profile an entry cannot be put into, with its reason.
+fn cannot_take_the_entry(why: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "this profile cannot take the entry: {why}, so nothing was written"
+    ))
 }
 
 /// The script that says where a profile's entry goes.
@@ -792,7 +836,8 @@ macro_rules! unsafe_profile {
 /// cannot take the entry there. The offset is given only when what is left on the line the prologue
 /// ends on is whitespace, a semicolon or a comment that ends on that line: an entry put in the
 /// middle of a line would move what follows it, and one put after the next line end could land
-/// inside a statement that began on the prologue's line.
+/// inside a statement that began on the prologue's line. When no line end follows the prologue,
+/// that line runs to the end of the text and the same is asked of all of it.
 const PLACE_SCRIPT: &str = concat!(
     "$ErrorActionPreference = 'Stop'; ",
     unsafe_profile!(),
@@ -806,27 +851,31 @@ const PLACE_SCRIPT: &str = concat!(
      if ($null -ne $ast.ParamBlock) { $at = [Math]::Max($at, $ast.ParamBlock.Extent.EndOffset) }; \
      if ($at -eq 0) { [Console]::Out.Write('kr-placed 0'); return }; \
      $lf = $text.IndexOf(\"`n\", $at); \
-     if ($lf -lt 0) { [Console]::Out.Write('kr-placed ' + $text.Length); return }; \
+     $lineEnd = if ($lf -lt 0) { $text.Length } else { $lf }; \
      foreach ($token in $tokens) { \
-         if ($token.Extent.EndOffset -le $at -or $token.Extent.StartOffset -gt $lf) { continue }; \
-         if ($token.Extent.StartOffset -lt $lf -and $token.Extent.EndOffset -gt $lf + 1) { \
+         if ($token.Extent.EndOffset -le $at -or $token.Extent.StartOffset -gt $lineEnd) { continue }; \
+         if ($lf -ge 0 -and $token.Extent.StartOffset -lt $lf -and $token.Extent.EndOffset -gt $lf + 1) { \
              [Console]::Out.Write('kr-refused a comment or a string runs over the line its using statements or param block end on'); return }; \
          if ($token.Kind -notin 'Comment', 'NewLine', 'Semi', 'EndOfInput') { \
              [Console]::Out.Write('kr-refused a statement shares the line its using statements or param block end on, and an entry cannot go between them; put it on a line of its own'); return } \
      }; \
-     [Console]::Out.Write('kr-placed ' + ($lf + 1))"
+     if ($lf -lt 0) { [Console]::Out.Write('kr-placed ' + $text.Length) } else { [Console]::Out.Write('kr-placed ' + ($lf + 1)) }"
 );
 
-/// The script that says whether an entry sits in a profile as whole statements and changed nothing
-/// else.
+/// The script that says whether an entry sits in a profile where it belongs, as whole statements,
+/// and changed nothing else.
 ///
 /// It parses the profile before and after. The entry is refused unless it adds no parse error the
-/// profile did not have, and, for a profile that parsed, unless every top-level statement of the
-/// new text lies wholly between the entry's two marker lines or wholly outside them and no
-/// statement or block holds the marker lines inside it; the statements outside are the profile's
-/// own top-level statements, with the same text in the same order, and its `using` statements and
-/// `param` block are as they were. A profile that already has an error keeps it: it does not run, and
-/// the entry is held to adding none.
+/// profile did not have and takes none away: a profile that does not run is not one an entry may
+/// start running. For a profile that parsed, the entry is refused unless every top-level statement
+/// of the new text lies wholly between the entry's two marker lines or wholly outside them, no
+/// statement or block holds the marker lines inside it, and the entry is on the side of the
+/// profile's own statements it was asked to be: before every one of them, below the `using`
+/// statements and `param` block, for the entry that opens the bridge, and after every one of them
+/// for the entry that checks the reader. The statements outside are the profile's own top-level
+/// statements, with the same text in the same order, and its `using` statements and `param` block
+/// are as they were. This holds whatever put the entry where it is, which is the point of asking
+/// the parser again instead of trusting the question that placed it.
 const VERIFY_SCRIPT: &str = concat!(
     "$ErrorActionPreference = 'Stop'; ",
     unsafe_profile!(),
@@ -838,7 +887,8 @@ const VERIFY_SCRIPT: &str = concat!(
          @{ Ast = $ast; Tokens = $tokens; Errors = @($errors | ForEach-Object { $_.ErrorId }) } \
      }; \
      function Refuse($why) { [Console]::Out.Write('kr-refused ' + $why) }; \
-     $oldText = Read 'KR_PROFILE_OLD'; $newText = Read 'KR_PROFILE_NEW'; \
+     function Same($a, $b) { [string]::Equals([string]$a, [string]$b, [System.StringComparison]::Ordinal) }; \
+     $oldText = Read 'KR_PROFILE_OLD'; $newText = Read 'KR_PROFILE_NEW'; $order = Read 'KR_ORDER'; \
      $why = Unsafe $oldText; \
      if ($null -ne $why) { Refuse $why; return }; \
      $old = Parse $oldText; $new = Parse $newText; \
@@ -846,10 +896,12 @@ const VERIFY_SCRIPT: &str = concat!(
      $added = @(); \
      foreach ($id in $new.Errors) { if ($had[$id] -gt 0) { $had[$id] = $had[$id] - 1 } else { $added += $id } }; \
      if ($added.Count -gt 0) { Refuse ('PowerShell would report ' + ($added -join ',')); return }; \
+     $ended = 0; foreach ($left in $had.Values) { $ended += $left }; \
+     if ($ended -gt 0) { Refuse 'the entry would change which errors PowerShell reports for the profile'; return }; \
      if ($old.Errors.Count -gt 0) { [Console]::Out.Write('kr-verified'); return }; \
      $beginText = Read 'KR_BEGIN'; $endText = Read 'KR_END'; \
-     $begin = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text -ceq $beginText }); \
-     $end = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text -ceq $endText }); \
+     $begin = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and (Same $_.Text $beginText) }); \
+     $end = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and (Same $_.Text $endText) }); \
      if ($begin.Count -ne 1 -or $end.Count -ne 1) { Refuse 'its entry is not one block between its markers'; return }; \
      $from = $begin[0].Extent.StartOffset; $to = $end[0].Extent.EndOffset; \
      $inside = @(); $outside = @(); \
@@ -861,15 +913,23 @@ const VERIFY_SCRIPT: &str = concat!(
      }; \
      $holding = @($new.Ast.FindAll({ param($node) $node.Extent.StartOffset -lt $from -and $node.Extent.EndOffset -gt $to -and -not ($node -is [System.Management.Automation.Language.ScriptBlockAst] -and $node.Parent -eq $null) -and -not ($node -is [System.Management.Automation.Language.NamedBlockAst]) }, $true)); \
      if ($holding.Count -gt 0) { Refuse 'its entry would sit inside a block of the profile'; return }; \
+     foreach ($statement in $outside) { \
+         if ($order -eq 'first' -and $statement.Extent.StartOffset -lt $from) { Refuse 'a statement of the profile would run before the entry'; return }; \
+         if ($order -eq 'last' -and $statement.Extent.StartOffset -gt $to) { Refuse 'a statement of the profile would run after the entry'; return } \
+     }; \
+     if ($order -eq 'first') { \
+         $prologue = @($new.Ast.UsingStatements) + @($new.Ast.ParamBlock | Where-Object { $null -ne $_ }); \
+         foreach ($part in $prologue) { if ($part.Extent.EndOffset -gt $from) { Refuse 'its using statements or param block would come after the entry'; return } } \
+     }; \
      $join = [string][char]1; \
      $oldTop = @($old.Ast.EndBlock.Statements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $newTop = @($outside | ForEach-Object { $_.Extent.Text }) -join $join; \
-     if ($oldTop -cne $newTop) { Refuse 'the statements of the profile are not what they were'; return }; \
+     if (-not (Same $oldTop $newTop)) { Refuse 'the statements of the profile are not what they were'; return }; \
      $oldUsing = @($old.Ast.UsingStatements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $newUsing = @($new.Ast.UsingStatements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $oldParam = if ($null -ne $old.Ast.ParamBlock) { $old.Ast.ParamBlock.Extent.Text } else { '' }; \
      $newParam = if ($null -ne $new.Ast.ParamBlock) { $new.Ast.ParamBlock.Extent.Text } else { '' }; \
-     if ($oldUsing -cne $newUsing -or $oldParam -cne $newParam) { Refuse 'its using statements or param block are not what they were'; return }; \
+     if (-not (Same $oldUsing $newUsing) -or -not (Same $oldParam $newParam)) { Refuse 'its using statements or param block are not what they were'; return }; \
      [Console]::Out.Write('kr-verified')"
 );
 
@@ -888,9 +948,7 @@ fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
     })?;
     let said = said.trim();
     if let Some(why) = said.strip_prefix("kr-refused ") {
-        return Err(std::io::Error::other(format!(
-            "this profile cannot take the entry: {why}, so nothing was written"
-        )));
+        return Err(cannot_take_the_entry(why));
     }
     let utf16 = said
         .strip_prefix("kr-placed ")
@@ -918,20 +976,27 @@ fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
 }
 
 /// Returns why an entry would not sit in a profile as whole statements, or nothing when it would.
-fn entry_refused(
-    shell: &Path,
-    old: &str,
-    new: &str,
-    markers: (&str, &str),
-) -> std::io::Result<Option<String>> {
+fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<String>> {
+    let Some(shell) = placement.shell() else {
+        return Ok(None);
+    };
+    if second_mark(old) {
+        return Ok(Some("it begins with a second byte-order mark".to_owned()));
+    }
+    let markers = placement.markers();
+    let order = match placement {
+        Placement::AfterPrologue { .. } => "first",
+        _ => "last",
+    };
     let said = ask_with(
         shell,
         &["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", VERIFY_SCRIPT],
         &[
-            ("KR_PROFILE_OLD", old.trim_start_matches('\u{feff}')),
-            ("KR_PROFILE_NEW", new.trim_start_matches('\u{feff}')),
+            ("KR_PROFILE_OLD", old.strip_prefix('\u{feff}').unwrap_or(old)),
+            ("KR_PROFILE_NEW", new.strip_prefix('\u{feff}').unwrap_or(new)),
             ("KR_BEGIN", markers.0),
             ("KR_END", markers.1),
+            ("KR_ORDER", order),
         ],
         PLACEMENT_DEADLINE,
     )
@@ -1449,9 +1514,20 @@ fn writing() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Returns whether a file holds a KalaReach entry.
+/// Returns whether a file holds the entry that `placement` puts in it.
+///
+/// Each entry is found by its own markers: the entry that opens PowerShell's bridge is not the one
+/// that checks its reader, and a file that holds one holds nothing of the other.
 #[must_use]
-pub fn installed(path: &Path) -> bool {
+pub fn installed(path: &Path, placement: &Placement) -> bool {
+    let (begin, end) = placement.markers();
+    read_or_empty(path).is_ok_and(|contents| strip(&contents, begin, end).is_some())
+}
+
+/// Returns whether a file holds any KalaReach entry, whichever of them it is, for what removes them
+/// all.
+#[must_use]
+pub fn holds_an_entry(path: &Path) -> bool {
     read_or_empty(path).is_ok_and(|contents| {
         strip(&contents, MARKER_BEGIN, MARKER_END).is_some()
             || strip(&contents, CHECK_MARKER_BEGIN, CHECK_MARKER_END).is_some()
@@ -1992,7 +2068,7 @@ mod tests {
         );
         std::fs::write(&path, &theirs).expect("writes");
         assert!(
-            !installed(&path),
+            !holds_an_entry(&path),
             "a file that prints the marker holds no entry"
         );
         assert_eq!(remove(&path).expect("reads"), Change::Absent);
@@ -2013,7 +2089,7 @@ mod tests {
             install(&path, &body, &Placement::End).expect("installs"),
             Change::Added
         );
-        assert!(installed(&path));
+        assert!(holds_an_entry(&path));
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
     }
@@ -2327,7 +2403,7 @@ mod tests {
             install(&path, &body, &Placement::End).expect("installs"),
             Change::Added
         );
-        assert!(installed(&path));
+        assert!(holds_an_entry(&path));
     }
 
     /// KR-REQ-07.23: every shell's entry but PowerShell's opening one is the last thing in the file,
@@ -2713,6 +2789,330 @@ mod tests {
         }
     }
 
+    /// KR-REQ-07.23: a profile whose `using` statements or `param` block end on its last line, with no
+    /// line end after it, is held to the same rule as one with a line end: a statement that shares
+    /// the line is refused, and nothing is written.
+    ///
+    /// The entry goes after the file, so a statement on that line would run before the bridge opens
+    /// and could end the profile before the entry runs at all. Whether anything follows the prologue
+    /// on its line is asked of the parser whatever the file ends with.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_statement_on_the_prologues_last_line_is_refused_when_the_file_has_no_final_line_end() {
+        let root = tempfile::tempdir().expect("a directory");
+        let target = for_shell(ShellKind::PowerShell);
+        let body = recording_entry(root.path());
+        for (name, theirs) in [
+            ("a prompt after param", "param() ; Read-Host 'name'"),
+            (
+                "a prompt after using",
+                "using namespace System; Read-Host 'name'",
+            ),
+            (
+                "a prompt on the line of the second using",
+                "using namespace System\nusing namespace System.IO; Read-Host 'name'",
+            ),
+            ("a return after param", "param(); return"),
+            (
+                "a prompt after a separator that is not a line end",
+                "param()\u{2028}Read-Host 'name'",
+            ),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            std::fs::write(&path, theirs).expect("writes");
+            let refused = install(&path, &body, &target.placement)
+                .expect_err(&format!("{name}: the entry was written"));
+            assert!(
+                refused.to_string().contains("a statement shares the line"),
+                "{name}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}: the profile was touched"
+            );
+        }
+        // The control: nothing but whitespace, a semicolon or a comment after the prologue is the
+        // entry's to follow, and it goes on a line of its own.
+        for (name, theirs) in [
+            ("a comment after param", "param() # note"),
+            ("a semicolon after using", "using namespace System;"),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            std::fs::write(&path, theirs).expect("writes");
+            install(&path, &body, &target.placement)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                format!("{theirs}\n{body}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// KR-REQ-07.23: the check of a profile with the entry in it proves where the entry sits as well
+    /// as that it is whole: the entry that opens the bridge comes before every statement of the
+    /// profile, and the entry that checks the reader after every one.
+    ///
+    /// A check that only found the entry whole would accept an entry put after a statement that runs
+    /// first or before one that has to come first, whatever placed it there.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn the_check_of_a_profile_proves_where_its_entry_sits() {
+        let package = Path::new("/opt/kr/entry");
+        let load = entry(&for_shell(ShellKind::PowerShell), package, false).expect("text");
+        let check = entry(
+            &StartupTarget {
+                placement: at_the_last(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            package,
+            false,
+        )
+        .expect("text");
+        let first = after_the_prologue();
+        let last = at_the_last();
+        for (name, old, new, placement, body, refused) in [
+            (
+                "a prompt before the load entry",
+                "param() ; Read-Host 'name'\n".to_owned(),
+                format!("param() ; Read-Host 'name'\n{load}"),
+                &first,
+                &load,
+                true,
+            ),
+            (
+                "the load entry after every statement",
+                "$x = 1\n".to_owned(),
+                format!("$x = 1\n{load}"),
+                &first,
+                &load,
+                true,
+            ),
+            (
+                "the load entry first",
+                "$x = 1\n".to_owned(),
+                format!("{load}$x = 1\n"),
+                &first,
+                &load,
+                false,
+            ),
+            (
+                "the load entry below the prologue",
+                "using namespace System\n$x = 1\n".to_owned(),
+                format!("using namespace System\n{load}$x = 1\n"),
+                &first,
+                &load,
+                false,
+            ),
+            (
+                "the check entry before a statement",
+                "$x = 1\n".to_owned(),
+                format!("{check}$x = 1\n"),
+                &last,
+                &check,
+                true,
+            ),
+            (
+                "the check entry last",
+                "$x = 1\n".to_owned(),
+                format!("$x = 1\n{check}"),
+                &last,
+                &check,
+                false,
+            ),
+            (
+                "a statement that differs by a character nobody sees",
+                "'ab'\n".to_owned(),
+                format!("{load}'a\u{ad}b'\n"),
+                &first,
+                &load,
+                true,
+            ),
+        ] {
+            let _ = body;
+            let said = entry_refused(old.as_str(), new.as_str(), placement)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                said.is_some(),
+                refused,
+                "{name}: the check said {said:?}\n{new}"
+            );
+            if refused && !name.contains("nobody sees") {
+                assert!(
+                    said.as_deref()
+                        .is_some_and(|why| why.contains("before the entry")
+                            || why.contains("after the entry")),
+                    "{name}: the refusal says which way: {said:?}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-07.23: an entry that would make PowerShell report fewer errors than the profile has is
+    /// refused too: a profile that does not run is not one the entry may start running.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn an_entry_that_would_end_a_parse_error_the_profile_has_is_refused() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let load = entry(&for_shell(ShellKind::PowerShell), package, false).expect("text");
+        let check = entry(
+            &StartupTarget {
+                placement: at_the_last(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            package,
+            false,
+        )
+        .expect("text");
+        let last = at_the_last();
+        let first = after_the_prologue();
+        for (name, theirs, placement, body) in [
+            (
+                "a value the entry would become",
+                "$global:order += 'user'\n$x =\n",
+                &last,
+                &check,
+            ),
+            (
+                "named blocks after an error",
+                "param()\nbegin { 1 }\nend { 2 }\n$global:order += 'tail'\n",
+                &first,
+                &load,
+            ),
+            (
+                "a continuation at the end",
+                "$global:order += 'user' `",
+                &last,
+                &check,
+            ),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            std::fs::write(&path, theirs).expect("writes");
+            let refused = install(&path, body, placement)
+                .expect_err(&format!("{name}: the entry was written"));
+            assert!(
+                refused.to_string().contains("which errors"),
+                "{name}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}: the profile was touched"
+            );
+        }
+    }
+
+    /// KR-REQ-07.23: a profile that begins with two byte-order marks is refused by name, at the start
+    /// of the file and at its end, and left as it was.
+    ///
+    /// The first mark is the file's encoding, and the second would be read as part of the first
+    /// token, so PowerShell already fails on such a file; an entry's offsets would also be one
+    /// character short.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_profile_with_two_byte_order_marks_is_refused_by_name() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let load = entry(&for_shell(ShellKind::PowerShell), package, false).expect("text");
+        let check = entry(
+            &StartupTarget {
+                placement: at_the_last(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            package,
+            false,
+        )
+        .expect("text");
+        let theirs = "\u{feff}\u{feff}param()\n$global:order += 'user'\n";
+        for (name, placement, body) in [
+            ("the start", after_the_prologue(), &load),
+            ("the end", at_the_last(), &check),
+        ] {
+            let path = root.path().join(format!("{name}.ps1"));
+            std::fs::write(&path, theirs).expect("writes");
+            let refused = install(&path, body, &placement)
+                .expect_err(&format!("{name}: the entry was written"));
+            assert!(
+                refused.to_string().contains("second byte-order mark")
+                    && refused.to_string().contains("nothing was written"),
+                "{name}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}: the profile was touched"
+            );
+        }
+    }
+
+    /// KR-REQ-07.23: a profile that is signed and already holds the entry is left alone rather than
+    /// refused: installing again changes nothing, and nothing needs the signature broken.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_signed_profile_that_already_holds_the_entry_is_unchanged() {
+        let root = tempfile::tempdir().expect("a directory");
+        let target = for_shell(ShellKind::PowerShell);
+        let body = entry(&target, Path::new("/opt/kr/entry"), false).expect("text");
+        let path = root.path().join("profile.ps1");
+        std::fs::write(&path, "using namespace System\n$x = 1\n").expect("writes");
+        install(&path, &body, &target.placement).expect("installs");
+        // Signed afterwards, as a policy that requires signatures asks.
+        let mut signed = std::fs::read_to_string(&path).expect("reads");
+        signed.push_str("# SIG # Begin signature block\n# MIIx\n# SIG # End signature block\n");
+        std::fs::write(&path, &signed).expect("writes");
+        assert_eq!(
+            install(&path, &body, &target.placement).expect("nothing to change"),
+            Change::Unchanged
+        );
+        assert_eq!(
+            plan(&path, &body, &target.placement).expect("nothing to change"),
+            Change::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), signed);
+        // The control: another body would change a signed file, which is refused.
+        let other = format!("{MARKER_BEGIN}\nGet-Date\n{MARKER_END}\n");
+        assert!(
+            install(&path, &other, &target.placement)
+                .expect_err("refused")
+                .to_string()
+                .contains("it is signed")
+        );
+    }
+
+    /// KR-REQ-07.23: whether a file holds an entry is asked of the markers of the entry in question:
+    /// the entry that opens the bridge is not the entry that checks the reader.
+    #[test]
+    fn a_file_holds_the_entry_whose_markers_it_has_and_not_the_other() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join("profile.ps1");
+        let load = format!("{MARKER_BEGIN}\nImport-Module x\n{MARKER_END}\n");
+        let check =
+            format!("{CHECK_MARKER_BEGIN}\nConfirm-KalaReachReadLine\n{CHECK_MARKER_END}\n");
+        let first = Placement::AfterPrologue {
+            shell: PathBuf::from("pwsh"),
+        };
+        let last = Placement::Last {
+            shell: PathBuf::from("pwsh"),
+        };
+        std::fs::write(&path, format!("Get-Date\n{load}")).expect("writes");
+        assert!(installed(&path, &first) && installed(&path, &Placement::End));
+        assert!(!installed(&path, &last), "the load entry is not the check");
+        assert!(holds_an_entry(&path));
+        std::fs::write(&path, format!("Get-Date\n{check}")).expect("writes");
+        assert!(installed(&path, &last));
+        assert!(!installed(&path, &first) && !installed(&path, &Placement::End));
+        assert!(holds_an_entry(&path));
+        std::fs::write(&path, "Get-Date\n").expect("writes");
+        assert!(!holds_an_entry(&path));
+    }
+
     /// KR-REQ-07.23: the two PowerShell entries differ by what they do. The one after the prologue
     /// of the first profile loads the module that opens the bridge, and the one at the end of the
     /// last profile asks the module whether the reader it went in front of is still the one the
@@ -2969,7 +3369,7 @@ mod tests {
             std::fs::read_to_string(&path).expect("reads"),
             format!("using namespace System\n{body}")
         );
-        assert!(installed(&path));
+        assert!(holds_an_entry(&path));
     }
 
     /// KR-REQ-07.23: an entry that would make PowerShell report an error the profile did not have
@@ -3207,7 +3607,7 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("reads");
         assert!(after.starts_with(theirs), "the user's own lines are first");
         assert!(after.contains(MARKER_BEGIN) && after.contains(MARKER_END));
-        assert!(installed(&path));
+        assert!(holds_an_entry(&path));
         // A second install is not a second entry.
         assert_eq!(
             install(&path, &body, &Placement::End).expect("installs"),
@@ -3312,7 +3712,7 @@ mod tests {
                 .is_symlink()
         );
         assert!(
-            !installed(&real),
+            !holds_an_entry(&real),
             "and the file it names no longer holds the entry"
         );
     }

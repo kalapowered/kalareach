@@ -17,7 +17,9 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
-use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
+use kr_shell_integration::host::startup::{
+    self, Change, EntryRecord, HomeLayout, RecordError, StartupTarget,
+};
 
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request};
@@ -171,6 +173,11 @@ fn stable_entry(package: &ShellPackage) -> Result<Option<std::path::PathBuf>> {
 /// Reports one package without changing anything.
 #[must_use]
 pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
+    report_targets(package, &layout.targets(package.kind()))
+}
+
+/// Reports one package against the targets it was given, which are the ones an install would use.
+fn report_targets(package: &ShellPackage, targets: &[StartupTarget]) -> ShellReport {
     ShellReport {
         package: Some(PackageReport {
             executable: package.executable().display().to_string(),
@@ -179,7 +186,7 @@ pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
             editor_abi: package.manifest.shell.editor_abi.clone(),
             integration_version: package.manifest.shell.integration_version.clone(),
         }),
-        ..entries_only(package.kind(), layout)
+        ..entries_only(package.kind(), targets)
     }
 }
 
@@ -188,14 +195,13 @@ pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
 /// What is left out is exactly what an installed package answers: which executable a session would
 /// launch and what it was built from. An operation that needs none of that says so rather than
 /// printing a blank where an answer belongs.
-fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
-    let entries = layout
-        .targets(kind)
-        .into_iter()
+fn entries_only(kind: ShellKind, targets: &[StartupTarget]) -> ShellReport {
+    let entries = targets
+        .iter()
         .map(|target| EntryReport {
-            installed: startup::installed(&target.path),
+            installed: startup::installed(&target.path, &target.placement),
             path: target.path.display().to_string(),
-            file: target.path,
+            file: target.path.clone(),
             reason: target.reason,
             change: None,
         })
@@ -226,16 +232,30 @@ pub fn install(
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
+    install_targets(
+        package,
+        &layout.targets(package.kind()),
+        record,
+        nsh_bypass,
+        dry_run,
+    )
+}
+
+/// Installs into the targets it is given: the entry each file gets, the report of it and the record
+/// of it are all made from this one list, so none of them can name a file another does not.
+fn install_targets(
+    package: &ShellPackage,
+    targets: &[StartupTarget],
+    record: &EntryRecord,
+    nsh_bypass: bool,
+    dry_run: bool,
+) -> Result<ShellReport> {
     let package_entry = stable_entry(package)?.unwrap_or_else(|| package.startup_entry());
     // The entry each file gets is the entry for that file: `.profile` is read by shells that are
     // not this one, and its entry says so.
-    let bodies = layout
-        .targets(package.kind())
-        .into_iter()
-        .map(|target| {
-            startup::entry(&target, &package_entry, nsh_bypass)
-                .map(|body| (target.path, body, target.placement))
-        })
+    let bodies = targets
+        .iter()
+        .map(|target| startup::entry(target, &package_entry, nsh_bypass))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|refused| {
             CliError::Usage(shown!(
@@ -243,7 +263,7 @@ pub fn install(
                 Shown::root(&refused.path)
             ))
         })?;
-    let mut reported = report(package, layout);
+    let mut reported = report_targets(package, targets);
     // Held from before the first file is recorded until the last entry is written, so a removal
     // run at the same time waits for the whole install rather than reading the record part way
     // through it. A dry run writes nothing and holds nothing.
@@ -256,9 +276,9 @@ pub fn install(
         // One file can take two entries, as when PowerShell's two profiles are one file, and is
         // recorded once.
         let mut files = Vec::new();
-        for (file, _, _) in &bodies {
-            if !files.contains(file) {
-                files.push(file.clone());
+        for target in targets {
+            if !files.contains(&target.path) {
+                files.push(target.path.clone());
             }
         }
         held.add(package.kind(), &files)
@@ -266,8 +286,9 @@ pub fn install(
         Some(held)
     };
     // The report has one entry for each target, in the order the targets are in, so each is paired
-    // with its own body by position and never by the file: one file can take two entries.
-    for (entry, (_, body, placement)) in reported.entries.iter_mut().zip(&bodies) {
+    // with its own body and placement by position and never by the file: one file can take two
+    // entries.
+    for ((entry, target), body) in reported.entries.iter_mut().zip(targets).zip(&bodies) {
         let io_failure = |error: std::io::Error| {
             CliError::Other(shown!(
                 "{}: {}",
@@ -276,14 +297,14 @@ pub fn install(
             ))
         };
         let change = if dry_run {
-            startup::plan(&entry.file, body, placement).map_err(io_failure)?
+            startup::plan(&entry.file, body, &target.placement).map_err(io_failure)?
         } else {
-            startup::install(&entry.file, body, placement, record).map_err(io_failure)?
+            startup::install(&entry.file, body, &target.placement, record).map_err(io_failure)?
         };
         entry.change = Some(change);
         // A dry run reports what is there; a real one reports what it just wrote.
         entry.installed = if dry_run {
-            startup::installed(&entry.file)
+            startup::installed(&entry.file, &target.placement)
         } else {
             true
         };
@@ -369,7 +390,7 @@ pub fn remove(
             .map_or(RECORDED, |target| target.reason);
         let change = match &held {
             None => {
-                if startup::installed(&file) {
+                if startup::holds_an_entry(&file) {
                     Change::Removed
                 } else {
                     Change::Absent
@@ -385,7 +406,7 @@ pub fn remove(
             }
         };
         entries.push(EntryReport {
-            installed: dry_run && startup::installed(&file),
+            installed: dry_run && startup::holds_an_entry(&file),
             path: file.display().to_string(),
             file,
             reason,
@@ -395,7 +416,7 @@ pub fn remove(
     drop(held);
     for target in targets {
         if !entries.iter().any(|entry| entry.file == target.path)
-            && startup::installed(&target.path)
+            && startup::holds_an_entry(&target.path)
         {
             entries.push(EntryReport {
                 installed: true,
@@ -691,7 +712,7 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(std::fs::read_to_string(&zshrc).expect("reads"), theirs);
-        assert!(!startup::installed(&zshrc));
+        assert!(!startup::holds_an_entry(&zshrc));
         assert!(
             record.files(ShellKind::Zsh).expect("reads").is_empty(),
             "a file whose entry is gone is taken out of the record"
@@ -702,6 +723,80 @@ mod tests {
             shells(Some("ksh")).expect_err("refused"),
             CliError::Usage(_)
         ));
+    }
+
+    /// KR-REQ-07.29: an install writes, reports and records the targets it was given and no others.
+    ///
+    /// Bash reads `.bash_profile` when there is one and `.profile` when there is not, so what a
+    /// layout names can change while an install runs. The entry each file gets, the report and the
+    /// record are made from one list: a second lookup that landed on another file would write one
+    /// file's body into another and record a third.
+    #[test]
+    fn an_install_writes_reports_and_records_the_targets_it_was_given_and_no_others() {
+        use kr_shell_integration::host::package::{
+            PackageManifest, PackageShell, PackageStartupEntry,
+        };
+
+        let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+            powershell: None,
+        };
+        let profile = home.path().join(".bash_profile");
+        let other = home.path().join(".profile");
+        std::fs::write(&profile, "# mine\n").expect("writes");
+        let targets = layout.targets(ShellKind::Bash);
+        assert_eq!(targets.len(), 2, "the interactive file and the login file");
+        assert_eq!(targets[1].path, profile, "bash reads this login file today");
+        // It goes away and another takes its place before the install writes anything.
+        std::fs::remove_file(&profile).expect("removes");
+        std::fs::write(&other, "# another\n").expect("writes");
+        assert_eq!(layout.targets(ShellKind::Bash)[1].path, other);
+
+        let directory = std::path::PathBuf::from("/opt/kr/bash/identity-1");
+        let package = ShellPackage {
+            manifest: PackageManifest {
+                identity: "identity-1".to_owned(),
+                shell: PackageShell {
+                    kind: ShellKind::Bash,
+                    executable: directory.join("bin/bash"),
+                    upstream_version: "5.3".to_owned(),
+                    editor_abi: "readline-8.3".to_owned(),
+                    integration_version: "1".to_owned(),
+                    patches: Vec::new(),
+                    modules: Vec::new(),
+                },
+                startup_entry: PackageStartupEntry {
+                    file: "startup/entry".to_owned(),
+                },
+            },
+            directory,
+        };
+        let reported =
+            install_targets(&package, &targets, &record, false, false).expect("installs");
+        assert_eq!(reported.entries.len(), 2);
+        assert_eq!(
+            reported.entries[1].file, profile,
+            "the report names the target given"
+        );
+        let mut recorded = record.files(ShellKind::Bash).expect("reads");
+        recorded.sort();
+        let mut given = vec![home.path().join(".bashrc"), profile.clone()];
+        given.sort();
+        assert_eq!(recorded, given, "and so does the record");
+        assert!(
+            startup::installed(&profile, &targets[1].placement),
+            "the entry is in the file the report names"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("reads"),
+            "# another\n",
+            "and the file a second lookup would have found is as it was"
+        );
     }
 
     /// KR-REQ-07.29: a package whose entry is not text is refused by name, and no startup file
