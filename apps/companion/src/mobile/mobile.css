@@ -193,19 +193,25 @@
 }
 
 /*
- * With text too large for every label, with the room a tab's padding gives it either side in one
- * row, to sit in a quarter of the bar, the tabs take two rows of two, in the same order, each glyph
- * beside its label as on a short landscape screen. Each column is as wide as its widest tab needs
- * and the rest of the bar is shared out, so a long label gets the room a short one leaves, and what
- * a tab holds is centred in its column, which keeps neighbours apart: every label is whole at the
- * person's own text size.
+ * With text too large for four labels side by side, the tabs take two rows of two, in the same
+ * order, each glyph beside its label as on a short landscape screen. Each column is as wide as its
+ * widest tab needs and the rest of the bar is shared out, so a long label gets the room a short one
+ * leaves, and what a tab holds is centred in its column, which keeps neighbours apart. Where a face
+ * is wide enough that two columns still cut a label, each tab has a row of its own.
  */
-.m-tabbar[data-crowded] {
+.m-tabbar[data-form] {
   grid-auto-flow: row;
+}
+
+.m-tabbar[data-form='pairs'] {
   grid-template-columns: repeat(2, minmax(0, auto));
 }
 
-.m-tabbar[data-crowded] .m-tab {
+.m-tabbar[data-form='column'] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.m-tabbar[data-form] .m-tab {
   grid-auto-flow: column;
   grid-template-columns: auto minmax(0, max-content);
   justify-content: center;
@@ -257,22 +263,22 @@
  * Beside its label, a glyph's badge takes up room in the row: it sits over the glyph's top corner
  * as it does in one row, and a wider count moves the label along rather than covering it.
  */
-.m-tabbar[data-crowded] .m-tab-glyph {
+.m-tabbar[data-form] .m-tab-glyph {
   grid-template-areas: 'glyph';
   place-items: start;
   inline-size: auto;
   min-inline-size: 26px;
 }
 
-.m-tabbar[data-crowded] .m-tab-glyph > * {
+.m-tabbar[data-form] .m-tab-glyph > * {
   grid-area: glyph;
 }
 
-.m-tabbar[data-crowded] .m-tab-glyph > svg {
+.m-tabbar[data-form] .m-tab-glyph > svg {
   margin: 2px;
 }
 
-.m-tabbar[data-crowded] .m-tab-badge {
+.m-tabbar[data-form] .m-tab-badge {
   position: static;
   margin-block-start: calc(15px - 1.7em);
   margin-inline-start: 14px;

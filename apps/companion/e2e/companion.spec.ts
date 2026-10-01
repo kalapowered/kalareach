@@ -1954,6 +1954,29 @@ async function onPhone(page: Page, surface: 'ios' | 'android', seen: Seen, addre
   await page.goto(`/harness.html?surface=${surface}${address}`)
 }
 
+/**
+ * Sets the letters of the tab labels wider by `spacing`, from the page's first frame, as a face wider
+ * than the system's would. Which face a platform's system font is differs from one to the next: a
+ * layout that holds only for the widths of the face it was drawn with does not hold.
+ */
+async function withWiderLetters(page: Page, spacing: string): Promise<void> {
+  await page.addInitScript((extra) => {
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      const style = document.createElement('style')
+      style.textContent = `.m-tab-label { letter-spacing: ${extra}; }`
+      root.append(style)
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  }, spacing)
+}
+
 // KR-REQ-13.19: the tab bar names each destination whole at a person's own text size. With text too
 // large for four labels side by side, the tabs take two rows of two, and no label runs into another
 // or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
@@ -1966,11 +1989,21 @@ test.describe("the phone's tab bar", () => {
     { width: 390, height: 844, scale: '100%' }
   ]
 
+  // The letters as the system sets them, then as a face a quarter wider than the Mac's and as one
+  // wider still would: the widths a label has differ from one platform's system font to the next.
+  const FACES: readonly { readonly name: string; readonly spacing?: string }[] = [
+    { name: '' },
+    { name: ' in a face a quarter wider', spacing: '0.12em' },
+    { name: ' in a face wider still', spacing: '0.24em' }
+  ]
+  const CASES = SIZES.flatMap((seen) => FACES.map((face) => ({ seen, face })))
+
   for (const surface of ['ios', 'android'] as const) {
-    for (const seen of SIZES) {
-      test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+    for (const { seen, face } of CASES) {
+      test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}${face.name}`, async ({
         page
       }) => {
+        if (face.spacing !== undefined) await withWiderLetters(page, face.spacing)
         await onPhone(page, surface, seen)
         const tabs = page.getByRole('navigation', { name: 'Sections' }).getByRole('button')
         await expect(tabs).toHaveCount(4)
@@ -1991,7 +2024,14 @@ test.describe("the phone's tab bar", () => {
                 top: text?.top ?? 0,
                 bottom: text?.bottom ?? 0
               },
-              cut: label === undefined ? Infinity : label.scrollWidth - label.clientWidth
+              cut: label === undefined ? Infinity : label.scrollWidth - label.clientWidth,
+              // The word as typeset, which the label's box holds whole or ends in an ellipsis.
+              word: (() => {
+                if (label === undefined) return Infinity
+                const range = document.createRange()
+                range.selectNodeContents(label)
+                return range.getBoundingClientRect().width
+              })()
             }
           })
         )
@@ -1999,6 +2039,11 @@ test.describe("the phone's tab bar", () => {
         const target = surface === 'ios' ? 44 : 48
         for (const [index, each] of placed.entries()) {
           expect.soft(each.cut, `${each.name} is whole`).toBeLessThanOrEqual(1)
+          expect
+            .soft(each.word, `${each.name} shows its whole word`)
+            .toBeLessThanOrEqual(each.label.right - each.label.left + 0.05)
+          expect.soft(each.tab.left, `${each.name} is inside the screen on the left`).toBeGreaterThanOrEqual(-0.5)
+          expect.soft(each.tab.right, `${each.name} is inside the screen on the right`).toBeLessThanOrEqual(seen.width + 0.5)
           expect.soft(each.label.left, `${each.name} starts inside its tab`).toBeGreaterThanOrEqual(each.tab.left - 0.5)
           expect.soft(each.label.right, `${each.name} ends inside its tab`).toBeLessThanOrEqual(each.tab.right + 0.5)
           expect.soft(each.tab.right - each.tab.left, `${each.name}'s width`).toBeGreaterThanOrEqual(target - 0.5)
@@ -2038,7 +2083,10 @@ test.describe("the phone's tab bar", () => {
           )
         })
         expect.soft(clear, 'the widest badge stays clear of its label').toBe(true)
-        await still(page, `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
+        await still(
+          page,
+          `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}${face.spacing === undefined ? '' : `-wider-${face.spacing}`}`
+        )
       })
     }
   }
