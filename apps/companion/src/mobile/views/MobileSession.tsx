@@ -90,7 +90,7 @@ import { AttachmentPicker } from '../components/picker'
 import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
-import { liftAbove } from '../model/keyboard'
+import { putBack, restOn, type Positions } from '../model/keyboard'
 import { admit, describeBytes, type Picked } from '../model/media'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
@@ -105,6 +105,9 @@ type Pane = 'semantic' | 'terminal'
  * small screen or with a large text size, gets the composer as its line.
  */
 const ROOMY_SESSION_REM = 25
+
+/** How long nothing about the keyboard or the page's pan has changed before the field's place is worked out once more. */
+const SETTLE_MS = 150
 
 /** One node as the phone holds it. */
 interface ReadNode {
@@ -449,9 +452,9 @@ export function MobileSession({
     const root = document.documentElement
     // The keyboard's height the composer's extra lift was worked out for.
     let liftedFor = 0
-    let settling = 0
-    let settleFrame = 0
-    const cover = () => {
+    let settleTimer = 0
+    const moved: Positions = new Map()
+    const cover = (again = true) => {
       const style = getComputedStyle(root)
       const covered = parseFloat(style.getPropertyValue('--keyboard')) || 0
       // What lies under the session is measured in the shell's own terms, from where the session
@@ -464,51 +467,50 @@ export function MobileSession({
       const under = Math.max(0, edge - (element.getBoundingClientRect().bottom + scrolled))
       element.style.setProperty('--under-session', `${under}px`)
       setKeyboardUp(covered > under)
-      // A session too tall for the room above the keyboard scrolls, and the field being typed into
-      // is scrolled to, since the platform's own scroll to it is undone with the shell's pan. What
-      // the areas that hold it cannot scroll by is room the composer lacks under the field: it is
-      // added to the composer's lift, and kept for as long as this keyboard stays the height it is.
-      const typing = document.activeElement
+      // A session too tall for the room above the keyboard scrolls, and the field being typed into is
+      // scrolled to rest on the keyboard's top edge, since the platform's own scroll to it is undone
+      // with the shell's pan. What the areas that hold it cannot scroll by is room the composer lacks
+      // under the field: it is added to the composer's lift, and taken from it again when the field
+      // is higher than it need be. Once the keyboard is gone, what was scrolled is put back.
       if (covered !== liftedFor) {
         liftedFor = covered
         element.style.removeProperty('--lift-more')
+        if (covered === 0) putBack(moved)
       }
-      let acted = false
+      const typing = document.activeElement
       if (covered > 0 && shell !== null && typing instanceof HTMLElement && typing.closest('.m-composer') !== null) {
         let more = parseFloat(element.style.getPropertyValue('--lift-more')) || 0
-        for (let pass = 0; pass < 3; pass += 1) {
-          const short = liftAbove(typing, edge - covered, shell)
-          if (short === 0) break
-          acted = true
-          more += short
+        for (let pass = 0; pass < 4; pass += 1) {
+          const off = restOn(typing, edge - covered, shell, moved)
+          if (Math.abs(off) <= 0.5 || (off < 0 && more === 0)) break
+          more = Math.max(0, more + off)
           element.style.setProperty('--lift-more', `${more}px`)
         }
       }
-      // The layout and the scroll position settle a frame after a change of this kind, so what was
-      // done is looked at once more then, a few times at most.
-      if (!acted) settling = 0
-      else if (settling < 4) {
-        settling += 1
-        settleFrame = requestAnimationFrame(cover)
-      }
+      // A keyboard takes some time to come up, and the platform pans the page and shrinks its
+      // viewport in steps while it does: whatever was worked out in the middle of that is worked out
+      // again once nothing has changed for a moment, so it is the final layout the field rests in.
+      window.clearTimeout(settleTimer)
+      if (again) settleTimer = window.setTimeout(() => cover(false), SETTLE_MS)
       const rem = parseFloat(style.fontSize)
       setShort(element.clientHeight > 0 && rem > 0 && element.clientHeight < ROOMY_SESSION_REM * rem)
     }
     cover()
-    const resized = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(cover)
+    const resized = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => cover())
     resized?.observe(element)
     // The keyboard's measure is written on the document's own style.
-    const written = new MutationObserver(cover)
+    const written = new MutationObserver(() => cover())
     written.observe(root, { attributes: true, attributeFilter: ['style'] })
-    window.addEventListener('resize', cover)
+    const onResize = () => cover()
+    window.addEventListener('resize', onResize)
     // A field that takes the focus while a keyboard is up is lifted as one that was there before it.
-    document.addEventListener('focusin', cover)
+    document.addEventListener('focusin', onResize)
     return () => {
-      cancelAnimationFrame(settleFrame)
+      window.clearTimeout(settleTimer)
       resized?.disconnect()
       written.disconnect()
-      window.removeEventListener('resize', cover)
-      document.removeEventListener('focusin', cover)
+      window.removeEventListener('resize', onResize)
+      document.removeEventListener('focusin', onResize)
     }
   }, [])
 
