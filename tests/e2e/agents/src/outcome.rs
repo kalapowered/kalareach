@@ -105,6 +105,50 @@ pub struct Outcome {
     pub evidence: serde_json::Value,
 }
 
+/// What replaces a string of a result that held one of a login's strings.
+const HELD: &str = "a text that held a string of the login's files, which is not kept";
+
+/// What a result is when nothing of it can be kept.
+const NOT_KEPT: &str = "the part's result held a string of the login's files, so it is not kept";
+
+/// Whether any string or key of `value`, at any depth, is held by `held`.
+fn holds_decoded(value: &serde_json::Value, held: &impl Fn(&str) -> bool) -> bool {
+    match value {
+        serde_json::Value::String(text) => held(text),
+        serde_json::Value::Array(items) => items.iter().any(|item| holds_decoded(item, held)),
+        serde_json::Value::Object(members) => members
+            .iter()
+            .any(|(key, item)| held(key) || holds_decoded(item, held)),
+        _ => false,
+    }
+}
+
+/// Replaces each string and key of `value` that `held` says holds a value by [`HELD`], keys made
+/// distinct by a number so two replaced keys do not become one.
+fn scrub(value: &mut serde_json::Value, held: &impl Fn(&str) -> bool) {
+    match value {
+        serde_json::Value::String(text) => {
+            if held(text) {
+                *text = HELD.to_owned();
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|item| scrub(item, held)),
+        serde_json::Value::Object(members) => {
+            let old = std::mem::take(members);
+            for (index, (key, mut item)) in old.into_iter().enumerate() {
+                scrub(&mut item, held);
+                let key = if held(&key) {
+                    format!("{HELD} ({index})")
+                } else {
+                    key
+                };
+                members.insert(key, item);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Outcome {
     /// The outcome with `failures` added to its evidence's failure codes, each once.
     #[must_use]
@@ -162,30 +206,63 @@ impl Outcome {
         }
     }
 
-    /// Whether the line this outcome would write holds any of `values`, the strings of a login's
-    /// files, which no record may hold.
+    /// Whether this outcome holds any of `values`, the strings of a login's files, which no record
+    /// may hold: in a string or an object's key at any depth, as it is decoded (the line it writes
+    /// escapes quotes, backslashes and line ends, and what is printed of its reason does not), and in
+    /// the line itself.
     #[must_use]
     pub fn mentions(&self, values: &[String]) -> bool {
         let line = serde_json::to_string(self).unwrap_or_default();
-        values
-            .iter()
-            .any(|value| !value.is_empty() && line.contains(value.as_str()))
+        let held = |text: &str| {
+            values
+                .iter()
+                .any(|value| !value.is_empty() && text.contains(value.as_str()))
+        };
+        held(&line)
+            || held(&self.part)
+            || held(&self.test)
+            || held(&self.outcome)
+            || self.reason.as_deref().is_some_and(held)
+            || holds_decoded(&self.evidence, &held)
     }
 
-    /// This outcome, or, where it holds one of `values`, a failure that says so and holds nothing
-    /// of the part's: a text that quotes a screen or a message can quote what a tool printed.
+    /// This outcome, or, where it holds one of `values`, the same outcome with each string that
+    /// holds one replaced by a fixed text, wherever it is (the reason, a key or a value of the
+    /// evidence, at any depth), the stop recorded and the failure's class added: what the part
+    /// observed and the other stops stay, and nothing it printed of what a tool showed. Where what
+    /// is left still holds one (the part's name or a fixed text colliding with a value), a result
+    /// of nothing but the stop.
     #[must_use]
-    pub fn without(self, values: &[String]) -> Self {
+    pub fn without(mut self, values: &[String]) -> Self {
         if !self.mentions(values) {
             return self;
         }
-        Self::failed(
-            &self.part,
-            &self.test,
-            "the part's result held a string of the login's files, so it is not kept",
-            json!({ "stop_agent": true }),
-        )
-        .with_failures(&[Failure::AgentStops("secret_found")])
+        let held = |text: &str| {
+            values
+                .iter()
+                .any(|value| !value.is_empty() && text.contains(value.as_str()))
+        };
+        if self.reason.as_deref().is_some_and(held) {
+            self.reason = Some(HELD.to_owned());
+        }
+        scrub(&mut self.evidence, &held);
+        if !self.evidence.is_object() {
+            self.evidence = json!({});
+        }
+        if let Some(evidence) = self.evidence.as_object_mut() {
+            evidence.insert("stop_agent".to_owned(), json!(true));
+        }
+        let mut kept = self.with_failures(&[Failure::AgentStops("secret_found")]);
+        if kept.mentions(values) {
+            kept = Self {
+                part: "?".to_owned(),
+                test: "?".to_owned(),
+                outcome: "failed".to_owned(),
+                reason: Some(NOT_KEPT.to_owned()),
+                evidence: json!({ "stop_agent": true }),
+            };
+        }
+        kept
     }
 
     /// Appends the line, and says so.
@@ -251,13 +328,17 @@ mod tests {
     }
 
     #[test]
-    fn a_result_that_holds_a_logins_string_is_replaced_by_a_failure_that_holds_none() {
+    fn a_result_that_holds_a_logins_string_loses_that_string_wherever_it_is_and_keeps_the_rest() {
         let secret = "sk-0123456789abcdefghij".to_owned();
         let quoting = Outcome::failed(
             "3",
             "a test",
             &format!("the screen showed {secret} and more"),
-            json!({ "login_held": true, "stop_agent": false }),
+            json!({
+                "login_held": true,
+                "provenance": { "pids": [41, 42], "executed": [{ "command": format!("run {secret}") }] },
+                "failure_codes": [{ "code": "part_failed" }],
+            }),
         );
         assert!(quoting.mentions(std::slice::from_ref(&secret)));
         assert!(!quoting.mentions(&["something else long".to_owned()]));
@@ -266,22 +347,82 @@ mod tests {
         assert_eq!(kept.outcome, "failed");
         assert_eq!(kept.evidence["stop_agent"], true);
         assert_eq!(
-            kept.evidence["failure_codes"],
-            json!([{ "code": "agent_stops", "class": "secret_found" }])
+            kept.evidence["provenance"]["pids"],
+            json!([41, 42]),
+            "what else it observed stays"
         );
-        // In the evidence too, where nothing but a count is meant to be.
-        let in_evidence = Outcome::passed("1", "a test", json!({ "note": secret.clone() }));
         assert_eq!(
-            in_evidence.without(std::slice::from_ref(&secret)).outcome,
-            "failed"
+            kept.evidence["failure_codes"],
+            json!([{ "code": "part_failed" }, { "code": "agent_stops", "class": "secret_found" }]),
+            "the codes it had stay, and the stop is added"
+        );
+        assert_eq!(kept.reason.as_deref(), Some(HELD));
+        // In a key, and in the evidence of a part that passed.
+        let in_key = Outcome::passed("1", "a test", json!({ secret.clone(): 1, "b": 2 }));
+        let kept = in_key.without(std::slice::from_ref(&secret));
+        assert!(!kept.mentions(std::slice::from_ref(&secret)));
+        assert_eq!(kept.evidence["b"], 2);
+        assert_eq!(
+            kept.outcome, "passed",
+            "a passed part keeps its outcome; the stop is what is recorded"
         );
         // A part that holds none is returned as it was.
         let clean = Outcome::passed("1", "a test", json!({ "a": 1 }));
         assert_eq!(
-            clean.clone().without(std::slice::from_ref(&secret)).outcome,
-            "passed"
+            clean
+                .clone()
+                .without(std::slice::from_ref(&secret))
+                .evidence,
+            json!({ "a": 1 })
         );
         assert_eq!(clean.without(&[]).evidence, json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn a_value_with_a_quote_a_backslash_or_a_line_end_is_found_as_it_is_decoded() {
+        // The line a result writes escapes these, so the raw value is not in it.
+        for secret in [
+            "abc\"def-0123456789",
+            "abc\\def-0123456789",
+            "abc\ndef-0123456789xyz",
+        ] {
+            let outcome = Outcome::failed(
+                "3",
+                "a test",
+                &format!("the screen showed {secret} and more"),
+                json!({ "note": format!("left {secret}") }),
+            );
+            let line = serde_json::to_string(&outcome).expect("JSON");
+            assert!(!line.contains(secret), "the line escapes it: {line}");
+            let values = [secret.to_owned()];
+            assert!(outcome.mentions(&values), "{secret:?}");
+            let kept = outcome.without(&values);
+            assert!(!kept.mentions(&values), "{secret:?}");
+            assert!(
+                kept.reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.contains(secret))
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_collides_with_a_fixed_text_leaves_a_result_of_nothing_but_the_stop() {
+        // A value that is the part's name or the replacement's own text cannot be removed from them.
+        let colliding = HELD.to_owned();
+        let outcome = Outcome::failed(
+            "3",
+            "a test",
+            &format!("x {colliding} y"),
+            json!({ "a": 1 }),
+        );
+        let kept = outcome.without(std::slice::from_ref(&colliding));
+        assert!(!kept.mentions(std::slice::from_ref(&colliding)));
+        assert_eq!(kept.evidence, json!({ "stop_agent": true }));
+        let named = Outcome::failed(&"p".repeat(20), "a test", "why", json!({}));
+        let kept = named.without(&["p".repeat(20)]);
+        assert!(!kept.mentions(&["p".repeat(20)]));
+        assert_eq!(kept.reason.as_deref(), Some(NOT_KEPT));
     }
 
     #[test]
