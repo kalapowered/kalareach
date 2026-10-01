@@ -814,25 +814,10 @@ impl NativeBridges {
                 sources.push((destination.to_string(), bytes));
             }
         }
-        // A configuration key is added only where this host names it for the application, with
-        // the one value that enables what the release installed: no key a bridge adds can hold a
-        // command, so none is left unread. Everything a file installs is read below.
-        for step in &recipe.install {
-            if let BridgeStep::AddConfigurationKey { file, key, value } = step
-                && !configuration_key_permitted(
-                    recipe.application.as_str(),
-                    file.as_str(),
-                    key,
-                    value,
-                )
-            {
-                return Err(format!(
-                    "the recipe adds the key {key} to {file}, which this host does not permit a \
-                     native bridge for {} to add",
-                    recipe.application
-                ));
-            }
-        }
+        // What a recipe may place is a closed set this host names for the application: the
+        // registration files in one directory of the application's own, and the one key that
+        // enables them. Nothing else a bridge adds can hold a command, so none is left unread.
+        permitted(recipe)?;
         let registered = sources.clone();
         let facts = registration(&registered, &forwarder)?;
         // The forwarder a registration starts reports for the application it names, and a
@@ -2381,28 +2366,110 @@ fn invocations(
 /// of entry it is, its name, the command, its arguments and its time limit.
 const COMMAND_MEMBERS: [&str; 5] = ["type", "name", "command", "args", "timeout"];
 
-/// Whether a native bridge for `application` may add `key` to `file` with `value`: a closed table.
+/// What a native bridge for an application may place, as a closed table this host names.
 ///
-/// Claude Code's `enabledPlugins.<name>` in `settings.json`, set to `true`, which enables the
-/// registration files the release installed. Any other key, in any other document or with any
-/// other value, is not on the list, and an application that is not on it may add none. A key that
-/// makes an application run a program (a status line, an API key helper, a credential refresh, a
-/// hook, an MCP server) is therefore never added, whatever the recipe says.
-fn configuration_key_permitted(application: &str, file: &str, key: &str, value: &str) -> bool {
-    match application {
-        "Claude Code" => {
-            file == "settings.json"
-                && serde_json::from_str::<serde_json::Value>(value)
-                    .is_ok_and(|value| value == serde_json::Value::Bool(true))
-                && key.strip_prefix("enabledPlugins.").is_some_and(|name| {
-                    !name.is_empty()
-                        && name.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'@')
-                        })
-                })
-        }
-        _ => false,
+/// A bridge installs exactly the registration files its application reads from one directory of
+/// its own, `<root>/<name>/<tail>` for each tail the table lists, and may add the one configuration
+/// key that enables them where the application has one, `enabledPlugins.<name>@skills-dir` set to
+/// `true` in `settings.json`, for the same `<name>`. A destination or a key that is not on the
+/// table is refused, so a bridge never writes a document an application reads its own settings or
+/// helper commands from, never enables a plugin its recipe did not install, and no value it adds
+/// can hold a command. A name in another case is another name here: it is refused.
+fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
+    struct Layout {
+        root: &'static str,
+        tails: &'static [&'static str],
+        enabling: Option<(&'static str, &'static str, &'static str)>,
     }
+    let layout = match recipe.application.as_str() {
+        "Claude Code" => Layout {
+            root: "skills",
+            tails: &[
+                ".claude-plugin/plugin.json",
+                ".mcp.json",
+                "hooks/hooks.json",
+            ],
+            enabling: Some(("settings.json", "enabledPlugins.", "@skills-dir")),
+        },
+        "Gemini CLI" => Layout {
+            root: "extensions",
+            tails: &[
+                ".gemini-extension-install.json",
+                "gemini-extension.json",
+                "hooks/hooks.json",
+            ],
+            enabling: None,
+        },
+        other => {
+            return Err(format!(
+                "this host does not name what a native bridge for {other} may place"
+            ));
+        }
+    };
+    let application = &recipe.application;
+    let mut name: Option<&str> = None;
+    // The files first, whatever order the recipe lists its steps in: the key is held to the
+    // directory they are in.
+    for step in &recipe.install {
+        if let BridgeStep::InstallFile { destination, .. } = step {
+            {
+                let destination = destination.as_str();
+                let placed = destination
+                    .strip_prefix(layout.root)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .and_then(|rest| rest.split_once('/'))
+                    .filter(|(directory, tail)| {
+                        plain_name(directory) && layout.tails.contains(tail)
+                    });
+                let Some((directory, _)) = placed else {
+                    return Err(format!(
+                        "the recipe installs {destination}, which this host does not permit a \
+                         native bridge for {application} to install: it installs {}/<name>/ with \
+                         {} and nothing else",
+                        layout.root,
+                        layout.tails.join(", ")
+                    ));
+                };
+                if name.is_some_and(|first| first != directory) {
+                    return Err(format!(
+                        "the recipe installs into more than one directory under {}/, which this \
+                         host does not permit a native bridge for {application} to do",
+                        layout.root
+                    ));
+                }
+                name = Some(directory);
+            }
+        }
+    }
+    for step in &recipe.install {
+        if let BridgeStep::AddConfigurationKey { file, key, value } = step {
+            let enabled = layout.enabling.is_some_and(|(document, prefix, suffix)| {
+                file.as_str() == document
+                    && value == "true"
+                    && key
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .is_some_and(|enabled| plain_name(enabled) && Some(enabled) == name)
+            });
+            if !enabled {
+                return Err(format!(
+                    "the recipe adds the key {key} to {file}, which this host does not permit a \
+                     native bridge for {application} to add: it adds only the key that enables \
+                     the registration it installs, set to true"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for a name of ASCII letters, digits, hyphens and underscores, which is one path component
+/// and one key member as it is written.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// True for a word of lower-case letters, digits and hyphens, which a shell reads as itself.
