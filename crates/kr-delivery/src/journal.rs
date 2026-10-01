@@ -4527,16 +4527,24 @@ mod tests {
             .configure_destination(&phone())
             .expect("a destination");
         assert_eq!(journal.lifted_at_ms().expect("a read"), 0);
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
         journal.fence(1).expect("a fence");
         journal
             .take_private(
                 &consumer(),
                 &private_entry(2, 1, Some(alert_request(2))),
-                1,
+                2,
                 1,
             )
             .expect("an alert");
         journal.lift_fence(2).expect("a lift");
+        assert_eq!(
+            journal.pending_count().expect("a count"),
+            0,
+            "an event taken before the fence and never produced from is decided by the lift"
+        );
         assert_eq!(
             journal.standing().expect("a read"),
             PrivacyStanding {
