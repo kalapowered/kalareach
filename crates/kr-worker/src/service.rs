@@ -1277,9 +1277,11 @@ impl WorkerService {
                 // A connection has one delivery writing at a time. The one this subscription
                 // replaces stops between two frames: a frame it has begun is finished, because one
                 // cut part way would end the connection, and it begins no other, except the
-                // keepalive that completes a closure notice it has already written. The new one
-                // begins its first frame only once the old one has stopped, so the peer is sent
-                // the old stream's last frame whole and then the new stream.
+                // keepalive that completes a closure notice it has already written and the side
+                // effects still queued on its stream, each written whole, which a screen drawn
+                // afresh does not carry. The new one begins its first frame only once the old one
+                // has stopped, so the peer is sent the old stream's last frame whole and then the
+                // new stream.
                 #[cfg(feature = "testing")]
                 let watched = if state.delivery.is_some() {
                     self.wait_before_replacing_delivery().await
@@ -1312,6 +1314,7 @@ impl WorkerService {
                 };
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
+                let runtime = Arc::clone(&self.runtime);
                 let task = tokio::spawn(async move {
                     // Nothing before this line touches the connection. A permit that never arrives
                     // means the registration was withdrawn while this task was being created.
@@ -1329,222 +1332,237 @@ impl WorkerService {
                     // bell, a query whose answer would arrive at the wrong moment — into a terminal
                     // that was not there when any of it happened.
                     let live_from = restoration.as_ref().map_or(0, |joined| joined.cursor);
-                    if let Some(joined) = restoration {
-                        if let Some(gap) = joined.gap.as_ref()
-                            && let Some(notification) =
-                                notification(&stream_id, sequence, "session.gap", gap)
-                        {
-                            sequence += 1;
-                            if !outlet.write(&notification).await {
-                                return;
+                    // Every way out of this block but the stream's own end (a detachment or the
+                    // closure, which are the last things it carries) is followed by what is still
+                    // owed to the terminal from the stream: see `settle_effects`.
+                    'delivery: {
+                        if let Some(joined) = restoration {
+                            if let Some(gap) = joined.gap.as_ref()
+                                && let Some(notification) =
+                                    notification(&stream_id, sequence, "session.gap", gap)
+                            {
+                                sequence += 1;
+                                if !outlet.write(&notification).await {
+                                    break 'delivery;
+                                }
+                            }
+                            if !send_screen(
+                                &mut outlet,
+                                &stream_id,
+                                &mut sequence,
+                                joined.cursor,
+                                &joined.bytes,
+                            )
+                            .await
+                            {
+                                break 'delivery;
                             }
                         }
-                        if !send_screen(
-                            &mut outlet,
-                            &stream_id,
-                            &mut sequence,
-                            joined.cursor,
-                            &joined.bytes,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                    loop {
-                        // Waiting for the next delivery is between two frames too, and a replaced
-                        // delivery stops there rather than keeping its successor waiting.
-                        let delivery = tokio::select! {
-                            biased;
-                            _ = &mut outlet.replaced => {
-                                // A side effect already queued on this stream is owed to the
-                                // terminal whatever stream comes next: the one that replaces
-                                // this begins only once this has stopped, so the effect is
-                                // written first and nothing of it is lost with the queue.
-                                send_queued_effects(
-                                    &mut outlet,
-                                    &stream_id,
-                                    &mut sequence,
-                                    &mut stream,
-                                )
-                                .await;
+                        loop {
+                            // Waiting for the next delivery is between two frames too, and a replaced
+                            // delivery stops there rather than keeping its successor waiting.
+                            let delivery = tokio::select! {
+                                biased;
+                                _ = &mut outlet.replaced => break,
+                                delivery = stream.recv() => match delivery {
+                                    Some(delivery) => delivery,
+                                    None => break,
+                                },
+                            };
+                            let delivered = delivery.len();
+                            let written = match delivery {
+                                OutputDelivery::Bytes { cursor, bytes } => {
+                                    // Anything the screen already covered is dropped here rather than
+                                    // sent again; a batch that straddles the boundary is trimmed to
+                                    // the part that follows it.
+                                    let end = cursor + bytes.len() as u64;
+                                    if end <= live_from {
+                                        stream.written(delivered);
+                                        continue;
+                                    }
+                                    let skip = usize::try_from(live_from.saturating_sub(cursor))
+                                        .unwrap_or(0)
+                                        .min(bytes.len());
+                                    send_stream(
+                                        &mut outlet,
+                                        &stream_id,
+                                        &mut sequence,
+                                        cursor + skip as u64,
+                                        &bytes[skip..],
+                                    )
+                                    .await
+                                }
+                                // A side effect is not a span of the stream, so the cut above is not
+                                // for it: whatever the screen this attachment joined on covers, an
+                                // effect the application caused after the attachment arrived is owed
+                                // to it whole.
+                                OutputDelivery::Effect(owed) => {
+                                    send_effect(
+                                        &mut outlet,
+                                        &stream_id,
+                                        &mut sequence,
+                                        owed.effect.at,
+                                        &owed.bytes,
+                                    )
+                                    .await
+                                }
+                                // A rendering is one screen at one cursor, however many frames it
+                                // takes: its cursor is the state it describes rather than an offset,
+                                // so the parts do not carry advancing cursors of their own.
+                                OutputDelivery::Screen { cursor, bytes } => {
+                                    send_screen(
+                                        &mut outlet,
+                                        &stream_id,
+                                        &mut sequence,
+                                        cursor,
+                                        &bytes,
+                                    )
+                                    .await
+                                }
+                                // A projection event is state, not a span of the stream: its cursor
+                                // says which screen it describes and the client applies it to the one
+                                // it holds. The event names the type it is published under, so there
+                                // is one place that decides that rather than one per variant.
+                                OutputDelivery::Projection { event, .. } => {
+                                    let event_type = event.event_type();
+                                    let frame = match event.as_ref() {
+                                        ProjectionEvent::Reset(reset) => {
+                                            notification(&stream_id, sequence, event_type, reset)
+                                        }
+                                        ProjectionEvent::Snapshot(header) => {
+                                            notification(&stream_id, sequence, event_type, header)
+                                        }
+                                        ProjectionEvent::Rows(page) => {
+                                            notification(&stream_id, sequence, event_type, page)
+                                        }
+                                        ProjectionEvent::Delta(delta) => {
+                                            notification(&stream_id, sequence, event_type, delta)
+                                        }
+                                    };
+                                    let Some(frame) = frame else {
+                                        continue;
+                                    };
+                                    sequence += 1;
+                                    outlet.write(&frame).await
+                                }
+                                // An attachment event about this attachment's own input. It carries
+                                // no output, so it neither advances the output stream nor waits behind
+                                // one: the fence the client's keystrokes waited for is not a question
+                                // about the screen.
+                                // A resolution of this session's agent.
+                                OutputDelivery::AgentResource { event, .. } => {
+                                    let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        kr_protocol::projection::AGENT_RESOURCE_EVENT,
+                                        &*event,
+                                    ) else {
+                                        continue;
+                                    };
+                                    sequence += 1;
+                                    outlet.write(&notification).await
+                                }
+                                // An announcement about one of this session's agent instances.
+                                OutputDelivery::AgentInstance { event, .. } => {
+                                    let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        kr_protocol::projection::AGENT_INSTANCE_EVENT,
+                                        &*event,
+                                    ) else {
+                                        continue;
+                                    };
+                                    sequence += 1;
+                                    outlet.write(&notification).await
+                                }
+                                OutputDelivery::EditorBusy(event) => {
+                                    let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        kr_protocol::root::EDITOR_BUSY_EVENT,
+                                        &*event,
+                                    ) else {
+                                        continue;
+                                    };
+                                    sequence += 1;
+                                    outlet.write(&notification).await
+                                }
+                                OutputDelivery::Resync(marker) => {
+                                    let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        "session.resync",
+                                        &marker,
+                                    ) else {
+                                        continue;
+                                    };
+                                    sequence += 1;
+                                    outlet.write(&notification).await
+                                }
+                                OutputDelivery::Detached => {
+                                    // The attachment has ended. The client is told so it can put its
+                                    // terminal back, rather than waiting for output that is not coming.
+                                    if let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        "session.detached",
+                                        &kr_protocol::attachment::SessionDetachParams {
+                                            attachment_id: Nullable::some(attachment_id),
+                                            line_token: Nullable::null(),
+                                        },
+                                    ) {
+                                        let _ = outlet.write(&notification).await;
+                                    }
+                                    return;
+                                }
+                                OutputDelivery::Closed(notice) => {
+                                    // The session has closed. How it ended is the last thing its
+                                    // attachment is sent, after every byte it was owed, so the client
+                                    // ends knowing why rather than finding a connection that stopped.
+                                    // The notice is released once the connection has it or never
+                                    // will, and that is what the worker waits for before it exits.
+                                    if let Some(notification) = notification(
+                                        &stream_id,
+                                        sequence,
+                                        kr_protocol::session::SESSION_CLOSED_EVENT,
+                                        notice.record(),
+                                    ) && outlet.write(&notification).await
+                                    {
+                                        // A frame written is not always a frame the connection has
+                                        // taken. A pipe finishes a write in the background, a process
+                                        // that exits first loses it, and the pipe takes no further
+                                        // frame until it has finished. So a keepalive, which every
+                                        // client already ignores, follows the notice, and its being
+                                        // taken is what shows the notice was. A socket takes a write
+                                        // when it is made, and there this costs one small frame. It is
+                                        // part of delivering the notice, so a replacement that arrives
+                                        // in between does not stop it.
+                                        let _ = outlet
+                                            .write_even_if_replaced(&ControlFrame::Event(
+                                                ControlEvent::Keepalive,
+                                            ))
+                                            .await;
+                                    }
+                                    drop(notice);
+                                    return;
+                                }
+                            };
+                            if !written {
                                 break;
                             }
-                            delivery = stream.recv() => match delivery {
-                                Some(delivery) => delivery,
-                                None => break,
-                            },
-                        };
-                        let delivered = delivery.len();
-                        let written = match delivery {
-                            OutputDelivery::Bytes { cursor, bytes } => {
-                                // Anything the screen already covered is dropped here rather than
-                                // sent again; a batch that straddles the boundary is trimmed to
-                                // the part that follows it.
-                                let end = cursor + bytes.len() as u64;
-                                if end <= live_from {
-                                    stream.written(delivered);
-                                    continue;
-                                }
-                                let skip = usize::try_from(live_from.saturating_sub(cursor))
-                                    .unwrap_or(0)
-                                    .min(bytes.len());
-                                send_stream(
-                                    &mut outlet,
-                                    &stream_id,
-                                    &mut sequence,
-                                    cursor + skip as u64,
-                                    &bytes[skip..],
-                                )
-                                .await
-                            }
-                            // A side effect is not a span of the stream, so the cut above is not
-                            // for it: whatever the screen this attachment joined on covers, an
-                            // effect the application caused after the attachment arrived is owed
-                            // to it whole.
-                            OutputDelivery::Effect { cursor, bytes } => {
-                                send_effect(&mut outlet, &stream_id, &mut sequence, cursor, &bytes)
-                                    .await
-                            }
-                            // A rendering is one screen at one cursor, however many frames it
-                            // takes: its cursor is the state it describes rather than an offset,
-                            // so the parts do not carry advancing cursors of their own.
-                            OutputDelivery::Screen { cursor, bytes } => {
-                                send_screen(&mut outlet, &stream_id, &mut sequence, cursor, &bytes)
-                                    .await
-                            }
-                            // A projection event is state, not a span of the stream: its cursor
-                            // says which screen it describes and the client applies it to the one
-                            // it holds. The event names the type it is published under, so there
-                            // is one place that decides that rather than one per variant.
-                            OutputDelivery::Projection { event, .. } => {
-                                let event_type = event.event_type();
-                                let frame = match event.as_ref() {
-                                    ProjectionEvent::Reset(reset) => {
-                                        notification(&stream_id, sequence, event_type, reset)
-                                    }
-                                    ProjectionEvent::Snapshot(header) => {
-                                        notification(&stream_id, sequence, event_type, header)
-                                    }
-                                    ProjectionEvent::Rows(page) => {
-                                        notification(&stream_id, sequence, event_type, page)
-                                    }
-                                    ProjectionEvent::Delta(delta) => {
-                                        notification(&stream_id, sequence, event_type, delta)
-                                    }
-                                };
-                                let Some(frame) = frame else {
-                                    continue;
-                                };
-                                sequence += 1;
-                                outlet.write(&frame).await
-                            }
-                            // An attachment event about this attachment's own input. It carries
-                            // no output, so it neither advances the output stream nor waits behind
-                            // one: the fence the client's keystrokes waited for is not a question
-                            // about the screen.
-                            // A resolution of this session's agent.
-                            OutputDelivery::AgentResource { event, .. } => {
-                                let Some(notification) = notification(
-                                    &stream_id,
-                                    sequence,
-                                    kr_protocol::projection::AGENT_RESOURCE_EVENT,
-                                    &*event,
-                                ) else {
-                                    continue;
-                                };
-                                sequence += 1;
-                                outlet.write(&notification).await
-                            }
-                            // An announcement about one of this session's agent instances.
-                            OutputDelivery::AgentInstance { event, .. } => {
-                                let Some(notification) = notification(
-                                    &stream_id,
-                                    sequence,
-                                    kr_protocol::projection::AGENT_INSTANCE_EVENT,
-                                    &*event,
-                                ) else {
-                                    continue;
-                                };
-                                sequence += 1;
-                                outlet.write(&notification).await
-                            }
-                            OutputDelivery::EditorBusy(event) => {
-                                let Some(notification) = notification(
-                                    &stream_id,
-                                    sequence,
-                                    kr_protocol::root::EDITOR_BUSY_EVENT,
-                                    &*event,
-                                ) else {
-                                    continue;
-                                };
-                                sequence += 1;
-                                outlet.write(&notification).await
-                            }
-                            OutputDelivery::Resync(marker) => {
-                                let Some(notification) =
-                                    notification(&stream_id, sequence, "session.resync", &marker)
-                                else {
-                                    continue;
-                                };
-                                sequence += 1;
-                                outlet.write(&notification).await
-                            }
-                            OutputDelivery::Detached => {
-                                // The attachment has ended. The client is told so it can put its
-                                // terminal back, rather than waiting for output that is not coming.
-                                if let Some(notification) = notification(
-                                    &stream_id,
-                                    sequence,
-                                    "session.detached",
-                                    &kr_protocol::attachment::SessionDetachParams {
-                                        attachment_id: Nullable::some(attachment_id),
-                                        line_token: Nullable::null(),
-                                    },
-                                ) {
-                                    let _ = outlet.write(&notification).await;
-                                }
-                                return;
-                            }
-                            OutputDelivery::Closed(notice) => {
-                                // The session has closed. How it ended is the last thing its
-                                // attachment is sent, after every byte it was owed, so the client
-                                // ends knowing why rather than finding a connection that stopped.
-                                // The notice is released once the connection has it or never
-                                // will, and that is what the worker waits for before it exits.
-                                if let Some(notification) = notification(
-                                    &stream_id,
-                                    sequence,
-                                    kr_protocol::session::SESSION_CLOSED_EVENT,
-                                    notice.record(),
-                                ) && outlet.write(&notification).await
-                                {
-                                    // A frame written is not always a frame the connection has
-                                    // taken. A pipe finishes a write in the background, a process
-                                    // that exits first loses it, and the pipe takes no further
-                                    // frame until it has finished. So a keepalive, which every
-                                    // client already ignores, follows the notice, and its being
-                                    // taken is what shows the notice was. A socket takes a write
-                                    // when it is made, and there this costs one small frame. It is
-                                    // part of delivering the notice, so a replacement that arrives
-                                    // in between does not stop it.
-                                    let _ = outlet
-                                        .write_even_if_replaced(&ControlFrame::Event(
-                                            ControlEvent::Keepalive,
-                                        ))
-                                        .await;
-                                }
-                                drop(notice);
-                                return;
-                            }
-                        };
-                        if !written {
-                            break;
+                            // Released only now. Until the bytes have reached the peer they are still
+                            // queued for it, which is what the bound is about.
+                            stream.written(delivered);
                         }
-                        // Released only now. Until the bytes have reached the peer they are still
-                        // queued for it, which is what the bound is about.
-                        stream.written(delivered);
                     }
+                    settle_effects(
+                        &mut outlet,
+                        &stream_id,
+                        &mut sequence,
+                        &mut stream,
+                        &runtime,
+                    )
+                    .await;
                     let _ = attachment_id;
                 });
                 // The registry holds the handle too, so a withdrawal can stop the delivery without
@@ -6923,7 +6941,8 @@ impl Delivery {
     /// The word goes out under the connection's writer, which is where the task decides whether to
     /// begin its next frame: it either sees the replacement and begins nothing more, or had already
     /// begun and finishes that frame. A closure notice it has written is still followed by the
-    /// keepalive that completes it.
+    /// keepalive that completes it, and the side effects still queued on its stream are written
+    /// after it, each whole (see `settle_effects`).
     fn replace(self, writer: &Mutex<kr_ipc::framed::FrameWriter>) -> Predecessor {
         {
             let _boundary = writer
@@ -7349,7 +7368,8 @@ impl Outlet {
     }
 
     /// Writes one frame that belongs with the frame this delivery wrote last, whether or not the
-    /// delivery has been replaced since. A withdrawal still stops it.
+    /// delivery has been replaced since: the keepalive that completes a closure notice, and each
+    /// frame of a side effect after its first. A withdrawal still stops it.
     async fn write_even_if_replaced(&self, frame: &ControlFrame) -> bool {
         write_frame(&self.writable, &self.writer, frame, &self.withdrawn, true).await
     }
@@ -7422,21 +7442,40 @@ async fn send_effect(
     true
 }
 
-/// Writes the side effects a replaced stream still has queued, in the order they were queued.
+/// Settles every side effect still queued on a stream whose delivery is ending.
 ///
-/// Everything else on that stream describes the screen the replacement is about to draw again.
-async fn send_queued_effects(
+/// A delivery ends because its stream's producer has gone, because the connection or its authority
+/// has, or because a newer subscription replaced it. What is still on the stream was owed to the
+/// terminal when it was queued, and the replacement that ends the delivery draws the screen again
+/// but cannot give an effect back: a bell is on no screen. So the stream is closed, which refuses
+/// anything published to it from here, and what it holds is written in the order it was queued,
+/// each effect whole, until one cannot be written. That one and everything after it are recorded as
+/// host events, as is everything when nothing has been written on this stream yet: its first frame
+/// is the one a client takes for the beginning of a new stream, and an effect is not that. A
+/// delivery that is stopped where it stands, by a withdrawal or the end of its connection, does not
+/// run this.
+async fn settle_effects(
     outlet: &mut Outlet,
     stream_id: &StreamId,
     sequence: &mut u64,
     stream: &mut crate::output::OutputStream,
+    runtime: &crate::runtime::SessionRuntime,
 ) {
+    stream.close();
+    let mut writing = *sequence > 0;
+    let mut abandoned: Vec<Arc<kr_term::sideeffect::SideEffect>> = Vec::new();
     while let Some(delivery) = stream.try_recv() {
-        if let OutputDelivery::Effect { cursor, bytes } = delivery
-            && !send_effect(outlet, stream_id, sequence, cursor, &bytes).await
-        {
-            return;
+        let OutputDelivery::Effect(owed) = delivery else {
+            continue;
+        };
+        if writing && send_effect(outlet, stream_id, sequence, owed.effect.at, &owed.bytes).await {
+            continue;
         }
+        writing = false;
+        abandoned.push(owed.effect);
+    }
+    if !abandoned.is_empty() {
+        runtime.session().record_abandoned_effects(&mut abandoned);
     }
 }
 

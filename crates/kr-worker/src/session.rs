@@ -134,7 +134,7 @@ enum Piece {
 impl Piece {
     /// Where this piece sorts: by the cursor it began at, and a span before an effect at the same
     /// cursor.
-    const fn order(&self) -> (u64, bool) {
+    fn order(&self) -> (u64, bool) {
         match self {
             Self::Span(cursor, _) => (*cursor, false),
             Self::Effect(owed) => (owed.effect.at, true),
@@ -3185,13 +3185,58 @@ impl Session {
         false
     }
 
-    /// Records a side effect as a durable host event.
+    /// Records side effects as durable host events, in one transaction and in the order they began.
     ///
-    /// What is kept is what the effect asked for and where in the stream it happened. A journal that
-    /// cannot take it has faulted, and says so to everything that reads the journal's condition.
-    fn record_host_event(&mut self, effect: &SideEffect) {
+    /// What is kept is what each effect asked for and where in the stream it happened. A journal
+    /// that cannot take them has faulted, and says so to everything that reads the journal's
+    /// condition.
+    fn record_host_events(&mut self, effects: &mut [Arc<SideEffect>]) {
+        effects.sort_by_key(|effect| effect.at);
         if let Some(journal) = self.journal.as_mut() {
-            let _ = journal.record_host_event(effect, kr_ipc::now_ms());
+            let _ = journal.record_host_events(effects.iter().map(AsRef::as_ref), kr_ipc::now_ms());
+        }
+    }
+
+    /// Records the side effects a delivery was owed and could not write, as durable host events.
+    ///
+    /// A subscription that another replaces writes the effects queued on it first. The ones it
+    /// cannot write, because its connection has gone or because it never wrote anything the client
+    /// could tell it apart by, are what this takes: each is a host event rather than something lost.
+    pub fn record_abandoned_effects(&mut self, effects: &mut [Arc<SideEffect>]) {
+        self.record_host_events(effects);
+    }
+
+    /// Delivers one side effect to the attachment it was routed to, or leaves it to be recorded.
+    ///
+    /// The destination is the attachment that held the input lease, at the epoch it held it, when
+    /// the application caused the effect, and it is the destination only while it still does: the
+    /// lease can end between the engine routing an effect and this delivering it, and an effect is
+    /// never handed to whoever holds the lease next. An effect with no destination left, or one the
+    /// destination's stream has no room for or is not taking, is added to `unrecorded`, so nothing
+    /// the application asked for leaves the session unrecorded. A queue with no room also tells the
+    /// attachment to begin again, and it is one of the attachments this returns.
+    fn deliver_effect(
+        &mut self,
+        owed: &OwedEffect,
+        oldest: u64,
+        resynchronised: &mut Vec<AttachmentId>,
+        unrecorded: &mut Vec<Arc<SideEffect>>,
+    ) {
+        let SideEffectDestination::Attachment { id, epoch } = owed.effect.destination else {
+            unrecorded.push(Arc::clone(&owed.effect));
+            return;
+        };
+        if self.lease.holder() != Some(id) || self.lease.epoch() != epoch.get() {
+            unrecorded.push(Arc::clone(&owed.effect));
+            return;
+        }
+        match self.hub.publish_effect(id, owed, oldest) {
+            EffectOutcome::Queued => {}
+            EffectOutcome::Overflowed => {
+                resynchronised.push(id);
+                unrecorded.push(Arc::clone(&owed.effect));
+            }
+            EffectOutcome::Refused => unrecorded.push(Arc::clone(&owed.effect)),
         }
     }
 
@@ -3209,6 +3254,7 @@ impl Session {
         oldest: u64,
         effects: &mut Vec<OwedEffect>,
         resynchronised: &mut Vec<AttachmentId>,
+        unrecorded: &mut Vec<Arc<SideEffect>>,
     ) {
         let (owed, rest): (Vec<_>, Vec<_>) =
             std::mem::take(effects).into_iter().partition(|owed| {
@@ -3219,44 +3265,11 @@ impl Session {
             });
         *effects = rest;
         for owed in &owed {
-            self.deliver_effect(owed, oldest, resynchronised);
+            self.deliver_effect(owed, oldest, resynchronised, unrecorded);
         }
         self.hub
             .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
         resynchronised.push(attachment_id);
-    }
-
-    /// Delivers one side effect to the attachment it was routed to, or records it.
-    ///
-    /// The destination is the attachment that held the input lease, at the epoch it held it, when
-    /// the application caused the effect, and it is the destination only while it still does: the
-    /// lease can end between the engine routing an effect and this delivering it, and an effect is
-    /// never handed to whoever holds the lease next. An effect with no destination left, or one the
-    /// destination's stream has no room for or is not taking, is a durable host event, so nothing
-    /// the application asked for leaves the session unrecorded. A queue with no room also tells the
-    /// attachment to begin again, and it is one of the attachments this returns.
-    fn deliver_effect(
-        &mut self,
-        owed: &OwedEffect,
-        oldest: u64,
-        resynchronised: &mut Vec<AttachmentId>,
-    ) {
-        let SideEffectDestination::Attachment { id, epoch } = owed.effect.destination else {
-            self.record_host_event(&owed.effect);
-            return;
-        };
-        if self.lease.holder() != Some(id) || self.lease.epoch() != epoch.get() {
-            self.record_host_event(&owed.effect);
-            return;
-        }
-        match self.hub.publish_effect(id, owed, oldest) {
-            EffectOutcome::Queued => {}
-            EffectOutcome::Overflowed => {
-                resynchronised.push(id);
-                self.record_host_event(&owed.effect);
-            }
-            EffectOutcome::Refused => self.record_host_event(&owed.effect),
-        }
     }
 
     /// Delivers one interpreted batch to the attachments and the application.
@@ -3299,11 +3312,12 @@ impl Session {
             filtered.absorb(settled);
         }
         self.queue_replies(filtered.replies);
-        for effect in filtered.host_events {
-            // Nothing holds the input lease, so there is no terminal this belongs to. Section 8
-            // makes it a durable host event rather than something shown to whoever is watching.
-            self.record_host_event(&effect);
-        }
+        // Nothing holds the input lease for these, so there is no terminal they belong to. Section 8
+        // makes each a durable host event rather than something shown to whoever is watching, and so
+        // is every effect below that has nowhere to go: they are all kept at the end of the call,
+        // in one transaction.
+        let mut unrecorded: Vec<Arc<SideEffect>> =
+            filtered.host_events.into_iter().map(Arc::new).collect();
         let oldest = self.history.oldest_retained_cursor();
         let next = self.history.next_cursor();
         let mut resynchronised = Vec::new();
@@ -3329,6 +3343,7 @@ impl Session {
                     oldest,
                     &mut effects,
                     &mut resynchronised,
+                    &mut unrecorded,
                 );
             }
         }
@@ -3360,6 +3375,7 @@ impl Session {
                     oldest,
                     &mut effects,
                     &mut resynchronised,
+                    &mut unrecorded,
                 );
             }
         }
@@ -3379,7 +3395,7 @@ impl Session {
         for piece in pieces {
             match piece {
                 Piece::Effect(owed) => {
-                    self.deliver_effect(&owed, oldest, &mut resynchronised);
+                    self.deliver_effect(&owed, oldest, &mut resynchronised, &mut unrecorded);
                 }
                 Piece::Span(cursor, bytes) => {
                     resynchronised.extend(self.hub.publish_direct(
@@ -3390,6 +3406,8 @@ impl Session {
                 }
             }
         }
+
+        self.record_host_events(&mut unrecorded);
 
         for (attachment_id, dimensions) in projected {
             if self.hub.is_resynchronising(attachment_id) {

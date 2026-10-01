@@ -128,7 +128,9 @@ fn drained(stream: &mut OutputStream) -> Vec<String> {
     while let Some(delivery) = stream.try_recv() {
         stream.written(delivery.len());
         seen.push(match delivery {
-            OutputDelivery::Effect { cursor, bytes } => format!("effect {cursor} {bytes:?}"),
+            OutputDelivery::Effect(owed) => {
+                format!("effect {} {:?}", owed.effect.at, owed.bytes.to_vec())
+            }
             OutputDelivery::Bytes { cursor, .. } => format!("bytes {cursor}"),
             OutputDelivery::Resync(_) => "resync".to_owned(),
             OutputDelivery::Projection { .. } => "projection".to_owned(),
@@ -315,4 +317,27 @@ async fn an_effect_in_a_batch_that_switches_buffers_reaches_a_direct_holder_befo
         vec![effect(0, BELL), "resync".to_owned()]
     );
     assert!(fixture.host_events().is_empty(), "it reached its holder");
+}
+
+/// KR-REQ-08.38: every effect a holder that cannot take them was owed is recorded, in the order the
+/// application caused them, however many one read of output holds. They are kept in one
+/// transaction, so a holder that has stopped taking output costs the read loop one commit for the
+/// output it reads and not one for each bell in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bells_of_one_read_a_holder_cannot_take_are_all_recorded_in_order() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    fixture.take_the_keys(holder);
+    // No subscription: the holder has nowhere to be sent them.
+    let output: Vec<u8> = (0..200).flat_map(|_| *b"x\x07").collect();
+    fixture.output(&output);
+    let recorded = fixture.host_events();
+    assert_eq!(recorded.len(), 200, "{recorded:?}");
+    assert!(recorded.iter().all(|(kind, _)| kind == "bell"));
+    let cursors: Vec<u64> = recorded.iter().map(|(_, cursor)| *cursor).collect();
+    let expected: Vec<u64> = (0..200).map(|bell| 2 * bell + 1).collect();
+    assert_eq!(
+        cursors, expected,
+        "in the order they happened, at their own cursors"
+    );
 }
