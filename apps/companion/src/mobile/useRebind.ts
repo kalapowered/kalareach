@@ -20,7 +20,7 @@ import type { Lifecycle } from './useLifecycle'
 /** Rebinds `lifecycle`'s detached drafts whenever `connected` and there is something to rebind. */
 export function useRebind(lifecycle: Lifecycle, connected: boolean): void {
   const { port } = useApp()
-  const { setDrafts, resumed } = lifecycle
+  const { setDrafts, resumed, resumedNow } = lifecycle
   const held = lifecycle.state.drafts
   const drafts = useRef(held)
   useEffect(() => {
@@ -31,9 +31,13 @@ export function useRebind(lifecycle: Lifecycle, connected: boolean): void {
   useEffect(() => {
     if (!connected || !waiting) return
     let current = true
+    const asked = resumedNow()
     observeTargets(port, drafts.current)
       .then((observed) => {
-        if (!current || observed.length === 0) return
+        // An answer read before the application came back again is about the drafts as they were,
+        // and says nothing of what the break since then took away. The page may not have rendered
+        // that yet, so the count is asked for now rather than read from the render.
+        if (!current || resumedNow() !== asked || observed.length === 0) return
         setDrafts((held) => rebindAll(held, observed))
       })
       .catch(() => undefined)
@@ -42,5 +46,5 @@ export function useRebind(lifecycle: Lifecycle, connected: boolean): void {
     }
     // `resumed` is here to run this again when the application comes back over a connection that
     // never dropped, which changes neither `connected` nor, once the drafts detach, `waiting`.
-  }, [port, connected, waiting, resumed, setDrafts])
+  }, [port, connected, waiting, resumed, resumedNow, setDrafts])
 }

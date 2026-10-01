@@ -107,11 +107,15 @@ extension PreviewEnvelope {
     }
 }
 
-/// A counter, which the protocol sends as a decimal string in JSON and as a number in some clients.
+/// A counter, which the protocol sends as a string of decimal digits in JSON and nothing else.
+///
+/// The gateway refuses any other shape, so a number, a boolean, a sign or a fraction here is not
+/// what it sent. `UInt64` alone would accept a leading plus sign, and a JSON number would turn a
+/// negative value into a huge one that never expires.
 private func unsigned(_ value: Any?) -> UInt64? {
-    if let text = value as? String { return UInt64(text) }
-    if let number = value as? NSNumber { return number.uint64Value }
-    return nil
+    guard let text = value as? String, !text.isEmpty, text.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 })
+    else { return nil }
+    return UInt64(text)
 }
 
 /// A base64url field, which the protocol uses for every byte string in JSON.
