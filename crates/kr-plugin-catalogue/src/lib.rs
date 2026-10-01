@@ -849,6 +849,38 @@ impl Catalogue {
         })
     }
 
+    /// Says why an installation does not stand, before anything about its package is read, or
+    /// `None` where it does: it is disabled, the current generation of its origin revoked its exact
+    /// package hash, or the organisation's allowlist does not name it.
+    ///
+    /// It is the decision the admissions make first, so whatever acts on an installation in an
+    /// application's name follows the same one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record or the index cannot be read.
+    pub fn standing(
+        &self,
+        installation: &Installation,
+    ) -> CatalogueResult<Option<NotAdmittedReason>> {
+        let revocation = self
+            .read_kept(|records| {
+                admission::current_entry(
+                    &self.root,
+                    records,
+                    &installation.enrolment,
+                    &installation.plugin_id,
+                    installation.package_digest,
+                )
+            })?
+            .and_then(|entry| entry.revocation.0);
+        Ok(admission::left_out_by_standing(
+            installation,
+            revocation,
+            self.allowed_adapters.as_ref(),
+        ))
+    }
+
     /// Returns the builds the current generation of an installation's origin names for its exact
     /// release on `host`'s platform: the signed records that say which version an executable is.
     ///
