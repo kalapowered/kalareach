@@ -391,6 +391,43 @@ fn the_module_reads_how_the_editor_spells_a_chord_and_refuses_one_that_does_not_
     );
 }
 
+/// KR-REQ-07.23, KR-REQ-07.85: the read-line function the module goes in front of has to be the
+/// editor's own, whoever defined what stood there before it, and what decides is whose function it is
+/// and not what its text says.
+///
+/// A profile an administrator owns runs before the module loads, so a wrapper it defines is what the
+/// module finds in front of the editor. One that calls the editor directly has the editor's call in
+/// its text and is somebody else's reader all the same, and the module going around it would take a
+/// tool's wrapper out of the host's path without a word. Each shape is a host of its own, because
+/// the function is global and what one defines is what the next would find.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_module_goes_in_front_of_the_editors_own_read_line_and_of_nothing_else() {
+    let in_front_of = |definition: &str| {
+        in_the_package_host(&format!(
+            "{definition}; \
+             Write-Output \"kr-key[inner]=[$(& $module {{ Install-KrReadLineWrapper; Test-KrInnerReadLine }})]\""
+        ))
+    };
+    let own = in_front_of("$null = 1");
+    assert_eq!(
+        said(&own, "inner"),
+        "True",
+        "the editor's own function is what the module goes in front of:\n{own}"
+    );
+    let calls_the_editor = in_front_of(
+        "function global:PSConsoleHostReadLine { [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($host.Runspace, $ExecutionContext, $true) }",
+    );
+    assert_eq!(
+        said(&calls_the_editor, "inner"),
+        "False",
+        "a wrapper that calls the editor directly is somebody else's reader:\n{calls_the_editor}"
+    );
+    let reads_another_way =
+        in_front_of("function global:PSConsoleHostReadLine { [Console]::ReadLine() }");
+    assert_eq!(said(&reads_another_way, "inner"), "False");
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

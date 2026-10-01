@@ -33,7 +33,6 @@ $script:Hooks = @{
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
     ReadLineInstalled  = $false
-    ReadLineText       = ''
 }
 
 # The operations whose key wait this module observes by wrapping them. Each runs its own read loop
@@ -412,9 +411,27 @@ function Install-KrReadLineWrapper {
         Invoke-KalaReachReadLine -LastStatus $?
     }
     Set-Item -Path function:global:PSConsoleHostReadLine -Value $wrapper
-    # What the host calls is this function for as long as its text is this text.
-    $script:Hooks.ReadLineText = "$wrapper"
     $script:Hooks.ReadLineInstalled = $true
+}
+
+# The module a read-line function was defined in, which says whose reader it is.
+#
+# A function a person wrote in a profile belongs to no module, one a tool added belongs to the tool's
+# module, and the editor's own belongs to PSReadLine. What a function's text says decides nothing: a
+# wrapper that calls the editor directly has the editor's call in its text and is somebody else's
+# reader all the same. Anything that is not a function, such as an alias, is named by what it is.
+function Get-KrReadLineOwner {
+    param($Command)
+    if ($null -eq $Command) { return '' }
+    if ($Command.CommandType -ne 'Function') { return "$($Command.CommandType)" }
+    $module = $Command.ScriptBlock.Module
+    if ($null -eq $module) { '' } else { "$($module.Name)" }
+}
+
+# The command the host runs under the read-line entry point's name, which an alias takes before a
+# function.
+function Get-KrReadLineCommand {
+    Get-Command -Name 'PSConsoleHostReadLine' -ErrorAction SilentlyContinue | Select-Object -First 1
 }
 
 # True when the read-line entry point this module went in front of is this editor's own.
@@ -424,7 +441,8 @@ function Install-KrReadLineWrapper {
 function Test-KrInnerReadLine {
     $inner = $script:Hooks.InnerReadLine
     if ($null -eq $inner) { return $true }
-    "$inner" -match 'PSConsoleReadLine\]::ReadLine'
+    $module = $inner.Module
+    $null -ne $module -and "$($module.Name)" -ceq 'PSReadLine'
 }
 
 # ---- the user-facing hooks, after the profile has run -----------------------------------------------
@@ -435,7 +453,7 @@ function Test-KrInnerReadLine {
 function Stop-KrActivation {
     param([string]$Reason, [string]$Detail)
     $script:Hooks.Activated = $true
-    Send-KrIntegrationLost 'post_startup_failure' $Detail
+    Send-KrIntegrationLost 'post_startup_failure' "${Reason}: $Detail"
     Write-KrDiagnostic $Reason $Detail
 }
 
@@ -449,18 +467,29 @@ function Confirm-KalaReachReadLine {
     profile so that the bridge is open before anything the person wrote can ask a question. A
     function of the same name that a later profile defines takes the host's calls away from the
     module, and the reader would never run: the session would stay authenticated and not ready with
-    nothing to say why. A function that replaces the entry point and one that wraps the function it
-    replaced are both the host's reader being somebody else's rather than the editor the package was
-    qualified against, and both are refused by name.
+    nothing to say why. What decides is whose function the host would call: a function that replaces
+    the entry point, one that wraps the function it replaced, one that calls the editor directly and
+    an alias are all the host's reader being somebody else's rather than the editor the package was
+    qualified against, and each is refused by name. The editor imported again puts its own function
+    back, which is the qualified reader, so the module goes back in front of it.
     #>
     [CmdletBinding()]
     param()
 
     if (-not $script:Kr.Registered -or $script:Hooks.Activated) { return }
     if (-not $script:Hooks.ReadLineInstalled) { return }
-    $current = Get-Command -Name 'PSConsoleHostReadLine' -CommandType Function -ErrorAction SilentlyContinue
-    if ($null -ne $current -and "$($current.ScriptBlock)" -eq $script:Hooks.ReadLineText) { return }
-    Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
+    switch (Get-KrReadLineOwner (Get-KrReadLineCommand)) {
+        'KalaReach.ShellBridge' { return }
+        'PSReadLine' {
+            # The editor imported again put its own function back in front of this module. That is
+            # the qualified reader, so the module goes back in front of it.
+            Install-KrReadLineWrapper
+            return
+        }
+        default {
+            Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
+        }
+    }
 }
 
 function Enable-KalaReachHooks {
