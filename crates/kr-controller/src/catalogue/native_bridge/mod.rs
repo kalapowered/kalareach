@@ -151,21 +151,17 @@ pub struct ApplicationDirectory {
 /// contact skill's installation uses. The daemon's environment is not the one Claude Code runs in,
 /// so a directory that variable names elsewhere is not read from it, and does not get the bridge.
 ///
-/// Gemini CLI's is `.gemini` in the home directory, where its `settings.json` lives and its
-/// `extensions/` sits, each extension in a directory of its own. An application this host does not
-/// name here has no directory, and a recipe for it places nothing.
+/// An application this host does not name here has no directory, and a recipe for it places
+/// nothing. Gemini CLI's is not named: its recipe must leave the record of where its extension is
+/// installed in place for as long as anything else stays in the extension's directory, because
+/// Gemini CLI refuses to start while such a directory has no record, and a recipe's removal steps
+/// cannot say "last, and only when nothing else is left".
 #[must_use]
 pub fn application_directories(home: &Path) -> Vec<ApplicationDirectory> {
-    vec![
-        ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: home.join(".claude"),
-        },
-        ApplicationDirectory {
-            application: "Gemini CLI".to_owned(),
-            directory: home.join(".gemini"),
-        },
-    ]
+    vec![ApplicationDirectory {
+        application: "Claude Code".to_owned(),
+        directory: home.join(".claude"),
+    }]
 }
 
 /// What an installation wants in place: one release's recipe, and what it is checked against.
