@@ -181,10 +181,11 @@ impl GrantedRecipients {
             .map(Standing::Paired)
     }
 
-    /// Reads the standing of the same grant again, once the policy's lock is held, so that what a
-    /// revocation completed while this waited for the lock is found.
-    fn still_standing(&self, standing: &Standing) -> bool {
-        match standing {
+    /// Reads the standing of the same grant again, and of the device it is bound to, once the
+    /// policy's lock is held, so that what a revocation completed while this waited for the lock is
+    /// found.
+    fn still_standing(&self, standing: &Standing, bound_to: Option<&DeviceRecord>) -> bool {
+        let grant_stands = match standing {
             Standing::Stored(record) => self
                 .sharing
                 .grants()
@@ -192,19 +193,33 @@ impl GrantedRecipients {
                 .ok()
                 .flatten()
                 .is_some_and(|fresh| fresh.revoked_at_ms.is_none() && fresh.is_active()),
-            Standing::Paired(device) => self
-                .lifetimes
-                .devices()
-                .record_for_device(device.device_id)
-                .ok()
-                .flatten()
-                .is_some_and(|fresh| fresh.is_paired()),
-        }
+            Standing::Paired(device) => self.is_still_paired(device),
+        };
+        grant_stands && bound_to.is_none_or(|device| self.is_still_paired(device))
+    }
+
+    /// Whether the directory still holds `device` as paired: not revoked and not recorded expired.
+    fn is_still_paired(&self, device: &DeviceRecord) -> bool {
+        self.lifetimes
+            .devices()
+            .record_for_device(device.device_id)
+            .ok()
+            .flatten()
+            .is_some_and(|fresh| fresh.is_paired())
     }
 
     /// The scope a grant gives its recipient now, decided as a device's own request is, on both
     /// clocks, under the policy and the configured ceiling.
-    fn scope_of(&self, standing: &Standing) -> Option<RecipientScope> {
+    ///
+    /// `bound_to` is the paired device a grant of the grant store is read for: its pairing is the
+    /// authority that lets this host send it anything, so its own grant is decided on both clocks
+    /// too, and a revocation of the device found while this waited for the policy's lock ends the
+    /// answer as one of the grant does.
+    fn scope_of(
+        &self,
+        standing: &Standing,
+        bound_to: Option<&DeviceRecord>,
+    ) -> Option<RecipientScope> {
         let grant = standing.grant();
         let started_at_ms = standing.started_at_ms()?;
         // Revoked, expired, or a proposal nobody has redeemed: neither admits anything, and no
@@ -227,23 +242,29 @@ impl GrantedRecipients {
                 self.lifetimes.paired(device).ok()?
             }
         };
-        // What the configuration allows, read before the policy's lock is taken, as a device's
-        // request reads it.
-        let ceiling = self.ceiling.as_ref().and_then(|ceiling| {
-            ceiling
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        });
+        // The device a stored grant is read for is anchored the same way, in this boot, so what
+        // follows reads no store: an expiring pairing this host cannot anchor admits nothing.
+        let bound = match bound_to {
+            Some(device) => Some((device, self.lifetimes.paired(device).ok()?)),
+            None => None,
+        };
         #[cfg(test)]
         self.before_the_policy_lock.wait();
         // The policy as it stands now, decided under its lock and after every read of a store
         // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
         // a decision takes have to be those of the lease whose time it loads.
         let policy = self.policy.lock().ok()?;
-        if !self.still_standing(standing) {
+        if !self.still_standing(standing, bound_to) {
             return None;
         }
+        // What the configuration allows, read with the policy's lock held, so that a change of it
+        // made while this waited for the lock narrows the answer.
+        let ceiling = self.ceiling.as_ref().and_then(|ceiling| {
+            ceiling
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
         // Both clocks, read once the lock is held, so a bound that ran out while this waited for it
         // is found, and everything below is decided at these readings. UTC is read through this
         // host's floor, which the reading raises, so a clock wound back after this message does not
@@ -254,6 +275,19 @@ impl GrantedRecipients {
         // end this host finds is: as the grant's tombstone, once the policy's lock is let go, since a
         // later boot reads the tombstone before it derives anything; and, when UTC found it, as the
         // floor it was found at, which is written under the lock like every write of the policy.
+        if let Some((device, anchor)) = &bound {
+            let expired_in_utc = !device.grant.expiry.is_valid_at(now_ms);
+            if expired_in_utc || !anchor.holds_at(continuous_now) {
+                if expired_in_utc {
+                    self.sharing.grants().record_floor(&policy);
+                }
+                drop(policy);
+                if *anchor != Anchored::Over {
+                    let _ = self.lifetimes.paired_standing(device);
+                }
+                return None;
+            }
+        }
         let expired_in_utc = !grant.expiry.is_valid_at(now_ms);
         if expired_in_utc || !anchored.holds_at(continuous_now) {
             if expired_in_utc {
@@ -377,7 +411,7 @@ impl RecipientAuthority for GrantedRecipients {
     /// that fails stays owed, and the host's next decision or its record task writes it.
     fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
         let standing = self.standing(rule.grant_id?)?;
-        self.scope_of(&standing)
+        self.scope_of(&standing, None)
     }
 
     /// The device is the one its destination is named by, and the grant its rule names is the
@@ -390,18 +424,20 @@ impl RecipientAuthority for GrantedRecipients {
         if standing.grant().recipient_device_id != device_id {
             return None;
         }
-        if matches!(standing, Standing::Stored(_))
-            && !self
-                .lifetimes
-                .devices()
-                .record_for_device(device_id)
-                .ok()
-                .flatten()
-                .is_some_and(|device| device.is_paired())
-        {
-            return None;
-        }
-        self.scope_of(&standing)
+        // A grant of the grant store issued to a device is still only as good as that device's own
+        // pairing, which has to be in force too: paired, and its own grant inside both its bounds.
+        let device = match standing {
+            Standing::Stored(_) => Some(
+                self.lifetimes
+                    .devices()
+                    .record_for_device(device_id)
+                    .ok()
+                    .flatten()
+                    .filter(DeviceRecord::is_paired)?,
+            ),
+            Standing::Paired(_) => None,
+        };
+        self.scope_of(&standing, device.as_ref())
     }
 }
 
@@ -1150,6 +1186,179 @@ mod tests {
                 asking.join().expect("the question ends").is_some(),
                 !revokes,
                 "paired {paired}, revoked {revokes}"
+            );
+        }
+    }
+
+    /// A grant of the grant store issued to a device is only as good as the device's own pairing,
+    /// and the pairing's grant is decided on both clocks as the device's own connection would
+    /// decide it: one that has run out in UTC, or on the continuous clock, or that cannot be proved
+    /// in force while the clock's continuity is lost, admits nothing, whatever the stored grant
+    /// says, and the end is written in the device's record. The control: with the pairing's grant
+    /// in force, the destination is admitted.
+    #[test]
+    fn a_stored_grant_for_a_device_whose_pairing_ran_out_admits_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for runs_out in [
+            None,
+            Some("in UTC"),
+            Some("on the continuous clock"),
+            Some("while the clock's continuity is lost"),
+        ] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let stored = Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                ..grant(37, SessionSelector::Any, &[ActionRight::SessionView])
+            };
+            issued(&sharing, stored, true);
+            let policy = personal();
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let continuous = kr_transport::clock::ManualClock::new();
+            let recipients = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                Arc::clone(&policy),
+                environment(),
+                Arc::new(continuous.clone()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            );
+            let pairing = Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                expiry: GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(NOW + 1_000),
+                },
+                ..grant(38, SessionSelector::Any, &[ActionRight::SessionView])
+            };
+            recipients
+                .lifetimes()
+                .devices()
+                .commit(&device(DeviceId::new(uuid(2)), pairing))
+                .expect("a device");
+            assert!(
+                recipients.device_scope(&destination(Some(37))).is_some(),
+                "in force when first asked"
+            );
+            match runs_out {
+                Some("in UTC") => wall.store(NOW + 1_000, Ordering::SeqCst),
+                Some("on the continuous clock") => {
+                    continuous.advance(std::time::Duration::from_millis(1_000));
+                }
+                Some(_) => policy
+                    .lock()
+                    .expect("not poisoned")
+                    .utc_floor()
+                    .lose_continuity(),
+                None => {}
+            }
+            let case = runs_out.unwrap_or("nowhere");
+            assert_eq!(
+                recipients.device_scope(&destination(Some(37))).is_some(),
+                runs_out.is_none(),
+                "the pairing's grant runs out {case}"
+            );
+            let ended = recipients
+                .lifetimes()
+                .devices()
+                .record_for_device(DeviceId::new(uuid(2)))
+                .expect("a read")
+                .expect("the device")
+                .expired_at_ms
+                .is_some();
+            // Unproven is not ended: nothing is written while the continuity is lost.
+            assert_eq!(
+                ended,
+                matches!(runs_out, Some("in UTC" | "on the continuous clock")),
+                "the record of the end, run out {case}"
+            );
+        }
+    }
+
+    /// A device revoked while a question about its stored grant waits for the policy's lock is
+    /// found, as one whose grant was revoked is: the device's record is read again once the lock
+    /// is held, and a revocation that marks only the device ends the answer. The control: left
+    /// alone, the question admits its recipient.
+    #[test]
+    fn a_device_revoked_while_its_stored_grants_question_waits_for_the_lock_is_found() {
+        for revokes in [false, true] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let recipients = Arc::new(recipients(&sharing));
+            issued(
+                &sharing,
+                Grant {
+                    recipient_device_id: DeviceId::new(uuid(2)),
+                    ..grant(39, SessionSelector::Any, &[ActionRight::SessionView])
+                },
+                true,
+            );
+            recipients
+                .lifetimes()
+                .devices()
+                .commit(&device(
+                    DeviceId::new(uuid(2)),
+                    grant(40, SessionSelector::Any, &[ActionRight::SessionView]),
+                ))
+                .expect("a device");
+            let (arrived, go) = recipients.before_the_policy_lock.arm();
+            let asking = {
+                let recipients = Arc::clone(&recipients);
+                std::thread::spawn(move || recipients.device_scope(&destination(Some(39))))
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the question read the standing and reached the lock");
+            if revokes {
+                recipients
+                    .lifetimes()
+                    .devices()
+                    .revoke(
+                        DeviceId::new(uuid(2)),
+                        kr_protocol::scalars::TimestampMs::new(NOW),
+                    )
+                    .expect("a revocation");
+            }
+            go.send(()).expect("the question waits");
+            assert_eq!(
+                asking.join().expect("the question ends").is_some(),
+                !revokes,
+                "device revoked {revokes}"
+            );
+        }
+    }
+
+    /// A change of the configured ceiling that lands while a question waits for the policy's lock
+    /// narrows the answer: the ceiling is read with the lock held, as the policy and both clocks
+    /// are. The control: a ceiling left as it was changes nothing.
+    #[test]
+    fn a_ceiling_changed_while_the_question_waits_for_the_lock_narrows_the_answer() {
+        for narrows in [false, true] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            issued(
+                &sharing,
+                grant(41, SessionSelector::Any, &[ActionRight::SessionView]),
+                true,
+            );
+            let ceiling = Arc::new(Mutex::new(None));
+            let recipients = Arc::new(recipients(&sharing).with_ceiling(Arc::clone(&ceiling)));
+            let (arrived, go) = recipients.before_the_policy_lock.arm();
+            let asking = {
+                let recipients = Arc::clone(&recipients);
+                std::thread::spawn(move || recipients.scope_for(&rule(Some(41))))
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the question reached the lock");
+            if narrows {
+                *ceiling.lock().expect("not poisoned") =
+                    Some([ActionRight::FilesRead].into_iter().collect());
+            }
+            go.send(()).expect("the question waits");
+            assert_eq!(
+                asking.join().expect("the question ends").is_some(),
+                !narrows,
+                "ceiling narrowed {narrows}"
             );
         }
     }
