@@ -35,8 +35,9 @@ pub const RESYNC_MARKER_BYTES: usize = 96;
 ///
 /// A bell is one byte on a terminal and a record of about this size in a queue. A queue bounded in
 /// bytes alone would hold many times its bound in memory when an application rings in a loop, so
-/// every effect is charged this much as well. The figure is the size of what the queue holds for
-/// an effect and leaves out the allocator's own rounding, which the margin under 256 is for.
+/// every effect is charged this much as well. The sizes of the types the queue holds for an effect
+/// add up to less than this figure, as a test sums them, and they leave out the allocator's own
+/// rounding, which the margin under 256 is for.
 pub const EFFECT_RECORD_BYTES: usize = 256;
 
 /// One thing delivered to a subscriber.
@@ -1238,7 +1239,7 @@ mod tests {
     }
 
     /// An effect is its own delivery: it keeps the cursor its sequence began at, it is charged to the
-    /// subscriber's queue for its bytes and its record, and reading it gives them back.
+    /// subscriber's queue for its bytes and its record, and `written` gives them back.
     #[test]
     fn a_side_effect_is_queued_as_an_effect_and_charged() {
         let mut hub = OutputHub::new();
