@@ -177,7 +177,6 @@ impl Controller {
         encode(&page)
     }
 
-    /// Serves one retained receipt of a closed session.
     /// Answers `action.read` for a catalogue action this actor performed, where there is one.
     ///
     /// `None` is a request this does not answer: one that names a session, or an action the
@@ -203,10 +202,13 @@ impl Controller {
         }
     }
 
+    /// Serves one retained receipt of a closed session, as `owner` says its reader may be shown it:
+    /// whole to the owner at this machine, and as the state of the action alone to anybody else.
     pub(super) async fn archive_action_read(
         self: &Arc<Self>,
         actor_id: &ActorId,
         params: &ParamsValue,
+        owner: bool,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
         let Some(session_id) = params.session_id else {
@@ -218,7 +220,7 @@ impl Controller {
         self.refuse_if_live(session_id).await?;
         let read = self
             .archive()
-            .receipt(session_id, actor_id, params.action_id)?;
+            .receipt(session_id, actor_id, params.action_id, owner)?;
         encode(&read)
     }
 

@@ -1084,7 +1084,7 @@ fn kr_req_24_06_a_workers_death_ends_what_it_held_live_and_leaves_its_dispatch_u
         "the marker the worker committed survived its death"
     );
     let receipt = archive
-        .receipt(session_id, &person_id(), dispatched())
+        .receipt(session_id, &person_id(), dispatched(), true)
         .expect("reads the receipt")
         .receipt;
     assert_eq!(

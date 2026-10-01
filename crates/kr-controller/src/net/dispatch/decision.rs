@@ -26,6 +26,22 @@ pub(super) struct Asked {
     entry: &'static MethodEntry,
     claims_geometry: bool,
     pub(super) decision: super::super::DeviceDecision,
+    /// The method whose answer the frame carries, which is what decides how the answer is shown.
+    ///
+    /// It is the entry's own method for a request answered by what it asks for. A retained answer
+    /// is decided as a read of a receipt, under `action.read`'s entry, and is still the answer to
+    /// the method it was kept for, so the two differ there.
+    pub(super) shown_as: Method,
+}
+
+impl Asked {
+    /// Returns the same decision, for an answer that is shown as `method`'s.
+    pub(super) fn answering(self, method: Method) -> Self {
+        Self {
+            shown_as: method,
+            ..self
+        }
+    }
 }
 
 /// The answer to one frame from the device, with the decision its request was taken under when the
@@ -65,10 +81,11 @@ impl RemoteConnection {
         };
         for _ in 0..RELAY_DECISIONS {
             // What the answer shows is the decision's it is written under, as its bounds are.
-            let shown = super::super::close_answer_shown(
+            let shown = super::super::answer_shown(
                 &frame,
-                asked.entry.method,
+                asked.shown_as,
                 &asked.decision.decided.permitted.rights,
+                &self.device.grant.history,
             );
             match self
                 .output
@@ -80,7 +97,7 @@ impl RemoteConnection {
                 Written::Undecided => {}
             }
             match self.ask(asked.session_id, asked.entry, asked.claims_geometry) {
-                Ok(again) => asked = again,
+                Ok(again) => asked = again.answering(asked.shown_as),
                 Err(error) => return self.output.send(&failure(request_id, error)).await,
             }
         }
@@ -103,6 +120,7 @@ impl RemoteConnection {
             entry,
             claims_geometry,
             decision,
+            shown_as: entry.method,
         })
     }
 

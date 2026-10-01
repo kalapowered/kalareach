@@ -228,7 +228,8 @@ impl Controller {
                 if let Some(answer) = self.host_action_read(actor_id, request).await {
                     return answer;
                 }
-                self.archive_action_read(actor_id, &request.params).await
+                self.archive_action_read(actor_id, &request.params, owner)
+                    .await
             }
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),

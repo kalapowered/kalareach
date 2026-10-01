@@ -293,32 +293,85 @@ pub fn shown_result(
     }
 }
 
-/// Returns a close's result without the worker's description of the session.
-#[must_use]
-pub fn without_description(result: &ParamsValue) -> ParamsValue {
-    use kr_cbor::{CanonicalMap, CanonicalValue};
+/// The member of a close's result that holds the worker's description of the session.
+pub const DESCRIPTION_MEMBER: &str = "session";
 
-    /// The member of a close answer that holds the worker's description of the session.
-    const DESCRIPTION: &str = "session";
+/// The member of an answer to a question's resolution that holds the question.
+pub const QUESTION_MEMBER: &str = "question";
+
+/// Returns one member of a result that is a map, as the worker wrote it.
+///
+/// The members are read from the encoded value rather than through a typed shape, so an answer
+/// this build cannot decode, as one from a worker built after it may be, is still opened.
+#[must_use]
+pub fn member<'a>(result: &'a ParamsValue, name: &str) -> Option<&'a kr_cbor::CanonicalValue> {
+    match result.as_value() {
+        kr_cbor::CanonicalValue::Map(map) => map.get(name),
+        _ => None,
+    }
+}
+
+/// Returns a result with one member taken out, and every other member as it was.
+///
+/// A result that is not a map, or has no such member, is returned as it is.
+#[must_use]
+pub fn without_member(result: &ParamsValue, name: &str) -> ParamsValue {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
 
     let CanonicalValue::Map(answer) = result.as_value() else {
         return result.clone();
     };
-    if answer.get(DESCRIPTION).is_none() {
+    if answer.get(name).is_none() {
         return result.clone();
     }
     let kept = answer
         .entries()
         .iter()
-        .filter(|(name, _)| name != DESCRIPTION)
+        .filter(|(key, _)| key != name)
         .cloned()
         .collect();
     // Taking one entry out of a canonical map leaves it ordered and free of duplicates, so this
-    // does not fail; were it ever to, the description stays out and so does the rest.
+    // does not fail; were it ever to, the member stays out and so does the rest.
     CanonicalMap::from_sorted_entries(kept).map_or_else(
         |_| ParamsValue::empty(),
         |members| ParamsValue::new(CanonicalValue::Map(members)),
     )
+}
+
+/// Returns a result with one member set to null where it has it, and every other member as it
+/// was. A member the result does not have is not added: a receipt that holds no question stays a
+/// receipt.
+#[must_use]
+pub fn with_member_nulled(result: &ParamsValue, name: &str) -> ParamsValue {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
+    let CanonicalValue::Map(answer) = result.as_value() else {
+        return result.clone();
+    };
+    if answer.get(name).is_none() {
+        return result.clone();
+    }
+    let replaced = answer
+        .entries()
+        .iter()
+        .map(|(key, value)| {
+            if key == name {
+                (key.clone(), CanonicalValue::Null)
+            } else {
+                (key.clone(), value.clone())
+            }
+        })
+        .collect();
+    CanonicalMap::from_sorted_entries(replaced).map_or_else(
+        |_| ParamsValue::empty(),
+        |members| ParamsValue::new(CanonicalValue::Map(members)),
+    )
+}
+
+/// Returns a close's result without the worker's description of the session.
+#[must_use]
+pub fn without_description(result: &ParamsValue) -> ParamsValue {
+    without_member(result, DESCRIPTION_MEMBER)
 }
 
 /// Builds the answer to `question.answer` or `question.cancel` that `disclosure` is shown.
