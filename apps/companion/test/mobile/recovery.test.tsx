@@ -10,7 +10,7 @@
  * failed is left exactly as it was. Nothing here ever sends anything on the person's behalf.
  */
 
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -66,6 +66,22 @@ function unreachableAtFirst(port: HostPort, times: number): { port: HostPort; as
         return port.sessionRead(params)
       }
     }
+  }
+}
+
+/** A promise a test settles when it chooses, for a read that is on its way. */
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
+/** Lets what a settled promise sets off run, inside the act it is called from. */
+async function flush(): Promise<void> {
+  for (let tick = 0; tick < 50; tick += 1) {
+    await Promise.resolve()
   }
 }
 
@@ -125,6 +141,8 @@ describe('a draft that came back is bound again when the host has said where it 
     expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
 
     comeBack()
+    // The suspension took the association away, and it stays away until the host has been asked.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
@@ -200,6 +218,190 @@ describe('a draft that came back is bound again when the host has said where it 
       expect(screen.getByText(/1 lost its session/)).toBeInTheDocument()
     })
     expect(screen.getByLabelText('Message this session')).toHaveValue('for a session that went')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  it('asks again after each suspension that follows a failed read, and not while contact continues', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const { port: flaky, asked } = unreachableAtFirst(port, 2)
+    render(shell(flaky, fakeStorage()))
+    await person.type(await openMainSession(person), 'kept through two suspensions')
+
+    comeBack()
+    await waitFor(() => {
+      expect(asked).toHaveLength(1)
+    })
+    // The read failed, so the draft is as it was, and nothing asks again by itself.
+    await act(flush)
+    expect(asked).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    // The next suspension is the same kind of resumption as the last, and asks again.
+    comeBack()
+    await waitFor(() => {
+      expect(asked).toHaveLength(2)
+    })
+    await act(flush)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    comeBack()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(asked).toHaveLength(3)
+    expect(controls.actions).toEqual([])
+  })
+
+  it('binds a draft once contact is back after a suspension that came while the host was out of reach', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(shell(port, fakeStorage()))
+    await person.type(await openMainSession(person), 'kept through a lost connection')
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    comeBack()
+    await act(flush)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(controls.actions).toEqual([])
+  })
+
+  it('drops an answer that arrives after contact was lost', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const held = deferred()
+    const reached = deferred()
+    let holding = false
+    // The last read of the three answers late, so only its own continuation is left to run.
+    const slow: HostPort = {
+      ...port,
+      agentCapabilities: async (params) => {
+        const read = await port.agentCapabilities(params)
+        if (holding) {
+          reached.release()
+          await held.promise
+        }
+        return read
+      }
+    }
+    render(shell(slow, fakeStorage()))
+    await person.type(await openMainSession(person), 'kept through a dropped answer')
+
+    holding = true
+    comeBack()
+    await reached.promise
+    act(() => {
+      controls.setConnected(false)
+    })
+    holding = false
+    await act(async () => {
+      held.release()
+      await flush()
+    })
+    // The answer was for a connection that is gone, so it binds nothing: the draft is still kept.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.getByText(/1 draft kept/)).toBeInTheDocument()
+
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+  })
+
+  it('keeps what was typed while the host was being asked', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    const held = deferred()
+    let holding = false
+    const slow: HostPort = {
+      ...port,
+      sessionRead: async (params) => {
+        if (holding) await held.promise
+        return await port.sessionRead(params)
+      }
+    }
+    render(shell(slow, fakeStorage()))
+    await person.type(await openMainSession(person), 'before')
+    holding = true
+    comeBack()
+    await act(flush)
+
+    await person.type(screen.getByLabelText('Message this session'), ' and after')
+    await act(async () => {
+      held.release()
+      await flush()
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(screen.getByLabelText('Message this session')).toHaveValue('before and after')
+  })
+
+  it('does not let a key pressed as the host answers undo the binding', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    const held = deferred()
+    let holding = false
+    const slow: HostPort = {
+      ...port,
+      sessionRead: async (params) => {
+        if (holding) await held.promise
+        return await port.sessionRead(params)
+      }
+    }
+    render(shell(slow, fakeStorage()))
+    await person.type(await openMainSession(person), 'before')
+    holding = true
+    comeBack()
+    await act(flush)
+
+    // The answer is applied and a key press is handled before the page renders either.
+    await act(async () => {
+      held.release()
+      await flush()
+      fireEvent.change(screen.getByLabelText('Message this session'), { target: { value: 'before!' } })
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(screen.getByLabelText('Message this session')).toHaveValue('before!')
+  })
+
+  it('orphans a draft whose session the host reports as closed', async () => {
+    const person = userEvent.setup()
+    const storage = fakeStorage()
+    const first = fakeHost()
+    const run = render(shell(first.port, storage))
+    await person.type(await openMainSession(person), 'for a session that closed')
+    run.unmount()
+
+    const second = fakeHost()
+    const closed: HostPort = {
+      ...second.port,
+      sessionRead: async (params) => {
+        const read = await second.port.sessionRead(params)
+        return { ...read, session: { ...read.session, state: 'closed' } }
+      },
+      sessionAgents: () =>
+        Promise.reject({ code: 'UNKNOWN_SESSION', message: 'No worker holds that session.', user_action: 'none' })
+    }
+    render(shell(closed, storage))
+    await openMainSession(person)
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 lost its session/)).toBeInTheDocument()
+    })
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
 })
