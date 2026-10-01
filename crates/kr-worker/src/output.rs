@@ -114,7 +114,7 @@ impl OutputDelivery {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
-            Self::Effect(owed) => owed.bytes.len(),
+            Self::Effect(owed) => owed.cost(),
             Self::Projection { bytes, .. }
             | Self::AgentResource { bytes, .. }
             | Self::AgentInstance { bytes, .. } => *bytes,
@@ -142,6 +142,30 @@ pub struct OwedEffect {
     pub effect: Arc<SideEffect>,
     /// The bytes that perform it on a terminal.
     pub bytes: Arc<Vec<u8>>,
+}
+
+impl OwedEffect {
+    /// What this effect costs a subscriber's queue: the bytes that perform it, and what the effect
+    /// keeps beside them. A clipboard write holds its decoded content and a notification its text
+    /// next to the rendering, and a queue bounded in bytes counts both.
+    #[must_use]
+    pub fn cost(&self) -> usize {
+        use kr_term::sideeffect::SideEffectKind;
+        let kept = match &self.effect.kind {
+            SideEffectKind::ClipboardWrite { content, .. } => content.len(),
+            SideEffectKind::Notification {
+                title, body, id, ..
+            } => title
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(body.len())
+                .saturating_add(id.as_ref().map_or(0, String::len)),
+            SideEffectKind::Bell
+            | SideEffectKind::Progress { .. }
+            | SideEffectKind::ClipboardRead { .. } => 0,
+        };
+        self.bytes.len().saturating_add(kept)
+    }
 }
 
 /// What became of one effect offered to a subscriber.
@@ -281,12 +305,12 @@ impl OutputStream {
         self.receiver.try_recv().ok()
     }
 
-    /// Stops this stream taking anything more, and keeps what is already queued for
-    /// [`Self::try_recv`].
+    /// Stops this stream taking anything more, and keeps what is already queued for [`Self::recv`].
     ///
-    /// What is published to it afterwards is refused, so a producer learns that nobody is reading,
-    /// and what was queued before is for the reader to settle: a reader that is about to stop reads
-    /// the rest, with nothing arriving between its last read and its stopping.
+    /// What is published to it afterwards is refused, so a producer learns that nobody is reading.
+    /// What was queued before is for the reader to settle, and a reader that is about to stop reads
+    /// until [`Self::recv`] says the stream has ended: that takes a send that had already begun
+    /// when this was called, which [`Self::try_recv`] would not.
     pub fn close(&mut self) {
         self.receiver.close();
     }
@@ -627,7 +651,8 @@ impl OutputHub {
             return EffectOutcome::Refused;
         }
         let queued = subscriber.queued.load(Ordering::Acquire);
-        if queued.saturating_add(owed.bytes.len()) > subscriber.limit {
+        let cost = owed.cost();
+        if queued.saturating_add(cost) > subscriber.limit {
             if !subscriber.resynchronise(
                 ResyncReason::SendQueueFull,
                 cursor,
@@ -637,9 +662,7 @@ impl OutputHub {
             }
             return EffectOutcome::Overflowed;
         }
-        subscriber
-            .queued
-            .fetch_add(owed.bytes.len(), Ordering::AcqRel);
+        subscriber.queued.fetch_add(cost, Ordering::AcqRel);
         if subscriber
             .sender
             .send(OutputDelivery::Effect(owed.clone()))
@@ -1220,6 +1243,45 @@ mod tests {
         );
         stream.written(delivery.len());
         assert_eq!(stream.queued_bytes(), 0);
+    }
+
+    /// A clipboard write holds its decoded content beside the bytes that perform it, and the queue's
+    /// bound counts both.
+    #[test]
+    fn an_effect_is_charged_for_what_it_keeps_beside_its_rendering() {
+        let mut hub = OutputHub::new();
+        let mut stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        let effect = OwedEffect {
+            effect: Arc::new(SideEffect {
+                kind: kr_term::sideeffect::SideEffectKind::ClipboardWrite {
+                    selection: kr_term::sideeffect::ClipboardSelection::Clipboard,
+                    content: vec![b'x'; 300],
+                },
+                destination: kr_term::sideeffect::SideEffectDestination::Attachment {
+                    id: identifier(1),
+                    epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+                },
+                at: 0,
+            }),
+            bytes: Arc::new(vec![b'y'; 400]),
+        };
+        assert_eq!(effect.cost(), 700);
+        assert_eq!(
+            hub.publish_effect(identifier(1), &effect, 0),
+            EffectOutcome::Queued
+        );
+        assert_eq!(stream.queued_bytes(), 700);
+        let delivery = stream.try_recv().expect("queued");
+        assert_eq!(
+            delivery.len(),
+            700,
+            "reading it gives back what was charged"
+        );
+        // A second one does not fit the 1,024 bytes: it is not queued.
+        assert_eq!(
+            hub.publish_effect(identifier(1), &effect, 0),
+            EffectOutcome::Overflowed
+        );
     }
 
     /// A queue with no room for an effect tells the subscriber to resynchronise, once, and the effect

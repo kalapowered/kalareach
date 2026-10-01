@@ -5100,7 +5100,7 @@ fn kr_req_11_37_a_ledger_refusing_the_settlement_of_a_client_request_raises_the_
             "{outcome:?}: the interval is on record"
         );
         // A restart reads the intent as it is stored: recorded and not settled, which is a request
-        // whose bytes may have gone, and nothing sends it again.
+        // whose bytes may have gone.
         drop(broker);
         let reopened = Broker::open(Some(&store.path), session(), JournalHealth::shared())
             .expect("the broker opens again");

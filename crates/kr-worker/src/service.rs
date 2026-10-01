@@ -1332,6 +1332,11 @@ impl WorkerService {
                     // bell, a query whose answer would arrive at the wrong moment — into a terminal
                     // that was not there when any of it happened.
                     let live_from = restoration.as_ref().map_or(0, |joined| joined.cursor);
+                    // Whether a frame other than the gap has been written to this client: the first
+                    // such frame is what a client takes for the beginning of the stream.
+                    let mut opened = false;
+                    // The effect being written when a write failed, which is owed like the rest.
+                    let mut failed: Option<Arc<kr_term::sideeffect::SideEffect>> = None;
                     // Every way out of this block but the stream's own end (a detachment or the
                     // closure, which are the last things it carries) is followed by what is still
                     // owed to the terminal from the stream: see `settle_effects`.
@@ -1357,6 +1362,9 @@ impl WorkerService {
                             {
                                 break 'delivery;
                             }
+                            // A projected join has no bytes of its own: its screen is the events
+                            // that follow.
+                            opened = !joined.bytes.is_empty();
                         }
                         loop {
                             // Waiting for the next delivery is between two frames too, and a replaced
@@ -1397,14 +1405,18 @@ impl WorkerService {
                                 // effect the application caused after the attachment arrived is owed
                                 // to it whole.
                                 OutputDelivery::Effect(owed) => {
-                                    send_effect(
+                                    let sent = send_effect(
                                         &mut outlet,
                                         &stream_id,
                                         &mut sequence,
                                         owed.effect.at,
                                         &owed.bytes,
                                     )
-                                    .await
+                                    .await;
+                                    if !sent {
+                                        failed = Some(owed.effect);
+                                    }
+                                    sent
                                 }
                                 // A rendering is one screen at one cursor, however many frames it
                                 // takes: its cursor is the state it describes rather than an offset,
@@ -1550,6 +1562,7 @@ impl WorkerService {
                             if !written {
                                 break;
                             }
+                            opened = true;
                             // Released only now. Until the bytes have reached the peer they are still
                             // queued for it, which is what the bound is about.
                             stream.written(delivered);
@@ -1561,6 +1574,8 @@ impl WorkerService {
                         &mut sequence,
                         &mut stream,
                         &runtime,
+                        opened,
+                        failed.take(),
                     )
                     .await;
                     let _ = attachment_id;
@@ -7342,7 +7357,8 @@ struct Writing {
 /// Every frame of a delivery goes through here. [`Outlet::write`] passes both checks: the
 /// withdrawal, which stops a delivery wherever it stands, and the replacement, which stops it
 /// between two frames. [`Outlet::write_even_if_replaced`] passes the withdrawal only, and carries
-/// nothing but the keepalive that completes a closure notice.
+/// the keepalive that completes a closure notice and every frame of a side effect, which a
+/// replacement must not cut.
 #[derive(Debug)]
 struct Outlet {
     writable: Writing,
@@ -7368,8 +7384,8 @@ impl Outlet {
     }
 
     /// Writes one frame that belongs with the frame this delivery wrote last, whether or not the
-    /// delivery has been replaced since: the keepalive that completes a closure notice, and each
-    /// frame of a side effect after its first. A withdrawal still stops it.
+    /// delivery has been replaced since: the keepalive that completes a closure notice, and every
+    /// frame of a side effect. A withdrawal still stops it.
     async fn write_even_if_replaced(&self, frame: &ControlFrame) -> bool {
         write_frame(&self.writable, &self.writer, frame, &self.withdrawn, true).await
     }
@@ -7442,29 +7458,53 @@ async fn send_effect(
     true
 }
 
-/// Settles every side effect still queued on a stream whose delivery is ending.
+/// Settles every side effect a stream still owes when its delivery is ending.
 ///
-/// A delivery ends because its stream's producer has gone, because the connection or its authority
-/// has, or because a newer subscription replaced it. What is still on the stream was owed to the
-/// terminal when it was queued, and the replacement that ends the delivery draws the screen again
-/// but cannot give an effect back: a bell is on no screen. So the stream is closed, which refuses
-/// anything published to it from here, and what it holds is written in the order it was queued,
-/// each effect whole, until one cannot be written. That one and everything after it are recorded as
-/// host events, as is everything when nothing has been written on this stream yet: its first frame
-/// is the one a client takes for the beginning of a new stream, and an effect is not that. A
-/// delivery that is stopped where it stands, by a withdrawal or the end of its connection, does not
-/// run this.
+/// A delivery ends because its stream's producer has gone, because a write to its connection failed
+/// or its authority was withdrawn, or because a newer subscription replaced it. What is still on the
+/// stream was owed to the terminal when it was queued, and the replacement that ends the delivery
+/// draws the screen again but cannot give an effect back: a bell is on no screen. So the stream is
+/// closed, which refuses anything published to it from here, and read until it is empty, which
+/// includes a send that was under way when it closed. Each effect is written in the order it was
+/// queued, whole, until one cannot be written; that one and everything after it are recorded as host
+/// events. `failed` is the effect whose write failed in the delivery loop, and it comes first.
+///
+/// Nothing is written when `opened` is false, that is when no frame other than the gap has reached
+/// the client: its first frame is the one a client takes for the beginning of a stream, and an
+/// effect is not that, so every effect is recorded instead. A delivery that is aborted where it
+/// stands, because its connection has ended or its registration was withdrawn, does not run this.
 async fn settle_effects(
     outlet: &mut Outlet,
     stream_id: &StreamId,
     sequence: &mut u64,
     stream: &mut crate::output::OutputStream,
     runtime: &crate::runtime::SessionRuntime,
+    opened: bool,
+    failed: Option<Arc<kr_term::sideeffect::SideEffect>>,
 ) {
+    let mut abandoned = settle(outlet, stream_id, sequence, stream, opened, failed).await;
+    if !abandoned.is_empty() {
+        runtime.session().record_abandoned_effects(&mut abandoned);
+    }
+}
+
+/// Closes a stream and writes what it owes, and returns the effects it could not write, in order.
+async fn settle(
+    outlet: &mut Outlet,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    stream: &mut crate::output::OutputStream,
+    opened: bool,
+    failed: Option<Arc<kr_term::sideeffect::SideEffect>>,
+) -> Vec<Arc<kr_term::sideeffect::SideEffect>> {
     stream.close();
-    let mut writing = *sequence > 0;
+    let mut writing = opened;
     let mut abandoned: Vec<Arc<kr_term::sideeffect::SideEffect>> = Vec::new();
-    while let Some(delivery) = stream.try_recv() {
+    if let Some(failed) = failed {
+        writing = false;
+        abandoned.push(failed);
+    }
+    while let Some(delivery) = stream.recv().await {
         let OutputDelivery::Effect(owed) = delivery else {
             continue;
         };
@@ -7474,9 +7514,7 @@ async fn settle_effects(
         writing = false;
         abandoned.push(owed.effect);
     }
-    if !abandoned.is_empty() {
-        runtime.session().record_abandoned_effects(&mut abandoned);
-    }
+    abandoned
 }
 
 /// Writes a rendering of the canonical screen, in frames the control stream can carry.
@@ -7892,6 +7930,7 @@ mod tests {
         SemanticSnapshots, SnapshotReader, SnapshotReading, StreamId, Withdrawal, Writing,
         notification, send_stream, vouched_deadline, write_frame, write_frame_unless, write_within,
     };
+    use crate::output::OutputDelivery;
 
     /// One reader's snapshot of the instance numbered `number`.
     fn reading(reader: &str, number: u8) -> SnapshotReading {
@@ -8431,6 +8470,174 @@ mod tests {
             nothing.is_err(),
             "the peer receives no frame of a span whose authority has gone"
         );
+    }
+
+    /// An effect owed to the attachment `at` cursors, as a hub would queue it.
+    fn owed_bell(at: u64) -> crate::output::OwedEffect {
+        crate::output::OwedEffect {
+            effect: Arc::new(kr_term::sideeffect::SideEffect {
+                kind: kr_term::sideeffect::SideEffectKind::Bell,
+                destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+                at,
+            }),
+            bytes: Arc::new(vec![0x07]),
+        }
+    }
+
+    /// A hub with one subscriber holding the effects at `cursors`, and the subscriber's stream.
+    fn queued_effects(cursors: &[u64]) -> crate::output::OutputStream {
+        let attachment =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let mut hub = crate::output::OutputHub::new();
+        let stream = hub.subscribe(attachment, 1 << 20, crate::output::Presentation::Direct);
+        for cursor in cursors {
+            assert_eq!(
+                hub.publish_effect(attachment, &owed_bell(*cursor), 0),
+                crate::output::EffectOutcome::Queued
+            );
+        }
+        // The hub goes out of scope with its senders, as a subscriber the session removed would.
+        stream
+    }
+
+    fn cursors(effects: &[Arc<kr_term::sideeffect::SideEffect>]) -> Vec<u64> {
+        effects.iter().map(|effect| effect.at).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_that_opened_writes_the_effects_it_owes_in_order_even_when_replaced() {
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let (subscription, replaced) = tokio::sync::oneshot::channel();
+        drop(subscription);
+        let mut outlet = Outlet {
+            writable,
+            writer,
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced,
+        };
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let mut stream = queued_effects(&[4, 9, 12]);
+        let mut sequence = 5_u64;
+        let abandoned = super::settle(
+            &mut outlet,
+            &stream_id,
+            &mut sequence,
+            &mut stream,
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            abandoned.is_empty(),
+            "every effect was written: {abandoned:?}"
+        );
+        assert_eq!(sequence, 8, "three frames follow the five already written");
+        for cursor in [4_u64, 9, 12] {
+            let frame = reader
+                .read_message::<kr_protocol::envelope::ControlFrame>()
+                .await
+                .expect("a frame arrives");
+            let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
+                panic!("an effect is a notification: {frame:?}");
+            };
+            let event: kr_protocol::recovery::OutputEvent =
+                notification.payload.to_typed().expect("an output event");
+            assert_eq!(
+                (event.cursor.get(), event.bytes.as_slice()),
+                (cursor, &[0x07][..])
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_that_wrote_nothing_but_a_gap_records_every_effect_and_writes_none() {
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let (_subscription, replaced) = tokio::sync::oneshot::channel();
+        let mut outlet = Outlet {
+            writable,
+            writer,
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced,
+        };
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let mut stream = queued_effects(&[1, 2]);
+        let mut sequence = 1_u64;
+        let abandoned = super::settle(
+            &mut outlet,
+            &stream_id,
+            &mut sequence,
+            &mut stream,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(cursors(&abandoned), vec![1, 2]);
+        assert_eq!(sequence, 1, "nothing was written");
+        let nothing = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+        )
+        .await;
+        assert!(nothing.is_err(), "the peer was sent no frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_effect_whose_write_failed_is_recorded_first_and_so_is_every_one_after_it() {
+        let (_temp, writable, writer, _reader) = connected().await;
+        let (_subscription, replaced) = tokio::sync::oneshot::channel();
+        let mut outlet = Outlet {
+            writable,
+            writer,
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced,
+        };
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let mut stream = queued_effects(&[20, 30]);
+        let mut sequence = 3_u64;
+        let failed = owed_bell(10).effect;
+        // The connection's authority has been withdrawn, so every write stops.
+        outlet.withdrawn.set();
+        let abandoned = super::settle(
+            &mut outlet,
+            &stream_id,
+            &mut sequence,
+            &mut stream,
+            true,
+            Some(failed),
+        )
+        .await;
+        assert_eq!(
+            cursors(&abandoned),
+            vec![10, 20, 30],
+            "in the order they were owed"
+        );
+        assert_eq!(
+            sequence, 3,
+            "nothing is written after a write failed, so nothing is retried"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_effect_published_to_a_closed_stream_is_refused_and_what_was_queued_is_kept() {
+        let attachment =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
+        let mut hub = crate::output::OutputHub::new();
+        let mut stream = hub.subscribe(attachment, 1 << 20, crate::output::Presentation::Direct);
+        assert_eq!(
+            hub.publish_effect(attachment, &owed_bell(1), 0),
+            crate::output::EffectOutcome::Queued
+        );
+        stream.close();
+        assert_eq!(
+            hub.publish_effect(attachment, &owed_bell(2), 0),
+            crate::output::EffectOutcome::Refused,
+            "the producer learns that nobody is reading"
+        );
+        assert!(matches!(
+            stream.recv().await,
+            Some(OutputDelivery::Effect(owed)) if owed.effect.at == 1
+        ));
+        assert!(stream.recv().await.is_none(), "and the stream then ends");
     }
 
     /// The journal keeps what a detach was going to do, never the capability that asked for it.

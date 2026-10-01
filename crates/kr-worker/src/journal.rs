@@ -4143,6 +4143,90 @@ mod tests {
         }
     }
 
+    fn bell(at: u64) -> kr_term::sideeffect::SideEffect {
+        kr_term::sideeffect::SideEffect {
+            kind: kr_term::sideeffect::SideEffectKind::Bell,
+            destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+            at,
+        }
+    }
+
+    #[test]
+    fn host_events_recorded_together_are_one_transaction_in_the_order_given() {
+        let mut journal = Journal::in_memory().expect("opens");
+        let effects: Vec<_> = (0..50).map(bell).collect();
+        journal
+            .record_host_events(effects.iter(), TimestampMs::new(7))
+            .expect("records the batch");
+        let recorded: Vec<u64> = journal
+            .host_events()
+            .expect("reads")
+            .into_iter()
+            .map(|event| event.output_cursor)
+            .collect();
+        assert_eq!(recorded, (0..50).collect::<Vec<u64>>());
+        // Nothing to record is nothing recorded.
+        journal
+            .record_host_events(std::iter::empty(), TimestampMs::new(8))
+            .expect("records nothing");
+        assert_eq!(journal.host_events().expect("reads").len(), 50);
+
+        // A batch whose fourth event the store refuses leaves none of it behind: it was one
+        // transaction, and a row for each event committed on its own would have kept the first three.
+        journal
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_the_fourth BEFORE INSERT ON host_events
+                 WHEN NEW.output_cursor = 1003
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .expect("the trigger is made");
+        let batch: Vec<_> = (1_000..1_006).map(bell).collect();
+        journal
+            .record_host_events(batch.iter(), TimestampMs::new(9))
+            .expect_err("the store refuses one of them");
+        assert_eq!(
+            journal.host_events().expect("reads").len(),
+            50,
+            "none of the batch is recorded"
+        );
+    }
+
+    #[test]
+    fn a_batch_the_store_refuses_records_none_of_it_and_faults_the_journal() {
+        let mut journal = Journal::in_memory().expect("opens");
+        journal
+            .record_host_events([bell(1)].iter(), TimestampMs::new(1))
+            .expect("one is recorded");
+        assert!(journal.health().is_healthy());
+        journal
+            .connection
+            .execute_batch("PRAGMA query_only = ON;")
+            .expect("the store stops taking writes");
+        let refused = journal
+            .record_host_events([bell(2), bell(3)].iter(), TimestampMs::new(2))
+            .expect_err("the store refuses the batch");
+        assert_eq!(
+            refused.code(),
+            kr_protocol::error::ErrorCode::StorageUnavailable
+        );
+        assert!(
+            !journal.health().is_healthy(),
+            "and says so to everything that reads its condition"
+        );
+        journal
+            .connection
+            .execute_batch("PRAGMA query_only = OFF;")
+            .expect("the store takes writes again");
+        let recorded: Vec<u64> = journal
+            .host_events()
+            .expect("reads")
+            .into_iter()
+            .map(|event| event.output_cursor)
+            .collect();
+        assert_eq!(recorded, vec![1], "none of the refused batch is there");
+    }
+
     #[test]
     fn an_accepted_intent_is_committed_before_it_is_acknowledged() {
         let mut journal = Journal::in_memory().expect("opens");
