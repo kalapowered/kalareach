@@ -264,6 +264,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
         accepted: Option<AcceptedDeadline>,
         admitted: Option<AuthorityRevision>,
     ) -> ControlFrame {
@@ -683,7 +684,11 @@ impl Controller {
                 // The envelope this host built for the connection, not anything the caller sent.
                 // A refresh may open a bridge, and what may cross one is decided by this.
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.environment_record(&actor, mutation, method).await
+                // A connection that came over a process bridge has already crossed its one: the
+                // helper that made it refuses to carry a request that would open another, and this
+                // is the rule kept where only the destination can keep it.
+                self.environment_record(&actor, origin.is_some(), mutation, method)
+                    .await
             }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the

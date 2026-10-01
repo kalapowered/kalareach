@@ -23,7 +23,7 @@ use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
-use kr_protocol::local::{LocalClientKind, LocalHello, LocalHelloAck};
+use kr_protocol::local::{BridgeOrigin, LocalClientKind, LocalHello, LocalHelloAck};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
 use kr_protocol::worker::{
@@ -78,6 +78,32 @@ impl LocalClient {
         Self::connect_receiving(endpoint, kind, build_id, ReceiveLimits::default()).await
     }
 
+    /// Connects as the helper of a process bridge, on behalf of an invoker in another environment.
+    ///
+    /// The hello says where the invocation originally entered, so the host at this end knows the
+    /// connection arrived over a bridge and keeps the rules only it can keep. The declaration is a
+    /// record and a restriction and never authority: this host authenticates the connection by the
+    /// operating-system credentials of its peer, as it does for every local client.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LocalClient::connect`] returns, and the host's refusal of an origin it does
+    /// not admit.
+    pub async fn connect_for_bridge(
+        endpoint: &Endpoint,
+        build_id: BuildId,
+        origin: BridgeOrigin,
+    ) -> Result<Self> {
+        Self::connecting(
+            endpoint,
+            LocalClientKind::Cli,
+            build_id,
+            ReceiveLimits::default(),
+            Some(origin),
+        )
+        .await
+    }
+
     /// Connects and says this client can receive `max_receive`, rather than the usual limits.
     ///
     /// A host cuts what it answers to fit what the peer said it can receive, and a peer that can
@@ -94,7 +120,7 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
     ) -> Result<Self> {
-        Self::connecting(endpoint, kind, build_id, max_receive).await
+        Self::connecting(endpoint, kind, build_id, max_receive, None).await
     }
 
     #[cfg(not(feature = "testing"))]
@@ -104,7 +130,7 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
     ) -> Result<Self> {
-        Self::connecting(endpoint, kind, build_id, max_receive).await
+        Self::connecting(endpoint, kind, build_id, max_receive, None).await
     }
 
     async fn connecting(
@@ -112,6 +138,7 @@ impl LocalClient {
         kind: LocalClientKind,
         build_id: BuildId,
         max_receive: ReceiveLimits,
+        origin: Option<BridgeOrigin>,
     ) -> Result<Self> {
         let connection = Connection::connect(endpoint).await?;
         let (mut reader, mut writer) = split(connection, StreamKind::Control);
@@ -122,6 +149,7 @@ impl LocalClient {
                 client: kind,
                 capabilities: CanonicalSet::new(),
                 max_receive,
+                origin,
             }))
             .await?;
         // The acknowledgement is read before the client exists, so there is never a moment when a

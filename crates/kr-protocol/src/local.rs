@@ -9,6 +9,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::actor::ActorIngress;
 use crate::envelope::{MutationRequest, Request};
 use crate::hello::{ActionWindow, PACKAGE_VERSION, PackageVersion, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
@@ -72,6 +73,37 @@ pub struct LocalPeer {
     pub pid: Nullable<U64>,
 }
 
+/// Where a request that crossed a process bridge first entered, as the invoker declares it.
+///
+/// Section 3 has a request record the ingress it *originally* arrived on, `local_peer` or
+/// `network_device`, and not merely the local IPC hop the bridge's helper makes at the destination.
+/// A process bridge carries locally authenticated command-line invocations only, so the one
+/// ingress a destination admits here is [`ActorIngress::LocalIpc`] (`local_peer`); a declaration of
+/// any other is refused at the hello.
+///
+/// This is a record and a restriction, never authority. The destination authenticates the helper by
+/// its own operating-system credentials and issues its own action window and generation, and
+/// nothing in a declared origin widens what that connection may do. What it does is let the
+/// destination know that the connection arrived over a bridge, so that a rule only a destination
+/// can keep, such as a request crossing at most one bridge, is kept there and not left to the
+/// helper alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeOrigin {
+    /// The environment the invoker ran in.
+    pub environment_id: EnvironmentId,
+    /// The ingress the request originally arrived on.
+    pub ingress: ActorIngress,
+}
+
+impl BridgeOrigin {
+    /// Whether a destination admits a connection that declares this origin.
+    #[must_use]
+    pub const fn is_admissible(&self) -> bool {
+        self.ingress.may_cross_process_bridge()
+    }
+}
+
 /// The first frame a local client sends.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +118,15 @@ pub struct LocalHello {
     pub capabilities: CanonicalSet<CapabilityId>,
     /// The client's own receive limits.
     pub max_receive: ReceiveLimits,
+    /// Where this connection's requests originally entered, when it is a process bridge's helper
+    /// connecting on an invoker's behalf.
+    ///
+    /// Absent for every other client, and then omitted from the frame, so a hello that declares no
+    /// origin is the frame it always was and a process that outlived an upgrade still reads it. A
+    /// host or worker of a build before this member refuses a hello that carries one, which fails
+    /// closed. Absence is not a shape to be read two ways: it means the connection is not bridged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<BridgeOrigin>,
 }
 
 /// The first frame the host sends back.
@@ -447,9 +488,13 @@ pub struct ForwardedRequest {
 
 #[cfg(test)]
 mod tests {
+    use super::{BridgeOrigin, LocalClientKind, LocalHello};
+    use crate::actor::ActorIngress;
     use crate::envelope::{ControlFrame, ParamsValue, Request};
-    use crate::ids::RequestId;
+    use crate::hello::{PROTOCOL_VERSION, ReceiveLimits};
+    use crate::ids::{BuildId, EnvironmentId, RequestId};
     use crate::method::{Method, MethodVersion};
+    use crate::scalars::CanonicalSet;
 
     #[test]
     fn a_worker_states_the_clock_floor_it_maps_by_its_identity() {
@@ -817,5 +862,55 @@ mod tests {
             panic!("an answer to a hello is read as one");
         };
         assert_eq!(read_back.build, None);
+    }
+
+    fn a_hello(origin: Option<BridgeOrigin>) -> LocalHello {
+        LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: BuildId::new("kr/0.1.0").expect("a build identifier"),
+            client: LocalClientKind::Cli,
+            capabilities: CanonicalSet::new(),
+            max_receive: ReceiveLimits::default(),
+            origin,
+        }
+    }
+
+    /// KR-REQ-03.13: a hello that declares no origin is the frame it always was, and one that
+    /// declares an origin carries it and reads back as it was written.
+    #[test]
+    fn a_hello_without_an_origin_omits_it_and_one_with_an_origin_round_trips() {
+        let plain = a_hello(None);
+        let document = serde_json::to_value(&plain).expect("a document");
+        assert!(document.get("origin").is_none(), "{document}");
+
+        let bridged = a_hello(Some(BridgeOrigin {
+            environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
+            ingress: ActorIngress::LocalIpc,
+        }));
+        let frame = ControlFrame::Hello(bridged.clone());
+        let bytes = kr_cbor::to_canonical_vec(&frame).expect("encodes");
+        let read: ControlFrame =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+        assert_eq!(read, frame);
+        let plain_bytes = kr_cbor::to_canonical_vec(&ControlFrame::Hello(plain)).expect("encodes");
+        assert!(bytes.len() > plain_bytes.len(), "the origin is on the wire");
+    }
+
+    /// KR-REQ-03.13, KR-ACC-021: the one ingress a destination admits an origin for is the locally
+    /// authenticated one; every network ingress, a workflow and a plugin are refused.
+    #[test]
+    fn only_a_local_peer_is_an_admissible_origin() {
+        for ingress in ActorIngress::ALL.iter().copied() {
+            let origin = BridgeOrigin {
+                environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
+                ingress,
+            };
+            assert_eq!(
+                origin.is_admissible(),
+                ingress == ActorIngress::LocalIpc,
+                "{}",
+                ingress.as_str()
+            );
+        }
     }
 }

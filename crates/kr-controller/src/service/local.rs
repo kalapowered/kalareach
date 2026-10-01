@@ -201,6 +201,10 @@ impl Controller {
         let actor_id = ActorId::new(format!("{LOCAL_PRINCIPAL_PREFIX}{}", peer.uid))
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
         let mut negotiated = false;
+        // Where this connection's requests originally entered, when it is a process bridge's
+        // helper and said so in its hello. Kept for the life of the connection and never replaced:
+        // a connection says hello once.
+        let mut origin: Option<kr_protocol::local::BridgeOrigin> = None;
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the first one.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
@@ -235,7 +239,32 @@ impl Controller {
                 }
             };
             let reply = match frame {
+                // A connection says hello once. Admitting it again would let a connection that
+                // was admitted as a bridge's helper take its origin off, or a controller's
+                // registration be replaced by a client's, so a second hello is answered and
+                // changes nothing.
+                ControlFrame::Hello(_) if negotiated => error_reply(
+                    RequestId::new(0),
+                    ErrorCode::UnsupportedSchema,
+                    "this connection has already negotiated; open another one to change client",
+                ),
                 ControlFrame::Hello(hello) => {
+                    // An origin is something only a bridge's helper has, and only for an
+                    // invocation that was locally authenticated where it started. Anything else is
+                    // refused here, on this side, whatever the helper checked before connecting.
+                    if let Some(declared) = hello.origin.as_ref()
+                        && (hello.client != kr_protocol::local::LocalClientKind::Cli
+                            || !declared.is_admissible())
+                    {
+                        let refusal = error_reply(
+                            RequestId::new(0),
+                            ErrorCode::PermissionDenied,
+                            "a process bridge carries locally authenticated invocations only, \
+                             and only a command-line client may declare where one began",
+                        );
+                        let _ = writer.write_message(&refusal).await;
+                        break;
+                    }
                     // A peer that says it can hold no outstanding mutation at all is refused
                     // rather than quietly read as one. The worker's endpoint refuses the same
                     // offer, and a limit this host would then ignore is worse than a refusal.
@@ -271,6 +300,7 @@ impl Controller {
                             }
                         }
                         negotiated = true;
+                        origin = hello.origin;
                         let Ok(window) = self.issue_window(connection_id) else {
                             break;
                         };
@@ -377,7 +407,9 @@ impl Controller {
                 }
                 ControlFrame::Mutation(mutation) if negotiated => {
                     let confirm = mutation.action_id;
-                    let reply = self.perform(&actor_id, connection_id, *mutation).await;
+                    let reply = self
+                        .perform(&actor_id, connection_id, origin, *mutation)
+                        .await;
                     // The acceptance reaches the caller here. A worker that is holding a close for
                     // this action learns that it has, and only then starts signalling.
                     if writer.write_message(&reply).await.is_err() {
@@ -410,6 +442,7 @@ impl Controller {
         self: &Arc<Self>,
         actor_id: &ActorId,
         connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
         mutation: MutationRequest,
     ) -> ControlFrame {
         // Receipt time, recorded before anything this daemon then waits for. Section 9 measures a
@@ -517,6 +550,7 @@ impl Controller {
                     &mutation,
                     method,
                     connection_id,
+                    origin,
                     accepted,
                     admitted,
                 )

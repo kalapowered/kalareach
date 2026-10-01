@@ -307,39 +307,56 @@ impl World {
         if !self.destination_answers() {
             return;
         }
-        let target = ReleaseName::new("0.0.0+000000000000").expect("a release name");
-        let prepared: HostUpdateHandoverResult = self.ask(
-            Method::HostUpdateHandover,
-            &HostUpdateHandoverParams {
-                step: HandoverStep::Prepare,
-                target: target.clone(),
-                attempt: kr_protocol::scalars::Nullable::null(),
-            },
-        );
         let endpoint = self
             .destination
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        on_a_thread_of_its_own(async {
-            if let Ok(mut client) =
+        let environment = self.destination.environment_id();
+        on_a_thread_of_its_own(async move {
+            let target = ReleaseName::new("0.0.0+000000000000").expect("a release name");
+            let Ok(mut client) =
                 LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
-            {
-                let _ = client
-                    .mutate(
-                        Method::HostUpdateHandover,
-                        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-                        kr_protocol::envelope::ActionTarget::environment(
-                            self.destination.environment_id(),
-                        ),
-                        &HostUpdateHandoverParams {
-                            step: HandoverStep::Stop,
-                            target,
-                            attempt: prepared.attempt,
-                        },
-                    )
-                    .await;
-            }
+            else {
+                return;
+            };
+            let step = |step: HandoverStep, attempt| {
+                (
+                    kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                    HostUpdateHandoverParams {
+                        step,
+                        target: target.clone(),
+                        attempt,
+                    },
+                )
+            };
+            let (action, params) = step(
+                HandoverStep::Prepare,
+                kr_protocol::scalars::Nullable::null(),
+            );
+            let Ok(Ok(prepared)) = client
+                .mutate(
+                    Method::HostUpdateHandover,
+                    action,
+                    kr_protocol::envelope::ActionTarget::environment(environment),
+                    &params,
+                )
+                .await
+            else {
+                return;
+            };
+            let Ok(prepared) = prepared.to_typed::<HostUpdateHandoverResult>() else {
+                return;
+            };
+            let (action, params) = step(HandoverStep::Stop, prepared.attempt);
+            let _ = client
+                .mutate(
+                    Method::HostUpdateHandover,
+                    action,
+                    kr_protocol::envelope::ActionTarget::environment(environment),
+                    &params,
+                )
+                .await;
         });
         let started = Instant::now();
         while self.destination_answers() && started.elapsed() < Duration::from_secs(30) {

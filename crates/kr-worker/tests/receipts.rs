@@ -3097,6 +3097,7 @@ async fn a_connection_that_admits_no_mutation_is_refused_at_the_handshake() {
                 max_outstanding_mutations: U64::new(0),
                 ..kr_protocol::hello::ReceiveLimits::default()
             },
+            origin: None,
         }))
         .await
         .expect("writes the hello");
