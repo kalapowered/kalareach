@@ -23,7 +23,10 @@
     "test:android-classes": "node scripts/android-classes-selftest.mjs",
     "identifiers": "node scripts/identifiers.mjs",
     "test:identifiers": "node scripts/identifiers-selftest.mjs",
-    "test:preview": "node scripts/preview-selftest.mjs"
+    "test:preview": "node scripts/preview-selftest.mjs",
+    "debug-code": "node scripts/debug-code.mjs",
+    "test:debug-code": "node scripts/debug-code-selftest.mjs",
+    "test:firebase-configuration": "node scripts/firebase-configuration-selftest.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",

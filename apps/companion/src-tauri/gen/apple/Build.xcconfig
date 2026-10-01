@@ -1,0 +1,16 @@
+// Settings this machine adds to a build.
+//
+// The Firebase configuration and the signing choices belong to whoever builds, not to this
+// repository, so they come from `Local.xcconfig`, which the repository ignores and a build reads
+// when it exists. A build with no such file is the build the repository describes: the same
+// settings on the command line of `xcodebuild` take precedence over it.
+//
+//   KR_GOOGLE_SERVICE_INFO   the path of this account's GoogleService-Info.plist
+//   KR_SIGN_STYLE            Manual, to sign with the profiles below; Automatic otherwise
+//   KR_SIGN_IDENTITY         the signing identity
+//   KR_SIGN_FLAGS            extra flags for codesign, such as --keychain <file>
+//   KR_APP_PROFILE           the provisioning profile of the application
+//   KR_EXTENSION_PROFILE     the provisioning profile of the notification extension
+//   KR_RUNNER_PROFILE        the provisioning profile of the device test runner
+
+#include? "Local.xcconfig"
