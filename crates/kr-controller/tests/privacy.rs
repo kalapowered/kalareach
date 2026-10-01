@@ -1489,6 +1489,171 @@ async fn kr_req_24_28_a_pending_question_and_approval_are_still_answered_and_the
 }
 
 // ---------------------------------------------------------------------------------------------
+// KR-REQ-18.08: a delivery of an item whose words are a session's record carries none of them
+// ---------------------------------------------------------------------------------------------
+
+/// A gateway that takes every notification it is given and keeps the bodies it was asked to
+/// deliver, on this machine's loopback interface and nowhere else.
+#[derive(Debug, Default)]
+struct TakingGateway {
+    bodies: Mutex<Vec<Vec<u8>>>,
+}
+
+impl kr_client::services::ServiceHttp for TakingGateway {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        let request: PushDeliveryRequest = serde_json::from_slice(body).expect("a request");
+        self.bodies
+            .lock()
+            .expect("not poisoned")
+            .push(body.to_vec());
+        let answer = serde_json::json!({
+            "ok": true,
+            "data": PushDeliveryAck {
+                decided_at_ms: now(),
+                notification_id: request.notification_id,
+                state: PushDeliveryState::Queued,
+                suppression: Nullable::null(),
+            },
+        });
+        Box::pin(async move {
+            Ok(kr_client::services::ServiceHttpAnswer {
+                status: 200,
+                body: serde_json::to_vec(&answer).expect("an answer"),
+            })
+        })
+    }
+}
+
+/// Every origin reached through one transport.
+#[derive(Debug)]
+struct OneGateway(Arc<TakingGateway>);
+
+impl kr_controller::push::transport::DeliveryTransports for OneGateway {
+    fn to(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
+        Ok(Arc::clone(&self.0) as Arc<dyn kr_client::services::ServiceHttp>)
+    }
+}
+
+/// KR-REQ-18.08, KR-REQ-16.13: a question asked inside a session is an item whose words are the
+/// session's own record, which the attention store keeps no copy of. When the daemon delivers it
+/// to a paired device, the journal's files and the preview the device opens hold none of the
+/// words: the notice carries the host's own words, and for a question there are none. The premise
+/// is read back from the store: the item's text is where to read the question, not the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_18_08_a_delivered_question_leaves_none_of_the_sessions_words_in_the_journal_or_the_preview()
+ {
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    let worker = &environment.worker;
+    let controller = environment.controller();
+    let phone = environment
+        .raw_device(reaching(&[ActionRight::SessionView]))
+        .await;
+    let preview_key = NotificationPreviewKeyPair::generate().expect("a keypair");
+    let sender = PushSenderRecordId::new(Uuid::from_bytes([0x51; 16]));
+    controller
+        .delivery()
+        .configure(&DestinationRecord {
+            id: DestinationId::new(phone.record.device_id.to_string()).expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(Uuid::from_bytes([0x52; 16])),
+                sender_record_id: sender,
+                preview_keys: PreviewKeys::only(*preview_key.public(), 1),
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: Some(phone.record.grant.grant_id),
+            }),
+            enabled: true,
+            configured_at_ms: now(),
+        })
+        .expect("a destination");
+    let current = kr_ipc::now_ms().get();
+    controller
+        .delivery_runtime()
+        .credentials()
+        .hold(PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(current + 29 * 24 * 60 * 60 * 1000),
+            issued_at_ms: TimestampMs::new(current - 1_000),
+            sender_record_id: sender,
+            ..credential(0)
+        });
+    let gateway = Arc::new(TakingGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneGateway(Arc::clone(&gateway)))));
+
+    let _asked = worker.ask("deploy-1", WORDS);
+    until("the question being delivered", || {
+        !gateway.bodies.lock().expect("not poisoned").is_empty()
+    })
+    .await;
+
+    // The premise: the question is in the store as an item whose text is a record of the session.
+    let reads_from_the_record = controller
+        .attention()
+        .take_for_delivery(|store, _| {
+            store
+                .engine()
+                .expect("the store is this owner's")
+                .items()
+                .filter(|item| item.rule == AttentionRule::PendingInput)
+                .all(|item| matches!(item.text, kr_attention::engine::Text::Record(_)))
+        })
+        .expect("the store is taken");
+    assert!(reads_from_the_record);
+
+    let body = gateway.bodies.lock().expect("not poisoned")[0].clone();
+    let request: PushDeliveryRequest = serde_json::from_slice(&body).expect("a request");
+    let host_preview = controller
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let opened = kr_delivery::preview::open_preview(
+        &preview_key,
+        &host_preview,
+        request.preview.as_ref().expect("a preview"),
+        kr_ipc::now_ms().get(),
+    )
+    .expect("the device opens its own preview");
+    assert_eq!(
+        opened.summary, "",
+        "the host has no words of its own for a question"
+    );
+    assert!(!format!("{opened:?}").contains(WORDS));
+    let state = environment
+        .host
+        .tree()
+        .environment()
+        .state_dir()
+        .to_path_buf();
+    for name in [
+        "delivery.sqlite3",
+        "delivery.sqlite3-wal",
+        "delivery.sqlite3-shm",
+    ] {
+        let Ok(bytes) = std::fs::read(state.join(name)) else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows(WORDS.len())
+                .any(|window| window == WORDS.as_bytes()),
+            "{name} holds the question"
+        );
+    }
+    environment.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // KR-REQ-23.34, KR-REQ-22.17 and KR-REQ-24.14: the session's name at both doors
 // ---------------------------------------------------------------------------------------------
 
