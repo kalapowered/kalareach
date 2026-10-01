@@ -24,10 +24,15 @@
 //! A value with a quote that never closes cannot be told apart from the rest of the field, so the
 //! whole field is withheld, as its length. So is a field with a credential name and a value in it
 //! and a quote open at its end, an apostrophe in a path that nothing closed: every quote after it
-//! reads the other way, and where a value ends cannot be told. A value that starts in a quote is
-//! read both as part of that quote and as a word of its own, and ends where the later reading ends;
-//! where only one of the two finds a close, so that the readings cannot be told apart, the field is
-//! withheld as well.
+//! reads the other way, and where a value ends cannot be told.
+//!
+//! Where a value ends is read from the quote state the text has where it starts, reading the text
+//! from its start as a shell does. Without a quote open, the value is a word. In a quote that an
+//! argument opened (one that starts the text, or follows whitespace or the `=` of an assignment),
+//! such as `"PASSWORD=two words"` or the script of `sh -c`, it runs to the quote that closes the
+//! argument. In a quote that opened anywhere else, an apostrophe in `/Users/Tom's x`, the text
+//! that follows reads the other way round and where a value ends cannot be told: the field is
+//! withheld. So no value is cut short by a quote read the wrong way.
 //!
 //! # What a name says
 //!
@@ -169,7 +174,7 @@ fn credentials(text: &str) -> Option<String> {
     // A quote that is open at the end of the text, an apostrophe in a path that nothing closed,
     // turns every quote after it the other way, so where a credential's value ends cannot be told:
     // with a credential name and a value in the text, the field is withheld.
-    if !named.is_empty() && quote_at(text, text.len()).is_some() {
+    if !named.is_empty() && open_quote_at(text, text.len()).is_some() {
         return None;
     }
     let mut spans = named;
@@ -327,35 +332,43 @@ fn step(
     false
 }
 
-/// The quote that is open at `position`, reading the text from its start as a shell reads it.
-fn quote_at(text: &str, position: usize) -> Option<char> {
+/// The quote that is open at `position` and the offset where it opened, reading the text from its
+/// start as a shell reads it.
+fn open_quote_at(text: &str, position: usize) -> Option<(char, usize)> {
     let mut open = None;
+    let mut opened = 0;
     let mut characters = text[..position].char_indices();
-    while let Some((_, character)) = characters.next() {
+    while let Some((offset, character)) = characters.next() {
+        let before = open;
         step(&mut open, character, &mut characters);
+        if before.is_none() && open.is_some() {
+            opened = offset;
+        }
     }
-    open
+    open.map(|quote| (quote, opened))
 }
 
-/// Where the value that starts at `start` ends.
-///
-/// The quote that is open at `start` is read from the start of the text, and an apostrophe in a path
-/// (`/Users/Tom's x TOKEN='a b' y/o'neil`) can turn it the other way round where the value is a
-/// quoted word of its own. So a value that starts in a quote is read both ways, as a shell reads it
-/// from that quote ([`value_end_in`]: the argument `"PASSWORD=two words"`, the script of
-/// `sh -c "tool --password \"a b\""`) and as the word it is ([`value_end`]), and ends where the
-/// later reading ends, so neither shortens the other. When the word reading finds a quote that
-/// never closes before the end of the argument reading, the readings cannot be told apart and the
-/// field is withheld; a quote it finds open at that end, or after it, is the argument's own
-/// closing quote (`curl "https://h/?token=x"`) and says nothing about the value.
+/// Whether the quote at `offset` opens an argument: it starts the text, follows whitespace, or
+/// follows the `=` of an assignment (`FOO="a b"`). A quote anywhere else is a character of the
+/// word it is in, such as the apostrophe of `Tom's`: what it opens is not an argument.
+fn opens_an_argument(text: &str, offset: usize) -> bool {
+    text[..offset]
+        .chars()
+        .next_back()
+        .is_none_or(|before| matches!(before, ' ' | '\t' | '\n' | '='))
+}
+
+/// Where the value that starts at `start` ends, read from the quote state the text has there: a
+/// word where no quote is open ([`value_end`]), the rest of the argument where an argument's quote
+/// is ([`value_end_in`]), and `None` where a quote that no argument opened is, because the text
+/// after it reads the other way round and nothing says where the value ends.
 fn value_end_from(text: &str, start: usize) -> Option<usize> {
-    let Some(outer) = quote_at(text, start) else {
-        return value_end(text, start);
-    };
-    let inside = value_end_in(text, start, outer)?;
-    match value_end(text, start) {
-        Some(word) => Some(inside.max(word)),
-        None => value_end(&text[..inside], start).map(|_| inside),
+    match open_quote_at(text, start) {
+        None => value_end(text, start),
+        Some((quote, opened)) if opens_an_argument(text, opened) => {
+            value_end_in(text, start, quote)
+        }
+        Some(_) => None,
     }
 }
 
