@@ -23,6 +23,7 @@ struct Hooks {
     catalogue: Catalogue,
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
+    free_space: Arc<Mutex<Option<u64>>>,
     abandon: bool,
 }
 
@@ -34,6 +35,7 @@ pub struct Placed {
     key: PathBuf,
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
+    free_space: Arc<Mutex<Option<u64>>>,
 }
 
 /// Places the description process at `program`, told `environment`, choosing from `catalogue`,
@@ -52,6 +54,7 @@ pub fn place(
     let key = canonical(state_dir);
     let skew_ms = Arc::new(AtomicU64::new(0));
     let conditions = Arc::new(Mutex::new(conditions));
+    let free_space = Arc::new(Mutex::new(None));
     PLACED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -63,6 +66,7 @@ pub fn place(
                 catalogue,
                 skew_ms: Arc::clone(&skew_ms),
                 conditions: Arc::clone(&conditions),
+                free_space: Arc::clone(&free_space),
                 abandon,
             },
         );
@@ -70,6 +74,7 @@ pub fn place(
         key,
         skew_ms,
         conditions,
+        free_space,
     }
 }
 
@@ -77,6 +82,14 @@ impl Placed {
     /// Moves the host's clocks forward by `ms`, and returns how far they are moved in all.
     pub fn advance(&self, ms: u64) -> u64 {
         self.skew_ms.fetch_add(ms, Ordering::AcqRel) + ms
+    }
+
+    /// Says how much room the disk has, in place of the disk's own, from now on.
+    pub fn set_free_space(&self, bytes: Option<u64>) {
+        *self
+            .free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = bytes;
     }
 
     /// Sets the conditions the host reads from now on.
@@ -115,5 +128,61 @@ pub(crate) fn placement_for(state_dir: &Path) -> Option<Placement> {
         clock: Clock::skewed(hooks.skew_ms),
         conditions: Some(hooks.conditions),
         abandon: hooks.abandon,
+        free_space: Some(hooks.free_space),
     })
+}
+
+/// Puts a profile's files in the daemon's model directory and marks them held, as a completed
+/// fetch leaves them: `files` are each file's name and its contents.
+///
+/// # Panics
+///
+/// Panics when a file cannot be written.
+pub fn hold_assets(state_dir: &Path, catalogue: &Catalogue, files: &[(&str, &[u8])]) {
+    let profile = selected(catalogue);
+    let models = super::host::models_dir(state_dir);
+    let here = super::assets::directory(&models, &profile);
+    std::fs::create_dir_all(&here).expect("the model directory");
+    for (name, contents) in files {
+        std::fs::write(here.join(name), contents).expect("a model file");
+    }
+    super::assets::mark_held(&models, &profile).expect("the marker");
+}
+
+/// As [`hold_assets`], for files that already exist and are too large to hold in memory: each file
+/// is a link to the one at the path it is given.
+///
+/// # Panics
+///
+/// Panics when a link cannot be made.
+pub fn link_assets(state_dir: &Path, catalogue: &Catalogue, files: &[(&str, &Path)]) {
+    let profile = selected(catalogue);
+    let models = super::host::models_dir(state_dir);
+    let here = super::assets::directory(&models, &profile);
+    std::fs::create_dir_all(&here).expect("the model directory");
+    for (name, target) in files {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, here.join(name)).expect("a link to a model file");
+        #[cfg(not(unix))]
+        std::fs::hard_link(target, here.join(name)).expect("a link to a model file");
+    }
+    super::assets::mark_held(&models, &profile).expect("the marker");
+}
+
+/// Where a profile's files are kept under the daemon whose state directory this is.
+#[must_use]
+pub fn assets_directory(state_dir: &Path, catalogue: &Catalogue) -> PathBuf {
+    super::assets::directory(&super::host::models_dir(state_dir), &selected(catalogue))
+}
+
+/// The profile the daemon selects from `catalogue` on this host.
+fn selected(catalogue: &Catalogue) -> kr_describe::profile::ModelProfile {
+    catalogue
+        .select(
+            kr_describe::environment::build_target(),
+            &kr_describe::profile::catalogue::MetGates::default(),
+        )
+        .profile()
+        .expect("the catalogue selects a profile")
+        .clone()
 }

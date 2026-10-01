@@ -16,8 +16,9 @@
 
 mod net_support;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kr_controller::registry::{Registry, WorkerRecord};
@@ -34,6 +35,7 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attention::{AttentionItem, AttentionReadParams, AttentionReadResult};
 use kr_protocol::describe::{
+    DescriptionDownload, DescriptionDownloadAction, DescriptionDownloadParams,
     DescriptionFreshness, DescriptionPause, DescriptionState, LabelSource, SessionDescribeParams,
     SessionDescribeResult,
 };
@@ -341,6 +343,19 @@ struct Setup {
     conditions: HostConditions,
     /// Whether the process is left running when the daemon's host stops.
     abandon: bool,
+    /// The profiles the daemon and the process choose from, when a test needs its own.
+    catalogue: Option<TestCatalogue>,
+    /// Whether the model's files are on this host when the daemon starts.
+    held: bool,
+    /// The real description process in place of the stub, which then chooses from the profiles
+    /// this build ships, and the files that are linked in as the model's.
+    real: Option<Real>,
+}
+
+/// The real description process, and the files linked in place of the model's.
+struct Real {
+    program: PathBuf,
+    files: Vec<(String, PathBuf)>,
 }
 
 impl Setup {
@@ -350,9 +365,18 @@ impl Setup {
             sessions: 1,
             conditions: roomy(),
             abandon: false,
+            catalogue: None,
+            held: true,
+            real: None,
         }
     }
 }
+
+/// What the default profile's one file holds.
+const WEIGHTS: &[u8] = b"the weights of a tiny model";
+
+/// The file's name.
+const WEIGHTS_FILE: &str = "tiny.gguf";
 
 fn roomy() -> HostConditions {
     HostConditions::measured(
@@ -372,11 +396,215 @@ fn catalogue() -> TestCatalogue {
         candidate: false,
         targets: Some(vec![kr_describe::environment::build_target().to_owned()]),
         assets: vec![TestAsset {
-            file_name: "tiny.gguf".to_owned(),
+            file_name: WEIGHTS_FILE.to_owned(),
             url: "http://127.0.0.1:1/tiny.gguf".to_owned(),
-            bytes: b"the weights of a tiny model".to_vec(),
+            bytes: WEIGHTS.to_vec(),
         }],
     }])
+}
+
+/// A catalogue whose one profile is at `revision` and whose one file `contents` is fetched from
+/// `url`.
+fn catalogue_at(revision: u64, url: String, contents: &[u8]) -> TestCatalogue {
+    TestCatalogue::sign(&[TestProfile {
+        profile_id: "tiny-default".to_owned(),
+        revision,
+        candidate: false,
+        targets: Some(vec![kr_describe::environment::build_target().to_owned()]),
+        assets: vec![TestAsset {
+            file_name: WEIGHTS_FILE.to_owned(),
+            url,
+            bytes: contents.to_vec(),
+        }],
+    }])
+}
+
+// ---------------------------------------------------------------------------------------------
+// A server the model's files are fetched from
+// ---------------------------------------------------------------------------------------------
+
+/// What the fixture answers a request for a path with.
+#[derive(Clone, Debug)]
+enum Reply {
+    /// The whole body, with its length declared.
+    Body(Vec<u8>),
+    /// A length declared at `declared` bytes, and then as much of `body` as there is.
+    Declares { declared: u64, body: Vec<u8> },
+    /// No length declared, and `body` sent in chunks.
+    Chunked(Vec<u8>),
+    /// The whole length declared, half of the body sent, and then nothing until the client leaves.
+    HalfThenHold(Vec<u8>),
+}
+
+/// A local HTTP server that answers each path the way a test says, and records what was asked.
+struct Fixture {
+    address: std::net::SocketAddr,
+    replies: Arc<Mutex<BTreeMap<String, Reply>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+    half_sent: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Fixture {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port");
+        let address = listener.local_addr().expect("its address");
+        let replies = Arc::new(Mutex::new(BTreeMap::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let half_sent = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let (replies, requests, half_sent) = (
+                Arc::clone(&replies),
+                Arc::clone(&requests),
+                Arc::clone(&half_sent),
+            );
+            async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(Self::serve(
+                        stream,
+                        Arc::clone(&replies),
+                        Arc::clone(&requests),
+                        Arc::clone(&half_sent),
+                    ));
+                }
+            }
+        });
+        Self {
+            address,
+            replies,
+            requests,
+            half_sent,
+            task,
+        }
+    }
+
+    async fn serve(
+        mut stream: tokio::net::TcpStream,
+        replies: Arc<Mutex<BTreeMap<String, Reply>>>,
+        requests: Arc<Mutex<Vec<String>>>,
+        half_sent: Arc<tokio::sync::Notify>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut seen = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => seen.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        let path = text
+            .lines()
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .unwrap_or("/")
+            .to_owned();
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.clone());
+        let reply = replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&path)
+            .cloned();
+        let ok = |length: u64| {
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n")
+        };
+        let _ = match reply {
+            None => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+            }
+            Some(Reply::Body(body)) => {
+                stream
+                    .write_all(ok(body.len() as u64).as_bytes())
+                    .await
+                    .ok();
+                stream.write_all(&body).await
+            }
+            Some(Reply::Declares { declared, body }) => {
+                stream.write_all(ok(declared).as_bytes()).await.ok();
+                stream.write_all(&body).await
+            }
+            Some(Reply::Chunked(body)) => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .ok();
+                for piece in body.chunks(8) {
+                    stream
+                        .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
+                        .await
+                        .ok();
+                    stream.write_all(piece).await.ok();
+                    stream.write_all(b"\r\n").await.ok();
+                }
+                stream.write_all(b"0\r\n\r\n").await
+            }
+            Some(Reply::HalfThenHold(body)) => {
+                stream
+                    .write_all(ok(body.len() as u64).as_bytes())
+                    .await
+                    .ok();
+                stream.write_all(&body[..body.len() / 2]).await.ok();
+                stream.flush().await.ok();
+                half_sent.notify_one();
+                // Held until the client leaves: reading answers nothing but its end.
+                let _ = stream.read(&mut chunk).await;
+                return;
+            }
+        };
+        let _ = stream.shutdown().await;
+    }
+
+    /// Answers `path` with `reply` from now on.
+    fn reply(&self, path: &str, reply: Reply) {
+        self.replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_owned(), reply);
+    }
+
+    /// The address a catalogue names for a file at `path`.
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.address)
+    }
+
+    /// The host and port a fetch from here reaches, as setup shows it.
+    fn source(&self) -> String {
+        self.address.to_string()
+    }
+
+    /// Every path that has been asked for, in order.
+    fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Waits until a reply of [`Reply::HalfThenHold`] has sent its half.
+    async fn until_half_sent(&self) {
+        tokio::time::timeout(PATIENCE, self.half_sent.notified())
+            .await
+            .expect("half of a body was sent in time");
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// A daemon with its workers, and the stub it starts.
@@ -386,6 +614,8 @@ struct Environment {
     placed: kr_controller::describe::hooks::Placed,
     runtime_dir: PathBuf,
     state_dir: PathBuf,
+    /// The profiles the daemon chooses from.
+    catalogue: kr_describe::Catalogue,
 }
 
 impl Environment {
@@ -396,30 +626,57 @@ impl Environment {
         let tree = stopped.tree();
         let state_dir = tree.environment().state_dir().to_path_buf();
         let runtime_dir = tree.environment().runtime_dir().to_path_buf();
-        // The stub, on the internal disk, started once so the operating system has checked it.
-        let stub = tree.root().join("kr-stub-inference");
-        kr_ipc::testing::place_and_start_once(
-            std::path::Path::new(env!("CARGO_BIN_EXE_kr-stub-inference")),
-            &stub,
-            &["--version"],
-        );
-        let signed = catalogue();
-        let bundle = tree.root().join("catalogue.json");
-        signed.write_to(&bundle);
-        let mut script = setup.script;
-        script.mark_start = true;
-        script.mark_work = true;
+        // The process, on the internal disk, started once so the operating system has checked it:
+        // the stub, or the real one a run names.
+        let program = tree.root().join("kr-stub-inference");
+        let (source, selected, environment) = match &setup.real {
+            Some(real) => (
+                real.program.clone(),
+                kr_describe::Catalogue::builtin().expect("the profiles this build ships"),
+                Vec::new(),
+            ),
+            None => {
+                let signed = setup.catalogue.unwrap_or_else(catalogue);
+                let bundle = tree.root().join("catalogue.json");
+                signed.write_to(&bundle);
+                let mut script = setup.script;
+                script.mark_start = true;
+                script.mark_work = true;
+                (
+                    PathBuf::from(env!("CARGO_BIN_EXE_kr-stub-inference")),
+                    signed.catalogue(),
+                    vec![
+                        (SCRIPT_VARIABLE.into(), script.to_env().into()),
+                        (CATALOGUE_VARIABLE.into(), bundle.into()),
+                    ],
+                )
+            }
+        };
+        kr_ipc::testing::place_and_start_once(&source, &program, &["--version"]);
         let placed = kr_controller::describe::hooks::place(
             &state_dir,
-            stub,
-            vec![
-                (SCRIPT_VARIABLE.into(), script.to_env().into()),
-                (CATALOGUE_VARIABLE.into(), bundle.into()),
-            ],
-            signed.catalogue(),
+            program,
+            environment,
+            selected.clone(),
             setup.conditions,
             setup.abandon,
         );
+        match (&setup.real, setup.held) {
+            (Some(real), true) => {
+                let files: Vec<(&str, &std::path::Path)> = real
+                    .files
+                    .iter()
+                    .map(|(name, path)| (name.as_str(), path.as_path()))
+                    .collect();
+                kr_controller::describe::hooks::link_assets(&state_dir, &selected, &files);
+            }
+            (None, true) => kr_controller::describe::hooks::hold_assets(
+                &state_dir,
+                &selected,
+                &[(WEIGHTS_FILE, WEIGHTS)],
+            ),
+            (_, false) => {}
+        }
         let mut workers = Vec::new();
         for display in 1..=setup.sessions as u64 {
             workers.push(Worker::start(tree, display).await);
@@ -432,6 +689,7 @@ impl Environment {
             placed,
             runtime_dir,
             state_dir,
+            catalogue: selected,
         };
         for worker in &environment.workers {
             environment.until_adopted(worker.session_id).await;
@@ -491,7 +749,19 @@ impl Environment {
         session_id: SessionId,
         holds: impl Fn(&SessionDescribeResult) -> bool,
     ) -> SessionDescribeResult {
-        let deadline = tokio::time::Instant::now() + PATIENCE;
+        self.describe_within(PATIENCE, what, session_id, holds)
+            .await
+    }
+
+    /// Reads the session until `holds` says it does, or `patience` runs out.
+    async fn describe_within(
+        &self,
+        patience: Duration,
+        what: &str,
+        session_id: SessionId,
+        holds: impl Fn(&SessionDescribeResult) -> bool,
+    ) -> SessionDescribeResult {
+        let deadline = tokio::time::Instant::now() + patience;
         loop {
             let described = self.describe(session_id).await;
             if holds(&described) {
@@ -541,6 +811,69 @@ impl Environment {
             .count()
     }
 
+    /// Starts or cancels the fetch of the model's files at the daemon's local socket.
+    async fn download(
+        &self,
+        action: DescriptionDownloadAction,
+    ) -> kr_protocol::describe::DescriptionSetup {
+        let mut client = self.host.client().await;
+        client
+            .mutate(
+                Method::DescriptionDownload,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.environment_id()),
+                &DescriptionDownloadParams { action },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the fetch is started or cancelled")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Reads what setup shows until `holds` says it does, or the patience runs out.
+    async fn setup_until(
+        &self,
+        what: &str,
+        holds: impl Fn(&kr_protocol::describe::DescriptionSetup) -> bool,
+    ) -> kr_protocol::describe::DescriptionSetup {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let shown = self.setup().await;
+            if holds(&shown) {
+                return shown;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen: {shown:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Where the daemon keeps the files of the profile it selected.
+    fn files(&self) -> PathBuf {
+        kr_controller::describe::hooks::assets_directory(&self.state_dir, &self.catalogue)
+    }
+
+    /// The names in the files' directory that are still being fetched.
+    fn partials(&self) -> Vec<String> {
+        std::fs::read_dir(self.files())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".partial"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the marker that says the files are held is on disk.
+    fn marker(&self) -> bool {
+        self.files().join("held.json").exists()
+    }
+
     /// Stops the daemon and starts another on the same tree, which finds the workers still running.
     async fn restart(self) -> Self {
         let Self {
@@ -549,6 +882,7 @@ impl Environment {
             placed,
             runtime_dir,
             state_dir,
+            catalogue,
         } = self;
         let host = host.restart().await;
         let environment = Self {
@@ -557,6 +891,55 @@ impl Environment {
             placed,
             runtime_dir,
             state_dir,
+            catalogue,
+        };
+        for worker in &environment.workers {
+            environment.until_adopted(worker.session_id).await;
+        }
+        environment
+    }
+
+    /// Stops the daemon and starts another on the same tree with other profiles to choose from,
+    /// which finds the workers still running and the stub told of the same profiles.
+    async fn restart_with(self, script: Script, signed: TestCatalogue, abandon: bool) -> Self {
+        let Self {
+            host,
+            workers,
+            placed,
+            runtime_dir,
+            state_dir,
+            catalogue: _,
+        } = self;
+        let stopped = host.shut_down().await;
+        let tree = stopped.tree();
+        let stub = tree.root().join("kr-stub-inference");
+        let bundle = tree.root().join("catalogue.json");
+        signed.write_to(&bundle);
+        let mut script = script;
+        script.mark_start = true;
+        script.mark_work = true;
+        // The new placement replaces the old one under the same state directory.
+        drop(placed);
+        let placed = kr_controller::describe::hooks::place(
+            &state_dir,
+            stub,
+            vec![
+                (SCRIPT_VARIABLE.into(), script.to_env().into()),
+                (CATALOGUE_VARIABLE.into(), bundle.into()),
+            ],
+            signed.catalogue(),
+            roomy(),
+            abandon,
+        );
+        let settings = stopped.settings().clone();
+        let host = stopped.start(settings).await;
+        let environment = Self {
+            host,
+            workers,
+            placed,
+            runtime_dir,
+            state_dir,
+            catalogue: signed.catalogue(),
         };
         for worker in &environment.workers {
             environment.until_adopted(worker.session_id).await;
@@ -1546,5 +1929,663 @@ async fn the_display_shows_the_age_of_a_waiting_job_and_the_time_of_the_last_suc
         })
         .await;
     assert_eq!(second.source, LabelSource::Generated);
+    environment.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The model's files: fetched on request, checked, kept, and found again
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-22.01: nothing is fetched until the owner asks, and setup shows the exact size and the
+/// address first. A session is shown its title from metadata while the files are not here. The
+/// fetch writes the file, has the description process check it, keeps it with a marker and no
+/// partial left, and the process that checked goes with the check: no process lingers and nothing
+/// was loaded. Then the same session is described by the model, in a process of its own, and a
+/// daemon that replaces this one finds the marker and fetches nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_begins_only_when_asked_and_leaves_checked_files_and_no_process_behind() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        script: Script {
+            mark_loads: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+
+    let shown = environment.setup().await;
+    assert!(shown.offered && shown.enabled);
+    assert_eq!(shown.asset_bytes.get(), 27, "the exact size, first");
+    assert_eq!(shown.sources, vec![fixture.source()]);
+    assert_eq!(shown.download, DescriptionDownload::NotStarted);
+    assert_eq!(shown.paused.0, Some(DescriptionPause::NotDownloaded));
+    assert!(!shown.needs_hosted_account);
+
+    // A session is shown its title from metadata, and nothing asks for a file or a process.
+    let titled = environment
+        .describe_until("the title from metadata", session_id, |described| {
+            described.paused.0 == Some(DescriptionPause::NotDownloaded)
+        })
+        .await;
+    assert_eq!(titled.source, LabelSource::Metadata);
+    assert!(fixture.requests().is_empty(), "nothing is fetched unasked");
+    assert_eq!(environment.figures().started, 0);
+    assert!(!environment.marker() && environment.partials().is_empty());
+
+    // Asked for: the answer shows the fetch, and then the files are here.
+    let started = environment.download(DescriptionDownloadAction::Start).await;
+    assert!(
+        matches!(
+            started.download,
+            DescriptionDownload::Running | DescriptionDownload::Verified
+        ),
+        "{started:?}"
+    );
+    let done = environment
+        .setup_until("the fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert_eq!(done.fetched_bytes.get(), 27);
+    assert_eq!(fixture.requests(), vec!["/tiny.gguf".to_owned()]);
+    assert_eq!(
+        std::fs::read(environment.files().join(WEIGHTS_FILE)).expect("the file"),
+        WEIGHTS
+    );
+    assert!(environment.marker(), "the files are marked held");
+    assert!(environment.partials().is_empty(), "no partial is left");
+
+    // The process that checked went with the check, and nothing was loaded.
+    until("no process left behind", || {
+        environment.figures().pid.is_none()
+    })
+    .await;
+    assert!(environment.began("check"), "the process checked the file");
+    assert_eq!(environment.loaded(), 0);
+    assert_eq!(environment.figures().mapped, 0);
+
+    // Now the model describes the session, in a process of its own.
+    environment.workers[0].report("make", "/home/a/other", None);
+    let described = environment
+        .describe_until("the generated description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(described.paused.0, None);
+    assert_eq!(environment.loaded(), 1);
+    assert_eq!(
+        environment.figures().started,
+        2,
+        "one to check, one to load"
+    );
+
+    // Asked for again while the files are held, nothing is fetched and nothing is taken away.
+    let held = environment.download(DescriptionDownloadAction::Start).await;
+    assert_eq!(held.download, DescriptionDownload::Verified);
+    assert_eq!(
+        fixture.requests().len(),
+        1,
+        "held files are not fetched again"
+    );
+    assert!(environment.marker());
+
+    // A daemon that replaces this one finds the marker and fetches nothing.
+    let environment = environment.restart().await;
+    let again = environment.setup().await;
+    assert_eq!(again.download, DescriptionDownload::Verified);
+    assert_eq!(again.paused.0, None);
+    assert_eq!(fixture.requests().len(), 1, "nothing is fetched again");
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: cancelling a fetch while its body is arriving stops it and deletes what it had
+/// written, and no file of the profile is left. A fetch asked for afterwards starts from nothing
+/// and completes. The server holds half the body until the client leaves, so only the cancellation
+/// ends the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_cancelled_mid_body_leaves_no_file_and_a_new_fetch_starts_from_nothing() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    let started = environment.download(DescriptionDownloadAction::Start).await;
+    assert_eq!(started.download, DescriptionDownload::Running);
+    assert!(started.can_cancel);
+    fixture.until_half_sent().await;
+    until("the partial file", || !environment.partials().is_empty()).await;
+
+    let cancelled = environment
+        .download(DescriptionDownloadAction::Cancel)
+        .await;
+    assert!(
+        matches!(
+            cancelled.download,
+            DescriptionDownload::Running | DescriptionDownload::Cancelled
+        ),
+        "{cancelled:?}"
+    );
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(environment.partials().is_empty(), "what it wrote is gone");
+    assert!(!environment.files().join(WEIGHTS_FILE).exists());
+    assert!(!environment.marker());
+    assert_eq!(environment.figures().started, 0, "no process was needed");
+
+    // The control: a fetch asked for afterwards completes.
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the second fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert!(environment.marker());
+    assert_eq!(fixture.requests().len(), 2);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: turning descriptions off stops a running fetch, as it stops the other work in
+/// flight, and what it had written is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_descriptions_off_stops_a_running_fetch() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.download(DescriptionDownloadAction::Start).await;
+    fixture.until_half_sent().await;
+    until("the partial file", || !environment.partials().is_empty()).await;
+
+    let off = environment.configure(Some(false), None).await;
+    assert!(!off.enabled);
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(environment.partials().is_empty());
+    assert!(!environment.files().join(WEIGHTS_FILE).exists());
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01, KR-REQ-22.09: a body larger than the profile records fails the fetch, whether the
+/// server declares the size or sends the body in chunks, and so does a body of the recorded size
+/// that is not the profile's file, which the description process finds when it checks it. Each
+/// leaves no file, no partial and no marker, and no process behind. The control is the file the
+/// profile records, which is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_is_too_large_or_not_the_profiles_fails_the_fetch_and_keeps_nothing() {
+    let fixture = Fixture::start().await;
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    let mut oversize = WEIGHTS.to_vec();
+    oversize.extend_from_slice(b" and some more, which the profile does not record");
+    let cases = [
+        (
+            "a declared size past the profile's",
+            Reply::Declares {
+                declared: oversize.len() as u64,
+                body: WEIGHTS.to_vec(),
+            },
+            "27 bytes",
+        ),
+        (
+            "a chunked body past the profile's",
+            Reply::Chunked(oversize),
+            "more than the 27 bytes",
+        ),
+        (
+            "a body of the recorded size that is another file",
+            Reply::Body(b"the weights of a tiny molde".to_vec()),
+            "is not the file the profile records",
+        ),
+    ];
+    for (case, reply, said) in cases {
+        fixture.reply("/tiny.gguf", reply);
+        environment.download(DescriptionDownloadAction::Start).await;
+        let failed = environment
+            .setup_until(case, |shown| shown.download == DescriptionDownload::Failed)
+            .await;
+        let why = failed.failure.0.expect("it says how it failed");
+        assert!(why.contains(said), "{case}: {why}");
+        assert!(
+            !environment.files().join(WEIGHTS_FILE).exists(),
+            "{case}: no file is kept"
+        );
+        assert!(environment.partials().is_empty(), "{case}");
+        assert!(!environment.marker(), "{case}");
+        until("no process left behind", || {
+            environment.figures().pid.is_none()
+        })
+        .await;
+        assert_eq!(environment.loaded(), 0, "{case}");
+    }
+    assert_eq!(fixture.requests().len(), 3);
+
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the right file verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert!(environment.marker());
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a fetch of a profile of two files that fails on the second leaves neither behind,
+/// the one it had already checked and put in place included: nothing of a profile is kept unless
+/// every file of it is. The control is the same fetch with the right second file, which keeps both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_that_fails_on_a_later_file_leaves_none_of_the_earlier_ones() {
+    let fixture = Fixture::start().await;
+    let second = b"a second file".to_vec();
+    let signed = TestCatalogue::sign(&[TestProfile {
+        profile_id: "tiny-default".to_owned(),
+        revision: 1,
+        candidate: false,
+        targets: Some(vec![kr_describe::environment::build_target().to_owned()]),
+        assets: vec![
+            TestAsset {
+                file_name: WEIGHTS_FILE.to_owned(),
+                url: fixture.url("/tiny.gguf"),
+                bytes: WEIGHTS.to_vec(),
+            },
+            TestAsset {
+                file_name: "second.bin".to_owned(),
+                url: fixture.url("/second.bin"),
+                bytes: second.clone(),
+            },
+        ],
+    }]);
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    fixture.reply("/second.bin", Reply::Body(b"a second flle".to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(signed),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    environment.download(DescriptionDownloadAction::Start).await;
+    let failed = environment
+        .setup_until("the failure", |shown| {
+            shown.download == DescriptionDownload::Failed
+        })
+        .await;
+    assert!(
+        failed
+            .failure
+            .0
+            .is_some_and(|why| why.contains("second.bin")),
+        "it names the file"
+    );
+    assert_eq!(fixture.requests(), vec!["/tiny.gguf", "/second.bin"]);
+    assert!(!environment.files().join(WEIGHTS_FILE).exists());
+    assert!(!environment.files().join("second.bin").exists());
+    assert!(environment.partials().is_empty());
+    assert!(!environment.marker());
+
+    fixture.reply("/second.bin", Reply::Body(second.clone()));
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("both files verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert_eq!(
+        std::fs::read(environment.files().join("second.bin")).expect("the second file"),
+        second
+    );
+    assert!(environment.files().join(WEIGHTS_FILE).exists());
+    assert!(environment.marker());
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a fetch that would not fit on the disk is refused before any request is made, and
+/// says how much room it needed. The control is the same fetch with room, which is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_that_would_not_fit_is_refused_before_any_request() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    // Room for the file and not for the margin beside it.
+    environment.placed.set_free_space(Some(1_000));
+    environment.download(DescriptionDownloadAction::Start).await;
+    let refused = environment
+        .setup_until("the refusal", |shown| {
+            shown.download == DescriptionDownload::Failed
+        })
+        .await;
+    let why = refused.failure.0.expect("it says why");
+    assert!(
+        why.contains("1000 bytes free") && why.contains("27 bytes"),
+        "{why}"
+    );
+    assert!(fixture.requests().is_empty(), "no request was made");
+    assert!(!environment.files().join(WEIGHTS_FILE).exists());
+
+    environment.placed.set_free_space(Some(64 * GIB));
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the fetch with room", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert_eq!(fixture.requests().len(), 1);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01, KR-REQ-22.09: a file that is changed after it was kept is refused by the process
+/// at the load, and that is no failure of inference: the session keeps its title from metadata,
+/// setup shows nothing fetched and the model's files as missing, the marker is gone, no restart is
+/// counted, and a new fetch recovers it. The control is the same host before the file was changed,
+/// which describes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_refused_for_a_changed_file_clears_the_marker_and_a_new_fetch_recovers() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        script: Script {
+            verify_on_load: true,
+            mark_loads: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    assert!(environment.marker());
+    // The file is changed under a daemon that has not loaded it yet.
+    std::fs::write(
+        environment.files().join(WEIGHTS_FILE),
+        b"the weights of a tiny molde",
+    )
+    .expect("the file is changed");
+
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let shown = environment
+        .setup_until("the files shown as missing", |shown| {
+            shown.paused.0 == Some(DescriptionPause::NotDownloaded)
+        })
+        .await;
+    assert_eq!(shown.download, DescriptionDownload::NotStarted);
+    until("the marker gone", || !environment.marker()).await;
+    let titled = environment.describe(session_id).await;
+    assert_eq!(titled.source, LabelSource::Metadata);
+    assert_eq!(environment.figures().restarts, 0, "no failure of inference");
+    assert_eq!(environment.loaded(), 0);
+    assert!(!environment.figures().assets_held);
+
+    // A new fetch recovers it, and the session is described.
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the recovery", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert_eq!(
+        std::fs::read(environment.files().join(WEIGHTS_FILE)).expect("the file"),
+        WEIGHTS
+    );
+    environment.workers[0].report("make", "/home/a/other", None);
+    environment
+        .describe_until("the generated description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(environment.loaded(), 1);
+    assert_eq!(environment.figures().restarts, 0);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.03: a daemon replaced by one whose catalogue has the profile at a new revision does
+/// not take the old files for the new revision's: setup shows nothing fetched and the files as
+/// missing, and the description from before is stale. After the new revision is fetched the new
+/// daemon loads it, but only once the old process has gone, so there is never a second mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_catalogue_is_fetched_afresh_and_loads_only_once_the_old_process_has_gone() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let script = Script {
+        mark_loads: true,
+        ..Script::default()
+    };
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        script: script.clone(),
+        abandon: true,
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    environment
+        .describe_until("the first description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    let old = environment.figures().pid.expect("the old process runs");
+    assert_eq!(environment.loaded(), 1);
+
+    let environment = environment
+        .restart_with(
+            script,
+            catalogue_at(2, fixture.url("/tiny.gguf"), WEIGHTS),
+            false,
+        )
+        .await;
+    assert!(
+        Environment::alive(old),
+        "the old process outlives its daemon"
+    );
+    let shown = environment.setup().await;
+    assert_eq!(shown.download, DescriptionDownload::NotStarted);
+    assert_eq!(shown.paused.0, Some(DescriptionPause::NotDownloaded));
+    assert!(
+        !environment.marker(),
+        "the old revision's files are not this one's"
+    );
+    let carried = environment.describe(session_id).await;
+    assert_eq!(carried.source, LabelSource::Generated);
+    assert_eq!(carried.freshness, DescriptionFreshness::Stale);
+
+    // The new revision is fetched; its process is told to load, and waits for the old one's lock.
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the new revision fetched", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    environment.workers[0].report("make", "/home/a/other", None);
+    until("the new process finding the lock held", || {
+        environment.began("lock-held")
+    })
+    .await;
+    assert!(Environment::alive(old));
+    assert_eq!(
+        environment.loaded(),
+        1,
+        "no second mapping while the old process lives"
+    );
+    assert_eq!(environment.figures().jobs.published, 0);
+
+    Environment::end(old);
+    until("the new process describing", || {
+        environment.figures().jobs.published >= 1
+    })
+    .await;
+    assert_eq!(environment.loaded(), 2);
+    let after = environment.describe(session_id).await;
+    assert_eq!(after.freshness, DescriptionFreshness::Current);
+    environment.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real description process
+// ---------------------------------------------------------------------------------------------
+
+/// The real description process this run names, or a failure that says how to name one: a run that
+/// asked for the real process and has none does not pass.
+fn real_process() -> PathBuf {
+    std::env::var_os("KR_DESCRIBE_INFERENCE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "KR_DESCRIBE_INFERENCE names no executable: build kr-describe-inference with \
+                 `cargo build -p kr-describe-model --bin kr-describe-inference` and name the file"
+            )
+        })
+}
+
+/// A host with room for the real model, so the policy admits it and the test is about the process.
+fn real_conditions() -> HostConditions {
+    HostConditions::measured(
+        64 * GIB,
+        48 * GIB,
+        PowerSource::Mains,
+        ThermalState::Nominal,
+    )
+}
+
+/// The default profile this build ships, and its weights file.
+fn shipped_weights() -> (kr_describe::profile::Asset, kr_describe::Catalogue) {
+    let catalogue = kr_describe::Catalogue::builtin().expect("the profiles this build ships");
+    let weights = catalogue
+        .default_profile()
+        .assets()
+        .iter()
+        .find(|asset| asset.role == "weights")
+        .expect("the profile names its weights")
+        .clone();
+    (weights, catalogue)
+}
+
+/// KR-REQ-22.01, KR-REQ-22.09: the real description process refuses, at the daemon's load, a file
+/// of the recorded size that is not the profile's, and the host answers as it does for the stub:
+/// the model's files are shown as missing, the marker is gone, the session keeps its title from
+/// metadata and no failure of inference is counted. The file is sparse, so no weights are needed.
+///
+/// It runs with `--ignored` and names the executable in `KR_DESCRIBE_INFERENCE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real description process that KR_DESCRIBE_INFERENCE names; it runs with --ignored"]
+async fn the_real_process_refuses_a_file_that_is_not_the_profiles_and_the_host_shows_it_missing() {
+    let program = real_process();
+    let (weights, _) = shipped_weights();
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let sparse = directory.path().join(&weights.file_name);
+    std::fs::File::create(&sparse)
+        .and_then(|file| file.set_len(weights.bytes))
+        .expect("a sparse file of the recorded size");
+    let environment = Environment::start(Setup {
+        real: Some(Real {
+            program,
+            files: vec![(weights.file_name.clone(), sparse)],
+        }),
+        conditions: real_conditions(),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    assert!(environment.marker());
+
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let shown = environment
+        .setup_until("the files shown as missing", |shown| {
+            shown.paused.0 == Some(DescriptionPause::NotDownloaded)
+        })
+        .await;
+    assert_eq!(shown.download, DescriptionDownload::NotStarted);
+    until("the marker gone", || !environment.marker()).await;
+    assert_eq!(
+        environment.describe(session_id).await.source,
+        LabelSource::Metadata
+    );
+    assert_eq!(environment.figures().restarts, 0, "no failure of inference");
+    environment.stop().await;
+}
+
+/// KR-REQ-22.05, KR-REQ-22.14: the real description process, with the real weights, describes a
+/// session the daemon serves, in one process with one mapping, and the description is labelled as
+/// generated. The weights are the ones the benchmark keeps (`KR_DESCRIBE_MODEL_CACHE`, or the
+/// platform's cache directory), linked in and never written.
+///
+/// It runs with `--ignored` and names the executable in `KR_DESCRIBE_INFERENCE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the real description process that KR_DESCRIBE_INFERENCE names and the real weights; it runs with --ignored"]
+async fn the_real_process_describes_a_session_from_the_real_weights() {
+    let program = real_process();
+    let (weights, _) = shipped_weights();
+    let cache = std::env::var_os("KR_DESCRIBE_MODEL_CACHE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            Some(if cfg!(target_os = "macos") {
+                home.join("Library/Caches/kalareach-describe")
+            } else {
+                home.join(".cache/kalareach-describe")
+            })
+        })
+        .expect("a cache directory");
+    let cached = cache.join(&weights.file_name);
+    assert_eq!(
+        std::fs::metadata(&cached).map(|about| about.len()).ok(),
+        Some(weights.bytes),
+        "the real weights are not at {}; fill the cache with scripts/bench-descriptions.sh",
+        cached.display()
+    );
+    let environment = Environment::start(Setup {
+        real: Some(Real {
+            program,
+            files: vec![(weights.file_name.clone(), cached)],
+        }),
+        conditions: real_conditions(),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let described = environment
+        .describe_within(
+            Duration::from_secs(900),
+            "the real model's description",
+            session_id,
+            |described| described.source == LabelSource::Generated,
+        )
+        .await;
+    assert_eq!(described.paused.0, None);
+    assert_eq!(environment.figures().mapped, 1, "one mapping");
+    assert_eq!(environment.figures().started, 1, "one process");
     environment.stop().await;
 }

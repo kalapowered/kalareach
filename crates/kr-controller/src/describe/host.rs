@@ -40,13 +40,17 @@ use std::time::Duration;
 use kr_describe::context::{ContextBinding, ContextSignal, ProjectText, SemanticEvent};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::privacy::PublishGate;
+use kr_describe::profile::ModelProfile;
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::queue::{Freshness, Priority};
 use kr_describe::resource::{HostConditions, PauseReason, ResourceSettings, ResourceState, Signal};
-use kr_describe::service::{DescriptionService, Handles, HostPlacement, PublicationGate};
+use kr_describe::service::{
+    DescriptionService, DownloadProgress, Handles, HostPlacement, PublicationGate,
+};
 use kr_describe::store::DescriptionStore;
-use kr_describe::supervise::{Driver, Launch, Waker};
+use kr_describe::supervise::{Check, Checked, Driver, Launch, Report, Waker};
 use kr_describe::time::Reading;
+use kr_describe::wire::VerifyResult;
 use kr_protocol::describe::{
     DescriptionCompletion, DescriptionEventKind, DescriptionFactsPage, DescriptionFreshness,
     DescriptionPause, DescriptionState,
@@ -71,6 +75,9 @@ const CONDITIONS_EVERY: Duration = Duration::from_secs(10);
 /// than leaving the last answer in force.
 const CONDITIONS_MAX_AGE_MS: u64 = 60_000;
 
+/// Where the identifiers of checks begin: well apart from the service's own, which count from one.
+const CHECK_IDS_FROM: u64 = 1 << 40;
+
 /// What the daemon says to the host.
 #[derive(Debug)]
 enum Message {
@@ -91,9 +98,34 @@ enum Message {
     Purge { done: SyncSender<()> },
     /// Something the host reads changed: the privacy state, a clock a test moved, the conditions.
     Wake,
+    /// How a fetch of the model's files is going, and answer when the host has taken it, when
+    /// asked to.
+    Download {
+        progress: DownloadProgress,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Whether this host holds the model's files.
+    Assets { held: bool },
+    /// Have the process check a file, and send what it says.
+    Check {
+        request: CheckRequest,
+        reply: tokio::sync::oneshot::Sender<Checked>,
+    },
+    /// Stop the check that is waiting or running.
+    CancelCheck,
     /// Fails the host's thread, for this crate's own tests of what a failing thread leaves behind.
     #[cfg(test)]
     Fail,
+}
+
+/// A file the process is to check against the size and digest its profile records.
+#[derive(Debug)]
+pub(crate) struct CheckRequest {
+    pub profile_id: String,
+    pub revision: u64,
+    pub file_name: String,
+    pub path: PathBuf,
+    pub deadline_ms: u64,
 }
 
 /// What the host publishes about the service after each turn, for a reader of `session.describe`.
@@ -137,6 +169,8 @@ pub struct Figures {
     pub loading: bool,
     /// Whether every publication is held under privacy mode's admission.
     pub gated: bool,
+    /// Whether this host holds the model's files.
+    pub assets_held: bool,
     /// The host's own clock as its last turn read it, in milliseconds: a turn that began after a
     /// moment reads a time at or past it.
     pub read_at_ms: u64,
@@ -189,6 +223,8 @@ pub(crate) struct Setup {
     /// Whether the process is left running when the host stops, as a daemon that hung would leave
     /// it. Only this crate's tests ask for it.
     pub abandon: bool,
+    /// The room a test says the disk has, in place of the disk's own.
+    pub free_space: Option<Arc<Mutex<Option<u64>>>>,
 }
 
 /// What the rest of the daemon holds of the host.
@@ -214,6 +250,29 @@ struct Shared {
     running: AtomicBool,
     /// The newest reading of the host's own conditions, and when it was taken.
     reading: Mutex<Option<Taken>>,
+    files: Files,
+}
+
+/// Where the model's files are kept and what the fetch of them needs of the host.
+#[derive(Debug, Default)]
+struct Files {
+    models: PathBuf,
+    /// The profile the host selected, whose files these are.
+    profile: Option<ModelProfile>,
+    /// The room a test says the disk has.
+    free_space: Option<Arc<Mutex<Option<u64>>>>,
+    /// The identifiers the host gives the checks it has made.
+    next_check: AtomicU64,
+}
+
+/// What the host's thread keeps of the model's files: whether the marker is on disk, the check
+/// waiting for the process, the one the process has, and who is to be told when a turn is done.
+#[derive(Debug, Default)]
+struct Held {
+    marker: bool,
+    pending: Option<(Check, tokio::sync::oneshot::Sender<Checked>)>,
+    awaiting: Option<(u64, tokio::sync::oneshot::Sender<Checked>)>,
+    acks: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// One reading of the host's own conditions.
@@ -243,6 +302,7 @@ impl DescribeHost {
             privacy,
             conditions,
             abandon,
+            free_space,
         } = setup;
         let started_wall_ms = clock.now().wall_ms().get();
         let store = DescriptionStore::open(&state_dir).map_err(ControllerError::registry)?;
@@ -265,6 +325,19 @@ impl DescribeHost {
         service.set_publication_gate(Box::new(Admission {
             privacy: privacy.clone(),
         }));
+        // The files the selected profile needs are held when the marker says so and each is there:
+        // until they are, nothing is loaded, and a session is shown its title from metadata.
+        let models = models_dir(&state_dir);
+        let profile = service.selection().profile().cloned();
+        let files_held = profile
+            .as_ref()
+            .is_some_and(|profile| super::assets::held(&models, profile));
+        if profile.is_some() {
+            service.set_assets_held(files_held);
+            if files_held {
+                service.note_download(DownloadProgress::Verified);
+            }
+        }
         let driver = Driver::new(service, launch, build);
         let (tell, inbox) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
@@ -277,6 +350,12 @@ impl DescribeHost {
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             reading: Mutex::new(None),
+            files: Files {
+                models,
+                profile,
+                free_space,
+                next_check: AtomicU64::new(CHECK_IDS_FROM),
+            },
         });
         // The conditions are read on a thread of their own: a platform reading can spawn a program,
         // and nothing here waits on one.
@@ -314,6 +393,10 @@ impl DescribeHost {
                         last_event: BTreeMap::new(),
                         started_wall_ms,
                         abandon,
+                        held: Held {
+                            marker: files_held,
+                            ..Held::default()
+                        },
                     }
                     .run();
                 })
@@ -355,6 +438,63 @@ impl DescribeHost {
     /// Wakes the host: something it reads changed.
     pub(crate) fn wake(&self) {
         self.post(Message::Wake);
+    }
+
+    /// Where the model's files are kept.
+    pub(crate) fn models(&self) -> &Path {
+        &self.shared.files.models
+    }
+
+    /// The profile whose files this host keeps, when it has selected one.
+    pub(crate) fn profile(&self) -> Option<&ModelProfile> {
+        self.shared.files.profile.as_ref()
+    }
+
+    /// The bytes free on the disk that holds `path`, when it can be said.
+    pub(crate) fn free_space(&self, path: &Path) -> Option<u64> {
+        match &self.shared.files.free_space {
+            Some(held) => *held.lock().unwrap_or_else(PoisonError::into_inner),
+            None => kr_describe::resource::platform::free_space(path),
+        }
+    }
+
+    /// Tells the host how a fetch is going.
+    pub(crate) fn progress(&self, progress: DownloadProgress) {
+        self.post(Message::Download {
+            progress,
+            done: None,
+        });
+    }
+
+    /// Tells the host how a fetch is going, and returns what completes once the host has taken it
+    /// and published it.
+    pub(crate) fn progress_and_wait(
+        &self,
+        progress: DownloadProgress,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (done, taken) = tokio::sync::oneshot::channel();
+        self.post(Message::Download {
+            progress,
+            done: Some(done),
+        });
+        taken
+    }
+
+    /// Tells the host whether the model's files are held.
+    pub(crate) fn assets_held(&self, held: bool) {
+        self.post(Message::Assets { held });
+    }
+
+    /// Has the process check a file, and returns what completes with what it says.
+    pub(crate) fn check(&self, request: CheckRequest) -> tokio::sync::oneshot::Receiver<Checked> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.post(Message::Check { request, reply });
+        answer
+    }
+
+    /// Stops the check that is waiting or running.
+    pub(crate) fn cancel_check(&self) {
+        self.post(Message::CancelCheck);
     }
 
     /// Tells the host a session exists, and that its worker may be read.
@@ -557,6 +697,8 @@ struct Thread {
     started_wall_ms: u64,
     /// Whether the process is left running when this thread ends.
     abandon: bool,
+    /// What it keeps of the model's files.
+    held: Held,
 }
 
 impl Thread {
@@ -571,8 +713,14 @@ impl Thread {
             self.take_pages(now);
             self.settle_sessions(now);
             let conditions = self.conditions();
-            let _ = self.driver.turn(&conditions, now);
+            let reports = self.driver.turn(&conditions, now).unwrap_or_default();
+            self.answer_checks(reports);
+            self.offer_check(now);
+            self.sync_marker();
             self.publish_snapshot(now);
+            for done in std::mem::take(&mut self.held.acks) {
+                let _ = done.send(());
+            }
             let wait = self.next_wait(now);
             self.driver.wait(wait);
         }
@@ -649,6 +797,43 @@ impl Thread {
                     let _ = done.send(());
                 }
                 Message::Wake => {}
+                Message::Download { progress, done } => {
+                    self.driver.service_mut().note_download(progress);
+                    // Told once the turn has published what it took, so the answer the caller
+                    // builds next shows it.
+                    self.held.acks.extend(done);
+                }
+                Message::Assets { held } => {
+                    self.driver.service_mut().set_assets_held(held);
+                }
+                Message::Check { request, reply } => {
+                    let id = self.shared.files.next_check.fetch_add(1, Ordering::AcqRel);
+                    // One at a time: a check that was waiting is replaced, and told it was
+                    // cancelled, as the fetch that asked for it has been replaced too.
+                    if let Some((_, older)) = self.held.pending.take() {
+                        let _ = older.send(cancelled_check());
+                    }
+                    self.held.pending = Some((
+                        Check {
+                            id,
+                            profile_id: request.profile_id,
+                            revision: request.revision,
+                            file_name: request.file_name,
+                            path: request.path,
+                            deadline_ms: request.deadline_ms,
+                        },
+                        reply,
+                    ));
+                }
+                Message::CancelCheck => {
+                    if let Some((_, reply)) = self.held.pending.take() {
+                        let _ = reply.send(cancelled_check());
+                    }
+                    if self.held.awaiting.is_some() {
+                        let reports = self.driver.cancel_check(now).unwrap_or_default();
+                        self.answer_checks(reports);
+                    }
+                }
                 #[cfg(test)]
                 Message::Fail => panic!("the host's thread fails, as a test asked"),
             }
@@ -675,6 +860,67 @@ impl Thread {
                 .fence
                 .raise(session_id, published.generation);
             self.shared.handles.running.cancel(&session_id);
+        }
+    }
+
+    /// Sends what the process said of the check the host was waiting on, when one ended.
+    fn answer_checks(&mut self, reports: Vec<Report>) {
+        for report in reports {
+            if let Report::Checked { id, checked } = report
+                && self
+                    .held
+                    .awaiting
+                    .as_ref()
+                    .is_some_and(|(awaited, _)| *awaited == id)
+                && let Some((_, reply)) = self.held.awaiting.take()
+            {
+                let _ = reply.send(checked);
+            }
+        }
+    }
+
+    /// Hands the check that is waiting to the process once it can take one: a check is refused
+    /// behind work, and tried again at the next turn, which the end of that work wakes.
+    fn offer_check(&mut self, now: Reading) {
+        if self.held.awaiting.is_some() {
+            return;
+        }
+        let Some((check, reply)) = self.held.pending.take() else {
+            return;
+        };
+        let id = check.id;
+        match self.driver.verify(&check, now) {
+            Ok(reports) => {
+                let refused = reports.iter().any(|report| {
+                    matches!(
+                        report,
+                        Report::Checked { id: refused, checked: Checked::Refused } if *refused == id
+                    )
+                });
+                if refused {
+                    self.held.pending = Some((check, reply));
+                } else {
+                    self.held.awaiting = Some((id, reply));
+                    self.answer_checks(reports);
+                }
+            }
+            // The store could not be written: the check is not made, and its asker is told so by
+            // the reply ending unsent.
+            Err(_) => drop(reply),
+        }
+    }
+
+    /// Keeps the marker on disk as the service has the files: gone when they are not held.
+    fn sync_marker(&mut self) {
+        let held = self.driver.service().assets_held();
+        if self.held.marker && !held {
+            if let Some(profile) = &self.shared.files.profile {
+                super::assets::clear_marker(&self.shared.files.models, profile);
+            }
+            self.held.marker = false;
+        } else if held && !self.held.marker && self.shared.files.profile.is_some() {
+            // Written by the fetch before it said so.
+            self.held.marker = true;
         }
     }
 
@@ -784,6 +1030,7 @@ impl Thread {
             sessions: service.live_sessions(),
             loading: service.is_loading(),
             gated: service.publication_gated(),
+            assets_held: service.assets_held(),
             read_at_ms: now.monotonic_ms(),
         };
         let snapshot = Snapshot {
@@ -904,6 +1151,14 @@ fn capture(
             );
         }
         last_event.insert(session_id, cursor);
+    }
+}
+
+/// What a check that was cancelled before the process had it says.
+fn cancelled_check() -> Checked {
+    Checked::Answered {
+        result: VerifyResult::Cancelled,
+        detail: None,
     }
 }
 
@@ -1043,6 +1298,7 @@ mod tests {
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             reading: Mutex::new(None),
+            files: Files::default(),
         });
         let mut thread = Thread {
             shared,
@@ -1054,6 +1310,7 @@ mod tests {
             last_event: BTreeMap::new(),
             started_wall_ms: 0,
             abandon: false,
+            held: Held::default(),
         };
         thread.driver.service_mut().session_opened(
             session(),
