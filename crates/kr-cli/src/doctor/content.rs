@@ -172,7 +172,7 @@ impl Why {
 }
 
 /// One session the host listed, and the reason it is left out when it is.
-pub struct Listed {
+pub(crate) struct Listed {
     summary: SessionSummary,
     why: Option<Why>,
 }
@@ -180,7 +180,7 @@ pub struct Listed {
 kr_client::debug_as_name!(Listed);
 
 /// What the host said, after the privacy rule has been applied to each session.
-pub struct Reading {
+pub(crate) struct Reading {
     listed: Vec<Listed>,
 }
 
@@ -189,7 +189,7 @@ kr_client::debug_as_name!(Reading);
 impl Reading {
     /// Whether the host listed this session.
     #[must_use]
-    pub fn knows(&self, session_id: SessionId) -> bool {
+    pub(crate) fn knows(&self, session_id: SessionId) -> bool {
         self.listed
             .iter()
             .any(|listed| listed.summary.session_id == session_id)
@@ -201,7 +201,7 @@ impl Reading {
 /// # Errors
 ///
 /// Returns the failure of whichever read failed. Nothing is exported from a reading that failed.
-pub async fn read(host: &mut impl Host, environment_id: EnvironmentId) -> Result<Reading> {
+pub(crate) async fn read(host: &mut impl Host, environment_id: EnvironmentId) -> Result<Reading> {
     let before = host.privacy().await?;
     let sessions = host.sessions(environment_id).await?;
     let after = host.privacy().await?;
@@ -212,7 +212,7 @@ pub async fn read(host: &mut impl Host, environment_id: EnvironmentId) -> Result
 
 /// Applies the privacy rule to `sessions`, which were read between `before` and `after`.
 #[must_use]
-pub fn select(
+pub(crate) fn select(
     before: &PrivacyReport,
     sessions: Vec<SessionSummary>,
     after: &PrivacyReport,
@@ -427,6 +427,16 @@ impl Digest {
 }
 
 /// The export, composed: the entry to write, what was left out of it, and what is shown.
+///
+/// A composed export approves nothing by itself: approval is private to the export, which makes it
+/// only after the preview has printed.
+///
+/// ```compile_fail
+/// fn forge(composed: kr_cli::doctor::content::Composed) {
+///     let digest = composed.digest();
+///     let _approved = composed.approve(&digest);
+/// }
+/// ```
 pub struct Composed {
     content: Content,
     text: String,
@@ -464,7 +474,7 @@ impl Composed {
 
     /// What the person is shown before anything is written.
     #[must_use]
-    pub fn preview(&self) -> Preview {
+    fn preview(&self) -> Preview {
         let mut lines = vec![
             stdout_line!("--include-content adds the content-bearing diagnostic export:"),
             stdout_line!("{}", self.content.describe()),
@@ -485,11 +495,17 @@ impl Composed {
         lines.push(stdout_line!(
             "A filter is not a guarantee that no secret remains. The rules take out credentials \
              written as NAME=value, as --option value and as user:password@host in a URL, and \
-             the home directory. A secret anywhere else stays in the text, and so does a user \
-             name elsewhere in a path."
+             the home directory of the user running this command. A secret anywhere else stays in \
+             the text, and so does a user name elsewhere in a path."
         ));
         lines.push(stdout_line!(
-            "Privacy mode turned on after the bundle is written cannot recall it."
+            "Privacy mode turned on after this preview is printed, or after the bundle is \
+             written, cannot recall either. A session that was created while privacy mode was on \
+             and has finished its cleanup is in the content once privacy mode is off."
+        ));
+        lines.push(stdout_line!(
+            "This preview is ordinary terminal output: in a KalaReach session it becomes that \
+             session's output, which the host and any device viewing the session can read."
         ));
         Preview { lines }
     }
@@ -500,7 +516,7 @@ impl Composed {
     ///
     /// Returns an error when the content composed now is not the content that was shown: nothing
     /// is approved, and nothing is written.
-    pub fn approve(&self, shown: &Digest) -> Result<Approved> {
+    fn approve(&self, shown: &Digest) -> Result<Approved> {
         if self.digest != *shown {
             return Err(changed());
         }
@@ -556,9 +572,14 @@ kr_client::debug_as_name!(Approved);
 
 impl Approved {
     /// The entry to write.
-    #[must_use]
-    pub const fn content(&self) -> &Content {
+    pub(super) const fn content(&self) -> &Content {
         &self.content
+    }
+
+    /// An approval of `content` for a test of the archive's own: no export has shown it.
+    #[cfg(test)]
+    pub(crate) const fn for_test(content: Content) -> Self {
+        Self { content }
     }
 }
 
@@ -567,7 +588,7 @@ impl Approved {
 /// # Errors
 ///
 /// Returns an error when the content cannot be serialised or summed up.
-pub fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -> Result<Composed> {
+pub(crate) fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -> Result<Composed> {
     let mut left_out: BTreeMap<Why, u64> = BTreeMap::new();
     let mut records = Vec::new();
     let mut kept = Vec::new();
@@ -612,14 +633,20 @@ pub fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -> Resul
     })
 }
 
-/// Writes every character that would change what a terminal shows as an escape, so the text on
-/// the screen is the text in the file. serde_json writes the control characters below U+0020 as
-/// escapes already; it writes these as themselves, and they are only ever inside a string.
+/// Writes every character that would change what a terminal shows, or show nothing, as an escape, so
+/// the text on the screen is the text in the file. serde_json writes the control characters below
+/// U+0020 as escapes already; it writes these as themselves, and they are only ever inside a string.
+/// A character outside the basic plane is written as the surrogate pair JSON spells it with.
 fn visible(text: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         if hides(character) {
-            out.push_str(&format!("\\u{:04x}", u32::from(character)));
+            let mut units = [0_u16; 2];
+            for unit in character.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
         } else {
             out.push(character);
         }
@@ -627,20 +654,37 @@ fn visible(text: &str) -> String {
     out
 }
 
-/// Whether a character can hide or reorder text on a terminal: delete, the C1 controls, the soft
-/// hyphen, the Arabic letter mark, the zero-width and directional marks and overrides, the line and
-/// paragraph separators, the invisible operators and the byte order mark.
+/// Whether a character can hide or reorder text on a terminal: delete and the C1 controls, the line
+/// and paragraph separators, the Arabic number signs, and every default-ignorable code point (the
+/// soft hyphen, the combining grapheme joiner, the Arabic letter mark, the Hangul and Khmer fillers,
+/// the Mongolian selectors, the zero-width and directional marks and overrides, the invisible
+/// operators, the variation selectors, the byte order mark, the interlinear and musical format
+/// characters and the tag characters).
 const fn hides(character: char) -> bool {
     matches!(
         character,
         '\u{007f}'..='\u{009f}'
             | '\u{00ad}'
+            | '\u{034f}'
+            | '\u{0600}'..='\u{0605}'
             | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{08e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
     )
 }
 
@@ -710,10 +754,11 @@ impl Exported {
 
 /// Reads, composes, shows and, where the person confirms it, approves the content export.
 ///
-/// `show` prints a [`Preview`]; `ask` puts a question to the person and returns what they typed,
-/// or nothing at the end of their input. A person who answers anything but yes or the identifier
-/// of a session in the content has declined, and a content that is not the content they were shown
-/// is never approved.
+/// The preview is printed on the error stream by [`crate::report::show_preview`] and the question
+/// is put at the terminal by [`ask_at_terminal`]; nothing else can stand in for either, because an
+/// approval is made only after the first has printed the content. A person who answers anything but
+/// yes or the identifier of a session in the content has declined, and a content that is not the
+/// content they were shown is never approved.
 ///
 /// # Errors
 ///
@@ -724,18 +769,44 @@ pub async fn export(
     host: &mut impl Host,
     environment_id: EnvironmentId,
     decision: Decision,
+    exclude: Vec<SessionId>,
+    rules: &Rules,
+) -> Result<Exported> {
+    export_with(
+        host,
+        environment_id,
+        decision,
+        exclude,
+        rules,
+        &mut crate::report::show_preview,
+        &mut ask_at_terminal,
+    )
+    .await
+}
+
+/// [`export`] with its two ways of reaching the person given: the crate's own tests hold what was
+/// printed and asked, and make each fail.
+pub(crate) async fn export_with(
+    host: &mut impl Host,
+    environment_id: EnvironmentId,
+    decision: Decision,
     mut exclude: Vec<SessionId>,
     rules: &Rules,
     show: &mut dyn FnMut(&Preview) -> Result<()>,
     ask: &mut dyn FnMut(&Shown) -> Result<Option<String>>,
 ) -> Result<Exported> {
+    // What was named on the command line has to be a session the host lists. A session a person
+    // dropped at the question was listed a moment ago, and is no cause for a usage failure if the
+    // host no longer lists it.
+    let mut named_by_the_command = true;
     loop {
         let reading = read(host, environment_id).await?;
-        if exclude.iter().any(|id| !reading.knows(*id)) {
+        if named_by_the_command && exclude.iter().any(|id| !reading.knows(*id)) {
             return Err(CliError::Usage(Shown::said(
                 "--exclude-session names a session this environment did not list",
             )));
         }
+        named_by_the_command = false;
         let composed = compose(&reading, &exclude, rules)?;
         match decision {
             Decision::Preview => {

@@ -77,19 +77,26 @@ pub fn say(line: &Shown) {
 ///
 /// Returns an error when the preview cannot be written or flushed.
 pub fn show_preview(preview: &Preview) -> Result<(), CliError> {
-    use std::io::Write as _;
+    write_preview(&mut std::io::stderr().lock(), preview)
+}
 
+/// Writes a preview's lines on `writer` and flushes it: [`show_preview`] on the error stream, and
+/// the crate's tests on writers that fail part of the way or when they are flushed.
+///
+/// # Errors
+///
+/// Returns an error when a line cannot be written or the writer cannot be flushed.
+pub fn write_preview(writer: &mut impl std::io::Write, preview: &Preview) -> Result<(), CliError> {
     let unwritten = |error: std::io::Error| {
         CliError::Terminal(shown!(
             "the content could not be shown, so nothing was written: {}",
             Shown::io(&error)
         ))
     };
-    let mut error_stream = std::io::stderr().lock();
     for line in preview.lines() {
-        output::write_line(&mut error_stream, line).map_err(unwritten)?;
+        output::write_line(writer, line).map_err(unwritten)?;
     }
-    error_stream.flush().map_err(unwritten)
+    writer.flush().map_err(unwritten)
 }
 
 /// Whether standard error is a terminal: whether a person is there to be shown a preview.

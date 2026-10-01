@@ -434,7 +434,7 @@ async fn exported(
     let mut answers = typed.iter().map(|text| (*text).to_owned());
     let previews = std::cell::RefCell::new(Vec::new());
     let questions = std::cell::RefCell::new(Vec::new());
-    let outcome = export(
+    let outcome = export_with(
         host,
         environment(),
         decision,
@@ -487,7 +487,7 @@ async fn a_preview_prints_the_content_and_its_digest_and_approves_nothing() {
     assert!(shown.contains(&session_id(1).to_string()), "{shown}");
     assert!(shown.contains("session-content-1"), "{shown}");
     assert!(shown.contains("A filter is not a guarantee"), "{shown}");
-    assert!(shown.contains("cannot recall it"), "{shown}");
+    assert!(shown.contains("cannot recall either"), "{shown}");
     assert_eq!(digest_in(shown), done.composed().digest());
 }
 
@@ -687,7 +687,7 @@ async fn a_yes_for_content_that_changed_during_the_question_approves_nothing() {
 /// KR-REQ-29.04: a preview that cannot be printed stops the export: no approval, so no bundle.
 #[tokio::test]
 async fn a_preview_that_cannot_be_printed_stops_the_export() {
-    let refused = export(
+    let refused = export_with(
         &mut steady(),
         environment(),
         Decision::Ask,
@@ -943,7 +943,7 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
         crate::doctor::tests::result(),
         Vec::new(),
     );
-    bundle::write(&path, &bundle, std::slice::from_ref(approved.content())).expect("writes");
+    bundle::write(&path, &bundle, Some(approved)).expect("writes");
     let archive = std::fs::read(&path).expect("reads it back");
     let found = entries(&archive);
     assert_eq!(
@@ -996,5 +996,199 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
     assert!(
         manifest.contains(&digest.hex()),
         "the manifest records the digest: {manifest}"
+    );
+}
+
+/// A writer that takes `allowed` writes and then fails, or fails only when it is flushed.
+struct Failing {
+    allowed: usize,
+    on_flush: bool,
+    taken: Vec<u8>,
+}
+
+impl std::io::Write for Failing {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.allowed == 0 {
+            return Err(std::io::Error::other("the stream is full"));
+        }
+        self.allowed -= 1;
+        self.taken.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.on_flush {
+            Err(std::io::Error::other("the stream could not be flushed"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// KR-REQ-29.04: a preview that fails part of the way through, or only when it is flushed, stops the
+/// export: no approval exists, whichever way the person would have answered, and the failure says
+/// that nothing was written. The control is a writer that takes everything: it approves.
+#[tokio::test]
+async fn a_preview_that_fails_part_way_or_at_the_flush_approves_nothing() {
+    let attempt = |allowed: usize, on_flush: bool| async move {
+        let mut writer = Failing {
+            allowed,
+            on_flush,
+            taken: Vec::new(),
+        };
+        let outcome = export_with(
+            &mut steady(),
+            environment(),
+            Decision::Confirmed(
+                exported(
+                    &mut steady(),
+                    Decision::Preview,
+                    Vec::new(),
+                    &[],
+                    &mut Seen::default(),
+                )
+                .await
+                .expect("previews")
+                .composed()
+                .digest(),
+            ),
+            Vec::new(),
+            &rules(),
+            &mut |preview: &Preview| crate::report::write_preview(&mut writer, preview),
+            &mut |_: &Shown| Ok(Some("yes".to_owned())),
+        )
+        .await;
+        (outcome, writer.taken)
+    };
+
+    let (partial, taken) = attempt(3, false).await;
+    let refused = partial.expect_err("a partial preview stops the export");
+    assert!(
+        format!("{refused}").contains("nothing was written"),
+        "{refused}"
+    );
+    assert!(!taken.is_empty(), "some of it did get out before it failed");
+
+    let (flushed, _) = attempt(usize::MAX, true).await;
+    let refused = flushed.expect_err("a flush that fails stops the export");
+    assert!(
+        format!("{refused}").contains("nothing was written"),
+        "{refused}"
+    );
+
+    let (whole, taken) = attempt(usize::MAX, false).await;
+    assert!(whole.expect("the control").approved().is_some());
+    let text = String::from_utf8(taken).expect("text");
+    assert!(text.contains("Digest "), "{text}");
+}
+
+/// KR-REQ-29.04: the preview says what the filter and the reads cannot do: the window before it
+/// was printed, a session whose cleanup is done and is in the content once privacy mode is off,
+/// and that the preview is itself output the host and a viewing device can read.
+#[tokio::test]
+async fn the_preview_states_what_the_export_cannot_promise() {
+    let mut seen = Seen::default();
+    exported(&mut steady(), Decision::Preview, Vec::new(), &[], &mut seen)
+        .await
+        .expect("previews");
+    let shown = seen.previews[0].replace("\n", " ");
+    for stated in [
+        "A filter is not a guarantee that no secret remains",
+        "the home directory of the user running this command",
+        "after this preview is printed, or after the bundle is written, cannot recall either",
+        "finished its cleanup is in the content once privacy mode is off",
+        "ordinary terminal output",
+        "any device viewing the session can read",
+    ] {
+        assert!(shown.contains(stated), "{stated}: {shown}");
+    }
+}
+
+/// KR-REQ-29.04: a session dropped at the question that the host no longer lists is no usage
+/// failure: only a session named on the command line has to be one the host lists.
+#[tokio::test]
+async fn a_dropped_session_the_host_stops_listing_does_not_fail_the_export() {
+    let dropped = session_id(2).to_string();
+    let mut host = Changing::new(
+        vec![report(0, false, &[])],
+        vec![vec![listed(1), listed(2)], vec![listed(1)]],
+    );
+    let mut seen = Seen::default();
+    let done = exported(
+        &mut host,
+        Decision::Ask,
+        Vec::new(),
+        &[&dropped, "yes"],
+        &mut seen,
+    )
+    .await
+    .expect("approved");
+    assert_eq!(done.composed().kept(), [session_id(1)]);
+}
+
+/// KR-REQ-29.04: characters that show as nothing, and the characters outside the basic plane among
+/// them, are escaped: tag characters and variation selectors can carry text no terminal shows. An
+/// escaped character outside the plane is the surrogate pair JSON spells it with, and the file
+/// reads back as the same text. The control is an ordinary character outside the plane.
+#[test]
+fn invisible_characters_outside_the_basic_plane_are_escaped_as_pairs() {
+    let mut closed = listed(4);
+    closed.cwd = "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}/\u{1f600}".to_owned();
+    let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
+    let composed = compose(&Reading { listed: selection }, &[], &rules()).expect("composes");
+    let text = composed.text();
+    for hidden in ['\u{e0041}', '\u{fe0f}', '\u{34f}', '\u{1d173}'] {
+        assert!(!text.contains(hidden), "{hidden:?} is in {text}");
+    }
+    assert!(text.contains("\\udb40\\udc41"), "{text}");
+    assert!(
+        text.contains("\u{1f600}"),
+        "an ordinary character stays: {text}"
+    );
+    let record: serde_json::Value = serde_json::from_str(text).expect("still JSON");
+    assert_eq!(
+        record["sessions"][0]["cwd"],
+        "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}/\u{1f600}"
+    );
+}
+
+/// KR-REQ-29.04: the types hold "written only after it was shown": an `Approved` is made only by
+/// the export, which approves after printing, so a run whose preview was never printed has no
+/// approval to hand the archive. The control is the run that printed.
+#[tokio::test]
+async fn nothing_is_approved_before_the_preview_has_printed() {
+    let printed = std::cell::Cell::new(false);
+    let order = std::cell::RefCell::new(Vec::new());
+    let digest = exported(
+        &mut steady(),
+        Decision::Preview,
+        Vec::new(),
+        &[],
+        &mut Seen::default(),
+    )
+    .await
+    .expect("previews")
+    .composed()
+    .digest();
+    let done = export_with(
+        &mut steady(),
+        environment(),
+        Decision::Confirmed(digest),
+        Vec::new(),
+        &rules(),
+        &mut |_: &Preview| {
+            printed.set(true);
+            order.borrow_mut().push("printed");
+            Ok(())
+        },
+        &mut |_: &Shown| Ok(None),
+    )
+    .await
+    .expect("approved");
+    assert!(printed.get() && done.approved().is_some());
+    assert_eq!(
+        *order.borrow(),
+        ["printed"],
+        "printed once, before approval"
     );
 }
