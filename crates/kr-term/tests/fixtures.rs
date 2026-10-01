@@ -195,6 +195,48 @@ fn profile_fixture_is_current() {
     );
 }
 
+/// The terminal reference names each behaviour the library record says constrains direct mode, and
+/// counts them as the record does.
+#[test]
+fn the_reference_lists_every_direct_mode_constraint() {
+    let path = fixtures_dir()
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("terminal")
+        .join("README.md");
+    let reference = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let heading = "#### What constrains the direct compatibility profile";
+    let section: Vec<&str> = reference
+        .lines()
+        .skip_while(|line| *line != heading)
+        .skip(1)
+        .take_while(|line| !line.starts_with('#'))
+        .collect();
+    assert!(
+        !section.is_empty(),
+        "the reference has no section {heading:?}"
+    );
+    let bullets = section
+        .iter()
+        .filter(|line| line.starts_with("- **"))
+        .count();
+    let constraints = kr_term::unicode::LIBRARY.direct_mode_constraints.len();
+    assert_eq!(
+        bullets, constraints,
+        "the reference lists {bullets} behaviours and the library record names {constraints}"
+    );
+    let count = ["No", "One", "Two", "Three", "Four", "Five", "Six"][constraints];
+    assert!(
+        section
+            .join("\n")
+            .contains(&format!("{count} behaviours differ")),
+        "the reference does not say that {} behaviours differ",
+        count.to_lowercase()
+    );
+}
+
 /// Every class-table row is represented, and every case names what it covers.
 #[test]
 fn every_case_names_its_requirement() {

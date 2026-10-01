@@ -355,8 +355,10 @@ empty: the pinned revision exposes everything section 8 asks a snapshot to carry
 
 #### What constrains the direct compatibility profile
 
-Two behaviours differ from xterm. Neither is a defect in the canonical state, and both mean a
-physical terminal has to be qualified against them before direct mode is offered.
+Three behaviours differ from xterm. The first two are not defects in the canonical state, and each
+means a physical terminal has to be qualified against it before direct mode is offered. The third
+is where the pinned library leaves the cursor, and both terminals measured so far report a
+different column.
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -367,6 +369,11 @@ physical terminal has to be qualified against them before direct mode is offered
   a five-column grid leaves a six-cell row and sets the pending wrap, where xterm blanks the last
   column and wraps the character. The fixture records the canonical result, and a projected renderer
   clips or safely replaces the overhanging cell.
+- **The cursor stops one column short after a wide character that ends on the last column.** The
+  pinned library leaves it on the character's first cell, where xterm and both measured terminals
+  report the last column. The grid reports the library's column.
+  `wide.wide-character-two-cells-from-the-edge` records the difference for each terminal in the
+  section on physical terminals.
 
 ## The query broker
 
@@ -1405,7 +1412,6 @@ Windows Terminal) has not been measured here. `QUALIFIED_TERMINALS` stays a list
 client reports: a `TERM` names an entry, not a build or a configuration, and these records show that
 two builds that both report `xterm-256color` disagree with each other and with the grid on rules a
 direct attachment depends on.
-
 
 ## Fixtures
 
