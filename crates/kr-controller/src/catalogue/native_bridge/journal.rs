@@ -356,7 +356,12 @@ impl Journals {
                 continue;
             }
             let path = entry.path();
-            let text = std::fs::read_to_string(&path).map_err(files::storage)?;
+            // A journal listed and gone by now was taken away by a removal finishing meanwhile.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(files::storage(error)),
+            };
             journals.push(read(&path, &text)?);
         }
         journals.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
