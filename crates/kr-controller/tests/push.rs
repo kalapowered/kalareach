@@ -6270,7 +6270,7 @@ fn a_notification_is_presented_only_to_the_device_its_grant_names_while_it_is_pa
     use kr_protocol::rights::ActionRight;
 
     // Unpaired while the credential renews.
-    let environment = environment();
+    let environment = self::environment();
     let paired = Paired::with(&[ActionRight::SessionView]);
     let destination = paired.destination(&environment);
     environment
@@ -6303,7 +6303,7 @@ fn a_notification_is_presented_only_to_the_device_its_grant_names_while_it_is_pa
     assert_eq!(one_record(&environment).state, DeliveryState::Revoked);
 
     // A rule naming another device's grant: the destination is the phone's, the grant is not.
-    let environment = environment();
+    let environment = self::environment();
     let paired = Paired::with(&[ActionRight::SessionView]);
     let other = Grant {
         grant_id: GrantId::new(uuid(101)),
@@ -6354,7 +6354,7 @@ fn a_notification_is_presented_only_to_the_device_its_grant_names_while_it_is_pa
     assert_eq!(one_record(&environment).state, DeliveryState::Refused);
 
     // A configured ceiling that leaves the device's grant nothing a notification asks for.
-    let environment = environment();
+    let environment = self::environment();
     let paired = Paired::under(&[ActionRight::SessionView], &[ActionRight::FilesRead]);
     let destination = paired.destination(&environment);
     environment
@@ -6371,7 +6371,7 @@ fn a_notification_is_presented_only_to_the_device_its_grant_names_while_it_is_pa
     assert_eq!(produced.refused.len(), 1, "the ceiling took the right away");
 
     // The control: the device, paired, under its own grant, with a ceiling that leaves the right.
-    let environment = environment();
+    let environment = self::environment();
     let paired = Paired::under(&[ActionRight::SessionView], &[ActionRight::SessionView]);
     let destination = paired.destination(&environment);
     environment
