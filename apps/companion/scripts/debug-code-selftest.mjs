@@ -75,6 +75,18 @@ held(
   debugCodeIn(bundle('fat', { extra: { 'Frameworks/Fat': Buffer.concat([Buffer.from([0xca, 0xfe, 0xba, 0xbe]), Buffer.from('ProbeSurface')]) } }))
 )
 held(
+  'a universal binary with 64-bit offsets is read, in either byte order',
+  ['Frameworks/Fat64 holds ProbeSurface', 'Frameworks/Fat64Swapped holds ProbeSurface'],
+  debugCodeIn(
+    bundle('fat64', {
+      extra: {
+        'Frameworks/Fat64': Buffer.concat([Buffer.from([0xca, 0xfe, 0xba, 0xbf]), Buffer.from('ProbeSurface')]),
+        'Frameworks/Fat64Swapped': Buffer.concat([Buffer.from([0xbf, 0xba, 0xfe, 0xca]), Buffer.from('ProbeSurface')])
+      }
+    })
+  )
+)
+held(
   'a file that is not an executable is not read',
   [],
   debugCodeIn(bundle('resource', { extra: { 'assets/page.js': Buffer.from('kr.probe. KRDeviceProbe') } }))
