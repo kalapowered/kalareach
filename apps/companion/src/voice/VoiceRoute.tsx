@@ -390,7 +390,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
             if (closure.closed_locally) setCall(null)
             setNotice(
               closure.host_failure
-                ? `This device's call is closed. The host was not told, so its grant may still be open: ${closure.host_failure.message}`
+                ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureMessage(closure.host_failure)}`
                 : null
             )
           })
