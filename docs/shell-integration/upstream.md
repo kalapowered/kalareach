@@ -77,50 +77,27 @@ date, with the choices above) or `not-affected`.
 
 ## Native modules and the editor ABI
 
-A person can load a native Zsh module of their own into a managed session. Zsh's loader records no
-editor ABI and refuses nothing for a module that binds its imports lazily, so a module built against
-an editor whose functions this package lacks loads without complaint and ends the shell at the first
-call that needs the missing function. The session answers that with a named error before it is
-ready, for the modules and the limits below; it does not claim to find every incompatible module.
+A person can load native Zsh modules of their own into a managed session. Specifically, the loader does not record the editor's ABI, and the loader refuses nothing for a module that binds its imports lazily. In short, a native Zsh module built against an editor whose functions this package lacks can be loaded without error, but will end the shell at the first call that needs the missing function. The session answers with a named error before it is ready, for the modules and the limits described below. However, it is not guaranteed that all incompatible modules will be detected.
 
-The triage record above, the update target and the requalification steps are the standing record for
-the packages. This section is the proof that the editor check refuses what it claims to, and the
-limits of what it claims.
+The triage record above, the update target and the requalification steps are the standing record for the packages. This section shows that the editor check refuses what it claims to refuse, and says where its claims stop.
 
 ### What the check does
 
-When the integration reports that its hooks are live, which is after every startup file has run, the
-Zsh package judges every dynamic module the shell holds, the package's own among them: where a module
-sits says nothing about what it is, and the package's own modules bind like any other.
+This check runs when the integration hooks are live, i.e. after all startup files have been run. The Zsh package judges all dynamic modules the shell holds. Note that it will also judge modules that ship with the Zsh package, but the location of a module is not relevant, they are bound the same way.
 
-Each module is judged as the shell loaded it. The check reads the module's undefined symbols from the
-tables the loader bound it with, which are in memory (the dynamic section on Linux, the `__LINKEDIT`
-segment on macOS), and opens no file: the name a module was loaded by can be removed or replaced
-afterwards, and the file then found is not the code the shell runs. On Linux every table is read
-only where the object's own loadable segments say memory is. The check asks the running shell
-whether the shell, the modules already loaded or the module's own libraries provide each name; a name
-bound to a symbol version is asked for under that version. A name the module imports weakly is not
-judged. The report says, for each module,
+For each module held in the shell it judges the module as the shell loaded it. It does this by reading the dynamic section (Linux) or the `__LINKEDIT` segment (macOS) in memory. The undefined symbols of the module are taken from the tables the loader used when binding the module, which are still available in memory. Note that no file is ever opened, since the module's file might have been removed or replaced after loading, and the file then found is not the code the shell runs. On Linux, the tables are only read if they appear in the loadable segments of the object that are loaded in memory. The symbols are then looked up in the shell itself, other modules that were already loaded at the time or the libraries the module was loaded with. If the symbol had a version it is looked up with that version in the global scope of the shell and in the libraries the module was loaded with. Symbols that were weakly imported by the module are not judged. The report gives one of three results for each module:
 
-* `bound`: every name resolves;
-* `missing`: the first name that does not, with the module and its path;
-* `not_read`: why the module could not be inspected (the loader does not say where it mapped the
-  module, a table that is not one this reads, a platform whose format it does not know).
+* `bound`: every name resolves.
+* `missing`: the first name that does not, with the module and its path.
+* `not_read`: why the module could not be inspected. The loader does not say where it mapped the module, a table is not one this reader knows, or the platform's format is unknown.
 
-The worker refuses the session on `missing` and on `not_read`, because an inspection that cannot be
-made whole is not a pass. The create answers `SHELL_INTEGRATION_UNSUPPORTED` with the reason
-`module_tree_unsupported` and names the module and the import, or the module and why it could not
-be checked. The Bash, Fish and PowerShell bridges send an empty list.
+The worker refuses the session on `missing` and on `not_read`, because an inspection that cannot be made whole is not a pass. The create answers `SHELL_INTEGRATION_UNSUPPORTED` with the reason `module_tree_unsupported`. It names the module and the import, or the module and why it could not be checked. The Bash, Fish and PowerShell bridges send an empty list.
 
-The reader is made for the shared objects a linker makes, on macOS and on Linux with glibc. On
-another platform every module is `not_read`, which refuses the session.
+The reader only supports shared objects generated by the linker on macOS and Linux with glibc. On other platforms all modules are `not_read`, which refuses the session.
 
 ### The proof
 
-`crates/kr-shell-integration/tests/module_abi.rs` compiles modules as a person compiles one, against
-the headers of this repository's own Zsh package (`tests/shells/zsh/native-module-abi/`), loads each
-from a startup file into the built package, and reads the report the shell sends. It runs on macOS
-and on Linux.
+The test source is `crates/kr-shell-integration/tests/module_abi.rs`. It compiles the modules the way a person compiles one, against the headers in this repository's own Zsh package (`tests/shells/zsh/native-module-abi/`). It then loads each one from a startup file into the built package, and reads what the shell sends in its report. It does this on macOS and Linux.
 
 | Module | What it is | Result |
 | --- | --- | --- |
@@ -131,63 +108,42 @@ and on Linux.
 | newer, beside a copy of the editor | a copy of the package's editor is first on the module path | `missing`: a neighbour of a copy is not the package's |
 | lazy | imports from a package module | `missing` while that module is not loaded, `bound` once the startup file has loaded it |
 | weak | imports a name it is content to lose | `bound` |
+| versioned | calls the C library, whose names carry a version on Linux | `bound` |
 | a file the loader refuses | not a module in any format the shell loads | the loader reports it; the report has no entry, and the session is not refused for a module that never loaded |
-| the package's own modules, all loaded from another directory, and each alone | what a module of the shell's own kind imports | every one `bound` |
+| the package's own modules | all loaded from another directory, and each loaded alone | every one `bound` |
 
-The newer module is the control that matters: the loader accepts it, which is the false ready state
-the check exists to prevent, and the check refuses it. `not_read` and the refusal it carries are
-proved in the contract's own tests: a module made by an ordinary compiler and linker is always read,
-so no module of these tests reaches it.
+The newer module is the control that matters. The loader accepts it, which is the false ready state the check exists to prevent, and the check refuses it. The refusal that `not_read` carries is proved in the contract's own tests. No module in these tests reaches `not_read`. Two known cases end there and refuse the session: a Mach-O import that has no C underscore prefix, and an ELF object whose table addresses the reader cannot place in the object's own memory.
 
-### What it does not detect
+### What it does not detect, and what it refuses
 
-* **A layout difference whose symbols resolve.** A module built against another layout of the same
-  names binds every symbol it imports, and no import check tells it from one built for this editor.
-  Two configures of the pinned release show it. `--enable-multibyte` and `--disable-multibyte`
-  export the same editor state, `zleline`, `zlell` and `zlecs`, with different element types
-  (`wchar_t` and `char`), and 1,131 function names in common. A module that uses only shared names
-  binds in either build. A module that calls one of the 27 functions only the multibyte build
-  exports, or one of the 8 only the other does, is refused by the other.
+* **A layout difference whose symbols resolve.** A module built against another layout of the same names binds every symbol it imports, and there is no way for an import check to tell it from one built for this editor. Two configures of the pinned release show the case. `--enable-multibyte` and `--disable-multibyte` export the same editor state, `zleline`, `zlell` and `zlecs`, with different element types (`wchar_t` and `char`), and the two builds share 1,131 function names. A module that imports only shared names binds in either build. A module that calls one of the 27 functions only the multibyte build exports, or one of the 8 only the other build exports, is refused by the other build.
 * **A changed signature, meaning or data type** behind a name that still resolves.
-* **A name a library imports in its turn.** The check reads the module, not the libraries the module
-  needs or opens for itself; a name the module imports from a library resolves in that library, and
-  what that library imports is not read. On macOS a lazily bound name is found in any loaded image,
-  not only in the library its two-level namespace names, and a module whose setup function comes
-  from a library it links is judged as that library.
-* **A name provided by a package module that is not loaded** when the hooks go live. The shell loads
-  a package module for its own features, never because another module imports a name from it, so a
-  call that needs it before it is loaded ends the shell. The check refuses such a module; a startup
-  file that loads the provider first makes it bind.
-* **A module loaded after the hooks go live**: a later `precmd`, `zle-line-init`, deferred or
-  on-demand loading, or a `module_path` the person extended after the check.
+* **A name that a library imports in its turn.** The check reads the module, not the libraries the module needs or opens for itself. What such a library imports is not read. A name the module looks up itself with `dlsym` is not seen either. On macOS a lazily bound name is found in any loaded image, not only in the library its two-level namespace names, and a module whose setup function comes from a library it links is judged as that library.
+* **A module loaded after the check.** That includes a later `precmd`, `zle-line-init`, deferred or on-demand loading, and a `module_path` the person extended after the check. The guarded startup entry asks for the report at the first prompt. A startup file that runs the activation builtin by hand earlier gets a report of what is loaded so far.
 * **A module the loader refuses.** The loader reports that itself.
-* **A module that is not an honest shared object.** The check is for the accidental mismatch, not
-  for a module made to be missed: a module is the person's own code, running with their authority.
-* **Loadable builtins and modules of other shells**: Bash's `enable -f`, Fish and PowerShell's
-  binary modules. PowerShell's own editor range is enforced by the PSReadLine package, and this
-  proof does not cover it.
+* **A module built to be missed.** The check is meant for an accidental mismatch. A module is the person's own code and runs with their authority.
+* **Loadable builtins and modules of other shells.** Bash's `enable -f`, Fish and PowerShell's binary modules are not checked. PowerShell's own editor range is enforced by the PSReadLine package, and this proof does not cover it.
+
+One module is refused although it may work: a module that imports from a package module that is not loaded when the hooks go live. Zsh loads a package module when that module's own features are needed, never because another module imports a name from it. A call that needs the provider before it loads ends the shell, so the session is refused by name. A startup file that loads the provider first makes the module bind.
 
 ### What the check costs at activation
 
-The check runs when the hooks go live, which is once for each report the integration sends (the
-activation builtin can be run again), inside the shell, and opens no file and calls no program: it
-walks tables that are in memory and asks the loader one question for each undefined name. It does
-not wait on anything.
+This check runs when the hooks are activated, which is once for each report the integration sends, and the activation builtin can be run again. It runs inside the shell. It does not open any file or run any program. It walks the in-memory tables and, for each undefined name, makes one or two requests to the loader.
 
-Measured from a timer around the whole check in a session under the built package, median of ten
-sessions per row, with the slowest of the ten beside it:
+These requests are not free of waiting in every case: a lookup can run the symbol-resolver function of a library that defines an indirect function, and the loader takes locks. However, the symbol resolvers of the C library only read CPU features, and the loader's locks are normally free since the shell runs one thread. A library that ships a resolver that blocks would make the check wait, and the shell would wait in the same way at its first call into that function.
+
+Each number is the median of ten sessions, measured with a timer around the whole check in a real session under the built package. The slowest of the ten sessions is in brackets.
 
 | The shell holds | Apple M4 Pro, macOS 26 | AMD EPYC 7502P, Linux (glibc 2.43) |
 | --- | --- | --- |
-| the editor and what the shell loaded itself | 0.22 ms (slowest 0.32) | 0.14 ms (0.17) |
+| only the modules it loaded itself (two on macOS, one on Linux) | 0.22 ms (0.32) | 0.14 ms (0.17) |
 | and 1 small module of the person's own | 0.22 ms (0.50) | 0.12 ms (0.15) |
 | and 3 | 0.24 ms (0.51) | 0.13 ms (0.18) |
 | and 8 | 0.29 ms (0.59) | 0.12 ms (0.16) |
-| 10 of the package's modules read from another directory | 1.2 ms (1.3) | 0.39 ms (0.48) |
-| about 35 of the package's modules read from another directory | 1.9 ms (3.2) | 0.58 ms (0.79) |
+| and 10 of the package's modules, read from another directory | 1.2 ms (1.3) | 0.39 ms (0.48) |
+| and about 35 of the package's modules, read from another directory | 1.9 ms (3.2) | 0.58 ms (0.79) |
 
-A `.zshrc` that loads a few modules pays under half a millisecond. The last two rows load the whole of
-the package's module tree, dozens of modules, and stay under four milliseconds.
+A `.zshrc` that loads a few modules of its own pays about a quarter of a millisecond on the Mac, at most 0.6 ms in the slowest run measured, and about a tenth of a millisecond on Linux. The last row loads the whole module tree of the package, which amounts to dozens of modules, and stays under four milliseconds.
 
 
 ## Requalifying a package
@@ -203,10 +159,8 @@ the package's module tree, dozens of modules, and stay under four milliseconds.
 4. `bash scripts/fetch-shell-stacks.sh` — the startup customisations, if they are not already here.
 5. `bash scripts/e2e-fence.sh` — the whole qualification against the rebuilt package, on a real
    daemon and a real shell.
-6. `cargo test -p kr-shell-integration --test module_abi --test relocation -- --include-ignored` —
-   the native-module proof described below, and the proof that a moved Zsh tree still finds its
-   modules, against the rebuilt package. A release whose editor changed is the release that can
-   make a module the last one accepted fail to bind.
+6. `cargo test -p kr-shell-integration --test module_abi --test relocation -- --include-ignored`, which runs
+   the native-module proof and the relocation proof against the rebuilt package.
 7. Add a row to the triage record with the date, the change, the packages, the assessment, the
    target release date and the status.
 

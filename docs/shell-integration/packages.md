@@ -105,14 +105,15 @@ itself. When the answer names a launcher, the forked child's `execute` starts it
 place with the backend's variables added, and a launcher that cannot be started leaves the child
 running the command as it was typed.
 
-The fifth patch is what lets a tree be moved. A release is kept under a directory of its own, beside
-its predecessors, so the shell has to load its editor and its modules from where it is and not from
-the prefix the build named. `setupvals` reads the executable's own place (`/proc/self/exe` on Linux,
-`_NSGetExecutablePath` on macOS), takes `<prefix>` from `<prefix>/bin/zsh`, and where
-`<prefix>/lib/zsh/<version>` is a directory that is not the build's module directory it makes that
-directory `module_path` and moves every default function directory that was under the build's prefix
-under this one. A shell that is not in a `bin` directory keeps the paths it was built with, and what
-a person sets in their startup files is set afterwards and wins.
+The fifth patch in the series allows the tree to be moved. A release is kept in a directory of its
+own beside its predecessors, so the shell needs to find its editor and modules in its own tree
+rather than in the prefix the build named. The method used is for `setupvals` to find where the
+executable is (by reading `/proc/self/exe` on Linux, by calling `_NSGetExecutablePath` on macOS) and
+to take `<prefix>` from `<prefix>/bin/zsh`. If `<prefix>/lib/zsh/<version>` is a directory and is
+not the build's module directory, it uses this as the `module_path`, and every default function
+directory that was under the build's prefix is moved under this one. If the shell is not in a `bin`
+directory the paths it was built with are kept, and user settings in startup files are applied
+afterwards and win.
 
 ## What Bash changes
 

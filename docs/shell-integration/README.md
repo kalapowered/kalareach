@@ -147,7 +147,7 @@ refused before its declaration is read at all:
 | `key_injection_forbidden` | `SHELL_INTEGRATION_UNSUPPORTED` | The declaration named pseudo-terminal key injection as its launch path |
 | `editor_abi_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The editor ABI is not one this build was qualified against |
 | `integration_version_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The integration version is not supported |
-| `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI, or a module the shell holds after its startup files imports a name this reader does not provide or could not be read |
+| `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI, or a module the shell holds after its startup files imports a name nothing the shell holds provides, or could not be read |
 | `package_mismatch` | `PERMISSION_DENIED` | The declaration describes a different build from the package this session launched |
 
 An installation is read shell by shell. A record this host cannot read refuses that shell by name
@@ -191,18 +191,26 @@ The phases advance on what the bridge reports, never on a guess. The handshake a
 session qualified. `integration_lost` says the ground has gone, and the worker infers the same when
 the bridge's connection ends.
 
-The handshake is made when the editor is set up, which can be before a startup file has run, so a
-native module a startup file loads may not be in the declaration. `hooks_activated` carries the dynamic modules the shell holds by then, and the
-worker judges them before the session qualifies: a module that imports a name the running reader
-does not provide, or that the bridge could not read, refuses the session with
-`module_tree_unsupported`, and the create answers `SHELL_INTEGRATION_UNSUPPORTED` with that reason,
-the module and the import, and what to do (rebuild the module, stop loading it in KalaReach
-sessions, or create the session with `--shell-mode native_compat`). The Zsh package reads each
-module's import table and asks the running shell for each undefined name; that finds a module built
-against an editor whose functions this one lacks, and it does not find a module built against
-another layout of the same names, one loaded after the hooks go live, or one the loader itself
-refuses (which the loader reports). The Bash, Fish and PSReadLine packages list no modules: Bash's
-loadable builtins (`enable -f`) and PowerShell's binary modules are not checked.
+The handshake is made when the editor is set up, which can be before a startup file has run. Some
+native modules loaded during startup may therefore not be present in the declaration. The
+`hooks_activated` event carries the dynamic modules the shell holds by the time it is sent, and the
+worker judges them before the session qualifies.
+
+A module that imports a name the running reader does not provide, or that the bridge could not read,
+refuses the session with `module_tree_unsupported`. The create then answers
+`SHELL_INTEGRATION_UNSUPPORTED` with that reason, the name of the module and the import, and a
+description of what to do (rebuild the module, load the module that provides the name before it,
+avoid loading the module in KalaReach sessions, or create the session with
+`--shell-mode native_compat`).
+
+The Zsh package accomplishes this by reading the symbol tables of each loaded module from memory,
+then going through the undefined symbols and asking the running shell for each undefined name. This
+method will detect modules that have been built against an editor whose functions this one lacks. It
+will not detect modules built against an editor with the same names but a different layout, modules
+loaded after the hooks go live, or modules the loader itself refuses (the loader reports these). The
+Bash, Fish and PSReadLine packages report no modules. This means that Bash loadable builtins
+(`enable -f`) and PowerShell binary modules are not checked. See
+`docs/shell-integration/upstream.md` for the proof, the limits and the cost.
 
 A loss before qualification closes the creating session, whatever it was: a create that cannot
 deliver the managed contract fails rather than succeeding with less, and an explicit compatibility
