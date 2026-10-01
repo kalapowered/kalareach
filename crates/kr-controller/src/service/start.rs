@@ -87,6 +87,7 @@ impl Controller {
             conditions: placed.conditions,
             abandon: placed.abandon,
             free_space: placed.free_space,
+            stall: placed.stall,
         };
         let started =
             tokio::task::spawn_blocking(move || crate::describe::host::DescribeHost::start(setup))
@@ -176,6 +177,7 @@ impl Controller {
             conditions: None,
             abandon: false,
             free_space: None,
+            stall: None,
         }
     }
 

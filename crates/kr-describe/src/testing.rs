@@ -122,6 +122,9 @@ pub struct Script {
     pub verify_until_cancelled: bool,
     /// How long checking a file sleeps without looking at its token, in milliseconds.
     pub verify_ignore_token_ms: u64,
+    /// Whether a check that slept without looking at its token goes on to finish, as a check that
+    /// was already past its last block would, rather than reading the cancellation it was sent.
+    pub verify_finishes_after_cancel: bool,
     /// Whether a load checks each file of the profile against its recorded size and digest first,
     /// as the real process does, and ends as [`crate::wire::LoadEnd::Assets`] when one is not it.
     pub verify_on_load: bool,
@@ -236,6 +239,10 @@ impl Script {
         };
         flag("load-until-cancelled", self.load_until_cancelled);
         flag("verify-until-cancelled", self.verify_until_cancelled);
+        flag(
+            "verify-finishes-after-cancel",
+            self.verify_finishes_after_cancel,
+        );
         flag("verify-on-load", self.verify_on_load);
         flag("mark-loads", self.mark_loads);
         flag("mark-work", self.mark_work);
@@ -291,6 +298,7 @@ impl Script {
                 "load-ignore-token-ms" => script.load_ignore_token_ms = number()?,
                 "verify-ms" => script.verify_ms = number()?,
                 "verify-ignore-token-ms" => script.verify_ignore_token_ms = number()?,
+                "verify-finishes-after-cancel" => script.verify_finishes_after_cancel = true,
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
@@ -516,6 +524,9 @@ impl Model for StubModel {
         self.began("check");
         if self.script.verify_ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.verify_ignore_token_ms));
+            if self.script.verify_finishes_after_cancel {
+                return check_file(asset, path);
+            }
         }
         let duration = (!self.script.verify_until_cancelled)
             .then(|| Duration::from_millis(self.script.verify_ms));

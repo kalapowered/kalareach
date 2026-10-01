@@ -24,6 +24,7 @@ struct Hooks {
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
     free_space: Arc<Mutex<Option<u64>>>,
+    stall: Arc<Mutex<Option<std::time::Duration>>>,
     abandon: bool,
 }
 
@@ -36,6 +37,7 @@ pub struct Placed {
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
     free_space: Arc<Mutex<Option<u64>>>,
+    stall: Arc<Mutex<Option<std::time::Duration>>>,
 }
 
 /// Places the description process at `program`, told `environment`, choosing from `catalogue`,
@@ -55,6 +57,7 @@ pub fn place(
     let skew_ms = Arc::new(AtomicU64::new(0));
     let conditions = Arc::new(Mutex::new(conditions));
     let free_space = Arc::new(Mutex::new(None));
+    let stall = Arc::new(Mutex::new(None));
     PLACED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -67,6 +70,7 @@ pub fn place(
                 skew_ms: Arc::clone(&skew_ms),
                 conditions: Arc::clone(&conditions),
                 free_space: Arc::clone(&free_space),
+                stall: Arc::clone(&stall),
                 abandon,
             },
         );
@@ -75,6 +79,7 @@ pub fn place(
         skew_ms,
         conditions,
         free_space,
+        stall,
     }
 }
 
@@ -90,6 +95,12 @@ impl Placed {
             .free_space
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = bytes;
+    }
+
+    /// Says how long a fetch waits for the server's answer and for each chunk of a body, in place
+    /// of the product's own bound, from the next fetch on.
+    pub fn set_fetch_stall(&self, stall: Option<std::time::Duration>) {
+        *self.stall.lock().unwrap_or_else(PoisonError::into_inner) = stall;
     }
 
     /// Sets the conditions the host reads from now on.
@@ -129,6 +140,7 @@ pub(crate) fn placement_for(state_dir: &Path) -> Option<Placement> {
         conditions: Some(hooks.conditions),
         abandon: hooks.abandon,
         free_space: Some(hooks.free_space),
+        stall: Some(hooks.stall),
     })
 }
 
