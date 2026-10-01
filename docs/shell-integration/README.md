@@ -196,12 +196,12 @@ native modules loaded during startup may therefore not be present in the declara
 `hooks_activated` event carries the dynamic modules the shell holds by the time it is sent, and the
 worker judges them before the session qualifies.
 
-A module that imports a name the running reader does not provide, or that the bridge could not read,
-refuses the session with `module_tree_unsupported`. The create then answers
-`SHELL_INTEGRATION_UNSUPPORTED` with that reason, the name of the module and the import, and a
-description of what to do (rebuild the module, load the module that provides the name before it,
-avoid loading the module in KalaReach sessions, or create the session with
-`--shell-mode native_compat`).
+A module that imports a name that neither the running reader nor anything else the shell holds
+provides, or that the bridge could not read, refuses the session with `module_tree_unsupported`. The
+create then answers `SHELL_INTEGRATION_UNSUPPORTED` with that reason, the module and either the
+import or why it could not be checked, and a description of what to do (rebuild the module, avoid
+loading the module in KalaReach sessions, or create the session with `--shell-mode native_compat`;
+where a name is missing, load the module that provides it first).
 
 The Zsh package accomplishes this by reading the symbol tables of each loaded module from memory,
 then going through the undefined symbols and asking the running shell for each undefined name. This
