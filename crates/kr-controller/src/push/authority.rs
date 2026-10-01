@@ -875,4 +875,308 @@ mod tests {
         issued(&sharing, organisational, true);
         assert_eq!(recipients(&sharing).scope_for(&rule(Some(10))), None);
     }
+
+    /// A paired device's record, holding `grant`, paired a second before `NOW`.
+    fn device(device_id: DeviceId, grant: Grant) -> DeviceRecord {
+        DeviceRecord {
+            device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([3; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([4; 32]),
+            stored_envelope: None,
+            device_name: kr_protocol::pairing::DeviceName::new("phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant,
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(NOW - 1_000),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: None,
+        }
+    }
+
+    /// The device `uuid(2)`'s destination, named by its identifier, under a rule that names `grant`.
+    fn destination(grant: Option<u8>) -> DestinationRecord {
+        DestinationRecord {
+            id: kr_delivery::destination::DestinationId::new(DeviceId::new(uuid(2)).to_string())
+                .expect("an identifier"),
+            destination: kr_delivery::destination::Destination::Push(Box::new(
+                kr_delivery::destination::PushDestination {
+                    installation_id: kr_protocol::ids::InstallationId::new(uuid(5)),
+                    sender_record_id: kr_protocol::ids::PushSenderRecordId::new(uuid(6)),
+                    preview_keys: kr_delivery::destination::PreviewKeys::only(
+                        kr_protocol::scalars::NotificationPreviewKey::from_bytes([1; 32]),
+                        1,
+                    ),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                },
+            )),
+            rule: Some(rule(grant)),
+            enabled: true,
+            configured_at_ms: kr_protocol::scalars::TimestampMs::new(NOW),
+        }
+    }
+
+    /// A paired device's grant is read from its own record, where its revocation and its expiry are
+    /// written: the destination is the device's, the grant is the device's, and a rule that names
+    /// another device's grant, a device that is revoked and one that is not in the directory admit
+    /// nothing. The control: the device under its own grant is admitted, with the reach the grant
+    /// has: its rights, its sessions, and the moment it began, which a history cursor replaces.
+    #[test]
+    fn a_paired_devices_grant_is_read_from_its_own_record_and_only_for_that_device() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        let recipients = recipients(&sharing);
+        let devices = recipients.lifetimes().devices();
+        let own = grant(30, SessionSelector::Any, &[ActionRight::SessionView]);
+        let own = Grant {
+            recipient_device_id: DeviceId::new(uuid(2)),
+            ..own
+        };
+        devices
+            .commit(&device(DeviceId::new(uuid(2)), own))
+            .expect("a device");
+        let other = Grant {
+            recipient_device_id: DeviceId::new(uuid(3)),
+            ..grant(31, SessionSelector::Any, &[ActionRight::SessionView])
+        };
+        devices
+            .commit(&device(DeviceId::new(uuid(3)), other))
+            .expect("another device");
+
+        let scope = recipients
+            .device_scope(&destination(Some(30)))
+            .expect("the device is admitted under its own grant");
+        assert_eq!(scope.recipient, DeviceId::new(uuid(2)));
+        assert_eq!(scope.grant_id, GrantId::new(uuid(30)));
+        assert!(scope.rights.contains(&ActionRight::SessionView));
+        assert_eq!(
+            scope.history_from_ms,
+            NOW - 1_000,
+            "with no cursor, from the moment the device was paired"
+        );
+        assert!(
+            recipients.scope_for(&rule(Some(30))).is_some(),
+            "a rule is read from the device's record as well"
+        );
+        assert_eq!(
+            recipients.device_scope(&destination(Some(31))),
+            None,
+            "a rule that names another device's grant"
+        );
+        assert_eq!(
+            recipients.device_scope(&destination(None)),
+            None,
+            "a rule that names none"
+        );
+
+        devices
+            .revoke(
+                DeviceId::new(uuid(2)),
+                kr_protocol::scalars::TimestampMs::new(NOW),
+            )
+            .expect("a revocation");
+        assert_eq!(
+            recipients.device_scope(&destination(Some(30))),
+            None,
+            "a device that is no longer paired"
+        );
+        assert!(recipients.scope_for(&rule(Some(30))).is_none());
+    }
+
+    /// A grant in the grant store that was issued to a device is only as good as the device's own
+    /// pairing: with no device record the destination admits nothing, and with one it does. The
+    /// reach begins where the store's own record says it was redeemed, unless the grant carries a
+    /// history cursor.
+    #[test]
+    fn a_stored_grant_for_a_device_that_is_not_paired_admits_nothing() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        let stored = Grant {
+            recipient_device_id: DeviceId::new(uuid(2)),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(NOW - 9_000)),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            ..grant(32, SessionSelector::Any, &[ActionRight::SessionView])
+        };
+        issued(&sharing, stored.clone(), true);
+        let recipients = recipients(&sharing);
+        assert_eq!(
+            recipients.device_scope(&destination(Some(32))),
+            None,
+            "no record of the device"
+        );
+        recipients
+            .lifetimes()
+            .devices()
+            .commit(&device(DeviceId::new(uuid(2)), stored))
+            .expect("a device");
+        let scope = recipients
+            .device_scope(&destination(Some(32)))
+            .expect("the device is paired, under a grant the store holds");
+        assert_eq!(
+            scope.history_from_ms,
+            NOW - 9_000,
+            "a history cursor replaces the start"
+        );
+    }
+
+    /// A paired device's grant that ends is decided on both clocks and written down in the device's
+    /// record, as its own connection's would be: a grant whose expiry UTC has passed admits nothing,
+    /// the record carries the end, and a host that holds no anchor for it and whose wall clock reads
+    /// before the expiry, as after a reboot with the clock wound back, finds it ended too. The
+    /// control: with UTC short of the expiry it admits and nothing is written.
+    #[test]
+    fn a_paired_devices_grant_that_ends_is_written_down_in_its_record() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for run_out in [false, true] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let recipients = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                personal(),
+                environment(),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            );
+            let expiring = Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                expiry: GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(NOW + 1_000),
+                },
+                ..grant(33, SessionSelector::Any, &[ActionRight::SessionView])
+            };
+            recipients
+                .lifetimes()
+                .devices()
+                .commit(&device(DeviceId::new(uuid(2)), expiring))
+                .expect("a device");
+            assert!(
+                recipients.device_scope(&destination(Some(33))).is_some(),
+                "in force when first asked"
+            );
+            if run_out {
+                wall.store(NOW + 1_000, Ordering::SeqCst);
+            }
+            assert_eq!(
+                recipients.device_scope(&destination(Some(33))).is_some(),
+                !run_out,
+                "run out {run_out}"
+            );
+            let recorded = recipients
+                .lifetimes()
+                .devices()
+                .record_for_device(DeviceId::new(uuid(2)))
+                .expect("a read")
+                .expect("the device")
+                .expired_at_ms;
+            assert_eq!(recorded.is_some(), run_out, "the record carries the end");
+            if run_out {
+                wall.store(NOW, Ordering::SeqCst);
+                assert_eq!(
+                    recipients.device_scope(&destination(Some(33))),
+                    None,
+                    "and the wall clock wound back does not bring it back"
+                );
+            }
+        }
+    }
+
+    /// A revocation that completes while a question waits for the policy's lock is found: the
+    /// grant is read again once the lock is held, for a grant in the store and for a paired
+    /// device's alike. The control: left alone, the question admits its recipient.
+    #[test]
+    fn a_revocation_completed_while_the_question_waits_for_the_lock_is_found() {
+        for (paired, revokes) in [(false, false), (false, true), (true, false), (true, true)] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let recipients = Arc::new(recipients(&sharing));
+            let base = Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                ..grant(34, SessionSelector::Any, &[ActionRight::SessionView])
+            };
+            if paired {
+                recipients
+                    .lifetimes()
+                    .devices()
+                    .commit(&device(DeviceId::new(uuid(2)), base))
+                    .expect("a device");
+            } else {
+                issued(&sharing, base, true);
+                recipients
+                    .lifetimes()
+                    .devices()
+                    .commit(&device(
+                        DeviceId::new(uuid(2)),
+                        grant(35, SessionSelector::Any, &[ActionRight::SessionView]),
+                    ))
+                    .expect("the device");
+            }
+            let (arrived, go) = recipients.before_the_policy_lock.arm();
+            let asking = {
+                let recipients = Arc::clone(&recipients);
+                std::thread::spawn(move || recipients.device_scope(&destination(Some(34))))
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the question read the grant's standing and reached the lock");
+            if revokes {
+                if paired {
+                    recipients
+                        .lifetimes()
+                        .devices()
+                        .revoke(
+                            DeviceId::new(uuid(2)),
+                            kr_protocol::scalars::TimestampMs::new(NOW),
+                        )
+                        .expect("a revocation");
+                } else {
+                    sharing
+                        .grants()
+                        .revoke(GrantId::new(uuid(34)), NOW, || Ok(()))
+                        .expect("a revocation");
+                }
+            }
+            go.send(()).expect("the question waits");
+            assert_eq!(
+                asking.join().expect("the question ends").is_some(),
+                !revokes,
+                "paired {paired}, revoked {revokes}"
+            );
+        }
+    }
+
+    /// The configured rights ceiling narrows a grant before the policy is applied, as it narrows a
+    /// device's every request: a ceiling that removes the right leaves nothing a notification can
+    /// ask for, and one that keeps it changes nothing.
+    #[test]
+    fn the_configured_ceiling_narrows_a_grant_as_it_does_a_devices_request() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        issued(
+            &sharing,
+            grant(36, SessionSelector::Any, &[ActionRight::SessionView]),
+            true,
+        );
+        let ceiling = Arc::new(Mutex::new(None));
+        let recipients = recipients(&sharing).with_ceiling(Arc::clone(&ceiling));
+        assert!(
+            recipients.scope_for(&rule(Some(36))).is_some(),
+            "no ceiling set"
+        );
+        *ceiling.lock().expect("not poisoned") =
+            Some([ActionRight::FilesRead].into_iter().collect());
+        assert_eq!(
+            recipients.scope_for(&rule(Some(36))),
+            None,
+            "a ceiling that removes session.view"
+        );
+        *ceiling.lock().expect("not poisoned") =
+            Some([ActionRight::SessionView].into_iter().collect());
+        assert!(recipients.scope_for(&rule(Some(36))).is_some());
+    }
 }
