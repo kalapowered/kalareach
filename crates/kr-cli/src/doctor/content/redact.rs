@@ -7,9 +7,9 @@
 //! and in the preview a person sees before anything is written.
 //!
 //! One scanner reads a field's text and replaces spans of it; every other character is left as it
-//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. Credentials are
-//! read in the field as it was written, and the home directory is replaced in what is left, so a
-//! quote in the home directory is a quote in the text the rules read. Then:
+//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. The home
+//! directory is replaced first, over the whole field, and a quote in it counts as a quote in the
+//! field. Then:
 //!
 //! * **Assignments.** A name, then `=`, then a value: when the name says credential, the value
 //!   becomes `[redacted]`. The name is the run of letters, digits, `_`, `.` and `-` before the
@@ -51,10 +51,10 @@
 //! It does not find a credential by its value. A secret that is a positional word, a plain path
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
 //! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
-//! or `#` in a URL, a quote character that is part of a secret (`TOKEN='it's a secret'`), a value in `$'...'`
-//! quoting, or a name nobody listed stays in the text. So does a user name anywhere in a
-//! path but the home directory's. The preview shows everything that will be written, and a person
-//! can leave a session out.
+//! or `#` in a URL, a quote character that is part of a secret, a value in `$'...'` quoting, a
+//! value with a command substitution, backticks or `${...}` in it, or a name nobody listed stays in
+//! the text. So does a user name anywhere in a path but the home directory's. The preview shows
+//! everything that will be written, and a person can leave a session out.
 
 /// The name of these rules, recorded in the file and in the bundle's manifest.
 pub const RULES: &str = "session-content-1";
@@ -98,20 +98,21 @@ impl Paths {
     }
 }
 
-/// Redacts one field's text: each credential its text spells, then its home directory.
+/// Redacts one field's text: its home directory, and each credential its text spells.
 ///
-/// The credentials are read in the text as it was written: a quote in the home directory
-/// (`/home/o'neil`) is a quote before the credential that follows it, and replacing the home first
-/// would hide it.
+/// Whether the field can be redacted at all is decided in the text as it was written: a quote in
+/// the home directory (`/home/o'neil`) is a quote before the credential that follows it, and
+/// replacing the home first would hide it. Which spans are replaced is read in the text with the
+/// home directory replaced, so that a credential's value that starts inside a home with a space in
+/// it does not cut the home in two and leave part of it in the text.
 #[must_use]
 pub fn field(text: &str, home: Option<&str>, paths: Paths) -> String {
-    match credentials(text) {
-        Some(redacted) => match home {
-            Some(home) => replace_home(&redacted, home, paths),
-            None => redacted,
-        },
-        None => format!("[withheld: {} characters]", text.chars().count()),
+    let withheld = || format!("[withheld: {} characters]", text.chars().count());
+    if credentials(text).is_none() {
+        return withheld();
     }
+    let homed = home.map_or_else(|| text.to_owned(), |home| replace_home(text, home, paths));
+    credentials(&homed).unwrap_or_else(withheld)
 }
 
 /// Replaces each place `home` is a path's start with [`HOME`].
