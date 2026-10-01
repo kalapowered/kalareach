@@ -5,43 +5,51 @@
 //! section 10 makes each the owner's and says the account's own identity is not that owner's
 //! confirmation:
 //!
-//! * **Adopting a repository's trust root.** A request to add a repository carries the owner's
-//!   signed confirmation of exactly that root, and only an owner device produces one. So
-//!   `kr plugin repo add` does not send a request it cannot complete: it says where a repository is
-//!   added instead.
+//! * **Adopting a repository's trust root** (`kr plugin repo add`).
 //! * **An installation that enlarges what a package may do,** beyond the installation it replaces
 //!   or, with none to replace, beyond what its repository permits by itself, and every release that
-//!   installs a native bridge or declares a command integration. `kr plugin install` asks without
-//!   a confirmation, which is enough for an installation inside what is already permitted. When the
-//!   daemon answers that the owner has to confirm this one, the command says so and stops: the
-//!   confirmation is an owner device's own, given with the installation it confirms, so nothing is
-//!   left waiting here for it.
+//!   installs a native bridge or declares a command integration (`kr plugin install`, which asks
+//!   without a confirmation first, enough for an installation inside what is already permitted).
+//!
+//! For both the terminal asks the host for the challenge by naming the exact request it will send,
+//! says that an owner device has to confirm and what the owner device is shown, and then repeats
+//! the request, with no proof, every [`OWNER_DEVICE_POLL`]. The host spends, once, the answer an
+//! owner device records to that challenge, and answers the repeated request with its result; until
+//! then it answers that the owner has to confirm, and the command waits until the challenge's own
+//! deadline and then says that nothing was changed. A host that is not on the network has no owner
+//! device to ask, and says so.
 
+use base64::Engine as _;
 use kr_client::error::refusal;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::catalogue::{
-    CatalogueListParams, CatalogueListResult, CataloguePinParams, CataloguePinResult,
-    CatalogueRemoveParams, CatalogueRemoveResult, CatalogueSummary, CatalogueSyncParams,
-    CatalogueSyncResult, PluginAdmission, PluginEnableParams, PluginEnableResult,
-    PluginInstallParams, PluginInstallResult, PluginLeftOutReason, PluginListParams,
-    PluginListResult, PluginPinParams, PluginPinResult, PluginRemoveParams, PluginRemoveResult,
-    PluginSummary,
+    CatalogueAddParams, CatalogueAddResult, CatalogueBudgets, CatalogueKind, CatalogueListParams,
+    CatalogueListResult, CataloguePinParams, CataloguePinResult, CatalogueRemoveParams,
+    CatalogueRemoveResult, CatalogueSummary, CatalogueSyncParams, CatalogueSyncResult,
+    PluginAdmission, PluginEnableParams, PluginEnableResult, PluginInstallParams,
+    PluginInstallResult, PluginLeftOutReason, PluginListParams, PluginListResult, PluginPinParams,
+    PluginPinResult, PluginRemoveParams, PluginRemoveResult, PluginSummary,
 };
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::confirmation::{
+    ConfirmationDisplay, ConfirmationSubject, NATIVE_BRIDGE_NOTICE, OwnerConfirmationPendingParams,
+    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{PluginId, RepositoryGeneration};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 
 use crate::cli::{
     PluginArguments, PluginCommand, PluginInstallArguments, PluginIntegrationCommand,
-    PluginListArguments, PluginPinArguments, PluginRepoArguments, PluginRepoCommand,
-    PluginRepoPinArguments,
+    PluginListArguments, PluginPinArguments, PluginRepoAddArguments, PluginRepoArguments,
+    PluginRepoCommand, PluginRepoPinArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request, left};
+use crate::pair::OWNER_DEVICE_POLL;
 use crate::{answer, stdout_line};
 
 /// Runs one `kr plugin` command and prints its result.
@@ -158,7 +166,7 @@ async fn integration(
 async fn repo(paths: &HostPaths, command: PluginRepoCommand, json: bool) -> Result<()> {
     match command {
         PluginRepoCommand::List(arguments) => repo_list(paths, &arguments, json).await,
-        PluginRepoCommand::Add(_) => Err(repo_add()),
+        PluginRepoCommand::Add(arguments) => repo_add(paths, &arguments, json).await,
         PluginRepoCommand::Sync(arguments) => repo_sync(paths, &arguments, json).await,
         PluginRepoCommand::Pin(arguments) => repo_pin(paths, &arguments, json).await,
         PluginRepoCommand::Remove(arguments) => repo_remove(paths, &arguments, json).await,
@@ -192,31 +200,40 @@ async fn list(paths: &HostPaths, arguments: &PluginListArguments, json: bool) ->
 async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bool) -> Result<()> {
     let plugin = plugin_identifier(&arguments.plugin)?;
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
-    let installed: std::result::Result<PluginInstallResult, CliError> = daemon
-        .mutate(
-            Method::PluginInstall,
-            &PluginInstallParams {
-                environment_id: daemon.environment_id(),
-                catalogue_id: arguments.catalogue.clone(),
-                plugin_id: plugin,
-                version: arguments.version.clone(),
-                package_digest: arguments.digest.clone(),
-                grant: arguments.grant.clone(),
-                // Nothing at this terminal can confirm on the owner's behalf. An installation that
-                // needs the owner's confirmation is refused, and said to be refused, below.
-                owner_confirmation: Nullable::null(),
-            },
-        )
-        .await;
-    let installed = match installed {
-        Ok(installed) => installed,
+    let params = PluginInstallParams {
+        environment_id: daemon.environment_id(),
+        catalogue_id: arguments.catalogue.clone(),
+        plugin_id: plugin,
+        version: arguments.version.clone(),
+        package_digest: arguments.digest.clone(),
+        grant: arguments.grant.clone(),
+        // Nothing at this terminal can sign for the owner. An installation that needs the owner's
+        // confirmation is asked for below, and an owner device's recorded answer is what spends.
+        owner_confirmation: Nullable::null(),
+    };
+    let asked: std::result::Result<PluginInstallResult, CliError> =
+        daemon.mutate(Method::PluginInstall, &params).await;
+    let (installed, challenge) = match asked {
+        Ok(installed) => (installed, None),
         Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::OwnerConfirmationRequired => {
-            return Err(needs_owner_device(&refusal));
+            let (installed, challenge) = confirmed_on_an_owner_device(
+                &mut daemon,
+                ConfirmationSubject::PluginInstall(Box::new(params.clone())),
+                Method::PluginInstall,
+                &params,
+                json,
+            )
+            .await?;
+            (installed, Some(challenge))
         }
         Err(error) => return Err(error),
     };
     if json {
-        output::document(&answer::plugin_install_result(&installed));
+        let mut document = answer::plugin_install_result(&installed);
+        if let Some(challenge) = &challenge {
+            document.set("confirmation", confirmation_document(challenge));
+        }
+        output::document(&document);
         return Ok(());
     }
     output::line(&stdout_line!("Installed {}.", line(&installed.plugin)));
@@ -238,16 +255,168 @@ async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bo
     Ok(())
 }
 
-/// The refusal an installation that needs the owner's confirmation ends with.
-fn needs_owner_device(host: &ProtocolError) -> CliError {
-    CliError::Refused(refusal(
-        ErrorCode::OwnerConfirmationRequired,
-        shown!(
-            "installing this release enlarges what the package may do, which only the owner \
-             confirms: confirm it and install it from an owner device. Nothing was installed ({})",
-            Shown::protocol(host)
-        ),
-    ))
+/// What a terminal that waited for an owner device says of the challenge in its `--json` answer.
+fn confirmation_document(challenge: &kr_protocol::pairing::OwnerConfirmationRequest) -> Document {
+    Document::new()
+        .with(
+            "confirmation_id",
+            output::said(&challenge.confirmation_id.get()),
+        )
+        .with(
+            "expires_at_ms",
+            output::said(&challenge.expires_at_ms.get()),
+        )
+}
+
+/// Asks the host for the challenge that confirms the exact request `params` names, says that an
+/// owner device has to confirm it and what that device is shown, and repeats the request with no
+/// proof every [`OWNER_DEVICE_POLL`] until the host spends the owner device's answer to it or the
+/// challenge's deadline passes.
+///
+/// Nothing here signs anything: an owner device answers with its own key, on its own screen, and
+/// the host spends that answer once. What the request does is the host's own, so a request that
+/// the host refuses for another reason ends the wait with that refusal.
+async fn confirmed_on_an_owner_device<P, T>(
+    daemon: &mut Daemon,
+    subject: ConfirmationSubject,
+    method: Method,
+    params: &P,
+    json: bool,
+) -> Result<(T, kr_protocol::pairing::OwnerConfirmationRequest)>
+where
+    P: serde::Serialize + ?Sized,
+    T: kr_protocol::wire::WireMessage,
+{
+    let challenge: OwnerConfirmationRequestResult = daemon
+        .mutate(
+            Method::OwnerConfirmationRequest,
+            &OwnerConfirmationRequestParams { subject },
+        )
+        .await?;
+    if challenge.initial_bootstrap {
+        return Err(CliError::Refused(refusal(
+            ErrorCode::OwnerConfirmationRequired,
+            Shown::said(
+                "this host has no owner device yet to confirm this: pair the first one with \
+                 `kr pair invite --owner`, then ask again. Nothing was changed",
+            ),
+        )));
+    }
+    let expires_at_ms = challenge.request.expires_at_ms.get();
+    if !json {
+        let pending: OwnerConfirmationPendingResult = daemon
+            .read(
+                Method::OwnerConfirmationPending,
+                &OwnerConfirmationPendingParams {},
+            )
+            .await?;
+        if let Some(listed) = pending
+            .pending
+            .iter()
+            .find(|pending| pending.request == challenge.request)
+        {
+            say_what_is_asked(&listed.display);
+        }
+        crate::report::say(&shown!(
+            "Confirm this on an owner device. Waiting {}.",
+            remaining(expires_at_ms, kr_ipc::now_ms().get())
+        ));
+    }
+    loop {
+        match daemon.mutate::<P, T>(method, params).await {
+            Ok(answer) => return Ok((answer, challenge.request)),
+            Err(CliError::Refused(refusal))
+                if refusal.code == ErrorCode::OwnerConfirmationRequired =>
+            {
+                if kr_ipc::now_ms().get() >= expires_at_ms {
+                    return Err(CliError::Refused(self::refusal(
+                        ErrorCode::OwnerConfirmationRequired,
+                        shown!(
+                            "no owner device confirmed this before the challenge ran out. Nothing \
+                             was changed ({})",
+                            Shown::protocol(&refusal)
+                        ),
+                    )));
+                }
+                tokio::time::sleep(OWNER_DEVICE_POLL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// How long a wait has left, in words.
+fn remaining(until_ms: u64, now_ms: u64) -> Shown {
+    let seconds = until_ms.saturating_sub(now_ms) / 1000;
+    match seconds {
+        0 => Shown::said("no longer"),
+        1..=59 => shown!("for {} seconds", seconds),
+        _ => {
+            let minutes = seconds / 60;
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            shown!("for {} {}", minutes, unit)
+        }
+    }
+}
+
+/// Says what an owner device is asked to confirm, as the host resolved it from the request.
+///
+/// A native bridge's statement is the publisher's own words, and is written apart from the host's
+/// own notice that such a bridge runs outside the plugin sandbox.
+fn say_what_is_asked(display: &ConfirmationDisplay) {
+    match display {
+        ConfirmationDisplay::CatalogueAdd {
+            catalogue_id,
+            metadata_url,
+            root_digest,
+            root_key_ids,
+            ceiling,
+            ..
+        } => {
+            output::line(&stdout_line!(
+                "An owner device is asked to trust the root {} for the repository {} ({}).",
+                Asked::text(Request::Plugins, root_digest),
+                Asked::text(Request::Plugins, catalogue_id),
+                Asked::text(Request::Plugins, metadata_url)
+            ));
+            output::line(&stdout_line!(
+                "  root key identifiers: {}",
+                Asked::text(Request::Plugins, &root_key_ids.join(", "))
+            ));
+            if !ceiling.is_empty() {
+                output::line(&stdout_line!(
+                    "  its packages may hold without a further grant: {}",
+                    Asked::text(Request::Plugins, &ceiling.join(", "))
+                ));
+            }
+        }
+        ConfirmationDisplay::PluginInstall {
+            catalogue_id,
+            plugin_id,
+            version,
+            package_digest,
+            grant,
+            grant_statement,
+            ..
+        } => {
+            output::line(&stdout_line!(
+                "An owner device is asked to install {} {} (package {}) from {} with: {}.",
+                Asked::text(Request::Plugins, &plugin_id.to_string()),
+                Asked::text(Request::Plugins, version),
+                Asked::text(Request::Plugins, package_digest),
+                Asked::text(Request::Plugins, catalogue_id),
+                Asked::text(Request::Plugins, &grant.join(", "))
+            ));
+            if let Some(statement) = &grant_statement.0 {
+                output::line(&stdout_line!("{}", Shown::said(NATIVE_BRIDGE_NOTICE)));
+                output::line(&stdout_line!(
+                    "  the publisher says: {}",
+                    Asked::text(Request::Plugins, statement)
+                ));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `kr plugin remove`.
@@ -362,18 +531,68 @@ async fn repo_list(paths: &HostPaths, arguments: &PluginListArguments, json: boo
     Ok(())
 }
 
-/// `kr plugin repo add`, which is refused before anything is sent.
+/// `kr plugin repo add`.
 ///
-/// A request to add a repository carries the owner's signed confirmation of the exact root it
-/// adopts, and there is no such request without one. Only an owner device signs one.
-fn repo_add() -> CliError {
-    CliError::Refused(refusal(
-        ErrorCode::OwnerConfirmationRequired,
-        Shown::said(
-            "adding a repository adopts its trust root, which only the owner confirms, on an \
-             owner device: add it from an owner device. Nothing was sent to this host",
-        ),
-    ))
+/// The root is read from the file the person names and travels with the request, because a host
+/// that fetched it from the location it is meant to verify would be trusting the thing it is
+/// checking. The repository is a directory on this machine when its metadata is addressed by a
+/// `file` location and a community repository otherwise, with the budgets and the ceiling this
+/// host starts a repository with; an owner device confirms exactly that enrolment.
+async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: bool) -> Result<()> {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    let root = std::fs::read(&arguments.root).map_err(|error| {
+        CliError::Usage(shown!(
+            "the trust root file could not be read: {}",
+            Shown::io(&error)
+        ))
+    })?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let defaults = EnrolmentBudgets::default();
+    let params = CatalogueAddParams {
+        environment_id: daemon.environment_id(),
+        catalogue_id: arguments.catalogue.clone(),
+        kind: if arguments.metadata_url.starts_with("file:") {
+            CatalogueKind::Local
+        } else {
+            CatalogueKind::Community
+        },
+        metadata_url: arguments.metadata_url.clone(),
+        targets_url: arguments.targets_url.clone(),
+        root: base64::engine::general_purpose::STANDARD.encode(&root),
+        budgets: CatalogueBudgets {
+            metadata_bytes: kr_protocol::scalars::U64::new(defaults.metadata_bytes),
+            metadata_entries: kr_protocol::scalars::U64::new(defaults.metadata_entries),
+            retained_generations: kr_protocol::scalars::U64::new(defaults.retained_generations),
+            retained_metadata_bytes: kr_protocol::scalars::U64::new(
+                defaults.retained_metadata_bytes,
+            ),
+            payload_cache_bytes: kr_protocol::scalars::U64::new(defaults.cached_payload_bytes),
+            full_offline_mirror: defaults.full_offline_mirror,
+        },
+        ceiling: Vec::new(),
+        // Nothing at this terminal can sign for the owner: an owner device's recorded answer to
+        // the challenge for exactly this request is what the host spends.
+        owner_confirmation: Nullable::null(),
+    };
+    let (added, challenge): (CatalogueAddResult, _) = confirmed_on_an_owner_device(
+        &mut daemon,
+        ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+        Method::CatalogueAdd,
+        &params,
+        json,
+    )
+    .await?;
+    if json {
+        // `catalogue.add` answers the shape `catalogue.pin` does: the repository as it now is.
+        let mut document = answer::catalogue_pin_result(&CataloguePinResult {
+            catalogue: added.catalogue.clone(),
+        });
+        document.set("confirmation", confirmation_document(&challenge));
+        output::document(&document);
+    } else {
+        output::line(&repo_line(&added.catalogue));
+    }
+    Ok(())
 }
 
 /// `kr plugin repo sync`.
