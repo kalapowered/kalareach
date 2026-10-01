@@ -71,6 +71,9 @@ pub enum Request {
     /// The content a support bundle's export would hold, shown to the person who asked for it
     /// before it is written: `kr doctor --include-content`.
     Export,
+    /// What session descriptions offer on this host: the model's name, where its files come from
+    /// and why a fetch failed: `kr host descriptions`.
+    Descriptions,
 }
 
 /// Content the person asked to read.
@@ -606,6 +609,9 @@ impl claim::Claimed for kr_protocol::ids::DeviceId {}
 impl claim::Claimed for kr_protocol::ids::GrantId {}
 impl claim::Claimed for kr_protocol::ids::SessionId {}
 impl claim::Claimed for kr_protocol::privacy::PrivacyDisabled {}
+impl claim::Claimed for kr_protocol::describe::DescriptionDownload {}
+impl claim::Claimed for kr_protocol::describe::DescriptionPause {}
+impl claim::Claimed for kr_protocol::describe::DescriptionState {}
 impl claim::Claimed for kr_protocol::action::BarrierState {}
 impl claim::Claimed for kr_protocol::receipt::ReceiptState {}
 impl claim::Claimed for kr_protocol::pairing::DevicePublicKeys {}
@@ -1373,6 +1379,9 @@ mod tests {
         assert_closed::<kr_protocol::error::RetryCategory>();
         assert_closed::<kr_protocol::identity::ProcessStartSource>();
         assert_closed::<kr_protocol::privacy::PrivacyDisabled>();
+        assert_closed::<kr_protocol::describe::DescriptionDownload>();
+        assert_closed::<kr_protocol::describe::DescriptionPause>();
+        assert_closed::<kr_protocol::describe::DescriptionState>();
     }
 
     /// Every type this file claims closed is one the planted test above checks: the claims and the

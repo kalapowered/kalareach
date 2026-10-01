@@ -48,6 +48,7 @@ pub mod cli;
 pub mod contact;
 pub mod create;
 pub mod daemon;
+pub mod descriptions;
 pub mod device;
 pub mod diff;
 pub mod doctor;
