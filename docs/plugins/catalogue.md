@@ -481,16 +481,18 @@ refused, and so is a name in another case.
 
 The host makes the directory, or uses one that is already there when it holds nothing but empty
 directories, or when its own record shows that it made that very directory. It tells the two apart
-by the directory's identity, never by its path. A directory with anything else in it is refused,
-because the application enables everything in a plugin's directory along with the plugin.
+by the directory's identity, never by its path. A directory the host did not make, with anything
+else in it, is refused, because the application enables everything in a plugin's directory along
+with the plugin. What is added to a directory the host made is the person's own, as it is after the
+install.
 
-A folder beside it whose manifest has the same name is refused for another reason. The application
+A folder beside it whose manifest has the same name is refused for another reason. Claude Code
 keeps the first plugin of each name, so the key that enables this registration could reach that one
-instead. The host reads each manifest the way the application does, past a leading byte order mark.
-When a manifest is there and the host cannot read it whole or parse it, the host refuses the install
-and names the folder. The directory itself under another name, such as a link to it, is not another
-folder. For Claude Code a hidden folder is not either, because Claude Code does not read it as a
-plugin.
+instead. The host reads each manifest past a leading byte order mark, as Claude Code does, and
+applies the same rule to Gemini CLI as a precaution. When a manifest is there and the host cannot
+read it whole or parse it, the host refuses the install and names the folder. The directory itself
+under another name, such as a link to it, is not another folder. For Claude Code a hidden folder is
+not either, because Claude Code does not read it as a plugin; for Gemini CLI it is another folder.
 
 These checks run before anything is written and are not repeated while the files are placed, so
 content that appears later is the person's own. A bridge therefore never installs a settings
@@ -498,9 +500,9 @@ document of its own, and no value it adds can hold a command.
 
 What the publisher chooses is which of the forwarder's events and which surface the registration
 starts it for, and what the package does with what the forwarder carries. The text the application
-shows is the publisher's too: the manifest's description and display name, and the names of the
-server and its channels. The owner's confirmation of the publisher's statement is the only control
-on any of it.
+shows is the publisher's too, such as the manifest's description, display name and version, and the
+names of the server and its channels. The owner's confirmation of the publisher's statement is the
+only control on any of it.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
