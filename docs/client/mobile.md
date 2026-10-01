@@ -210,8 +210,10 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 
 The iOS Notification Service Extension and the Android messaging service are started by the system,
 with no application and no JavaScript context anywhere. Each makes one decision, which has its own
-tests; neither is connected to a registration with the gateway or to the payload shape the gateway
-sends. Both make the same decision in the same order:
+tests; neither is connected to a registration with the gateway. The message format for push messages
+only allows string data. Thus, the extension on iOS reads the sealed preview as the JSON text the
+gateway puts in the `preview` field, while the receiver on Android reads the same fields from
+separate keys. Both make the same decision in the same order:
 
 On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
 where the payload alone decides the content; work it hands to the scheduler finishes without
