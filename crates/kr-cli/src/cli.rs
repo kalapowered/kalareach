@@ -1278,10 +1278,24 @@ pub struct DoctorArguments {
     /// redacted errors, as one archive.
     #[arg(long, value_name = "PATH")]
     pub bundle: Option<PathBuf>,
-    /// Add the content-bearing diagnostic export to the bundle. The command prints what it will
-    /// contain before it writes anything.
+    /// Add the content-bearing diagnostic export to the bundle: each session's shell, working
+    /// directory and closure, with the credentials the rules find taken out and every private
+    /// session left out. The command prints that content in full, with a digest, before it writes
+    /// anything. At a terminal it then asks; anywhere else it needs `--preview` first and then
+    /// `--confirm-content`.
     #[arg(long, requires = "bundle")]
     pub include_content: bool,
+    /// Print the content export and its digest, and write nothing.
+    #[arg(long, requires = "include_content", conflicts_with = "confirm_content")]
+    pub preview: bool,
+    /// Write the content export only when it has this digest, the one `--preview` printed. The
+    /// command prints the content again as it writes, and refuses if it is not the same.
+    #[arg(long, value_name = "DIGEST", requires = "include_content")]
+    pub confirm_content: Option<String>,
+    /// Leave this session out of the content export, by identifier. Repeat for more. Give the same
+    /// ones to `--preview` and `--confirm-content`.
+    #[arg(long, value_name = "SESSION", requires = "include_content")]
+    pub exclude_session: Vec<String>,
 }
 
 impl Execution {

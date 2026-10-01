@@ -18,6 +18,7 @@ use kr_protocol::desktop::{
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::session::{ClosureRecord, SessionState, SessionSummary};
 
+use crate::doctor::content::Preview;
 use crate::error::CliError;
 use crate::output::{self, Asked, Document, Line, Request, left, right};
 use crate::stdout_line;
@@ -58,9 +59,45 @@ pub fn with_failure(mut document: Document, error: &CliError) -> Document {
 ///
 /// Every failure, warning and notice this program writes there goes through here or through
 /// [`failed`], and each is a [`Shown`]: this program's own words, values with nothing in them to
-/// hide, and what a reducer or a door decided may be said.
+/// hide, and what a reducer or a door decided may be said. The one other thing written there is
+/// the preview of a content export, by [`show_preview`].
 pub fn say(line: &Shown) {
     eprintln!("{line}");
+}
+
+/// Prints the preview of a content export on standard error, and flushes it.
+///
+/// This is the one place content a person asked to read reaches the error stream. The export's
+/// preview goes there so that `--json` keeps standard output for its document, and the command
+/// prints it before it writes anything. It takes a [`Preview`], which only the export builds, and
+/// a failure to write or flush it is the command's failure: nothing is written after a preview
+/// the person could not be shown.
+///
+/// # Errors
+///
+/// Returns an error when the preview cannot be written or flushed.
+pub fn show_preview(preview: &Preview) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let unwritten = |error: std::io::Error| {
+        CliError::Terminal(shown!(
+            "the content could not be shown, so nothing was written: {}",
+            Shown::io(&error)
+        ))
+    };
+    let mut error_stream = std::io::stderr().lock();
+    for line in preview.lines() {
+        output::write_line(&mut error_stream, line).map_err(unwritten)?;
+    }
+    error_stream.flush().map_err(unwritten)
+}
+
+/// Whether standard error is a terminal: whether a person is there to be shown a preview.
+#[must_use]
+pub fn is_terminal() -> bool {
+    use std::io::IsTerminal as _;
+
+    std::io::stderr().is_terminal()
 }
 
 /// Reports a failure on standard error, as `kr: ` and what the failure says.
