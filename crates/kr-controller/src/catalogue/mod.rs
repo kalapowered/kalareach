@@ -591,6 +591,64 @@ impl CatalogueModule {
         record_disable_policy(&mut catalogue, wanted).map_err(ProtocolError::from)
     }
 
+    /// Puts the adapters an organisation's policy allows in force for the admissions that follow,
+    /// or every adapter with `None`, and returns true when that changed what was in force, so the
+    /// caller sends every worker a round.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when the revision could not be raised, and then the
+    /// list in force is the one before.
+    pub async fn put_allowed_adapters(
+        &self,
+        allowed: Option<std::collections::BTreeSet<PluginId>>,
+    ) -> Answer<bool> {
+        let mut catalogue = self.catalogue.lock().await;
+        let moved = catalogue
+            .set_allowed_adapters(allowed, &Owner::acting())
+            .map_err(ProtocolError::from)?;
+        if moved {
+            // The list changed which packages may run in an application's name, so each bridge
+            // follows what its installation now wants, under the same lock and after the change's
+            // commit, as a plugin change's bridge does.
+            let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
+            let wanted = self.wanted_bridges(&catalogue, subjects);
+            self.follow_bridges(wanted).await;
+        }
+        Ok(moved)
+    }
+
+    /// What each of `subjects`' installations wants of its native bridge, read from the catalogue
+    /// the caller holds.
+    fn wanted_bridges(
+        &self,
+        catalogue: &Catalogue,
+        subjects: Vec<PluginId>,
+    ) -> Vec<(PluginId, CatalogueResult<WantedBridge>)> {
+        subjects
+            .into_iter()
+            .map(|plugin_id| {
+                let wanted = wanted_bridge(catalogue, self.environment_id, &plugin_id);
+                (plugin_id, wanted)
+            })
+            .collect()
+    }
+
+    /// Brings each native bridge to what its installation wants. What a bridge does is its own
+    /// journal's and never changes the answer of the change that moved it.
+    async fn follow_bridges(&self, wanted: Vec<(PluginId, CatalogueResult<WantedBridge>)>) {
+        for (plugin_id, wanted) in wanted {
+            let bridges = Arc::clone(&self.bridges);
+            let followed = tokio::task::spawn_blocking(move || {
+                reconcile_bridge(&bridges, &plugin_id, wanted);
+            })
+            .await;
+            if let Err(error) = followed {
+                eprintln!("kr-controller: a native bridge was not reconciled: {error}");
+            }
+        }
+    }
+
     /// Returns the disable policy in force.
     ///
     /// # Errors
@@ -1157,17 +1215,8 @@ impl CatalogueModule {
                 }
             };
         let subjects = if raised { subjects } else { Vec::new() };
-        for plugin_id in subjects {
-            let bridges = Arc::clone(&self.bridges);
-            let wanted = wanted_bridge(&catalogue, self.environment_id, &plugin_id);
-            let followed = tokio::task::spawn_blocking(move || {
-                reconcile_bridge(&bridges, &plugin_id, wanted);
-            })
-            .await;
-            if let Err(error) = followed {
-                eprintln!("kr-controller: a native bridge was not reconciled: {error}");
-            }
-        }
+        let wanted = self.wanted_bridges(&catalogue, subjects);
+        self.follow_bridges(wanted).await;
         answer
     }
 
@@ -1687,6 +1736,13 @@ fn wanted_bridge(
     let Some(installation) = catalogue.installation(environment_id, plugin_id)? else {
         return Ok(WantedBridge::Nothing);
     };
+    // A registration in an application's directory is the package running in that application's
+    // name, so it follows the standing the admissions decide first: a package the owner disabled,
+    // a release its repository revoked and one the organisation's allowlist does not name want
+    // none, and the installation stays.
+    if catalogue.standing(&installation)?.is_some() {
+        return Ok(WantedBridge::Nothing);
+    }
     // The grant is what permits the bridge: a release installed without it, or an installation
     // that withdrew it, wants none.
     if !catalogue
