@@ -656,6 +656,13 @@ async fn run(cli: Cli) -> Result<Completion> {
             Ok(Completion::Done)
         }
         Command::Doctor(arguments) => {
+            // Before any host is asked: what the content export needs of the person is settled
+            // first, so a command that could not show them the content never reads it.
+            let content_asked = if arguments.include_content {
+                Some(content_asked(&arguments)?)
+            } else {
+                None
+            };
             let environment = kr_cli::resolve::select(&paths, None)?;
             let mut client = open_controller(&environment.paths, build_id()).await?;
             // The diagnostics first, because asking for them is what puts this host's
@@ -683,28 +690,29 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The bundle is written before anything is printed, so `--json` produces one document
             // and a bundle that could not be written is the command's failure rather than a note
             // after a result that already said everything went well.
+            let content = match content_asked {
+                Some((decision, excluded)) => Some(
+                    kr_cli::doctor::content::export(
+                        &mut client,
+                        environment.environment_id,
+                        decision,
+                        excluded,
+                        &kr_cli::doctor::content::Rules::here(),
+                        &mut report::show_preview,
+                        &mut kr_cli::doctor::content::ask_at_terminal,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
             let bundle = match arguments.bundle.as_deref() {
-                Some(path) => {
-                    let (content, left_out) = if arguments.include_content {
-                        let reading =
-                            kr_cli::doctor::content::read(&mut client, environment.environment_id)
-                                .await?;
-                        let composed = kr_cli::doctor::content::compose(&reading)?;
-                        let left_out = composed.left_out().to_vec();
-                        let selected = vec![composed.into_content()];
-                        // On the error stream, because standard output is one document. A person
-                        // sees what they selected either way, and a `--json` reader is not handed
-                        // two things to parse.
-                        report::say(&Shown::said(
-                            "--include-content adds the content-bearing diagnostic export:",
-                        ));
-                        for entry in &selected {
-                            report::say(&entry.describe());
-                        }
-                        (selected, left_out)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                // A preview writes nothing, and a bundle without content is written as it was.
+                Some(path)
+                    if content
+                        .as_ref()
+                        .is_none_or(|exported| exported.approved().is_some()) =>
+                {
+                    let approved = content.as_ref().and_then(|exported| exported.approved());
                     let bundle = kr_protocol::hostinfo::ComposedBundle::new(
                         kr_protocol::scalars::TimestampMs::new(
                             std::time::SystemTime::now()
@@ -716,10 +724,16 @@ async fn run(cli: Cli) -> Result<Completion> {
                         checks.clone(),
                         Vec::new(),
                     );
-                    kr_cli::doctor::bundle::write(path, &bundle, &content)?;
-                    Some((path, bundle, content.len(), left_out))
+                    kr_cli::doctor::bundle::write(
+                        path,
+                        &bundle,
+                        approved
+                            .map(|approved| std::slice::from_ref(approved.content()))
+                            .unwrap_or_default(),
+                    )?;
+                    Some((path, bundle, usize::from(approved.is_some())))
                 }
-                None => None,
+                _ => None,
             };
             // One document, whether the diagnostics passed or not. A command that printed a result
             // and then a failure would give a reader two documents to reconcile.
@@ -736,7 +750,35 @@ async fn run(cli: Cli) -> Result<Completion> {
                         "environment",
                         report::environment_capabilities(&capabilities),
                     );
-                if let Some((path, written, entries, left_out)) = bundle.as_ref() {
+                if let Some(exported) = content.as_ref() {
+                    // What the content export left out and why, and the digest of what was shown,
+                    // so a script can tell a bundle with no sessions in it from a host with none,
+                    // and can confirm the content a preview showed.
+                    document.set(
+                        "content_digest",
+                        Shown::compose(
+                            "{}",
+                            &[&kr_cli::shown::hex_digest(
+                                &exported.composed().digest().hex(),
+                            )],
+                        ),
+                    );
+                    document.set(
+                        "content_left_out",
+                        exported
+                            .composed()
+                            .left_out()
+                            .iter()
+                            .map(|(why, sessions)| {
+                                Document::new()
+                                    .with("reason", Shown::said(why.code()))
+                                    .with("sessions", *sessions)
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    document.set("content_written", exported.approved().is_some());
+                }
+                if let Some((path, written, entries)) = bundle.as_ref() {
                     document.set(
                         "bundle",
                         Document::new()
@@ -748,20 +790,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                             .with("software", written.software().len())
                             .with("capabilities", written.capabilities().len())
                             .with("checks", written.doctor().get().checks.len())
-                            .with("content_entries", *entries)
-                            // What the content export left out and why, so a script can tell a
-                            // bundle with no sessions in it from a host with none.
-                            .with(
-                                "content_left_out",
-                                left_out
-                                    .iter()
-                                    .map(|(why, sessions)| {
-                                        Document::new()
-                                            .with("reason", Shown::said(why.code()))
-                                            .with("sessions", *sessions)
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
+                            .with("content_entries", *entries),
                     );
                 }
                 output::document(&document);
@@ -785,7 +814,16 @@ async fn run(cli: Cli) -> Result<Completion> {
                 output::say(&report::power_line(&info.power));
                 output::lines(&kr_cli::doctor::configurable_lines(&checks.configuration));
                 output::lines(&kr_cli::doctor::doctor_lines(&checks, arguments.verbose));
-                if let Some((path, written, entries, _)) = bundle.as_ref() {
+                if let Some(exported) = content.as_ref()
+                    && exported.approved().is_none()
+                {
+                    output::say(&shown!(
+                        "content previewed and nothing written: run the command again with \
+                         --confirm-content {} to write it",
+                        kr_cli::shown::hex_digest(&exported.composed().digest().hex())
+                    ));
+                }
+                if let Some((path, written, entries)) = bundle.as_ref() {
                     output::say(&shown!(
                         "support bundle written to {} ({} software versions, {} capability \
                          records, {} checks, {} content-bearing entries)",
@@ -1717,6 +1755,54 @@ fn stdio_is_terminal() -> bool {
     use std::io::IsTerminal as _;
 
     std::io::stdin().is_terminal() && output::is_terminal()
+}
+
+/// What the content export needs of the person, settled before any host is asked: whether it only
+/// shows the content, writes it only when it has a digest the person saw, or asks at a terminal,
+/// and which sessions they left out.
+///
+/// # Errors
+///
+/// Returns a usage failure when the digest or a session identifier is not one, and when there is
+/// no terminal to ask at and neither `--preview` nor `--confirm-content` was given.
+fn content_asked(
+    arguments: &kr_cli::cli::DoctorArguments,
+) -> Result<(
+    kr_cli::doctor::content::Decision,
+    Vec<kr_protocol::ids::SessionId>,
+)> {
+    use kr_cli::doctor::content::{Decision, Digest};
+    use std::io::IsTerminal as _;
+
+    let excluded = arguments
+        .exclude_session
+        .iter()
+        .map(|session| {
+            session.parse().map_err(|_| {
+                CliError::Usage(Shown::said(
+                    "--exclude-session takes a session identifier, as kr list shows it",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let decision = if arguments.preview {
+        Decision::Preview
+    } else if let Some(digest) = arguments.confirm_content.as_deref() {
+        Decision::Confirmed(Digest::parse(digest).ok_or_else(|| {
+            CliError::Usage(Shown::said(
+                "--confirm-content takes the digest --preview printed: 64 hexadecimal digits",
+            ))
+        })?)
+    } else if report::is_terminal() && std::io::stdin().is_terminal() {
+        Decision::Ask
+    } else {
+        return Err(CliError::Usage(Shown::said(
+            "this command shows the content before it writes it and needs an answer: run it at a \
+             terminal, or run it with --preview and then with --confirm-content and the digest it \
+             printed",
+        )));
+    };
+    Ok((decision, excluded))
 }
 
 /// Reads one host answer, on a new connection when the authority behind this one was withdrawn.

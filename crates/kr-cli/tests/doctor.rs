@@ -94,6 +94,90 @@ fn asking_for_content_without_a_bundle_is_a_usage_error() {
     );
 }
 
+/// KR-REQ-29.04: where there is no terminal to ask at, the content export needs a preview first and
+/// the digest it printed. Without either, the command says so before it asks any host: a usage
+/// failure, not the failure of a host that is not there, and it writes and prints nothing.
+#[test]
+fn content_with_no_terminal_and_no_digest_is_refused_before_any_host_is_asked() {
+    let installation = Installation::create();
+    let bundle = installation.tree.root().join("support.tar");
+    let output = installation.run(&[
+        "doctor",
+        "--bundle",
+        bundle.to_str().expect("a path"),
+        "--include-content",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a usage failure, where a missing host would be 3: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("--preview") && message.contains("--confirm-content"),
+        "it says what to run instead: {message}"
+    );
+    assert!(!bundle.exists());
+    assert!(
+        output.stdout.is_empty(),
+        "nothing is printed on standard output"
+    );
+}
+
+/// KR-REQ-29.04: the flags that belong to the content export need it, a preview does not confirm,
+/// and a digest is 64 hexadecimal digits.
+#[test]
+fn the_content_flags_are_checked_before_any_host_is_asked() {
+    let installation = Installation::create();
+    let bundle = installation.tree.root().join("support.tar");
+    let path = bundle.to_str().expect("a path");
+    let digest = "ab".repeat(32);
+    for arguments in [
+        vec!["doctor", "--bundle", path, "--preview"],
+        vec![
+            "doctor",
+            "--bundle",
+            path,
+            "--confirm-content",
+            digest.as_str(),
+        ],
+        vec![
+            "doctor",
+            "--bundle",
+            path,
+            "--exclude-session",
+            "0badc0de-0000-4000-8000-00000000c105",
+        ],
+        vec![
+            "doctor",
+            "--bundle",
+            path,
+            "--include-content",
+            "--preview",
+            "--confirm-content",
+            digest.as_str(),
+        ],
+        vec![
+            "doctor",
+            "--bundle",
+            path,
+            "--include-content",
+            "--confirm-content",
+            "not-a-digest",
+        ],
+    ] {
+        let output = installation.run(&arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!bundle.exists());
+    }
+}
+
 /// KR-REQ-01.23: with no host to ask, the command says so and writes no bundle.
 #[test]
 fn with_no_host_the_command_reports_and_writes_nothing() {

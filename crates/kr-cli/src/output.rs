@@ -15,7 +15,8 @@
 //!
 //! [`Asked`] is content the person asked to read: a question's text, a repository's path, the name
 //! a paired device gave itself. Each names the [`Request`] that asked for it. It never becomes a
-//! `Shown` or a `Plain` value, so it cannot reach standard error, a failure or a `Debug`.
+//! `Shown` or a `Plain` value, so it cannot reach a failure or a `Debug`, and standard error shows
+//! it only through the one reporter function that prints a content export's preview.
 //!
 //! Three commands own standard output for a protocol or a terminal rather than for lines: the tool
 //! server, `kr bridge --stdio` and the attach guard. [`protocol_stream`] and [`attached_terminal`]
@@ -67,6 +68,9 @@ pub enum Request {
     /// Privacy mode's report: what is still owed and why, what is kept and what had already left:
     /// `kr privacy`.
     Privacy,
+    /// The content a support bundle's export would hold, shown to the person who asked for it
+    /// before it is written: `kr doctor --include-content`.
+    Export,
 }
 
 /// Content the person asked to read.
@@ -769,7 +773,8 @@ pub fn lines(lines: &[Line]) {
 }
 
 /// Writes one composed line on `writer`: the controlling terminal a command asks its person at,
-/// opened as itself rather than as standard output.
+/// opened as itself rather than as standard output, or the error stream a content export's preview
+/// is printed on (`report::show_preview`, the one place that does).
 ///
 /// # Errors
 ///

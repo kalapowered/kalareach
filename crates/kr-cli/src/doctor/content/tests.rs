@@ -1,6 +1,8 @@
 //! The privacy rule and the composition of the content export, without a host.
 
+use super::redact::Paths;
 use super::*;
+use kr_protocol::hostinfo::ComposedBundle;
 use kr_protocol::ids::SessionEpoch;
 use kr_protocol::privacy::{PrivacyCompletion, PrivacySession, PrivacySessionStanding};
 use kr_protocol::scalars::{TimestampMs, U64, Uuid};
@@ -30,6 +32,17 @@ fn listed(token: u8) -> SessionSummary {
         root_process: Nullable::null(),
         closure: Nullable::null(),
     }
+}
+
+/// The rules for a host whose home is `/home/tom`.
+fn rules() -> Rules {
+    Rules::new(
+        Some("/home/tom".to_owned()),
+        Paths {
+            ignores_case: false,
+            backslash_separates: false,
+        },
+    )
 }
 
 /// Privacy mode's report at `generation`, on or off, with `owing` sessions still owing cleanup.
@@ -201,10 +214,9 @@ fn the_export_names_what_is_in_and_says_why_the_rest_is_out() {
         vec![listed(1), listed(2), listed(3)],
         &report(2, false, &[2]),
     );
-    let composed = compose(&Reading { listed: selection }).expect("composes");
+    let composed = compose(&Reading { listed: selection }, &[], &rules()).expect("composes");
     assert_eq!(composed.left_out(), [(Why::OwesCleanup, 1)]);
-    let content = composed.into_content();
-    let text = String::from_utf8(content.bytes.clone()).expect("text");
+    let text = composed.text();
     assert!(text.contains(&session_id(1).to_string()), "{text}");
     assert!(text.contains(&session_id(3).to_string()), "{text}");
     assert!(
@@ -212,9 +224,13 @@ fn the_export_names_what_is_in_and_says_why_the_rest_is_out() {
         "a session that is out is not named: {text}"
     );
     assert_eq!(
-        content.describe().as_str(),
-        "  content/sessions.json: the shell, working directory and closure of 2 sessions; 1 session \
-         left out: privacy cleanup is still owed"
+        composed.content.describe().as_str(),
+        format!(
+            "  content/sessions.json: the shell, working directory and closure of 2 sessions, \
+             redacted by session-content-1 and printed before it was written (digest {}); 1 \
+             session left out: privacy cleanup is still owed",
+            composed.digest().hex()
+        )
     );
 }
 
@@ -227,15 +243,27 @@ fn an_export_with_every_session_out_is_an_empty_list_that_says_so() {
         vec![listed(1), listed(2)],
         &report(1, true, &[]),
     );
-    let content = compose(&Reading { listed: selection })
-        .expect("composes")
-        .into_content();
-    let record: serde_json::Value = serde_json::from_slice(&content.bytes).expect("JSON");
+    let composed = compose(&Reading { listed: selection }, &[], &rules()).expect("composes");
+    let record: serde_json::Value = serde_json::from_str(composed.text()).expect("JSON");
     assert_eq!(record["sessions"], serde_json::json!([]));
-    assert_eq!(
-        content.describe().as_str(),
-        "  content/sessions.json: the shell, working directory and closure of 0 sessions; 2 sessions \
-         left out: privacy mode is on"
+    assert_eq!(record["redaction"], "session-content-1");
+    assert!(
+        composed
+            .content
+            .describe()
+            .as_str()
+            .contains("closure of 0 sessions, redacted by session-content-1"),
+        "{}",
+        composed.content.describe()
+    );
+    assert!(
+        composed
+            .content
+            .describe()
+            .as_str()
+            .ends_with("; 2 sessions left out: privacy mode is on"),
+        "{}",
+        composed.content.describe()
     );
 }
 
@@ -279,15 +307,23 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
         closed_at_ms: TimestampMs::new(2_000),
     });
     let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
-    let content = compose(&Reading { listed: selection })
+    let text = compose(&Reading { listed: selection }, &[], &rules())
         .expect("composes")
-        .into_content();
-    let text = String::from_utf8(content.bytes).expect("text");
+        .text()
+        .to_owned();
     assert!(
         !text.contains(marker),
         "no name or description is repeated: {text}"
     );
     let record: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        record
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["redaction", "sessions"]
+    );
     let session = &record["sessions"][0];
     let keys = |value: &serde_json::Value| -> Vec<String> {
         value
@@ -297,6 +333,7 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
             .cloned()
             .collect()
     };
+    assert_eq!(keys(&record), ["redaction", "sessions"]);
     assert_eq!(
         keys(session),
         [
@@ -330,4 +367,634 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
     assert_eq!(session["closure"]["durability"], "volatile");
     assert_eq!(session["closure"]["root_signal"], "SIGTERM");
     assert_eq!(session["closure"]["reason"], "root_signal");
+}
+
+/// What the host says, scripted per call: the last answer repeats, so a host can change once.
+struct Changing {
+    reports: Vec<PrivacyReport>,
+    lists: Vec<Vec<SessionSummary>>,
+    privacy_calls: usize,
+    list_calls: usize,
+}
+
+impl Changing {
+    fn new(reports: Vec<PrivacyReport>, lists: Vec<Vec<SessionSummary>>) -> Self {
+        Self {
+            reports,
+            lists,
+            privacy_calls: 0,
+            list_calls: 0,
+        }
+    }
+}
+
+impl Host for Changing {
+    async fn privacy(&mut self) -> Result<PrivacyReport> {
+        let at = self.privacy_calls.min(self.reports.len() - 1);
+        self.privacy_calls += 1;
+        Ok(self.reports[at].clone())
+    }
+
+    async fn sessions(&mut self, _: EnvironmentId) -> Result<SessionListResult> {
+        let at = self.list_calls.min(self.lists.len() - 1);
+        self.list_calls += 1;
+        Ok(SessionListResult {
+            sessions: self.lists[at].clone(),
+        })
+    }
+}
+
+fn environment() -> EnvironmentId {
+    EnvironmentId::new(Uuid::from_bytes([9; 16]))
+}
+
+/// A host that is plainly the same on every call: privacy mode never on, two sessions.
+fn steady() -> Changing {
+    Changing::new(
+        vec![report(0, false, &[])],
+        vec![vec![listed(1), listed(2)]],
+    )
+}
+
+/// What `export` printed and asked, so a test can say what the person saw and was asked.
+#[derive(Default)]
+struct Seen {
+    previews: Vec<String>,
+    questions: Vec<String>,
+}
+
+/// Runs the export with a person who gives `typed` in order, then the end of their input.
+async fn exported(
+    host: &mut Changing,
+    decision: Decision,
+    exclude: Vec<SessionId>,
+    typed: &[&str],
+    seen: &mut Seen,
+) -> Result<Exported> {
+    let mut answers = typed.iter().map(|text| (*text).to_owned());
+    let previews = std::cell::RefCell::new(Vec::new());
+    let questions = std::cell::RefCell::new(Vec::new());
+    let outcome = export(
+        host,
+        environment(),
+        decision,
+        exclude,
+        &rules(),
+        &mut |preview: &Preview| {
+            previews.borrow_mut().push(
+                preview
+                    .lines()
+                    .iter()
+                    .map(Line::text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(())
+        },
+        &mut |question: &Shown| {
+            questions.borrow_mut().push(question.as_str().to_owned());
+            Ok(answers.next())
+        },
+    )
+    .await;
+    seen.previews = previews.into_inner();
+    seen.questions = questions.into_inner();
+    outcome
+}
+
+/// What a preview run printed, for the digest it shows.
+fn digest_in(preview: &str) -> Digest {
+    let line = preview
+        .lines()
+        .find(|line| line.starts_with("Digest "))
+        .expect("the preview prints a digest");
+    Digest::parse(line.trim_start_matches("Digest ")).expect("a digest")
+}
+
+/// KR-REQ-29.04: a preview prints the whole content with its digest and the filter's limit, and
+/// writes nothing: there is nothing approved to write.
+#[tokio::test]
+async fn a_preview_prints_the_content_and_its_digest_and_approves_nothing() {
+    let mut seen = Seen::default();
+    let done = exported(&mut steady(), Decision::Preview, Vec::new(), &[], &mut seen)
+        .await
+        .expect("previews");
+    assert!(done.approved().is_none(), "a preview writes nothing");
+    assert!(seen.questions.is_empty(), "and asks nothing");
+    let [shown] = seen.previews.as_slice() else {
+        panic!("one preview: {:?}", seen.previews.len())
+    };
+    assert!(shown.contains(&session_id(1).to_string()), "{shown}");
+    assert!(shown.contains("session-content-1"), "{shown}");
+    assert!(shown.contains("A filter is not a guarantee"), "{shown}");
+    assert!(shown.contains("cannot recall it"), "{shown}");
+    assert_eq!(digest_in(shown), done.composed().digest());
+}
+
+/// KR-REQ-29.04: what is written is what was shown. A confirmed run with the digest of a preview
+/// approves content whose bytes are the text the preview printed.
+#[tokio::test]
+async fn a_confirmed_run_writes_the_bytes_the_preview_showed() {
+    let mut first = Seen::default();
+    let previewed = exported(
+        &mut steady(),
+        Decision::Preview,
+        Vec::new(),
+        &[],
+        &mut first,
+    )
+    .await
+    .expect("previews");
+    let digest = previewed.composed().digest();
+
+    let mut second = Seen::default();
+    let confirmed = exported(
+        &mut steady(),
+        Decision::Confirmed(digest),
+        Vec::new(),
+        &[],
+        &mut second,
+    )
+    .await
+    .expect("confirms");
+    let approved = confirmed.approved().expect("approved");
+    assert_eq!(
+        second.previews.len(),
+        1,
+        "it prints the content again as it writes"
+    );
+    assert_eq!(
+        approved.content().bytes_for_test(),
+        previewed.composed().text().as_bytes(),
+        "the bytes are the bytes the preview printed"
+    );
+    // The printed lines hold the file's text, line for line, with the preview's own indent.
+    for line in previewed.composed().text().lines() {
+        assert!(second.previews[0].contains(line), "{line}");
+    }
+}
+
+/// KR-REQ-29.04: a digest that is not the content's refuses, and prints none of it: a person's
+/// log was only asked for content they had already seen. The control is the matching digest above.
+#[tokio::test]
+async fn a_digest_that_is_not_the_contents_refuses_and_prints_nothing() {
+    let mut seen = Seen::default();
+    let wrong = Digest::parse(&"ab".repeat(32)).expect("a digest");
+    let refused = exported(
+        &mut steady(),
+        Decision::Confirmed(wrong),
+        Vec::new(),
+        &[],
+        &mut seen,
+    )
+    .await
+    .expect_err("a different digest is refused");
+    assert!(
+        format!("{refused}").contains("not what was shown"),
+        "{refused}"
+    );
+    assert!(seen.previews.is_empty(), "no content was printed");
+}
+
+/// KR-REQ-29.04: content that changed since the preview, here because privacy mode is on now,
+/// has another digest and is refused without being printed.
+#[tokio::test]
+async fn content_that_changed_since_the_preview_is_refused_unprinted() {
+    let mut first = Seen::default();
+    let digest = exported(
+        &mut steady(),
+        Decision::Preview,
+        Vec::new(),
+        &[],
+        &mut first,
+    )
+    .await
+    .expect("previews")
+    .composed()
+    .digest();
+    let mut private = Changing::new(vec![report(1, true, &[])], vec![vec![listed(1), listed(2)]]);
+    let mut seen = Seen::default();
+    let refused = exported(
+        &mut private,
+        Decision::Confirmed(digest),
+        Vec::new(),
+        &[],
+        &mut seen,
+    )
+    .await
+    .expect_err("changed content is refused");
+    assert!(
+        format!("{refused}").contains("not what was shown"),
+        "{refused}"
+    );
+    assert!(seen.previews.is_empty(), "{:?}", seen.previews);
+}
+
+/// KR-REQ-29.04: at a terminal the person is shown the content and asked, and `yes` approves it.
+#[tokio::test]
+async fn at_a_terminal_yes_approves_what_was_shown() {
+    let mut seen = Seen::default();
+    let done = exported(
+        &mut steady(),
+        Decision::Ask,
+        Vec::new(),
+        &["yes"],
+        &mut seen,
+    )
+    .await
+    .expect("approved");
+    assert!(done.approved().is_some());
+    assert_eq!(seen.previews.len(), 1, "shown once");
+    assert_eq!(seen.questions.len(), 1, "asked once");
+}
+
+/// KR-REQ-29.04: a person who declines, or whose input ends, or who types anything that is not yes
+/// or an identifier, writes nothing: no approval exists.
+#[tokio::test]
+async fn at_a_terminal_anything_but_yes_writes_nothing() {
+    for typed in [&["no"][..], &["y"], &[""], &["perhaps"], &[]] {
+        let mut seen = Seen::default();
+        let refused = exported(&mut steady(), Decision::Ask, Vec::new(), typed, &mut seen)
+            .await
+            .expect_err("not approved");
+        assert!(
+            format!("{refused}").contains("nothing was written"),
+            "{typed:?}: {refused}"
+        );
+        assert_eq!(seen.previews.len(), 1, "{typed:?}: it was shown first");
+    }
+}
+
+/// KR-REQ-29.04: naming a session at the question leaves it out and shows the content again; an
+/// identifier that is not in the content is said and asked about again. The digest changes with the
+/// content, and the session is counted as left out by choice.
+#[tokio::test]
+async fn at_a_terminal_a_session_can_be_dropped_and_the_content_shown_again() {
+    let dropped = session_id(2).to_string();
+    let unlisted = session_id(7).to_string();
+    let mut seen = Seen::default();
+    let done = exported(
+        &mut steady(),
+        Decision::Ask,
+        Vec::new(),
+        &[&unlisted, &dropped, "yes"],
+        &mut seen,
+    )
+    .await
+    .expect("approved");
+    assert_eq!(seen.previews.len(), 2, "shown again after the drop");
+    assert!(seen.previews[0].contains(&dropped));
+    assert!(!seen.previews[1].contains(&dropped), "{}", seen.previews[1]);
+    assert_eq!(
+        seen.questions.len(),
+        3,
+        "the unlisted one is asked about again"
+    );
+    assert!(seen.questions[1].contains("not the identifier of a session"));
+    assert_eq!(done.composed().left_out(), [(Why::Dropped, 1)]);
+    assert_eq!(done.composed().kept(), [session_id(1)]);
+    assert_ne!(digest_in(&seen.previews[0]), digest_in(&seen.previews[1]));
+}
+
+/// KR-REQ-29.04: a person's yes is for the content they were shown. When the host says something
+/// else after the question, here that privacy mode is on, nothing is approved.
+#[tokio::test]
+async fn a_yes_for_content_that_changed_during_the_question_approves_nothing() {
+    // Two reads before the question (privacy, list, privacy); the host changes for the read after.
+    let mut host = Changing::new(
+        vec![
+            report(0, false, &[]),
+            report(0, false, &[]),
+            report(1, true, &[]),
+        ],
+        vec![vec![listed(1), listed(2)]],
+    );
+    let mut seen = Seen::default();
+    let refused = exported(&mut host, Decision::Ask, Vec::new(), &["yes"], &mut seen)
+        .await
+        .expect_err("changed content is not approved");
+    assert!(
+        format!("{refused}").contains("not what was shown"),
+        "{refused}"
+    );
+    assert_eq!(
+        seen.previews.len(),
+        1,
+        "only the content they saw was ever printed"
+    );
+}
+
+/// KR-REQ-29.04: a preview that cannot be printed stops the export: no approval, so no bundle.
+#[tokio::test]
+async fn a_preview_that_cannot_be_printed_stops_the_export() {
+    let refused = export(
+        &mut steady(),
+        environment(),
+        Decision::Ask,
+        Vec::new(),
+        &rules(),
+        &mut |_: &Preview| Err(CliError::Other(Shown::said("the stream is closed"))),
+        &mut |_: &Shown| Ok(Some("yes".to_owned())),
+    )
+    .await
+    .expect_err("no preview, no export");
+    assert!(
+        format!("{refused}").contains("the stream is closed"),
+        "{refused}"
+    );
+}
+
+/// KR-REQ-29.04: a session named for exclusion that the host never listed is a usage failure, not
+/// a silently different export.
+#[tokio::test]
+async fn excluding_a_session_the_host_never_listed_is_a_usage_failure() {
+    let mut seen = Seen::default();
+    let refused = exported(
+        &mut steady(),
+        Decision::Preview,
+        vec![session_id(7)],
+        &[],
+        &mut seen,
+    )
+    .await
+    .expect_err("refused");
+    assert!(matches!(refused, CliError::Usage(_)), "{refused}");
+    assert!(seen.previews.is_empty());
+}
+
+/// KR-REQ-29.04: the digest covers what is in and what was left out, and never two different
+/// exports with one digest: dropping a session, or a different reason for the same content, differs.
+#[test]
+fn the_digest_covers_the_content_and_the_reasons() {
+    let both = compose(
+        &Reading {
+            listed: select(
+                &report(0, false, &[]),
+                vec![listed(1), listed(2)],
+                &report(0, false, &[]),
+            ),
+        },
+        &[],
+        &rules(),
+    )
+    .expect("composes");
+    let again = compose(
+        &Reading {
+            listed: select(
+                &report(0, false, &[]),
+                vec![listed(1), listed(2)],
+                &report(0, false, &[]),
+            ),
+        },
+        &[],
+        &rules(),
+    )
+    .expect("composes");
+    assert_eq!(
+        both.digest(),
+        again.digest(),
+        "the same export, the same digest"
+    );
+    let dropped = compose(
+        &Reading {
+            listed: select(
+                &report(0, false, &[]),
+                vec![listed(1), listed(2)],
+                &report(0, false, &[]),
+            ),
+        },
+        &[session_id(2)],
+        &rules(),
+    )
+    .expect("composes");
+    assert_ne!(both.digest(), dropped.digest());
+    // One session, two reasons for being out: same entry bytes, different digest.
+    let owing = compose(
+        &Reading {
+            listed: select(
+                &report(1, false, &[2]),
+                vec![listed(1), listed(2)],
+                &report(1, false, &[2]),
+            ),
+        },
+        &[],
+        &rules(),
+    )
+    .expect("composes");
+    let chosen = compose(
+        &Reading {
+            listed: select(
+                &report(1, false, &[]),
+                vec![listed(1), listed(2)],
+                &report(1, false, &[]),
+            ),
+        },
+        &[session_id(2)],
+        &rules(),
+    )
+    .expect("composes");
+    assert_eq!(owing.text(), chosen.text(), "the file is the same");
+    assert_ne!(
+        owing.digest(),
+        chosen.digest(),
+        "what was left out and why is not"
+    );
+}
+
+/// KR-REQ-29.04: a digest as the preview prints it reads back, in either case, and nothing else
+/// does.
+#[test]
+fn a_digest_reads_back_as_printed_and_nothing_else_does() {
+    let digest = Digest::parse(&"0f".repeat(32)).expect("a digest");
+    assert_eq!(digest.hex(), "0f".repeat(32));
+    assert_eq!(Digest::parse(&"0F".repeat(32)), Some(digest));
+    assert_eq!(
+        Digest::parse(&format!("  {}\n", "0f".repeat(32))),
+        Some(digest)
+    );
+    for text in [
+        "",
+        "0f",
+        &"0f".repeat(31),
+        &"0f".repeat(33),
+        &"zz".repeat(32),
+        "sha256:abc",
+    ] {
+        assert!(Digest::parse(text).is_none(), "{text}");
+    }
+}
+
+/// KR-REQ-29.04: characters that would hide or reorder text on a terminal are written as escapes,
+/// so the text on the screen is the text in the file. The control is an ordinary non-ASCII letter.
+#[test]
+fn characters_that_change_what_a_terminal_shows_are_escaped() {
+    let mut closed = listed(4);
+    closed.cwd = "/work/caf\u{e9}".to_owned();
+    closed.shell_path = "/bin/\u{202e}hs\u{7f}\u{85}\u{200b}\u{feff}sh".to_owned();
+    let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
+    let composed = compose(&Reading { listed: selection }, &[], &rules()).expect("composes");
+    let text = composed.text();
+    for hidden in ['\u{202e}', '\u{7f}', '\u{85}', '\u{200b}', '\u{feff}'] {
+        assert!(!text.contains(hidden), "{hidden:?} is in {text}");
+    }
+    assert!(text.contains("\\u202e") && text.contains("\\u007f") && text.contains("\\u0085"));
+    assert!(
+        text.contains("caf\u{e9}"),
+        "an ordinary letter stays: {text}"
+    );
+    let record: serde_json::Value = serde_json::from_str(text).expect("still JSON");
+    assert_eq!(
+        record["sessions"][0]["shell"],
+        "/bin/\u{202e}hs\u{7f}\u{85}\u{200b}\u{feff}sh"
+    );
+}
+
+/// An archive's entries, by name.
+fn entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 512 <= archive.len() && archive[at] != 0 {
+        let header = &archive[at..at + 512];
+        let end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        let name = String::from_utf8_lossy(&header[..end]).into_owned();
+        let size = usize::from_str_radix(
+            String::from_utf8_lossy(&header[124..135])
+                .trim_matches(['\0', ' '])
+                .trim(),
+            8,
+        )
+        .expect("an octal size");
+        found.push((name, archive[at + 512..at + 512 + size].to_vec()));
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    found
+}
+
+/// KR-REQ-29.04: planted credentials in every text field of every session reach neither the
+/// preview, nor the file, nor the manifest, nor the report, through the whole path from what the
+/// host lists to the archive on disk; the control is an ordinary path and command line, which stay.
+#[tokio::test]
+async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints_or_writes() {
+    use kr_protocol::session::ClosureRecord;
+
+    const MARKERS: [&str; 6] = [
+        "kr-marker-token-1",
+        "kr-marker-pass-2",
+        "kr-marker-url-3",
+        "kr-marker-quoted-4",
+        "kr-marker-signal-5",
+        "kr-marker-equals-6",
+    ];
+    let mut planted = listed(1);
+    planted.shell_path = format!("/opt/tools/sh --password {}", MARKERS[1]);
+    planted.cwd = format!(
+        "/home/tom/work TOKEN={} https://user:{}@host.example/ --secret \"two words {}\"",
+        MARKERS[0], MARKERS[2], MARKERS[3]
+    );
+    let mut closed = listed(2);
+    closed.state = SessionState::Closed;
+    closed.cwd = format!("/home/tom/--api-key={}", MARKERS[5]);
+    closed.closure = Nullable::some(ClosureRecord {
+        session_id: session_id(2),
+        session_epoch: SessionEpoch::V1,
+        reason: ClosureReason::RootSignal,
+        root_exit_code: Nullable::null(),
+        root_signal: Some(format!("signal TOKEN={}", MARKERS[4])).into(),
+        terminated: Vec::new(),
+        surviving: Vec::new(),
+        ownership_coverage: OwnershipCoverage::Complete,
+        durability: Durability::Durable,
+        closed_at_ms: TimestampMs::new(2_000),
+    });
+    let mut ordinary = listed(3);
+    ordinary.cwd = "/home/tom/projects/ordinary".to_owned();
+    ordinary.shell_path = "/bin/zsh".to_owned();
+    let mut host = Changing::new(
+        vec![report(0, false, &[])],
+        vec![vec![planted, closed, ordinary]],
+    );
+
+    let mut seen = Seen::default();
+    let previewed = exported(&mut host, Decision::Preview, Vec::new(), &[], &mut seen)
+        .await
+        .expect("previews");
+    let digest = previewed.composed().digest();
+    let mut confirmed_seen = Seen::default();
+    let confirmed = exported(
+        &mut host,
+        Decision::Confirmed(digest),
+        Vec::new(),
+        &[],
+        &mut confirmed_seen,
+    )
+    .await
+    .expect("confirms");
+    let approved = confirmed.approved().expect("approved");
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("support.tar");
+    let bundle = ComposedBundle::new(
+        TimestampMs::new(1),
+        Vec::new(),
+        Vec::new(),
+        crate::doctor::tests::result(),
+        Vec::new(),
+    );
+    bundle::write(&path, &bundle, std::slice::from_ref(approved.content())).expect("writes");
+    let archive = std::fs::read(&path).expect("reads it back");
+    let found = entries(&archive);
+    assert_eq!(
+        found.len(),
+        3,
+        "the manifest, the report and one content entry"
+    );
+
+    for marker in MARKERS {
+        for printed in seen.previews.iter().chain(&confirmed_seen.previews) {
+            assert!(
+                !printed.contains(marker),
+                "{marker} in the preview: {printed}"
+            );
+        }
+        for (name, bytes) in &found {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(marker),
+                "{marker} in {name}"
+            );
+        }
+    }
+    let written = found
+        .iter()
+        .find(|(name, _)| name == "content/sessions.json")
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .expect("the content entry");
+    assert_eq!(
+        written,
+        previewed.composed().text(),
+        "what is written is what was shown"
+    );
+    for readable in [
+        "[home]/projects/ordinary",
+        "/bin/zsh",
+        "TOKEN=[redacted]",
+        "--password [redacted]",
+    ] {
+        assert!(written.contains(readable), "{readable}: {written}");
+    }
+    let manifest = found
+        .iter()
+        .find(|(name, _)| name == "manifest.json")
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .expect("the manifest");
+    assert!(
+        manifest.contains("redacted by session-content-1"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains(&digest.hex()),
+        "the manifest records the digest: {manifest}"
+    );
 }

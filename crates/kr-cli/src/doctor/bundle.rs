@@ -53,11 +53,11 @@ pub struct Content {
     /// `&'static str` is a lifetime, not an origin, and a runtime string leaked with
     /// `Box::leak` fits it as well as a literal does. The one producer, the content export
     /// `kr doctor --include-content` builds, passes [`SESSIONS_ENTRY`].
-    pub entry: &'static str,
+    entry: &'static str,
     /// What it holds, in the words the command prints before it writes.
-    pub describes: Sentence,
+    describes: Sentence,
     /// The bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for Content {
@@ -74,6 +74,22 @@ impl std::fmt::Debug for Content {
 }
 
 impl Content {
+    /// An entry. Only this crate makes one: the content export builds the one a person approves,
+    /// and nothing outside it can hand the archive bytes nobody was shown.
+    pub(crate) const fn new(entry: &'static str, describes: Sentence, bytes: Vec<u8>) -> Self {
+        Self {
+            entry,
+            describes,
+            bytes,
+        }
+    }
+
+    /// The bytes, for a test that compares them with what was shown.
+    #[cfg(test)]
+    pub(crate) fn bytes_for_test(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// The sentence the command prints before writing a bundle that will carry this.
     #[must_use]
     pub fn describe(&self) -> Shown {
