@@ -1173,9 +1173,9 @@ impl FenceDriver {
                 .unwritten_replies
                 .load(std::sync::atomic::Ordering::Acquire);
             if owed > 0 {
-                // The machine's answer to this stimulus never starts an exchange or refuses a
-                // reader's event, so the `ignored` mark the first call set is not overwritten by
-                // anything that belongs to this one.
+                // This call overwrites the `ignored` mark, which is safe: an outcome that asked for
+                // a fence is not one that refused a reader's event, so the first call's mark is
+                // already false, and this stimulus refuses none.
                 let produced = self.apply(
                     &Stimulus::HostReplyQueued(
                         kr_shell_integration::contract::fence::HostReplyQueued {

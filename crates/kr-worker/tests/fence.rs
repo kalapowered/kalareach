@@ -6003,8 +6003,8 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
     // The revocation ends the hold with it: the keys go to the terminal, in the order they were
     // typed, rather than waiting for a deadline nothing is left to set. Keys typed after the answer
     // go behind them, and neither waits for a hold nothing will end.
-    echoed(&wired.runtime, b"held-keys").await;
     type_keys(&wired, holder, 1, b"later-keys\n");
+    echoed(&wired.runtime, b"held-keys").await;
     echoed(&wired.runtime, b"later-keys").await;
     let seen = retained(&wired.runtime.session());
     let position = |needle: &[u8]| {
