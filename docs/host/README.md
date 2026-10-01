@@ -1138,10 +1138,10 @@ destination. Reasons for not delivering a side effect include: the lease has mov
 attachment; the attachment has no subscription; its stream has been told to begin again; its queue
 has no room; or a write to it failed. When a subscription is replaced by another, the former
 subscription writes the effects still queued on its stream, each whole, before it stops, and records
-the ones it cannot write. When a subscription that has written no frame but a gap is replaced by
-another, it writes no side effects and records them all, because the first frame of a stream is the
-one a client takes for its beginning. A connection that ends, or an authority that is withdrawn,
-stops a delivery where it stands, and the effects still queued on its stream go with it.
+the ones it cannot write. A subscription replaced before it has sent its whole first screen (a gap
+notice alone, or part of the screen) writes no side effects and records them all, because a client
+takes a stream's first frame for its beginning. A connection that ends, or an authority that is
+withdrawn, stops a delivery where it stands, and the effects still queued on its stream go with it.
 
 The host's own replies to the application's questions are measured on the session's continuous
 clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. Each
