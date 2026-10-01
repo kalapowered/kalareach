@@ -1955,17 +1955,18 @@ async function onPhone(page: Page, surface: 'ios' | 'android', seen: Seen, addre
 }
 
 /**
- * Sets the letters of the tab labels wider by `spacing`, from the page's first frame, as a face wider
- * than the system's would. Which face a platform's system font is differs from one to the next: a
- * layout that holds only for the widths of the face it was drawn with does not hold.
+ * Sets the letters of the tab labels as `rule` says, from the page's first frame, as a face wider
+ * than the system's would be. Which face a platform's system font is differs from one to the next: a
+ * layout that holds only for the widths of the face it was drawn with does not hold. The rule is
+ * written to outrank the page's own, so no rule of the page's can take it back.
  */
-async function withWiderLetters(page: Page, spacing: string): Promise<void> {
-  await page.addInitScript((extra) => {
+async function withLabelFace(page: Page, rule: string): Promise<void> {
+  await page.addInitScript((css) => {
     const apply = (): boolean => {
       const root = document.documentElement as HTMLElement | null
       if (root === null) return false
       const style = document.createElement('style')
-      style.textContent = `.m-tab-label { letter-spacing: ${extra}; }`
+      style.textContent = css
       root.append(style)
       return true
     }
@@ -1974,12 +1975,12 @@ async function withWiderLetters(page: Page, spacing: string): Promise<void> {
         if (apply()) observer.disconnect()
       }).observe(document, { childList: true })
     }
-  }, spacing)
+  }, rule)
 }
 
 // KR-REQ-13.19: the tab bar names each destination whole at a person's own text size. With text too
-// large for four labels side by side, the tabs take two rows of two, and no label runs into another
-// or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
+// large for four labels side by side, the tabs take two rows of two, or a row each where two columns
+// still cut a label, and no label runs into another or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
 // KR-REQ-13.09: the phone's destinations are Attention, Sessions, Hosts and Account, in that order.
 test.describe("the phone's tab bar", () => {
   const SIZES: readonly Seen[] = [
@@ -1990,11 +1991,19 @@ test.describe("the phone's tab bar", () => {
   ]
 
   // The letters as the system sets them, then as a face a quarter wider than the Mac's and as one
-  // wider still would: the widths a label has differ from one platform's system font to the next.
-  const FACES: readonly { readonly name: string; readonly spacing?: string }[] = [
-    { name: '' },
-    { name: ' in a face a quarter wider', spacing: '0.12em' },
-    { name: ' in a face wider still', spacing: '0.24em' }
+  // wider still would, and as a face whose bold is much wider than its regular, which the label of the
+  // tab the person is on is set in (its letters are spaced wider wherever the bold weight is set): the
+  // widths a label has differ from one platform's system font to the next, and from one tab to the
+  // next.
+  const FACES: readonly { readonly name: string; readonly shot: string; readonly rule?: string; readonly spacing?: string }[] = [
+    { name: '', shot: '' },
+    { name: ' in a face a quarter wider', shot: '-wider-0.12em', rule: ':root .m-tab-label { letter-spacing: 0.12em; }', spacing: '0.12em' },
+    { name: ' in a face wider still', shot: '-wider-0.24em', rule: ':root .m-tab-label { letter-spacing: 0.24em; }', spacing: '0.24em' },
+    {
+      name: ' in a face with a wide bold',
+      shot: '-wide-bold',
+      rule: ":root .m-tab[aria-current='page'] .m-tab-label, :root .m-tab-label::after { letter-spacing: 0.2em; }"
+    }
   ]
   const CASES = SIZES.flatMap((seen) => FACES.map((face) => ({ seen, face })))
 
@@ -2003,7 +2012,7 @@ test.describe("the phone's tab bar", () => {
       test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}${face.name}`, async ({
         page
       }) => {
-        if (face.spacing !== undefined) await withWiderLetters(page, face.spacing)
+        if (face.rule !== undefined) await withLabelFace(page, face.rule)
         await onPhone(page, surface, seen)
         const tabs = page.getByRole('navigation', { name: 'Sections' }).getByRole('button')
         await expect(tabs).toHaveCount(4)
@@ -2036,6 +2045,10 @@ test.describe("the phone's tab bar", () => {
           })
         )
         expect(placed.map((each) => each.name)).toEqual(['Attention', 'Sessions', 'Hosts', 'Account'])
+        // The room a label keeps for its bold form is not read out: a tab is named once.
+        for (const [index, each] of placed.entries()) {
+          await expect(tabs.nth(index)).toHaveAccessibleName(new RegExp(`^${each.name}(\\s*, \\d+ waiting for you)?$`))
+        }
         const target = surface === 'ios' ? 44 : 48
         for (const [index, each] of placed.entries()) {
           expect.soft(each.cut, `${each.name} is whole`).toBeLessThanOrEqual(1)
@@ -2066,6 +2079,53 @@ test.describe("the phone's tab bar", () => {
               .toBe(true)
           }
         }
+        // A face's rule is in force: a page rule that took it back would leave a case that proves nothing.
+        if (face.spacing !== undefined) {
+          expect(
+            await tabs.first().locator('.m-tab-label').evaluate((label) => getComputedStyle(label).letterSpacing),
+            'the face is in force'
+          ).not.toBe('normal')
+        }
+        // The bar keeps its form and its tabs where they are as the person moves from one destination
+        // to the next: a label that is bolder on the tab the person is on is no reason for the bar to
+        // take another form.
+        const shape = async () =>
+          page.evaluate(() => {
+            const bar = document.querySelector('.m-tabbar') as HTMLElement
+            return {
+              form: bar.getAttribute('data-form'),
+              tabs: Array.from(bar.querySelectorAll('.m-tab')).map((tab) => {
+                const box = tab.getBoundingClientRect()
+                const label = tab.querySelector('.m-tab-label') as HTMLElement
+                return { left: box.left, top: box.top, width: box.width, height: box.height, cut: label.scrollWidth - label.clientWidth }
+              })
+            }
+          })
+        const settle = async () =>
+          page.evaluate(
+            () =>
+              new Promise<void>((done) => {
+                requestAnimationFrame(() => {
+                  requestAnimationFrame(() => {
+                    setTimeout(done, 100)
+                  })
+                })
+              })
+          )
+        const resting = await shape()
+        for (const [index, name] of ['Attention', 'Sessions', 'Hosts', 'Account'].entries()) {
+          await tabs.nth(index).click()
+          await expect(tabs.nth(index)).toHaveAttribute('aria-current', 'page')
+          await settle()
+          const moved = await shape()
+          expect.soft(moved.form, `the bar's form on ${name}`).toBe(resting.form)
+          for (const [at, each] of moved.tabs.entries()) {
+            expect.soft(each.cut, `${name} is current: tab ${at + 1} is whole`).toBeLessThanOrEqual(1)
+            for (const key of ['left', 'top', 'width', 'height'] as const) {
+              expect.soft(each[key], `${name} is current: tab ${at + 1}'s ${key}`).toBeCloseTo(resting.tabs[at]?.[key] ?? -1, 0)
+            }
+          }
+        }
         // The widest count a badge shows, 99+, stays clear of its own label.
         const badge = page.locator('.m-tab-badge')
         await expect(badge).toBeVisible()
@@ -2085,7 +2145,7 @@ test.describe("the phone's tab bar", () => {
         expect.soft(clear, 'the widest badge stays clear of its label').toBe(true)
         await still(
           page,
-          `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}${face.spacing === undefined ? '' : `-wider-${face.spacing}`}`
+          `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}${face.shot}`
         )
       })
     }
