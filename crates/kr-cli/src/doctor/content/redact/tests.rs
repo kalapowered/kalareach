@@ -441,7 +441,8 @@ fn a_value_with_no_quote_before_it_is_replaced_and_its_neighbours_stay() {
 }
 
 /// KR-REQ-29.04: a quote in the home directory is a quote before the credential that follows it,
-/// even though the home is replaced: the credentials are read in the text as it was written.
+/// even though the home is replaced: whether the field is withheld is decided in the text as it was
+/// written.
 #[test]
 fn a_quote_in_the_home_directory_is_a_quote_before_the_credential() {
     for text in [
@@ -461,6 +462,45 @@ fn a_quote_in_the_home_directory_is_a_quote_before_the_credential() {
         field("/home/o'neil/work", Some("/home/o'neil"), UNIX),
         "[home]/work"
     );
+}
+
+/// KR-REQ-29.04: a credential whose value starts in the home directory does not cut the home in two:
+/// which spans are replaced is read in the text with the home replaced, so no part of a home that
+/// holds a space, or a credential, stays in the text.
+#[test]
+fn a_credential_value_that_starts_in_the_home_directory_leaves_no_part_of_it() {
+    for (home, paths, text, expected) in [
+        (
+            "/home/john smith",
+            UNIX,
+            format!("TOKEN=/home/john smith/{MARKER}"),
+            "TOKEN=[redacted]",
+        ),
+        (
+            "C:\\Users\\John Smith",
+            WINDOWS,
+            format!("tool --auth-sock C:\\Users\\John Smith\\.ssh\\{MARKER}"),
+            "tool --auth-sock [redacted]",
+        ),
+        (
+            "C:\\Users\\John Smith",
+            WINDOWS,
+            format!("--token C:\\Users\\John Smith\\{MARKER}"),
+            "--token [redacted]",
+        ),
+        // A home that holds an assignment: the home is replaced whole.
+        (
+            "/Users/Alice TOKEN=x",
+            UNIX,
+            "/Users/Alice TOKEN=x/work".to_owned(),
+            "[home]/work",
+        ),
+    ] {
+        let said = field(&text, Some(home), paths);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+        assert!(!said.contains("Smith") && !said.contains("Alice"), "{said}");
+    }
 }
 
 /// Where the word that holds the value starting at `start` ends when each quote character before
