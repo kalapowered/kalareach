@@ -617,11 +617,19 @@ async fn kr_req_10_49_a_grant_with_no_history_and_a_caller_with_no_scope_answer_
         rights: vec![ActionRight::SessionView, ActionRight::QuestionRespond],
         history: Some(scope(None, &[])),
     };
+    // The live screen is not a retained history: a grant that adds it has no bound all the same.
+    let no_history_and_the_live_screen = Grant {
+        rights: vec![ActionRight::SessionView, ActionRight::QuestionRespond],
+        history: Some(HistoryScope {
+            include_live_screen: true,
+            ..scope(None, &[])
+        }),
+    };
     let unscoped = Grant {
         rights: vec![ActionRight::SessionView, ActionRight::QuestionRespond],
         history: None,
     };
-    for grant in [&no_history, &unscoped] {
+    for grant in [&no_history, &no_history_and_the_live_screen, &unscoped] {
         forward(
             &mut daemon,
             &host,
@@ -701,8 +709,8 @@ async fn kr_req_10_49_a_respond_only_grant_answers_and_is_shown_no_content() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-10.49: the first answer shows the question to a device whose history reaches it; a retry
-/// after the grant narrowed shows only the state, and the stored result, its digest and the
-/// receipt's revision are the bytes they were.
+/// after the grant narrowed shows only the state, and the stored result is the bytes it was and
+/// a reused identifier with another payload is still a conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_49_a_retry_after_the_grant_narrows_shows_the_state_and_changes_nothing_kept() {
     let host = host().await;
