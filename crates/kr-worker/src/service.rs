@@ -7502,8 +7502,8 @@ async fn deliver_effect(
 /// beginning of its stream, whether because only the gap notice reached it or because its
 /// restoration stopped part way: an effect is never the first frame of a stream and must not follow
 /// part of a restoration's bytes, so every effect is recorded instead. A projected join counts as
-/// begun after its first frame. A delivery that is aborted where it stands, because its connection
-/// has ended or its registration was withdrawn, does not run this.
+/// begun after the first frame that follows any gap notice. A delivery that is aborted where it
+/// stands, because its connection has ended or its registration was withdrawn, does not run this.
 async fn settle_effects(
     outlet: &mut Outlet,
     stream_id: &StreamId,
