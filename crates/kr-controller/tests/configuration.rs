@@ -1828,7 +1828,7 @@ async fn a_catalogue_whose_record_differs_from_the_accepted_document_takes_its_p
     }
 
     let settings = stopped.settings().clone();
-    let host = stopped.start(settings).await;
+    let host = stopped.start(settings.clone()).await;
     let (carried, held, _) = policy_in_force(host.controller()).await;
     assert_eq!(held, RevocationPolicy::DisableAtOnce, "in force at start");
     assert_eq!(carried, RevocationPolicy::DisableAtOnce);
@@ -1837,6 +1837,34 @@ async fn a_catalogue_whose_record_differs_from_the_accepted_document_takes_its_p
         [RevocationPolicy::DisableAtOnce],
         "and no snapshot was computed before it"
     );
+
+    // The document the registry accepted decides too where the file on disk is gone, as it does
+    // for the budgets: a record that went back to warning only is not what a missing file leaves.
+    let stopped = host.shut_down().await;
+    let environment = stopped.tree().environment();
+    {
+        let mut catalogue = kr_plugin_catalogue::Catalogue::open(
+            &environment.state_dir().join("catalogue"),
+            std::sync::Arc::new(
+                kr_plugin_catalogue::transport::RepositoryTransport::local_only(
+                    "this test reaches no repository",
+                ),
+            ),
+        )
+        .expect("the catalogue's records");
+        catalogue
+            .set_disable_policy(kr_plugin_catalogue::DisablePolicy::WarnOnly)
+            .expect("the older record");
+    }
+    std::fs::remove_file(kr_worker::config::document_path(&environment)).expect("the document");
+    let host = stopped.start(settings).await;
+    let (carried, held, _) = policy_in_force(host.controller()).await;
+    assert_eq!(
+        held,
+        RevocationPolicy::DisableAtOnce,
+        "the accepted document's policy, with no file to read"
+    );
+    assert_eq!(carried, RevocationPolicy::DisableAtOnce);
     host.stop().await;
 }
 
