@@ -1328,7 +1328,7 @@ async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_ha
 
 /// KR-REQ-24.11: a load in flight when privacy mode is enabled is cancelled, and privacy mode's
 /// change is not complete until it has answered; nothing is loaded for a session captured before.
-/// The control is the same load left alone, which the stub holds until it is cancelled.
+/// The stub holds the load until it is cancelled, so nothing but the cancellation ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
     let environment = Environment::start(Setup {
@@ -1344,11 +1344,6 @@ async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
         environment.began("load") && environment.figures().loading
     })
     .await;
-    assert!(
-        environment.figures().loading,
-        "left alone, the load goes on"
-    );
-
     let report = environment.privacy(true).await;
     assert!(report.enabled);
     environment.until_privacy_settled().await;

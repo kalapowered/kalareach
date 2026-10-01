@@ -466,7 +466,11 @@ async fn a_command_block_becomes_a_directory_a_program_and_a_completion() {
 
     report(
         &host,
-        block("TOKEN=hunter2 cargo test --all", "/home/a/kalareach", None),
+        block(
+            "cargo test --all --token hunter2",
+            "/home/a/kalareach",
+            None,
+        ),
     );
     let started = ask(&mut link, 2, 0, 0, Some(0)).await;
     let facts = started.facts.0.expect("facts");
@@ -485,7 +489,7 @@ async fn a_command_block_becomes_a_directory_a_program_and_a_completion() {
     report(
         &host,
         block(
-            "TOKEN=hunter2 cargo test --all",
+            "cargo test --all --token hunter2",
             "/home/a/kalareach",
             Some(0),
         ),
@@ -685,6 +689,8 @@ async fn privacy_mode_stops_capture_clears_the_record_and_tells_the_daemon() {
     // Nothing is captured while it is on, and the daemon, now current, is held rather than spun.
     report(&host, block("secret", "/home/a/while-private", None));
     send(&mut link, request(3, 0, 1_000, Some(1))).await;
+    // Held, not answered at once: the worker has begun to hold a second request.
+    until_held(&host, 2).await;
     let still = page(&mut link).await;
     assert_eq!(still.request_id, RequestId::new(3));
     assert!(still.private);

@@ -40,6 +40,7 @@ use kr_protocol::describe::{
 };
 use kr_protocol::root::RootCommandBlockParams;
 use kr_protocol::scalars::{Nullable, U64};
+use kr_shell_integration::contract::qualification::ShellKind;
 
 use crate::privacy::{
     Cancelled, Fenced, PrivacyGeneration, PrivacySubsystem, Removed, Unavailable,
@@ -231,9 +232,14 @@ impl DescriptionFacts {
     ///
     /// A command starting is also an event, with its program name for a summary. The repository the
     /// directory is in is read on a thread of its own.
-    pub fn note_command(&self, block: &RootCommandBlockParams, shell: Option<u64>) {
+    pub fn note_command(
+        &self,
+        block: &RootCommandBlockParams,
+        shell: Option<u64>,
+        kind: Option<ShellKind>,
+    ) {
         let directory = last_component(&block.cwd);
-        let application = program_of(&block.command);
+        let application = program_of(&block.command, kind);
         let finished = block.finished();
         let completion = block.exit_status.0.map(|status| {
             if status.get() == 0 {
@@ -299,8 +305,15 @@ impl DescriptionFacts {
     }
 
     /// Records the prompt an agent in the session was last given.
+    ///
+    /// A prompt that holds nothing once its control characters and blanks are gone is no intent: it
+    /// changes nothing, so the record never says an intent was cleared that the host would then
+    /// have to be told of.
     pub fn note_intent(&self, prompt: &str) {
-        let intent = clip(prompt);
+        let Some(intent) = clip(prompt) else {
+            return;
+        };
+        let intent = Some(intent);
         self.change(|state| {
             if state.record.intent == intent {
                 return false;
@@ -532,22 +545,24 @@ fn last_component(path: &str) -> Option<String> {
 
 /// The program a command line runs, and nothing else of it.
 ///
-/// This reads a closed grammar and nothing more. A line is blanks, any number of variable
-/// assignments (`NAME=value`, `NAME+=value`), and then the program word; the program word's last
-/// component is the name. Every word is made of characters whose meaning is the same in every
-/// shell this product runs (letters, digits and `_ . / : + , @ % ~ - =`, a backslash in front of
-/// one of them, and quoted parts whose contents hold no character a shell treats specially inside
-/// quotes), and the words are separated by spaces and tabs alone. Anything else, wherever it is
-/// before the program word ends, means this reader does not know what the shell will run, and
-/// the line names no program: a redirection, an operator, a substitution, a group, a comment, an
-/// escaped blank or quote, an unterminated quote, a newline before the program, a name that is not
-/// a variable's. Nothing after the program word is read. A missing name is no harm, and a wrong
-/// one is a leak of what a person typed, so no syntax is ever modelled: it is refused.
-fn program_of(command: &str) -> Option<String> {
+/// This reads a closed grammar and nothing more. A line is blanks, the variable assignments the
+/// shell it came from has (see [`Assignments`]), and then the program word; the program word's last
+/// component is the name. Every word is made of characters whose meaning is the same in every shell
+/// this product runs (letters, digits and `_ . / : + - = ~`) and quoted parts whose contents hold
+/// only letters, digits, spaces and ASCII punctuation that no shell reads specially inside the
+/// quote it is in; the words are separated by spaces and tabs alone. Anything else, wherever it is
+/// before the program word ends, means this reader does not know what the shell will run, and the
+/// line names no program: a redirection, an operator, a substitution, a group, a comment, a
+/// backslash, a comma, a quote of any other kind, an unterminated quote, a newline before the
+/// program, a name that is not a variable's, a line from a shell this reader has no assignment
+/// rule for. Nothing after the program word is read. A missing name is no harm, and a wrong one
+/// is a leak of what a person typed, so no syntax is ever modelled: it is refused.
+fn program_of(command: &str, kind: Option<ShellKind>) -> Option<String> {
+    let assignments = Assignments::of(kind);
     let mut rest = command.trim_start_matches(is_blank);
     loop {
         let (word, after) = scan_word(rest)?;
-        if word.is_assignment() {
+        if word.is_assignment(assignments) {
             // What it is for follows after blanks. A newline or the end of the line makes the
             // assignment a command of its own: the next word is then empty, and names nothing.
             rest = after.trim_start_matches(is_blank);
@@ -557,8 +572,31 @@ fn program_of(command: &str) -> Option<String> {
         if word.raw.contains('=') {
             return None;
         }
-        let name = word.text.rsplit(['/', '\\']).next().unwrap_or(&word.text);
+        let name = word.text.rsplit('/').next().unwrap_or(&word.text);
         return clip(name);
+    }
+}
+
+/// Which variable assignments may come before a program, by the shell the line came from. A line
+/// from a shell this reader has no rule for has none: its first word is the program, or the line
+/// names none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Assignments {
+    /// `NAME=value` and `NAME+=value`: Bash and Zsh.
+    Appending,
+    /// `NAME=value`: Fish.
+    Plain,
+    /// None: PowerShell has no prefix assignment, and a shell not known has no rule.
+    None,
+}
+
+impl Assignments {
+    const fn of(kind: Option<ShellKind>) -> Self {
+        match kind {
+            Some(ShellKind::Bash | ShellKind::Zsh) => Self::Appending,
+            Some(ShellKind::Fish) => Self::Plain,
+            Some(ShellKind::PowerShell) | None => Self::None,
+        }
     }
 }
 
@@ -570,17 +608,22 @@ struct Word<'a> {
 
 impl Word<'_> {
     /// Whether the word sets a variable for the command after it: an unquoted name that starts
-    /// with a letter or an underscore, an optional `+`, an `=`, and a value with no backslash.
-    fn is_assignment(&self) -> bool {
+    /// with a letter or an underscore, an `=` (after a `+` where the shell appends), and a value.
+    fn is_assignment(&self, assignments: Assignments) -> bool {
+        if assignments == Assignments::None {
+            return false;
+        }
         let Some((name, _value)) = self.raw.split_once('=') else {
             return false;
         };
-        let name = name.strip_suffix('+').unwrap_or(name);
+        let name = match (assignments, name.strip_suffix('+')) {
+            (Assignments::Appending, Some(appended)) => appended,
+            _ => name,
+        };
         name.chars()
             .next()
             .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
             && name.chars().all(is_variable_character)
-            && !self.raw.contains('\\')
     }
 }
 
@@ -592,18 +635,16 @@ const fn is_blank(character: char) -> bool {
 /// A character that means the same in every shell, outside quotes.
 fn is_plain(character: char) -> bool {
     character.is_alphanumeric()
-        || matches!(
-            character,
-            '_' | '.' | '/' | ':' | '+' | ',' | '@' | '%' | '~' | '-' | '='
-        )
+        || matches!(character, '_' | '.' | '/' | ':' | '+' | '~' | '-' | '=')
 }
 
-/// Whether a quoted part may hold `character`: nothing a shell reads specially inside the quote
-/// it is in (a backslash, and in double quotes `$`, a backtick and `!`), no control character, and
-/// no quote of the kind that closes it, which the search for the closing quote has already ruled
-/// out.
+/// Whether a quoted part may hold `character`: a letter, a digit, a space or ASCII punctuation, and
+/// nothing a shell reads specially inside the quote it is in (a backslash, and in double quotes
+/// `$`, a backtick and `!`). The quote that closes the part is ruled out by the search for it. A
+/// quote of another script, such as the curved ones PowerShell closes a string at, is not ASCII
+/// punctuation, and is refused.
 fn is_quotable(character: char, quote: char) -> bool {
-    !character.is_control()
+    (character == ' ' || character.is_alphanumeric() || character.is_ascii_punctuation())
         && character != '\\'
         && (quote == '\'' || !matches!(character, '$' | '`' | '!'))
 }
@@ -626,16 +667,6 @@ fn scan_word(rest: &str) -> Option<(Word<'_>, &str)> {
                 text.push_str(inside);
                 at = close + 1;
                 continue;
-            }
-            // A backslash is a Windows path's separator or a shell's escape of the next character,
-            // and which it is depends on the shell: only before a character of the closed set does
-            // it say the same thing in both, a word that goes on.
-            '\\' => {
-                let next = rest[at + 1..].chars().next()?;
-                if !(is_plain(next) || next == '\\') {
-                    return None;
-                }
-                text.push(character);
             }
             plain if is_plain(plain) => text.push(plain),
             _ => return None,
@@ -745,14 +776,26 @@ fn head_of(marker: &Path, owner: &Path) -> Option<String> {
 
 /// Reads at most [`HEAD_BYTES`] of a regular file as text. Anything else a directory can hold under
 /// that name, a pipe or a device, is not read: opening one can wait for ever for a writer, and the
-/// read that waits is the only one this session would ever make.
+/// read that waits is the only one this session would ever make. The file is opened without
+/// waiting and its type is read from the open handle, so a file swapped for a pipe between the
+/// two is no different.
 fn read_bounded(path: &Path) -> Option<String> {
     use std::io::Read as _;
 
-    if !std::fs::metadata(path).ok()?.is_file() {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
     let mut text = String::new();
     file.take(HEAD_BYTES).read_to_string(&mut text).ok()?;
     Some(text)
@@ -846,16 +889,21 @@ mod tests {
             ("cargo test --all", Some("cargo")),
             ("FOO=1 BAR=two /usr/bin/git status", Some("git")),
             ("  \"/opt/tools/rg\" secret-needle", Some("rg")),
-            ("C:\\tools\\node.exe app.js", Some("node.exe")),
+            ("C:/tools/node.exe app.js", Some("node.exe")),
             ("A=1", None),
             ("", None),
         ] {
-            assert_eq!(program_of(line).as_deref(), program, "{line:?}");
+            assert_eq!(
+                program_in(line, ShellKind::Bash).as_deref(),
+                program,
+                "{line:?}"
+            );
         }
         let facts = facts();
         facts.note_command(
             &block("TOKEN=hunter2 deploy --key abc", "/home/a/work", None),
             None,
+            Some(ShellKind::Zsh),
         );
         let record = read(&facts);
         assert_eq!(record.application.0.as_deref(), Some("deploy"));
@@ -864,6 +912,10 @@ mod tests {
             !encoded.contains("hunter2") && !encoded.contains("abc"),
             "{encoded}"
         );
+    }
+
+    fn program_in(line: &str, kind: ShellKind) -> Option<String> {
+        program_of(line, Some(kind))
     }
 
     /// The program is read from a closed grammar: assignments, then the program word, in
@@ -883,8 +935,9 @@ mod tests {
             ("\"/Applications/My App/run\" --flag", Some("run")),
             ("'/opt/tools/rg' secret-needle", Some("rg")),
             ("cargo\nrm -rf secret", Some("cargo")),
-            ("C:\\tools\\node.exe app.js", Some("node.exe")),
+            ("C:/tools/node.exe app.js", Some("node.exe")),
             ("~/bin/tool --now", Some("tool")),
+            ("g++ -O2 main.cc", Some("g++")),
             // Not named: a redirection, in any spelling, before the program.
             ("> out.log cargo build", None),
             (">out.log cargo build", None),
@@ -918,8 +971,12 @@ mod tests {
             ("(cd /x && run) --now", None),
             ("#note secret text", None),
             ("TOKEN=x #note", None),
-            // Not named: an escaped blank or backslash, a name that is not a variable's, and a
-            // line with no program.
+            // Not named: any backslash (an escape in one shell and a path separator in another), a
+            // comma, a name that is not a variable's, and a line with no program.
+            ("C:\\tools\\node.exe app.js", None),
+            ("foo\\bar arg", None),
+            ("deploy,SECRET", None),
+            ("@splat SECRET", None),
             ("TOKEN=first\\ secret cargo test", None),
             ("A=x\\\\ y cmd", None),
             ("ls\\ secret", None),
@@ -935,12 +992,26 @@ mod tests {
             ("\"C:\\Program Files\\x.exe\" arg", None),
             ("'a\\b' secret", None),
         ] {
-            assert_eq!(program_of(line).as_deref(), program, "{line:?}");
+            assert_eq!(
+                program_in(line, ShellKind::Bash).as_deref(),
+                program,
+                "{line:?}"
+            );
+            assert_eq!(
+                program_in(line, ShellKind::Zsh).as_deref(),
+                program,
+                "{line:?}"
+            );
         }
+        // A quote of another script, which PowerShell closes a string at, is refused in a quote.
+        let curved = "Write-Output\"\u{201d} SECRET \u{201c}\"";
+        assert_eq!(program_in(curved, ShellKind::Bash), None);
+        assert_eq!(program_in(curved, ShellKind::PowerShell), None);
         let facts = facts();
         facts.note_command(
             &block("TOKEN='first secret' cargo test", "/home/a/work", None),
             None,
+            Some(ShellKind::Bash),
         );
         let record = read(&facts);
         assert_eq!(record.application.0.as_deref(), Some("cargo"));
@@ -949,54 +1020,123 @@ mod tests {
         assert!(!encoded.contains("secret"), "{encoded}");
     }
 
+    /// The assignments a line may start with are the ones its shell has: Bash and Zsh take `=` and
+    /// `+=`, Fish takes `=`, PowerShell has none, and a line from a shell that is not known has
+    /// none either. Where a shell has none, a word with an `=` is the program word, which is no
+    /// name, and what follows it is never named.
+    #[test]
+    fn a_line_may_start_with_the_assignments_its_shell_has_and_no_others() {
+        for (line, bash, fish, powershell, unknown) in [
+            ("A=x cmd", Some("cmd"), Some("cmd"), None, None),
+            ("A+=x cmd", Some("cmd"), None, None, None),
+            ("A=x SECRET", Some("SECRET"), Some("SECRET"), None, None),
+            (
+                "TOKEN=value SECRET",
+                Some("SECRET"),
+                Some("SECRET"),
+                None,
+                None,
+            ),
+            (
+                "cmd A=x",
+                Some("cmd"),
+                Some("cmd"),
+                Some("cmd"),
+                Some("cmd"),
+            ),
+        ] {
+            assert_eq!(
+                program_in(line, ShellKind::Bash).as_deref(),
+                bash,
+                "{line:?} in Bash"
+            );
+            assert_eq!(
+                program_in(line, ShellKind::Zsh).as_deref(),
+                bash,
+                "{line:?} in Zsh"
+            );
+            assert_eq!(
+                program_in(line, ShellKind::Fish).as_deref(),
+                fish,
+                "{line:?} in Fish"
+            );
+            assert_eq!(
+                program_in(line, ShellKind::PowerShell).as_deref(),
+                powershell,
+                "{line:?} in PowerShell"
+            );
+            assert_eq!(
+                program_of(line, None).as_deref(),
+                unknown,
+                "{line:?} in an unknown shell"
+            );
+        }
+    }
+
     /// Whatever a line starts with, nothing past the point where one command ends and the next
     /// begins is ever named: every line of up to four characters from a set of the characters
-    /// shells treat specially, followed by each way of ending one command and starting the next,
-    /// never names the word that comes after.
+    /// shells treat specially (and, with up to three, from a set that holds the characters the
+    /// grammar accepts), followed by each way of ending one command and starting the next, names
+    /// neither of the words that come after.
     #[test]
-    fn nothing_after_what_a_line_starts_with_is_ever_named() {
-        const CHARACTERS: [char; 20] = [
+    fn nothing_after_a_command_boundary_is_ever_named() {
+        const SPECIAL: [char; 20] = [
             '\'', '"', '\\', ' ', '$', ';', '=', '#', 'a', '<', '>', '\n', '\u{a0}', '&', '|', '(',
             '`', '!', '{', '\t',
         ];
-        const TAILS: [&str; 5] = [
-            " cmd SECRET",
-            "\ncmd SECRET",
-            ";cmd SECRET",
-            "&&cmd SECRET",
-            "|cmd SECRET",
+        const ACCEPTED: [char; 14] = [
+            'a', '1', '_', '.', '/', ':', '+', '~', '-', '=', ' ', '\t', '\'', '"',
         ];
-        let mut prefixes = vec![String::new()];
-        let mut all = vec![String::new()];
-        for _ in 0..4 {
-            let mut longer = Vec::new();
-            for prefix in &prefixes {
-                for character in CHARACTERS {
-                    let mut next = prefix.clone();
-                    next.push(character);
-                    longer.push(next);
+        const BOUNDARIES: [&str; 4] =
+            ["\ncmd SECRET", ";cmd SECRET", "&&cmd SECRET", "|cmd SECRET"];
+        let lines = |alphabet: &[char], length: usize| {
+            let mut all = vec![String::new()];
+            let mut level = vec![String::new()];
+            for _ in 0..length {
+                let mut longer = Vec::new();
+                for prefix in &level {
+                    for character in alphabet {
+                        let mut next = prefix.clone();
+                        next.push(*character);
+                        longer.push(next);
+                    }
+                }
+                all.extend(longer.iter().cloned());
+                level = longer;
+            }
+            all
+        };
+        let mut checked = 0_u64;
+        for prefix in lines(&SPECIAL, 4).into_iter().chain(lines(&ACCEPTED, 3)) {
+            for boundary in BOUNDARIES {
+                let line = format!("{prefix}{boundary}");
+                for kind in [ShellKind::Bash, ShellKind::Fish, ShellKind::PowerShell] {
+                    if let Some(named) = program_in(&line, kind) {
+                        assert!(
+                            !named.contains("SECRET") && !named.contains("cmd"),
+                            "{line:?} named {named:?} in {kind:?}"
+                        );
+                    }
+                    checked += 1;
                 }
             }
-            all.extend(longer.iter().cloned());
-            prefixes = longer;
         }
-        for prefix in &all {
-            for tail in TAILS {
-                let line = format!("{prefix}{tail}");
-                if let Some(named) = program_of(&line) {
-                    assert!(!named.contains("SECRET"), "{line:?} named {named:?}");
-                }
-            }
-        }
+        assert!(checked > 700_000, "the sets were enumerated: {checked}");
+        // The control: a boundary that is a blank does not end the command, so what follows an
+        // assignment is its program.
+        assert_eq!(
+            program_in("A=b cmd SECRET", ShellKind::Bash).as_deref(),
+            Some("cmd")
+        );
     }
 
     /// A root directory has a name of its own, so `cd /` replaces the directory the session left.
     #[test]
     fn the_root_directory_is_named_and_a_move_to_it_is_a_move() {
         let facts = facts();
-        facts.note_command(&block("ls", "/home/a/kalareach", None), None);
+        facts.note_command(&block("ls", "/home/a/kalareach", None), None, None);
         assert_eq!(read(&facts).directory.0.as_deref(), Some("kalareach"));
-        facts.note_command(&block("ls", "/", None), None);
+        facts.note_command(&block("ls", "/", None), None, None);
         assert_eq!(read(&facts).directory.0.as_deref(), Some("/"));
     }
 
@@ -1081,7 +1221,7 @@ mod tests {
     #[test]
     fn a_command_has_a_completion_only_once_it_has_ended_and_is_one_event() {
         let facts = facts();
-        facts.note_command(&block("cargo test", "/home/a/kalareach", None), None);
+        facts.note_command(&block("cargo test", "/home/a/kalareach", None), None, None);
         let started = read(&facts);
         assert_eq!(started.directory.0.as_deref(), Some("kalareach"));
         assert_eq!(started.completion.0, None);
@@ -1092,13 +1232,17 @@ mod tests {
         );
         assert_eq!(started.events[0].summary, "cargo");
 
-        facts.note_command(&block("cargo test", "/home/a/kalareach", Some(1)), None);
+        facts.note_command(
+            &block("cargo test", "/home/a/kalareach", Some(1)),
+            None,
+            None,
+        );
         let ended = read(&facts);
         assert_eq!(ended.completion.0, Some(DescriptionCompletion::Failed));
         assert_eq!(ended.events.len(), 1, "the end is not a second event");
         assert!(ended.revision.get() > started.revision.get());
 
-        facts.note_command(&block("make", "/home/a/kalareach", None), None);
+        facts.note_command(&block("make", "/home/a/kalareach", None), None, None);
         assert_eq!(
             read(&facts).completion.0,
             None,
@@ -1119,6 +1263,10 @@ mod tests {
         let revision = record.revision;
         facts.note_intent(&format!("check\u{1b}[31m the flow {}", "x".repeat(300)));
         assert_eq!(read(&facts).revision, revision, "the same prompt again");
+        facts.note_intent("  \u{1b}\t ");
+        let after = read(&facts);
+        assert_eq!(after.revision, revision, "a prompt of nothing is no intent");
+        assert!(after.intent.0.is_some(), "and the intent stands");
 
         for number in 0..20 {
             facts.note_event(DescriptionEventKind::TaskStarted, &format!("task {number}"));
@@ -1148,7 +1296,7 @@ mod tests {
         );
         let revision = facts.state().revision;
         facts.note_intent("while private");
-        facts.note_command(&block("ls", "/home/a/x", None), None);
+        facts.note_command(&block("ls", "/home/a/x", None), None, None);
         facts.note_event(DescriptionEventKind::TaskStarted, "while private");
         facts.note_thread(Some("while private"));
         let held = facts.state();
@@ -1340,7 +1488,7 @@ mod tests {
         // Nothing is reported after the transition: only the transition says the read is old.
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("make", "/w/app", None), None);
+        facts.note_command(&block("make", "/w/app", None), None, None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
         facts.fence(PrivacyGeneration::new(1));
         facts.release(PrivacyGeneration::new(2));
@@ -1355,11 +1503,11 @@ mod tests {
         // The next command names the same directory: the first read is refused, the second applies.
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("make", "/w/app", None), None);
+        facts.note_command(&block("make", "/w/app", None), None, None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
         facts.fence(PrivacyGeneration::new(1));
         facts.release(PrivacyGeneration::new(2));
-        facts.note_command(&block("make", "/w/app", None), None);
+        facts.note_command(&block("make", "/w/app", None), None, None);
 
         // The first read answers now, from before the transition. The second begins only once the
         // first has been dealt with, so its beginning is the point to look from.
@@ -1387,9 +1535,9 @@ mod tests {
     fn a_read_for_an_older_block_is_refused_when_a_newer_block_has_arrived() {
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("ls", "/w/a", None), None);
+        facts.note_command(&block("ls", "/w/a", None), None, None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/a"));
-        facts.note_command(&block("ls", "/w/b", Some(0)), None);
+        facts.note_command(&block("ls", "/w/b", Some(0)), None, None);
 
         step.hand_over("/w/a", Some(("a", None)));
         assert_eq!(step.next_read().directory, PathBuf::from("/w/b"));
@@ -1426,7 +1574,7 @@ mod tests {
         });
         let facts = DescriptionFacts::reading_with(false, PrivacyGeneration::new(0), reader);
 
-        facts.note_command(&block("cd /w/new", "/w/old", None), Some(7));
+        facts.note_command(&block("cd /w/new", "/w/old", None), Some(7), None);
         let started = entered.recv_timeout(WAIT).expect("a read for the start");
         assert_eq!(
             started.shell, None,
@@ -1436,7 +1584,7 @@ mod tests {
             facts.state().record.directory.as_deref() == Some("old")
         });
 
-        facts.note_command(&block("cd /w/new", "/w/old", Some(0)), Some(7));
+        facts.note_command(&block("cd /w/new", "/w/old", Some(0)), Some(7), None);
         let ended = entered.recv_timeout(WAIT).expect("a read for the end");
         assert_eq!(
             ended.shell,
@@ -1460,8 +1608,8 @@ mod tests {
         let cwd = repo.display().to_string();
 
         let facts = facts();
-        facts.note_command(&block("git switch topic", &cwd, None), None);
-        facts.note_command(&block("git switch topic", &cwd, Some(0)), None);
+        facts.note_command(&block("git switch topic", &cwd, None), None, None);
+        facts.note_command(&block("git switch topic", &cwd, Some(0)), None, None);
         until("the repository to be read", || {
             read(&facts).repository.0.is_some()
         });
@@ -1471,8 +1619,8 @@ mod tests {
         );
 
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/topic\n").expect("a new HEAD");
-        facts.note_command(&block("git status", &cwd, None), None);
-        facts.note_command(&block("git status", &cwd, Some(0)), None);
+        facts.note_command(&block("git status", &cwd, None), None, None);
+        facts.note_command(&block("git status", &cwd, Some(0)), None, None);
         until("the branch the command left", || {
             read(&facts)
                 .repository

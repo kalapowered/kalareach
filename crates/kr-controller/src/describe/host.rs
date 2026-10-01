@@ -300,12 +300,12 @@ impl DescribeHost {
                 })?;
         }
         let thread = {
-            let shared = Arc::clone(&shared);
+            let held = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("describe-host".to_owned())
                 .spawn(move || {
                     Thread {
-                        shared,
+                        shared: held,
                         driver,
                         inbox,
                         privacy,
@@ -318,6 +318,9 @@ impl DescribeHost {
                     .run();
                 })
                 .map_err(|error| {
+                    // The reader of conditions started first and must not outlive a host that did
+                    // not start.
+                    shared.running.store(false, Ordering::Release);
                     ControllerError::registry(format!(
                         "the description host's thread could not start: {error}"
                     ))
@@ -382,11 +385,19 @@ impl DescribeHost {
 
     /// Hands the host the newest page of a session's facts, replacing one it has not read.
     pub(crate) fn page(&self, session_id: SessionId, page: Box<DescriptionFactsPage>) {
-        self.shared
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(session_id, page);
+        {
+            let mut slots = self
+                .shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Checked under the lock the exit and the purge clear the slots under: a page that
+            // arrives for a host that has stopped is dropped, and never left for nobody to take.
+            if !self.shared.running.load(Ordering::Acquire) {
+                return;
+            }
+            slots.insert(session_id, page);
+        }
         self.shared.waker.wake();
     }
 
@@ -550,6 +561,7 @@ impl Thread {
         while self.shared.running.load(Ordering::Acquire) {
             let now = self.clock.now();
             self.take_messages(now);
+            self.follow_privacy();
             self.take_pages(now);
             self.settle_sessions(now);
             let conditions = self.conditions();
@@ -634,6 +646,29 @@ impl Thread {
                 #[cfg(test)]
                 Message::Fail => panic!("the host's thread fails, as a test asked"),
             }
+        }
+    }
+
+    /// Raises the fence of every session that does not hold one while privacy mode is published as
+    /// on, at the generation it is on at, and cancels the job running for it. Privacy mode raises
+    /// the fences itself once it is published; between its publication and that, a turn of this
+    /// thread could dispatch a job, and this is what stops it: no job starts for a session after
+    /// privacy mode is published, whichever of the two comes first. Read with no admission held.
+    fn follow_privacy(&mut self) {
+        let published = self.privacy.now();
+        if !published.private {
+            return;
+        }
+        for session_id in self.driver.service().live_session_ids() {
+            let raised = self.driver.service().fence().generation(&session_id);
+            if raised.is_some_and(|raised| raised.get() >= published.generation.get()) {
+                continue;
+            }
+            self.shared
+                .handles
+                .fence
+                .raise(session_id, published.generation);
+            self.shared.handles.running.cancel(&session_id);
         }
     }
 
@@ -1251,6 +1286,62 @@ mod tests {
             })),
             DescriptionFreshness::None
         );
+    }
+
+    /// A session that holds no fence when privacy mode is published as on is fenced at the host's
+    /// next turn, at the generation it is on at, so a job cannot start in the moment between the
+    /// publication and the fences privacy mode raises itself. A session already fenced at that
+    /// generation or a later one is left as it is, and nothing is fenced while privacy mode is
+    /// off.
+    #[test]
+    fn a_turn_fences_every_session_that_holds_no_fence_while_privacy_mode_is_published_as_on() {
+        let (_directory, mut host) = thread(state(3, true));
+        assert!(!host.shared.handles.fence.is_fenced(&session()));
+        host.follow_privacy();
+        assert_eq!(
+            host.shared.handles.fence.generation(&session()),
+            Some(PrivacyGeneration::new(3))
+        );
+
+        // Raised at a later generation already: left as it is.
+        let (_directory, mut later) = thread(state(3, true));
+        later
+            .shared
+            .handles
+            .fence
+            .raise(session(), PrivacyGeneration::new(5));
+        later.follow_privacy();
+        assert_eq!(
+            later.shared.handles.fence.generation(&session()),
+            Some(PrivacyGeneration::new(5))
+        );
+
+        // The control: privacy mode off.
+        let (_directory, mut off) = thread(state(3, false));
+        off.follow_privacy();
+        assert!(!off.shared.handles.fence.is_fenced(&session()));
+    }
+
+    /// A page that arrives for a host that has stopped is dropped, where a page for one that runs
+    /// is kept: nothing is left in the slots for a thread that is not there to take it.
+    #[test]
+    fn a_page_for_a_host_that_has_stopped_is_dropped() {
+        for running in [true, false] {
+            let (_directory, host) = thread(state(0, false));
+            host.shared.running.store(running, Ordering::Release);
+            let handle = DescribeHost {
+                shared: Arc::clone(&host.shared),
+                thread: Mutex::new(None),
+            };
+            handle.page(session(), Box::new(page(0)));
+            let held = host
+                .shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            assert_eq!(held, usize::from(running), "running: {running}");
+        }
     }
 
     /// A reading of the host's conditions serves while it is under a minute old and says nothing
