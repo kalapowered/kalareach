@@ -299,7 +299,7 @@ pub struct Controller {
     /// a narrower ceiling decides every request from that moment, and the fence stops what was
     /// admitted under the wider one. A reading that produced no document leaves it as it is.
     pub(crate) rights_ceiling:
-        std::sync::Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>,
+        Arc<std::sync::Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>>,
     /// The restrictive changes whose debt no barrier has retired yet ([`Debts`]).
     ///
     /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a

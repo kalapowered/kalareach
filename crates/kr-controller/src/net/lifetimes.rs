@@ -486,6 +486,12 @@ impl GrantLifetimes {
         self.pending_expiry.settle(&self.devices);
     }
 
+    /// Returns the directory of paired devices whose grants these lifetimes anchor.
+    #[must_use]
+    pub const fn devices(&self) -> &Arc<DeviceDirectory> {
+        &self.devices
+    }
+
     /// Returns the expiry records this host owes its directory.
     #[must_use]
     pub const fn pending_expiry(&self) -> &Arc<PendingExpiry> {

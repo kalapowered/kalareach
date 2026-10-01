@@ -296,17 +296,25 @@ impl DeliveryModule {
     /// A revision that is not ahead of the one recorded is refused: a replay of an older
     /// registration would otherwise put a retired key back into service.
     ///
+    /// `admitted` is the admission the registration carries, asked once the journal's lock is held
+    /// and everything the registration is checked against has been read, immediately before the
+    /// write. A registration that writes nothing, because the one recorded is the same, is not
+    /// asked about. Returns whether the journal was written, which is what tells the caller whether
+    /// the registration has begun.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] when the revision does not move forward, and
-    /// [`ControllerError::Unavailable`] when the journal cannot be written.
+    /// Returns [`ControllerError::InvalidArgument`] when the revision does not move forward, what
+    /// `admitted` refuses with, and [`ControllerError::Unavailable`] when the journal cannot be
+    /// written.
     pub fn update_preview_key(
         &self,
         destination_id: &DestinationId,
         key: NotificationPreviewKey,
         revision: u64,
         now_ms: u64,
-    ) -> Result<()> {
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<bool> {
         self.with(|producer| {
             let journal = producer.journal_mut();
             journal
@@ -328,7 +336,7 @@ impl DeliveryModule {
             if push.preview_keys.revision == revision && push.preview_keys.current == key {
                 // The registration already recorded. A device whose answer was lost sends the
                 // same one again, and the same registration twice is one registration.
-                return Ok(());
+                return Ok(false);
             }
             if revision <= push.preview_keys.revision {
                 return Err(ControllerError::InvalidArgument(format!(
@@ -360,7 +368,11 @@ impl DeliveryModule {
                 .max()
                 .map(TimestampMs::new);
             push.preview_keys = push.preview_keys.rotated(key, revision, outstanding);
-            journal.configure_destination(&record).map_err(unavailable)
+            admitted()?;
+            journal
+                .configure_destination(&record)
+                .map_err(unavailable)?;
+            Ok(true)
         })
     }
 
@@ -468,6 +480,24 @@ impl DeliveryModule {
             enabled: true,
             configured_at_ms: TimestampMs::new(now_ms),
         }
+    }
+
+    /// Produces from every event this journal took and has not produced from, which is how a
+    /// notification is built from an announcement the producer took: the take commits the event
+    /// with its notice, and this builds from the notice, so a pass that stopped between the two
+    /// finishes it on the next without a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the journal cannot be read or written.
+    pub fn finish_pending(&self, authority: &dyn RecipientAuthority, now_ms: u64) -> Result<usize> {
+        self.with(|producer| {
+            let destinations = producer.journal().destinations().map_err(unavailable)?;
+            let produced = producer
+                .finish_pending(&destinations, authority, now_ms)
+                .map_err(unavailable)?;
+            Ok(produced.admitted + produced.collapsed)
+        })
     }
 
     /// Finishes what a restart found unfinished.
@@ -791,6 +821,7 @@ impl DeliveryModule {
                     sender,
                     status,
                     credentials,
+                    authority,
                     now_ms,
                     clock,
                 )?;
@@ -803,9 +834,9 @@ impl DeliveryModule {
 
     /// Whether the authority a claimed delivery was admitted under is still the authority now.
     ///
-    /// A push destination's recipient is the paired device, so the rule is the whole of it. An
-    /// external destination's is the grant, and the grant decides which sessions' lines may be in
-    /// the message at all, so it is asked again and the answer compared.
+    /// The recipient's grant decides what a notification may tell it, for a paired device as for an
+    /// external destination, so it is asked again and the answer compared with what the delivery
+    /// was admitted under: its rights, its sessions, its history, the grant itself.
     fn authority_still_holds(
         &self,
         record: &DestinationRecord,
@@ -815,15 +846,15 @@ impl DeliveryModule {
         let Ok(rule) = record.require_rule() else {
             return false;
         };
-        let now = if record.as_push().is_some() {
-            kr_delivery::producer::authority_digest(rule, None)
+        let scope = if record.as_push().is_some() {
+            authority.device_scope(record)
         } else {
-            let Some(scope) = authority.scope_for(rule) else {
-                return false;
-            };
-            kr_delivery::producer::authority_digest(rule, Some(&scope))
+            authority.scope_for(rule)
         };
-        now == claimed.authority_digest
+        let Some(scope) = scope else {
+            return false;
+        };
+        kr_delivery::producer::authority_digest(rule, Some(&scope)) == claimed.authority_digest
     }
 
     /// Puts a claimed delivery back, waiting for a renewal that has not happened.
@@ -914,13 +945,18 @@ impl DeliveryModule {
         })
     }
 
-    /// Admits one claimed delivery to be presented: only while privacy mode is off and the
-    /// generation it was admitted under is the one in force ([`crate::privacy::PrivacyState`]).
-    fn admitted(&self, delivery: &ClaimedDelivery) -> Option<crate::privacy::SendAdmission<'_>> {
-        self.privacy
-            .admit_send(kr_worker::privacy::PrivacyGeneration::new(
-                delivery.privacy_generation,
-            ))
+    /// Admits one claimed delivery to be presented: only while the generation it was admitted
+    /// under is the one in force ([`crate::privacy::PrivacyState`]).
+    ///
+    /// Privacy mode ends the generation every notification carrying content was admitted under, so
+    /// this refuses all of them while it is on, and the rows of the generation it begins are the
+    /// alerts a pending question or approval still owes, which carry none. The reading is held
+    /// until the answer is recorded, as an admission is: a change of privacy mode waits for it.
+    fn admitted(&self, delivery: &ClaimedDelivery) -> Option<crate::privacy::Reading<'_>> {
+        let reading = self.privacy.reading();
+        (reading.published().generation
+            == kr_worker::privacy::PrivacyGeneration::new(delivery.privacy_generation))
+        .then_some(reading)
     }
 
     /// Settles a claimed delivery privacy mode took back before it was presented. Nothing was
@@ -942,6 +978,7 @@ impl DeliveryModule {
         sender: &dyn PushSender,
         status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
+        authority: &dyn RecipientAuthority,
         now_ms: u64,
         clock: &dyn Clock,
     ) -> Result<()> {
@@ -986,6 +1023,18 @@ impl DeliveryModule {
                 DeliveryState::Expired,
                 "the notification expired while the credential was being renewed",
                 now_ms,
+            );
+        }
+        // The recipient's authority is asked once more, after the renewal, which waits on the
+        // gateway: a grant that ended, a device that was unpaired or a limit that moved while this
+        // waited stops the notification here, and it is the last time anything is asked before it
+        // is presented.
+        if !self.authority_still_holds(record, delivery, authority) {
+            return self.settle(
+                delivery,
+                DeliveryState::Revoked,
+                "the recipient's authority is not the one this was admitted under",
+                clock.now_ms().max(now_ms),
             );
         }
         // Presented only under an admission of the generation this was admitted under, taken

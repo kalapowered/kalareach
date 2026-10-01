@@ -846,6 +846,52 @@ impl AttentionModule {
         }
     }
 
+    /// Hands the delivery consumer the store, to take the announcements the store has decided, and
+    /// the offer that says which of them it may take now.
+    ///
+    /// The store is held for the whole call, so what the consumer takes, commits and settles is one
+    /// step to every other reader and writer of the store. The consumer commits to its own journal
+    /// before it settles, and settles with the store before it lets go.
+    ///
+    /// The offer holds back an announcement about a session that is neither one the store reads
+    /// nor one whose records it has finished reading, and about one closed over a worker this host
+    /// could not account for: a closing session's pending questions and approvals end when the
+    /// store has read what is left of its journal, and an announcement taken before that is one
+    /// about a condition that is about to end. What is held back is offered again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the store cannot be taken, and nothing is taken.
+    pub fn take_for_delivery<T>(
+        &self,
+        consume: impl FnOnce(&mut Attention, &dyn Fn(&kr_attention::engine::Item) -> bool) -> T,
+    ) -> Answer<T> {
+        let mut store = self.store()?;
+        let held: BTreeSet<SessionId> = {
+            let engine = store.engine().map_err(refusal)?;
+            let origins = self.origins();
+            engine
+                .items()
+                .filter_map(|item| item.origin.session())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|session_id| {
+                    let reads = origins.links.contains_key(session_id)
+                        || engine.is_finalised(&Origin::Session(*session_id));
+                    !reads
+                        || origins.closing.contains(session_id)
+                        || origins.unaccounted.contains(session_id)
+                })
+                .collect()
+        };
+        let offer = |item: &kr_attention::engine::Item| {
+            item.origin
+                .session()
+                .is_none_or(|session_id| !held.contains(&session_id))
+        };
+        Ok(consume(&mut store, &offer))
+    }
+
     /// Resolves the text of records for a delivery send, with the ticket its release is bound by.
     ///
     /// The consumer sends the text only through [`Self::release_delivery`].

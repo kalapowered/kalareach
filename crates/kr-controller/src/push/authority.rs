@@ -1,42 +1,55 @@
-//! What a delivery rule's grant lets its recipient read, answered from this host's grant store.
+//! What a delivery rule's grant lets its recipient see, answered from this host's own records.
 //!
-//! Section 19 intersects an external message's content with the recipient's own authority, and
-//! the recipient's authority is the grant the destination's rule names, intersected with this
-//! host's current policy the way every other use of a grant is. So this answers from the grants
-//! this host issued, as they stand at the moment of asking, and from the policy in force at that
-//! moment: a grant revoked, expired, never redeemed, issued under an authority revision this host
-//! has not reached, or for another environment admits nothing; so does one the policy will not
-//! honour - an organisation grant whose recipient this host cannot attribute to a member with a
-//! current lease, a personal grant on a host that is exclusively organisation-managed, a grant
-//! used past the bounded offline-validity policy - and so does one whose rights, after that
-//! intersection, no longer include viewing a session.
+//! Section 19 intersects a notification's content with the recipient's own authority, and the
+//! recipient's authority is the grant the destination's rule names, intersected with this host's
+//! current policy the way every other use of a grant is. So this answers from the grants this host
+//! holds, as they stand at the moment of asking, and from the policy in force at that moment: a
+//! grant revoked, expired, never redeemed, issued under an authority revision this host has not
+//! reached, or for another environment admits nothing; so does one the policy will not honour - an
+//! organisation grant whose recipient this host cannot attribute to a member with a current lease,
+//! a personal grant on a host that is exclusively organisation-managed, a grant used past the
+//! bounded offline-validity policy - and so does one whose rights, after that intersection and the
+//! host's configured ceiling, include nothing a notification can ask for.
 //!
-//! A push destination never asks. Its recipient is the paired device and the content is sealed to
-//! that device's own key, so the rule is the whole of its authority.
+//! A grant lives in one of two places: the grant store, for a grant this host issued or shared, and
+//! a paired device's own record, for the grant its pairing committed, where its revocation and its
+//! expiry are written. Both are asked, the store first, and both decide the way a device's own
+//! request does.
+//!
+//! A paired device's destination asks too. Its content is sealed to the device's own key, and that
+//! says who can read it, not whether the device's grant admits it. The destination is named by the
+//! device's identifier and its rule names a grant, and the grant has to be the device's own: a rule
+//! that names another device's grant, or a device that is no longer paired, admits nothing.
 
 use std::sync::{Arc, Mutex};
 
-use kr_delivery::destination::DeliveryRule;
+use kr_delivery::destination::{DeliveryRule, DestinationRecord};
 use kr_delivery::producer::{RecipientAuthority, RecipientScope};
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::ids::EnvironmentId;
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{DeviceId, EnvironmentId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::CanonicalSet;
 use kr_worker::history_filter::ViewerScope;
 
-use crate::grants::{AccessRequest, HostPolicy};
+use crate::grants::{AccessRequest, GrantRecord, HostPolicy};
+use crate::service::net::devices::DeviceRecord;
 use crate::service::net::lifetimes::{Anchored, GrantLifetimes};
 use crate::sharing::SharingService;
 
-/// The grants this host issued, under its current policy, as a delivery rule's recipient
-/// authority.
+/// The grants this host holds, under its current policy and configuration, as a delivery rule's
+/// recipient authority.
 pub struct GrantedRecipients {
     sharing: Arc<SharingService>,
     policy: Arc<Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
     /// Every grant's anchor in this boot, with the clocks a grant and a membership lease are both
-    /// decided on.
+    /// decided on, and the directory of paired devices a pairing grant is read from.
     lifetimes: Arc<GrantLifetimes>,
+    /// The rights this host's configuration allows, which narrows every grant as it narrows a
+    /// paired device's every request. None where nothing sets one.
+    ceiling: Option<Arc<Mutex<Option<CanonicalSet<ActionRight>>>>>,
     /// Where this host's own tests stop a question once the grant's standing has been read and
     /// before the policy's lock is taken. Compiled away in every shipped build.
     #[cfg(test)]
@@ -52,10 +65,35 @@ impl std::fmt::Debug for GrantedRecipients {
     }
 }
 
+/// What a rule's grant stands on.
+enum Standing {
+    /// A grant in the grant store.
+    Stored(GrantRecord),
+    /// The grant a paired device's pairing committed, with the device's record.
+    Paired(DeviceRecord),
+}
+
+impl Standing {
+    fn grant(&self) -> &Grant {
+        match self {
+            Self::Stored(record) => &record.grant,
+            Self::Paired(device) => &device.grant,
+        }
+    }
+
+    /// When the grant began, in UTC milliseconds, or none while it has not been redeemed.
+    fn started_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::Stored(record) => record.activated_at_ms,
+            Self::Paired(device) => Some(device.paired_at_ms.get()),
+        }
+    }
+}
+
 impl GrantedRecipients {
-    /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment, with
-    /// each grant's own bound and a membership lease decided on the clocks of `lifetimes`, the
-    /// daemon's.
+    /// Answers from `sharing`'s grants and the devices `lifetimes` holds, under `policy`, for the
+    /// sessions of one environment, with each grant's own bound and a membership lease decided on
+    /// the clocks of `lifetimes`, the daemon's.
     #[must_use]
     pub fn new(
         sharing: Arc<SharingService>,
@@ -68,9 +106,18 @@ impl GrantedRecipients {
             policy,
             environment_id,
             lifetimes,
+            ceiling: None,
             #[cfg(test)]
             before_the_policy_lock: crate::attention::Pause::default(),
         }
+    }
+
+    /// Narrows every grant by the rights ceiling this host's configuration holds in `ceiling`,
+    /// read at each question, as the daemon narrows a paired device's every request.
+    #[must_use]
+    pub fn with_ceiling(mut self, ceiling: Arc<Mutex<Option<CanonicalSet<ActionRight>>>>) -> Self {
+        self.ceiling = Some(ceiling);
+        self
     }
 
     /// Answers on clocks of the caller's choosing, with anchors of its own, which is how a test
@@ -108,37 +155,89 @@ impl GrantedRecipients {
         ));
         Self::new(sharing, policy, environment_id, lifetimes)
     }
-}
 
-impl RecipientAuthority for GrantedRecipients {
-    /// Every lapse a clock decides here is written down where it is found, before the answer, as a
-    /// paired device's and a workflow's are, so a clock wound back before a restart or a reboot
-    /// cannot bring back what was refused: the end of the grant's own bound as its tombstone; a
-    /// lapse found in UTC, the grant's own or a bound of the policy, as the floor it was found at;
-    /// and the offline bound's end on the continuous clock as the time the bound has spent. A write
-    /// that fails stays owed, and the host's next decision or its record task writes it.
-    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
-        let grant_id = rule.grant_id?;
-        // A store this host cannot read is a grant this host cannot show, and a grant it cannot
-        // show admits nothing.
-        let record = self.sharing.grants().record(grant_id).ok()??;
-        // Revoked, or a proposal nobody has redeemed: neither admits anything, and no clock decides
-        // either.
-        if record.revoked_at_ms.is_some() || !record.is_active() {
-            return None;
+    /// Finds what one grant stands on, in whichever store holds it.
+    ///
+    /// A store this host cannot read is a grant this host cannot show, and a grant it cannot show
+    /// admits nothing.
+    fn standing(&self, grant_id: GrantId) -> Option<Standing> {
+        match self.sharing.grants().record(grant_id) {
+            Ok(Some(record)) => return Some(Standing::Stored(record)),
+            Ok(None) => {}
+            Err(_) => return None,
         }
-        // The grant's anchor in this boot, taken the first time anything asks and read back after
-        // that, so what follows reads no store. An end already on record reads as over. An
-        // expiring grant this host cannot anchor, or whose end it cannot write down, admits
-        // nothing.
-        let anchored = self.lifetimes.stored(self.sharing.grants(), &record).ok()?;
-        let grant = &record.grant;
+        self.lifetimes
+            .devices()
+            .devices()
+            .ok()?
+            .into_iter()
+            .find(|device| device.grant.grant_id == grant_id)
+            .map(Standing::Paired)
+    }
+
+    /// Reads the standing of the same grant again, once the policy's lock is held, so that what a
+    /// revocation completed while this waited for the lock is found.
+    fn still_standing(&self, standing: &Standing) -> bool {
+        match standing {
+            Standing::Stored(record) => self
+                .sharing
+                .grants()
+                .record(record.grant.grant_id)
+                .ok()
+                .flatten()
+                .is_some_and(|fresh| fresh.revoked_at_ms.is_none() && fresh.is_active()),
+            Standing::Paired(device) => self
+                .lifetimes
+                .devices()
+                .record_for_device(device.device_id)
+                .ok()
+                .flatten()
+                .is_some_and(|fresh| fresh.is_paired()),
+        }
+    }
+
+    /// The scope a grant gives its recipient now, decided as a device's own request is, on both
+    /// clocks, under the policy and the configured ceiling.
+    fn scope_of(&self, standing: &Standing) -> Option<RecipientScope> {
+        let grant = standing.grant();
+        let started_at_ms = standing.started_at_ms()?;
+        // Revoked, expired, or a proposal nobody has redeemed: neither admits anything, and no
+        // clock decides any of them.
+        let anchored = match standing {
+            Standing::Stored(record) => {
+                if record.revoked_at_ms.is_some() || !record.is_active() {
+                    return None;
+                }
+                // The grant's anchor in this boot, taken the first time anything asks and read back
+                // after that, so what follows reads no store. An end already on record reads as
+                // over. An expiring grant this host cannot anchor, or whose end it cannot write
+                // down, admits nothing.
+                self.lifetimes.stored(self.sharing.grants(), record).ok()?
+            }
+            Standing::Paired(device) => {
+                if !device.is_paired() {
+                    return None;
+                }
+                self.lifetimes.paired(device).ok()?
+            }
+        };
+        // What the configuration allows, read before the policy's lock is taken, as a device's
+        // request reads it.
+        let ceiling = self.ceiling.as_ref().and_then(|ceiling| {
+            ceiling
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
         #[cfg(test)]
         self.before_the_policy_lock.wait();
         // The policy as it stands now, decided under its lock and after every read of a store
         // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
         // a decision takes have to be those of the lease whose time it loads.
         let policy = self.policy.lock().ok()?;
+        if !self.still_standing(standing) {
+            return None;
+        }
         // Both clocks, read once the lock is held, so a bound that ran out while this waited for it
         // is found, and everything below is decided at these readings. UTC is read through this
         // host's floor, which the reading raises, so a clock wound back after this message does not
@@ -156,8 +255,16 @@ impl RecipientAuthority for GrantedRecipients {
             }
             drop(policy);
             if anchored != Anchored::Over {
-                self.lifetimes.owe_stored_expiry(grant.grant_id);
-                self.lifetimes.settle_stored(self.sharing.grants());
+                match standing {
+                    Standing::Stored(_) => {
+                        self.lifetimes.owe_stored_expiry(grant.grant_id);
+                        self.lifetimes.settle_stored(self.sharing.grants());
+                    }
+                    // Asking where a paired device's grant stands writes down an end it finds.
+                    Standing::Paired(device) => {
+                        let _ = self.lifetimes.paired_standing(device);
+                    }
+                }
             }
             return None;
         }
@@ -175,12 +282,26 @@ impl RecipientAuthority for GrantedRecipients {
         {
             return None;
         }
+        // The configured ceiling narrows the grant before the policy is applied to it, as it does
+        // for a device's request.
+        let narrowed = match &ceiling {
+            Some(ceiling) => Grant {
+                actions: grant
+                    .actions
+                    .iter()
+                    .copied()
+                    .filter(|right| ceiling.contains(right))
+                    .collect(),
+                ..grant.clone()
+            },
+            None => grant.clone(),
+        };
         // Content leaving this host for a recipient elsewhere is remote use of the grant, so it is
         // intersected the way a paired device's request is. An organisation grant answers to the
         // lease of the member its recipient device is bound to, on both clocks; a message carries
         // no account of its own that could name another.
         let effective = match policy.intersect(
-            grant,
+            &narrowed,
             &AccessRequest {
                 method: Method::SessionRead,
                 ingress: ActorIngress::PairedDevice,
@@ -213,13 +334,68 @@ impl RecipientAuthority for GrantedRecipients {
             return None;
         }
         drop(policy);
-        if !effective.rights.contains(&ActionRight::SessionView) {
+        // A grant that keeps none of the rights a notification can ask for admits nothing.
+        if ![
+            ActionRight::SessionView,
+            ActionRight::AutomationManage,
+            ActionRight::HostManage,
+        ]
+        .iter()
+        .any(|right| effective.rights.contains(right))
+        {
             return None;
         }
         Some(RecipientScope {
-            viewer: ViewerScope::from_grant(grant),
-            sessions: grant.session_selector.clone(),
+            viewer: ViewerScope::from_grant(&narrowed),
+            sessions: narrowed.session_selector.clone(),
+            rights: effective.rights,
+            grant_id: narrowed.grant_id,
+            recipient: narrowed.recipient_device_id,
+            // Earlier history is opt-in: a grant reaches what was first seen at or after its own
+            // history cursor, or at or after its own start when it has none.
+            history_from_ms: narrowed
+                .history
+                .lower_bound_ms
+                .as_ref()
+                .map_or(started_at_ms, |cursor| cursor.get()),
         })
+    }
+}
+
+impl RecipientAuthority for GrantedRecipients {
+    /// Every lapse a clock decides here is written down where it is found, before the answer, as a
+    /// paired device's and a workflow's are, so a clock wound back before a restart or a reboot
+    /// cannot bring back what was refused: the end of the grant's own bound as its tombstone; a
+    /// lapse found in UTC, the grant's own or a bound of the policy, as the floor it was found at;
+    /// and the offline bound's end on the continuous clock as the time the bound has spent. A write
+    /// that fails stays owed, and the host's next decision or its record task writes it.
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+        let standing = self.standing(rule.grant_id?)?;
+        self.scope_of(&standing)
+    }
+
+    /// The device is the one its destination is named by, and the grant its rule names is the
+    /// device's own, by the device it was issued to; a grant in the grant store that was issued to
+    /// a device is still only as good as that device's own pairing, so the device has to be
+    /// paired.
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        let device_id: DeviceId = destination.id.as_str().parse().ok()?;
+        let standing = self.standing(destination.rule.as_ref()?.grant_id?)?;
+        if standing.grant().recipient_device_id != device_id {
+            return None;
+        }
+        if matches!(standing, Standing::Stored(_))
+            && !self
+                .lifetimes
+                .devices()
+                .record_for_device(device_id)
+                .ok()
+                .flatten()
+                .is_some_and(|device| device.is_paired())
+        {
+            return None;
+        }
+        self.scope_of(&standing)
     }
 }
 

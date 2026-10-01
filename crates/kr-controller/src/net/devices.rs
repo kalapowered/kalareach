@@ -1241,13 +1241,18 @@ impl DeviceDirectory {
         Ok(changed > 0)
     }
 
-    /// Updates the notification-preview public key and key revision for a device.
+    /// Updates the notification-preview public key and key revision for a device, once `admitted`
+    /// says the write may be made.
     ///
     /// The revision only moves forward. A registration is a key and the number the device gave it,
     /// and a number that does not follow the one recorded belongs to a registration this host has
     /// already replaced: writing it would put a retired key back into service, and the same
-    /// revision is also what a connection is authenticated against. The condition is part of the
-    /// write rather than a read before it, so two registrations racing cannot both pass it.
+    /// revision is also what a connection is authenticated against. The device is read and the row
+    /// written in one transaction, so two registrations racing cannot both pass the check.
+    ///
+    /// `admitted` runs inside that transaction, once the registration is known to be a write and
+    /// immediately before it, as a declaration's does ([`Self::declare_keys`]): what it refuses with
+    /// is returned and nothing is written. A registration that writes nothing is not asked about.
     ///
     /// A repeat of the registration already recorded is not a move backwards and is not refused:
     /// an answer lost on the way to the device is resubmitted, and the store it reaches says the
@@ -1255,14 +1260,40 @@ impl DeviceDirectory {
     ///
     /// # Errors
     ///
-    /// Returns an error when the row cannot be written.
+    /// Returns an error when the row cannot be written, and whatever `admitted` fails with.
     pub fn update_preview_key(
         &self,
         device_id: DeviceId,
         preview_key: NotificationPreviewKey,
         revision: DeviceKeyRevision,
+        admitted: impl FnOnce() -> Result<()>,
     ) -> Result<PreviewKeyOutcome> {
-        let Some(record) = self.record_for_device(device_id)? else {
+        let bytes = device_id.get().as_bytes().to_vec();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Immediate, for the reason `claim_action_route` gives. Dropping it without a commit rolls
+        // back everything it wrote.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(ControllerError::registry)?;
+        let Some(record) = transaction
+            .query_row(
+                "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
+                        device_name, platform, grant, paired_at_ms, revoked_at_ms,
+                        expired_at_ms, committed_invitation_id, notification_preview,
+                        stored_envelope_key
+                 FROM network_devices WHERE device_id = ?1",
+                params![bytes],
+                |row| Ok(read_record(row)),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?
+            .transpose()?
+        else {
             return Ok(PreviewKeyOutcome::NotPaired);
         };
         if record.revoked_at_ms.is_some() {
@@ -1273,9 +1304,14 @@ impl DeviceDirectory {
         {
             return Ok(PreviewKeyOutcome::AlreadyRecorded);
         }
-        let bytes = device_id.get().as_bytes().to_vec();
-        let changed = self.with(|connection| {
-            connection.execute(
+        if record.device_key_revision >= revision {
+            return Ok(PreviewKeyOutcome::RevisionBehind(
+                record.device_key_revision,
+            ));
+        }
+        admitted()?;
+        transaction
+            .execute(
                 "UPDATE network_devices
                  SET notification_preview = ?2,
                      device_key_revision = ?3
@@ -1287,13 +1323,9 @@ impl DeviceDirectory {
                     i64::try_from(revision.get()).unwrap_or(i64::MAX),
                 ],
             )
-        })?;
-        if changed > 0 {
-            return Ok(PreviewKeyOutcome::Recorded);
-        }
-        Ok(PreviewKeyOutcome::RevisionBehind(
-            record.device_key_revision,
-        ))
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(PreviewKeyOutcome::Recorded)
     }
 }
 
