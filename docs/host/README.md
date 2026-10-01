@@ -2296,7 +2296,7 @@ The caller that performs an action always gets its state in the first answer: th
 
 Answering a question needs more than the right to answer. The worker refuses a question the caller's history does not reach, with the refusal it gives for a question it does not hold, so the refusal says nothing about the question's state or text.
 
-The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level, so a worker of an earlier build never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
+The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level, so a worker at another compatibility level never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
 
 ### What each store promises
 
