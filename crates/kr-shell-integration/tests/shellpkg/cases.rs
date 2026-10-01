@@ -2555,6 +2555,9 @@ pub enum ReadLineChange {
     Aliased,
     /// The editor imported again, which puts its own function back in front of the module.
     EditorImportedAgain,
+    /// A function defined inside the editor's own module scope, which reports the editor as the
+    /// module it belongs to and is not the editor's function.
+    InsideTheEditorsModule,
 }
 
 impl ReadLineChange {
@@ -2571,6 +2574,9 @@ impl ReadLineChange {
             }
             Self::Aliased => "Set-Alias PSConsoleHostReadLine Get-Date -Scope Global\n",
             Self::EditorImportedAgain => "Import-Module PSReadLine -Force\n",
+            Self::InsideTheEditorsModule => {
+                "& (Get-Module PSReadLine) { function global:PSConsoleHostReadLine { [Console]::ReadLine() } }\n"
+            }
         }
     }
 
@@ -2593,7 +2599,7 @@ impl ReadLineChange {
 /// function of the same name that a later profile defines takes the host's calls away from it and
 /// the reader never runs: nothing would say so, and the session would stay authenticated and not
 /// ready. The entry at the end of the last profile asks the module whether its own function is still
-/// the one the host calls. What decides is whose function it is, not what its text says: a
+/// the one the host calls. What decides is whether it is the editor's own function, not what its text or its module's name says: a
 /// function that replaces the entry point, one that wraps the one before it, one that calls the
 /// editor directly and an alias are all the host's reader being somebody else's rather than the
 /// editor the package was qualified against, and each is refused by the name the integration loss
@@ -2610,6 +2616,7 @@ pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kin
         ReadLineChange::Wrapped,
         ReadLineChange::CallsTheEditor,
         ReadLineChange::Aliased,
+        ReadLineChange::InsideTheEditorsModule,
     ] {
         let mut session = Session::start_with_profile(
             &package,

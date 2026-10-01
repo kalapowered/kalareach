@@ -32,6 +32,7 @@ $script:Hooks = @{
     GestureBefore      = $null
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
+    Wrapper            = $null
     ReadLineInstalled  = $false
 }
 
@@ -411,21 +412,24 @@ function Install-KrReadLineWrapper {
         Invoke-KalaReachReadLine -LastStatus $?
     }
     Set-Item -Path function:global:PSConsoleHostReadLine -Value $wrapper
+    $script:Hooks.Wrapper = $wrapper
     $script:Hooks.ReadLineInstalled = $true
 }
 
-# The module a read-line function was defined in, which says whose reader it is.
+# Whether a script block is the editor's own read-line function, by identity.
 #
-# A function a person wrote in a profile belongs to no module, one a tool added belongs to the tool's
-# module, and the editor's own belongs to PSReadLine. What a function's text says decides nothing: a
-# wrapper that calls the editor directly has the editor's call in its text and is somebody else's
-# reader all the same. Anything that is not a function, such as an alias, is named by what it is.
-function Get-KrReadLineOwner {
-    param($Command)
-    if ($null -eq $Command) { return '' }
-    if ($Command.CommandType -ne 'Function') { return "$($Command.CommandType)" }
-    $module = $Command.ScriptBlock.Module
-    if ($null -eq $module) { '' } else { "$($module.Name)" }
+# A function's text decides nothing, and neither does the name of the module it lives in: a wrapper
+# that calls the editor directly has the editor's call in its text, and a function made inside the
+# editor's own module scope reports the editor as its module. The editor's function is the one
+# its module exports, so a script block is that function only when it is that very object. The
+# editor imported again exports a new one, and it is that one that is compared with.
+function Test-KrEditorsReadLine {
+    param($ScriptBlock)
+    if ($null -eq $ScriptBlock) { return $false }
+    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
+    if ($null -eq $module) { return $false }
+    $editor = $module.ExportedFunctions['PSConsoleHostReadLine']
+    $null -ne $editor -and [object]::ReferenceEquals($ScriptBlock, $editor.ScriptBlock)
 }
 
 # The command the host runs under the read-line entry point's name, which an alias takes before a
@@ -441,8 +445,7 @@ function Get-KrReadLineCommand {
 function Test-KrInnerReadLine {
     $inner = $script:Hooks.InnerReadLine
     if ($null -eq $inner) { return $true }
-    $module = $inner.Module
-    $null -ne $module -and "$($module.Name)" -ceq 'PSReadLine'
+    Test-KrEditorsReadLine $inner
 }
 
 # ---- the user-facing hooks, after the profile has run -----------------------------------------------
@@ -467,29 +470,32 @@ function Confirm-KalaReachReadLine {
     profile so that the bridge is open before anything the person wrote can ask a question. A
     function of the same name that a later profile defines takes the host's calls away from the
     module, and the reader would never run: the session would stay authenticated and not ready with
-    nothing to say why. What decides is whose function the host would call: a function that replaces
-    the entry point, one that wraps the function it replaced, one that calls the editor directly and
-    an alias are all the host's reader being somebody else's rather than the editor the package was
-    qualified against, and each is refused by name. The editor imported again puts its own function
-    back, which is the qualified reader, so the module goes back in front of it.
+    nothing to say why. What decides is whether the command the host would call is this module's own
+    function or the editor's own, by identity: a function that replaces the entry point, one that
+    wraps the function it replaced, one that calls the editor directly, one made inside the editor's
+    module scope and an alias are all the host's reader being somebody else's rather than the editor
+    the package was qualified against, and each is refused by name. The editor imported again puts its
+    own function back, which is the qualified reader, so the module goes back in front of it.
     #>
     [CmdletBinding()]
     param()
 
     if (-not $script:Kr.Registered -or $script:Hooks.Activated) { return }
     if (-not $script:Hooks.ReadLineInstalled) { return }
-    switch (Get-KrReadLineOwner (Get-KrReadLineCommand)) {
-        'KalaReach.ShellBridge' { return }
-        'PSReadLine' {
-            # The editor imported again put its own function back in front of this module. That is
-            # the qualified reader, so the module goes back in front of it.
-            Install-KrReadLineWrapper
-            return
-        }
-        default {
-            Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
-        }
+    $current = Get-KrReadLineCommand
+    $scriptBlock = if ($null -ne $current -and $current.CommandType -eq 'Function') {
+        $current.ScriptBlock
+    } else { $null }
+    if ($null -ne $scriptBlock -and [object]::ReferenceEquals($scriptBlock, $script:Hooks.Wrapper)) {
+        return
     }
+    if (Test-KrEditorsReadLine $scriptBlock) {
+        # The editor imported again put its own function back in front of this module. That is the
+        # qualified reader, so the module goes back in front of it.
+        Install-KrReadLineWrapper
+        return
+    }
+    Stop-KrActivation 'reader_replaced' 'another read-line entry point is installed'
 }
 
 function Enable-KalaReachHooks {
@@ -534,7 +540,7 @@ function Enable-KalaReachHooks {
 
     if (-not $gesture.Ok) {
         # An explicitly incompatible binding is diagnosed rather than silently replaced.
-        Send-KrIntegrationLost 'post_startup_failure' $gesture.Detail
+        Send-KrIntegrationLost 'post_startup_failure' "$($gesture.Reason): $($gesture.Detail)"
         Write-KrDiagnostic $gesture.Reason $gesture.Detail
     }
     $script:Hooks.Wrapped = $installed
@@ -719,7 +725,7 @@ function Sync-KrGestureHandler {
     if ($null -eq $wanted) { return }
     $gesture = Install-KrGestureHandler
     if (-not $gesture.Ok) {
-        Send-KrIntegrationLost 'post_startup_failure' $gesture.Detail
+        Send-KrIntegrationLost 'post_startup_failure' "$($gesture.Reason): $($gesture.Detail)"
         Write-KrDiagnostic $gesture.Reason $gesture.Detail
     }
 }

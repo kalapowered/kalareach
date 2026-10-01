@@ -426,6 +426,20 @@ fn the_module_goes_in_front_of_the_editors_own_read_line_and_of_nothing_else() {
     let reads_another_way =
         in_front_of("function global:PSConsoleHostReadLine { [Console]::ReadLine() }");
     assert_eq!(said(&reads_another_way, "inner"), "False");
+    // A function made inside the editor's own module scope reports the editor as its module, so
+    // the module's name is no proof it is the editor's function.
+    let inside = in_front_of(
+        "& (Get-Module PSReadLine) { function global:PSConsoleHostReadLine { [Console]::ReadLine() } }",
+    );
+    assert_eq!(
+        said(&inside, "inner"),
+        "False",
+        "a function that only lives in the editor's module is not the editor's reader:\n{inside}"
+    );
+    // The editor imported again is the editor's own function, which is what the module compares
+    // with and not with what it saw first.
+    let again = in_front_of("Import-Module PSReadLine -Force");
+    assert_eq!(said(&again, "inner"), "True");
 }
 
 /// KR-REQ-07.85, KR-REQ-26.11
