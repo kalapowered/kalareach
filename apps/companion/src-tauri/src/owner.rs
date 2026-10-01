@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, Listed, OwnerConfirmations, ReviewOutcome, SessionChannel,
-    Subject, reason, shows_value,
+    Subject, is_plain_text, reason, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
+use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
 use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
@@ -63,10 +64,31 @@ pub struct RequestView {
     pub detail: Option<String>,
     /// The value both devices show, grouped, for a device being added.
     pub value: Option<String>,
+    /// What the request names beyond the sentence, one fact to a line, exactly as the host
+    /// described it and as the confirmation covers it.
+    pub facts: Vec<Fact>,
+    /// What this host says in its own words about what the request would place, where it would
+    /// place code that runs outside the plugin sandbox.
+    pub notice: Option<String>,
+    /// What the publisher says in its own words about what the release does. The page quotes it
+    /// apart from the host's own words, so it is never read as the host's.
+    pub statement: Option<String>,
     /// When the host stops accepting an answer.
     pub expires_at_ms: u64,
     /// False when it cannot be checked, so it cannot be confirmed here.
     pub checkable: bool,
+}
+
+/// One fact a request names: what it is, and its exact value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Fact {
+    /// What the value is, in a few words.
+    pub label: String,
+    /// The value, as the confirmation covers it.
+    pub value: String,
+    /// True for a value read character by character, an address, a hash or a list of identifiers,
+    /// which the page sets in a monospace face and breaks anywhere; false for words.
+    pub code: bool,
 }
 
 /// What the page sends to review one request: its reference, and nothing else.
@@ -353,6 +375,9 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         title: title.to_owned(),
         detail: None,
         value: None,
+        facts: Vec::new(),
+        notice: None,
+        statement: None,
         expires_at_ms,
         checkable: false,
     };
@@ -363,6 +388,8 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         Subject::IssueInvitation { .. } => "Issue an invitation",
         Subject::ConfirmDevice { .. } => "Add a device",
         Subject::EstablishClock => "Trust this host's clock again",
+        Subject::CatalogueAdd(_) => "Trust a plugin repository",
+        Subject::PluginInstall(_) => "Install a plugin",
         Subject::Described(described) => match described.action {
             SensitiveAction::EnlargeGrant => "Widen what devices may do",
             SensitiveAction::TrustRepositoryRoot => "Trust a plugin repository",
@@ -373,6 +400,11 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         },
     };
     let Ok(line) = reason(subject, host_name, now_ms) else {
+        return unchecked(title);
+    };
+    // What a request names beyond its sentence is shown as the host wrote it or not at all: text
+    // this page could not show exactly makes the request one that is not confirmed here.
+    let Some(particulars) = particulars(subject) else {
         return unchecked(title);
     };
     let value = match subject {
@@ -393,9 +425,216 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         title: title.to_owned(),
         detail: Some(sentence(line)),
         value,
+        facts: particulars.facts,
+        notice: particulars.notice,
+        statement: particulars.statement,
         expires_at_ms,
         checkable: true,
     }
+}
+
+/// What a request names beyond the sentence the platform's dialog says.
+struct Particulars {
+    facts: Vec<Fact>,
+    notice: Option<String>,
+    statement: Option<String>,
+}
+
+/// The facts, the host's notice and the publisher's statement for an enrolment or an installation,
+/// and nothing for any other request. `None` when a word the host or the publisher wrote could
+/// not be shown exactly as it was written.
+fn particulars(subject: &Subject) -> Option<Particulars> {
+    match subject {
+        Subject::CatalogueAdd(plan) => Some(Particulars {
+            facts: enrolment_facts(plan)?,
+            notice: None,
+            statement: None,
+        }),
+        Subject::PluginInstall(plan) => {
+            let bridge = plan.grant_statement.is_some()
+                || plan.grant.contains(&"native_bridge.install".to_owned());
+            Some(Particulars {
+                facts: installation_facts(plan)?,
+                notice: bridge.then(|| NATIVE_BRIDGE_NOTICE.to_owned()),
+                statement: match &plan.grant_statement {
+                    Some(words) => Some(plain(words, STATEMENT_CHARS)?),
+                    None => None,
+                },
+            })
+        }
+        _ => Some(Particulars {
+            facts: Vec::new(),
+            notice: None,
+            statement: None,
+        }),
+    }
+}
+
+/// The longest publisher statement a manifest may carry, and so the longest this page shows whole.
+const STATEMENT_CHARS: usize = 1000;
+
+/// The longest address, name or identifier this page shows whole.
+const FIELD_CHARS: usize = 2048;
+
+/// `text` as written when it is one plain line of at most `limit` characters, and `None` otherwise.
+fn plain(text: &str, limit: usize) -> Option<String> {
+    (!text.is_empty() && text.chars().count() <= limit && is_plain_text(text))
+        .then(|| text.to_owned())
+}
+
+/// A list of names, in the order the host sent them, as one line.
+fn names(list: impl IntoIterator<Item = impl AsRef<str>>) -> Option<String> {
+    let mut words = Vec::new();
+    for word in list {
+        words.push(plain(word.as_ref(), FIELD_CHARS)?);
+    }
+    Some(words.join(", "))
+}
+
+/// A hash as eight groups of eight characters, which a person reads and compares by group.
+fn grouped(hash: &str) -> Option<String> {
+    let hash = plain(hash, FIELD_CHARS)?;
+    Some(
+        hash.as_bytes()
+            .chunks(8)
+            .map(|group| String::from_utf8_lossy(group).into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// A fact whose value is words.
+fn words(label: &str, value: String) -> Fact {
+    Fact {
+        label: label.to_owned(),
+        value,
+        code: false,
+    }
+}
+
+/// A fact whose value is read character by character.
+fn exact(label: &str, value: String) -> Fact {
+    Fact {
+        label: label.to_owned(),
+        value,
+        code: true,
+    }
+}
+
+/// A count with its thousands separated.
+fn count(number: u64) -> String {
+    let digits = number.to_string();
+    let mut grouped = String::new();
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// A size in the largest binary unit that holds it exactly, and in bytes where none does.
+fn size(bytes: u64) -> String {
+    for (unit, name) in [(1u64 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")] {
+        if bytes >= unit && bytes.is_multiple_of(unit) {
+            return format!("{} {name}", bytes / unit);
+        }
+    }
+    format!("{} bytes", count(bytes))
+}
+
+fn enrolment_facts(plan: &CatalogueTrustPlan) -> Option<Vec<Fact>> {
+    use kr_protocol::catalogue::CatalogueKind;
+    let kind = match plan.kind {
+        CatalogueKind::Official => "The official repository",
+        CatalogueKind::Vendor => "A vendor's repository",
+        CatalogueKind::Community => "A community repository",
+        CatalogueKind::Local => "A folder on the host",
+        CatalogueKind::Mirror => "A mirror of another repository",
+    };
+    let budgets = &plan.budgets;
+    let beyond = if plan.ceiling.is_empty() {
+        "Nothing".to_owned()
+    } else {
+        names(plan.ceiling.iter())?
+    };
+    Some(vec![
+        words("Name", plain(&plan.catalogue_id, FIELD_CHARS)?),
+        words("Kind", kind.to_owned()),
+        exact("Metadata at", plain(&plan.metadata_url, FIELD_CHARS)?),
+        exact("Targets at", plain(&plan.targets_url, FIELD_CHARS)?),
+        exact("Root", grouped(&plan.root_digest)?),
+        exact("Root keys", names(plan.root_key_ids.iter())?),
+        Fact {
+            label: "Beyond the default".to_owned(),
+            value: beyond,
+            code: !plan.ceiling.is_empty(),
+        },
+        words(
+            "Metadata",
+            format!(
+                "Up to {} and {} entries",
+                size(budgets.metadata_bytes.get()),
+                count(budgets.metadata_entries.get())
+            ),
+        ),
+        words(
+            "Metadata kept",
+            format!(
+                "{} generation{}, up to {}",
+                count(budgets.retained_generations.get()),
+                if budgets.retained_generations.get() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                size(budgets.retained_metadata_bytes.get())
+            ),
+        ),
+        words(
+            "Package cache",
+            format!("Up to {}", size(budgets.payload_cache_bytes.get())),
+        ),
+        words(
+            "Offline copy",
+            if budgets.full_offline_mirror {
+                "The whole generation is kept".to_owned()
+            } else {
+                "Not kept".to_owned()
+            },
+        ),
+    ])
+}
+
+fn installation_facts(plan: &PluginInstallPlan) -> Option<Vec<Fact>> {
+    let granted = if plan.grant.is_empty() {
+        "Nothing beyond what the repository allows".to_owned()
+    } else {
+        names(plan.grant.iter())?
+    };
+    Some(vec![
+        exact(
+            "Plugin",
+            format!(
+                "{} {}",
+                plain(plan.plugin_id.as_str(), FIELD_CHARS)?,
+                plain(&plan.version, FIELD_CHARS)?
+            ),
+        ),
+        words("From", plain(&plan.catalogue_id, FIELD_CHARS)?),
+        exact("Package hash", grouped(&plan.package_digest)?),
+        Fact {
+            label: "Granted".to_owned(),
+            value: granted,
+            code: !plan.grant.is_empty(),
+        },
+        if plan.ceiling.is_empty() {
+            words("Allowed by the repository", "Nothing".to_owned())
+        } else {
+            exact("Allowed by the repository", names(plan.ceiling.iter())?)
+        },
+    ])
 }
 
 /// The title of a request that could not be checked.
@@ -420,9 +659,10 @@ fn sentence(line: &str) -> String {
 mod tests {
     use super::*;
     use kr_crypto::keys::DeviceKeys;
+    use kr_protocol::confirmation::{CatalogueTrustPlan, PluginInstallPlan};
     use kr_protocol::invitation::PairCandidateView;
     use kr_protocol::pairing::{DeviceName, DevicePlatform, OwnerConfirmationRequest};
-    use kr_protocol::scalars::{Digest256, Nonce256, Nullable, TimestampMs, Uuid};
+    use kr_protocol::scalars::{CanonicalSet, Digest256, Nonce256, Nullable, TimestampMs, Uuid};
 
     const NOW: u64 = 1_790_000_000_000;
 
@@ -479,5 +719,302 @@ mod tests {
                 .ends_with("It shows f3c1 46fd."),
             "the dialog's line keeps the value"
         );
+    }
+
+    /// A request for `subject` as a host this computer owns lists it.
+    fn listed_subject(subject: Subject, action: SensitiveAction) -> Listed {
+        let mut listed = a_device_being_added();
+        listed.request.action = action;
+        listed.request.destination_keys = Nullable::null();
+        listed.request.destination_rights = CanonicalSet::new();
+        listed.subject = Ok(subject);
+        listed
+    }
+
+    fn enrolment() -> CatalogueTrustPlan {
+        use kr_protocol::catalogue::{CatalogueAddParams, CatalogueBudgets, CatalogueKind};
+        use kr_protocol::scalars::U64;
+        CatalogueTrustPlan::of_request(
+            &CatalogueAddParams {
+                environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16])),
+                catalogue_id: "community".to_owned(),
+                kind: CatalogueKind::Community,
+                metadata_url: "https://repo.example/metadata/".to_owned(),
+                targets_url: "https://repo.example/targets/".to_owned(),
+                root: "cm9vdA==".to_owned(),
+                budgets: CatalogueBudgets {
+                    metadata_bytes: U64::new(67_108_864),
+                    metadata_entries: U64::new(100_000),
+                    retained_generations: U64::new(2),
+                    retained_metadata_bytes: U64::new(268_435_456),
+                    payload_cache_bytes: U64::new(2_147_483_648),
+                    full_offline_mirror: false,
+                },
+                ceiling: vec!["terminal.stream".to_owned()],
+                owner_confirmation: Nullable::null(),
+            },
+            "1a2b3c4d".repeat(8),
+            ["key-one".to_owned(), "key-two".to_owned()]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    const PUBLISHER: &str =
+        "Adds one registration file in Claude Code's directory, which Claude Code starts.";
+
+    fn installation() -> PluginInstallPlan {
+        PluginInstallPlan {
+            environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            catalogue_id: "community".to_owned(),
+            ceiling: ["metadata.match".to_owned()].into_iter().collect(),
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+                .expect("a plugin identifier"),
+            version: "0.3.0".to_owned(),
+            package_digest: "e5f60718".repeat(8),
+            grant: [
+                "approval.respond".to_owned(),
+                "native_bridge.install".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            grant_statement: Some(PUBLISHER.to_owned()),
+        }
+    }
+
+    fn fact(label: &str, value: &str, code: bool) -> Fact {
+        Fact {
+            label: label.to_owned(),
+            value: value.to_owned(),
+            code,
+        }
+    }
+
+    /// KR-REQ-11.42: a repository whose root an owner is asked to trust is listed with the sentence
+    /// the platform's dialog will say and, one fact to a line, everything the confirmation covers:
+    /// where its metadata and targets are, its whole root and the keys it names, its limits and
+    /// what its packages may hold. Nothing else is placed beside it.
+    #[test]
+    fn an_enrolment_is_listed_with_everything_its_confirmation_covers() {
+        let listed = listed_subject(
+            Subject::CatalogueAdd(enrolment()),
+            SensitiveAction::TrustRepositoryRoot,
+        );
+        let view = describe("a reference", "studio", &listed, NOW);
+        assert!(view.checkable);
+        assert_eq!(view.title, "Trust a plugin repository");
+        assert_eq!(
+            view.detail.as_deref(),
+            Some(
+                "Trust the plugin repository community on studio, served from repo.example: its \
+                 root starts 1a2b 3c4d, and its packages may hold 1 capability beyond the \
+                 default."
+            )
+        );
+        let group = "1a2b3c4d";
+        let root = [group; 8].join(" ");
+        assert_eq!(
+            view.facts,
+            vec![
+                fact("Name", "community", false),
+                fact("Kind", "A community repository", false),
+                fact("Metadata at", "https://repo.example/metadata/", true),
+                fact("Targets at", "https://repo.example/targets/", true),
+                fact("Root", &root, true),
+                fact("Root keys", "key-one, key-two", true),
+                fact("Beyond the default", "terminal.stream", true),
+                fact("Metadata", "Up to 64 MiB and 100,000 entries", false),
+                fact("Metadata kept", "2 generations, up to 256 MiB", false),
+                fact("Package cache", "Up to 2 GiB", false),
+                fact("Offline copy", "Not kept", false),
+            ]
+        );
+        assert_eq!(view.notice, None);
+        assert_eq!(view.statement, None);
+        assert_eq!(view.value, None);
+    }
+
+    /// KR-REQ-11.42: an installation of a release with a native bridge carries the host's own
+    /// notice, that the bridge runs in the application's directory with its permissions outside
+    /// the plugin sandbox, and the publisher's statement apart from it: the two are never one
+    /// text. The controls are an installation with no bridge, which has neither, and a repository
+    /// that names no capability beyond the default.
+    #[test]
+    fn an_installation_with_a_native_bridge_shows_the_hosts_notice_apart_from_the_publishers_words()
+    {
+        let listed = listed_subject(
+            Subject::PluginInstall(installation()),
+            SensitiveAction::GrantExecutableCapability,
+        );
+        let view = describe("a reference", "studio", &listed, NOW);
+        assert!(view.checkable);
+        assert_eq!(view.title, "Install a plugin");
+        assert_eq!(
+            view.facts,
+            vec![
+                fact("Plugin", "kalareach/claude-code 0.3.0", true),
+                fact("From", "community", false),
+                fact("Package hash", &["e5f60718"; 8].join(" "), true),
+                fact("Granted", "approval.respond, native_bridge.install", true),
+                fact("Allowed by the repository", "metadata.match", true),
+            ]
+        );
+        assert_eq!(
+            view.notice.as_deref(),
+            Some(kr_protocol::confirmation::NATIVE_BRIDGE_NOTICE)
+        );
+        assert_eq!(view.statement.as_deref(), Some(PUBLISHER));
+        assert!(
+            !view
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains(PUBLISHER),
+            "the host's words never carry the publisher's"
+        );
+        assert!(
+            view.detail.as_deref().is_some_and(
+                |line| line.contains("a native bridge that runs outside the plugin sandbox")
+            ),
+            "{:?}",
+            view.detail
+        );
+
+        let plain = PluginInstallPlan {
+            grant: CanonicalSet::new(),
+            grant_statement: None,
+            ..installation()
+        };
+        let view = describe(
+            "a reference",
+            "studio",
+            &listed_subject(
+                Subject::PluginInstall(plain),
+                SensitiveAction::GrantExecutableCapability,
+            ),
+            NOW,
+        );
+        assert_eq!(view.notice, None);
+        assert_eq!(view.statement, None);
+        assert!(
+            view.facts.contains(&fact(
+                "Granted",
+                "Nothing beyond what the repository allows",
+                false
+            )),
+            "{:?}",
+            view.facts
+        );
+    }
+
+    /// KR-REQ-11.42: what a host or a publisher wrote is shown as it was written or not at all. A
+    /// statement, a name or an address with a line break, a control character or a character that
+    /// reorders text makes the request one this computer cannot check, so it cannot be confirmed
+    /// here, and no part of it is placed on the page. The control is the same request without it.
+    #[test]
+    fn text_that_cannot_be_shown_as_written_makes_a_request_one_that_cannot_be_checked() {
+        for bad in [
+            "two\nlines",
+            "reordered \u{202E}text",
+            "tab\there",
+            "bell\u{7}",
+            "zero\u{200B}width",
+        ] {
+            let hostile_statement = PluginInstallPlan {
+                grant_statement: Some(bad.to_owned()),
+                ..installation()
+            };
+            let view = describe(
+                "a reference",
+                "studio",
+                &listed_subject(
+                    Subject::PluginInstall(hostile_statement),
+                    SensitiveAction::GrantExecutableCapability,
+                ),
+                NOW,
+            );
+            assert!(!view.checkable, "{bad:?}");
+            assert!(view.facts.is_empty() && view.statement.is_none() && view.notice.is_none());
+            let hostile_name = CatalogueTrustPlan {
+                catalogue_id: bad.to_owned(),
+                ..enrolment()
+            };
+            let view = describe(
+                "a reference",
+                "studio",
+                &listed_subject(
+                    Subject::CatalogueAdd(hostile_name),
+                    SensitiveAction::TrustRepositoryRoot,
+                ),
+                NOW,
+            );
+            assert!(!view.checkable, "{bad:?}");
+            assert!(view.facts.is_empty());
+        }
+        let ordinary = describe(
+            "a reference",
+            "studio",
+            &listed_subject(
+                Subject::PluginInstall(installation()),
+                SensitiveAction::GrantExecutableCapability,
+            ),
+            NOW,
+        );
+        assert!(ordinary.checkable);
+    }
+
+    /// A count of one is worded as one, and a repository that allows nothing by itself says so
+    /// rather than leaving a line empty.
+    #[test]
+    fn a_single_generation_and_an_empty_allowance_are_worded_as_they_are() {
+        let mut one = enrolment();
+        one.budgets.retained_generations = kr_protocol::scalars::U64::new(1);
+        one.budgets.retained_metadata_bytes = kr_protocol::scalars::U64::new(1_500_000);
+        let view = describe(
+            "a reference",
+            "studio",
+            &listed_subject(
+                Subject::CatalogueAdd(one),
+                SensitiveAction::TrustRepositoryRoot,
+            ),
+            NOW,
+        );
+        assert!(
+            view.facts.contains(&fact(
+                "Metadata kept",
+                "1 generation, up to 1,500,000 bytes",
+                false
+            )),
+            "{:?}",
+            view.facts
+        );
+        let nothing = PluginInstallPlan {
+            ceiling: CanonicalSet::new(),
+            ..installation()
+        };
+        let view = describe(
+            "a reference",
+            "studio",
+            &listed_subject(
+                Subject::PluginInstall(nothing),
+                SensitiveAction::GrantExecutableCapability,
+            ),
+            NOW,
+        );
+        assert!(
+            view.facts
+                .contains(&fact("Allowed by the repository", "Nothing", false)),
+            "{:?}",
+            view.facts
+        );
+    }
+
+    /// A request that names nothing beyond its sentence, a device being added, has no facts, no
+    /// notice and no statement.
+    #[test]
+    fn a_device_being_added_carries_no_facts_notice_or_statement() {
+        let view = describe("a reference", "studio", &a_device_being_added(), NOW);
+        assert!(view.facts.is_empty());
+        assert_eq!((view.notice, view.statement), (None, None));
     }
 }

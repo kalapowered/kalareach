@@ -7,6 +7,11 @@
  * request: the platform's dialog then asks the person, and nothing here can answer it. A computer
  * with no ceremony says where to confirm instead, and a request that could not be checked says so
  * and offers nothing to press.
+ *
+ * A request for a repository's root or an installation lists everything the confirmation covers
+ * under its sentence. What this host says of a native bridge and what the publisher says of the
+ * release are two texts: the host's notice comes first, and the publisher's words follow it, quoted
+ * and named, so one is never read as the other.
  */
 
 import {
@@ -240,6 +245,27 @@ export function Confirmations(): ReactNode {
                 <span className="small muted"> · {request.host_name}</span>
               </p>
               {request.detail !== null ? <p className="small">{request.detail}</p> : null}
+              {request.facts.length > 0 ? (
+                <dl className="confirmation-facts small" data-testid="confirmation-facts">
+                  {request.facts.map((fact) => (
+                    <div className="confirmation-fact" key={fact.label}>
+                      <dt className="muted">{fact.label}</dt>
+                      <dd data-code={fact.code ? 'true' : undefined}>{fact.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : null}
+              {request.notice !== null ? (
+                <p className="small warning-text confirmation-notice" data-testid="confirmation-notice">
+                  {request.notice}
+                </p>
+              ) : null}
+              {request.statement !== null ? (
+                <figure className="confirmation-statement" data-testid="confirmation-statement">
+                  <figcaption className="small muted">The publisher says</figcaption>
+                  <blockquote className="small">{request.statement}</blockquote>
+                </figure>
+              ) : null}
               {request.value !== null ? (
                 <p className="small" data-testid="confirmation-value">
                   It should show <SpelledValue value={request.value} />.
