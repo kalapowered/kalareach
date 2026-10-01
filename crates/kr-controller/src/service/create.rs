@@ -283,6 +283,29 @@ impl Controller {
             return Err(error.into());
         }
 
+        // The session owes its cleanup from the moment its worker is asked for, if privacy mode is
+        // on, and the worker is told the privacy state in its launch specification: the obligation
+        // is on the disk before anything is started, so turning privacy mode off waits for the
+        // session from here. This waits for everything that holds the privacy record, a change of
+        // privacy mode among it, which can be for as long as that change waits for the deliveries
+        // on the wire. So it comes before the critical section below, whose deadline and
+        // registration are read as the last thing before the launch and must not be read before a
+        // wait; and it holds neither the registry nor the pending map. A launch refused here
+        // started nothing and has recorded nothing owed.
+        let privacy = Arc::clone(&self.privacy);
+        let session_id = reservation.session_id;
+        let noted = tokio::task::spawn_blocking(move || {
+            privacy.note_session_launching(session_id, kr_ipc::now_ms())
+        })
+        .await;
+        if let Err(error) = noted
+            .map_err(|error| ControllerError::supervision(error.to_string()))
+            .and_then(|noted| noted)
+        {
+            self.resolve_failed(reservation.reservation_id).await?;
+            return Err(error);
+        }
+
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
         // launcher returns, and a reservation still recorded as merely reserved would fence its own
