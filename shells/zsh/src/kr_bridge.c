@@ -48,16 +48,15 @@
 
 #ifdef __APPLE__
 #include <libproc.h>
-#include <libkern/OSByteOrder.h>
-#include <mach-o/fat.h>
+#include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
-#include <mach/machine.h>
 #include <sys/proc_info.h>
 #endif
 
 #ifdef __linux__
 #include <elf.h>
+#include <link.h>
 #endif
 
 #define KR_ENDPOINT_VARIABLE "KR_SHELL_BRIDGE"
@@ -859,23 +858,26 @@ kr_open_answer(kr_cbor_writer *writer, unsigned long long id, const char *name)
  * since renamed. The shell loads modules lazily, so such a module loads without complaint and
  * fails at the first call that needs the missing name, which is a shell that ends in the middle of
  * a command. The handshake is made when the editor is set up, which can be before a startup file has
- * run, so it may not see a module a startup file loads. When the user-facing hooks are reported live, which is after the person's
- * startup files, this reads the imports of every dynamic module the shell holds that did not come
- * with the package, and the report says for each whether every name it imports is provided.
+ * run, so it may not see a module a startup file loads. When the user-facing hooks are reported
+ * live, which is after the person's startup files, this reads the imports of every dynamic module
+ * the shell holds that did not come with the package, and the report says for each whether every
+ * name it imports is provided.
  *
- * What is read is a module's undefined symbols, and what is asked is whether the running shell, the
- * modules already loaded, the module's own libraries or a module of the package that has not been
- * loaded yet provides each of them. A module built against another layout of the same names, one
- * that binds every symbol it imports, is not told apart from one built against this reader. An
- * inspection that cannot be made whole is reported as such and never as a module that binds.
+ * What is judged is the image the loader mapped, never a file opened again by its name: the name
+ * can be replaced or removed after the module loaded, and the file then found is not the code the
+ * shell runs. The module's undefined symbols are read from the tables the loader itself bound it
+ * with, which are in memory already, so nothing is opened, read or waited for. What is asked is
+ * whether the running shell, the modules already loaded, the module's own libraries or a module of
+ * the package that has not been loaded yet provides each name; a name that carries a symbol
+ * version is asked for under that version, in the module's own libraries. A module built against
+ * another layout of the same names, one that binds every symbol it imports, is not told apart from
+ * one built against this reader. An inspection that cannot be
+ * made whole is reported as such and never as a module that binds.
  *
- * The cost is bounded by what the person loaded: one read of each such module's file, at most
- * KR_MODULE_FILE_MAX bytes, and one lookup per undefined name. Nothing here waits on anything that
- * is not a regular file, and nothing runs when the person loaded no module of their own.
+ * The cost is bounded by what the person loaded: one walk of each such module's symbol table and
+ * one lookup per undefined name, and, for a name no loaded image provides, one pass over the
+ * package's own modules. Nothing runs when the person loaded no module of their own.
  */
-
-/* The most a module file may be for this to read it. */
-#define KR_MODULE_FILE_MAX (64u * 1024u * 1024u)
 
 typedef enum { KR_IMPORTS_BOUND, KR_IMPORTS_MISSING, KR_IMPORTS_NOT_READ } kr_imports_state;
 
@@ -894,7 +896,8 @@ typedef struct {
     char detail[256];
 } kr_scan;
 
-/* Where the package's own modules are, once known: the directory that holds `zsh/zle.so`. */
+/* Where the package's own modules are, once known: the directory under the running executable's
+ * own prefix that the shell's module path names, or empty when the executable is not in one. */
 static char kr_package_modules[PATH_MAX];
 
 int (*kr_loaded_modules_hook)(kr_loaded_module **out, size_t *count) = NULL;
@@ -983,6 +986,14 @@ kr_package_module_exports(const char *directory, const char *name, int depth)
     return found;
 }
 
+/* Whether `handle`'s lookup finds `name`: a symbol whose value is zero is still one that exists. */
+static int
+kr_provides(void *handle, const char *name)
+{
+    (void)dlerror();
+    return dlsym(handle, name) != NULL || dlerror() == NULL;
+}
+
 /* Records `name` when nothing that can provide it does. */
 static void
 kr_check_import(const char *name, kr_scan *scan)
@@ -991,7 +1002,7 @@ kr_check_import(const char *name, kr_scan *scan)
         return;
     }
     /* The shell and what it has loaded, then the module's own dependencies. */
-    if (dlsym(RTLD_DEFAULT, name) != NULL || dlsym(scan->handle, name) != NULL) {
+    if (kr_provides(RTLD_DEFAULT, name) || kr_provides(scan->handle, name)) {
         return;
     }
     if (kr_package_modules[0] != '\0' && kr_package_module_exports(kr_package_modules, name, 0)) {
@@ -1004,73 +1015,94 @@ kr_check_import(const char *name, kr_scan *scan)
 
 #ifdef __APPLE__
 
-/* The undefined names of one thin 64-bit Mach-O image. */
+/*
+ * The undefined names of the Mach-O image the loader mapped at `header`. The symbol and string
+ * tables are in the image's __LINKEDIT segment, which is mapped with it: a file offset in the
+ * load commands is an address there, relative to where the segment's file offset puts it.
+ */
 static void
-kr_macho_imports(const unsigned char *image, size_t size, kr_scan *scan)
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
 {
-    struct mach_header_64 header;
-    struct symtab_command symtab;
-    struct dysymtab_command dysymtab;
-    size_t offset = sizeof(header);
-    int have_symtab = 0;
-    int have_dysymtab = 0;
+    const struct mach_header_64 *image = header;
+    const unsigned char *cursor;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct segment_command_64 *text = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const unsigned char *base;
     uint32_t command;
+    uint32_t used = 0;
     uint32_t index;
 
-    if (size < sizeof(header)) {
-        kr_scan_not_read(scan, "its file is too short to be a module");
+    (void)handle;
+    if (image == NULL) {
+        kr_scan_not_read(scan, "the loader does not say where it mapped it");
         return;
     }
-    memcpy(&header, image, sizeof(header));
-    if (header.magic != MH_MAGIC_64) {
+    if (image->magic != MH_MAGIC_64) {
         kr_scan_not_read(scan, "its format is not one this reads");
         return;
     }
-    for (command = 0; command < header.ncmds; command++) {
-        struct load_command load;
+    cursor = (const unsigned char *)(image + 1);
+    for (command = 0; command < image->ncmds; command++) {
+        const struct load_command *load = (const struct load_command *)cursor;
 
-        if (size - offset < sizeof(load)) {
-            kr_scan_not_read(scan, "its load commands run past its file");
+        if (image->sizeofcmds < sizeof(*load) ||
+            used > image->sizeofcmds - sizeof(*load) || load->cmdsize < sizeof(*load) ||
+            load->cmdsize > image->sizeofcmds - used) {
+            kr_scan_not_read(scan, "its load commands run past their size");
             return;
         }
-        memcpy(&load, image + offset, sizeof(load));
-        if (load.cmdsize < sizeof(load) || load.cmdsize > size - offset) {
-            kr_scan_not_read(scan, "its load commands run past its file");
-            return;
+        if (load->cmd == LC_SEGMENT_64 && load->cmdsize >= sizeof(*text)) {
+            const struct segment_command_64 *segment = (const struct segment_command_64 *)cursor;
+
+            if (strncmp(segment->segname, "__TEXT", sizeof(segment->segname)) == 0) {
+                text = segment;
+            } else if (strncmp(segment->segname, "__LINKEDIT", sizeof(segment->segname)) == 0) {
+                linkedit = segment;
+            }
+        } else if (load->cmd == LC_SYMTAB && load->cmdsize >= sizeof(*symtab)) {
+            symtab = (const struct symtab_command *)cursor;
+        } else if (load->cmd == LC_DYSYMTAB && load->cmdsize >= sizeof(*dysymtab)) {
+            dysymtab = (const struct dysymtab_command *)cursor;
         }
-        if (load.cmd == LC_SYMTAB && load.cmdsize >= sizeof(symtab)) {
-            memcpy(&symtab, image + offset, sizeof(symtab));
-            have_symtab = 1;
-        } else if (load.cmd == LC_DYSYMTAB && load.cmdsize >= sizeof(dysymtab)) {
-            memcpy(&dysymtab, image + offset, sizeof(dysymtab));
-            have_dysymtab = 1;
-        }
-        offset += load.cmdsize;
+        used += load->cmdsize;
+        cursor += load->cmdsize;
     }
-    if (!have_symtab || !have_dysymtab || symtab.stroff > size ||
-        symtab.strsize > size - symtab.stroff || symtab.symoff > size ||
-        symtab.nsyms > (size - symtab.symoff) / sizeof(struct nlist_64) ||
-        dysymtab.iundefsym > symtab.nsyms ||
-        dysymtab.nundefsym > symtab.nsyms - dysymtab.iundefsym) {
+    if (text == NULL || linkedit == NULL || symtab == NULL || dysymtab == NULL) {
+        kr_scan_not_read(scan, "its load commands name no symbol table this reads");
+        return;
+    }
+    /* Where the loader put the segment that holds the tables, and what of it is theirs. */
+    base = (const unsigned char *)((uintptr_t)image - (uintptr_t)text->vmaddr +
+                                   (uintptr_t)linkedit->vmaddr) -
+           (size_t)linkedit->fileoff;
+    if (symtab->symoff < linkedit->fileoff || symtab->symoff - linkedit->fileoff > linkedit->filesize ||
+        symtab->nsyms > (linkedit->filesize - (symtab->symoff - linkedit->fileoff)) /
+                            sizeof(struct nlist_64) ||
+        symtab->stroff < linkedit->fileoff || symtab->stroff - linkedit->fileoff > linkedit->filesize ||
+        symtab->strsize > linkedit->filesize - (symtab->stroff - linkedit->fileoff) ||
+        dysymtab->iundefsym > symtab->nsyms ||
+        dysymtab->nundefsym > symtab->nsyms - dysymtab->iundefsym) {
         kr_scan_not_read(scan, "its symbol table is not one this reads");
         return;
     }
-    for (index = dysymtab.iundefsym; index < dysymtab.iundefsym + dysymtab.nundefsym; index++) {
-        struct nlist_64 symbol;
+    for (index = dysymtab->iundefsym; index < dysymtab->iundefsym + dysymtab->nundefsym; index++) {
+        const struct nlist_64 *symbol =
+            (const struct nlist_64 *)(base + symtab->symoff) + index;
         const char *name;
 
-        memcpy(&symbol, image + symtab.symoff + (size_t)index * sizeof(symbol), sizeof(symbol));
         /* A weak reference is one the module is content to lose. */
-        if ((symbol.n_type & N_TYPE) != N_UNDF || !(symbol.n_type & N_EXT) ||
-            (symbol.n_desc & N_WEAK_REF)) {
+        if ((symbol->n_type & N_TYPE) != N_UNDF || !(symbol->n_type & N_EXT) ||
+            (symbol->n_desc & N_WEAK_REF)) {
             continue;
         }
-        if (symbol.n_un.n_strx >= symtab.strsize) {
+        if (symbol->n_un.n_strx >= symtab->strsize) {
             kr_scan_not_read(scan, "its string table is not one this reads");
             return;
         }
-        name = (const char *)image + symtab.stroff + symbol.n_un.n_strx;
-        if (memchr(name, '\0', symtab.strsize - symbol.n_un.n_strx) == NULL) {
+        name = (const char *)(base + symtab->stroff) + symbol->n_un.n_strx;
+        if (memchr(name, '\0', symtab->strsize - symbol->n_un.n_strx) == NULL) {
             kr_scan_not_read(scan, "its string table is not one this reads");
             return;
         }
@@ -1086,169 +1118,198 @@ kr_macho_imports(const unsigned char *image, size_t size, kr_scan *scan)
     }
 }
 
-/* `loaded` is the module's own header as the loader mapped it, which says which slice of a file
- * that holds several is the one that was loaded. */
-static void
-kr_module_imports(const unsigned char *image, size_t size, const void *loaded, kr_scan *scan)
+#elif defined(__linux__) && defined(__GLIBC__)
+
+/* The most entries a dynamic section is read to: a section that runs on is not one this reads. */
+#define KR_DYNAMIC_MAX 4096u
+/* The most symbols a module's symbol table is taken to hold. */
+#define KR_SYMBOLS_MAX (1u << 24)
+
+/* An address the dynamic section holds: the loader may have added the load bias to it already. */
+static uintptr_t
+kr_dynamic_address(uintptr_t value, uintptr_t bias)
 {
-    uint32_t magic;
-    struct mach_header_64 mine;
-
-    if (size < sizeof(magic)) {
-        kr_scan_not_read(scan, "its file is too short to be a module");
-        return;
-    }
-    memcpy(&mine, loaded, sizeof(mine));
-    memcpy(&magic, image, sizeof(magic));
-    if (magic == FAT_CIGAM || magic == FAT_CIGAM_64) {
-        struct fat_header fat;
-        uint32_t count;
-        uint32_t i;
-        int wide = magic == FAT_CIGAM_64;
-        size_t entry = wide ? sizeof(struct fat_arch_64) : sizeof(struct fat_arch);
-
-        if (size < sizeof(fat)) {
-            kr_scan_not_read(scan, "its file is too short to be a module");
-            return;
-        }
-        memcpy(&fat, image, sizeof(fat));
-        count = OSSwapBigToHostInt32(fat.nfat_arch);
-        for (i = 0; i < count; i++) {
-            size_t at = sizeof(fat) + (size_t)i * entry;
-            uint64_t begin;
-            uint64_t length;
-            uint32_t cputype;
-            uint32_t subtype;
-
-            if (at > size || entry > size - at) {
-                kr_scan_not_read(scan, "its slice table runs past its file");
-                return;
-            }
-            if (wide) {
-                struct fat_arch_64 arch;
-
-                memcpy(&arch, image + at, sizeof(arch));
-                cputype = OSSwapBigToHostInt32((uint32_t)arch.cputype);
-                subtype = OSSwapBigToHostInt32((uint32_t)arch.cpusubtype);
-                begin = OSSwapBigToHostInt64(arch.offset);
-                length = OSSwapBigToHostInt64(arch.size);
-            } else {
-                struct fat_arch arch;
-
-                memcpy(&arch, image + at, sizeof(arch));
-                cputype = OSSwapBigToHostInt32((uint32_t)arch.cputype);
-                subtype = OSSwapBigToHostInt32((uint32_t)arch.cpusubtype);
-                begin = OSSwapBigToHostInt32(arch.offset);
-                length = OSSwapBigToHostInt32(arch.size);
-            }
-            if (cputype == (uint32_t)mine.cputype &&
-                (subtype & ~CPU_SUBTYPE_MASK) == ((uint32_t)mine.cpusubtype & ~CPU_SUBTYPE_MASK)) {
-                if (begin > size || length > size - begin) {
-                    kr_scan_not_read(scan, "its slice runs past its file");
-                    return;
-                }
-                kr_macho_imports(image + begin, (size_t)length, scan);
-                return;
-            }
-        }
-        kr_scan_not_read(scan, "its file holds no slice for the one that was loaded");
-        return;
-    }
-    kr_macho_imports(image, size, scan);
+    return value < bias ? value + bias : value;
 }
 
-#elif defined(__linux__)
-
-/* The undefined, unversioned, non-weak names in a 64-bit little-endian ELF image. A name a
- * version is required for comes from a library that defines versions, never from the shell. */
-static void
-kr_module_imports(const unsigned char *image, size_t size, const void *loaded, kr_scan *scan)
+/* The name of the version the module's version table calls `index`, or NULL when it lists none. */
+static const char *
+kr_needed_version(const ElfW(Verneed) *needs, size_t count, uint16_t index, const char *strings,
+                  size_t string_size)
 {
-    Elf64_Ehdr header;
-    uint16_t section;
-    Elf64_Shdr dynsym;
-    Elf64_Shdr strings;
-    Elf64_Shdr versions;
-    int have_dynsym = 0;
-    int have_versions = 0;
-    uint16_t dynsym_index = 0;
-    size_t symbols;
+    const unsigned char *at = (const unsigned char *)needs;
+    size_t file;
+
+    if (needs == NULL) {
+        return NULL;
+    }
+    for (file = 0; file < count && file < KR_DYNAMIC_MAX; file++) {
+        const ElfW(Verneed) *need = (const ElfW(Verneed) *)at;
+        const unsigned char *aux_at = at + need->vn_aux;
+        size_t aux;
+
+        for (aux = 0; aux < need->vn_cnt; aux++) {
+            const ElfW(Vernaux) *aux_entry = (const ElfW(Vernaux) *)aux_at;
+
+            if (aux_entry->vna_other == index) {
+                if (aux_entry->vna_name >= string_size ||
+                    memchr(strings + aux_entry->vna_name, '\0', string_size - aux_entry->vna_name) ==
+                        NULL) {
+                    return NULL;
+                }
+                return strings + aux_entry->vna_name;
+            }
+            if (aux_entry->vna_next == 0) {
+                break;
+            }
+            aux_at += aux_entry->vna_next;
+        }
+        if (need->vn_next == 0) {
+            break;
+        }
+        at += need->vn_next;
+    }
+    return NULL;
+}
+
+/*
+ * The undefined names of the ELF object the loader mapped for `handle`. The dynamic section, and the
+ * symbol, string, version and hash tables it points to, are what the loader bound the module with,
+ * and they are in memory.
+ */
+static void
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
+{
+    struct link_map *map = NULL;
+    const ElfW(Dyn) *entry;
+    uintptr_t bias;
+    const ElfW(Sym) *symbols = NULL;
+    const char *strings = NULL;
+    size_t string_size = 0;
+    const uint16_t *versions = NULL;
+    const ElfW(Verneed) *needs = NULL;
+    size_t need_count = 0;
+    const uint32_t *sysv = NULL;
+    const uint32_t *gnu = NULL;
+    size_t symbol_size = sizeof(ElfW(Sym));
+    size_t count;
+    size_t seen = 0;
     size_t n;
 
-    (void)loaded;
-    if (size < sizeof(header)) {
-        kr_scan_not_read(scan, "its file is too short to be a module");
+    if (header == NULL || handle == NULL || dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 ||
+        map == NULL || map->l_ld == NULL) {
+        kr_scan_not_read(scan, "the loader does not say where it mapped it");
         return;
     }
-    memcpy(&header, image, sizeof(header));
-    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64 ||
-        header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_shentsize != sizeof(Elf64_Shdr)) {
-        kr_scan_not_read(scan, "its format is not one this reads");
-        return;
-    }
-    if (header.e_shnum == 0 || header.e_shoff > size ||
-        (size_t)header.e_shnum > (size - header.e_shoff) / sizeof(Elf64_Shdr)) {
-        kr_scan_not_read(scan, "its file has no section table this reads");
-        return;
-    }
-    for (section = 0; section < header.e_shnum; section++) {
-        Elf64_Shdr table;
-
-        memcpy(&table, image + header.e_shoff + (size_t)section * sizeof(table), sizeof(table));
-        if (table.sh_type == SHT_DYNSYM && !have_dynsym) {
-            dynsym = table;
-            dynsym_index = section;
-            have_dynsym = 1;
+    bias = (uintptr_t)map->l_addr;
+    for (entry = map->l_ld; entry->d_tag != DT_NULL; entry++) {
+        if (++seen > KR_DYNAMIC_MAX) {
+            kr_scan_not_read(scan, "its dynamic section does not end");
+            return;
+        }
+        switch (entry->d_tag) {
+        case DT_SYMTAB:
+            symbols = (const ElfW(Sym) *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        case DT_STRTAB:
+            strings = (const char *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        case DT_STRSZ:
+            string_size = (size_t)entry->d_un.d_val;
+            break;
+        case DT_SYMENT:
+            symbol_size = (size_t)entry->d_un.d_val;
+            break;
+        case DT_VERSYM:
+            versions = (const uint16_t *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        case DT_VERNEED:
+            needs = (const ElfW(Verneed) *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        case DT_VERNEEDNUM:
+            need_count = (size_t)entry->d_un.d_val;
+            break;
+        case DT_HASH:
+            sysv = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        case DT_GNU_HASH:
+            gnu = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, bias);
+            break;
+        default:
+            break;
         }
     }
-    if (!have_dynsym || dynsym.sh_link >= header.e_shnum) {
-        kr_scan_not_read(scan, "its file has no dynamic symbol table");
+    if (symbols == NULL || strings == NULL || string_size == 0 || symbol_size != sizeof(*symbols)) {
+        kr_scan_not_read(scan, "its dynamic section names no symbol table this reads");
         return;
     }
-    memcpy(&strings, image + header.e_shoff + (size_t)dynsym.sh_link * sizeof(strings),
-           sizeof(strings));
-    for (section = 0; section < header.e_shnum; section++) {
-        Elf64_Shdr table;
+    /* How many symbols there are is what the loader's own hash table says. */
+    if (gnu != NULL) {
+        uint32_t buckets = gnu[0];
+        uint32_t first_hashed = gnu[1];
+        uint32_t bloom = gnu[2];
+        const uint32_t *table = (const uint32_t *)((const ElfW(Addr) *)(gnu + 4) + bloom);
+        const uint32_t *chains = table + buckets;
+        uint32_t last = 0;
+        uint32_t i;
 
-        memcpy(&table, image + header.e_shoff + (size_t)section * sizeof(table), sizeof(table));
-        /* The version table of the dynamic symbol table: its link names the table it versions. */
-        if (table.sh_type == SHT_GNU_versym && table.sh_link == dynsym_index) {
-            versions = table;
-            have_versions = 1;
-        }
-    }
-    if (dynsym.sh_offset > size || dynsym.sh_size > size - dynsym.sh_offset ||
-        strings.sh_offset > size || strings.sh_size > size - strings.sh_offset ||
-        (have_versions && (versions.sh_offset > size || versions.sh_size > size - versions.sh_offset))) {
-        kr_scan_not_read(scan, "its symbol tables run past its file");
-        return;
-    }
-    symbols = (size_t)(dynsym.sh_size / sizeof(Elf64_Sym));
-    for (n = 1; n < symbols; n++) {
-        Elf64_Sym symbol;
-        const char *name;
-
-        memcpy(&symbol, image + dynsym.sh_offset + n * sizeof(symbol), sizeof(symbol));
-        if (symbol.st_shndx != SHN_UNDEF || ELF64_ST_BIND(symbol.st_info) == STB_WEAK ||
-            ELF64_ST_TYPE(symbol.st_info) == STT_TLS) {
-            continue;
-        }
-        if (have_versions && (n + 1) * sizeof(uint16_t) <= versions.sh_size) {
-            uint16_t version;
-
-            memcpy(&version, image + versions.sh_offset + n * sizeof(version), sizeof(version));
-            if ((version & 0x7fff) >= 2) {
-                continue;
+        for (i = 0; i < buckets; i++) {
+            if (table[i] > last) {
+                last = table[i];
             }
         }
-        if (symbol.st_name >= strings.sh_size) {
+        if (last < first_hashed) {
+            count = first_hashed;
+        } else {
+            while (last - first_hashed < KR_SYMBOLS_MAX && !(chains[last - first_hashed] & 1u)) {
+                last++;
+            }
+            count = (size_t)last + 1;
+        }
+    } else if (sysv != NULL) {
+        count = sysv[1];
+    } else {
+        kr_scan_not_read(scan, "it has no hash table to say how many symbols it holds");
+        return;
+    }
+    if (count > KR_SYMBOLS_MAX) {
+        kr_scan_not_read(scan, "its symbol table is larger than this reads");
+        return;
+    }
+    for (n = 1; n < count; n++) {
+        const char *name;
+
+        if (symbols[n].st_shndx != SHN_UNDEF || ELF64_ST_BIND(symbols[n].st_info) == STB_WEAK ||
+            ELF64_ST_TYPE(symbols[n].st_info) == STT_TLS) {
+            continue;
+        }
+        if (symbols[n].st_name >= string_size) {
             kr_scan_not_read(scan, "its string table is not one this reads");
             return;
         }
-        name = (const char *)image + strings.sh_offset + symbol.st_name;
-        if (memchr(name, '\0', strings.sh_size - symbol.st_name) == NULL) {
+        name = strings + symbols[n].st_name;
+        if (memchr(name, '\0', string_size - symbols[n].st_name) == NULL) {
             kr_scan_not_read(scan, "its string table is not one this reads");
             return;
+        }
+        /* A name a version is required for comes from a library that defines versions, never from
+         * the shell: it is asked for under that version, in the module's own libraries. */
+        if (versions != NULL && (versions[n] & 0x7fff) >= 2) {
+            const char *version = kr_needed_version(needs, need_count, versions[n] & 0x7fff, strings,
+                                                    string_size);
+
+            if (version == NULL) {
+                kr_scan_not_read(scan, "a name it imports is bound to a version it does not list");
+                return;
+            }
+            (void)dlerror();
+            if (dlvsym(handle, name, version) == NULL && dlerror() != NULL &&
+                scan->state == KR_IMPORTS_BOUND) {
+                scan->state = KR_IMPORTS_MISSING;
+                snprintf(scan->detail, sizeof(scan->detail), "%s@%s", name, version);
+                kr_utf8_clean(scan->detail);
+            }
+            continue;
         }
         kr_check_import(name, scan);
     }
@@ -1257,67 +1318,14 @@ kr_module_imports(const unsigned char *image, size_t size, const void *loaded, k
 #else
 
 static void
-kr_module_imports(const unsigned char *image, size_t size, const void *loaded, kr_scan *scan)
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
 {
-    (void)image;
-    (void)size;
-    (void)loaded;
+    (void)header;
+    (void)handle;
     kr_scan_not_read(scan, "this platform's module format is not one this reads");
 }
 
 #endif
-
-/* Reads one module's file and judges its imports. Only a regular file is opened, and never one
- * that could make this wait. */
-static void
-kr_scan_module(const char *path, const void *loaded, kr_scan *scan)
-{
-    int fd;
-    struct stat about;
-    unsigned char *image;
-    size_t got = 0;
-
-    if (path[0] != '/') {
-        kr_scan_not_read(scan, "it was loaded by a relative path, which names no file now");
-        return;
-    }
-    fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) {
-        kr_scan_not_read(scan, "its file cannot be opened");
-        return;
-    }
-    if (fstat(fd, &about) != 0 || !S_ISREG(about.st_mode)) {
-        close(fd);
-        kr_scan_not_read(scan, "its file is not a regular file");
-        return;
-    }
-    if (about.st_size <= 0 || (unsigned long long)about.st_size > KR_MODULE_FILE_MAX) {
-        close(fd);
-        kr_scan_not_read(scan, "its file is empty or larger than this reads");
-        return;
-    }
-    image = malloc((size_t)about.st_size);
-    if (image == NULL) {
-        close(fd);
-        kr_scan_not_read(scan, "there was no memory to read its file");
-        return;
-    }
-    while (got < (size_t)about.st_size) {
-        ssize_t taken = read(fd, image + got, (size_t)about.st_size - got);
-
-        if (taken <= 0) {
-            break;
-        }
-        got += (size_t)taken;
-    }
-    close(fd);
-    if (got != (size_t)about.st_size) {
-        kr_scan_not_read(scan, "its file could not be read whole");
-    } else {
-        kr_module_imports(image, got, loaded, scan);
-    }
-    free(image);
-}
 
 /* Whether the file at `path` is inside `directory`, both read through any links. */
 static int
@@ -1334,28 +1342,58 @@ kr_inside(const char *path, const char *directory)
     return strncmp(file, root, length) == 0 && (file[length] == '/' || file[length] == '\0');
 }
 
-/* Finds where the package's own modules are from where this code was loaded: this bridge is part of
- * the editor module, `<modules>/zsh/zle.so`, so the modules are two directories above it. It is
- * read here rather than compiled in, so a package that was moved finds its own tree. */
+/*
+ * Finds where the package's own modules are from where the running executable is: the shell is
+ * `<prefix>/bin/zsh` and its modules are in `<prefix>/lib/zsh/<version>`, which is the directory the
+ * shell's own default module path names for a tree that was moved. It is not read from where the
+ * bridge was loaded, since that is a copy a person may have made of the editor, and a module beside
+ * that copy would then be taken for the package's. Where the executable is not in a package, no
+ * directory is named and every module is judged.
+ */
 static void
 kr_locate_package_modules(void)
 {
-    Dl_info here;
-    const char *tail = "/zsh/zle.so";
-    size_t length;
+    char found[PATH_MAX + 1];
+    char resolved[PATH_MAX + 1];
+    const char *tail = "/lib/zsh/" KR_UPSTREAM_VERSION;
+    char *slash;
+#if defined(__APPLE__)
+    uint32_t size = sizeof(found);
+#elif defined(__linux__)
+    ssize_t length;
+#endif
 
     kr_package_modules[0] = '\0';
-    if (!dladdr((void *)kr_locate_package_modules, &here) || here.dli_fname == NULL ||
-        here.dli_fname[0] != '/') {
+#if defined(__APPLE__)
+    if (_NSGetExecutablePath(found, &size) != 0) {
         return;
     }
-    length = strlen(here.dli_fname);
-    if (length <= strlen(tail) || length - strlen(tail) >= sizeof(kr_package_modules) ||
-        strcmp(here.dli_fname + length - strlen(tail), tail) != 0) {
+#elif defined(__linux__)
+    length = readlink("/proc/self/exe", found, sizeof(found) - 1);
+    if (length <= 0) {
         return;
     }
-    memcpy(kr_package_modules, here.dli_fname, length - strlen(tail));
-    kr_package_modules[length - strlen(tail)] = '\0';
+    found[length] = '\0';
+#else
+    return;
+#endif
+    if (realpath(found, resolved) == NULL) {
+        return;
+    }
+    slash = strrchr(resolved, '/');
+    if (slash == NULL || slash == resolved) {
+        return;
+    }
+    *slash = '\0';
+    slash = strrchr(resolved, '/');
+    if (slash == NULL || strcmp(slash, "/bin") != 0) {
+        return;
+    }
+    *slash = '\0';
+    if (strlen(resolved) + strlen(tail) >= sizeof(kr_package_modules)) {
+        return;
+    }
+    snprintf(kr_package_modules, sizeof(kr_package_modules), "%s%s", resolved, tail);
 }
 
 static void
@@ -1420,11 +1458,7 @@ kr_inspect_modules(kr_module_report **out, size_t *count)
         }
         memset(&scan, 0, sizeof(scan));
         scan.handle = loaded[i].handle;
-        if (loaded[i].path == NULL) {
-            kr_scan_not_read(&scan, "the loader does not say where it came from");
-        } else {
-            kr_scan_module(loaded[i].path, loaded[i].header, &scan);
-        }
+        kr_module_imports(loaded[i].header, loaded[i].handle, &scan);
         report->name = strdup(loaded[i].name);
         report->path = strdup(loaded[i].path != NULL ? loaded[i].path : "");
         if (report->name == NULL || report->path == NULL) {

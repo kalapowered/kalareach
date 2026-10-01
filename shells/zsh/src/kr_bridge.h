@@ -141,11 +141,12 @@ void kr_shell_unexport(const char *name);
 typedef struct {
     /* The name the shell loaded it by. */
     char *name;
-    /* The file the loader took it from, as the loader names it, or NULL when it does not say. */
+    /* The file the loader took it from, as the loader names it, or NULL when it does not say. It is
+     * what the report shows, and the bridge judges the mapped image and not this file. */
     char *path;
     /* The loader's handle for it, valid while the module stays loaded. */
     void *handle;
-    /* Where the loader mapped its image, which says which slice of a file it was. */
+    /* Where the loader mapped its image: the module's symbol tables are read from there. */
     const void *header;
 } kr_loaded_module;
 
