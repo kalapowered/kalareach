@@ -8763,23 +8763,57 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_gap_notice_alone_is_not_the_beginning_of_a_stream_and_a_whole_screen_is() {
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        for (bytes, gap, opened, frames) in [
-            (&b""[..], Some(a_gap()), false, 1_u64),
-            (&b"a screen"[..], None, true, 1),
-            (&b"a screen"[..], Some(a_gap()), true, 2),
-            (&b""[..], None, false, 0),
+        for (bytes, gap, opened, written) in [
+            (&b""[..], Some(a_gap()), false, vec!["session.gap"]),
+            (&b"a screen"[..], None, true, vec!["session.output"]),
+            (
+                &b"a screen"[..],
+                Some(a_gap()),
+                true,
+                vec!["session.gap", "session.output"],
+            ),
+            (&b""[..], None, false, vec![]),
         ] {
-            let (_temp, _subscription, mut outlet, _reader) = an_outlet().await;
+            let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
             let mut sequence = 0_u64;
             let sent =
                 super::open_delivery(&mut outlet, &stream_id, &mut sequence, joined(bytes, gap))
                     .await;
-            assert_eq!(
-                (sent, sequence),
-                (Some(opened), frames),
-                "a screen of {} bytes after {gap:?}",
-                bytes.len()
-            );
+            let what = format!("a screen of {} bytes after {gap:?}", bytes.len());
+            assert_eq!(sent, Some(opened), "{what}");
+            assert_eq!(sequence, written.len() as u64, "{what}");
+            // What the peer was sent, in the order it arrived: the gap notice comes first and the
+            // screen follows it at the cursor it was taken at.
+            for (position, event) in written.iter().enumerate() {
+                let frame = reader
+                    .read_message::<kr_protocol::envelope::ControlFrame>()
+                    .await
+                    .expect("a frame arrives");
+                let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
+                    panic!("an opening frame is a notification: {frame:?}");
+                };
+                assert_eq!(notification.event_type.as_str(), *event, "{what}");
+                assert_eq!(
+                    notification.sequence.get(),
+                    position as u64,
+                    "frames are numbered as they are written: {what}"
+                );
+                if *event == "session.output" {
+                    let output: kr_protocol::recovery::OutputEvent =
+                        notification.payload.to_typed().expect("an output event");
+                    assert_eq!(
+                        (output.cursor.get(), output.bytes.as_slice()),
+                        (5, bytes),
+                        "{what}"
+                    );
+                }
+            }
+            let nothing = tokio::time::timeout(
+                Duration::from_millis(100),
+                reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+            )
+            .await;
+            assert!(nothing.is_err(), "no other frame was written: {what}");
         }
     }
 
