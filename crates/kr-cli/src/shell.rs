@@ -253,19 +253,21 @@ pub fn install(
         let held = record
             .hold()
             .map_err(|error| record_failure(record, &error))?;
-        let files = bodies
-            .iter()
-            .map(|(file, _, _)| file.clone())
-            .collect::<Vec<_>>();
+        // One file can take two entries, as when PowerShell's two profiles are one file, and is
+        // recorded once.
+        let mut files = Vec::new();
+        for (file, _, _) in &bodies {
+            if !files.contains(file) {
+                files.push(file.clone());
+            }
+        }
         held.add(package.kind(), &files)
             .map_err(|error| record_failure(record, &error))?;
         Some(held)
     };
-    for entry in &mut reported.entries {
-        let Some((_, body, placement)) = bodies.iter().find(|(file, _, _)| *file == entry.file)
-        else {
-            continue;
-        };
+    // The report has one entry for each target, in the order the targets are in, so each is paired
+    // with its own body by position and never by the file: one file can take two entries.
+    for (entry, (_, body, placement)) in reported.entries.iter_mut().zip(&bodies) {
         let io_failure = |error: std::io::Error| {
             CliError::Other(shown!(
                 "{}: {}",
