@@ -35,6 +35,7 @@ import { MobileSession } from './views/MobileSession'
 import { MobileSettings } from './views/Settings'
 import type { Channel } from '../model/account'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
+import { useRebind } from './useRebind'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
 
@@ -110,6 +111,7 @@ export function MobileApp({
   } | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
+  useRebind(lifecycle, connection?.connected === true)
   useKeyboardInset()
 
   useEffect(() => {
