@@ -43,7 +43,7 @@ use kr_protocol::identity::{
 use kr_protocol::ids::{
     ActionId, ActionWindowId, BootEpoch, ConnectionId, EnvironmentId, RequestId,
 };
-use kr_protocol::local::{LocalClientKind, LocalRole};
+use kr_protocol::local::{BridgeOrigin, LocalClientKind, LocalHello, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
@@ -956,6 +956,14 @@ impl FixtureDaemon {
         self.tree.environment_id()
     }
 
+    /// The endpoint of the daemon's control socket.
+    fn endpoint(&self) -> kr_ipc::paths::Endpoint {
+        self.tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint")
+    }
+
     /// Connects one local client, once the daemon answers.
     async fn client(&self) -> LocalClient {
         let endpoint = self
@@ -1465,4 +1473,181 @@ async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_
     assert_eq!(count(&listing), 10, "{invocations:?}");
     assert_eq!(count(&bridge(FIRST_HELPER)), 8, "{invocations:?}");
     assert_eq!(count(&bridge(MOVED_HELPER)), 2, "{invocations:?}");
+}
+
+/// The origin a bridge's helper declares for an invocation that began at a person's command line.
+fn declared_origin() -> BridgeOrigin {
+    BridgeOrigin {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([0x0a; 16])),
+        ingress: ActorIngress::LocalIpc,
+    }
+}
+
+async fn refresh_that_starts(
+    client: &mut LocalClient,
+    host_environment: EnvironmentId,
+    environment_id: EnvironmentId,
+) -> Result<ParamsValue, ProtocolError> {
+    client
+        .mutate(
+            Method::EnvironmentRefresh,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host_environment),
+            &EnvironmentRefreshParams {
+                environment_id,
+                start: true,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+}
+
+/// KR-REQ-03.13, KR-ACC-021: a request crosses at most one process bridge, and the destination keeps
+/// that rule for itself. A connection that declared where its invocation began is a bridge's, and
+/// its refresh, which could start an environment and open a bridge of its own, is refused before
+/// anything is asked of the platform and before the record is touched. The same request from a
+/// connection that declared nothing goes ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_that_came_over_a_bridge_cannot_refresh_an_environment() {
+    let daemon = FixtureDaemon::start();
+    let mut owner = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x31; 16]));
+    enrol_as(
+        &mut owner,
+        host,
+        fixture_record(environment_id, FIRST_HELPER),
+    )
+    .await;
+    daemon.answer(FIRST_HELPER, &answered_as(environment_id));
+
+    let mut bridged =
+        LocalClient::connect_for_bridge(&daemon.endpoint(), build(), declared_origin())
+            .await
+            .expect("a bridge's helper connects");
+    let refused = refresh_that_starts(&mut bridged, host, environment_id)
+        .await
+        .expect_err("a request that crossed a bridge does not open another");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        refused.message.contains("at most one"),
+        "{}",
+        refused.message
+    );
+    assert!(
+        daemon.invocations().is_empty(),
+        "nothing was asked of the platform: {:?}",
+        daemon.invocations()
+    );
+
+    // The control: the same request from a connection that is not a bridge's.
+    let answered = refresh_that_starts(&mut owner, host, environment_id).await;
+    assert!(answered.is_ok(), "{answered:?}");
+    assert!(
+        !daemon.invocations().is_empty(),
+        "the refresh that was not refused asked the platform"
+    );
+}
+
+/// KR-REQ-03.13: a connection says hello once. A second hello, which a helper would carry if it
+/// carried everything it was sent, does not take the origin off the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_hello_does_not_take_the_origin_off_a_connection() {
+    let daemon = FixtureDaemon::start();
+    let mut owner = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x32; 16]));
+    enrol_as(
+        &mut owner,
+        host,
+        fixture_record(environment_id, FIRST_HELPER),
+    )
+    .await;
+
+    let mut bridged =
+        LocalClient::connect_for_bridge(&daemon.endpoint(), build(), declared_origin())
+            .await
+            .expect("a bridge's helper connects");
+    bridged
+        .writer()
+        .write_message(&ControlFrame::Hello(LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: build(),
+            client: LocalClientKind::Cli,
+            capabilities: kr_protocol::scalars::CanonicalSet::new(),
+            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: None,
+        }))
+        .await
+        .expect("writes the second hello");
+    match bridged.recv().await.expect("the daemon answers") {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => assert_eq!(error.code, ErrorCode::UnsupportedSchema, "{error}"),
+        other => panic!("a second hello is answered with a refusal: {other:?}"),
+    }
+    // The connection is still a bridge's: the second hello changed nothing about it.
+    let refused = refresh_that_starts(&mut bridged, host, environment_id)
+        .await
+        .expect_err("still refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        daemon.invocations().is_empty(),
+        "{:?}",
+        daemon.invocations()
+    );
+}
+
+/// KR-REQ-03.12, KR-ACC-021: the destination refuses an origin it does not admit at the hello,
+/// whatever the helper checked before it connected: any ingress but a local peer's, and any client
+/// but a command-line one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_that_is_not_a_local_peer_is_refused_at_the_hello() {
+    let daemon = FixtureDaemon::start();
+    let _ready = daemon.client().await;
+    for ingress in ActorIngress::ALL
+        .iter()
+        .copied()
+        .filter(|ingress| *ingress != ActorIngress::LocalIpc)
+    {
+        let refused = LocalClient::connect_for_bridge(
+            &daemon.endpoint(),
+            build(),
+            BridgeOrigin {
+                environment_id: declared_origin().environment_id,
+                ingress,
+            },
+        )
+        .await
+        .expect_err("a network origin is refused");
+        assert!(
+            refused.to_string().contains("locally authenticated"),
+            "{}: {refused}",
+            ingress.as_str()
+        );
+    }
+    // And a client that is not a command line cannot declare one at all.
+    let connection = kr_ipc::endpoint::Connection::connect(&daemon.endpoint())
+        .await
+        .expect("connects");
+    let (mut reader, mut writer) = kr_ipc::framed::split(connection, StreamKind::Control);
+    writer
+        .write_message(&ControlFrame::Hello(LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: build(),
+            client: LocalClientKind::Worker,
+            capabilities: kr_protocol::scalars::CanonicalSet::new(),
+            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: Some(declared_origin()),
+        }))
+        .await
+        .expect("writes the hello");
+    match reader.read_message::<ControlFrame>().await {
+        Ok(ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        })) => assert_eq!(error.code, ErrorCode::PermissionDenied, "{error}"),
+        other => panic!("a worker's hello that declares an origin is refused: {other:?}"),
+    }
 }

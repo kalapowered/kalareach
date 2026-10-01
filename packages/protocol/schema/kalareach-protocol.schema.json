@@ -4649,6 +4649,25 @@
       ],
       "type": "object"
     },
+    "BridgeOrigin": {
+      "additionalProperties": false,
+      "description": "Where a request that crossed a process bridge first entered, as the invoker declares it.\n\nSection 3 has a request record the ingress it *originally* arrived on, `local_peer` or\n`network_device`, and not merely the local IPC hop the bridge's helper makes at the destination.\nA process bridge carries locally authenticated command-line invocations only, so the one\ningress a destination admits here is [`ActorIngress::LocalIpc`] (`local_peer`); a declaration of\nany other is refused at the hello.\n\nThis is a record and a restriction, never authority. The destination authenticates the helper by\nits own operating-system credentials and issues its own action window and generation, and\nnothing in a declared origin widens what that connection may do. What it does is let the\ndestination know that the connection arrived over a bridge, so that a rule only a destination\ncan keep, such as a request crossing at most one bridge, is kept there and not left to the\nhelper alone.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the invoker ran in."
+        },
+        "ingress": {
+          "$ref": "#/$defs/ActorIngress",
+          "description": "The ingress the request originally arrived on."
+        }
+      },
+      "required": [
+        "environment_id",
+        "ingress"
+      ],
+      "type": "object"
+    },
     "BridgeTarget": {
       "description": "What a bridge helper is asked to reach inside its own environment.",
       "oneOf": [
@@ -17456,6 +17475,17 @@
             "$ref": "#/$defs/ProtocolVersion"
           },
           "type": "array"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BridgeOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this connection's requests originally entered, when it is a process bridge's helper\nconnecting on an invoker's behalf.\n\nAbsent for every other client, and then omitted from the frame, so a hello that declares no\norigin is the frame it always was and a process that outlived an upgrade still reads it. A\nhost or worker of a build before this member refuses a hello that carries one, which fails\nclosed. Absence is not a shape to be read two ways: it means the connection is not bridged."
         }
       },
       "required": [

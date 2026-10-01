@@ -527,6 +527,7 @@ async fn a_second_hello_cannot_change_what_a_connection_is() {
                 client: LocalClientKind::Cli,
                 capabilities: kr_protocol::scalars::CanonicalSet::new(),
                 max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                origin: None,
             },
         ))
         .await
