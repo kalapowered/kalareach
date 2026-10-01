@@ -6,7 +6,8 @@
 //!
 //! Standard input and output must be the terminal to measure. The launcher file is a JSON value the
 //! launcher wrote from outside the terminal's own answers (its application, its version and its
-//! configuration), and goes into the record unchanged.
+//! configuration), and goes into the record with what identifies the account taken out: see
+//! `report::keep_private`.
 
 #[cfg(unix)]
 mod unix {

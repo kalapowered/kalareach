@@ -372,7 +372,7 @@ fn replies_are_found_among_bytes_nobody_asked_for() {
 /// facts before it is written: the programs the window descends from keep their names and lose
 /// their directories, and the home directory, where one is written, becomes `~`.
 #[test]
-fn a_record_keeps_no_home_directory_and_no_user_name() {
+fn a_record_names_programs_and_writes_a_home_directory_as_a_tilde() {
     let launcher = serde_json::json!({
         "ancestors": [
             "/bin/bash",
@@ -415,6 +415,40 @@ fn a_record_keeps_no_home_directory_and_no_user_name() {
         kr_term_probe::report::keep_private(serde_json::Value::Null, Some("/Users/jo")),
         serde_json::Value::Null
     );
+}
+
+/// A home directory written with a trailing slash is the same directory: a path under it is still
+/// written as `~`, and a directory that only begins with its name is not.
+#[test]
+fn a_home_directory_with_a_trailing_slash_is_written_as_a_tilde_all_the_same() {
+    let launcher = serde_json::json!({
+        "paths": [
+            "/Users/jo",
+            "/Users/jo/",
+            "/Users/jo/.terminfo",
+            "/Users/joanne/.terminfo",
+            "/opt:/Users/jo/bin:/usr/bin"
+        ]
+    });
+    let expected = serde_json::json!([
+        "~",
+        "~/",
+        "~/.terminfo",
+        "/Users/joanne/.terminfo",
+        "/opt:~/bin:/usr/bin"
+    ]);
+    for home in ["/Users/jo", "/Users/jo/", "/Users/jo//"] {
+        let kept = kr_term_probe::report::keep_private(launcher.clone(), Some(home));
+        assert_eq!(kept["paths"], expected, "with the home directory {home:?}");
+    }
+    // A home directory that is only slashes names no account, and takes nothing out.
+    for home in ["/", "//"] {
+        assert_eq!(
+            kr_term_probe::report::keep_private(launcher.clone(), Some(home)),
+            launcher,
+            "with the home directory {home:?}"
+        );
+    }
 }
 
 /// The home directory is written as `~` only where it is a whole path or begins one, and the
