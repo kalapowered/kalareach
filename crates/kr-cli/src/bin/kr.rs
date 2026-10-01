@@ -698,8 +698,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                         decision,
                         excluded,
                         &kr_cli::doctor::content::Rules::here(),
-                        &mut report::show_preview,
-                        &mut kr_cli::doctor::content::ask_at_terminal,
                     )
                     .await?,
                 ),
@@ -724,13 +722,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         checks.clone(),
                         Vec::new(),
                     );
-                    kr_cli::doctor::bundle::write(
-                        path,
-                        &bundle,
-                        approved
-                            .map(|approved| std::slice::from_ref(approved.content()))
-                            .unwrap_or_default(),
-                    )?;
+                    kr_cli::doctor::bundle::write(path, &bundle, approved)?;
                     Some((path, bundle, usize::from(approved.is_some())))
                 }
                 _ => None,

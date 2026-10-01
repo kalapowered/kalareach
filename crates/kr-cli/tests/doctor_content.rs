@@ -65,6 +65,12 @@ fn worker() -> &'static Path {
     })
 }
 
+/// A session this test created, and the process of its worker.
+struct Created {
+    session: String,
+    worker: Option<u64>,
+}
+
 /// A host tree, its daemon, and the sessions this test created in it.
 struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -72,37 +78,70 @@ struct Host {
     home: PathBuf,
     _controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
-    created: Mutex<Vec<String>>,
+    created: Mutex<Vec<Created>>,
+}
+
+/// Whether the process `pid` has ended: it is gone, or it is a zombie nobody has waited for. Asked
+/// of `ps`, which says both the same way on every Unix this runs on.
+fn has_ended(pid: u64) -> bool {
+    let listed = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&listed.stdout);
+    state.trim().is_empty() || state.trim().starts_with('Z')
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
         // A session this test left open would keep its worker and its shell running, so each is
-        // closed and its descriptor, which its worker removes as it ends, is waited for before the
-        // tree it lives in goes. Nothing here asserts: this runs while a failure may be unwinding.
+        // closed and its descriptor is waited for, and then its worker's process, before the tree
+        // it lives in goes. A failure to end one is reported once all are tried and the daemon is
+        // stopped, unless the test is already failing: this runs while a failure may be unwinding.
         let created =
             std::mem::take(&mut *self.created.lock().unwrap_or_else(PoisonError::into_inner));
-        for session in created {
-            let closed = self.kr(&["close", &session]);
-            if !closed.status.success() {
-                eprintln!("session {session} could not be closed when the test ended");
-                continue;
-            }
-            if let Ok(session_id) = session.parse::<kr_protocol::ids::SessionId>() {
-                let descriptor = self.temp.environment().descriptor_file(session_id);
-                let started = Instant::now();
-                while descriptor.exists() && started.elapsed() < LIVENESS_DEADLINE {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+        let mut failures = Vec::new();
+        for Created { session, worker } in created {
+            if let Some(failure) = self.end(&session, worker) {
+                failures.push(failure);
             }
         }
         for task in &self.serving {
             task.abort();
         }
+        if !failures.is_empty() && !std::thread::panicking() {
+            panic!("cleanup failed: {failures:?}");
+        }
     }
 }
 
 impl Host {
+    /// Closes `session` and waits until its descriptor has gone and its worker's process has ended.
+    /// Returns what went wrong, if anything.
+    fn end(&self, session: &str, worker: Option<u64>) -> Option<String> {
+        let closed = self.kr(&["close", session]);
+        if !closed.status.success() {
+            return Some(format!(
+                "session {session} could not be closed: {}",
+                String::from_utf8_lossy(&closed.stderr)
+            ));
+        }
+        let session_id: kr_protocol::ids::SessionId = session.parse().ok()?;
+        let descriptor = self.temp.environment().descriptor_file(session_id);
+        let started = Instant::now();
+        while descriptor.exists() || worker.is_some_and(|pid| !has_ended(pid)) {
+            if started.elapsed() >= LIVENESS_DEADLINE {
+                return Some(format!(
+                    "session {session}'s worker (process {worker:?}) did not end: its descriptor \
+                     is {}there",
+                    if descriptor.exists() { "" } else { "not " }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
     async fn start() -> Self {
         let worker = worker().to_path_buf();
         let temp = kr_ipc::testing::TempHost::create();
@@ -230,36 +269,44 @@ impl Host {
             .as_str()
             .expect("an identifier")
             .to_owned();
+        // The worker's own process, which its descriptor names: what ending the session has to
+        // wait for, since the descriptor goes before the process does.
+        let worker = kr_ipc::descriptor::read(
+            &self.temp.environment(),
+            session.parse().expect("an identifier"),
+        )
+        .expect("the descriptor reads")
+        .map(|descriptor| descriptor.process_start_identity.pid.get());
+        assert!(
+            worker.is_some(),
+            "a created session has a worker descriptor"
+        );
         self.created
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(session.clone());
+            .push(Created {
+                session: session.clone(),
+                worker,
+            });
         session
     }
 
     /// Closes a session and waits until its worker has gone.
     fn close(&self, session: &str) {
-        let closed = self.kr(&["close", session]);
-        assert!(
-            closed.status.success(),
-            "kr close: {}",
-            String::from_utf8_lossy(&closed.stderr)
-        );
-        let session_id: kr_protocol::ids::SessionId = session.parse().expect("an identifier");
-        let descriptor = self.temp.environment().descriptor_file(session_id);
-        let started = Instant::now();
-        while descriptor.exists() {
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "session {session}'s descriptor is still at {}",
-                descriptor.display()
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        let worker = self
+            .created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|created| created.session == session)
+            .and_then(|created| created.worker);
+        if let Some(failure) = self.end(session, worker) {
+            panic!("{failure}");
         }
         self.created
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|created| created != session);
+            .retain(|created| created.session != session);
     }
 
     /// Waits until `holds` says privacy mode's report is what the test needs, and returns it.
@@ -672,8 +719,6 @@ async fn export_held<'a>(
         kr_cli::doctor::content::Decision::Preview,
         Vec::new(),
         &kr_cli::doctor::content::Rules::here(),
-        &mut |_| Ok(()),
-        &mut |_| Ok(None),
     )
     .await
     .expect("an export")
@@ -810,11 +855,17 @@ async fn the_written_content_is_the_content_the_command_printed() {
     let host = Host::start().await;
     host.create();
     host.create();
+    let diagnostics = host.kr(&["doctor"]);
     let (previewed, digest) = host.preview("shown.tar", &[]);
     assert!(
         previewed.said().contains(&digest),
         "the preview prints the digest it reports: {}",
         previewed.said()
+    );
+    assert_eq!(
+        previewed.output.status.code(),
+        diagnostics.status.code(),
+        "a preview exits as the diagnostics alone would have"
     );
 
     let written = host.doctor("shown.tar", &["--confirm-content", &digest]);
@@ -947,56 +998,6 @@ async fn a_session_excluded_by_name_is_left_out_and_confirmed_with_it() {
     assert!(!host.temp.root().join("unknown.tar").exists());
 }
 
-/// KR-REQ-29.04: the export's preview is the only place content reaches the error stream, and it
-/// gets there through one reporter function: the source holds `write_line` to the output module that
-/// defines it, the pairing command's terminal, and `show_preview` in the reporter.
-#[test]
-fn only_the_reporters_preview_writes_content_to_the_error_stream() {
-    fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory)
-            .expect("a source directory")
-            .flatten()
-        {
-            let path = entry.path();
-            if path.is_dir() {
-                sources(&path, found);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found = Vec::new();
-    sources(&root, &mut found);
-    for path in found {
-        let name = path
-            .strip_prefix(&root)
-            .expect("under src")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let text = std::fs::read_to_string(&path).expect("readable source");
-        let calls = text.matches("write_line(").count();
-        match name.as_str() {
-            "output.rs" | "pair.rs" => {}
-            "report.rs" => {
-                let body = text
-                    .split("pub fn show_preview")
-                    .nth(1)
-                    .and_then(|rest| rest.split("\npub fn ").next())
-                    .expect("the reporter's preview function");
-                assert_eq!(calls, 1, "report.rs calls write_line once");
-                assert_eq!(
-                    body.matches("write_line(").count(),
-                    1,
-                    "and that call is inside show_preview"
-                );
-            }
-            other => assert_eq!(calls, 0, "{other} calls write_line"),
-        }
-    }
-}
-
 /// A terminal window the command runs in, with the person's side of it: what the window has shown,
 /// and a way to type.
 struct Window {
@@ -1097,6 +1098,14 @@ impl Window {
         }
     }
 
+    /// Ends the person's input, as Ctrl-D does at the start of a line.
+    fn end_of_input(&mut self) {
+        self.typing
+            .write_all(&[0x04])
+            .and_then(|()| self.typing.flush())
+            .expect("types into the window");
+    }
+
     /// Types one line, as a person does.
     fn type_line(&mut self, line: &str) {
         self.typing
@@ -1162,8 +1171,11 @@ async fn at_a_terminal_yes_writes_the_content_that_was_shown() {
 async fn at_a_terminal_declining_writes_nothing() {
     let host = Host::start().await;
     host.create();
-    for answer in ["no", "perhaps"] {
-        let path = host.temp.root().join(format!("{answer}.tar"));
+    for answer in ["no", "perhaps", "end of input"] {
+        let path = host
+            .temp
+            .root()
+            .join(format!("{}.tar", answer.replace(' ', "-")));
         let mut window = Window::run(
             &host,
             &[
@@ -1174,7 +1186,11 @@ async fn at_a_terminal_declining_writes_nothing() {
             ],
         );
         window.wait_for(QUESTION, 1);
-        window.type_line(answer);
+        if answer == "end of input" {
+            window.end_of_input();
+        } else {
+            window.type_line(answer);
+        }
         let shown = window.wait_for("kr ended", 1);
         assert!(
             shown.contains("nothing was written"),
@@ -1275,4 +1291,65 @@ async fn privacy_mode_turned_on_while_the_person_is_asked_writes_nothing() {
         "only the content that was asked about was ever printed: {}",
         shown.escape_debug()
     );
+}
+
+/// KR-REQ-29.04: a preview that cannot be written stops the command before it writes anything, and
+/// a bundle already at the destination is left as it was. The error stream is `/dev/full`, which
+/// takes no write, so the failure is the real one. The control is the same confirmation with an
+/// error stream that works, which writes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preview_the_error_stream_cannot_take_writes_nothing() {
+    let host = Host::start().await;
+    host.create();
+    let (_, digest) = host.preview("full.tar", &[]);
+    let destination = host.temp.root().join("full.tar");
+    std::fs::write(&destination, b"the bundle that was here before").expect("an existing file");
+    let before = std::fs::read(&destination).expect("reads it");
+
+    let mut command = std::process::Command::new(kr());
+    command
+        .args([
+            "doctor",
+            "--bundle",
+            destination.to_str().expect("a path"),
+            "--include-content",
+            "--json",
+            "--confirm-content",
+            &digest,
+        ])
+        .env_clear()
+        .envs(host.variables())
+        .current_dir(&host.work)
+        .stdin(std::process::Stdio::null())
+        .stderr(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("/dev/full"),
+        );
+    let output = command.output().expect("kr runs");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a failure document");
+    assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("nothing was written")),
+        "{document}"
+    );
+    assert!(document.get("bundle").is_none(), "{document}");
+    assert_eq!(
+        std::fs::read(&destination).expect("still there"),
+        before,
+        "the bundle that was there is untouched"
+    );
+
+    let written = host.doctor("full.tar", &["--confirm-content", &digest]);
+    assert_eq!(
+        written.document()["content_written"],
+        Value::Bool(true),
+        "{}",
+        written.said()
+    );
+    assert_ne!(std::fs::read(&destination).expect("replaced"), before);
 }

@@ -9,11 +9,11 @@
 //!   library's error message does not reach the file. [`write`] takes that type and no other, so a
 //!   bundle somebody else wrote cannot be written back out of this host unreduced: it parses into
 //!   the read model and stays there.
-//! * Nothing content-bearing is in it. Terminal output, prompts, attachment filenames, shell
-//!   command lines and working directories arrive only through [`Content`], which exists only when
-//!   the person gave `--include-content` on the command line. That flag is the explicit selection
-//!   section 26 asks for, and [`Content::describe`] is what the command prints before it writes
-//!   anything, so the person sees what they selected while they can still stop.
+//! * Nothing content-bearing is in it. Shell programs, working directories and anything else a
+//!   person or a platform wrote arrive only through [`Content`], and [`write`] takes one only from
+//!   an [`Approved`](super::content::Approved), which the content export makes when the person has
+//!   been shown exactly that content and has confirmed it. `--include-content` is the explicit
+//!   selection section 26 asks for, and the preview is what lets the person stop.
 //!
 //! # The archive
 //!
@@ -27,6 +27,8 @@ use std::path::Path;
 
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{ComposedBundle, ContentExport};
+
+use super::content::Approved;
 
 use crate::error::{CliError, Result};
 
@@ -99,8 +101,10 @@ impl Content {
 
 /// Writes one support bundle.
 ///
-/// `content` is empty unless the person explicitly selected a content-bearing export, and the
-/// bundle records what that selection was so a reader of the file can see it too.
+/// `content` is none unless the person explicitly selected a content-bearing export and approved
+/// what they were shown of it, and the bundle records what that selection was so a reader of the
+/// file can see it too. An [`Approved`] is the only way to hand this function content, so bytes
+/// nobody was shown cannot reach the archive.
 ///
 /// The readable report is rendered here from the bundle's own exported diagnostics rather than
 /// taken from the caller. The command prints a report of its own to the terminal, and that one is
@@ -114,14 +118,16 @@ impl Content {
 /// ```compile_fail
 /// use kr_protocol::hostinfo::SupportBundle;
 /// let arrived: SupportBundle = serde_json::from_str("{}").expect("a bundle");
-/// kr_cli::doctor::bundle::write(std::path::Path::new("support.tar"), &arrived, &[])
+/// kr_cli::doctor::bundle::write(std::path::Path::new("support.tar"), &arrived, None)
 ///     .expect("a bundle that arrived cannot be written");
 /// ```
 ///
 /// # Errors
 ///
 /// Returns an error when the archive cannot be written to `path`.
-pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Result<()> {
+pub fn write(path: &Path, bundle: &ComposedBundle, content: Option<&Approved>) -> Result<()> {
+    let content: &[Content] =
+        content.map_or(&[], |approved| std::slice::from_ref(approved.content()));
     // A bare file name has no parent directory, and the atomic replacement needs one to write its
     // temporary file into and to flush afterwards. Resolving it here is what makes
     // `kr doctor --bundle support.tar` work from a terminal the way a person expects.

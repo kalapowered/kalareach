@@ -11,6 +11,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs};
 
 use kr_protocol::hostinfo::export::{ContentClass, Declared, Sentence};
 
+use super::content::Approved;
 use super::*;
 
 fn checks() -> Vec<DoctorCheck> {
@@ -537,7 +538,7 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
         )],
     );
     assert!(!bundle.content().is_present(), "nothing was selected");
-    bundle::write(&path, &bundle, &[]).expect("writes the bundle");
+    bundle::write(&path, &bundle, None).expect("writes the bundle");
 
     let bytes = std::fs::read(&path).expect("reads it back");
     let names = entry_names(&bytes);
@@ -567,23 +568,20 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
 fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("support.tar");
-    let content = vec![bundle::Content::new(
+    let entry = bundle::Content::new(
         bundle::SESSIONS_ENTRY,
         kr_protocol::hostinfo::export::Sentence::new()
             .stated("every live and closed session with its shell command line"),
         br#"{"sessions": []}"#.to_vec(),
-    )];
+    );
     assert!(
-        content[0]
-            .describe()
-            .as_str()
-            .contains("shell command line"),
+        entry.describe().as_str().contains("shell command line"),
         "the command prints what it will contain before writing"
     );
     // A rendering of the entry names it and counts its bytes, and never holds them: they are the
     // content the person selected to send.
     assert_eq!(
-        format!("{:?}", content[0]),
+        format!("{entry:?}"),
         "Content { entry: \"content/sessions.json\", describes: \"every live and closed session \
          with its shell command line\", bytes: 16 }"
     );
@@ -594,7 +592,8 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         result(),
         Vec::new(),
     );
-    bundle::write(&path, &bundle, &content).expect("writes the bundle");
+    let content = Approved::for_test(entry);
+    bundle::write(&path, &bundle, Some(&content)).expect("writes the bundle");
 
     let bytes = std::fs::read(&path).expect("reads it back");
     assert_eq!(
@@ -650,7 +649,7 @@ fn writes_a_bundle_to_a_bare_name() {
         result(),
         Vec::new(),
     );
-    bundle::write(std::path::Path::new(&name), &bundle, &[])
+    bundle::write(std::path::Path::new(&name), &bundle, None)
         .expect("a bare file name resolves against the current directory");
 }
 
@@ -669,13 +668,17 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         result(),
         Vec::new(),
     );
-    let content = vec![bundle::Content::new(
+    let content = Approved::for_test(bundle::Content::new(
         LONG_ENTRY_NAME,
         kr_protocol::hostinfo::export::Sentence::new().stated("a name longer than a header holds"),
         Vec::new(),
-    )];
-    let refused = bundle::write(&directory.path().join("support.tar"), &bundle, &content)
-        .expect_err("a name the header cannot carry");
+    ));
+    let refused = bundle::write(
+        &directory.path().join("support.tar"),
+        &bundle,
+        Some(&content),
+    )
+    .expect_err("a name the header cannot carry");
     assert!(
         format!("{refused}").contains("longer than an archive entry name"),
         "{refused}"
