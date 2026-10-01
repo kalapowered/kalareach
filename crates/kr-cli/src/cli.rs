@@ -873,6 +873,9 @@ pub enum HostCommand {
     Terminal(TerminalArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
+    /// Show what session descriptions offer on this host, turn them on or off, and fetch or stop
+    /// fetching the model's files.
+    Descriptions(DescriptionsArguments),
     /// Bring this environment's journals that are older than this build migrates forward, once,
     /// while its control daemon is stopped.
     ImportJournals,
@@ -920,6 +923,30 @@ pub struct StartupArguments {
     /// kr wrote is removed, and a daemon that is running keeps running.
     #[arg(long, conflicts_with = "set")]
     pub clear: bool,
+}
+
+/// `kr host descriptions`.
+#[derive(Args)]
+pub struct DescriptionsArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+    /// Turn session descriptions on.
+    #[arg(long, conflicts_with = "off")]
+    pub on: bool,
+    /// Turn session descriptions off. A fetch that is running is stopped.
+    #[arg(long)]
+    pub off: bool,
+    /// Allow inference while this host is on battery (`on`), or stop it (`off`).
+    #[arg(long, value_name = "on|off")]
+    pub battery: Option<String>,
+    /// Fetch the model's files. The size and where they come from are shown first by running this
+    /// command without it, and nothing is fetched until it is given.
+    #[arg(long, conflicts_with_all = ["off", "cancel"])]
+    pub download: bool,
+    /// Stop the fetch that is running, and remove what it wrote.
+    #[arg(long)]
+    pub cancel: bool,
 }
 
 /// `kr host terminal`.

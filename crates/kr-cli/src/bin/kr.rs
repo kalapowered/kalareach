@@ -792,6 +792,9 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
         }
         Command::Host(arguments) => match arguments.command {
+            HostCommand::Descriptions(descriptions) => {
+                kr_cli::descriptions::run(&paths, descriptions, cli.json).await
+            }
             HostCommand::Power(power) => {
                 let environment = kr_cli::resolve::select(&paths, None)?;
                 // Changing the setting is one validated edit of this user's own host
