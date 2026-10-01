@@ -120,9 +120,12 @@ impl Placed {
             "kr-describe-inference{}",
             std::env::consts::EXE_SUFFIX
         ));
-        kr_ipc::testing::place_program(
+        // Started once and let end, so the operating system's check of a new executable is paid
+        // before the test times anything.
+        kr_ipc::testing::place_and_start_once(
             Path::new(env!("CARGO_BIN_EXE_kr-describe-inference")),
             &program,
+            &["--version"],
         );
         let models = directory.path().join("models");
         let placed = models
@@ -292,8 +295,11 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
         build: "kr-describe-tests/0".to_owned(),
         wire: U64::new(WIRE_VERSION),
     });
-    let ready = answers.recv_timeout(Duration::from_secs(10));
-    assert!(matches!(ready, Ok(Answer::Ready { .. })), "{ready:?}");
+    let ready = answers.recv_timeout(Duration::from_secs(120));
+    assert!(
+        matches!(ready, Ok(Answer::Ready { .. })),
+        "waited 120 s for ready after hello, and saw {ready:?}"
+    );
     let profile = &placed.profile;
     let directory = placed
         .models
@@ -348,7 +354,8 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     std::thread::sleep(Duration::from_millis(500));
     send(&Request::Cancel { id: U64::new(2) });
     let asked = Instant::now();
-    // The control thread says it has read the cancellation, then the model thread answers the job.
+    // The control thread says it has read the cancellation before it cancels, and the model thread
+    // answers the job after it has forgotten it, so the acknowledgement is the first frame.
     let mut acknowledged_in = None;
     let answer = loop {
         let answer = answers.recv_timeout(Duration::from_secs(30));

@@ -133,6 +133,12 @@ pub enum Rejection {
         /// The generation the job was produced under.
         found: PrivacyGeneration,
     },
+    /// Nothing admits a publication under the generation the job was produced under: privacy mode
+    /// is on, or the generation moved on while the job ran.
+    NotAdmitted {
+        /// The generation the job was produced under.
+        found: PrivacyGeneration,
+    },
     /// The session's name is pinned. Generated text never overwrites one.
     NamePinned,
     /// The session closed while its job was running.
@@ -154,6 +160,7 @@ impl Rejection {
             Self::StaleProfileRevision { .. } => "stale_profile_revision",
             Self::ProvenanceMismatch { .. } => "provenance_mismatch",
             Self::LateGeneration { .. } => "late_generation",
+            Self::NotAdmitted { .. } => "not_admitted",
             Self::NamePinned => "name_pinned",
             Self::SessionClosed => "session_closed",
         }
