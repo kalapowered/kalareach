@@ -1319,6 +1319,7 @@
 .confirmation-fact dd {
   margin: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
   user-select: text;
 }
 
@@ -1342,6 +1343,7 @@
 }
 
 .confirmation-statement {
+  min-width: 0;
   margin: var(--gap-2) 0 0;
 }
 
@@ -1353,7 +1355,14 @@
   margin: 0;
   padding-left: var(--gap-3);
   border-left: 2px solid var(--warning-line);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
   user-select: text;
+}
+
+/* A long unbroken token in a row's text may shrink the row's text and never widen the row. */
+.confirmation-row > .spacer {
+  min-width: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
