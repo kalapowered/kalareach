@@ -165,6 +165,10 @@ struct Members {
 pub struct WorkerBridge {
     generation: ControllerGeneration,
     members: Mutex<Members>,
+    /// How many times a pass of the admissions cadence was asked for ahead of its tick, for this
+    /// host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    passes_asked: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerBridge {
@@ -174,7 +178,24 @@ impl WorkerBridge {
         Self {
             generation,
             members: Mutex::new(Members::default()),
+            #[cfg(feature = "testing")]
+            passes_asked: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Notes that a pass of the admissions cadence was asked for ahead of its tick.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pass_asked(&self) {
+        self.passes_asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns how many times a pass of the admissions cadence was asked for ahead of its tick,
+    /// for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn passes_asked(&self) -> u64 {
+        self.passes_asked.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn members(&self) -> std::sync::MutexGuard<'_, Members> {
