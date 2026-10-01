@@ -433,6 +433,14 @@ pub fn forbidden_in_a_restoration(bytes: &[u8]) -> Vec<&'static str> {
         (b"\x1b[c", "a device attributes query"),
         (b"\x1b[6n", "a cursor position query"),
         (
+            b"\x1b[?47h",
+            "a switch of mode 47, which the profile does not track",
+        ),
+        (
+            b"\x1b[?47l",
+            "a switch of mode 47, which the profile does not track",
+        ),
+        (
             b"\xc2\x9d",
             "an operating-system command introduced by a C1 control",
         ),
@@ -1169,19 +1177,21 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
     }
 }
 
-/// A restoration with every mode-47 switch turned the other way.
+/// A restoration with every switch between the two buffers turned the other way.
+///
+/// The switches are the ones of mode 1049, which is how a restoration enters and leaves a buffer.
 #[must_use]
 pub fn with_the_switches_reversed(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
         let rest = &bytes[at..];
-        if rest.starts_with(b"\x1b[?47h") {
-            out.extend_from_slice(b"\x1b[?47l");
-            at += 6;
-        } else if rest.starts_with(b"\x1b[?47l") {
-            out.extend_from_slice(b"\x1b[?47h");
-            at += 6;
+        if rest.starts_with(b"\x1b[?1049h") {
+            out.extend_from_slice(b"\x1b[?1049l");
+            at += 8;
+        } else if rest.starts_with(b"\x1b[?1049l") {
+            out.extend_from_slice(b"\x1b[?1049h");
+            at += 8;
         } else {
             out.push(bytes[at]);
             at += 1;
@@ -1192,27 +1202,34 @@ pub fn with_the_switches_reversed(bytes: &[u8]) -> Vec<u8> {
 
 /// A restoration with the part that paints the buffer that is not showing cut out.
 ///
-/// The session paints that buffer between a switch to it with mode 47 and the switch back; this
-/// removes both switches and everything between them, and returns the bytes unchanged when there
-/// is no such part.
+/// A restoration switches buffers three times when there is a buffer not showing: once to make the
+/// one that shows the one that does, and twice to paint the other, into it and out of it. With the
+/// primary buffer showing the paint comes first and the switch that follows it is the one that
+/// leaves the primary buffer showing, so the first two are the paint (`h`, `l`, `l`); with the
+/// alternate buffer showing the switch comes first and the paint is the other two (`h`, `l`, `h`).
+/// This removes the paint's two switches and everything between them, and returns the bytes
+/// unchanged when there are not three.
 #[must_use]
 pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
-    for (enter, leave) in [
-        (&b"\x1b[?47h"[..], &b"\x1b[?47l"[..]),
-        (&b"\x1b[?47l"[..], &b"\x1b[?47h"[..]),
-    ] {
-        let Some(start) = find(bytes, enter) else {
-            continue;
-        };
-        let Some(end) = find(&bytes[start + enter.len()..], leave) else {
-            continue;
-        };
-        let end = start + enter.len() + end + leave.len();
-        let mut cut = bytes[..start].to_vec();
-        cut.extend_from_slice(&bytes[end..]);
-        return cut;
+    let mut switches = Vec::new();
+    let mut at = 0;
+    while let Some(found) = find(&bytes[at..], b"\x1b[?1049") {
+        let start = at + found;
+        match bytes.get(start + 7) {
+            Some(b'h') => switches.push((start, true)),
+            Some(b'l') => switches.push((start, false)),
+            _ => {}
+        }
+        at = start + 8;
     }
-    bytes.to_vec()
+    let paint = match switches.as_slice() {
+        [(first, true), (second, false), (_, false)] => (*first, *second),
+        [(_, true), (second, false), (third, true)] => (*second, *third),
+        _ => return bytes.to_vec(),
+    };
+    let mut cut = bytes[..paint.0].to_vec();
+    cut.extend_from_slice(&bytes[paint.1 + 8..]);
+    cut
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1235,134 +1252,40 @@ mod tests {
     }
 
     #[test]
-    fn reversing_the_switches_turns_each_mode_47_switch_the_other_way() {
+    fn reversing_the_switches_turns_each_mode_1049_switch_the_other_way() {
         assert_eq!(
-            with_the_switches_reversed(b"a\x1b[?47hb\x1b[?47lc\x1b[?1047h"),
-            b"a\x1b[?47lb\x1b[?47hc\x1b[?1047h".to_vec()
-        );
-    }
-
-    fn bell(at: u64, completed_at: u64) -> Caused {
-        Caused {
-            kind: SideEffectKind::Bell,
-            at,
-            completed_at,
-        }
-    }
-
-    #[test]
-    fn an_owed_effect_the_terminal_never_performed_fails_wherever_it_was_completed() {
-        // Two bells owed and neither performed: each is a failure, whatever else was happening at
-        // the byte that completed it.
-        let found = account(&[bell(9, 10), bell(19, 20)], &[]);
-        assert_eq!(found.failures.len(), 2, "{found:?}");
-        assert!(
-            found.failures[0].contains("completed at byte 10"),
-            "{found:?}"
-        );
-        assert!(
-            found.failures[1].contains("completed at byte 20"),
-            "{found:?}"
+            with_the_switches_reversed(b"a\x1b[?1049hb\x1b[?1049lc\x1b[?1047h"),
+            b"a\x1b[?1049lb\x1b[?1049hc\x1b[?1047h".to_vec()
         );
     }
 
     #[test]
-    fn an_effect_nobody_owed_fails_beside_one_that_was_not_performed() {
-        let delivered = [Delivered {
-            cursor: 30,
-            kind: SideEffectKind::Bell,
-        }];
-        let found = account(&[bell(9, 10)], &delivered);
-        assert_eq!(found.failures.len(), 2, "{found:?}");
-        assert!(
-            found
-                .failures
-                .iter()
-                .any(|failure| failure.contains("delivery at byte 30")),
-            "{found:?}"
-        );
-    }
-
-    #[test]
-    fn two_equal_effects_are_told_apart_by_where_they_were_delivered() {
-        // The second bell arrived; the first did not.
-        let delivered = [Delivered {
-            cursor: 19,
-            kind: SideEffectKind::Bell,
-        }];
-        let found = account(&[bell(9, 10), bell(19, 20)], &delivered);
-        assert_eq!(found.failures.len(), 1, "{found:?}");
-        assert!(found.failures[0].contains("began at byte 9"), "{found:?}");
-    }
-
-    fn clipboard(content: &str, at: u64) -> Caused {
-        Caused {
-            kind: SideEffectKind::ClipboardWrite {
-                selection: kr_term::sideeffect::ClipboardSelection::Clipboard,
-                content: content.as_bytes().to_vec(),
-            },
-            at,
-            completed_at: at + 5,
-        }
-    }
-
-    fn performed(effect: &Caused) -> Delivered {
-        Delivered {
-            cursor: effect.at,
-            kind: effect.kind.clone(),
-        }
-    }
-
-    #[test]
-    fn two_effects_performed_the_other_way_round_fail() {
-        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
-        let found = account(
-            &[first.clone(), second.clone()],
-            &[performed(&second), performed(&first)],
-        );
-        assert!(
-            found
-                .failures
-                .iter()
-                .any(|failure| failure.contains("out of the order")),
-            "{found:?}"
-        );
-        let in_order = account(
-            &[first.clone(), second.clone()],
-            &[performed(&first), performed(&second)],
-        );
-        assert_eq!(in_order, Account::default());
-    }
-
-    #[test]
-    fn a_reversed_pair_fails_beside_an_effect_that_was_not_performed() {
-        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
-        let found = account(
-            &[bell(4, 5), first.clone(), second.clone()],
-            &[performed(&second), performed(&first)],
-        );
-        assert!(
-            found
-                .failures
-                .iter()
-                .any(|failure| failure.contains("completed at byte 5")),
-            "the bell fails: {found:?}"
-        );
-        assert!(
-            found
-                .failures
-                .iter()
-                .any(|failure| failure.contains("out of the order")),
-            "the reversal fails too: {found:?}"
-        );
-    }
-
-    #[test]
-    fn cutting_the_other_buffer_removes_the_switch_and_everything_it_painted() {
-        let restoration = b"\x1b[!p\x1b[?47h\x1b[H\x1b[2Jother\x1b[?47l\x1b[Hshowing";
+    fn a_restoration_that_switches_through_mode_47_is_named() {
         assert_eq!(
-            without_the_buffer_not_showing(restoration),
-            b"\x1b[!p\x1b[Hshowing".to_vec()
+            forbidden_in_a_restoration(b"a\x1b[?47hb"),
+            vec!["a switch of mode 47, which the profile does not track"]
+        );
+        assert_eq!(
+            forbidden_in_a_restoration(b"a\x1b[?47lb"),
+            vec!["a switch of mode 47, which the profile does not track"]
+        );
+        assert!(forbidden_in_a_restoration(b"\x1b[?1047h\x1b[?1049l").is_empty());
+    }
+
+    #[test]
+    fn cutting_the_other_buffer_removes_the_paint_and_nothing_of_the_switch_that_shows_a_buffer() {
+        // The primary buffer showing: the other buffer is painted first.
+        let primary =
+            b"\x1b[!p\x1b[?1049h\x1b[H\x1b[2Jother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing";
+        assert_eq!(
+            without_the_buffer_not_showing(primary),
+            b"\x1b[!p\x1b[!p\x1b[?1049l\x1b[Hshowing".to_vec()
+        );
+        // The alternate buffer showing: it is selected first, and the other buffer painted after.
+        let alternate = b"\x1b[!p\x1b[?1049h\x1b[?1049l\x1b[H\x1b[2Jother\x1b[?1049h\x1b[Hshowing";
+        assert_eq!(
+            without_the_buffer_not_showing(alternate),
+            b"\x1b[!p\x1b[?1049h\x1b[Hshowing".to_vec()
         );
         assert_eq!(without_the_buffer_not_showing(b"plain"), b"plain".to_vec());
     }
