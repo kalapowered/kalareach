@@ -374,6 +374,9 @@ impl Controller {
             self.plugin_bridge.closed(session_id, false);
         }
         drop(registry);
+        // Every worker the last daemon left is a member now, so what the bridge reports of the
+        // workers' live releases is the whole account and a commit may forget what none holds.
+        self.plugin_bridge.members_known();
         self.check_unconfirmed_members();
         Ok(())
     }
