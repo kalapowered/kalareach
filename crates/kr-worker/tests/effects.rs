@@ -63,6 +63,12 @@ impl Fixture {
 
     /// Attaches a terminal of the session's size that declares `profile` and asks to type.
     fn attach(&mut self, profile: &str) -> AttachmentId {
+        self.attach_sized(profile, Dimensions::new(80, 24))
+    }
+
+    /// The same for a terminal of `dimensions`, which is served a projection when it is not the
+    /// session's own size.
+    fn attach_sized(&mut self, profile: &str, dimensions: Dimensions) -> AttachmentId {
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
         requested.insert(AttachmentCapability::Input);
@@ -70,7 +76,7 @@ impl Fixture {
             session_id: self.session_id,
             mode: AttachMode::Terminal,
             claim_geometry: false,
-            dimensions: Nullable::some(Dimensions::new(80, 24)),
+            dimensions: Nullable::some(dimensions),
             terminal_profile_id: Nullable::some(profile.to_owned()),
             requested,
         };
@@ -340,4 +346,33 @@ async fn the_bells_of_one_read_a_holder_cannot_take_are_all_recorded_in_order() 
         cursors, expected,
         "in the order they happened, at their own cursors"
     );
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38: the holder of the lease is a terminal of another size, served a
+/// projection. The effect is owed to it all the same, and queued on its stream; a terminal of the
+/// session's size that is only watching is sent nothing, and nothing is recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_effect_for_a_projected_holder_is_delivered_to_it_and_to_nobody_else() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach_sized("xterm-256color", Dimensions::new(40, 12));
+    let watcher = fixture.attach("xterm-256color");
+    fixture.take_the_keys(holder);
+    let mut holding = fixture.subscribe(holder);
+    let mut watching = fixture.subscribe(watcher);
+    let _ = drained(&mut holding);
+    let _ = drained(&mut watching);
+
+    fixture.output(b"\x07");
+    let held = drained(&mut holding);
+    assert!(
+        held.contains(&effect(0, BELL)),
+        "the projected holder is sent its bell: {held:?}"
+    );
+    assert!(
+        !drained(&mut watching)
+            .iter()
+            .any(|seen| seen.starts_with("effect")),
+        "and the terminal that only watches is not"
+    );
+    assert!(fixture.host_events().is_empty());
 }
