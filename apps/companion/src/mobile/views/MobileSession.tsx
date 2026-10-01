@@ -263,6 +263,28 @@ export function MobileSession({
     [lifecycle]
   )
 
+  /**
+   * Records what the person typed on top of the draft as it is stored now.
+   *
+   * The field's last render is not the newest draft: a rebind the host's answer set off may have
+   * bound it since, and writing the render's copy back would undo that. The text is the person's,
+   * and everything else is whatever the store holds.
+   */
+  const typeInto = useCallback(
+    (text: string) => {
+      lifecycle.setDrafts((drafts) => {
+        const stored = drafts.find((each) => each.draftId === draft.draftId)
+        const base =
+          stored === undefined
+            ? draft
+            : { ...stored, state: stored.state === 'bound' && draft.state === 'conflicted' ? draft.state : stored.state }
+        const next = edit(base, text, Date.now())
+        return [...drafts.filter((each) => each.draftId !== draft.draftId), next]
+      })
+    },
+    [lifecycle, draft]
+  )
+
   /** Changes the files on this session's draft, whatever else changed it meanwhile. */
   const changeFiles = useCallback(
     (change: (files: readonly DraftAttachment[]) => readonly DraftAttachment[]) => {
@@ -679,7 +701,7 @@ export function MobileSession({
       placeholder={pane === 'terminal' ? 'Type into the terminal' : 'Message this session'}
       aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
       onChange={(event) => {
-        setDraft(edit(draft, event.target.value, Date.now()))
+        typeInto(event.target.value)
       }}
       onKeyDown={(event) => {
         // Control-Tab and Control-Shift-Tab move on from the field as they do from the program's
