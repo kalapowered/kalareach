@@ -1053,9 +1053,16 @@ impl RemoteConnection {
                         ),
                     );
                 }
+                // The admission travels into the writes, as a key declaration's does: the stores
+                // ask about it again where they are written.
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
                 match self
                     .controller
-                    .preview_key_update_action(&actor_id, mutation)
+                    .preview_key_update_action(&actor_id, mutation, carried)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {

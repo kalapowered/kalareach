@@ -8,7 +8,9 @@
 //!    never produced from is finished, page after page. That is [`DeliveryModule::reconcile`].
 //!    Nothing is delivered until it has succeeded: a recovery that failed is tried again before
 //!    every pass until it does.
-//! 2. **A pass on every tick** of [`Cadence::pass`]: the due outbox is claimed and sent, which is
+//! 2. **A pass on every tick** of [`Cadence::pass`]: what the environment's attention store has
+//!    announced is taken, which is [`DeliveryRuntime::attach_attention`]'s feed, whatever is taken
+//!    and not yet produced from is produced, and then the due outbox is claimed and sent, which is
 //!    [`DeliveryModule::run_due`].
 //! 3. **Questions on their own loop**, every [`Cadence::questions`]: credentials inside their
 //!    renewal window are renewed ahead of need, and a bounded batch of the outcomes nobody knows
@@ -49,6 +51,9 @@ use super::sender::GatewaySenders;
 use super::status::{GatewayStatus, StatusAllowance};
 use super::transport::DeliveryTransports;
 use super::{Clock, DeliveryModule, SystemClock};
+
+/// The scope the attention store's announcements are taken under: one store, so one cursor.
+pub const ATTENTION_SCOPE: &str = "environment";
 
 /// How often the runtime works, and how often each loop may ask a gateway what became of a
 /// notification.
@@ -104,6 +109,7 @@ pub struct DeliveryRuntime {
     authority: Arc<dyn RecipientAuthority + Send + Sync>,
     signer: Arc<dyn ServiceSigner>,
     adapters: OnceLock<Adapters>,
+    attention: OnceLock<Arc<crate::attention::AttentionModule>>,
     recovered: AtomicBool,
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
@@ -131,6 +137,7 @@ impl DeliveryRuntime {
             authority,
             signer,
             adapters: OnceLock::new(),
+            attention: OnceLock::new(),
             recovered: AtomicBool::new(false),
             cadence,
             runtime,
@@ -186,6 +193,15 @@ impl DeliveryRuntime {
                 )));
         }
         attached
+    }
+
+    /// Hands the runtime the environment's attention store, which every pass takes the
+    /// announcements of.
+    ///
+    /// Once, like the transport: the store is the composition root's decision. Returns false when
+    /// one was already attached.
+    pub fn attach_attention(&self, attention: Arc<crate::attention::AttentionModule>) -> bool {
+        self.attention.set(attention).is_ok()
     }
 
     /// Returns true once recovery has succeeded.
@@ -255,18 +271,70 @@ impl DeliveryRuntime {
 
     /// Whether queued work for one destination may still be sent after a restart.
     ///
-    /// A destination still configured and enabled, with a rule, and for an external destination a
-    /// grant that is still in force. A push destination's credential is not asked about: it is
-    /// renewed or handed over afterwards, and a restart is not a revocation.
+    /// A destination still configured and enabled, with a rule, and a grant that is still in force
+    /// for the recipient. A push destination's credential is not asked about: it is renewed or
+    /// handed over afterwards, and a restart is not a revocation.
     fn still_authorised(&self, record: &DestinationRecord) -> bool {
         let Ok(rule) = record.require_rule() else {
             return false;
         };
-        record.enabled && (record.as_push().is_some() || self.authority.scope_for(rule).is_some())
+        record.enabled
+            && if record.as_push().is_some() {
+                self.authority.device_scope(record).is_some()
+            } else {
+                self.authority.scope_for(rule).is_some()
+            }
+    }
+
+    /// Takes what the attention store has announced, and produces from what is taken and not yet
+    /// produced from.
+    ///
+    /// The order is the producer's: take, commit the events and the cursor in the journal, settle
+    /// with the store. It is made on every pass, with or without a transport: what is taken is
+    /// this host's own record, and a notification waits in the outbox for the transport the same
+    /// as one that was produced before it was attached. A take the journal and the published
+    /// privacy state do not agree on takes nothing, and the store offers the announcements again.
+    fn feed(&self) {
+        let Some(attention) = self.attention.get() else {
+            return;
+        };
+        let published = self.module.privacy_state().now();
+        let view = kr_delivery::producer::PrivacyView {
+            generation: published.generation.get(),
+            private: published.private,
+        };
+        let now_ms = SystemClock.now_ms();
+        let taken = attention.take_for_delivery(|store, offer| {
+            self.module.with(|producer| {
+                producer
+                    .take_from_attention(
+                        store,
+                        offer,
+                        self.authority.as_ref(),
+                        ATTENTION_SCOPE,
+                        view,
+                        now_ms,
+                    )
+                    .map_err(storage)
+            })
+        });
+        match taken {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                eprintln!("kr-controller: attention announcements were not taken: {error}");
+            }
+            Err(refusal) => {
+                eprintln!("kr-controller: the attention store could not be taken from: {refusal}");
+            }
+        }
+        if let Err(error) = self.module.finish_pending(self.authority.as_ref(), now_ms) {
+            eprintln!("kr-controller: taken announcements were not produced from: {error}");
+        }
     }
 
     /// Runs one delivery pass, when there is a transport to run it with.
     fn pass(&self) {
+        self.feed();
         let Some(adapters) = self.adapters.get() else {
             return;
         };

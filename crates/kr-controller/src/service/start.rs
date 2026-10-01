@@ -119,9 +119,10 @@ impl Controller {
         // not running, and would fence nothing.
         // The rights ceiling this environment accepted is in force from the first request, before
         // any acceptance below runs: it is what the fences recorded against it were raised for.
-        let rights_ceiling = accepted_document
-            .as_ref()
-            .and_then(|document| crate::config::ceilings::configured_rights(&document.ceilings));
+        let rights_ceiling =
+            Arc::new(std::sync::Mutex::new(accepted_document.as_ref().and_then(
+                |document| crate::config::ceilings::configured_rights(&document.ceilings),
+            )));
         // So are the enrolment budgets it accepted. A startup reading that loaded a document
         // replaces them below, by the session number's rule; one that decided nothing leaves them.
         let accepted_budgets = accepted_document
@@ -365,18 +366,23 @@ impl Controller {
         let delivery_runtime = crate::push::runtime::DeliveryRuntime::new(
             Arc::clone(&delivery),
             Arc::new(crate::push::credentials::HeldCredentials::new()),
-            Arc::new(crate::push::authority::GrantedRecipients::new(
-                Arc::clone(&sharing),
-                Arc::clone(&policy),
-                setup.environment_id,
-                Arc::clone(&lifetimes),
-            )),
+            Arc::new(
+                crate::push::authority::GrantedRecipients::new(
+                    Arc::clone(&sharing),
+                    Arc::clone(&policy),
+                    setup.environment_id,
+                    Arc::clone(&lifetimes),
+                )
+                .with_ceiling(Arc::clone(&rights_ceiling)),
+            ),
             Arc::new(crate::push::sender::HostSigner::new(
                 device_keys.authorisation,
             )),
             crate::push::runtime::Cadence::DEFAULT,
             tokio::runtime::Handle::current(),
         );
+        // What the environment's attention store announces is taken on every pass of the runtime.
+        delivery_runtime.attach_attention(Arc::clone(&attention));
         // Privacy mode's record comes before anything the subsystems it drives do. It is read and
         // published into the delivery module's send gate here, and whatever it asks for is taken
         // through the backup service, the delivery journal and the descriptions again, before the
@@ -424,7 +430,7 @@ impl Controller {
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
             started,
-            rights_ceiling: std::sync::Mutex::new(rights_ceiling),
+            rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             debt_pass: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]

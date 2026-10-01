@@ -468,7 +468,8 @@ impl Controller {
             Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
             Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
             Method::DevicePreviewKeyUpdate => {
-                self.device_preview_key_update(actor_id, mutation).await
+                self.device_preview_key_update(actor_id, mutation, carried)
+                    .await
             }
             Method::DeliveryDestinationSecretSet => {
                 self.delivery_destination_secret_set(mutation, carried)
@@ -725,6 +726,7 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
@@ -734,7 +736,9 @@ impl Controller {
                     .await;
             }
         };
-        let outcome = self.device_preview_key_update(actor_id, mutation).await;
+        let outcome = self
+            .device_preview_key_update(actor_id, mutation, carried)
+            .await;
         self.settle_claim(&hold, &outcome)?;
         drop(hold);
         outcome
@@ -782,10 +786,13 @@ impl Controller {
             if record.revoked_at_ms.is_some() || record.device_key_revision >= revision {
                 continue;
             }
-            if self
-                .devices
-                .update_preview_key(device_id, push.preview_keys.current, revision)?
-                == net::devices::PreviewKeyOutcome::Recorded
+            // Finishing what the journal already took: nothing refuses it any more.
+            if self.devices.update_preview_key(
+                device_id,
+                push.preview_keys.current,
+                revision,
+                || Ok(()),
+            )? == net::devices::PreviewKeyOutcome::Recorded
             {
                 recovered += 1;
             }
@@ -793,11 +800,31 @@ impl Controller {
         Ok(recovered)
     }
 
-    /// Rotates a paired device's notification-preview key and revision.
+    /// Rotates a paired device's notification-preview key and revision, under the admission it was
+    /// asked under.
+    ///
+    /// The admission travels into the writes. Both stores are written with the registry held, and
+    /// the admission is asked there, after every wait: its deadline on the continuous clock, the
+    /// authority it was admitted under, and the device's own grant on both clocks, so a bound that
+    /// ran out while the effect waited for its turn stops it. The journal is written first, because
+    /// it can refuse a registration for a reason the directory knows nothing about, and the
+    /// admission is asked immediately before that write. Once the journal has taken the
+    /// registration the directory is completed without asking again: a registration the journal
+    /// holds is one the host owes the directory, and refusing the second half would answer a
+    /// registration that took effect as one that did not. When the journal writes nothing, because
+    /// it holds no destination for the device or already holds this registration, the admission is
+    /// asked inside the directory's own write instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the admission refuses with, [`ControllerError::InvalidArgument`] for a
+    /// revision that does not follow the recorded one, and a storage error when a store cannot be
+    /// reached.
     pub async fn device_preview_key_update(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
         // Section 16 registers this key through the device's own authenticated channel, so the
@@ -836,33 +863,64 @@ impl Controller {
                 recorded.device_key_revision.get()
             )));
         }
+        let registry = self.registry.lock().await;
+        // The admission, asked where both stores are about to be written: the connection's
+        // admission, and the device's own grant on both of its clocks, from memory alone so that it
+        // is safe inside the directory's transaction.
+        let admitted = || {
+            self.check_admission(&registry, &carried)?;
+            if self
+                .lifetimes()
+                .in_force_now(params.device_id, &recorded.grant)
+            {
+                Ok(())
+            } else {
+                Err(ControllerError::PermissionDenied {
+                    detail: "this device's grant has run out; pair again".to_owned(),
+                })
+            }
+        };
         // The delivery journal is written first, because it is the store that can refuse a
         // registration for a reason the directory knows nothing about: section 16 keeps one
         // replaced key, so a rotation while an earlier replacement still has notifications
         // outstanding is refused. A refusal therefore leaves both stores as they were. Both take
         // the same registration again without complaint, so a resubmission after a lost answer,
         // and a restart between the two writes, both end with the two agreeing.
-        match self.delivery.update_preview_key(
+        let journal_took_it = match self.delivery.update_preview_key(
             &destination_id,
             params.notification_preview,
             params.revision.get(),
             now_ms,
+            &admitted,
         ) {
-            Ok(()) => {}
+            Ok(wrote) => wrote,
             Err(ControllerError::InvalidArgument(message))
                 if message.contains("is not a destination this host has configured") =>
             {
                 // The device has registered a key before this host configured it as a delivery
                 // destination. The directory holds the key, and configuring the destination takes
                 // it from there.
+                false
             }
             Err(error) => return Err(error),
-        }
-        match self.devices.update_preview_key(
-            params.device_id,
-            params.notification_preview,
-            params.revision,
-        )? {
+        };
+        let outcome = if journal_took_it {
+            self.devices.update_preview_key(
+                params.device_id,
+                params.notification_preview,
+                params.revision,
+                || Ok(()),
+            )?
+        } else {
+            self.devices.update_preview_key(
+                params.device_id,
+                params.notification_preview,
+                params.revision,
+                &admitted,
+            )?
+        };
+        drop(registry);
+        match outcome {
             net::devices::PreviewKeyOutcome::Recorded
             | net::devices::PreviewKeyOutcome::AlreadyRecorded => {}
             net::devices::PreviewKeyOutcome::RevisionBehind(recorded) => {
