@@ -15,16 +15,36 @@ import { useState, type ReactNode } from 'react'
 import type { FakeHostControls, HeldMutations } from './host/fake'
 import { DRAFTS_KEY, SUBMISSIONS_KEY } from './mobile/model/store'
 
+/** What tells the next page that a reset was asked for. */
+const RESET_KEY = 'kr.harness.reset'
+
+/**
+ * Clears what the page keeps of drafts and sends, if the strip asked for it, before the page shows
+ * anything.
+ *
+ * The page writes what it holds as it is unloaded, so clearing at the moment of the reset is undone
+ * by the unload that follows it. The reset is asked for there and done here, by the page that
+ * starts after, and once: a draft written later is kept.
+ */
+export function applyPendingReset(storage: Storage, session: Storage): void {
+  if (session.getItem(RESET_KEY) === null) return
+  session.removeItem(RESET_KEY)
+  storage.removeItem(DRAFTS_KEY)
+  storage.removeItem(SUBMISSIONS_KEY)
+}
+
 /** The strip, for the scripted host `controls` drives. */
 export function HarnessStrip({
   controls,
   storage = window.localStorage,
+  session = window.sessionStorage,
   reload = () => {
     window.location.reload()
   }
 }: {
   readonly controls: FakeHostControls
   readonly storage?: Storage
+  readonly session?: Storage
   readonly reload?: () => void
 }): ReactNode {
   const [open, setOpen] = useState(false)
@@ -59,7 +79,14 @@ export function HarnessStrip({
           <button type="button" id="kr-strip-restore" onClick={choose(() => { controls.setConnected(true) })}>
             Restore contact
           </button>
-          <button type="button" id="kr-strip-hold" onClick={choose(() => { setHeld(controls.holdMutation()) })}>
+          <button
+            type="button"
+            id="kr-strip-hold"
+            disabled={held !== null}
+            onClick={choose(() => {
+              setHeld(controls.holdMutation())
+            })}
+          >
             Hold sends
           </button>
           <button
@@ -76,8 +103,10 @@ export function HarnessStrip({
             type="button"
             id="kr-strip-reset"
             onClick={choose(() => {
+              // Cleared now, so that nothing reads it meanwhile, and again by the next page.
               storage.removeItem(DRAFTS_KEY)
               storage.removeItem(SUBMISSIONS_KEY)
+              session.setItem(RESET_KEY, '1')
               reload()
             })}
           >
