@@ -17,6 +17,11 @@
 //!
 //! Nothing here is history. A reply that was never drained is dropped when the lane resets, and a
 //! reconnecting client is never sent a reply or a probe answer from before it arrived.
+//!
+//! The lane reads no clock. Every call that has a deadline or a refill in it is handed a reading of
+//! one, in milliseconds, and the readings a lane is handed all come from one continuous clock: a
+//! deadline offered on one clock and read on another is dropped at once or kept for ever, and a
+//! wall clock that is set moves a window it has no business moving.
 
 use std::collections::VecDeque;
 
@@ -309,7 +314,9 @@ impl ResponseLane {
 
     /// Offers a reply to the lane. Returns whether it was accepted.
     ///
-    /// This is the only way anything reaches the lane, and the broker is the only caller.
+    /// This is the only way anything reaches the lane, and the broker is the only caller. `now_ms` is
+    /// a reading of the continuous clock the lane is driven by, which the deadline and the refill are
+    /// measured from.
     pub(crate) fn offer(&mut self, mut response: Response, now_ms: u64) -> bool {
         if response.bytes.len() > self.limits.max_response_bytes {
             self.degradation.oversized += 1;
@@ -341,7 +348,8 @@ impl ResponseLane {
     /// stays where it is, including the first one: a budget of zero takes nothing.
     ///
     /// A reply that has waited past its deadline is dropped here rather than written, and the drop
-    /// shows up in the degradation record.
+    /// shows up in the degradation record. `now_ms` is a reading of the same continuous clock the
+    /// replies were offered on.
     pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
         if !gate.allows_write() {
             return Vec::new();

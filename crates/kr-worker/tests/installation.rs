@@ -106,7 +106,11 @@ fn dimensions(columns: u64, rows: u64) -> Dimensions {
 /// the screen is as expensive as a screen of this size can reasonably be. The alternate buffer is
 /// filled as well, because an installation carries both.
 fn filled(columns: u64, rows: u64) -> TerminalEngine {
-    let mut engine = TerminalEngine::new(dimensions(columns, rows)).expect("a canonical grid");
+    let mut engine = TerminalEngine::new(
+        dimensions(columns, rows),
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("a canonical grid");
     let mut stream = Vec::new();
     for buffer in 0..2 {
         if buffer == 1 {
@@ -135,7 +139,7 @@ fn filled(columns: u64, rows: u64) -> TerminalEngine {
             }
         }
     }
-    engine.feed(0, &stream, LaneGate::default(), 0);
+    engine.feed(0, &stream, LaneGate::default());
     engine
 }
 
@@ -162,7 +166,6 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
         tall.restoration(
             dimensions(320, 160),
             LaneGate::default(),
-            0,
             kr_worker::render::Keyboard::Install,
             kr_worker::render::Scope::WholeScreen,
         )
@@ -181,7 +184,6 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
             kr_worker::projection::Window::live(dimensions(320, 16)),
             ProjectionResetReason::Attached,
             LaneGate::default(),
-            0,
             QUEUE,
             kr_worker::render::Scope::WholeScreen,
         )
@@ -191,7 +193,6 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
             kr_worker::projection::Window::live(dimensions(320, 160)),
             ProjectionResetReason::Attached,
             LaneGate::default(),
-            0,
             QUEUE,
             kr_worker::render::Scope::WholeScreen,
         )
