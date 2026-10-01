@@ -685,7 +685,7 @@ pub mod platform {
                 let _ = done.send(run_bounded(
                     "/bin/sh",
                     &["-c", &script],
-                    Duration::from_secs(1),
+                    Duration::from_secs(10),
                 ));
             });
             let result = returned

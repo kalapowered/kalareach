@@ -521,12 +521,13 @@ fn clip(text: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// The last component of a path, clipped.
+/// The last component of a path, clipped; a path with none, such as a root, is its own name.
 fn last_component(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
+    let path = Path::new(path);
+    path.file_name()
         .and_then(|name| name.to_str())
         .and_then(clip)
+        .or_else(|| path.to_str().and_then(clip))
 }
 
 /// The program a command line runs: its first word that is neither a variable assignment nor a
@@ -545,6 +546,10 @@ fn program_of(command: &str) -> Option<String> {
             skip_target = false;
             continue;
         }
+        // A word that starts with `#` starts a comment: there is no command in what follows.
+        if word.raw.starts_with('#') {
+            return None;
+        }
         if let Some(operator_only) = word.redirection() {
             // `> file` names its target in the word after it.
             skip_target = operator_only;
@@ -553,7 +558,9 @@ fn program_of(command: &str) -> Option<String> {
         if word.assignment() {
             continue;
         }
-        if word.raw.contains(is_shell_syntax) {
+        // A program word is a name: syntax in it, or a `=` the shell did not take for an
+        // assignment, means this reader does not know what the shell will run.
+        if word.raw.contains(is_shell_syntax) || word.raw.contains('=') {
             return None;
         }
         let name = word.text.rsplit(['/', '\\']).next().unwrap_or(&word.text);
@@ -569,21 +576,33 @@ struct Word {
 }
 
 impl Word {
-    /// Whether the word sets a variable for the command after it: `NAME=value`.
+    /// Whether the word sets a variable for the command after it: `NAME=value` or `NAME+=value`,
+    /// where a name starts with a letter or an underscore.
     fn assignment(&self) -> bool {
-        self.raw
-            .split_once('=')
-            .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(is_variable_character))
+        self.raw.split_once('=').is_some_and(|(name, _)| {
+            let name = name.strip_suffix('+').unwrap_or(name);
+            name.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && name.chars().all(is_variable_character)
+        })
     }
 
     /// Whether the word is a redirection, and when it is, whether it is only the operator, so that
-    /// its target is the next word.
+    /// its target is the next word. An operator is one of the shell's own, so a word this does not
+    /// know is not taken for one, and is not skipped as one.
     fn redirection(&self) -> Option<bool> {
         let rest = self
             .raw
             .trim_start_matches(|character: char| character.is_ascii_digit());
-        let operator = |character: char| matches!(character, '<' | '>' | '&');
-        (rest.starts_with(['<', '>']) || rest.starts_with("&>")).then(|| rest.chars().all(operator))
+        // Longest first, so `>>` is not read as `>` with a target of `>`.
+        const OPERATORS: [&str; 12] = [
+            "<<<", "<<-", "&>>", ">>", "<<", ">|", "<>", "<&", ">&", "&>", "<", ">",
+        ];
+        let operator = OPERATORS
+            .into_iter()
+            .find(|operator| rest.starts_with(operator))?;
+        Some(rest.len() == operator.len())
     }
 }
 
@@ -658,6 +677,9 @@ impl Iterator for Words<'_> {
                 '\\' => {
                     word.raw.push(character);
                     match self.characters.peek().copied() {
+                        // An escaped backslash, or the separator of a Windows network path: this
+                        // reader does not know which, and so does not say where a word ends.
+                        Some('\\') => return Some(None),
                         Some(next) if next.is_whitespace() || matches!(next, '\'' | '"') => {
                             self.characters.next();
                             word.raw.push(next);
@@ -706,14 +728,32 @@ const fn is_variable_character(character: char) -> bool {
 
 /// Reads what the file system says of one read: the directory it names, and the repository above.
 fn read_from_disk(read: &Read) -> Found {
-    let directory = read
-        .shell
-        .and_then(shell_directory)
-        .unwrap_or_else(|| read.directory.clone());
+    // The block's directory is the shell's own spelling of it; the operating system spells a link
+    // out. Where both name one directory, the shell's spelling stays, so a link is not a move.
+    let directory = match read.shell.and_then(shell_directory) {
+        Some(now) if !same_directory(&now, &read.directory) => now,
+        _ => read.directory.clone(),
+    };
     Found {
         repository: repository_above(&directory),
         directory,
     }
+}
+
+/// Whether two paths name one directory.
+#[cfg(unix)]
+fn same_directory(first: &Path, second: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(first), std::fs::metadata(second)) {
+        (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
+        _ => false,
+    }
+}
+
+/// Whether two paths name one directory: where this platform cannot say, they do not.
+#[cfg(not(unix))]
+fn same_directory(_first: &Path, _second: &Path) -> bool {
+    false
 }
 
 /// The directory a shell process is in, as the operating system keeps it, where this platform
@@ -920,6 +960,21 @@ mod tests {
             ("$TOOL --now", None),
             ("(cd /x && run) --now", None),
             ("TOKEN='only a secret'", None),
+            // Appended assignments, `>|` and `<<-`, comments, an escaped backslash and a name the
+            // shell does not take for a variable.
+            ("TOKEN+=s3cret deploy", Some("deploy")),
+            ("TOKEN+=s3cret", None),
+            ("RUSTFLAGS+=\" -D warnings\" cargo build", Some("cargo")),
+            (">| out.log cargo build", Some("cargo")),
+            ("<<- END cat", Some("cat")),
+            ("<<<text cat", Some("cat")),
+            (">&- cargo build", Some("cargo")),
+            ("2>&1 >> log make", Some("make")),
+            ("#note secret text", None),
+            ("TOKEN=x #note", None),
+            ("A=x\\\\ y cmd", None),
+            ("1A=x cmd", None),
+            ("pasted=secret", None),
         ] {
             assert_eq!(program_of(line).as_deref(), program, "{line:?}");
         }
@@ -933,6 +988,49 @@ mod tests {
         assert_eq!(record.events[0].summary, "cargo");
         let encoded = serde_json::to_string(&record).expect("facts encode");
         assert!(!encoded.contains("secret"), "{encoded}");
+    }
+
+    /// A root directory has a name of its own, so `cd /` replaces the directory the session left.
+    #[test]
+    fn the_root_directory_is_named_and_a_move_to_it_is_a_move() {
+        let facts = facts();
+        facts.note_command(&block("ls", "/home/a/kalareach", None), None);
+        assert_eq!(read(&facts).directory.0.as_deref(), Some("kalareach"));
+        facts.note_command(&block("ls", "/", None), None);
+        assert_eq!(read(&facts).directory.0.as_deref(), Some("/"));
+    }
+
+    /// A link to the directory the shell is in is that directory: the shell's spelling stays, and
+    /// where the shell is now replaces a directory it is not in.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_link_to_the_shells_directory_is_not_a_move() {
+        let here = std::env::current_dir().expect("a working directory");
+        let root = tempfile::tempdir().expect("a directory");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&here, &link).expect("a link");
+        let shell = Some(u64::from(std::process::id()));
+        let found = read_from_disk(&Read {
+            epoch: 0,
+            block: 1,
+            directory: link.clone(),
+            shell,
+        });
+        assert_eq!(found.directory, link, "the shell's spelling stays");
+
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).expect("another directory");
+        let found = read_from_disk(&Read {
+            epoch: 0,
+            block: 1,
+            directory: other,
+            shell,
+        });
+        assert_eq!(
+            found.directory.canonicalize().expect("it exists"),
+            here.canonicalize().expect("it exists"),
+            "a directory the shell is not in is replaced by where it is"
+        );
     }
 
     /// A command that has started has no completion, one that has ended has its own, and only
