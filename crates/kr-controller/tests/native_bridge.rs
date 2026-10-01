@@ -736,6 +736,130 @@ fn a_configuration_value_that_registers_another_application_is_refused() {
     assert_eq!(site.tree(), before, "nothing was written");
 }
 
+/// A recipe's configuration key is read where it will stand. A key whose last member is `command`
+/// makes a `command` member in the document, so what it holds is a command the application runs,
+/// and a value that is not the forwarder in a form the host reads is refused: alone and beside the
+/// package's own registration, for a key at any depth. The control is the forwarder itself at such
+/// a key, which is applied.
+#[cfg(unix)]
+#[test]
+fn a_configuration_key_that_makes_a_command_member_is_read_as_a_command() {
+    let with_key = |site: &Site, key: &str, value: &str| {
+        let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+        recipe["install"]
+            .as_array_mut()
+            .expect("the install steps")
+            .push(
+                serde_json::json!({"type": "add_configuration_key", "file": "settings.json",
+                                      "key": key, "value": value}),
+            );
+        recipe["remove"]
+            .as_array_mut()
+            .expect("the removal steps")
+            .insert(
+                0,
+                serde_json::json!({"type": "remove_configuration_key", "file": "settings.json",
+                                   "key": key}),
+            );
+        BridgeTarget {
+            recipe: serde_json::from_value(recipe).expect("a recipe"),
+            ..site.release()
+        }
+    };
+    for (key, value) in [
+        ("statusLine.command", r#""other-command""#),
+        ("mcpServers.channels.command", r#""other-command""#),
+        (
+            "a.b.c.command",
+            r#""kr-hook claude-code hook; other-command""#,
+        ),
+        ("statusLine.command", r#""'kr-hook' claude-code hook""#),
+        ("statusLine.command", "5"),
+        ("statusLine.command", "null"),
+        (
+            "statusLine",
+            r#"{"type": "command", "command": "other-command"}"#,
+        ),
+    ] {
+        let site = Site::new();
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&with_key(&site, key, value)))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(
+            reason.contains(UNREAD_COMMAND),
+            "{key} = {value}: refused as a command the host does not read: {reason}"
+        );
+        assert_eq!(site.tree(), before, "{key} = {value}: nothing was written");
+    }
+    // The control: the forwarder, for the package's own application, at such a key.
+    let site = Site::new();
+    let settled = site
+        .bridges()
+        .reconcile(
+            &plugin(),
+            Some(&with_key(
+                &site,
+                "statusLine.command",
+                r#""kr-hook claude-code hook""#,
+            )),
+        )
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+}
+
+/// A file the recipe installs whose name says it is JSON, and that does not parse as JSON, is
+/// refused: an application that reads it more leniently than this host would read commands this
+/// host never saw. The control is the same file with its content as JSON.
+#[cfg(unix)]
+#[test]
+fn an_installed_json_file_this_host_cannot_read_is_refused() {
+    for bytes in [
+        &b"{ // a comment\n \"hooks\": {} }"[..],
+        &b"{\"hooks\": {},}"[..],
+        &b"not json at all"[..],
+    ] {
+        let site = Site::new();
+        std::fs::write(site.package("a").join("bridge/hooks.json"), bytes).expect("changes it");
+        let before = site.tree();
+        let digest = PayloadDigest::of(bytes).to_string();
+        let target = BridgeTarget {
+            recipe: recipe_with_hooks(&digest),
+            ..site.release()
+        };
+
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+
+        let reason = refused(&settled);
+        assert!(
+            reason.contains("hooks.json") && reason.contains("cannot be read as JSON"),
+            "{reason}"
+        );
+        assert_eq!(site.tree(), before, "nothing was written");
+    }
+    let site = Site::new();
+    std::fs::write(
+        site.package("a").join("bridge/hooks.json"),
+        b"{\"hooks\": {}}",
+    )
+    .expect("changes it");
+    let digest = PayloadDigest::of(b"{\"hooks\": {}}").to_string();
+    let target = BridgeTarget {
+        recipe: recipe_with_hooks(&digest),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+}
+
 /// A forwarder the host cannot name, and an application it does not know, refuse the recipe.
 #[cfg(unix)]
 #[test]
@@ -3576,7 +3700,7 @@ const UNREAD_COMMAND: &str = "starts the forwarder with arguments it does not ac
 /// KR-REQ-11.42: a command that is not a string, and the forwarder's name with an argument list
 /// that is not exactly the application and the surface as two words, are commands the host does
 /// not read, wherever they stand: a list with a third member of any kind, one that is not a word,
-/// or a command member that is not text. Each is refused before anything is written, alone and
+/// a command member that is not text, and a one-line command with an argument list beside it. Each is refused before anything is written, alone and
 /// beside a good command.
 #[cfg(unix)]
 #[test]
@@ -3596,6 +3720,10 @@ fn kr_req_11_42_a_command_in_a_shape_the_host_does_not_read_is_refused_wherever_
         serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
                            "args": ["gemini-cli", 5]}),
         serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook"}),
+        serde_json::json!({"type": "command", "name": "kalareach",
+                           "command": "kr-hook gemini-cli hook", "args": ["extra"]}),
+        serde_json::json!({"type": "command", "name": "kalareach",
+                           "command": "kr-hook gemini-cli hook", "args": []}),
     ];
     for shape in shapes {
         for hooks in [
