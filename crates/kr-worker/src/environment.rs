@@ -155,15 +155,23 @@ impl TerminfoSelection {
 /// `text` with every control character written as its escape, so it stays on one line and a
 /// viewer cannot be made to break it or to reorder what follows.
 ///
-/// That is every control character, the line and paragraph separators (U+2028, U+2029) and the
-/// direction marks and overrides (U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
+/// That is every control character, the line and paragraph separators (U+2028, U+2029) and every
+/// character the Unicode standard names a bidirectional control: the Arabic letter mark (U+061C),
+/// the direction marks (U+200E, U+200F), the embeddings and overrides (U+202A to U+202E) and the
+/// isolates (U+2066 to U+2069).
 fn one_line(text: &str) -> String {
     text.chars()
         .flat_map(|character| {
             if character.is_control()
                 || matches!(
                     character,
-                    '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
                 )
             {
                 character.escape_default().collect::<Vec<_>>()
@@ -830,6 +838,48 @@ mod tests {
                 .describe()
                 .contains("/home/a/\u{e9}.terminfo"),
             "text that is not a control character is written as it is"
+        );
+    }
+
+    /// Every character the Unicode standard names as a bidirectional control, and both separators,
+    /// is written as an escape, and text that only reads right to left is not.
+    #[test]
+    fn every_bidirectional_control_and_separator_is_written_as_an_escape() {
+        let controls = [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{2028}', '\u{2029}',
+        ];
+        for control in controls {
+            let built = built_with(
+                &[("TERMINFO", &format!("/a{control}b"))],
+                &with_private_database("/state/terminfo/ab"),
+            );
+            let line = built.sources.terminfo.describe();
+            assert!(
+                !line.contains(control),
+                "U+{:04X} reached the line as it is: {line:?}",
+                u32::from(control)
+            );
+            assert!(
+                line.contains(&format!("/a{}b", control.escape_default())),
+                "U+{:04X} is not written as its escape: {line:?}",
+                u32::from(control)
+            );
+        }
+        let arabic = built_with(
+            &[(
+                "TERMINFO",
+                "/\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}",
+            )],
+            &with_private_database("/state/terminfo/ab"),
+        );
+        assert!(
+            arabic
+                .sources
+                .terminfo
+                .describe()
+                .contains("/\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}"),
+            "letters that read right to left are text, not controls"
         );
     }
 
