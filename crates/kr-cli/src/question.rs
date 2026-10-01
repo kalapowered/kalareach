@@ -149,7 +149,7 @@ pub async fn answer(
     )
     .await;
     match answered {
-        Ok(Answered::Sent(question)) => Ok(*question),
+        Ok(Answered::Sent(resolved)) => shown(*resolved),
         Ok(Answered::Kept(draft)) => Err(kept(&workers, draft.question_id, "was kept")),
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
@@ -233,7 +233,7 @@ pub async fn send(
     })?;
     let workers = Workers::new(paths, build_id).knowing(std::slice::from_ref(&draft));
     match answers::send(&workers, &drafts, &draft).await {
-        Ok(question) => Ok(question),
+        Ok(resolved) => shown(resolved),
         // The library keeps a draft it could not send for any reason but its question's end, so
         // what is still in the store says whether it stayed kept. The failure is reported as
         // itself, with what the store says beside it, and a store that cannot be read replaces
@@ -976,12 +976,15 @@ impl QuestionHost for Workers {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> std::result::Result<Question, ClientError> {
+    ) -> std::result::Result<QuestionResolveResult, ClientError> {
         let session_id = params.session_id;
         // Nothing is written until the mutation goes out, whatever an earlier attempt recorded.
         self.delivered(Delivery::NotSent);
         let mut connections = self.connections.lock().await;
         let client = self.connection(&mut connections, session_id).await?;
+        // Nothing is sent to a worker whose reply this build cannot be sure to read.
+        check_worker(client.acknowledgement().build.as_ref(), session_id)
+            .map_err(ClientError::Host)?;
         let action_id = ActionId::new(kr_ipc::new_uuid());
         // Composing reads whatever the worker already sent and writes nothing, so a failure here
         // sent nothing.
@@ -1010,7 +1013,7 @@ impl QuestionHost for Workers {
             Ok(Ok(value)) => {
                 self.delivered(Delivery::Taken);
                 match value.to_typed::<QuestionResolveResult>() {
-                    Ok(resolved) => Ok(resolved.question),
+                    Ok(resolved) => Ok(resolved),
                     Err(unreadable) => {
                         let error = ClientError::from(unreadable);
                         self.failed(error.code(), shown!("its reply cannot be read ({})", error));
@@ -1108,6 +1111,11 @@ pub async fn cancel(
     build_id: BuildId,
 ) -> Result<Question> {
     let (descriptor, question, mut client) = locate(paths, question_id, build_id).await?;
+    check_worker(
+        client.acknowledgement().build.as_ref(),
+        descriptor.session_id,
+    )
+    .map_err(CliError::Refused)?;
     let result: QuestionResolveResult = mutate(
         &mut client,
         &descriptor,
@@ -1119,7 +1127,72 @@ pub async fn cancel(
         },
     )
     .await?;
-    Ok(result.question)
+    shown(result)
+}
+
+/// The question a resolution shows, which the host shows this command whole: it answers as the
+/// owner at this machine, whose authority has no grant to narrow it.
+///
+/// # Errors
+///
+/// Returns [`CliError::Unfinished`] when the host took the action and left the question out of its
+/// answer, which it does for a caller whose authority does not reach it.
+fn shown(resolved: QuestionResolveResult) -> Result<Question> {
+    let (session_id, question_id) = (resolved.session_id, resolved.question_id);
+    resolved.into_question().ok_or_else(|| CliError::Unfinished {
+        code: ErrorCode::PermissionDenied,
+        message: shown!(
+            "session {}'s worker took the action on question {}, and does not show the question \
+             to this command",
+            session_id,
+            question_id
+        ),
+    })
+}
+
+/// Refuses a worker whose frames this build cannot be sure to read, before an answer or a
+/// cancellation goes to it.
+///
+/// A worker outlives an upgrade, and what it answers an answer or a cancellation with changes from
+/// one protocol version to the next: a worker of an earlier build keeps the whole question in its
+/// reply and a later one may hold it back, so a command that sent the action and then could not
+/// read the reply would leave its person unsure whether it was taken. A worker states its build in
+/// its answer to the hello, and one whose protocol version shares this build's compatibility level
+/// reads and writes the same frames. Nothing is sent to any other.
+fn check_worker(
+    stated: Option<&kr_protocol::local::LocalBuild>,
+    session_id: SessionId,
+) -> std::result::Result<(), kr_protocol::error::ProtocolError> {
+    use kr_protocol::hello::PACKAGE_VERSION;
+
+    let said = |version: kr_protocol::hello::PackageVersion| {
+        shown!("{}.{}.{}", version.major, version.minor, version.patch)
+    };
+    let worker = match stated {
+        Some(build) if build.protocol_version.shares_frames_with(PACKAGE_VERSION) => {
+            return Ok(());
+        }
+        Some(build) => shown!(
+            "runs on {} with protocol {}",
+            crate::shown::build_name(&build.build_id),
+            said(build.protocol_version)
+        ),
+        None => {
+            Shown::said("runs on a worker of an earlier build, which states no protocol version")
+        }
+    };
+    Err(kr_client::error::refusal(
+        ErrorCode::UnsupportedSchema,
+        shown!(
+            "session {} {}, and this is {} with protocol {}: this kr cannot be sure to read what \
+             that worker answers an answer or a cancellation with, so nothing was sent. Use a kr of \
+             the worker's build",
+            session_id,
+            worker,
+            crate::shown::build_name(&crate::build_id()),
+            said(PACKAGE_VERSION)
+        ),
+    ))
 }
 
 /// Renders one question for a script. Its text, its context, its choices, its label, the

@@ -750,6 +750,30 @@ fn history_bearing_reads_apply_the_grant_filter() {
     );
 }
 
+/// KR-REQ-10.51: the two methods that resolve a question show the question in their result, so
+/// they state the rule that governs a question: its history bound, or a grant that names it while
+/// it is open. Answering still needs `question.respond` and nothing else.
+#[test]
+fn resolving_a_question_applies_the_named_resource_rule_and_needs_only_the_respond_right() {
+    for name in ["question.answer", "question.cancel"] {
+        let entry = lookup(name).expect("listed");
+        assert_eq!(
+            entry.history_filter,
+            HistoryFilter::NamedCurrentResources,
+            "{name} shows a question and must apply the shared history filter to it"
+        );
+        let rights: Vec<ActionRight> = entry.unconditional_rights().collect();
+        assert_eq!(rights, vec![ActionRight::QuestionRespond], "{name}");
+        assert!(
+            entry
+                .required_rights
+                .iter()
+                .all(|required| matches!(required.authority, RequiredAuthority::Right { .. })),
+            "{name} needs no basis beside its right"
+        );
+    }
+}
+
 #[test]
 fn every_entry_that_names_a_capability_names_a_revision() {
     for entry in REGISTRY {

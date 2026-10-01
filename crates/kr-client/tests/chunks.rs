@@ -661,6 +661,7 @@ async fn converse(
                                         } else {
                                             Nullable::null()
                                         },
+                                        error_withheld: false,
                                         updated_at_ms: TimestampMs::new(0),
                                     },
                                 }))

@@ -91,8 +91,8 @@ links to its document.
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `question.read` | read | `local_ipc`, `paired_device` | Read questions this actor may see, at their exact current revision. | [Agent contact: Answering from the terminal](../contact/README.md) |
-| `question.answer` | write | `local_ipc`, `paired_device` | Answer the exact question revision shown, resolved atomically. | [Agent contact: Questions](../contact/README.md) |
-| `question.cancel` | write | `local_ipc`, `paired_device` | Cancel the exact question revision shown, resolved atomically. | [Agent contact: Cancellation](../contact/README.md) |
+| `question.answer` | write | `local_ipc`, `paired_device` | Answer the exact question revision shown, resolved atomically. Only a question the caller's history reaches, or its grant names while it is open, can be answered. The result shows the question under the caller's present view authority and history scope, and the same holds for a retained copy of it. | [Agent contact: Questions](../contact/README.md) |
+| `question.cancel` | write | `local_ipc`, `paired_device` | Cancel the exact question revision shown, resolved atomically. Only a question the caller's history reaches, or its grant names while it is open, can be cancelled. The result shows the question under the caller's present view authority and history scope, and the same holds for a retained copy of it. | [Agent contact: Cancellation](../contact/README.md) |
 
 ## Skill setup
 

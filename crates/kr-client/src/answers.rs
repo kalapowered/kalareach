@@ -175,8 +175,10 @@ pub enum Reconciled {
 /// What became of one answer a person gave.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Answered {
-    /// The host took it. This is the question as it now stands.
-    Sent(Box<Question>),
+    /// The host took it. This is what the host says of the resolution: its own record of it, and
+    /// the question as it now stands, which the host leaves out of the answer to a device whose
+    /// grant does not reach it ([`QuestionResolveResult::question`]).
+    Sent(Box<QuestionResolveResult>),
     /// The host could not be reached, so it is kept on this device.
     Kept(AnswerDraft),
 }
@@ -185,11 +187,11 @@ impl std::fmt::Debug for Answered {
     /// Which question it was and where it stands, never its text.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Sent(question) => formatter
+            Self::Sent(resolved) => formatter
                 .debug_struct("Sent")
-                .field("question_id", &question.question_id)
-                .field("revision", &question.revision)
-                .field("state", &question.state)
+                .field("question_id", &resolved.question_id)
+                .field("revision", &resolved.revision)
+                .field("state", &resolved.state)
                 .finish_non_exhaustive(),
             Self::Kept(draft) => formatter.debug_tuple("Kept").field(draft).finish(),
         }
@@ -279,7 +281,7 @@ pub trait QuestionHost {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> impl Future<Output = std::result::Result<Question, ClientError>> + Send;
+    ) -> impl Future<Output = std::result::Result<QuestionResolveResult, ClientError>> + Send;
 
     /// Whether the host's own record of a session says the session ended.
     ///
@@ -314,8 +316,8 @@ impl QuestionHost for Session {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> std::result::Result<Question, ClientError> {
-        let result: QuestionResolveResult = self
+    ) -> std::result::Result<QuestionResolveResult, ClientError> {
+        Ok(self
             .mutate(
                 Method::QuestionAnswer,
                 target,
@@ -325,8 +327,7 @@ impl QuestionHost for Session {
                 ANSWER_TTL,
             )
             .await?
-            .to_typed()?;
-        Ok(result.question)
+            .to_typed()?)
     }
 
     async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {
@@ -561,10 +562,10 @@ pub async fn answer<H: QuestionHost>(
         .submission(Some(question))
         .map_err(AnswerError::Retired)?;
     match host.answer(draft.target.clone(), params).await {
-        Ok(question) => {
+        Ok(resolved) => {
             // An answer kept earlier for this question has been superseded by this one.
             drafts.discard(draft.question_id)?;
-            Ok(Answered::Sent(Box::new(question)))
+            Ok(Answered::Sent(Box::new(resolved)))
         }
         Err(error) if keeps_the_answer(&error) => {
             drafts.keep(&draft)?;
@@ -665,7 +666,7 @@ pub async fn send<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
     draft: &AnswerDraft,
-) -> Result<Question> {
+) -> Result<QuestionResolveResult> {
     let questions = host.questions(draft.session_id).await?;
     let current = questions
         .iter()
@@ -683,9 +684,9 @@ pub async fn send<H: QuestionHost>(
         }
     };
     match host.answer(draft.target.clone(), params).await {
-        Ok(question) => {
+        Ok(resolved) => {
             drafts.discard(draft.question_id)?;
-            Ok(question)
+            Ok(resolved)
         }
         Err(ClientError::Host(refused))
             if matches!(

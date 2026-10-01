@@ -46,6 +46,13 @@ pub struct Vouched<'a> {
     pub actor: &'a ActorEnvelope,
     /// The rights of the grant the host checked this request against.
     pub grant_rights: &'a CanonicalSet<ActionRight>,
+    /// The history scope of that grant, for a caller that acts under one.
+    ///
+    /// The worker holds what it retains to it: the first answer to a question and the retained
+    /// answer to a duplicate are shown as far as it reaches. It goes only to a worker that states
+    /// it holds results to a scope ([`kr_protocol::local::FORWARDED_RESULT_SCOPE`]), because an
+    /// earlier worker ends the link a frame with a member it does not know arrived on.
+    pub history: Option<&'a HistoryScope>,
 }
 use crate::service::Controller;
 
@@ -196,6 +203,12 @@ pub struct WorkerProxy {
     /// A worker of an earlier build reads a scope and still answers a question read with every
     /// question it holds, so a question read with a scope goes only to a worker that says this.
     holds_question_reads: bool,
+    /// Whether the worker said, in the same answer, that it holds what it retains to the history
+    /// scope a forwarded mutation carries.
+    ///
+    /// A worker of an earlier build keeps a retained answer whole and ends the link a mutation with
+    /// a scope arrived on, so such a worker is sent none.
+    holds_results_to_scopes: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -281,6 +294,8 @@ impl WorkerProxy {
             kr_protocol::local::reads_history_scopes(&acknowledgement.capabilities);
         let holds_question_reads =
             kr_protocol::local::holds_question_reads_to_scopes(&acknowledgement.capabilities);
+        let holds_results_to_scopes =
+            kr_protocol::local::holds_results_to_scopes(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -299,6 +314,7 @@ impl WorkerProxy {
             next_request: AtomicU64::new(1),
             reads_history_scopes,
             holds_question_reads,
+            holds_results_to_scopes,
         }))
     }
 
@@ -348,6 +364,10 @@ impl WorkerProxy {
             actor: vouched.actor.clone(),
             grant_rights: vouched.grant_rights.clone(),
             accepted_deadline_boot_ms,
+            history: vouched
+                .history
+                .filter(|_| self.holds_results_to_scopes)
+                .cloned(),
         }));
         self.call(request_id, &frame).await
     }

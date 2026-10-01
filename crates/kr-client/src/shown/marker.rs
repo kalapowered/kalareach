@@ -1077,7 +1077,9 @@ mod cases {
             resolved_at_ms: Nullable::null(),
         };
         renders_only(
-            &crate::answers::Answered::Sent(Box::new(question)),
+            &crate::answers::Answered::Sent(Box::new(
+                kr_protocol::question::QuestionResolveResult::whole(question),
+            )),
             "Sent{question_id:QuestionId(Uuid(08080808-0808-0808-0808-080808080808)),\
              revision:QuestionRevision(U64(1)),state:Pending,..}",
         );

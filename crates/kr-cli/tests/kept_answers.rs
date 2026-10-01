@@ -733,10 +733,8 @@ fn take(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, Proto
     question.state = QuestionState::Answered;
     question.revision = QuestionRevision::new(question.revision.get() + 1);
     question.resolved_at_ms = Nullable::some(now);
-    ParamsValue::from_typed(&QuestionResolveResult {
-        question: question.clone(),
-    })
-    .map_err(|error| refusal(&error.to_string()))
+    ParamsValue::from_typed(&QuestionResolveResult::whole(question.clone()))
+        .map_err(|error| refusal(&error.to_string()))
 }
 
 /// KR-REQ-11.63: an answer the worker could not take is kept on this device, the person is told,

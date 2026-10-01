@@ -233,11 +233,44 @@ pub struct Receipt {
     pub accepted_deadline_ms: Nullable<TimestampMs>,
     /// The failure recorded with a refusal, rejection or unknown outcome.
     pub error: Nullable<ProtocolError>,
+    /// True when the host replaced the message of [`Self::error`] with one of its own, because the
+    /// reader is not the local owner. An error's message can quote an upstream, a session or a
+    /// person, and it carries no date of its own to hold to a history bound, so only the owner is
+    /// shown it again. The code, the retry category and the diagnostic identifier stay.
+    ///
+    /// It is absent from the wire when it is false, so a receipt the host shows in full is byte
+    /// for byte what a reader built before this member expects. Remove the default and the omission
+    /// once no worker of a build before this member can still be running.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub error_withheld: bool,
     /// When this revision was written.
     pub updated_at_ms: TimestampMs,
 }
 
 impl Receipt {
+    /// Returns this receipt as a reader that may not see an error's text is shown it: the message
+    /// is replaced by a sentence the host composes from the code, and [`Self::error_withheld`] says
+    /// so. A receipt that records no error is returned as it is.
+    #[must_use]
+    pub fn with_error_withheld(&self) -> Self {
+        let Some(error) = self.error.as_ref() else {
+            return self.clone();
+        };
+        let mut shown = self.clone();
+        shown.error = Nullable::some(ProtocolError {
+            code: error.code,
+            message: format!(
+                "the action failed with {}; the host does not show the detail of a failure to this \
+                 reader",
+                error.code
+            ),
+            retry: error.retry,
+            diagnostic_id: error.diagnostic_id.clone(),
+        });
+        shown.error_withheld = true;
+        shown
+    }
+
     /// Moves the receipt to `next` at `revision`.
     ///
     /// # Errors
@@ -337,4 +370,88 @@ pub struct ActionCancelParams {
 pub struct ActionCancelResult {
     /// The receipt after the cancellation.
     pub receipt: Receipt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+    use crate::ids::ActionId;
+    use crate::scalars::{Digest256, Uuid};
+
+    fn receipt(error: Option<ProtocolError>) -> Receipt {
+        Receipt {
+            action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+            actor_id: ActorId::new("device:test").expect("a principal"),
+            method: crate::method::Method::AgentPromptSubmit.into(),
+            method_version: MethodVersion::V1,
+            revision: U64::new(3),
+            state: ReceiptState::Refused,
+            reason: Nullable::null(),
+            payload_digest: Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable(error),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(7),
+        }
+    }
+
+    /// KR-REQ-10.49: a receipt the host shows in full is the frame a reader built before the
+    /// marker expects, and a frame without the marker reads as one that shows its error.
+    #[test]
+    fn a_receipt_shown_in_full_has_no_marker_on_the_wire() {
+        let shown = receipt(Some(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "the upstream said the prompt was too long",
+        )));
+        let json = serde_json::to_value(&shown).expect("encodes");
+        assert!(json.get("error_withheld").is_none(), "{json}");
+        let decoded: Receipt = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, shown);
+        assert!(!decoded.error_withheld);
+    }
+
+    /// KR-REQ-10.49: an error's text is replaced for a reader that may not see it, the marker says
+    /// so, and what a client acts on stays: the state, the code, the retry category and the
+    /// diagnostic identifier.
+    #[test]
+    fn a_receipt_withholding_its_error_keeps_the_code_and_loses_the_text() {
+        let error = ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "the upstream said: remove the secret in /home/person/notes",
+        )
+        .with_diagnostic_id(
+            crate::ids::DiagnosticId::new("diag-7f3a").expect("a diagnostic identifier"),
+        );
+        let full = receipt(Some(error.clone()));
+        let shown = full.with_error_withheld();
+
+        assert!(shown.error_withheld);
+        let kept = shown.error.as_ref().expect("an error is still recorded");
+        assert_eq!(kept.code, error.code);
+        assert_eq!(kept.retry, error.retry);
+        assert_eq!(kept.diagnostic_id, error.diagnostic_id);
+        assert!(kept.is_consistent());
+        let json = serde_json::to_string(&shown).expect("encodes");
+        assert!(!json.contains("secret"), "{json}");
+        assert!(!json.contains("/home/person"), "{json}");
+        assert!(json.contains("\"error_withheld\":true"), "{json}");
+        assert_eq!(shown.state, full.state);
+        assert_eq!(shown.revision, full.revision);
+        assert_eq!(shown.payload_digest, full.payload_digest);
+        assert_eq!(shown.updated_at_ms, full.updated_at_ms);
+
+        let decoded: Receipt = serde_json::from_str(&json).expect("decodes");
+        assert_eq!(decoded, shown);
+        assert_eq!(decoded.with_error_withheld(), shown);
+    }
+
+    /// KR-REQ-10.49: a receipt that records no error has nothing to withhold, and says nothing
+    /// was.
+    #[test]
+    fn a_receipt_with_no_error_is_shown_as_it_is() {
+        let applied = receipt(None);
+        assert_eq!(applied.with_error_withheld(), applied);
+        assert!(!applied.with_error_withheld().error_withheld);
+    }
 }

@@ -13818,6 +13818,17 @@
           "type": "array",
           "uniqueItems": true
         },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The history scope of the grant the host decided this mutation under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies it to the answer it gives the caller: the first answer to a question, and\nthe retained answer to a duplicate. The worker holds no grants, so the scope travels with\nthe mutation. It is absent for a caller acting under no grant. Absence never widens what a\ncaller is shown: a worker shows retained content without a scope only to a caller it can\nsee is the local owner.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before scopes travelled with mutations reads, and the daemon's own link\nfor a local caller's action never writes one. A daemon sends one only to a worker that states\n[`FORWARDED_RESULT_SCOPE`]."
+        },
         "mutation": {
           "$ref": "#/$defs/MutationRequest",
           "description": "The caller's mutation, exactly as it arrived at the host."
@@ -17531,12 +17542,12 @@
         },
         {
           "const": "question.answer",
-          "description": "Answer the exact question revision shown, resolved atomically.",
+          "description": "Answer the exact question revision shown, resolved atomically. Only a question the caller's history reaches, or its grant names while it is open, can be answered. The result shows the question under the caller's present view authority and history scope, and the same holds for a retained copy of it.",
           "type": "string"
         },
         {
           "const": "question.cancel",
-          "description": "Cancel the exact question revision shown, resolved atomically.",
+          "description": "Cancel the exact question revision shown, resolved atomically. Only a question the caller's history reaches, or its grant names while it is open, can be cancelled. The result shows the question under the caller's present view authority and history scope, and the same holds for a retained copy of it.",
           "type": "string"
         },
         {
@@ -26341,14 +26352,53 @@
     },
     "QuestionResolveResult": {
       "additionalProperties": false,
-      "description": "The result of `question.answer` and `question.cancel`.",
+      "description": "The result of `question.answer` and `question.cancel`.\n\nThe first five members are the host's own record of the resolution. They carry no content an\napplication or a person wrote, so every caller that took the action is told them. `question` is\nthe question as it now stands, and null means the host withheld it: what a question asks, the\ncontext it gives, its choices, who asked it and what was answered are session content, and the\nhost shows them under the caller's present view authority and history scope. A caller that\nsent the answer already holds what it said.",
       "properties": {
         "question": {
-          "$ref": "#/$defs/Question",
-          "description": "The question as it now stands."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Question"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The question as it now stands, or null where the host withheld it from this caller."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question's identity."
+        },
+        "resolved_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it reached a terminal state."
+        },
+        "revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "Its revision after the resolution."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that owns it."
+        },
+        "state": {
+          "$ref": "#/$defs/QuestionState",
+          "description": "Where it stands now."
         }
       },
       "required": [
+        "question_id",
+        "revision",
+        "state",
+        "session_id",
+        "resolved_at_ms",
         "question"
       ],
       "type": "object"
@@ -26571,6 +26621,10 @@
             }
           ],
           "description": "The failure recorded with a refusal, rejection or unknown outcome."
+        },
+        "error_withheld": {
+          "description": "True when the host replaced the message of [`Self::error`] with one of its own, because the\nreader is not the local owner. An error's message can quote an upstream, a session or a\nperson, and it carries no date of its own to hold to a history bound, so only the owner is\nshown it again. The code, the retry category and the diagnostic identifier stay.\n\nIt is absent from the wire when it is false, so a receipt the host shows in full is byte\nfor byte what a reader built before this member expects. Remove the default and the omission\nonce no worker of a build before this member can still be running.",
+          "type": "boolean"
         },
         "method": {
           "$ref": "#/$defs/MethodName",

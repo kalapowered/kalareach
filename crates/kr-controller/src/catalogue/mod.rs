@@ -1733,6 +1733,7 @@ fn action_read_result(
                     .map(kr_protocol::scalars::TimestampMs::new),
             ),
             error: Nullable(record.error.clone()),
+            error_withheld: false,
             updated_at_ms: kr_protocol::scalars::TimestampMs::new(record.updated_at_ms),
         },
         result,

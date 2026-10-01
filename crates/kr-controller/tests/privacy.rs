@@ -1462,7 +1462,7 @@ async fn kr_req_24_28_a_pending_question_and_approval_are_still_answered_and_the
         .expect("the question is answered while privacy mode is on")
         .to_typed()
         .expect("decodes");
-    assert_eq!(resolved.question.state, QuestionState::Answered);
+    assert_eq!(resolved.state, QuestionState::Answered);
     viewer.close();
     responder.close();
 

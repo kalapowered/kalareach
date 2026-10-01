@@ -671,6 +671,7 @@ impl RemoteConnection {
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
                 let grant_rights = rights;
+                let history = self.device.grant.history.clone();
                 let request_id = mutation.request_id;
                 // The answer comes back before the link that carried the close is released,
                 // because releasing it is what tells the worker the acceptance was delivered.
@@ -685,6 +686,7 @@ impl RemoteConnection {
                             Vouched {
                                 actor: &envelope,
                                 grant_rights: &grant_rights,
+                                history: Some(&history),
                             },
                             accepted,
                             &observer,
