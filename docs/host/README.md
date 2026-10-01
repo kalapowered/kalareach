@@ -1114,33 +1114,37 @@ negotiation of the buffer that is not showing, the virtual title stack, soft-wra
 right-hand side of a row wider than the window, and a pending wrap on a row outside that window —
 and `Session::restoration_losses` is the count.
 
-The hidden buffer (the one that is not showing) is painted, and that has to be done before anything
-else is installed. Entering through mode 1049 clears the buffer. So this paints the rows after
-entering 1049 and before leaving 1049 (which retains what was painted). Leaving 1049 restores the
-cursor and (on some terminals) turns line-feed/new-line mode off. (A mode installed first would be
-undone.) Mode 47 is not one the profile tracks, and a restoration never asks a terminal for it. What
-the switches save is what the session has saved. If the session has no saved cursor, nothing is
-saved.
+To paint the buffer that is not showing, the restoration enters it through mode 1049 (clearing it)
+and leaves it (retaining what was painted) before installing anything, since leaving restores the
+cursor and may turn off line-feed/new-line mode on some terminals, undoing anything that was put in.
+When the primary buffer is showing, the other buffer is painted immediately after the soft reset,
+and the reset is repeated to forget the cursor that entering saved. When the alternate buffer is
+showing, the primary buffer is painted between leaving and re-entering the alternate buffer. The
+second entry to the alternate buffer saves a plain cursor (the default pen and shape, no link, at
+home). Mode 47 is not one the profile tracks, and a restoration never asks a terminal for it. A
+saved cursor the session holds for the buffer that is showing is installed afterwards. The one it
+holds for the other buffer is counted as not carried.
 
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
 the input lease has no destination, so it becomes a durable host event in the worker's own journal
 rather than being shown to whoever happens to be watching.
 
-A side effect that has a destination is delivered whole, never trimmed as if it were a span of the
-stream. It is also delivered ahead of any request to begin again that the same output makes of that
-attachment, because the byte that ends a clipboard write can also be the byte that lets a held
-terminal take the stream. If a side effect with a destination cannot be delivered (because the lease
-has since moved, the attachment has no subscription, its stream has been told to begin again, or its
-queue has no room) it is treated the same as a side effect with no destination and recorded as a
-host event. If a subscription is replaced by another, any queued side effects on the subscription
-will be written prior to the subscription being stopped.
+A side effect with a destination is delivered whole, never trimmed as if it were a span of the
+stream, and ahead of any request to begin again that the same output makes of that attachment,
+because the byte that ends a clipboard write can also be the byte that lets a held terminal take the
+stream. If a side effect with a destination cannot be delivered for any reason (its lease has moved,
+its attachment has no subscription, its stream has been told to begin again, or its queue has no
+room), it is recorded as a host event as though it had no destination. When a subscription is
+replaced by another, the original subscription will attempt to deliver all side effects queued on
+its stream before it stops. These side effects will be delivered in full, and any that cannot be
+delivered will be recorded as host events.
 
 The host's own replies to the application's questions are measured on the session's continuous
-clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. One
-read writes at most 4 KiB of replies, and the rest wait for a later read within the same two
-seconds. A host can answer at most 256 questions in one second, wall clock stepping does not make
-replies drop sooner or wait longer.
+clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. Each
+time the lane is drained it writes at most 4 KiB of replies, and the rest wait for a later drain
+within the same two seconds. A session answers at most 256 questions a second. A step of the wall
+clock neither drops a reply early nor holds one longer.
 
 ## Windows
 
