@@ -16,6 +16,7 @@ import { fakeHost, type FakeHostControls } from './host/fake'
 // The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
 // the phone's one without pretending to be a phone.
 import { Shell, surfaceOf } from './mobile/entry'
+import { HarnessStrip } from './harness-strip'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -38,6 +39,7 @@ createRoot(root).render(
   <StrictMode>
     <AppProvider port={port}>
       <Shell surface={surfaceOf(window.location.search)} />
+      <HarnessStrip controls={controls} />
     </AppProvider>
   </StrictMode>
 )
