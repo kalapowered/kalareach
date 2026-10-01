@@ -520,6 +520,13 @@ journal also says what an applied release yields for the sessions that launch it
 application name its registration invokes the forwarder for, the registrations it makes and the
 forwarder it is expected to start.
 
+`kr doctor` has a row for the native bridges. As for the other checks, the row states a package's
+name, an application's name and any note by class and length only. The row also contains the state
+of the bridge, the number of files the host published for the bridge and each file's digest. The row
+emits a warning when the bridge is applying, removing or unsettled, or when it is applied and its
+files no longer match what was applied. If the host refused a recipe, the row reports it as refused
+and emits no warning. On Windows the host refuses every recipe, and the row says so.
+
 ## The transport, and the broker
 
 A repository is read over https or from a local directory, and nothing else: a Git URL, a branch or
