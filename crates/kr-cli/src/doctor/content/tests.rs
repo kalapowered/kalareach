@@ -880,7 +880,7 @@ fn entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
 async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints_or_writes() {
     use kr_protocol::session::ClosureRecord;
 
-    const MARKERS: [&str; 8] = [
+    const MARKERS: [&str; 9] = [
         "kr-marker-token-1",
         "kr-marker-pass-2",
         "kr-marker-url-3",
@@ -889,9 +889,13 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
         "kr-marker-equals-6",
         "kr-marker-overlap-7",
         "kr-marker-apostrophe-8",
+        "kr-marker-whole-9",
     ];
     let mut planted = listed(1);
-    planted.shell_path = format!("/opt/tools/sh --password {}", MARKERS[1]);
+    planted.shell_path = format!(
+        "/opt/tools/sh --password {} -e \"PASSWORD=two words {}\"",
+        MARKERS[1], MARKERS[8]
+    );
     planted.cwd = format!(
         "/home/tom/work TOKEN={} https://user:{}@host.example/ --secret \"two words {}\"",
         MARKERS[0], MARKERS[2], MARKERS[3]
@@ -983,6 +987,7 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
     );
     for readable in [
         "[home]/projects/ordinary --password [redacted]",
+        "-e \\\"PASSWORD=[redacted]\\\"",
         "https://[redacted]@host/",
         "/bin/zsh",
         "TOKEN=[redacted]",
