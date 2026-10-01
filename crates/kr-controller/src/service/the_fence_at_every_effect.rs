@@ -463,6 +463,7 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
     };
 
     let stale = revoke(1);
+    let revision_before = controller.policy().authority_revision();
     let answered = controller
         .write_method(
             &actor_id,
@@ -480,6 +481,11 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
     assert_eq!(
         error.message,
         crate::authority::AdmissionLapse::Revoked.to_string()
+    );
+    assert_eq!(
+        controller.policy().authority_revision(),
+        revision_before,
+        "the refused change advanced nothing"
     );
 
     // The control: the revision the connection stands under now.
@@ -500,6 +506,76 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
         refusal(&answered).is_none(),
         "a change under the revision in force is performed: {answered:?}"
     );
+}
+
+/// KR-REQ-09.12: a method that takes no admission into a service is still refused on a connection
+/// whose registration was withdrawn while the call waited. The control: the same methods, on a
+/// connection whose registration stands, are not refused for authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let request = |method: Method| MutationRequest {
+        request_id: RequestId::new(1),
+        method: method.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(temp.environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: ActionWindowId::new("local:test").expect("a window"),
+        requested_ttl_ms: DurationMs::new(30_000),
+        params: ParamsValue::empty(),
+    };
+    let methods = [
+        Method::EnvironmentEnrol,
+        Method::EnvironmentForget,
+        Method::EnvironmentRefresh,
+        Method::HostUpdateHandover,
+    ];
+
+    // The control first: nothing here is refused for authority while the registration stands.
+    for method in [
+        Method::EnvironmentEnrol,
+        Method::EnvironmentForget,
+        Method::EnvironmentRefresh,
+    ] {
+        let answered = controller
+            .write_method(
+                &actor_id,
+                &request(method),
+                method,
+                connection_id,
+                Some(accepted(&controller)),
+                Some(captured),
+            )
+            .await;
+        assert!(
+            refusal(&answered).is_none_or(|error| !error.message.contains("withdrawn")),
+            "{method:?} on a standing registration: {answered:?}"
+        );
+    }
+
+    controller.admitted_table().remove(&connection_id);
+    for method in methods {
+        let answered = controller
+            .write_method(
+                &actor_id,
+                &request(method),
+                method,
+                connection_id,
+                Some(accepted(&controller)),
+                Some(captured),
+            )
+            .await;
+        let error = refusal(&answered)
+            .unwrap_or_else(|| panic!("{method:?} on a withdrawn registration: {answered:?}"));
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{method:?}");
+        assert!(error.message.contains("withdrawn"), "{method:?}: {error:?}");
+    }
 }
 
 /// A worker the lease issuer has bound and holds the acknowledgement of the revision in force from,
