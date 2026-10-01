@@ -908,10 +908,13 @@ jobs:
       # The cases that drive a package are left out of a run that has built none, such as the rust
       # job's. This job built them above, so it runs those cases with --include-ignored, and a
       # package that is missing, or is not the one this tree gives, fails the case that needed it.
+      # The module and relocation suites load a native module into the built Zsh package and start
+      # a copy of its tree from another path.
       - name: Drive the built packages through the contract
         run: |
           cargo test --locked -p kr-shell-integration \
-            --test zsh --test bash --test fish --test pwsh -- --test-threads=1 --include-ignored
+            --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation \
+            -- --test-threads=1 --include-ignored
 
       # Section 7 qualifies the packages against the startup customisations people run. The
       # customisations are pinned by digest and fetched once here. The checks that need a package
@@ -930,6 +933,17 @@ jobs:
           cargo test --locked -p kr-shell-integration --test qualification -- \
             --test-threads=1 --include-ignored
           cat /tmp/kr-shell-qualification/qualification-cases.tsv
+
+      # The installer is run over a home for each customisation the qualification pins and over
+      # the homes the corpus does not have. This job holds what that needs: the fetched
+      # customisations, the built packages and the qualified PowerShell package. The suite runs the
+      # installer's own `kr`, which this job builds first, since no test of the package crate
+      # builds it.
+      - name: Install onto a home that holds each customisation
+        run: |
+          cargo build --locked -p kr-cli --bin kr
+          cargo test --locked -p kr-shell-integration --test install_homes -- \
+            --test-threads=1 --include-ignored
 
   typescript:
     name: typescript
