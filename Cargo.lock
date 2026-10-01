@@ -4341,6 +4341,7 @@ dependencies = [
 name = "kr-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "kr-attention",
  "kr-cbor",
