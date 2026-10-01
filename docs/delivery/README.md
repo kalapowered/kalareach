@@ -17,6 +17,24 @@ can still see the pending work on the host. The event row carries the notice it 
 the next pass finishes what the last one started rather than skipping an event whose cursor has
 already moved.
 
+## What feeds the journal
+
+The environment's attention store decides that something wants a person and offers the decision as
+an announcement. The daemon takes announcements on every pass, whether or not a transport is
+attached. For each one, it commits the events and the consumer's cursor to the delivery journal in
+one transaction, and only then tells the store it has them. If the daemon stops between the commit
+and the settlement, it is offered the same announcements when it restarts, and the event keys absorb
+them: one announcement is one event and one set of notifications. If the daemon stops before the
+commit, nothing is lost, because the store still holds what was never settled.
+
+Producing is a separate step that reads the notice the journal holds for each event. A pass that
+fails while it produces is finished by the next pass, without a restart.
+
+Some announcements are taken and produce nothing. One about a session the daemon is still closing is
+held back until the closure is read to its end, because its condition ends with the session. One
+routed to the input lease holder is not for a destination of this host. One decided while privacy
+mode was on is never sent after it ends.
+
 ## What travels, and what does not
 
 A notification carries four things: an opaque identifier, a sealed preview, an expiry, and a
@@ -36,12 +54,35 @@ A registration is one action with one answer. The host keeps the answer with the
 device whose answer was lost asks again with the same action and is told what it was told the first
 time, even after a later rotation; a new action carrying an old revision is refused. The delivery
 journal takes a registration before the device directory does, and a host that stopped between the
-two finishes the directory's half from the journal when it next starts.
+two finishes the directory's half from the journal when it next starts. The registration carries the admission it was served under,
+and both stores ask it again where they are written.
 
 The **collapse identifier** groups notifications about one thing so the newest replaces the older on
 the device. It is a keyed digest of what the host groups by, under a secret only the delivery
 journal holds, so two equal values tell a provider that they group and nothing about what they
 group.
+
+## Who may be told
+
+A notification is built for a destination only when the recipient's grant reaches what the notice is
+about, and the grant is read as it stands. A notice about sessions needs `session.view` over every
+one of them. A notice about a workflow needs `automation.manage` under the grant the workflow itself
+acts under. A notice about the environment needs `host.manage`. Earlier history is opt-in: a grant
+reaches what was first seen at or after its history cursor, or at or after the moment it began when
+it has none. A notice outside a destination's reach writes no record, because it is not a refusal. A
+destination with no rule, or one whose grant no longer stands, gets a refused record that says why.
+
+A paired device's destination is named by the device's identifier, and its rule names a grant that
+has to be the device's own. A rule that names another device's grant admits nothing, and neither
+does a device that is no longer paired. The grant is found in the grant store and then in the
+device's own record, where its revocation and its expiry are written. It is decided the way one of
+the device's own requests is: on the continuous clock and on UTC, under the host's policy and under
+the rights ceiling its configuration holds.
+
+The grant is asked three times: when the notification is produced, when it is claimed, and once more
+after the credential has been renewed, which can wait on the gateway, immediately before the request
+is presented. What the grant reaches is digested with the notification, so a change to it settles
+the notification as revoked rather than sending it.
 
 ## Two sizes, measured rather than estimated
 
@@ -77,13 +118,20 @@ bytes, so the gateway recognises a repeat and answers with the decision it alrea
 - A **rejected token** takes the destination out of service until a native registration proves
   receipt again.
 
+What a gateway answers is read by a decoder and never turned into text. An outcome records the
+answer's status and this host's own words, and a refused renewal records the code the gateway named
+only when it is one of a closed list this host holds. Nothing else the gateway says reaches the
+journal or a log, however it is worded, because an answer that repeats what it was shown repeats the
+bearer credential.
+
 ## Who sends, and when
 
 The daemon sends on its own. Its start path runs recovery first: an attempt an earlier daemon left
 on the wire becomes an outcome nobody knows, queued work whose authority has ended is taken back,
 and every event taken and never produced from is finished. Nothing is delivered until recovery has
-succeeded; one that fails is tried again before every pass. Then a pass runs every second and
-claims and sends whatever is due.
+succeeded; one that fails is tried again before every pass. Then a pass runs every second. It takes
+what the attention store has announced, produces from what the journal has taken, and claims and
+sends whatever is due.
 
 Every few minutes, on a loop of its own, the daemon renews delivery credentials inside their renewal
 window, so a credential is current before a notification needs it, and asks about outcomes nobody
@@ -141,8 +189,9 @@ authority, which is the grant the destination's rule names, read from the host's
 intersected with the host's current policy at the moment of asking: a grant that is revoked,
 expired, not yet redeemed, issued for another environment, refused by the policy (an organisation
 grant whose recipient no current member lease answers for, a personal grant on a host that is
-exclusively organisation-managed, remote use past the offline-validity bound), or one whose rights
-no longer include viewing a session admits nothing. The host filter
+exclusively organisation-managed, remote use past the offline-validity bound), or one whose rights,
+after the policy and the host's configured ceiling, include nothing a notification can ask for admits
+nothing. The host filter
 decides which interval of history the grant reaches, and the producer checks that each line's
 session is one the grant covers. A line that fails either is left out, and the message says how
 many were left out and why.
@@ -242,15 +291,29 @@ destination, and a webhook configured without an identifier.
 
 ## Privacy mode
 
-Enabling privacy mode fences the delivery outbox at once: nothing more is offered to a sender, and
-the fence is in the read every sender makes rather than in a flag each of them remembers to check.
-Work that was admitted and never dispatched is taken back, and its bytes go with it. The queued
-request bodies and the encrypted objects a preview's excess moved into are removed; the records of
-what happened stay, because a host that forgot its own attempts could not tell a person what the
-device did not see.
+Enabling privacy mode fences the delivery outbox at once. Nothing that carries content is offered to
+a sender, and the fence is in the read every sender makes rather than in a flag each of them
+remembers to check. Work that was admitted and never dispatched is taken back, and its bytes go with
+it. The queued request bodies and the encrypted objects a preview's excess moved into are removed.
+The records of what happened stay, because a host that forgot its own attempts could not tell a
+person what the device did not see.
 
 Cleanup is not complete while an attempt is on the wire or an outcome is unknown. A result produced
 under an earlier generation is refused rather than published.
+
+A pending question or approval still alerts a paired device while privacy mode is on, under the
+grant the device holds, but with no preview and none of its words. The notification is the generic
+alert, grouped on the device by its rule and the privacy generation and by nothing that names the
+session. It is the only thing the outbox takes under the fence, and it is admitted in the same
+transaction as its event. Every other announcement decided while privacy mode is on is taken from
+the store and settled with nothing produced, and it is never sent after privacy mode ends, because
+turning privacy mode off cannot reconstruct what was withheld. The journal records when privacy mode
+was last turned off, and an announcement decided at or before that moment is dropped. One decided
+between the state being published as off and the journal lifting its fence is dropped too.
+
+The alerts are the only rows of the generation the fence stands at. Cleanup acts on rows of earlier
+generations, so running it again at every start leaves them alone, and turning privacy mode off
+takes back the ones nothing has sent.
 
 What has already left is not erased and is not claimed to be. Notifications a provider queued and
 messages another service accepted are listed as retained artifacts, each carrying the notification
@@ -258,6 +321,20 @@ and destination it is a copy of so that a separately authorised deletion action 
 artifact a person chose. Every entry is marked non-deletable (`deletable: false`): the flag says
 whether this host holds a way to ask for a removal, and for a copy that is on a device or in another
 service it does not.
+
+## Session text
+
+A notice holds none of a session's text. When an announcement's words are a session's record, the
+summary is empty, and the only summary a notice carries is the host's own words. A sender that
+carried a session's text would read it when it sends, through the daemon's release, which allows one
+transport write at a time and only while the text's lease and the privacy state hold. No sender here
+meets that contract: each hands its bytes to a transport that sends them later on its own. So none
+carries session text, and each carries instead the generic alert, the host's own words, or the
+sentence that names a message's readers.
+
+A request already handed to a transport can still leave after a lease lapses or privacy mode turns
+on, within that sender's own deadline. What it carries then is only the generic alert, the host's
+own words, or the readers' sentence, never a session's text.
 
 ## Where the state lives
 
