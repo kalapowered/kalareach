@@ -35,7 +35,7 @@ pub(super) fn check(application: &str, directory: &str, tail: &str, value: &Valu
         ("Gemini CLI", "gemini-extension.json") => {
             manifest(value, &["name", "version", "description"], directory)
         }
-        ("Gemini CLI", ".gemini-extension-install.json") => record(value),
+        ("Gemini CLI", ".gemini-extension-install.json") => record(value, directory),
         (_, "hooks/hooks.json") => hooks(value),
         _ => Err("this host names no shape for it".to_owned()),
     }
@@ -154,14 +154,19 @@ fn hooks(value: &Value) -> Checked {
     Ok(())
 }
 
-/// An extension's install record: where it was installed from, a local source.
-fn record(value: &Value) -> Checked {
+/// An extension's install record: where it was installed from, a local source that leads nowhere,
+/// `/dev/null/<directory>`, so that the application has nothing to update it from and an
+/// allowed-extensions pattern sees the name the directory has.
+fn record(value: &Value, directory: &str) -> Checked {
     let held = members(value, &["source", "type"], "the install record")?;
     if held.get("type").is_some_and(|kind| kind == "local")
-        && held.get("source").is_some_and(is_text)
+        && held.get("source").and_then(Value::as_str)
+            == Some(format!("/dev/null/{directory}").as_str())
     {
         Ok(())
     } else {
-        Err("the install record is not a local one with a source".to_owned())
+        Err(format!(
+            "the install record is not a local one with the source /dev/null/{directory}"
+        ))
     }
 }
