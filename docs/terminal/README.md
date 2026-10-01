@@ -355,10 +355,10 @@ empty: the pinned revision exposes everything section 8 asks a snapshot to carry
 
 #### What constrains the direct compatibility profile
 
-Three behaviours differ from xterm. The first two are not defects in the canonical state, and each
-means a physical terminal has to be qualified against it before direct mode is offered. The third
-is where the pinned library leaves the cursor, and both terminals measured so far report a
-different column.
+There are three differences from xterm. The first two are not bugs in the canonical state, but mean
+that a physical terminal needs to be qualified against them in order for direct mode to be offered.
+The third is a difference in where the pinned library leaves the cursor; both terminals tested
+report a different column from the library's:
 
 - **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
   U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
@@ -369,11 +369,13 @@ different column.
   a five-column grid leaves a six-cell row and sets the pending wrap, where xterm blanks the last
   column and wraps the character. The fixture records the canonical result, and a projected renderer
   clips or safely replaces the overhanging cell.
-- **The cursor stops one column short after a wide character that ends on the last column.** The
-  pinned library leaves it on the character's first cell, where xterm and both measured terminals
-  report the last column. The grid reports the library's column.
-  `wide.wide-character-two-cells-from-the-edge` records the difference for each terminal in the
-  section on physical terminals.
+- **The cursor stops one column short after a wide character that ends on the last column.** In the
+  pinned library, when a wide character that ends in the last column of the line is printed, the
+  cursor is left in the first column of that wide character. In xterm, and in the two terminals that
+  have been measured for this purpose, the cursor is left at the last column of the line (the grid
+  reports the column the library leaves the cursor at). The differences with each terminal are
+  described under `wide.wide-character-two-cells-from-the-edge` in the section on physical
+  terminals.
 
 ## The query broker
 
