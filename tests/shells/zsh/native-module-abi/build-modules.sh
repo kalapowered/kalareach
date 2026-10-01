@@ -13,6 +13,7 @@
 #   kr_user_newer.so        the same, and one call to a function this release's editor lacks
 #   kr_user_lazy.so         imports from a package module that has not been loaded yet
 #   kr_user_weak.so         imports a name it is content to lose
+#   kr_user_versioned.so    imports names the C library defines under a version
 #
 # The archive is the one `scripts/build-shells.sh` fetched and pinned; nothing is fetched here.
 # Output that already exists is left as it is.
@@ -35,7 +36,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$archive" ] && [ -n "$output" ] || { echo "usage: build-modules.sh --archive <file> --output <dir>" >&2; exit 2; }
 
-variants="compatible newer lazy weak"
+variants="compatible newer lazy weak versioned"
 complete=1
 for variant in $variants; do
     [ -f "$output/kr_user_$variant.so" ] || complete=0
@@ -120,6 +121,7 @@ for variant in $variants; do
         newer) define="-DKR_NEWER_IMPORT" ;;
         lazy) define="-DKR_LAZY_IMPORT" ;;
         weak) define="-DKR_WEAK_IMPORT" ;;
+        versioned) define="-DKR_VERSIONED_IMPORT" ;;
     esac
     # shellcheck disable=SC2086
     cc -DMODULE "-DKR_WIDGET=\"kr-user-$variant\"" $define $cflags $dlcflags -I"$tree/Src/Zle" -I"$tree/Src" -I"$tree" \

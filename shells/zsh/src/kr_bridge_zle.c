@@ -505,7 +505,10 @@ kr_utf8_clean(char *text)
 
             for (i = 1; i <= need && (p[i] & 0xC0) == 0x80; i++) {
             }
-            if (i == need + 1) {
+            /* The second byte narrows three lead bytes: no overlong form (E0, F0), no surrogate
+             * (ED) and nothing above U+10FFFF (F4). */
+            if (i == need + 1 && !(*p == 0xE0 && p[1] < 0xA0) && !(*p == 0xED && p[1] > 0x9F) &&
+                !(*p == 0xF0 && p[1] < 0x90) && !(*p == 0xF4 && p[1] > 0x8F)) {
                 p += need + 1;
                 continue;
             }
@@ -521,6 +524,16 @@ kr_provides(void *handle, const char *name)
     (void)dlerror();
     return dlsym(handle, name) != NULL || dlerror() == NULL;
 }
+
+#if defined(__linux__) && defined(__GLIBC__)
+/* The same for one symbol under one version. */
+static int
+kr_provides_version(void *handle, const char *name, const char *version)
+{
+    (void)dlerror();
+    return dlvsym(handle, name, version) != NULL || dlerror() == NULL;
+}
+#endif
 
 /* Records `name` when nothing that can provide it does. */
 static void
@@ -659,6 +672,7 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
 /* The memory the loader mapped for one object: where its loadable segments are. */
 typedef struct {
     uintptr_t bias;
+    const char *name;
     size_t count;
     uintptr_t start[KR_SEGMENTS_MAX];
     uintptr_t end[KR_SEGMENTS_MAX];
@@ -671,13 +685,16 @@ kr_collect_segments(struct dl_phdr_info *info, size_t size, void *data)
     size_t i;
 
     (void)size;
-    if ((uintptr_t)info->dlpi_addr != object->bias || object->count != 0) {
+    /* The object the loader calls this, at this bias: a bias alone does not name one. */
+    if ((uintptr_t)info->dlpi_addr != object->bias || object->count != 0 ||
+        strcmp(info->dlpi_name != NULL ? info->dlpi_name : "",
+               object->name != NULL ? object->name : "") != 0) {
         return 0;
     }
     for (i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr) *segment = &info->dlpi_phdr[i];
 
-        if (segment->p_type != PT_LOAD) {
+        if (segment->p_type != PT_LOAD || !(segment->p_flags & PF_R)) {
             continue;
         }
         if (object->count == KR_SEGMENTS_MAX) {
@@ -706,11 +723,26 @@ kr_mapped(const kr_object *object, const void *at, size_t size)
     return 0;
 }
 
-/* An address the dynamic section holds: the loader may have added the load bias to it already. */
+/*
+ * An address the dynamic section holds. The loader may have added the load bias to it already,
+ * which depends on the architecture, so the address is the one of the two that is in the object's
+ * own memory. Where both or neither are, this is not an address it can tell, and the answer is 0.
+ */
 static uintptr_t
-kr_dynamic_address(uintptr_t value, uintptr_t bias)
+kr_dynamic_address(const kr_object *object, uintptr_t value)
 {
-    return value < bias ? value + bias : value;
+    int as_given;
+    int moved;
+
+    if (object->bias == 0) {
+        return kr_mapped(object, (const void *)value, 1) ? value : 0;
+    }
+    as_given = kr_mapped(object, (const void *)value, 1);
+    moved = kr_mapped(object, (const void *)(value + object->bias), 1);
+    if (as_given == moved) {
+        return 0;
+    }
+    return as_given ? value : value + object->bias;
 }
 
 /* The name of the version the module's version table calls `index`, or NULL when it lists none. */
@@ -846,6 +878,7 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
     }
     memset(&object, 0, sizeof(object));
     object.bias = (uintptr_t)map->l_addr;
+    object.name = map->l_name;
     dl_iterate_phdr(kr_collect_segments, &object);
     if (object.count == 0) {
         kr_scan_not_read(scan, "the loader does not say which memory it mapped");
@@ -861,10 +894,10 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
         }
         switch (entry->d_tag) {
         case DT_SYMTAB:
-            symbols = (const ElfW(Sym) *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            symbols = (const ElfW(Sym) *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         case DT_STRTAB:
-            strings = (const char *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            strings = (const char *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         case DT_STRSZ:
             string_size = (size_t)entry->d_un.d_val;
@@ -873,19 +906,19 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
             symbol_size = (size_t)entry->d_un.d_val;
             break;
         case DT_VERSYM:
-            versions = (const uint16_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            versions = (const uint16_t *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         case DT_VERNEED:
-            needs = (const ElfW(Verneed) *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            needs = (const ElfW(Verneed) *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         case DT_VERNEEDNUM:
             need_count = (size_t)entry->d_un.d_val;
             break;
         case DT_HASH:
-            sysv = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            sysv = (const uint32_t *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         case DT_GNU_HASH:
-            gnu = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            gnu = (const uint32_t *)kr_dynamic_address(&object, entry->d_un.d_ptr);
             break;
         default:
             break;
@@ -932,9 +965,8 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
                 kr_scan_not_read(scan, "a name it imports is bound to a version it does not list");
                 return;
             }
-            (void)dlerror();
-            if (dlvsym(handle, name, version) == NULL && dlerror() != NULL &&
-                scan->state == KR_IMPORTS_BOUND) {
+            if (!kr_provides_version(RTLD_DEFAULT, name, version) &&
+                !kr_provides_version(handle, name, version) && scan->state == KR_IMPORTS_BOUND) {
                 scan->state = KR_IMPORTS_MISSING;
                 snprintf(scan->detail, sizeof(scan->detail), "%s@%s", name, version);
                 kr_utf8_clean(scan->detail);
@@ -979,8 +1011,9 @@ kr_zle_module_reports(kr_module_report **out, size_t *count)
 
     *out = NULL;
     *count = 0;
+    /* A shell with no module table is not one this can say anything of: the list is not made. */
     if (modulestab == NULL) {
-        return 1;
+        return 0;
     }
     for (slot = 0; slot < modulestab->hsize; slot++) {
         Module module;
@@ -1029,6 +1062,23 @@ kr_zle_module_reports(kr_module_report **out, size_t *count)
                     return 0;
                 }
             }
+#if defined(__linux__) && defined(__GLIBC__)
+            /* The module's own file, which is what is judged, where a library it links is the one
+             * that supplied the setup function the address above came from. */
+            {
+                struct link_map *own = NULL;
+
+                if (dlinfo(module->u.handle, RTLD_DI_LINKMAP, &own) == 0 && own != NULL &&
+                    own->l_name != NULL && own->l_name[0] != '\0') {
+                    free(report->path);
+                    report->path = strdup(own->l_name);
+                    if (report->path == NULL) {
+                        kr_zle_free_partial(list, made + 1);
+                        return 0;
+                    }
+                }
+            }
+#endif
             memset(&scan, 0, sizeof(scan));
             scan.handle = module->u.handle;
             kr_module_imports(header, module->u.handle, &scan);
