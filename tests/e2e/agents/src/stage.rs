@@ -268,6 +268,10 @@ pub fn install_package(
         .collect();
     grant.sort();
     grant.dedup();
+    let grant_statement = grant
+        .iter()
+        .any(|capability| capability == "native_bridge.install")
+        .then(|| native_bridge_statement(copy, entry));
 
     let environment_id = owner.remote.environment_id();
     let listed: CatalogueListResult = runtime
@@ -291,6 +295,7 @@ pub fn install_package(
         version: version.clone(),
         package_digest: package_digest.clone(),
         grant: grant.iter().cloned().collect(),
+        grant_statement,
     };
     let digest = plan
         .action_digest()
@@ -324,6 +329,31 @@ pub fn install_package(
         grant,
         result,
     }
+}
+
+/// What the release's manifest says its native bridge does, which the owner is shown and the
+/// installation's digest covers.
+///
+/// # Panics
+///
+/// Panics when the generation's copy holds no manifest for the entry or the manifest names no
+/// native bridge statement.
+fn native_bridge_statement(copy: &Path, entry: &serde_json::Value) -> String {
+    let text = |name: &str| entry[name].as_str().unwrap_or_default();
+    let manifest = copy
+        .join("targets/packages")
+        .join(text("publisher_id"))
+        .join(text("plugin_name"))
+        .join(text("version"))
+        .join("plugin.json");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest).unwrap_or_else(|error| panic!("{}: {error}", manifest.display())),
+    )
+    .expect("the manifest is JSON");
+    manifest["native_bridge"]["grant_statement"]
+        .as_str()
+        .expect("a native bridge release's manifest carries its grant statement")
+        .to_owned()
 }
 
 /// A loopback port nothing listens on: one the operating system handed out and took back.
