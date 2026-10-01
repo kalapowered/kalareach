@@ -8,7 +8,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, EnvironmentId, SessionId};
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{SessionCreateParams, SessionCreateResult};
+use kr_protocol::session::{EnvironmentVariable, SessionCreateParams, SessionCreateResult};
 use kr_protocol::worker::{ReservationId, WorkerReady};
 use tokio::sync::oneshot;
 
@@ -25,8 +25,112 @@ const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bi
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The environment variables a session's creator sent, from the reservation to the worker's claim.
+///
+/// They are in this memory and nowhere else: the record of the request leaves them out, so a
+/// credential among them is not on disk after the launch, or at all. The worker's claim takes them
+/// once, to put them into its launch specification, and the create withdraws them when it stops
+/// waiting for the worker; whichever takes them first decides which of the two has them.
+pub(super) type CreatorEnvironment = Arc<std::sync::Mutex<Option<Vec<EnvironmentVariable>>>>;
+
+/// A create that is waiting for its worker.
 pub(super) struct PendingCreate {
     pub(super) ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
+    /// The creator's variables, until the claim of this create's worker takes them.
+    pub(super) environment: CreatorEnvironment,
+}
+
+/// Takes what is in `slot`, and says whether the other party had already taken it.
+///
+/// It never waits for anything but the slot's own lock, which nobody holds across an await.
+fn withdraw(slot: &CreatorEnvironment) -> bool {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .is_none()
+}
+
+/// A create's wait for its worker, held from the moment the wait is registered until the create
+/// ends, however it ends.
+///
+/// Where the create ends its wait it says so with [`Self::end_wait`]. Anywhere else, a return, a
+/// panic or a future that is dropped, the drop does the same without waiting for anything.
+pub(super) struct CreateHold {
+    controller: Arc<Controller>,
+    reservation_id: ReservationId,
+    environment: CreatorEnvironment,
+    /// Whether the wait has been ended and its entry removed.
+    ended: bool,
+}
+
+impl CreateHold {
+    /// Registers the wait for `reservation_id`'s worker and the variables its claim may take.
+    pub(super) async fn open(
+        controller: &Arc<Controller>,
+        reservation_id: ReservationId,
+        environment: Vec<EnvironmentVariable>,
+        ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
+    ) -> Self {
+        let environment: CreatorEnvironment = Arc::new(std::sync::Mutex::new(Some(environment)));
+        controller.pending.lock().await.insert(
+            reservation_id,
+            PendingCreate {
+                ready,
+                environment: Arc::clone(&environment),
+            },
+        );
+        Self {
+            controller: Arc::clone(controller),
+            reservation_id,
+            environment,
+            ended: false,
+        }
+    }
+
+    /// Ends this create's wait, and says whether a worker's claim had already taken the variables.
+    ///
+    /// The variables are withdrawn first, before anything is awaited, so no claim can take them
+    /// once the create has stopped waiting; only then is the entry removed. A claim that took them
+    /// means a launch that may still complete, which the create's caller is told is not known.
+    pub(super) async fn end_wait(&mut self) -> bool {
+        let taken = withdraw(&self.environment);
+        self.controller
+            .pending
+            .lock()
+            .await
+            .remove(&self.reservation_id);
+        // Only once the entry is gone: a future dropped while it waits for the lock is a create
+        // that has not removed it, and the drop does.
+        self.ended = true;
+        taken
+    }
+}
+
+impl Drop for CreateHold {
+    fn drop(&mut self) {
+        withdraw(&self.environment);
+        if self.ended {
+            return;
+        }
+        // The entry goes now when its lock is free, and otherwise from a task that does not keep
+        // this daemon alive. With no runtime to run one the entry goes with the daemon.
+        match self.controller.pending.try_lock() {
+            Ok(mut pending) => {
+                pending.remove(&self.reservation_id);
+            }
+            Err(_) => {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let controller = Arc::downgrade(&self.controller);
+                    let reservation_id = self.reservation_id;
+                    runtime.spawn(async move {
+                        if let Some(controller) = controller.upgrade() {
+                            controller.pending.lock().await.remove(&reservation_id);
+                        }
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl Controller {
@@ -49,7 +153,7 @@ impl Controller {
         // Through the gate first, and counted until this create has settled: a daemon making way
         // for an update of the host starts nothing new, and waits for what it has started.
         let _under_way = self.handover.admit()?;
-        let create: SessionCreateParams = parse(&mutation.params)?;
+        let mut create: SessionCreateParams = parse(&mutation.params)?;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
         // the launch specification and is recorded there; what cannot travel is a provenance
@@ -69,6 +173,10 @@ impl Controller {
         }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The environment its creator sent is for the worker's launch and for nothing else: it is
+        // taken out of the request here, held in memory until the worker claims it, and never
+        // written down. The digest above covers it, as a hash.
+        let environment = std::mem::take(&mut create.environment_snapshot);
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can
         // resolve rather than an identifier with nothing behind it.
@@ -156,10 +264,8 @@ impl Controller {
         };
 
         let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .await
-            .insert(reservation.reservation_id, PendingCreate { ready: sender });
+        let mut hold =
+            CreateHold::open(self, reservation.reservation_id, environment, sender).await;
 
         // Everything the launch needs is prepared before the checks that admit it, so nothing
         // between the last check and the launch can wait: a directory tree is several filesystem
@@ -172,6 +278,7 @@ impl Controller {
         {
             // Nothing was started, so the reservation is resolved as a confirmed failure and stops
             // occupying the environment.
+            hold.end_wait().await;
             self.resolve_failed(reservation.reservation_id).await?;
             return Err(error.into());
         }
@@ -202,10 +309,7 @@ impl Controller {
                 // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
-                self.pending
-                    .lock()
-                    .await
-                    .remove(&reservation.reservation_id);
+                hold.end_wait().await;
                 self.discard_worker_dir(reservation.session_id);
                 return Err(refusal);
             }
@@ -238,10 +342,7 @@ impl Controller {
             // Nothing started, so the reservation is resolved as a confirmed failure and stops
             // occupying the environment. It is never resumed.
             LaunchOutcome::NotStarted { detail } => {
-                self.pending
-                    .lock()
-                    .await
-                    .remove(&reservation.reservation_id);
+                hold.end_wait().await;
                 let mut registry = self.registry.lock().await;
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
@@ -254,10 +355,9 @@ impl Controller {
             // A process may be running. The create fails for the caller, and the reservation stays
             // spawned: it keeps its slot until something settles what happened to that process.
             LaunchOutcome::Uncertain { detail, pid } => {
-                self.pending
-                    .lock()
-                    .await
-                    .remove(&reservation.reservation_id);
+                // Before the launcher's identity is recorded: a claim waits for that identity, so
+                // none can take the variables of a create that has stopped waiting.
+                hold.end_wait().await;
                 let launched =
                     pid.and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok());
                 if let Some(identity) = &launched {
@@ -284,14 +384,20 @@ impl Controller {
                 });
             }
             Ok(Err(_)) | Err(_) => {
-                self.pending
-                    .lock()
-                    .await
-                    .remove(&reservation.reservation_id);
+                let claimed = hold.end_wait().await;
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
-                return Err(ControllerError::supervision(
-                    "the worker did not report itself in time",
-                ));
+                // A claim that took the variables has a launch that may still complete, and its
+                // worker may yet report itself: what became of this create is not known, and its
+                // caller asks again under the same token rather than making another session.
+                return Err(if claimed {
+                    ControllerError::Uncertain {
+                        detail: "the worker did not report itself in time, and its launch may \
+                                 still be under way"
+                            .to_owned(),
+                    }
+                } else {
+                    ControllerError::supervision("the worker did not report itself in time")
+                });
             }
         };
 
@@ -410,10 +516,9 @@ impl Controller {
     /// Resolves a reservation that never reached a launch, and releases what it was holding.
     ///
     /// The phase is the durable half: a reservation recorded as failed stops occupying the
-    /// environment and is never resumed. The pending report and the directory prepared for the
-    /// worker go with it, because nothing is going to use either.
+    /// environment and is never resumed. The directory prepared for the worker goes with it,
+    /// because nothing is going to use it.
     async fn resolve_failed(&self, reservation_id: ReservationId) -> Result<()> {
-        self.pending.lock().await.remove(&reservation_id);
         let mut registry = self.registry.lock().await;
         let session_id = registry
             .reservation(reservation_id)?

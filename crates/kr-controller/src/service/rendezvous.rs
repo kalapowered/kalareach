@@ -206,10 +206,28 @@ impl Controller {
             ));
         }
 
+        // The environment its creator sent is taken here, once, by the claim of the create that is
+        // still waiting for this worker. Nothing else holds it: a claim that finds none belongs to
+        // a create that has stopped waiting, or to one a daemon that has since ended was making,
+        // and is refused rather than launched with an environment it was not sent.
+        let environment = self.take_creator_environment(claim.reservation_id).await;
+
         // Admission is consumed here, in one transaction, together with the key that authenticates
         // this worker from now on. Everything above is a check; this is the commitment.
         let reservation = {
             let mut registry = self.registry.lock().await;
+            if environment.is_none() && registry.fail_if_spawned(claim.reservation_id)? {
+                // A launch that produced no session: no key was recorded, and nothing was told
+                // anything. A reservation in any other phase is left to the claim's own rules
+                // below, which fence a second claim.
+                drop(registry);
+                self.discard_worker_dir(claim.session_id);
+                self.retire_job_when_ended(claim.reservation_id, Some(launcher));
+                return Err(ControllerError::rendezvous(
+                    "the create this worker was started for is not waiting for it, so its \
+                     launch is not admitted",
+                ));
+            }
             match registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key) {
                 Ok(reservation) => {
                     // A member from the moment the claim commits, before anything is awaited: a
@@ -238,6 +256,10 @@ impl Controller {
             ControllerError::registry(format!(
                 "the recorded create request cannot be read: {error}"
             ))
+        })?;
+        // Before the specification is measured: the variables are part of what the frame carries.
+        create.environment_snapshot = environment.ok_or_else(|| {
+            ControllerError::rendezvous("this claim found no environment to launch with")
         })?;
 
         // The package this worker will launch is resolved here, by the daemon, against the
@@ -335,6 +357,26 @@ impl Controller {
                 crate::catalogue::integrations::Fill::default()
             }
         }
+    }
+
+    /// Takes the environment variables the creator of this reservation's session sent, when its
+    /// create is still waiting for the worker, and says nothing of them otherwise.
+    ///
+    /// The variables leave the create's own slot, so the create cannot also have them. The list of
+    /// waiting creates is released before anything else is awaited.
+    async fn take_creator_environment(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Option<Vec<kr_protocol::session::EnvironmentVariable>> {
+        let slot = self
+            .pending
+            .lock()
+            .await
+            .get(&reservation_id)
+            .map(|pending| Arc::clone(&pending.environment))?;
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Waits for the launcher's reported identity to reach the registry.

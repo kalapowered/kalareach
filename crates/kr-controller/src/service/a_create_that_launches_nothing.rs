@@ -1380,6 +1380,137 @@ async fn a_create_whose_directory_cannot_be_made_releases_its_reservation() {
     );
 }
 
+/// Makes the registry refuse the write that moves a reservation to `spawned`, which a create
+/// makes after it has registered the wait for its worker.
+fn refuse_the_move_to_spawned(temp: &kr_ipc::testing::TempHost) {
+    rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry")
+        .execute_batch(
+            "CREATE TRIGGER refuse_spawned BEFORE UPDATE OF phase ON reservations
+                 WHEN NEW.phase = 'spawned'
+                 BEGIN SELECT RAISE(ABORT, 'refused by this test'); END;",
+        )
+        .expect("installs the refusal");
+}
+
+/// A create that fails after it registered its wait for a worker leaves no wait registered, so the
+/// requests the host counts as pending go back to none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_fails_after_registering_its_wait_leaves_nothing_registered() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    refuse_the_move_to_spawned(&temp);
+
+    let error = controller
+        .session_create(
+            &actor_id,
+            &create_request(environment_id),
+            carried(&controller, connection_id, half_a_minute(&controller)),
+        )
+        .await
+        .expect_err("a create whose reservation cannot move to spawned starts nothing");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "nothing was launched: {error}"
+    );
+    assert_eq!(
+        controller.pending.lock().await.len(),
+        0,
+        "and the wait it registered is not left behind"
+    );
+}
+
+/// The same, while something else keeps taking the lock the registered waits are under: a wait is
+/// removed once that lock is free, and that is decided by looking, never by a delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_create_leaves_nothing_registered_while_the_waits_are_contended() {
+    let (temp, controller, _asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    refuse_the_move_to_spawned(&temp);
+
+    let hammer = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move {
+            loop {
+                drop(controller.pending.lock().await);
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    for _ in 0..20 {
+        controller
+            .session_create(
+                &actor_id,
+                &create_request(environment_id),
+                carried(&controller, connection_id, half_a_minute(&controller)),
+            )
+            .await
+            .expect_err("a create whose reservation cannot move to spawned starts nothing");
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !controller.pending.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every wait the failed creates registered is removed");
+    hammer.abort();
+}
+
+/// A create that is dropped while it ends its wait, held up by the lock the registered waits are
+/// under, leaves no wait registered and no variables: the drop finishes what the create began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_dropped_while_it_ends_its_wait_leaves_nothing_registered() {
+    use std::future::Future as _;
+
+    let (_temp, controller, _asked) = daemon().await;
+    let (sender, _receiver) = tokio::sync::oneshot::channel();
+    let reservation_id = kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid());
+    let mut hold = super::create::CreateHold::open(
+        &controller,
+        reservation_id,
+        vec![kr_protocol::session::EnvironmentVariable {
+            name: "SECRET_NAME".to_owned(),
+            value: "secret-value".to_owned(),
+        }],
+        sender,
+    )
+    .await;
+    let slot = Arc::clone(
+        &controller
+            .pending
+            .lock()
+            .await
+            .get(&reservation_id)
+            .expect("the wait is registered")
+            .environment,
+    );
+
+    // The lock is held, so ending the wait stops at it. Polled once, it is waiting there, and
+    // dropping it is the create being dropped at that point.
+    let contended = controller.pending.lock().await;
+    {
+        let mut ending = std::pin::pin!(hold.end_wait());
+        let polled =
+            std::future::poll_fn(|context| std::task::Poll::Ready(ending.as_mut().poll(context)))
+                .await;
+        assert!(polled.is_pending(), "ending the wait waits for the lock");
+    }
+    assert!(
+        slot.lock().expect("the slot is not poisoned").is_none(),
+        "the variables were withdrawn before the wait for the lock began"
+    );
+    drop(contended);
+    drop(hold);
+    assert_eq!(
+        controller.pending.lock().await.len(),
+        0,
+        "and dropping the create removed the wait it had registered"
+    );
+}
+
 /// Returns the sessions that still have a directory under this environment's workers folder.
 ///
 /// A directory that cannot be read is a failure rather than an empty answer: an assertion that

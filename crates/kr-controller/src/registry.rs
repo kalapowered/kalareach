@@ -124,11 +124,16 @@ pub struct Reservation {
     pub create_token: Uuid,
     /// The digest of the immutable create payload.
     pub payload_digest: Digest256,
-    /// The create request itself, canonically encoded.
+    /// The create request itself, canonically encoded, without the environment its creator sent.
     ///
     /// It is written before anything is spawned. A daemon that restarts mid-create can then say
     /// what the session was going to be instead of holding an identifier with no request behind it.
-    /// It is absent only for a reservation an earlier schema recorded without one.
+    /// The creator's environment variables are never part of it: a credential among them would
+    /// outlive its session in this file, so the list in a recorded request is always empty and
+    /// tells nothing about what the creator sent. The variables are held in memory from the
+    /// reservation to the worker's claim, which is the only thing that reads them, and written
+    /// nowhere. It is absent only for a reservation an earlier schema recorded without one, or one
+    /// whose record no build could read.
     pub create_intent: Option<Vec<u8>>,
     /// The session identifier allocated for it.
     pub session_id: SessionId,
@@ -1576,6 +1581,31 @@ impl Registry {
         transaction.commit().map_err(ControllerError::registry)?;
         self.reservation(reservation_id)?
             .ok_or_else(|| ControllerError::rendezvous("the reservation vanished"))
+    }
+
+    /// Resolves a reservation as a launch that produced no session, when it is still waiting for
+    /// its worker's claim, and says whether it did.
+    ///
+    /// The phase test and the write are one statement, so a claim that commits first leaves the
+    /// reservation as it made it: a row in any other phase is not touched, and the caller goes on
+    /// to the claim's own rules, which fence a second claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn fail_if_spawned(&mut self, reservation_id: ReservationId) -> Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE reservations SET phase = ?2 WHERE reservation_id = ?1 AND phase = ?3",
+                params![
+                    reservation_id.get().as_bytes().as_slice(),
+                    LaunchPhase::Failed.as_str(),
+                    LaunchPhase::Spawned.as_str()
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(changed > 0)
     }
 
     /// Moves a reservation out of `claimed` into a resolved phase.
