@@ -374,6 +374,21 @@ impl CatalogueModule {
         &self.bridges
     }
 
+    /// The doctor's check of the native bridges this host has put in place, read on a thread that
+    /// may block, no later than `deadline`. Records that cannot be read in time are a warning of
+    /// their own, which says so.
+    pub async fn native_bridges_check(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> kr_protocol::hostinfo::DoctorCheck {
+        let bridges = Arc::clone(&self.bridges);
+        let read = tokio::task::spawn_blocking(move || bridges.reports());
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(Ok(Ok(reports))) => native_bridge::check(&reports),
+            _ => native_bridge::unread_check(),
+        }
+    }
+
     /// Returns the admissions in force now, as records on the wire, for this host: what new
     /// bindings may use and the state of every admitted release and of every release in `live`.
     ///

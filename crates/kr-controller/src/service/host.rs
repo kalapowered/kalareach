@@ -494,6 +494,11 @@ impl Controller {
         // integration, from the admissions in force and the configuration this reading accepted.
         let (integrations_check, integrations) = self.command_integration_report(enabled).await;
         checks.push(integrations_check);
+        checks.push(
+            self.catalogue
+                .native_bridges_check(tokio::time::Instant::now() + DOCTOR_READS)
+                .await,
+        );
         Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
     }
 

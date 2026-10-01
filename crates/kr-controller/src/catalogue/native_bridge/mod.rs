@@ -47,6 +47,7 @@
 //! place is never taken for it, and nothing at its path is not taken as its deletion: what was
 //! placed stays recorded until the directory is back.
 
+mod check;
 mod journal;
 pub(crate) mod json;
 mod tree;
@@ -63,6 +64,7 @@ use kr_protocol::scalars::Digest256;
 pub use kr_worker::broker::bridge::BridgeSurface;
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
+pub use self::check::{check, unread_check};
 use self::journal::{
     Change, Journal, Journals, Kept, Publication, RecordedFacts, Release, Removal, Staging, State,
 };
@@ -197,6 +199,15 @@ pub enum Settled {
     Unsettled(String),
 }
 
+/// One file a bridge's release put in an application's directory, by the digest of its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeFile {
+    /// The file, under the application's directory.
+    pub path: String,
+    /// The digest of the bytes this host published, in hexadecimal.
+    pub digest: String,
+}
+
 /// One package's bridge, as a person reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeReport {
@@ -207,6 +218,11 @@ pub struct BridgeReport {
     pub state: String,
     /// The release it is about, where there is one.
     pub package_digest: Option<String>,
+    /// The application the release's recipe is for, as the recipe names it, where there is a
+    /// release.
+    pub application: Option<String>,
+    /// Each file this host has published for the release, by digest.
+    pub files: Vec<BridgeFile>,
     /// What no longer matches, what was left in place, what could not be settled or taken out, and
     /// why the last application was refused.
     pub notes: Vec<String>,
@@ -556,6 +572,26 @@ impl NativeBridges {
                     journal.state.as_str().to_owned()
                 },
                 package_digest: journal.digest().map(str::to_owned),
+                application: journal
+                    .release
+                    .as_ref()
+                    .map(|release| release.application.clone()),
+                files: journal
+                    .changes
+                    .iter()
+                    .filter_map(|change| match change {
+                        Change::File {
+                            path,
+                            digest,
+                            publication: Publication::Published { .. },
+                            ..
+                        } => Some(BridgeFile {
+                            path: path.clone(),
+                            digest: digest.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
                 notes,
             });
         }

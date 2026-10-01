@@ -493,6 +493,22 @@ async fn kr_req_07_45_the_doctor_reports_each_integration_and_what_a_new_session
     assert_eq!(check.status, DoctorStatus::Warning);
 }
 
+/// KR-REQ-11.42: the doctor's answer carries the check of the native bridges. A host whose
+/// packages have put none in place says that nothing applies, rather than leaving the row out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_42_the_doctor_carries_the_check_of_the_native_bridges() {
+    use kr_protocol::hostinfo::DoctorStatus;
+
+    let daemon = daemon(None).await;
+    let result = doctor(&daemon).await;
+    let check = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "native-bridges")
+        .expect("the native bridges are checked");
+    assert_eq!(check.status, DoctorStatus::NotApplicable, "{check:?}");
+}
+
 /// Sixteen flags of the most bytes a flag may have: the most a package may declare.
 fn largest_flags() -> Vec<String> {
     (0..kr_plugin_sdk::integration::MAX_FLAGS)
