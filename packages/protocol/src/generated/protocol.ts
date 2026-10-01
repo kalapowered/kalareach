@@ -15737,6 +15737,7 @@ export interface PendingConfirmation {
     | 'establish_clock'
     | {
         catalogue_add: {
+          budgets: CatalogueBudgets3
           /**
            * This host's identifier for the repository.
            */
@@ -16006,7 +16007,39 @@ export interface ProposedGrant1 {
     | 'none'
 }
 /**
- * An action described by its caller, for the three actions no served method performs yet.
+ * The budgets its syncs and its cache run inside.
+ */
+export interface CatalogueBudgets3 {
+  /**
+   * Whether every referenced payload is fetched rather than only what is installed.
+   *
+   * A larger full mirror is this setting plus a payload budget that admits it. It is never
+   * reached by syncing more often.
+   */
+  full_offline_mirror: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  metadata_entries: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  payload_cache_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_generations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_metadata_bytes: string
+}
+/**
+ * An action described by its caller, which an owner device is shown as the caller's own words.
  */
 export interface DescribedAction {
   /**

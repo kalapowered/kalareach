@@ -1709,10 +1709,10 @@ mod terminal_catalogue {
     use super::*;
 
     use base64::Engine as _;
-    use kr_controller::sharing::{CatalogueTrustPlan, PluginInstallPlan};
     use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
     use kr_protocol::catalogue as wire;
     use kr_protocol::confirmation::NATIVE_BRIDGE_NOTICE;
+    use kr_protocol::confirmation::{CatalogueTrustPlan, PluginInstallPlan};
     use kr_protocol::ids::PluginId;
 
     /// The owner's own client on the daemon's socket, asking for one thing with no proof.
@@ -1869,17 +1869,15 @@ mod terminal_catalogue {
             CapabilityCeiling::default_ceiling(),
         )
         .expect("an enrolment");
-        CatalogueTrustPlan {
-            environment_id: params.environment_id,
-            catalogue_id: params.catalogue_id.clone(),
-            root_digest: enrolment.root_digest().to_string(),
-            root_key_ids: enrolment
+        CatalogueTrustPlan::of_request(
+            params,
+            enrolment.root_digest().to_string(),
+            enrolment
                 .root_key_ids()
                 .expect("a readable root")
                 .into_iter()
                 .collect(),
-            ceiling: params.ceiling.iter().cloned().collect(),
-        }
+        )
         .action_digest()
         .expect("a digest")
     }
@@ -2037,8 +2035,10 @@ mod terminal_catalogue {
         host.stop().await;
     }
 
-    /// KR-REQ-10.05: an answer for another repository name, root or ceiling is never spent on this
-    /// request, and the request is refused as needing confirmation.
+    /// KR-REQ-10.05: an answer for another repository name, root, ceiling, location, kind or
+    /// budget is never spent on this request, and the request is refused as needing
+    /// confirmation. What an owner device is shown of an enrolment is what the answer covers, so
+    /// the same root served from another location is another enrolment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_answer_for_another_enrolment_is_never_spent_on_this_one() {
         let owner = keys();
@@ -2047,12 +2047,21 @@ mod terminal_catalogue {
         let mut client = host.client().await;
         let development = Published::development();
         let bridge = Published::with_bridge();
+        let moved = Published::development();
         let asked = add(&host, &development, "development", &[]);
+        let mut another_kind = asked.clone();
+        another_kind.kind = wire::CatalogueKind::Community;
+        let mut another_budget = asked.clone();
+        another_budget.budgets.payload_cache_bytes =
+            kr_protocol::scalars::U64::new(asked.budgets.payload_cache_bytes.get() - 1);
 
         for other in [
             add(&host, &development, "elsewhere", &[]),
             add(&host, &development, "development", &["terminal.stream"]),
             add(&host, &bridge, "development", &[]),
+            add(&host, &moved, "development", &[]),
+            another_kind,
+            another_budget,
         ] {
             calls::confirm_subject(
                 environment,
@@ -2141,8 +2150,243 @@ mod terminal_catalogue {
         host.stop().await;
     }
 
-    /// The request a subject names carries no proof of its own, and a request that is not one of
-    /// the two the catalogue describes is not described by it.
+    /// KR-REQ-10.05, KR-REQ-11.42: an answer to a challenge a caller described, even one whose
+    /// digest is exactly a catalogue plan's digest, is not spent by a request that carries no
+    /// proof: what the owner device was shown for it was the caller's description and not the
+    /// repository, the grant or the publisher's statement, so only a challenge the host described
+    /// from the request itself is spent. The control is the host's own challenge for the same
+    /// request, which is spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_to_a_described_challenge_is_never_spent_without_a_proof() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::with_bridge();
+        let described = |action, digest| {
+            ConfirmationSubject::Described(kr_protocol::confirmation::DescribedAction {
+                action,
+                action_digest: digest,
+                destination_keys: Nullable::null(),
+                destination_rights: CanonicalSet::new(),
+            })
+        };
+
+        // A repository's root: a described challenge with exactly the trust plan's digest.
+        let params = add(&host, &published, "bridge", &[]);
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            described(SensitiveAction::TrustRepositoryRoot, trust_digest(&params)),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("an owner device answers what a caller described");
+        assert_eq!(
+            code(effect(environment, &mut client, &params).await),
+            ErrorCode::OwnerConfirmationRequired,
+            "the description of a root is not the host's description of this repository"
+        );
+        assert!(listed(environment, &mut client).await.is_empty());
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered");
+        effect(environment, &mut client, &params)
+            .await
+            .expect("the host's own challenge is spent");
+        let _: wire::CatalogueSyncResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id: environment,
+                catalogue_id: "bridge".to_owned(),
+            },
+        )
+        .await
+        .expect("synchronised");
+
+        // An installation: a described challenge with exactly the installation plan's digest.
+        let plugin = "kalareach/claude-code";
+        let install = wire::PluginInstallParams {
+            environment_id: environment,
+            catalogue_id: "bridge".to_owned(),
+            plugin_id: PluginId::new(plugin).expect("a plugin id"),
+            version: "0.3.0".to_owned(),
+            package_digest: published.manifest_digest(plugin, "0.3.0"),
+            grant: BRIDGE_GRANT.iter().map(|word| (*word).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        };
+        let ceiling = {
+            let listed: wire::CatalogueListResult = calls::read(
+                &mut client,
+                Method::CatalogueList,
+                &wire::CatalogueListParams {
+                    environment_id: environment,
+                },
+            )
+            .await
+            .expect("listed");
+            listed.catalogues[0].ceiling.clone()
+        };
+        let digest = PluginInstallPlan {
+            environment_id: environment,
+            catalogue_id: "bridge".to_owned(),
+            ceiling: ceiling.iter().cloned().collect(),
+            plugin_id: install.plugin_id.clone(),
+            version: "0.3.0".to_owned(),
+            package_digest: install.package_digest.clone(),
+            grant: install.grant.iter().cloned().collect(),
+            grant_statement: Some(published.statement(plugin, "0.3.0")),
+        }
+        .action_digest()
+        .expect("a digest");
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            described(SensitiveAction::GrantExecutableCapability, digest),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("an owner device answers what a caller described");
+        assert_eq!(
+            code(installed(environment, &mut client, &install).await),
+            ErrorCode::OwnerConfirmationRequired,
+            "the description of an installation is not the host's description of this release"
+        );
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::PluginInstall(Box::new(install.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered");
+        installed(environment, &mut client, &install)
+            .await
+            .expect("the host's own challenge is spent");
+        host.stop().await;
+    }
+
+    /// KR-REQ-10.05: an answer whose signer lost its authority is passed over in favour of a
+    /// newer answer from an owner device that still holds it, on the first request: the older
+    /// answer is not the one the request is refused for. The signer is checked when the answer is
+    /// chosen and not only when the choice is recorded, so the live answer is never lost to a
+    /// request that chose the revoked one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_newer_answer_from_a_live_owner_is_spent_when_an_older_signer_was_revoked() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::development();
+        let params = add(&host, &published, "development", &[]);
+
+        let second_keys = keys();
+        let second = Device::with_keys(second_keys.clone()).await;
+        let record = pair_with(&host, &second, &owner, proposal(&[ActionRight::HostManage])).await;
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&second_keys),
+        )
+        .await
+        .expect("the second owner device answers while it is paired");
+        let _: kr_protocol::sharing::RevocationResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::DeviceRevoke,
+            &DeviceRevokeParams {
+                device_id: record.device_id,
+            },
+        )
+        .await
+        .expect("revoked");
+        let mut client = host.client().await;
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("the first owner device answers after it");
+
+        // Both answers wait, the older one under authority this host no longer holds. The one
+        // request is spent from the newer.
+        let added = effect(environment, &mut client, &params)
+            .await
+            .expect("the live owner's answer is the one spent");
+        assert_eq!(added.catalogue.catalogue_id, "development");
+        host.stop().await;
+    }
+
+    /// KR-REQ-10.05: a paired device that is not the owner is refused before the catalogue
+    /// resolves anything for a subject it names. What resolving refuses with names the repository,
+    /// the release and the host's budgets, and a device without owner authority learns none of it:
+    /// an unknown repository, an unreadable root and a release no index holds all answer
+    /// `PERMISSION_DENIED`. The control is the owner's own request for the same subjects, which is
+    /// refused for what is wrong with each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_device_without_owner_authority_learns_nothing_from_a_subject_it_names() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let viewer_keys = keys();
+        let viewer_device = Device::with_keys(viewer_keys.clone()).await;
+        let viewer_record = pair_with(&host, &viewer_device, &owner, viewer()).await;
+        let viewer_raw = RawDevice::connect(&host, &viewer_device, &viewer_record).await;
+
+        let published = Published::development();
+        let mut unreadable = add(&host, &published, "development", &[]);
+        unreadable.root = "bm90IGEgcm9vdA==".to_owned();
+        let install = wire::PluginInstallParams {
+            environment_id: environment,
+            catalogue_id: "nowhere".to_owned(),
+            plugin_id: PluginId::new("kalareach/claude-code").expect("a plugin id"),
+            version: "0.3.0".to_owned(),
+            package_digest: "0".repeat(64),
+            grant: Vec::new(),
+            owner_confirmation: Nullable::null(),
+        };
+        for subject in [
+            ConfirmationSubject::CatalogueAdd(Box::new(unreadable)),
+            ConfirmationSubject::PluginInstall(Box::new(install)),
+        ] {
+            let asked = viewer_raw
+                .mutate(
+                    Method::OwnerConfirmationRequest,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment),
+                    &OwnerConfirmationRequestParams {
+                        subject: subject.clone(),
+                    },
+                )
+                .await;
+            assert_eq!(
+                code(asked),
+                ErrorCode::PermissionDenied,
+                "a device that is not the owner is refused first: {subject:?}"
+            );
+            let owned = calls::request(environment, &mut client, subject.clone()).await;
+            assert_ne!(
+                code(owned),
+                ErrorCode::PermissionDenied,
+                "the owner is refused for what is wrong with the request: {subject:?}"
+            );
+        }
+        host.stop().await;
+    }
+
+    /// The request a subject names carries no proof of its own: a request that already carries
+    /// one is not a thing to ask a confirmation for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_subject_names_a_request_without_its_proof() {
         let owner = keys();
