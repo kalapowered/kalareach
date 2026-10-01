@@ -5906,6 +5906,69 @@ async fn an_answer_leaves_the_lane_with_the_lanes_deadline() {
     );
 }
 
+/// KR-REQ-08.49: more answers than one drain of the response lane takes reach the terminal in the
+/// order they were asked, whichever drain they came out in.
+///
+/// One write asks for the colour of many palette entries, so the lane holds more than the bytes one
+/// drain may take. The root editor's machine hears of a batch once it is queued, and what it does
+/// with that drains the lane again: the rest of the lane has to come out behind the first batch and
+/// never in front of any of it. The question of each entry names its index, so the order of what
+/// the terminal was handed is read from the answers themselves. Control: a session with no
+/// driver is handed the same answers in the same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_that_outrun_one_drain_of_the_lane_reach_the_terminal_in_the_order_they_were_asked()
+{
+    const ENTRIES: usize = 200;
+    let asked: Vec<u8> = (0..ENTRIES)
+        .flat_map(|index| format!("\x1b]4;{index};?\x1b\\").into_bytes())
+        .collect();
+    let indices_handed = |managed: bool| -> Vec<usize> {
+        let temp = kr_ipc::testing::TempHost::create();
+        let config = configuration(&temp, ShellMode::NativeCompat);
+        let session_id = config.session_id;
+        let mut session = Session::open(config).expect("opens the session");
+        session.launch().expect("launches the shell");
+        if managed {
+            session.install_fence(FenceDriver::new(
+                session_id,
+                LeaseView::unheld(InputLeaseEpoch::new(0)),
+                Arc::new(kr_transport::clock::ManualClock::new()) as Arc<_>,
+            ));
+        }
+        session.ingest_output(&asked);
+        let mut handed = Vec::new();
+        for batch in session.take_pending_input() {
+            if let kr_worker::session::InputBatch::Reply { bytes, .. } = batch {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                for answer in text.split("\x1b]4;").skip(1) {
+                    let index = answer
+                        .split(';')
+                        .next()
+                        .and_then(|index| index.parse::<usize>().ok())
+                        .expect("an answer names its palette entry");
+                    handed.push(index);
+                }
+            }
+        }
+        handed
+    };
+    // The control has no driver, so nothing drains the lane again and it is handed what one drain
+    // takes: the first of the answers, in the order they were asked.
+    let plain = indices_handed(false);
+    assert!(
+        plain.len() < ENTRIES && plain.windows(2).all(|pair| pair[0] < pair[1]),
+        "the case asks for more than one drain takes, and the control gets the first of them in order: {plain:?}"
+    );
+    // With a driver the machine hears of each batch and the lane is drained again behind it, so the
+    // rest of the answers follow the first ones: all of them, each once, in the order asked.
+    let managed = indices_handed(true);
+    assert_eq!(
+        managed,
+        (0..ENTRIES).collect::<Vec<_>>(),
+        "the rest of the lane came out in front of, or in the middle of, the first batch"
+    );
+}
+
 /// Queues the host's own answer to the application for the terminal, as the response lane does
 /// when the program in the terminal asks what it is talking to.
 fn the_host_answers_the_application(wired: &Wired) {
@@ -6124,8 +6187,21 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
 
     the_host_answers_the_application(&wired);
     // The revocation ends the hold with it: the keys go to the terminal, in the order they were
-    // typed, rather than waiting for a deadline nothing is left to set.
+    // typed, rather than waiting for a deadline nothing is left to set. Keys typed after the answer
+    // go behind them, and neither waits for a hold nothing will end.
     echoed(&wired.runtime, b"held-keys").await;
+    type_keys(&wired, holder, 1, b"later-keys\n");
+    echoed(&wired.runtime, b"later-keys").await;
+    let seen = retained(&wired.runtime.session());
+    let position = |needle: &[u8]| {
+        seen.windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the keys were echoed")
+    };
+    assert!(
+        position(b"held-keys") < position(b"later-keys"),
+        "the keys held for the launch reached the terminal before the ones typed after the answer"
+    );
     let (transaction, reason) = loop {
         match wired.next().await {
             ToBridge::LaunchRevoked {
