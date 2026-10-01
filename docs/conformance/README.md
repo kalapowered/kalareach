@@ -498,14 +498,11 @@ entry, and named clients, which attach and subscribe as the worker's service sub
 waits on a clock. A step that moves time says by how much, and a timer that falls due fires in that
 step, so a race happens in the same order on every run.
 
-The session still decides three things on the host's own clock, which no step moves: a reply to a
-question the application asks while the person's input is inside a paste or a held delimiter waits
-until that closes and is dropped after two seconds, the replies of one read past 4 KiB may wait for a
-later read and are dropped after the same two seconds, and replies past 256 a second are dropped.
-The replayer refuses a trace that reaches any of them, so no replay turns on how fast the machine
-ran it: an output that asks a question while the input side holds the reply back, one whose replies
-are larger than one read writes, or more than 256 questions in all, counted by an engine of the
-profile reading the same output.
+The session decides its windows on the continuous clock the replayer moves, so a trace states what
+it expects of each: a reply to a question the application asks while the person's input is inside a
+paste or a held delimiter waits until that closes and is dropped after two seconds, the replies of
+one read past 4 KiB wait for a later read and are dropped after the same two seconds, and replies
+past 256 a second are dropped until the clock has moved on. A `step_wall` moves none of them.
 
 | Step (`do`) | Fields | What happens |
 | --- | --- | --- |

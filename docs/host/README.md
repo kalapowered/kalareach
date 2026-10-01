@@ -1125,6 +1125,19 @@ A sequence the profile does not name is consumed rather than forwarded, and the 
 the input lease has no destination, so it becomes a durable host event in the worker's own journal
 rather than being shown to whoever happens to be watching.
 
+A side effect that has a destination is delivered whole, never trimmed as if it were a span of the
+stream, and ahead of any request to begin again that the same output makes of that attachment: the
+byte that ends a clipboard write can also be the byte that lets a held terminal take the stream. One
+that cannot be delivered is a host event in the same way: the lease has since moved, the attachment
+has no subscription, its stream has been told to begin again, or its queue has no room. A
+subscription that another replaces writes the effects already queued on it before it stops.
+
+The host's own replies to the application's questions are measured on the session's continuous
+clock: a reply waits behind the person's open bracketed paste and is dropped after two seconds, one
+read writes at most 4 KiB of replies and the rest wait for a later read inside the same two seconds,
+and at most 256 questions a second are answered. A step of the wall clock neither drops a reply early
+nor holds one longer.
+
 ## Windows
 
 The terminal on Windows is a pseudo-console. It is the same session, the same lease and the same

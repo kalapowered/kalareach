@@ -33,6 +33,8 @@
 //! handed complete spans the engine has cleared, each one beginning where a sequence begins, so
 //! there is no moment at which it could be handed the middle of an escape sequence.
 
+use std::sync::Arc;
+
 use kr_protocol::attachment::ViewportPosition;
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
 use kr_protocol::projection::ProjectionResetReason;
@@ -243,6 +245,14 @@ pub struct TerminalEngine {
     /// Once, at creation. A second choice is a change to the session's palette, which is a terminal
     /// mutation with an authority of its own and not something a creation-time seam may make.
     palette_chosen: bool,
+    /// The clock every window the engine keeps is measured on: how long a reply waits for the
+    /// response lane, the replies it may write in a second, how often one kind of diagnostic is
+    /// published, and how long a transition into live byte forwarding waits for a boundary.
+    ///
+    /// It is the session's continuous clock, which a suspension moves and a set wall clock does not,
+    /// and it is held here, not passed with each call, so that no call can measure one window on
+    /// one clock and read it on another.
+    clock: Arc<dyn kr_ipc::clock::SharedClock>,
 }
 
 impl std::fmt::Debug for TerminalEngine {
@@ -256,12 +266,13 @@ impl std::fmt::Debug for TerminalEngine {
 }
 
 impl TerminalEngine {
-    /// Builds the canonical grid of a session of these dimensions.
+    /// Builds the canonical grid of a session of these dimensions, whose windows are measured on
+    /// `clock`.
     ///
     /// # Errors
     ///
     /// Returns an error when the dimensions are outside what a canonical grid may be.
-    pub fn new(canonical: Dimensions) -> Result<Self> {
+    pub fn new(canonical: Dimensions, clock: Arc<dyn kr_ipc::clock::SharedClock>) -> Result<Self> {
         let size = grid_size(canonical)?;
         let engine = Engine::new(EngineConfig {
             size,
@@ -287,7 +298,17 @@ impl TerminalEngine {
             tail: Vec::new(),
             tail_cursor: 0,
             palette_chosen: false,
+            clock,
         })
+    }
+
+    /// Reads the clock the engine's windows are measured on, in milliseconds.
+    ///
+    /// It is a reading of the continuous clock: meaningful beside another reading of it, and not as
+    /// a time of day.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.clock.boot_elapsed_ms()
     }
 
     /// Returns the session's canonical dimensions.
@@ -329,8 +350,9 @@ impl TerminalEngine {
     /// Returns an error when the grid cannot be that size, including
     /// [`WorkerError::ResourceUnavailable`] when what both screen buffers would hold at that size
     /// does not fit the session's budget. Nothing is allocated and nothing moves in that case.
-    pub fn resize(&mut self, canonical: Dimensions, now_ms: u64) -> Result<()> {
+    pub fn resize(&mut self, canonical: Dimensions) -> Result<()> {
         let size = grid_size(canonical)?;
+        let now_ms = self.now_ms();
         self.engine.resize(size, now_ms).map_err(term_failure)?;
         self.canonical = canonical;
         // A resize advances the engine's projection, so every client's screen is described again
@@ -355,7 +377,8 @@ impl TerminalEngine {
     /// `cursor` is where the batch starts in the raw stream, which must be where the engine has
     /// consumed to: the grid and the history are two views of one stream, and a disagreement about
     /// where a byte is would put a snapshot's cursor somewhere the history does not have.
-    pub fn feed(&mut self, cursor: u64, bytes: &[u8], gate: LaneGate, now_ms: u64) -> Filtered {
+    pub fn feed(&mut self, cursor: u64, bytes: &[u8], gate: LaneGate) -> Filtered {
+        let now_ms = self.now_ms();
         debug_assert_eq!(
             self.engine.read_offset(),
             cursor,
@@ -399,7 +422,8 @@ impl TerminalEngine {
     ///
     /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the
     /// moment one of those closes is a moment to look again. Nothing else in the engine changes.
-    pub fn drain_replies(&mut self, gate: LaneGate, now_ms: u64) -> Vec<Vec<u8>> {
+    pub fn drain_replies(&mut self, gate: LaneGate) -> Vec<Vec<u8>> {
+        let now_ms = self.now_ms();
         self.engine
             .lane_mut()
             .drain(gate, MAX_REPLY_BYTES, now_ms)
@@ -421,7 +445,8 @@ impl TerminalEngine {
     ///
     /// The last scalar of a run waits to see whether a combining mark follows it, so a screen that
     /// has stopped changing is only final once this has run.
-    pub fn quiesce(&mut self, gate: LaneGate, now_ms: u64) -> Filtered {
+    pub fn quiesce(&mut self, gate: LaneGate) -> Filtered {
+        let now_ms = self.now_ms();
         let outcome = self.engine.quiesce(now_ms);
         self.collect(&outcome, gate, now_ms)
     }
@@ -461,10 +486,10 @@ impl TerminalEngine {
         &mut self,
         dimensions: Dimensions,
         gate: LaneGate,
-        now_ms: u64,
         keyboard: crate::render::Keyboard,
         scope: crate::render::Scope,
     ) -> (u64, Restoration, Filtered) {
+        let now_ms = self.now_ms();
         let mut viewport = self.viewport_for(Window::live(dimensions));
         let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
@@ -644,10 +669,10 @@ impl TerminalEngine {
         window: Window,
         reason: ProjectionResetReason,
         gate: LaneGate,
-        now_ms: u64,
         budget: usize,
         scope: crate::render::Scope,
     ) -> Result<(crate::snapshot::Update, Filtered)> {
+        let now_ms = self.now_ms();
         let viewport = self.viewport_for(window);
         // The state without its rows, and then the rows a bounded run at a time as the pages are
         // built. Taking the whole screen first and paging it afterwards would hold the session
@@ -930,13 +955,17 @@ mod tests {
     }
 
     fn engine() -> TerminalEngine {
-        TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
+        TerminalEngine::new(
+            dimensions(80, 24),
+            Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("a canonical grid")
     }
 
     #[test]
     fn ordinary_output_reaches_a_direct_attachment_unchanged() {
         let mut engine = engine();
-        let filtered = engine.feed(0, b"hello", LaneGate::default(), 0);
+        let filtered = engine.feed(0, b"hello", LaneGate::default());
         let forwarded: Vec<u8> = filtered
             .direct
             .iter()
@@ -944,7 +973,7 @@ mod tests {
             .collect();
         // The last scalar waits for a combining mark, so a settled screen needs the quiesce the
         // session loop performs when the read goes quiet.
-        let settled = engine.quiesce(LaneGate::default(), 0);
+        let settled = engine.quiesce(LaneGate::default());
         let tail: Vec<u8> = settled
             .direct
             .iter()
@@ -956,7 +985,7 @@ mod tests {
     #[test]
     fn a_query_is_answered_into_the_application_and_reaches_no_terminal() {
         let mut engine = engine();
-        let filtered = engine.feed(0, b"\x1b[c", LaneGate::default(), 0);
+        let filtered = engine.feed(0, b"\x1b[c", LaneGate::default());
         assert!(
             filtered.direct.is_empty(),
             "no attached terminal is asked the question"
@@ -973,7 +1002,7 @@ mod tests {
         let mut engine = engine();
         let attachment = AttachmentId::new(kr_ipc::new_uuid());
         engine.set_lease_holder(Some(attachment), InputLeaseEpoch::new(1));
-        let filtered = engine.feed(0, b"\x07", LaneGate::default(), 0);
+        let filtered = engine.feed(0, b"\x07", LaneGate::default());
         assert!(filtered.direct.is_empty(), "nothing is broadcast");
         assert_eq!(filtered.effects.len(), 1);
         assert_eq!(*filtered.effects[0].bytes, vec![0x07]);
@@ -983,7 +1012,7 @@ mod tests {
     #[test]
     fn a_bell_with_no_lease_holder_becomes_a_host_event() {
         let mut engine = engine();
-        let filtered = engine.feed(0, b"\x07", LaneGate::default(), 0);
+        let filtered = engine.feed(0, b"\x07", LaneGate::default());
         assert!(filtered.effects.is_empty());
         assert_eq!(filtered.host_events.len(), 1);
     }
@@ -991,11 +1020,10 @@ mod tests {
     #[test]
     fn a_restoration_describes_the_screen_rather_than_the_bytes_that_made_it() {
         let mut engine = engine();
-        engine.feed(0, b"\x07before\x1b[c after", LaneGate::default(), 0);
+        engine.feed(0, b"\x07before\x1b[c after", LaneGate::default());
         let (cursor, restoration, _) = engine.restoration(
             dimensions(80, 24),
             LaneGate::default(),
-            0,
             crate::render::Keyboard::Install,
             crate::render::Scope::WholeScreen,
         );
@@ -1040,7 +1068,11 @@ mod projection_tests {
     }
 
     fn engine() -> TerminalEngine {
-        TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
+        TerminalEngine::new(
+            dimensions(80, 24),
+            Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("a canonical grid")
     }
 
     /// KR-REQ-08.83: each buffer's pages carry that buffer's own retention.
@@ -1059,13 +1091,12 @@ mod projection_tests {
         // Then into the alternate buffer, which starts its own numbering and keeps no history.
         stream.extend_from_slice(b"\x1b[?1049h");
         stream.extend_from_slice(b"an application's screen\r\n");
-        engine.feed(0, &stream, LaneGate::default(), 0);
+        engine.feed(0, &stream, LaneGate::default());
         let (update, _) = engine
             .projection_install(
                 Window::live(dimensions(80, 24)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
                 crate::render::Scope::WholeScreen,
             )
@@ -1124,7 +1155,7 @@ mod projection_tests {
         stream.extend_from_slice(b"an application's screen\r\n");
         // And the application's own, on the buffer that is showing, which it is told.
         stream.extend_from_slice(b"\x1b[>3u");
-        engine.feed(0, &stream, LaneGate::default(), 0);
+        engine.feed(0, &stream, LaneGate::default());
 
         for (scope, expected) in [
             (crate::render::Scope::WholeScreen, 2),
@@ -1135,7 +1166,6 @@ mod projection_tests {
                     Window::live(dimensions(80, 24)),
                     ProjectionResetReason::Attached,
                     LaneGate::default(),
-                    0,
                     crate::output::DEFAULT_SEND_QUEUE_BYTES,
                     scope,
                 )
@@ -1356,7 +1386,7 @@ mod projection_tests {
         for line in 0..23 {
             stream.extend_from_slice(format!("line {line}\r\n").as_bytes());
         }
-        engine.feed(0, &stream, LaneGate::default(), 0);
+        engine.feed(0, &stream, LaneGate::default());
         // A queue several times what this screen costs, and far less than forty-eight times what
         // its longest row costs: a rule that gave every row the same allowance would cut that row
         // here, and the screen it belongs to never came near the queue.
@@ -1365,7 +1395,6 @@ mod projection_tests {
                 Window::live(dimensions(80, 24)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 512 * 1024,
                 crate::render::Scope::WholeScreen,
             )
@@ -1423,14 +1452,13 @@ mod projection_tests {
             }
             stream.extend_from_slice(b"\r\n");
         }
-        engine.feed(0, &stream, LaneGate::default(), 0);
+        engine.feed(0, &stream, LaneGate::default());
         let budget = 256 * 1024;
         let (update, _) = engine
             .projection_install(
                 Window::live(dimensions(80, 24)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 budget,
                 crate::render::Scope::WholeScreen,
             )
@@ -1448,7 +1476,6 @@ mod projection_tests {
                 Window::live(dimensions(80, 24)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 total,
                 crate::render::Scope::WholeScreen,
             )
@@ -1481,7 +1508,6 @@ mod projection_tests {
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
-                0,
                 crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot")
@@ -1497,7 +1523,6 @@ mod projection_tests {
                     Window::live(dimensions(80, 24)),
                     ProjectionResetReason::Attached,
                     LaneGate::default(),
-                    0,
                     budget,
                     crate::render::Scope::WholeScreen,
                 )
@@ -1555,7 +1580,6 @@ mod projection_tests {
                 Window::live(dimensions(40, 10)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
                 crate::render::Scope::WholeScreen,
             )
@@ -1568,7 +1592,7 @@ mod projection_tests {
         // One batch later the client can still be continued from.
         let mut cursor = engine.output_cursor();
         let batch = b"a\r\n";
-        engine.feed(cursor, batch, LaneGate::default(), 0);
+        engine.feed(cursor, batch, LaneGate::default());
         cursor += batch.len() as u64;
         assert!(
             matches!(
@@ -1587,7 +1611,7 @@ mod projection_tests {
         // is bounded, which is the whole point: a client that has fallen further behind than this
         // is told to start again rather than being reasoned about.
         for _ in 0..200 {
-            engine.feed(cursor, batch, LaneGate::default(), 0);
+            engine.feed(cursor, batch, LaneGate::default());
             cursor += batch.len() as u64;
         }
         assert_eq!(
@@ -1618,7 +1642,7 @@ mod projection_tests {
             engine.palette_source(),
             kr_term::palette::PaletteSource::LightPreset
         );
-        engine.feed(0, b"output", LaneGate::default(), 0);
+        engine.feed(0, b"output", LaneGate::default());
         let refused = engine
             .set_initial_palette(PaletteChoice::DarkPreset)
             .expect_err("a session that has produced output");
@@ -1641,7 +1665,7 @@ mod projection_tests {
         // 61,122 cells — and outside what both screen buffers and their scrollback may hold. The
         // two are different refusals and this is the second one.
         let refused = engine
-            .resize(dimensions(61, 1_002), 0)
+            .resize(dimensions(61, 1_002))
             .expect_err("a grid whose state does not fit the session budget");
         assert!(
             matches!(refused, WorkerError::ResourceUnavailable { .. }),
@@ -1649,7 +1673,7 @@ mod projection_tests {
         );
         assert!(
             matches!(
-                engine.resize(dimensions(2_048, 1_024), 0),
+                engine.resize(dimensions(2_048, 1_024)),
                 Err(WorkerError::InvalidArgument(_))
             ),
             "and a geometry outside the cell count is the caller's mistake, which is a different              refusal"
@@ -1670,7 +1694,6 @@ mod projection_tests {
                 Window::live(dimensions(40, 10)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
                 crate::render::Scope::WholeScreen,
             )
@@ -1702,7 +1725,6 @@ mod projection_tests {
                 Window::live(dimensions(40, 10)),
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
-                0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
                 crate::render::Scope::WholeScreen,
             )

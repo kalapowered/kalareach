@@ -124,7 +124,11 @@ const IDLE_VIEW_BYTES: usize = 16 * 1024;
 #[test]
 fn an_idle_session_and_an_installed_view_hold_what_they_are_supposed_to() {
     let (engine, session) = held_by(|| {
-        TerminalEngine::new(dimensions(IDLE_GEOMETRY.0, IDLE_GEOMETRY.1)).expect("a canonical grid")
+        TerminalEngine::new(
+            dimensions(IDLE_GEOMETRY.0, IDLE_GEOMETRY.1),
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("a canonical grid")
     });
     let mut engine = engine;
     assert!(
@@ -191,7 +195,6 @@ fn install_for(
             kr_worker::projection::Window::live(window),
             ProjectionResetReason::Attached,
             LaneGate::default(),
-            0,
             QUEUE,
             kr_worker::render::Scope::WholeScreen,
         )
