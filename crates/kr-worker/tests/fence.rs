@@ -2942,6 +2942,34 @@ async fn a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_f
         );
         let encoded = serde_json::to_string(&pasted).expect("facts encode");
         assert!(!encoded.contains("9f3a7c1e"), "{kind:?}: {encoded}");
+
+        // A word with slashes in it is the word itself to a shell's search, found or not, and a
+        // shell may ask about it with the path it would have been: a token with slashes in it and
+        // an address pasted at the prompt name no program either.
+        let mut before = pasted.revision.get();
+        for word in [
+            "kr-9f3a7c1e/kr-5d2b/notacommand",
+            "https://hooks.example.test/services/kr-77aa31/notacommand",
+        ] {
+            keys.type_line(&shell, word);
+            let after = before;
+            let pasted = shell
+                .until_described("the word with slashes to end", |facts| {
+                    facts.revision.get() > after
+                        && facts.completion.0 == Some(DescriptionCompletion::Failed)
+                })
+                .await;
+            before = pasted.revision.get();
+            assert_eq!(
+                pasted.application.0, None,
+                "{kind:?}: {word}: a word with slashes in it that is no file names no program"
+            );
+            let encoded = serde_json::to_string(&pasted).expect("facts encode");
+            assert!(
+                !encoded.contains("notacommand") && !encoded.contains("kr-77aa31"),
+                "{kind:?}: {encoded}"
+            );
+        }
         shell.close().await;
     }
 }

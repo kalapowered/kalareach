@@ -1300,6 +1300,17 @@ fn a_load_whose_file_is_not_the_profiles_ends_as_assets_and_is_no_failure() {
             "{case}"
         );
         if case != "right" {
+            // The process holds no model and has nothing to do, so it is ended with the load.
+            assert!(
+                reports.iter().any(|report| matches!(
+                    report,
+                    Report::Unloaded {
+                        why: UnloadReason::Assets
+                    }
+                )),
+                "{case}: {reports:?}"
+            );
+            assert_eq!(rig.driver.pid(), None, "{case}: no process is left");
             assert_eq!(
                 rig.driver.service().setup_state().progress,
                 DownloadProgress::NotStarted,

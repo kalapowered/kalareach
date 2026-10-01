@@ -225,6 +225,8 @@ pub(crate) struct Setup {
     pub abandon: bool,
     /// The room a test says the disk has, in place of the disk's own.
     pub free_space: Option<Arc<Mutex<Option<u64>>>>,
+    /// How long a test lets a fetch wait for the server, in place of the product's own bound.
+    pub stall: Option<Arc<Mutex<Option<Duration>>>>,
 }
 
 /// What the rest of the daemon holds of the host.
@@ -261,6 +263,8 @@ struct Files {
     profile: Option<ModelProfile>,
     /// The room a test says the disk has.
     free_space: Option<Arc<Mutex<Option<u64>>>>,
+    /// How long a test lets a fetch wait for the server.
+    stall: Option<Arc<Mutex<Option<Duration>>>>,
     /// The identifiers the host gives the checks it has made.
     next_check: AtomicU64,
 }
@@ -303,6 +307,7 @@ impl DescribeHost {
             conditions,
             abandon,
             free_space,
+            stall,
         } = setup;
         let started_wall_ms = clock.now().wall_ms().get();
         let store = DescriptionStore::open(&state_dir).map_err(ControllerError::registry)?;
@@ -329,6 +334,10 @@ impl DescribeHost {
         // until they are, nothing is loaded, and a session is shown its title from metadata.
         let models = models_dir(&state_dir);
         let profile = service.selection().profile().cloned();
+        // A fetch that was cut off by the daemon going leaves a partial file, which nothing reads.
+        if let Some(profile) = &profile {
+            super::assets::remove_leftovers(&models, profile);
+        }
         let files_held = profile
             .as_ref()
             .is_some_and(|profile| super::assets::held(&models, profile));
@@ -354,6 +363,7 @@ impl DescribeHost {
                 models,
                 profile,
                 free_space,
+                stall,
                 next_check: AtomicU64::new(CHECK_IDS_FROM),
             },
         });
@@ -456,6 +466,16 @@ impl DescribeHost {
             Some(held) => *held.lock().unwrap_or_else(PoisonError::into_inner),
             None => kr_describe::resource::platform::free_space(path),
         }
+    }
+
+    /// How long a fetch waits for the server's answer and then for each chunk of a body.
+    pub(crate) fn stall(&self) -> Duration {
+        self.shared
+            .files
+            .stall
+            .as_ref()
+            .and_then(|held| *held.lock().unwrap_or_else(PoisonError::into_inner))
+            .unwrap_or(super::assets::STALL)
     }
 
     /// Tells the host how a fetch is going.

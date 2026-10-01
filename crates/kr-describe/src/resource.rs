@@ -588,11 +588,25 @@ pub mod platform {
             .ok()
     }
 
-    /// The bytes free on the disk that holds `path`, when this host can say: the disk whose mount
-    /// point is the longest prefix of the path as the operating system names it.
+    /// The bytes free to this user on the file system that holds `path`, when this host can say.
+    ///
+    /// Where the operating system answers for a path, it is asked: a mount that a list of disks
+    /// leaves out (a network share, a memory-backed directory) is measured as itself, never as the
+    /// disk of the root.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn free_space(path: &std::path::Path) -> Option<u64> {
+        let stat = rustix::fs::statvfs(path).ok()?;
+        stat.f_bavail.checked_mul(stat.f_frsize)
+    }
+
+    /// The bytes free to this user on the disk that holds `path`, when this host can say: the disk
+    /// whose mount point is the longest prefix of the path as the operating system names it.
+    #[cfg(not(unix))]
     #[must_use]
     pub fn free_space(path: &std::path::Path) -> Option<u64> {
         let path = path.canonicalize().ok()?;
+        let path = std::path::PathBuf::from(without_verbatim_prefix(path.to_str()?));
         let disks = sysinfo::Disks::new_with_refreshed_list();
         disks
             .list()
@@ -600,6 +614,20 @@ pub mod platform {
             .filter(|disk| path.starts_with(disk.mount_point()))
             .max_by_key(|disk| disk.mount_point().as_os_str().len())
             .map(sysinfo::Disk::available_space)
+    }
+
+    /// A path as the disks list names it: Windows spells a canonical path with a `\\?\` prefix
+    /// that a disk's mount point (`C:\`) does not carry, so a prefix test between the two would
+    /// never hold. A share keeps its server, as `\\server\share`.
+    #[cfg_attr(unix, allow(dead_code))]
+    fn without_verbatim_prefix(path: &str) -> String {
+        let Some(rest) = path.strip_prefix(r"\\?\") else {
+            return path.to_owned();
+        };
+        match rest.strip_prefix("UNC\\") {
+            Some(share) => format!(r"\\{share}"),
+            None => rest.to_owned(),
+        }
     }
 
     /// The longest a platform program may take to say what it knows.
@@ -656,6 +684,56 @@ pub mod platform {
         status
             .success()
             .then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[cfg(test)]
+    mod free_space_tests {
+        use super::without_verbatim_prefix;
+
+        /// A canonical Windows path is read as the disks list names it, so the prefix test between
+        /// a path and a mount point can hold; a path with no such prefix is left as it is.
+        #[test]
+        fn a_verbatim_prefix_is_taken_off_a_drive_and_off_a_share_and_nothing_else_is() {
+            assert_eq!(
+                without_verbatim_prefix(r"\\?\C:\Users\a\models"),
+                r"C:\Users\a\models"
+            );
+            assert_eq!(
+                without_verbatim_prefix(r"\\?\UNC\server\share\models"),
+                r"\\server\share\models"
+            );
+            assert_eq!(without_verbatim_prefix(r"C:\Users\a"), r"C:\Users\a");
+            assert_eq!(without_verbatim_prefix("/home/a"), "/home/a");
+        }
+
+        /// Where the operating system answers for a path, the free space is what it says: what
+        /// `df` reports for the same directory, to within what other processes use while this runs,
+        /// and nothing for a directory that is not there.
+        #[cfg(unix)]
+        #[test]
+        fn the_free_space_is_what_the_file_system_that_holds_the_path_says() {
+            let directory = tempfile::tempdir().expect("a directory");
+            let asked = super::free_space(directory.path()).expect("the free space is read");
+            let printed = std::process::Command::new("/bin/df")
+                .arg("-k")
+                .arg(directory.path())
+                .output()
+                .expect("df runs");
+            let text = String::from_utf8_lossy(&printed.stdout).into_owned();
+            let available_kib: u64 = text
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split_whitespace().nth(3))
+                .and_then(|figure| figure.parse().ok())
+                .unwrap_or_else(|| panic!("df says something else: {text}"));
+            let said = available_kib * 1024;
+            assert!(
+                asked.abs_diff(said) < 2 * 1024 * 1024 * 1024,
+                "free_space says {asked} and df says {said} for {}",
+                directory.path().display()
+            );
+            assert_eq!(super::free_space(&directory.path().join("absent")), None);
+        }
     }
 
     #[cfg(all(test, unix))]

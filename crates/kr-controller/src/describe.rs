@@ -151,6 +151,19 @@ impl DescribeModule {
         self.host().map(|host| host.snapshot().figures)
     }
 
+    /// Applies the owner's settings, as the configuration document says them: the host takes them
+    /// at its next turn, and turning descriptions off also stops a fetch of the model's files, as
+    /// it stops every other piece of work in flight. Every acceptance of the document comes here,
+    /// whether the daemon wrote it or the owner edited it by hand.
+    pub(crate) fn apply_settings(&self, settings: kr_describe::resource::ResourceSettings) {
+        if let Some(host) = self.host() {
+            host.settings(Some(settings.enabled), Some(settings.on_battery));
+        }
+        if !settings.enabled {
+            self.fetches.cancel();
+        }
+    }
+
     /// Wakes the host, for this crate's own tests that change what it reads.
     #[cfg(feature = "testing")]
     pub fn wake(&self) {
@@ -615,11 +628,6 @@ impl crate::service::Controller {
                     },
                 )
                 .await?;
-                // Turning descriptions off stops the work in flight, and a fetch of the model's
-                // files is part of it.
-                if params.enabled.0 == Some(false) {
-                    self.descriptions.fetches.cancel();
-                }
                 self.description_setup()
             }
             Method::DescriptionDownload => {
@@ -672,9 +680,10 @@ impl crate::service::Controller {
                 detail: "this host offers no model to fetch".to_owned(),
             });
         }
-        // Files that are held are not fetched again: one the process finds wrong at a load clears
-        // the marker, and the next fetch starts from nothing.
-        if assets::held(host.models(), &profile) {
+        // Files the host holds are not fetched again. A process that finds a file wrong at a load
+        // makes the host lower its own record, so the next fetch starts from nothing; a fetch asked
+        // for while the files are held changes nothing, and the answer says they are.
+        if host.snapshot().figures.assets_held {
             return Ok(());
         }
         let proxy = self.started_proxy()?;
@@ -822,6 +831,7 @@ pub(crate) struct Placement {
     pub(crate) conditions: Option<Arc<Mutex<kr_describe::resource::HostConditions>>>,
     pub(crate) abandon: bool,
     pub(crate) free_space: Option<Arc<Mutex<Option<u64>>>>,
+    pub(crate) stall: Option<Arc<Mutex<Option<std::time::Duration>>>>,
 }
 
 /// Maps where a title came from onto the protocol's word for it.

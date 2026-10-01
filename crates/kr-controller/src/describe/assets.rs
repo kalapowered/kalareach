@@ -13,8 +13,8 @@
 //! only once its size and digest are the profile's. It refuses a file larger than the profile
 //! records, as it refuses to begin when the disk has less room than the files need. It runs as a
 //! task of its own, so nothing on the host's thread or on a keystroke's path waits for it, and a
-//! cancellation stops it between two chunks of the body. A fetch that is cancelled or fails leaves
-//! no file of the profile behind.
+//! cancellation stops it between two chunks of the body. A fetch that is cancelled or fails removes
+//! the files it wrote, and one that is kept removes the files of the profile's other revisions.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,8 +39,9 @@ const PARTIAL_SUFFIX: &str = ".partial";
 /// How long a connection may take to be made.
 const CONNECT: Duration = Duration::from_secs(30);
 
-/// How long the body may go without a chunk before the fetch is given up.
-const STALL: Duration = Duration::from_secs(60);
+/// How long the fetch waits for the server's answer, and then for each chunk of the body, before it
+/// is given up. A test shortens it through the host.
+pub(crate) const STALL: Duration = Duration::from_secs(60);
 
 /// The room left on the disk beyond the files themselves.
 const ROOM_BEYOND: u64 = 256 * 1024 * 1024;
@@ -285,11 +286,50 @@ async fn fetch_all(
         placed.push(file);
         fetched_before = fetched_before.saturating_add(asset.bytes);
     }
+    // The last look before the files are kept, and the one that honours a cancellation that came
+    // while the process was checking a file even though the check ended as passed: the process may
+    // have answered before it read the cancellation. A cancellation that comes after this finds
+    // the files held.
+    if *cancel.borrow() {
+        return Ended::Cancelled;
+    }
     if let Err(error) = mark_held(&models, profile) {
         return Ended::Failed(format!("the model's files could not be marked: {error}"));
     }
+    remove_other_revisions(&models, profile);
     host.assets_held(true);
     Ended::Verified
+}
+
+/// Removes the directories of the profile's other revisions, which the held files have replaced.
+fn remove_other_revisions(models: &Path, profile: &ModelProfile) {
+    let kept = directory(models, profile);
+    let Some(profile_directory) = kept.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(profile_directory) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let other = entry.path();
+        if other != kept && other.is_dir() {
+            let _ = std::fs::remove_dir_all(other);
+        }
+    }
+}
+
+/// Removes what a fetch that did not end left in the selected profile's directory: a partial file.
+/// Files that are kept are held by a marker, and nothing else is taken away.
+pub(crate) fn remove_leftovers(models: &Path, profile: &ModelProfile) {
+    let Ok(entries) = std::fs::read_dir(directory(models, profile)) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(PARTIAL_SUFFIX) && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Fetches one file to its partial, has the process check it, and leaves it checked, or deletes it.
@@ -338,10 +378,16 @@ async fn receive(
         .and_then(|(_, rest)| rest.split('/').next())
         .unwrap_or("the model's source")
         .to_owned();
+    let stall = host.stall();
     let mut response = tokio::select! {
-        sent = client.get(&asset.url).send() => sent.map_err(|error| {
-            Ended::Failed(format!("{source} could not be reached: {}", error.without_url()))
-        })?,
+        sent = tokio::time::timeout(stall, client.get(&asset.url).send()) => match sent {
+            Err(_) => return Err(Ended::Failed(format!(
+                "{source} did not answer within {} seconds", stall.as_secs()
+            ))),
+            Ok(sent) => sent.map_err(|error| {
+                Ended::Failed(format!("{source} could not be reached: {}", error.without_url()))
+            })?,
+        },
         () = until_cancelled(cancel) => return Err(Ended::Cancelled),
     };
     if !response.status().is_success() {
@@ -366,9 +412,9 @@ async fn receive(
     let mut told = tokio::time::Instant::now();
     loop {
         let chunk = tokio::select! {
-            chunk = tokio::time::timeout(STALL, response.chunk()) => match chunk {
+            chunk = tokio::time::timeout(stall, response.chunk()) => match chunk {
                 Err(_) => return Err(Ended::Failed(format!(
-                    "{source} sent nothing for {} seconds", STALL.as_secs()
+                    "{source} sent nothing for {} seconds", stall.as_secs()
                 ))),
                 Ok(Err(error)) => return Err(Ended::Failed(format!(
                     "{source} broke off: {}", error.without_url()
@@ -414,8 +460,10 @@ async fn receive(
 
 /// How long the process is given to check a file of `bytes`, in milliseconds.
 fn check_deadline_ms(bytes: u64) -> u64 {
-    // Reading the file whole at a tenth of a gigabyte a second, and a minute beside it.
-    60_000_u64.saturating_add(bytes / 100_000)
+    // Reading the file whole at ten megabytes a second, which the process's lowest scheduling class
+    // can come to on a busy host, and two minutes beside it: a good download is never thrown away
+    // for the time a check took.
+    120_000_u64.saturating_add(bytes / 10_000)
 }
 
 /// Has the description process check `partial` against `asset`, and waits for it to say so, however
@@ -483,6 +531,25 @@ mod tests {
             .expect("the profiles this build ships")
             .default_profile()
             .clone()
+    }
+
+    /// The check is given time to read the whole file at ten megabytes a second and two minutes
+    /// beside that, so a good download is not thrown away for the time a busy host took to hash it.
+    #[test]
+    fn a_check_is_given_the_time_to_read_the_whole_file_slowly() {
+        for asset in profile().assets() {
+            let allowed = check_deadline_ms(asset.bytes);
+            assert!(
+                allowed >= 120_000 + asset.bytes / 10_000,
+                "{} bytes are given {allowed} ms",
+                asset.bytes
+            );
+        }
+        assert_eq!(
+            check_deadline_ms(0),
+            120_000,
+            "a file of nothing keeps the margin"
+        );
     }
 
     fn sparse(path: &Path, length: u64) {

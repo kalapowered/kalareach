@@ -199,6 +199,9 @@ pub enum UnloadReason {
     Failed,
     /// The process was started to check a file and holds no model: it goes with the check.
     CheckDone,
+    /// The process refused the model's files at a load and holds no model: it goes, and the next
+    /// load starts another once the files are fetched again.
+    Assets,
 }
 
 impl UnloadReason {
@@ -210,6 +213,7 @@ impl UnloadReason {
             Self::Paused(reason) => reason.as_str(),
             Self::Failed => "failed",
             Self::CheckDone => "check_done",
+            Self::Assets => "assets",
         }
     }
 }
@@ -1794,9 +1798,11 @@ impl DescriptionService {
             Answered::LoadEnded { why, detail } => {
                 if why == LoadEnd::Assets {
                     // The files are not the profile's: nothing is loaded until they are fetched
-                    // again, and that is no failure of inference.
+                    // again, and that is no failure of inference. The process holds no model and
+                    // has nothing to do, so it goes.
                     self.assets_held = false;
                     self.progress = DownloadProgress::NotStarted;
+                    self.unload_owed = Some(UnloadReason::Assets);
                 } else if why != LoadEnd::Cancelled {
                     self.restart.failed(now, None);
                 }
