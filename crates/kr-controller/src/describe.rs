@@ -45,6 +45,7 @@ use kr_worker::privacy::{
 use crate::error::{ControllerError, Result};
 use crate::privacy::{Admitted, PrivacyState, Published};
 
+pub(crate) mod assets;
 #[cfg(feature = "testing")]
 pub mod hooks;
 pub(crate) mod host;
@@ -90,6 +91,8 @@ pub struct DescribeModule {
     host: OnceLock<Arc<host::DescribeHost>>,
     /// The tasks that read each session's facts from its worker.
     links: link::Links,
+    /// The fetch of the model's files, when one runs.
+    fetches: assets::Fetches,
     /// Where this crate's own tests stop a read.
     #[cfg(test)]
     pub(crate) pauses: Pauses,
@@ -130,6 +133,7 @@ impl DescribeModule {
             ),
             host: OnceLock::new(),
             links: link::Links::default(),
+            fetches: assets::Fetches::default(),
             #[cfg(test)]
             pauses: Pauses::default(),
         })
@@ -611,6 +615,35 @@ impl crate::service::Controller {
                     },
                 )
                 .await?;
+                // Turning descriptions off stops the work in flight, and a fetch of the model's
+                // files is part of it.
+                if params.enabled.0 == Some(false) {
+                    self.descriptions.fetches.cancel();
+                }
+                self.description_setup()
+            }
+            Method::DescriptionDownload => {
+                let params: kr_protocol::describe::DescriptionDownloadParams = mutation
+                    .params
+                    .to_typed()
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                let host = self
+                    .descriptions
+                    .host()
+                    .filter(|host| host.runs())
+                    .cloned()
+                    .ok_or_else(|| ControllerError::Refused {
+                        code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+                        detail: "this daemon is not generating descriptions".to_owned(),
+                    })?;
+                match params.action {
+                    kr_protocol::describe::DescriptionDownloadAction::Start => {
+                        self.start_fetch(&host, &carried).await?;
+                    }
+                    kr_protocol::describe::DescriptionDownloadAction::Cancel => {
+                        self.descriptions.fetches.cancel();
+                    }
+                }
                 self.description_setup()
             }
             _ => Err(ControllerError::InvalidArgument(format!(
@@ -618,6 +651,44 @@ impl crate::service::Controller {
                 method.as_str()
             ))),
         }
+    }
+
+    /// Starts the fetch of the selected profile's files, unless they are held or a fetch runs. The
+    /// fetch begins only while the admission it was accepted under still stands.
+    async fn start_fetch(
+        self: &std::sync::Arc<Self>,
+        host: &std::sync::Arc<host::DescribeHost>,
+        carried: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        let Some(profile) = host.profile().cloned() else {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+                detail: "this host has no model to fetch".to_owned(),
+            });
+        };
+        if host.snapshot().setup.is_some_and(|setup| !setup.offered) {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+                detail: "this host offers no model to fetch".to_owned(),
+            });
+        }
+        // Files that are held are not fetched again: one the process finds wrong at a load clears
+        // the marker, and the next fetch starts from nothing.
+        if assets::held(host.models(), &profile) {
+            return Ok(());
+        }
+        let proxy = self.started_proxy()?;
+        let client = assets::client(proxy.as_ref())?;
+        let taken = self.under_registration(carried, || {
+            self.descriptions
+                .fetches
+                .start(std::sync::Arc::clone(host), profile, client)
+        })?;
+        // Waited for, so the answer that follows shows the fetch as running.
+        if let Some(taken) = taken {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), taken).await;
+        }
+        Ok(())
     }
 
     /// Answers `description.setup`: what descriptions offer on this host, and what it costs, from
@@ -750,6 +821,7 @@ pub(crate) struct Placement {
     pub(crate) clock: host::Clock,
     pub(crate) conditions: Option<Arc<Mutex<kr_describe::resource::HostConditions>>>,
     pub(crate) abandon: bool,
+    pub(crate) free_space: Option<Arc<Mutex<Option<u64>>>>,
 }
 
 /// Maps where a title came from onto the protocol's word for it.

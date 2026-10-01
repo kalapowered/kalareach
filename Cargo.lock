@@ -4464,6 +4464,7 @@ dependencies = [
  "kr-voice",
  "kr-worker",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustix",
  "rustls",

@@ -54,6 +54,9 @@ kr-transport.workspace = true
 kr-voice.workspace = true
 kr-attention.workspace = true
 kr-worker.workspace = true
+# The model files are fetched with the HTTP client that kr-client's builder makes, whose type this
+# crate names.
+reqwest.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 # Mail submission, opened on a TLS stream verified against the platform's trust, which kr-client
 # builds for every TLS client here, with no way to switch the verification off. The rendezvous

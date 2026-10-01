@@ -86,6 +86,7 @@ impl Controller {
             privacy: self.privacy.state(),
             conditions: placed.conditions,
             abandon: placed.abandon,
+            free_space: placed.free_space,
         };
         let started =
             tokio::task::spawn_blocking(move || crate::describe::host::DescribeHost::start(setup))
@@ -174,6 +175,7 @@ impl Controller {
             clock: crate::describe::host::Clock::default(),
             conditions: None,
             abandon: false,
+            free_space: None,
         }
     }
 

@@ -277,9 +277,10 @@ pub enum LoadEnd {
     DeadlineExceeded,
     /// Another description process held this environment's lock until the deadline.
     LockHeld,
-    /// The process would not load this: a profile its catalogue does not hold, or a file that is
-    /// not the one the profile records.
+    /// The process would not load this: a profile its catalogue does not hold.
     Refused,
+    /// A file of the profile is missing, cannot be read or is not the one the profile records.
+    Assets,
     /// The runtime could not load it.
     Failed,
 }
@@ -293,6 +294,7 @@ impl LoadEnd {
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::LockHeld => "lock_held",
             Self::Refused => "refused",
+            Self::Assets => "assets",
             Self::Failed => "failed",
         }
     }
