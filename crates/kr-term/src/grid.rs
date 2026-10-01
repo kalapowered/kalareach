@@ -1299,6 +1299,14 @@ impl CanonicalGrid {
             reason = "a saved column index is bounded by the validated column count"
         )]
         let col = saved.position.x as u32;
+        // The cursor of the buffer in use is on that buffer's screen and the other's is on the one
+        // the library keeps back.
+        let screen = if alternate == self.terminal.is_alt_screen_active() {
+            self.terminal.screen()
+        } else {
+            self.terminal.inactive_screen()
+        };
+        let col = self.last_cell_column(screen, col, saved.position.y, saved.wrap_next);
         Some(SavedCursor {
             buffer: if alternate {
                 ActiveBuffer::Alternate
@@ -1351,10 +1359,11 @@ impl CanonicalGrid {
 
     /// The cursor position, zero-based.
     ///
-    /// A character that reaches the right margin leaves the cursor on the last column with a wrap
-    /// pending, and that is where this says it is. The library leaves a two-cell character's cursor
-    /// on the character's first cell, one column short of the margin it ended on; a terminal, and a
-    /// one-cell character at the same margin, leave it on the last.
+    /// With a wrap pending after a two-cell character the cursor is reported on the character's
+    /// last cell, as a terminal leaves it. The library keeps the column of the character's first
+    /// cell there, one short of where a one-cell character at the same margin leaves it. That is
+    /// the only difference between this and the library's own column: what a later sequence does
+    /// from that cell is still the library's.
     #[must_use]
     pub fn cursor(&self) -> (u32, u32) {
         let pos = self.terminal.cursor_pos();
@@ -1369,10 +1378,44 @@ impl CanonicalGrid {
             reason = "a column index is bounded by the validated column count"
         )]
         let col = pos.x as u32;
-        if self.terminal.pending_wrap() {
-            return (col.max(self.margins_horizontal().1), row);
-        }
+        let col = self.last_cell_column(
+            self.terminal.screen(),
+            col,
+            pos.y,
+            self.terminal.pending_wrap(),
+        );
         (col, row)
+    }
+
+    /// The column a cursor reports: where the library has it, unless a wrap is pending after a
+    /// two-cell character, which puts it on that character's last cell.
+    ///
+    /// Only the cell the cursor is on is read, so a wrap the library left set after the cursor was
+    /// moved (it is not always cleared) cannot move the column: the cell under the cursor then is
+    /// not the one the character was written to.
+    fn last_cell_column(
+        &self,
+        screen: &wezterm_term::screen::Screen,
+        col: u32,
+        row: i64,
+        wrap_pending: bool,
+    ) -> u32 {
+        if !wrap_pending {
+            return col;
+        }
+        let line = screen.phys_row(row);
+        let mut width = 1;
+        screen.with_phys_lines(line..line + 1, |lines| {
+            if let Some(cell) = lines.first().and_then(|line| line.get_cell(col as usize)) {
+                width = cell.width();
+            }
+        });
+        if width < 2 {
+            return col;
+        }
+        let width = u32::try_from(width).unwrap_or(u32::MAX);
+        col.saturating_add(width - 1)
+            .min(self.size.cols.saturating_sub(1))
     }
 
     /// The top and bottom margins, zero-based and inclusive.

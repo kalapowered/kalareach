@@ -166,8 +166,8 @@ fn a_wide_character_that_ends_in_the_last_column_is_answered_as_both_recorded_te
 
 #[test]
 fn every_absolute_column_past_the_last_stops_on_the_last() {
-    // One grid wider than it is tall and one taller than it is wide: the library's own bound on a
-    // column parameter is the larger of the two, so both shapes are needed.
+    // One grid wider than it is tall and one taller than it is wide: the grid's bound on a count,
+    // which a column is not, is the larger of the two sizes, and a column must not depend on it.
     for (cols, rows) in [(10, 5), (10, 30)] {
         for (name, bytes) in [
             ("cursor position, far past", "\x1b[2;99H"),
@@ -304,5 +304,81 @@ fn a_wide_character_that_ends_at_a_right_margin_leaves_the_cursor_on_the_margin(
     for text in ["aaaa\u{3042}", "aaaaab"] {
         let bytes = format!("\x1b[?69h\x1b[3;8s\x1b[1;3H{text}");
         assert_eq!(cursor_after(20, 5, bytes.as_bytes()), (1, 8), "{text:?}");
+    }
+}
+
+#[test]
+fn an_absolute_column_past_the_last_is_forwarded_to_a_terminal_that_stops_there_too() {
+    // A terminal stops on the last column for each of these, as the grid does, so the bytes go to it
+    // as they came and nothing makes the attachment project.
+    for bytes in [
+        "\x1b[2;99H",
+        "\x1b[2;81H",
+        "\x1b[2;99f",
+        "\x1b[2;4H\x1b[99G",
+        "\x1b[2;4H\x1b[81G",
+        "\x1b[2;4H\x1b[99`",
+    ] {
+        let mut engine = engine(80, 24);
+        let outcome = engine.feed(bytes.as_bytes(), 0);
+        engine.quiesce(0);
+        let length = u64::try_from(bytes.len()).expect("a length");
+        let forwarded: u64 = outcome.forward.iter().map(|span| span.len()).sum();
+        assert_eq!(forwarded, length, "{bytes:?} is forwarded whole");
+        assert!(
+            outcome.projection_required_at.is_none(),
+            "{bytes:?} needs no projection"
+        );
+        assert_eq!(reported(&mut engine).1, 80, "{bytes:?}");
+    }
+    // A column too large for terminals to agree on is still reduced and still withheld.
+    for bytes in ["\x1b[2;70000H", "\x1b[2;4H\x1b[70000G"] {
+        let mut engine = engine(80, 24);
+        let outcome = engine.feed(bytes.as_bytes(), 0);
+        assert!(
+            outcome.projection_required_at.is_some(),
+            "{bytes:?} is held back from a terminal"
+        );
+    }
+}
+
+#[test]
+fn a_wrap_left_set_after_the_cursor_moved_does_not_move_the_reported_column() {
+    // The library keeps a pending wrap through these, though the cursor is no longer on the cell
+    // the wrap belongs to.
+    let full = "aaaaaaaaaa";
+    assert_eq!(
+        cursor_after(10, 5, format!("{full}\x1b#8").as_bytes()),
+        (1, 1),
+        "the alignment pattern homes the cursor"
+    );
+    let margins = "\x1b[?69h\x1b[3;8s\x1b[1;3Haaaaab";
+    assert_eq!(cursor_after(20, 5, margins.as_bytes()), (1, 8));
+    for (name, after) in [
+        ("margin mode reset", "\x1b[?69l"),
+        ("a soft terminal reset", "\x1b[!p"),
+    ] {
+        assert_eq!(
+            cursor_after(20, 5, format!("{margins}{after}").as_bytes()),
+            (1, 8),
+            "{name} leaves the cursor where it was"
+        );
+    }
+}
+
+#[test]
+fn a_saved_cursor_names_the_same_column_the_live_cursor_did() {
+    for (name, text, column, pending) in [
+        ("a wide character ends the row", "aaaaaaaa\u{3042}", 9, true),
+        ("a narrow character ends the row", "aaaaaaaaab", 9, true),
+        ("a wide character leaves room", "aaaaaaa\u{3042}", 9, false),
+    ] {
+        let mut engine = engine(10, 5);
+        engine.feed(format!("{text}\x1b7").as_bytes(), 0);
+        engine.quiesce(0);
+        let saved = engine.grid().saved_cursor(false).expect("a saved cursor");
+        assert_eq!(saved.col, column, "{name}");
+        assert_eq!(saved.pending_wrap, pending, "{name}");
+        assert_eq!(engine.grid().cursor().0, column, "{name}: the live cursor");
     }
 }
