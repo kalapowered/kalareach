@@ -154,13 +154,16 @@ pub struct CatalogueAddParams {
     pub budgets: CatalogueBudgets,
     /// Capabilities its packages may hold without a further grant, beyond the default ceiling.
     pub ceiling: Vec<String>,
-    /// The owner's confirmation of this exact enrolment.
+    /// The owner's confirmation of this exact enrolment, presented with the request.
     ///
     /// Adopting a root is one of the actions section 10 requires a fresh confirmation for, bound
-    /// to the exact action digest and consumed once. It is not optional here: a caller's
-    /// operating-system identity is explicitly not that confirmation, so there is no shape of this
-    /// request that carries none.
-    pub owner_confirmation: OwnerConfirmationProof,
+    /// to the exact action digest and consumed once. A caller's operating-system identity is
+    /// explicitly not that confirmation. A caller that holds the owner's signed proof presents it
+    /// here; a caller that does not, a terminal, leaves this null and the host spends, once, the
+    /// answer an owner device recorded to the challenge it issued for this exact request
+    /// (`owner.confirmation.request` with the `catalogue_add` subject). With neither, the request
+    /// is refused as needing the owner's confirmation.
+    pub owner_confirmation: Nullable<OwnerConfirmationProof>,
 }
 
 /// Result of `catalogue.add`.
@@ -565,9 +568,12 @@ pub struct PluginInstallParams {
     /// An installation that may do anything the installation it replaces could not, or, with
     /// nothing to replace, anything the repository's ceiling does not permit by itself, needs it,
     /// and so does every release that installs a native bridge. It is bound to the repository and
-    /// its ceiling as `catalogue.list` reports them, the release, the package hash and the grant
-    /// above, so it cannot be carried to another repository, release or grant. One that is given is
-    /// spent whether or not the installation needed it.
+    /// its ceiling as `catalogue.list` reports them, the release, the package hash, the grant
+    /// above and, for a release that installs a native bridge, the statement of what the bridge
+    /// does, so it cannot be carried to another repository, release or grant. One that is given is
+    /// spent whether or not the installation needed it. Where none is given, the host spends, once,
+    /// the answer an owner device recorded to the challenge it issued for this exact request, when
+    /// there is one.
     pub owner_confirmation: Nullable<OwnerConfirmationProof>,
 }
 

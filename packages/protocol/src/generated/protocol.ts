@@ -2230,7 +2230,7 @@ export interface KalaReachProtocol {
   owner_confirmation_complete_result?: OwnerConfirmationCompleteResult
   owner_confirmation_pending_params?: OwnerConfirmationPendingParams
   owner_confirmation_pending_result?: OwnerConfirmationPendingResult
-  owner_confirmation_proof?: OwnerConfirmationProof1
+  owner_confirmation_proof?: OwnerConfirmationProof
   owner_confirmation_request?: OwnerConfirmationRequest2
   owner_confirmation_request_params?: OwnerConfirmationRequestParams
   owner_confirmation_request_result?: OwnerConfirmationRequestResult
@@ -8214,7 +8214,18 @@ export interface CatalogueAddParams {
    * Where its metadata lives.
    */
   metadata_url: string
-  owner_confirmation: OwnerConfirmationProof
+  /**
+   * The owner's confirmation of this exact enrolment, presented with the request.
+   *
+   * Adopting a root is one of the actions section 10 requires a fresh confirmation for, bound
+   * to the exact action digest and consumed once. A caller's operating-system identity is
+   * explicitly not that confirmation. A caller that holds the owner's signed proof presents it
+   * here; a caller that does not, a terminal, leaves this null and the host spends, once, the
+   * answer an owner device recorded to the challenge it issued for this exact request
+   * (`owner.confirmation.request` with the `catalogue_add` subject). With neither, the request
+   * is refused as needing the owner's confirmation.
+   */
+  owner_confirmation: OwnerConfirmationProof | null
   /**
    * The trust root, as its bytes, base64 encoded.
    */
@@ -8257,12 +8268,11 @@ export interface CatalogueBudgets {
   retained_metadata_bytes: string
 }
 /**
- * The owner's confirmation of this exact enrolment.
+ * An owner's answer to a confirmation challenge.
  *
- * Adopting a root is one of the actions section 10 requires a fresh confirmation for, bound
- * to the exact action digest and consumed once. It is not optional here: a caller's
- * operating-system identity is explicitly not that confirmation, so there is no shape of this
- * request that carries none.
+ * The verification ceremony itself is platform code; this object records its result and binds it
+ * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
+ * challenge-consumption transition together.
  */
 export interface OwnerConfirmationProof {
   /**
@@ -13507,7 +13517,7 @@ export interface GrantCreateParams {
   /**
    * The owner's confirmation, when the request enlarges persistent authority.
    */
-  owner_confirmation: OwnerConfirmationProof1 | null
+  owner_confirmation: OwnerConfirmationProof | null
   /**
    * The grant this one is delegated from. Null issues from the issuer's own authority.
    */
@@ -13521,35 +13531,6 @@ export interface GrantCreateParams {
    * One KalaReach terminal session.
    */
   session_id: string
-}
-/**
- * An owner's answer to a confirmation challenge.
- *
- * The verification ceremony itself is platform code; this object records its result and binds it
- * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
- * challenge-consumption transition together.
- */
-export interface OwnerConfirmationProof1 {
-  /**
-   * How the confirmation reached the host.
-   */
-  channel:
-    | 'owner_device_presence'
-    | 'paired_owner_device'
-    | 'enrolled_presence_signer'
-    | 'local_bootstrap_terminal'
-    | 'session'
-    | 'plugin'
-    | 'contact_tool'
-  request: OwnerConfirmationRequest
-  /**
-   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
-   */
-  signature: string
-  /**
-   * The key identifier of the signer that produced the proof.
-   */
-  signer_key_id: string
 }
 /**
  * The role and the explicit choices on top of it.
@@ -15646,7 +15627,7 @@ export interface OwnerConfirmationCompleteParams {
    * outside a KalaReach session.
    */
   bootstrap_signer: AuthorisationKey | null
-  proof: OwnerConfirmationProof2
+  proof: OwnerConfirmationProof1
 }
 /**
  * An owner's answer to a confirmation challenge.
@@ -15655,7 +15636,7 @@ export interface OwnerConfirmationCompleteParams {
  * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
  * challenge-consumption transition together.
  */
-export interface OwnerConfirmationProof2 {
+export interface OwnerConfirmationProof1 {
   /**
    * How the confirmation reached the host.
    */
@@ -15754,6 +15735,82 @@ export interface PendingConfirmation {
         }
       }
     | 'establish_clock'
+    | {
+        catalogue_add: {
+          /**
+           * This host's identifier for the repository.
+           */
+          catalogue_id: string
+          /**
+           * The capabilities its packages may hold without a further grant, beyond the default
+           * ceiling.
+           */
+          ceiling: string[]
+          /**
+           * One installed OS, distribution or container environment and OS user.
+           */
+          environment_id: string
+          /**
+           * What kind of repository it is.
+           */
+          kind: 'official' | 'vendor' | 'community' | 'local' | 'mirror'
+          /**
+           * Where its metadata lives.
+           */
+          metadata_url: string
+          /**
+           * The digest of the exact root bytes being adopted.
+           */
+          root_digest: string
+          /**
+           * The key identifiers the root declares for its own role: what the owner is trusting.
+           */
+          root_key_ids: string[]
+          /**
+           * Where its targets live.
+           */
+          targets_url: string
+        }
+      }
+    | {
+        plugin_install: {
+          /**
+           * The repository it is installed from.
+           */
+          catalogue_id: string
+          /**
+           * What the repository's ceiling permits by itself.
+           */
+          ceiling: string[]
+          /**
+           * One installed OS, distribution or container environment and OS user.
+           */
+          environment_id: string
+          /**
+           * The capabilities the installation is granted.
+           */
+          grant: string[]
+          /**
+           * What the release's own manifest says a native bridge it installs does, where it
+           * installs one. These are the publisher's words, taken by the host from the verified
+           * manifest of the exact package hash and covered by the confirmation; a device shows
+           * them apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's.
+           */
+          grant_statement: string | null
+          /**
+           * The exact package hash.
+           */
+          package_digest: string
+          /**
+           * A plugin identifier from its manifest.
+           */
+          plugin_id: string
+          /**
+           * The release.
+           */
+          version: string
+        }
+      }
     | {
         described: DescribedAction
       }
@@ -16104,6 +16161,12 @@ export interface OwnerConfirmationRequestParams {
           invitation_id: string
         }
       }
+    | {
+        catalogue_add: CatalogueAddParams
+      }
+    | {
+        plugin_install: PluginInstallParams
+      }
     | 'establish_clock'
     | {
         described: DescribedAction
@@ -16166,6 +16229,53 @@ export interface ProposedGrant2 {
         }
       }
     | 'none'
+}
+/**
+ * Parameters of `plugin.install`.
+ */
+export interface PluginInstallParams {
+  /**
+   * The repository to install from.
+   */
+  catalogue_id: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Capabilities the owner is granting this installation.
+   */
+  grant: string[]
+  /**
+   * The owner's confirmation of this exact installation, where it needs one.
+   *
+   * An installation that may do anything the installation it replaces could not, or, with
+   * nothing to replace, anything the repository's ceiling does not permit by itself, needs it,
+   * and so does every release that installs a native bridge. It is bound to the repository and
+   * its ceiling as `catalogue.list` reports them, the release, the package hash, the grant
+   * above and, for a release that installs a native bridge, the statement of what the bridge
+   * does, so it cannot be carried to another repository, release or grant. One that is given is
+   * spent whether or not the installation needed it. Where none is given, the host spends, once,
+   * the answer an owner device recorded to the challenge it issued for this exact request, when
+   * there is one.
+   */
+  owner_confirmation: OwnerConfirmationProof | null
+  /**
+   * The exact package hash the caller expects.
+   *
+   * Installation verifies the signature before it installs, and the hash makes the caller's
+   * expectation explicit: a repository that published something else between the caller reading
+   * the index and this request arriving is a refusal rather than a surprise.
+   */
+  package_digest: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * The release.
+   */
+  version: string
 }
 /**
  * The result of `owner.confirmation.request`.
@@ -17118,7 +17228,7 @@ export interface PluginGrantParams {
    * decision, and a host that received only additions could not tell one from a removal.
    */
   grant: string[]
-  owner_confirmation: OwnerConfirmationProof3
+  owner_confirmation: OwnerConfirmationProof2
   /**
    * The exact package hash the grant is for.
    *
@@ -17138,7 +17248,7 @@ export interface PluginGrantParams {
  * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
  * challenge-consumption transition together.
  */
-export interface OwnerConfirmationProof3 {
+export interface OwnerConfirmationProof2 {
   /**
    * How the confirmation reached the host.
    */
@@ -17216,50 +17326,6 @@ export interface PluginSummary2 {
   revoked: boolean
   /**
    * The installed release.
-   */
-  version: string
-}
-/**
- * Parameters of `plugin.install`.
- */
-export interface PluginInstallParams {
-  /**
-   * The repository to install from.
-   */
-  catalogue_id: string
-  /**
-   * One installed OS, distribution or container environment and OS user.
-   */
-  environment_id: string
-  /**
-   * Capabilities the owner is granting this installation.
-   */
-  grant: string[]
-  /**
-   * The owner's confirmation of this exact installation, where it needs one.
-   *
-   * An installation that may do anything the installation it replaces could not, or, with
-   * nothing to replace, anything the repository's ceiling does not permit by itself, needs it,
-   * and so does every release that installs a native bridge. It is bound to the repository and
-   * its ceiling as `catalogue.list` reports them, the release, the package hash and the grant
-   * above, so it cannot be carried to another repository, release or grant. One that is given is
-   * spent whether or not the installation needed it.
-   */
-  owner_confirmation: OwnerConfirmationProof1 | null
-  /**
-   * The exact package hash the caller expects.
-   *
-   * Installation verifies the signature before it installs, and the hash makes the caller's
-   * expectation explicit: a repository that published something else between the caller reading
-   * the index and this request arriving is a refusal rather than a surprise.
-   */
-  package_digest: string
-  /**
-   * A plugin identifier from its manifest.
-   */
-  plugin_id: string
-  /**
-   * The release.
    */
   version: string
 }
@@ -18407,7 +18473,7 @@ export interface ProjectLocationAttachParams {
   /**
    * The owner's confirmation, on the submission that carries one.
    */
-  owner_confirmation: OwnerConfirmationProof1 | null
+  owner_confirmation: OwnerConfirmationProof | null
   /**
    * The repository to bind.
    */
@@ -18573,7 +18639,7 @@ export interface ProjectLocationAuthoriseParams {
    * the owner's own fresh confirmation for that. A first submission carries none and is answered
    * with the challenge; the same action submitted again carries the proof.
    */
-  owner_confirmation: OwnerConfirmationProof1 | null
+  owner_confirmation: OwnerConfirmationProof | null
   /**
    * The absolute path to open.
    */

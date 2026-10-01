@@ -1696,3 +1696,643 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     host.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// A terminal's catalogue decisions, confirmed on an owner device
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-07.47, KR-REQ-10.05: what a terminal asks of the catalogue (adopting a repository's root,
+/// an installation that needs the owner) is confirmed on an owner device and spent from the answer
+/// that device recorded. The terminal asks the host for the challenge by naming the exact request,
+/// an owner device answers it, and the request, repeated with no proof, spends that one answer.
+mod terminal_catalogue {
+    use super::*;
+
+    use base64::Engine as _;
+    use kr_controller::sharing::{CatalogueTrustPlan, PluginInstallPlan};
+    use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+    use kr_protocol::catalogue as wire;
+    use kr_protocol::confirmation::NATIVE_BRIDGE_NOTICE;
+    use kr_protocol::ids::PluginId;
+
+    /// The owner's own client on the daemon's socket, asking for one thing with no proof.
+    type Client = kr_ipc::client::LocalClient;
+
+    /// The release the bridge fixture publishes with a native bridge recipe, and the capabilities
+    /// it is installed with.
+    const BRIDGE_GRANT: [&str; 4] = [
+        "approval.decode",
+        "approval.respond",
+        "native_bridge.install",
+        "upstream.action",
+    ];
+
+    /// A copy of a published generation, on the internal disk.
+    struct Published {
+        _temp: tempfile::TempDir,
+        root: std::path::PathBuf,
+    }
+
+    impl Published {
+        fn of(source: &std::path::Path) -> Self {
+            let temp = tempfile::tempdir().expect("a temporary directory on the internal disk");
+            let root = temp.path().join("generation");
+            copy_tree(source, &root);
+            Self { _temp: temp, root }
+        }
+
+        fn development() -> Self {
+            Self::of(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/plugins/catalogue/development"),
+            )
+        }
+
+        fn with_bridge() -> Self {
+            Self::of(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/bridge-generation"),
+            )
+        }
+
+        fn url(&self, directory: &str) -> String {
+            url::Url::from_directory_path(
+                std::fs::canonicalize(self.root.join(directory)).expect("a directory"),
+            )
+            .expect("an absolute path")
+            .to_string()
+        }
+
+        fn index(&self) -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(self.root.join("targets/index.json")).expect("an index"),
+            )
+            .expect("a readable index")
+        }
+
+        fn manifest_digest(&self, plugin: &str, version: &str) -> String {
+            self.index()["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|entry| entry["plugin_id"] == plugin && entry["version"] == version)
+                .expect("the release")["manifest_digest"]
+                .as_str()
+                .expect("a digest")
+                .to_owned()
+        }
+
+        /// What the release's own manifest says its native bridge does.
+        fn statement(&self, plugin: &str, version: &str) -> String {
+            let name = plugin.split('/').nth(1).expect("a name");
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    self.root
+                        .join("targets/packages/kalareach")
+                        .join(name)
+                        .join(version)
+                        .join("plugin.json"),
+                )
+                .expect("a manifest"),
+            )
+            .expect("a manifest");
+            manifest["native_bridge"]["grant_statement"]
+                .as_str()
+                .expect("a statement")
+                .to_owned()
+        }
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("a destination");
+        let mut stack = vec![from.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).expect("readable").flatten() {
+                let source = entry.path();
+                if source.is_dir() {
+                    stack.push(source);
+                    continue;
+                }
+                let destination = to.join(source.strip_prefix(from).expect("inside"));
+                std::fs::create_dir_all(destination.parent().expect("a parent")).expect("writable");
+                std::fs::copy(&source, &destination).expect("copyable");
+            }
+        }
+    }
+
+    fn budgets() -> wire::CatalogueBudgets {
+        let defaults = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
+        wire::CatalogueBudgets {
+            metadata_bytes: defaults.metadata_bytes,
+            metadata_entries: defaults.metadata_entries,
+            retained_generations: defaults.retained_generations,
+            retained_metadata_bytes: defaults.retained_metadata_bytes,
+            payload_cache_bytes: defaults.payload_cache_bytes,
+            full_offline_mirror: false,
+        }
+    }
+
+    /// The request a terminal sends for a repository, with no proof.
+    fn add(
+        host: &Host,
+        published: &Published,
+        catalogue_id: &str,
+        ceiling: &[&str],
+    ) -> wire::CatalogueAddParams {
+        wire::CatalogueAddParams {
+            environment_id: host.environment_id,
+            catalogue_id: catalogue_id.to_owned(),
+            kind: wire::CatalogueKind::Local,
+            metadata_url: published.url("metadata"),
+            targets_url: published.url("targets"),
+            root: base64::engine::general_purpose::STANDARD
+                .encode(std::fs::read(published.root.join("root.json")).expect("a root")),
+            budgets: budgets(),
+            ceiling: ceiling.iter().map(|word| (*word).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        }
+    }
+
+    /// What the host's challenge for `params` has to be: the digest of the plan the effect builds
+    /// from the same request.
+    fn trust_digest(params: &wire::CatalogueAddParams) -> Digest256 {
+        let root = base64::engine::general_purpose::STANDARD
+            .decode(&params.root)
+            .expect("a root");
+        let enrolment = Enrolment::new(
+            RepositoryId::new(&params.catalogue_id).expect("an identifier"),
+            RepositoryKind::Local,
+            url::Url::parse(&params.metadata_url).expect("a location"),
+            url::Url::parse(&params.targets_url).expect("a location"),
+            root,
+            kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .expect("an enrolment");
+        CatalogueTrustPlan {
+            environment_id: params.environment_id,
+            catalogue_id: params.catalogue_id.clone(),
+            root_digest: enrolment.root_digest().to_string(),
+            root_key_ids: enrolment
+                .root_key_ids()
+                .expect("a readable root")
+                .into_iter()
+                .collect(),
+            ceiling: params.ceiling.iter().cloned().collect(),
+        }
+        .action_digest()
+        .expect("a digest")
+    }
+
+    fn effect(
+        environment: kr_protocol::ids::EnvironmentId,
+        client: &mut Client,
+        params: &wire::CatalogueAddParams,
+    ) -> impl std::future::Future<Output = Result<wire::CatalogueAddResult, ProtocolError>> {
+        calls::mutate(environment, client, Method::CatalogueAdd, params)
+    }
+
+    async fn installed(
+        environment: kr_protocol::ids::EnvironmentId,
+        client: &mut Client,
+        install: &wire::PluginInstallParams,
+    ) -> Result<wire::PluginInstallResult, ProtocolError> {
+        calls::mutate(environment, client, Method::PluginInstall, install).await
+    }
+
+    async fn listed(
+        environment: kr_protocol::ids::EnvironmentId,
+        client: &mut Client,
+    ) -> Vec<String> {
+        let listed: wire::CatalogueListResult = calls::read(
+            client,
+            Method::CatalogueList,
+            &wire::CatalogueListParams {
+                environment_id: environment,
+            },
+        )
+        .await
+        .expect("catalogue.list answers");
+        listed
+            .catalogues
+            .into_iter()
+            .map(|catalogue| catalogue.catalogue_id)
+            .collect()
+    }
+
+    /// KR-REQ-07.47: `catalogue.add` with no proof spends, once, the answer an owner device
+    /// recorded to the challenge the host issued for exactly this request. The challenge is the
+    /// plan's own digest, an owner device is shown the repository, its root and its ceiling, a
+    /// request nobody has answered adopts nothing, and a second request needs a new answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recorded_owner_answer_lets_catalogue_add_enrol_a_repository_once() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::development();
+        let params = add(&host, &published, "development", &[]);
+
+        // Control: nothing was answered, so nothing is adopted.
+        let refused = effect(environment, &mut client, &params).await;
+        assert_eq!(
+            code(refused),
+            ErrorCode::OwnerConfirmationRequired,
+            "no answer, no enrolment"
+        );
+        assert!(listed(environment, &mut client).await.is_empty());
+
+        let challenge = calls::request(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+        )
+        .await
+        .expect("the host describes the request");
+        assert_eq!(
+            challenge.request.action,
+            SensitiveAction::TrustRepositoryRoot
+        );
+        assert_eq!(
+            challenge.request.action_digest,
+            trust_digest(&params),
+            "the challenge is the digest of the plan the effect builds from the same request"
+        );
+        let shown = calls::pending(&mut client)
+            .await
+            .expect("readable")
+            .pending
+            .into_iter()
+            .find(|pending| pending.request == challenge.request)
+            .expect("the challenge is listed");
+        match &shown.display {
+            ConfirmationDisplay::CatalogueAdd {
+                catalogue_id,
+                metadata_url,
+                targets_url,
+                root_digest,
+                root_key_ids,
+                ceiling,
+                ..
+            } => {
+                assert_eq!(catalogue_id, "development");
+                assert_eq!(metadata_url, &params.metadata_url);
+                assert_eq!(targets_url, &params.targets_url);
+                assert_eq!(
+                    root_digest.len(),
+                    64,
+                    "the digest of the root: {root_digest}"
+                );
+                assert!(!root_key_ids.is_empty(), "the keys the owner is trusting");
+                assert!(ceiling.is_empty());
+            }
+            other => panic!("an owner device is shown the repository, not {other:?}"),
+        }
+
+        // A device that has not answered yet.
+        assert_eq!(
+            code(effect(environment, &mut client, &params).await),
+            ErrorCode::OwnerConfirmationRequired
+        );
+        assert!(listed(environment, &mut client).await.is_empty());
+
+        let (proof, presented) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner));
+        calls::complete(environment, &mut client, proof, presented)
+            .await
+            .expect("the owner device answers");
+        let added = effect(environment, &mut client, &params)
+            .await
+            .expect("the answer is spent");
+        assert_eq!(added.catalogue.catalogue_id, "development");
+        assert_eq!(listed(environment, &mut client).await, ["development"]);
+
+        // Spent once: the repository removed, the same request needs a new answer.
+        let _: wire::CatalogueRemoveResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::CatalogueRemove,
+            &wire::CatalogueRemoveParams {
+                environment_id: environment,
+                catalogue_id: "development".to_owned(),
+            },
+        )
+        .await
+        .expect("removed");
+        assert_eq!(
+            code(effect(environment, &mut client, &params).await),
+            ErrorCode::OwnerConfirmationRequired,
+            "the first answer is spent"
+        );
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered again");
+        effect(environment, &mut client, &params)
+            .await
+            .expect("the new answer is spent");
+        host.stop().await;
+    }
+
+    /// KR-REQ-10.05: an answer for another repository name, root or ceiling is never spent on this
+    /// request, and the request is refused as needing confirmation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_for_another_enrolment_is_never_spent_on_this_one() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let development = Published::development();
+        let bridge = Published::with_bridge();
+        let asked = add(&host, &development, "development", &[]);
+
+        for other in [
+            add(&host, &development, "elsewhere", &[]),
+            add(&host, &development, "development", &["terminal.stream"]),
+            add(&host, &bridge, "development", &[]),
+        ] {
+            calls::confirm_subject(
+                environment,
+                &mut client,
+                ConfirmationSubject::CatalogueAdd(Box::new(other)),
+                &Signer::OwnerDevice(&owner),
+            )
+            .await
+            .expect("an owner device answers another enrolment");
+        }
+        assert_eq!(
+            code(effect(environment, &mut client, &asked).await),
+            ErrorCode::OwnerConfirmationRequired
+        );
+        assert!(listed(environment, &mut client).await.is_empty());
+
+        // Control: the answer for this very request is spent.
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(asked.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered");
+        effect(environment, &mut client, &asked)
+            .await
+            .expect("spent");
+        host.stop().await;
+    }
+
+    /// KR-REQ-10.05: an answer whose signer lost its authority before the spend is passed over, and
+    /// the request is refused until an owner device that still holds it answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_whose_signer_was_revoked_is_passed_over() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::development();
+        let params = add(&host, &published, "development", &[]);
+
+        // A second owner device answers, and is revoked before the request spends it.
+        let second_keys = keys();
+        let second = Device::with_keys(second_keys.clone()).await;
+        let record = pair_with(&host, &second, &owner, proposal(&[ActionRight::HostManage])).await;
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&second_keys),
+        )
+        .await
+        .expect("the second owner device answers while it is paired");
+        let _: kr_protocol::sharing::RevocationResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::DeviceRevoke,
+            &DeviceRevokeParams {
+                device_id: record.device_id,
+            },
+        )
+        .await
+        .expect("revoked");
+        // The revocation withdrew the authority this connection was admitted under.
+        let mut client = host.client().await;
+        assert_eq!(
+            code(effect(environment, &mut client, &params).await),
+            ErrorCode::OwnerConfirmationRequired,
+            "an answer given under authority this host no longer holds is not spent"
+        );
+        assert!(listed(environment, &mut client).await.is_empty());
+
+        // Control: the first owner device, which still holds it.
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered");
+        effect(environment, &mut client, &params)
+            .await
+            .expect("spent");
+        host.stop().await;
+    }
+
+    /// The request a subject names carries no proof of its own, and a request that is not one of
+    /// the two the catalogue describes is not described by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subject_names_a_request_without_its_proof() {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::development();
+        let mut params = add(&host, &published, "development", &[]);
+        let proof = {
+            let challenge = calls::request(
+                environment,
+                &mut client,
+                ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            )
+            .await
+            .expect("a challenge");
+            calls::sign(&challenge.request, &Signer::OwnerDevice(&owner)).0
+        };
+        params.owner_confirmation = Nullable::some(proof);
+        let refused = calls::request(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params)),
+        )
+        .await;
+        assert_eq!(code(refused), ErrorCode::InvalidArgument);
+        host.stop().await;
+    }
+
+    /// KR-REQ-11.42, KR-REQ-10.05: an installation of a release that installs a native bridge is
+    /// confirmed on an owner device, shown the publisher's own statement apart from the host's
+    /// notice, and spent from the recorded answer. The statement comes from the release's verified
+    /// manifest and is in the digest: an answer for a plan that says another statement, or none, is
+    /// not spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recorded_owner_answer_lets_a_native_bridge_installation_proceed_with_its_statement()
+    {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let mut client = host.client().await;
+        let published = Published::with_bridge();
+        let plugin = "kalareach/claude-code";
+        let statement = published.statement(plugin, "0.3.0");
+
+        // The repository, adopted on an owner device's answer, and synchronised.
+        let params = add(&host, &published, "bridge", &[]);
+        calls::confirm_subject(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+            &Signer::OwnerDevice(&owner),
+        )
+        .await
+        .expect("answered");
+        effect(environment, &mut client, &params)
+            .await
+            .expect("enrolled");
+        let _: wire::CatalogueSyncResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id: environment,
+                catalogue_id: "bridge".to_owned(),
+            },
+        )
+        .await
+        .expect("synchronised");
+
+        let install = wire::PluginInstallParams {
+            environment_id: environment,
+            catalogue_id: "bridge".to_owned(),
+            plugin_id: PluginId::new(plugin).expect("a plugin id"),
+            version: "0.3.0".to_owned(),
+            package_digest: published.manifest_digest(plugin, "0.3.0"),
+            grant: BRIDGE_GRANT.iter().map(|word| (*word).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        };
+
+        // Control: the installation needs the owner's confirmation and has none.
+        assert_eq!(
+            code(installed(environment, &mut client, &install).await),
+            ErrorCode::OwnerConfirmationRequired
+        );
+
+        let challenge = calls::request(
+            environment,
+            &mut client,
+            ConfirmationSubject::PluginInstall(Box::new(install.clone())),
+        )
+        .await
+        .expect("the host describes the installation");
+        // The repository's ceiling as `catalogue.list` reports it, which is what a client knows.
+        let ceiling: Vec<String> = {
+            let listed: wire::CatalogueListResult = calls::read(
+                &mut client,
+                Method::CatalogueList,
+                &wire::CatalogueListParams {
+                    environment_id: environment,
+                },
+            )
+            .await
+            .expect("listed");
+            listed.catalogues[0].ceiling.clone()
+        };
+        let plan = |grant_statement: Option<String>| PluginInstallPlan {
+            environment_id: environment,
+            catalogue_id: "bridge".to_owned(),
+            ceiling: ceiling.iter().cloned().collect(),
+            plugin_id: install.plugin_id.clone(),
+            version: "0.3.0".to_owned(),
+            package_digest: install.package_digest.clone(),
+            grant: install.grant.iter().cloned().collect(),
+            grant_statement,
+        };
+        let shown = calls::pending(&mut client)
+            .await
+            .expect("readable")
+            .pending
+            .into_iter()
+            .find(|pending| pending.request == challenge.request)
+            .expect("the challenge is listed");
+        match &shown.display {
+            ConfirmationDisplay::PluginInstall {
+                package_digest,
+                grant,
+                grant_statement,
+                ..
+            } => {
+                assert_eq!(package_digest, &install.package_digest);
+                assert_eq!(grant, &install.grant.iter().cloned().collect::<Vec<_>>());
+                assert_eq!(
+                    grant_statement.as_ref(),
+                    Some(&statement),
+                    "the publisher's words, from the release's own manifest"
+                );
+            }
+            other => panic!("an owner device is shown the installation, not {other:?}"),
+        }
+        assert!(NATIVE_BRIDGE_NOTICE.contains("outside"));
+        assert_eq!(
+            challenge.request.action_digest,
+            plan(Some(statement.clone()))
+                .action_digest()
+                .expect("a digest")
+        );
+        assert_ne!(
+            challenge.request.action_digest,
+            plan(None).action_digest().expect("a digest"),
+            "the statement is covered"
+        );
+        assert_ne!(
+            challenge.request.action_digest,
+            plan(Some("another statement".to_owned()))
+                .action_digest()
+                .expect("a digest")
+        );
+
+        // Not answered yet.
+        assert_eq!(
+            code(installed(environment, &mut client, &install).await),
+            ErrorCode::OwnerConfirmationRequired
+        );
+        let (proof, presented) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner));
+        calls::complete(environment, &mut client, proof, presented)
+            .await
+            .expect("the owner device answers");
+        let done = installed(environment, &mut client, &install)
+            .await
+            .expect("the answer is spent on the installation");
+        assert_eq!(done.plugin.package_digest, install.package_digest);
+
+        // Spent once: removed, the same request needs a new answer.
+        let _: wire::PluginRemoveResult = calls::mutate(
+            environment,
+            &mut client,
+            Method::PluginRemove,
+            &wire::PluginRemoveParams {
+                environment_id: environment,
+                plugin_id: install.plugin_id.clone(),
+            },
+        )
+        .await
+        .expect("removed");
+        assert_eq!(
+            code(installed(environment, &mut client, &install).await),
+            ErrorCode::OwnerConfirmationRequired
+        );
+
+        host.stop().await;
+    }
+}

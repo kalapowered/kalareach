@@ -67,6 +67,19 @@ pub enum ConfirmationSubject {
         /// The invitation.
         invitation_id: InvitationId,
     },
+    /// Adopting a repository's trust root, as this exact `catalogue.add` would.
+    ///
+    /// The host resolves the root's key identifiers, the ceiling and the repository from the
+    /// request itself, so what an owner device shows and signs is what the effect then checks. The
+    /// request carries no proof of its own here: a request that already carries one is not a thing
+    /// to ask a confirmation for.
+    CatalogueAdd(Box<crate::catalogue::CatalogueAddParams>),
+    /// Installing a release, as this exact `plugin.install` would.
+    ///
+    /// The host resolves the repository's ceiling and, from the verified manifest of the exact
+    /// package hash, the statement of what a native bridge does, so the owner device shows the
+    /// publisher's own words and the confirmation covers them. The request carries no proof.
+    PluginInstall(Box<crate::catalogue::PluginInstallParams>),
     /// Establishing this host's clock again after it was found to have gone backwards.
     EstablishClock,
     /// An action whose effect no served method performs yet: enlarging a persistent grant,
@@ -157,9 +170,58 @@ pub enum ConfirmationDisplay {
     },
     /// Establishing this host's clock again.
     EstablishClock,
+    /// Adopting this repository's trust root.
+    CatalogueAdd {
+        /// The environment it is enrolled in.
+        environment_id: crate::ids::EnvironmentId,
+        /// This host's identifier for the repository.
+        catalogue_id: String,
+        /// What kind of repository it is.
+        kind: crate::catalogue::CatalogueKind,
+        /// Where its metadata lives.
+        metadata_url: String,
+        /// Where its targets live.
+        targets_url: String,
+        /// The digest of the exact root bytes being adopted.
+        root_digest: String,
+        /// The key identifiers the root declares for its own role: what the owner is trusting.
+        root_key_ids: Vec<String>,
+        /// The capabilities its packages may hold without a further grant, beyond the default
+        /// ceiling.
+        ceiling: Vec<String>,
+    },
+    /// Installing this release with this grant.
+    PluginInstall {
+        /// The environment the package is installed in.
+        environment_id: crate::ids::EnvironmentId,
+        /// The repository it is installed from.
+        catalogue_id: String,
+        /// The package.
+        plugin_id: crate::ids::PluginId,
+        /// The release.
+        version: String,
+        /// The exact package hash.
+        package_digest: String,
+        /// What the repository's ceiling permits by itself.
+        ceiling: Vec<String>,
+        /// The capabilities the installation is granted.
+        grant: Vec<String>,
+        /// What the release's own manifest says a native bridge it installs does, where it
+        /// installs one. These are the publisher's words, taken by the host from the verified
+        /// manifest of the exact package hash and covered by the confirmation; a device shows
+        /// them apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's.
+        grant_statement: Nullable<String>,
+    },
     /// An action its caller described.
     Described(DescribedAction),
 }
+
+/// What the host says, in its own words, of a native bridge an installation would place: it runs
+/// in the application's own directory with the application's permissions, outside the sandbox
+/// every other package runs in.
+pub const NATIVE_BRIDGE_NOTICE: &str = "This package installs a native bridge: code in the \
+     application's own directory that runs with the application's permissions, outside the plugin \
+     sandbox. The publisher's own statement of what it does follows.";
 
 /// One challenge an owner can still answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -238,6 +300,87 @@ mod tests {
         ] {
             assert!(!described(action).is_describable(), "{action:?}");
         }
+    }
+
+    fn add_params() -> crate::catalogue::CatalogueAddParams {
+        crate::catalogue::CatalogueAddParams {
+            environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+            catalogue_id: "community".to_owned(),
+            kind: crate::catalogue::CatalogueKind::Community,
+            metadata_url: "https://repo.example/metadata/".to_owned(),
+            targets_url: "https://repo.example/targets/".to_owned(),
+            root: "cm9vdA==".to_owned(),
+            budgets: crate::catalogue::CatalogueBudgets {
+                metadata_bytes: crate::scalars::U64::new(1),
+                metadata_entries: crate::scalars::U64::new(1),
+                retained_generations: crate::scalars::U64::new(1),
+                retained_metadata_bytes: crate::scalars::U64::new(1),
+                payload_cache_bytes: crate::scalars::U64::new(1),
+                full_offline_mirror: false,
+            },
+            ceiling: Vec::new(),
+            owner_confirmation: Nullable::null(),
+        }
+    }
+
+    fn install_params() -> crate::catalogue::PluginInstallParams {
+        crate::catalogue::PluginInstallParams {
+            environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+            catalogue_id: "community".to_owned(),
+            plugin_id: crate::ids::PluginId::new("kalareach/example").expect("a plugin id"),
+            version: "0.1.0".to_owned(),
+            package_digest: "sha256:aa".to_owned(),
+            grant: vec!["native_bridge.install".to_owned()],
+            owner_confirmation: Nullable::null(),
+        }
+    }
+
+    /// The two catalogue subjects name the exact request without its proof, and an owner device
+    /// is shown what the host resolved from it, the publisher's statement apart from the host's
+    /// own notice.
+    #[test]
+    fn a_catalogue_subject_and_what_is_shown_for_it_round_trip() {
+        for subject in [
+            ConfirmationSubject::CatalogueAdd(Box::new(add_params())),
+            ConfirmationSubject::PluginInstall(Box::new(install_params())),
+        ] {
+            let params = OwnerConfirmationRequestParams { subject };
+            let bytes = kr_cbor::to_canonical_vec(&params).expect("encodes");
+            let decoded: OwnerConfirmationRequestParams =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(decoded, params);
+        }
+        for display in [
+            ConfirmationDisplay::CatalogueAdd {
+                environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                catalogue_id: "community".to_owned(),
+                kind: crate::catalogue::CatalogueKind::Community,
+                metadata_url: "https://repo.example/metadata/".to_owned(),
+                targets_url: "https://repo.example/targets/".to_owned(),
+                root_digest: "sha256:aa".to_owned(),
+                root_key_ids: vec!["k1".to_owned()],
+                ceiling: Vec::new(),
+            },
+            ConfirmationDisplay::PluginInstall {
+                environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                catalogue_id: "community".to_owned(),
+                plugin_id: crate::ids::PluginId::new("kalareach/example").expect("a plugin id"),
+                version: "0.1.0".to_owned(),
+                package_digest: "sha256:aa".to_owned(),
+                ceiling: vec!["metadata.match".to_owned()],
+                grant: vec!["native_bridge.install".to_owned()],
+                grant_statement: Nullable::some("Installs three registration files".to_owned()),
+            },
+        ] {
+            let bytes = kr_cbor::to_canonical_vec(&display).expect("encodes");
+            let decoded: ConfirmationDisplay =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(decoded, display);
+        }
+        assert!(
+            NATIVE_BRIDGE_NOTICE.contains("outside"),
+            "the host's own sentence says the bridge runs outside the plugin sandbox"
+        );
     }
 
     #[test]
