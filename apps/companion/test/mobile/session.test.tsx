@@ -215,6 +215,51 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     })
   })
 
+  it('writes a new draft to the conversation the agent is in after a send, even if it moved since', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const sent: string[] = []
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          composerSubmit: (params) => {
+            sent.push(params.target.binding_revision)
+            return port.composerSubmit(params)
+          }
+        }}
+      >
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'First')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    })
+    expect(sent).toHaveLength(1)
+
+    // The composer is empty and still names the conversation it was written for. The agent moves
+    // on, and the view has read that before anything more is typed.
+    const read = controls.hold('agentCapabilities')
+    controls.records.moveBinding(SESSION_MAIN)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await made(read, 1)
+    await answer(read, 0)
+
+    await person.type(screen.getByLabelText('Message this session'), 'Second')
+    expect(screen.queryByText(/The conversation changed since this was written/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(sent).toHaveLength(2)
+    })
+    expect(sent[1]).not.toEqual(sent[0])
+  })
+
   it('keeps a draft written before the agent was read to the first conversation it learns', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
