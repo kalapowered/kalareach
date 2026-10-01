@@ -522,6 +522,19 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
     })
   })
 
+  it('leaves a conflicted or an orphaned draft for the person, whatever the host reports', () => {
+    const conflicted = rebindAll(
+      [connectionLost(draft)],
+      [{ draftId: 'd-1', target: { ...target, agentBindingRevision: '5' }, attachmentId: 'at-9' }]
+    )
+    const orphaned = rebindAll([connectionLost(draft)], [{ draftId: 'd-1', target: null, attachmentId: 'at-9' }])
+    const again = rebindAll([...conflicted, ...orphaned], [
+      { draftId: 'd-1', target, attachmentId: 'at-10' }
+    ])
+    expect(again[0]).toBe(conflicted[0])
+    expect(again[1]).toBe(orphaned[0])
+  })
+
   it('never submits anything on the way back', () => {
     const detached = connectionLost(draft)
     const rebound = rebindAll([detached], [{ draftId: 'd-1', target, attachmentId: 'at-9' }])
