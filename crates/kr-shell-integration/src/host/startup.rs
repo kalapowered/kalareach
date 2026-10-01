@@ -590,33 +590,9 @@ fn owns_separator(block: &str) -> bool {
     block.lines().any(|line| line == SEPARATOR_NOTE)
 }
 
-/// Whether a profile that is signed is placed into and checked like any other.
-///
-/// A signed profile is refused whenever the entry would change it. One that already holds the entry
-/// is not changed when the entry is where an install puts it: it is placed into and checked exactly
-/// as an unsigned profile is, and left alone only when that gives its own text back.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Signed {
-    /// The signature is the reason to refuse: the entry would change the profile.
-    Refused,
-    /// The profile is placed into and checked as if it were not signed, and what that gives is
-    /// compared with it.
-    Allowed,
-}
-
-impl Signed {
-    /// The answer the scripts are given.
-    const fn answer(self) -> &'static str {
-        match self {
-            Self::Refused => "no",
-            Self::Allowed => "yes",
-        }
-    }
-}
-
-/// The line a signed PowerShell script's signature block begins with. The script that refuses a
-/// signed profile reads the same text.
-const SIGNATURE_BEGIN: &str = "# SIG # Begin signature block";
+/// What a PowerShell signature block begins with, in lower case: a profile whose text does not hold
+/// it in any case has no signature, and PowerShell is not asked.
+const SIGNATURE_BEGIN_LOWER: &str = "# sig # begin signature block";
 
 /// Where in a startup file a guarded entry goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -727,13 +703,13 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
     // A signed profile cannot change without losing its signature. One that already holds its entry
     // where an install puts it needs no change, which is not a refusal, and that is decided by the
     // one rule an unsigned profile is held to: the entry put into the profile without it gives
-    // this text. The same placement and the same check run, with the signature allowed, and the
-    // result is compared with the file below, so an entry anywhere else, or one the check cannot
-    // see the place of, is never taken for being where it belongs.
-    let signed = if !matches!(placement, Placement::End) && existing.contains(SIGNATURE_BEGIN) {
-        Signed::Allowed
-    } else {
-        Signed::Refused
+    // this text. The same placement and the same check run, and the result is compared with the
+    // file below, so an entry anywhere else, or one the check cannot see the place of, is never
+    // taken for being where it belongs. What is a signature is what PowerShell's parser reads as
+    // one, and never a string that holds the same text.
+    let signature = match placement.shell() {
+        Some(shell) => signature_in(shell, existing, &theirs)?,
+        None => Signature::Absent,
     };
     let rebuilt = match placement {
         Placement::End => match stripped {
@@ -751,23 +727,22 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
             None => appended(existing, body),
         },
         Placement::AfterPrologue { shell } => {
-            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement, signed)?;
+            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement)?;
             rebuilt
         }
         Placement::Last { .. } => {
-            let rebuilt = if signed == Signed::Allowed {
-                before_the_signature(&theirs, body)
-            } else {
-                appended(&theirs, body)
+            let rebuilt = match signature {
+                Signature::Block(block) => before_the_signature(&theirs, body, block)
+                    .ok_or_else(|| cannot_take_the_entry(SIGNED))?,
+                Signature::Unplaced => return Err(cannot_take_the_entry(SIGNED)),
+                Signature::Absent => appended(&theirs, body),
             };
-            checked(&theirs, &rebuilt, placement, signed)?;
+            checked(&theirs, &rebuilt, placement)?;
             rebuilt
         }
     };
-    if signed == Signed::Allowed && rebuilt != existing {
-        return Err(cannot_take_the_entry(
-            "it is signed, and any change to it breaks its signature",
-        ));
+    if signature != Signature::Absent && rebuilt != existing {
+        return Err(cannot_take_the_entry(SIGNED));
     }
     Ok(if !had_entry {
         (Change::Added, rebuilt)
@@ -778,20 +753,112 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
     })
 }
 
-/// Puts `body` at the end of a signed profile's own text: on the line its signature block begins on.
+/// Why a signed profile is refused.
+const SIGNED: &str = "it is signed, and any change to it breaks its signature";
+
+/// What PowerShell's parser makes of a profile's signature.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Signature {
+    /// The parser reads no signature block in the profile.
+    Absent,
+    /// The parser reads one, at this byte offset of the profile's text without a byte-order mark,
+    /// in the profile without the entry.
+    Block(usize),
+    /// The profile is signed as it is and the parser reads no block in it without the entry, which
+    /// leaves no place to put an entry before one.
+    Unplaced,
+}
+
+/// Where PowerShell reads the signature block of a profile, when it reads one.
 ///
-/// Text after a signature block is not part of the script, so the end of what a signed profile says
-/// is the line before the block. A profile whose block is not found at the start of a line gets the
-/// entry at its end, and the check refuses what that makes.
-fn before_the_signature(existing: &str, body: &str) -> String {
-    let at = existing
-        .rmatch_indices(SIGNATURE_BEGIN)
-        .map(|(at, _)| at)
-        .find(|at| *at == 0 || existing[..*at].ends_with('\n'));
-    match at {
-        Some(at) => format!("{}{body}{}", &existing[..at], &existing[at..]),
-        None => appended(existing, body),
+/// Asked of PowerShell's parser, which reads a comment that begins the block, of any case, the
+/// first one when there are two, and nothing inside a string, a here-string or a block comment.
+/// This asks nothing of PowerShell for a profile whose text holds nothing that could be one.
+fn signature_in(shell: &Path, existing: &str, theirs: &str) -> std::io::Result<Signature> {
+    let without_mark = |text: &str| text.strip_prefix('\u{feff}').unwrap_or(text).to_owned();
+    let holds = |text: &str| text.to_ascii_lowercase().contains(SIGNATURE_BEGIN_LOWER);
+    if !holds(existing) && !holds(theirs) {
+        return Ok(Signature::Absent);
     }
+    if let Some(block) = signature_block(shell, &without_mark(theirs))? {
+        return Ok(Signature::Block(block));
+    }
+    Ok(match signature_block(shell, &without_mark(existing))? {
+        Some(_) => Signature::Unplaced,
+        None => Signature::Absent,
+    })
+}
+
+/// The script that says where PowerShell reads a profile's signature block.
+const SIGNATURE_SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+     $text = [System.IO.File]::ReadAllText($env:KR_PROFILE_TEXT, (New-Object System.Text.UTF8Encoding $false)); \
+     $tokens = $null; $errors = $null; \
+     [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors); \
+     $block = @($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text.StartsWith('# SIG # Begin signature block', [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1; \
+     if ($null -eq $block) { [Console]::Out.Write('kr-unsigned') } else { [Console]::Out.Write('kr-signature ' + $block.Extent.StartOffset) }";
+
+/// Asks PowerShell where it reads a signature block in a profile's text, as a byte offset.
+fn signature_block(shell: &Path, text: &str) -> std::io::Result<Option<usize>> {
+    let said = ask_with(
+        shell,
+        &["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", SIGNATURE_SCRIPT],
+        &[("KR_PROFILE_TEXT", text)],
+        PLACEMENT_DEADLINE,
+    )
+    .ok_or_else(|| {
+        std::io::Error::other(
+            "PowerShell did not say whether the profile is signed: it did not answer in time or could not start",
+        )
+    })?;
+    let said = said.trim();
+    if said == "kr-unsigned" {
+        return Ok(None);
+    }
+    let utf16 = said
+        .strip_prefix("kr-signature ")
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "PowerShell's answer about the profile's signature was not understood",
+            )
+        })?;
+    byte_offset(text, utf16).map(Some).ok_or_else(|| {
+        std::io::Error::other("PowerShell's answer about the signature is not inside the profile")
+    })
+}
+
+/// Puts `body` at the end of a signed profile's own text, before the signature block.
+///
+/// A signer puts a line end of its own in front of the block and signs the text before that, so the
+/// profile's own text is everything up to it and the entry ends that text the way it ends any
+/// profile's. A profile whose block does not follow a line end of that kind is not laid out as a
+/// signer lays one out, and has no such place.
+fn before_the_signature(theirs: &str, body: &str, block: usize) -> Option<String> {
+    let (mark, text) = match theirs.strip_prefix('\u{feff}') {
+        Some(text) => ("\u{feff}", text),
+        None => ("", theirs),
+    };
+    let own = text.get(..block)?.strip_suffix("\r\n")?;
+    Some(format!(
+        "{mark}{}\r\n{}",
+        appended(own, body),
+        &text[block..]
+    ))
+}
+
+/// Returns the byte offset in `text` of the UTF-16 offset PowerShell counted.
+fn byte_offset(text: &str, utf16: usize) -> Option<usize> {
+    let mut units = 0;
+    for (index, character) in text.char_indices() {
+        if units == utf16 {
+            return Some(index);
+        }
+        units += character.len_utf16();
+        if units > utf16 {
+            return None;
+        }
+    }
+    (units == utf16).then_some(text.len())
 }
 
 /// Puts `body` after everything in a file, on a line of its own.
@@ -814,7 +881,6 @@ fn after_the_prologue(
     theirs: &str,
     body: &str,
     placement: &Placement,
-    signed: Signed,
 ) -> std::io::Result<(String, usize)> {
     if second_mark(theirs) {
         return Err(cannot_take_the_entry(
@@ -825,7 +891,7 @@ fn after_the_prologue(
         Some(text) => ("\u{feff}", text),
         None => ("", theirs),
     };
-    let at = prologue_end(shell, text, signed)?;
+    let at = prologue_end(shell, text)?;
     let (head, rest) = text.split_at(at);
     // The prologue's line is the last of a file with no final line end, and PowerShell has said
     // that nothing but whitespace, a semicolon or a comment follows the prologue on it. This is an
@@ -835,13 +901,13 @@ fn after_the_prologue(
     } else {
         format!("{mark}{head}{body}{rest}")
     };
-    checked(theirs, &rebuilt, placement, signed)?;
+    checked(theirs, &rebuilt, placement)?;
     Ok((rebuilt, at))
 }
 
 /// Refuses an entry PowerShell would not read as part of the profile it was added to.
-fn checked(old: &str, new: &str, placement: &Placement, signed: Signed) -> std::io::Result<()> {
-    match entry_refused(old, new, placement, signed)? {
+fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
+    match entry_refused(old, new, placement)? {
         None => Ok(()),
         Some(why) => Err(cannot_take_the_entry(&why)),
     }
@@ -850,15 +916,15 @@ fn checked(old: &str, new: &str, placement: &Placement, signed: Signed) -> std::
 /// The question both scripts ask first about a profile's text: whether an entry can be added to it
 /// at all.
 ///
-/// A profile the entry would damage is refused by name and left as it is: one that is signed, or
-/// whose line ends cannot be told from each other. A profile that begins with a second byte-order
-/// mark is refused before either script is asked, by [`second_mark`], because reading a file takes
-/// one mark off it and the question could not see the second.
+/// A profile whose line ends cannot be told from each other is refused by name and left as it is. A
+/// profile that begins with a second byte-order mark is refused before either script is asked, by
+/// [`second_mark`], because reading a file takes one mark off it and the question could not see the
+/// second. A signed profile is refused or left alone by the host, from what PowerShell's parser says
+/// of its signature, before either script is asked.
 macro_rules! unsafe_profile {
     () => {
-        "function Unsafe($text, $signedOk) { \
+        "function Unsafe($text) { \
             if ($text -match \"`r(?!`n)\") { return 'it has a line end that is a carriage return alone' }; \
-            if (-not $signedOk -and $text.Contains('# SIG # Begin signature block')) { return 'it is signed, and any change to it breaks its signature' }; \
             $null \
         }; "
     };
@@ -895,8 +961,7 @@ const PLACE_SCRIPT: &str = concat!(
     unsafe_profile!(),
     "$utf8 = New-Object System.Text.UTF8Encoding $false; \
      $text = [System.IO.File]::ReadAllText($env:KR_PROFILE_TEXT, $utf8); \
-     $signedOk = ([System.IO.File]::ReadAllText($env:KR_SIGNED_OK, $utf8) -ceq 'yes'); \
-     $why = Unsafe $text $signedOk; \
+     $why = Unsafe $text; \
      if ($null -ne $why) { [Console]::Out.Write('kr-refused ' + $why); return }; \
      $tokens = $null; $errors = $null; \
      $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors); \
@@ -943,8 +1008,7 @@ const VERIFY_SCRIPT: &str = concat!(
      function Refuse($why) { [Console]::Out.Write('kr-refused ' + $why) }; \
      function Same($a, $b) { [string]::Equals([string]$a, [string]$b, [System.StringComparison]::Ordinal) }; \
      $oldText = Read 'KR_PROFILE_OLD'; $newText = Read 'KR_PROFILE_NEW'; $order = Read 'KR_ORDER'; \
-     $signedOk = ((Read 'KR_SIGNED_OK') -ceq 'yes'); \
-     $why = Unsafe $oldText $signedOk; \
+     $why = Unsafe $oldText; \
      if ($null -ne $why) { Refuse $why; return }; \
      $old = Parse $oldText; $new = Parse $newText; \
      $had = @{}; foreach ($id in $old.Errors) { $had[$id] = 1 + [int]$had[$id] }; \
@@ -989,14 +1053,11 @@ const VERIFY_SCRIPT: &str = concat!(
 );
 
 /// Returns the byte offset in `text` at which PowerShell says an entry goes.
-fn prologue_end(shell: &Path, text: &str, signed: Signed) -> std::io::Result<usize> {
+fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
     let said = ask_with(
         shell,
         &["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", PLACE_SCRIPT],
-        &[
-            ("KR_PROFILE_TEXT", text),
-            ("KR_SIGNED_OK", signed.answer()),
-        ],
+        &[("KR_PROFILE_TEXT", text)],
         PLACEMENT_DEADLINE,
     )
     .ok_or_else(|| {
@@ -1034,12 +1095,7 @@ fn prologue_end(shell: &Path, text: &str, signed: Signed) -> std::io::Result<usi
 }
 
 /// Returns why an entry would not sit in a profile as whole statements, or nothing when it would.
-fn entry_refused(
-    old: &str,
-    new: &str,
-    placement: &Placement,
-    signed: Signed,
-) -> std::io::Result<Option<String>> {
+fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<String>> {
     let Some(shell) = placement.shell() else {
         return Ok(None);
     };
@@ -1060,7 +1116,6 @@ fn entry_refused(
             ("KR_BEGIN", markers.0),
             ("KR_END", markers.1),
             ("KR_ORDER", order),
-            ("KR_SIGNED_OK", signed.answer()),
         ],
         PLACEMENT_DEADLINE,
     )
@@ -2997,7 +3052,7 @@ mod tests {
             ),
         ] {
             let _ = body;
-            let said = entry_refused(old.as_str(), new.as_str(), placement, Signed::Refused)
+            let said = entry_refused(old.as_str(), new.as_str(), placement)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!(
                 said.is_some(),
@@ -3115,6 +3170,159 @@ mod tests {
         }
     }
 
+    /// What a PowerShell signer adds to a script: a line end of its own, then the signature block.
+    ///
+    /// The signed text is everything before that line end, so a profile that was signed after an
+    /// entry was written ends with the entry and then this.
+    const SIGNER_BLOCK: &str =
+        "\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n";
+
+    /// KR-REQ-07.23: a profile signed after its entries were written keeps both, in every layout a
+    /// signer leaves, and a later install changes nothing and reports that.
+    ///
+    /// A signer puts a line end of its own before the block, so the entry that ends the profile is
+    /// followed by a blank line and then the block, and installing again has to give that text back.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_profile_signed_after_its_entries_were_written_is_left_as_the_signer_made_it() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let first = after_the_prologue();
+        let last = at_the_last();
+        let load = entry(&for_shell(ShellKind::PowerShell), package, false).expect("text");
+        let check = entry(
+            &StartupTarget {
+                placement: last.clone(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            package,
+            false,
+        )
+        .expect("text");
+        for (name, theirs) in [
+            (
+                "a prologue and a statement",
+                "using namespace System\n$x = 1\n",
+            ),
+            ("one statement", "Read-Host 'name'\n"),
+            ("no final line end", "Read-Host 'name'"),
+            ("crlf line ends", "using namespace System\r\n$x = 1\r\n"),
+            ("a byte-order mark", "\u{feff}$x = 1\n"),
+            ("nothing at all", ""),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            std::fs::write(&path, theirs).expect("writes");
+            // Both entries, the way one file under both profile names holds them, then signed.
+            install(&path, &load, &first).expect("installs the load entry");
+            install(&path, &check, &last).expect("installs the check entry");
+            let mut signed = std::fs::read_to_string(&path).expect("reads");
+            signed.push_str(SIGNER_BLOCK);
+            std::fs::write(&path, &signed).expect("writes");
+            for (placement, body) in [(&first, &load), (&last, &check)] {
+                assert_eq!(
+                    install(&path, body, placement)
+                        .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    Change::Unchanged,
+                    "{name}"
+                );
+                assert_eq!(
+                    plan(&path, body, placement).unwrap_or_else(|error| panic!("{name}: {error}")),
+                    Change::Unchanged,
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                signed,
+                "{name}"
+            );
+        }
+    }
+
+    /// KR-REQ-07.23: text that looks like a signature is a signature only where PowerShell reads one.
+    ///
+    /// The parser reads a comment that begins the block, of any case, and nothing in a string or a
+    /// here-string. A profile that holds the text in a string is not signed: its entry goes where an
+    /// entry always goes, and one already there is left alone. A profile with two blocks is signed
+    /// from the first. A profile with the block in another case is signed, and is refused rather than
+    /// changed.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn signature_text_is_a_signature_only_where_powershell_reads_one() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let last = at_the_last();
+        let check = entry(
+            &StartupTarget {
+                placement: last.clone(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            package,
+            false,
+        )
+        .expect("text");
+        let in_a_string = "$example = @'\n# SIG # Begin signature block\n'@\n";
+
+        // A fresh install goes to the end, below the string and not inside it.
+        let path = root.path().join("string.ps1");
+        std::fs::write(&path, in_a_string).expect("writes");
+        assert_eq!(
+            install(&path, &check, &last).expect("installs"),
+            Change::Added
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            format!("{in_a_string}{check}")
+        );
+        // And installing again changes nothing, though the text of a signature is in the file.
+        assert_eq!(
+            install(&path, &check, &last).expect("in place"),
+            Change::Unchanged
+        );
+        assert_eq!(
+            plan(&path, &check, &last).expect("in place"),
+            Change::Unchanged
+        );
+
+        // A string that holds a whole entry is data and is no signature: what an install does with
+        // the lines that look like its entry is what it does anywhere, and the check ends the file.
+        let path = root.path().join("entry-in-a-string.ps1");
+        let theirs = format!(
+            "class KrDerived : KrBase {{}}\n$example = @'\n{check}# SIG # Begin signature block\n'@\nfunction global:PSConsoleHostReadLine {{ 'mine' }}\n"
+        );
+        std::fs::write(&path, &theirs).expect("writes");
+        assert_ne!(
+            install(&path, &check, &last).expect("installs"),
+            Change::Unchanged,
+            "a string was taken for a signature, and the entry in it for the entry"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("reads")
+                .ends_with(&check),
+            "the check is the last thing in the profile"
+        );
+
+        // Two blocks: PowerShell stops at the first, and the entry goes before it.
+        let path = root.path().join("two-blocks.ps1");
+        let content = format!("Read-Host 'name'\n{check}");
+        std::fs::write(&path, format!("{content}{SIGNER_BLOCK}{SIGNER_BLOCK}")).expect("writes");
+        assert_eq!(
+            install(&path, &check, &last).expect("in place"),
+            Change::Unchanged
+        );
+
+        // The block in another case is read as one: the profile is signed, so it is refused.
+        let path = root.path().join("lowercase.ps1");
+        let theirs = "Get-Date\n# sig # begin signature block\n# MIIx\n";
+        std::fs::write(&path, theirs).expect("writes");
+        let refused = install(&path, &check, &last).expect_err("a signed profile");
+        assert!(refused.to_string().contains("it is signed"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
+    }
+
     /// KR-REQ-07.23: a profile that is signed and already holds the entry is left alone rather than
     /// refused: installing again changes nothing, and nothing needs the signature broken.
     #[cfg(unix)]
@@ -3129,7 +3337,7 @@ mod tests {
         install(&path, &body, &target.placement).expect("installs");
         // Signed afterwards, as a policy that requires signatures asks.
         let mut signed = std::fs::read_to_string(&path).expect("reads");
-        signed.push_str("# SIG # Begin signature block\n# MIIx\n# SIG # End signature block\n");
+        signed.push_str(SIGNER_BLOCK);
         std::fs::write(&path, &signed).expect("writes");
         assert_eq!(
             install(&path, &body, &target.placement).expect("nothing to change"),
@@ -3157,7 +3365,7 @@ mod tests {
         // reader runs after its check; an entry inside a named block, or a statement that parses
         // only because an earlier profile defined its base type, is no nearer the place. None of
         // them is made right by a signature, and none is moved.
-        let signature = "# SIG # Begin signature block\n# MIIx\n# SIG # End signature block\n";
+        let signature = SIGNER_BLOCK;
         let check_body = entry(
             &StartupTarget {
                 placement: at_the_last(),
