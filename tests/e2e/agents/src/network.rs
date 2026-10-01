@@ -647,6 +647,31 @@ mod tests {
         }
     }
 
+    /// A reader that is interrupted once before each of its bytes.
+    struct InterruptedReads(bool, &'static [u8]);
+
+    impl Read for InterruptedReads {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.0 = !self.0;
+            if self.0 {
+                return Err(std::io::Error::new(ErrorKind::Interrupted, "signal"));
+            }
+            let Some((first, rest)) = self.1.split_first() else {
+                return Ok(0);
+            };
+            buffer[0] = *first;
+            self.1 = rest;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_tried_again_and_not_taken_for_the_end_of_the_stream() {
+        let mut taken = Vec::new();
+        assert_eq!(relay(&mut InterruptedReads(false, b"hello"), &mut taken), 5);
+        assert_eq!(taken, b"hello");
+    }
+
     /// A writer that is interrupted once before each byte it takes.
     struct Interrupting(bool, Vec<u8>);
 

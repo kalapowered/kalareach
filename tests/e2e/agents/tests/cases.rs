@@ -3369,8 +3369,17 @@ impl Logged {
             NEW_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // What the two fresh screen reads of a submission cost, measured here where no turn can be
-        // affected: three reads, each from opening a new attachment to its drawn screen.
-        for _ in 0..3 {
+        // affected: three reads, each from opening a new attachment to its drawn screen. Only for
+        // an agent that is confined: the others' parts are as they were.
+        let measured_runs = if stage
+            .login
+            .is_some_and(|login| login.account.confinement.is_some())
+        {
+            3
+        } else {
+            0
+        };
+        for _ in 0..measured_runs {
             let started = std::time::Instant::now();
             logged.no_dialog_now(stage, "in the measurement before any turn");
             if let Ok(mut measured) = FRESH_MS.lock() {
