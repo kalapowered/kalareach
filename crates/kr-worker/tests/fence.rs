@@ -5040,6 +5040,120 @@ async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() 
     wired.close().await;
 }
 
+/// A session that has been qualified and then closed is no answer to a create that asks afterwards.
+#[tokio::test]
+async fn a_session_that_closed_after_it_qualified_is_not_answered_ready() {
+    let mut wired = wired_with(ShellMode::Managed, false).await;
+    wired
+        .bridge
+        .send_event(activation(wired.session_id, Vec::new()))
+        .await
+        .expect("reports");
+    wired
+        .runtime
+        .await_qualification(Duration::from_secs(10))
+        .await
+        .expect("the create is answered while the session is live");
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+    tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
+        .await
+        .expect("the session closes");
+    let error = wired
+        .runtime
+        .await_qualification(Duration::from_secs(1))
+        .await
+        .expect_err("a closed session is not ready");
+    assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
+    assert_eq!(
+        error.message,
+        "the session ended before its root integration qualified"
+    );
+    wired.close().await;
+}
+
+/// A shell refused for what it cannot do, and gone by the time the worker answers, still ends the
+/// create with the named error: the reason is kept before the answer is written, so a write that
+/// fails loses nothing. The shell hangs up before the worker serves, so the answer cannot be
+/// written and nothing here depends on timing. Linux, where the peer of a closed connection is
+/// still known.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_refused_at_the_handshake_that_has_gone_still_ends_the_create_by_name() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let config = configuration(&temp, ShellMode::Managed);
+    let session_id = config.session_id;
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let host_endpoint = HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
+    .expect("binds the bridge");
+    let address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(SystemContinuousClock::new()),
+    ));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+
+    // The shell, built against another editor, says hello and goes.
+    let declared = ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.8");
+    let hello = qualified_hello(&declared, session_id, &address, process.clone(), &secret)
+        .expect("a hello");
+    ScriptedBridge::hello_and_hang_up(&address, &hello)
+        .await
+        .expect("the hello is written");
+
+    let expectation = WorkerExpectation {
+        session_id,
+        root_process: process,
+        supported_editor_abis: vec!["zle-5.9".to_owned()],
+        supported_integration_versions: vec!["1".to_owned()],
+        launched_package: None,
+        already_registered: false,
+        gesture: EofGesture::default(),
+    };
+    let bridge_task = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            expectation,
+        )
+        .serve(),
+    );
+
+    let error = runtime
+        .await_qualification(Duration::from_secs(10))
+        .await
+        .expect_err("a shell built against another editor is not qualified");
+    assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
+    assert!(
+        error.message.starts_with(
+            "editor_abi_unsupported: editor ABI zle-5.8 is not one this build was qualified against"
+        ),
+        "{}",
+        error.message
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    bridge_task.abort();
+}
+
 /// A hello refused for what the shell cannot do reaches the create as the named error at once,
 /// where it used to wait out its bound and say the integration did not qualify.
 #[tokio::test]
