@@ -550,6 +550,29 @@ async fn an_attach_to_a_closed_session_in_a_stopped_environment_says_how_it_ende
         )
         .current_dir("/");
     assert!(close.output().expect("runs kr").status.success());
+    // Closing is asynchronous: the daemon stops once the destination records the closure, and a
+    // distribution that stopped in the middle of one would leave nothing to be asked about it.
+    let started = Instant::now();
+    loop {
+        let listed: kr_protocol::session::SessionListResult = world.ask(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: kr_protocol::scalars::Nullable::null(),
+                include_closed: true,
+            },
+        );
+        if listed.sessions.iter().any(|summary| {
+            summary.session_id.to_string() == session
+                && summary.state == kr_protocol::session::SessionState::Closed
+        }) {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the session did not close: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     world.stop_destination_daemon();
     assert!(!world.destination_answers());
 
