@@ -259,6 +259,11 @@ impl Controller {
         respond(request.request_id, outcome)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a write is the actor, the request, the connection it arrived on and where that \
+                  began, and the admission it carries"
+    )]
     pub(super) async fn write_method(
         self: &Arc<Self>,
         actor_id: &ActorId,
