@@ -807,6 +807,10 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
             reports[0].notes.iter().any(|note| note.contains(why)),
             "{reports:?}"
         );
+        // The doctor reports it as refused, with nothing of it in place, and it is no warning.
+        let check = kr_controller::catalogue::native_bridge::check(&reports);
+        assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Ok);
+        assert!(check.detail().contains("refused"), "{}", check.detail());
     }
     let journals: Vec<_> = std::fs::read_dir(site.root.join("state/native-bridges"))
         .expect("the journals")
@@ -3740,4 +3744,210 @@ fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the
             .expect("reconciles");
         assert_eq!(settled, Settled::Applied, "{commands:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the doctor reports of the bridges
+// ---------------------------------------------------------------------------------------------
+
+/// The first sixteen hexadecimal digits of a digest, as the doctor writes a file's digest.
+fn short(digest: &str) -> &str {
+    &digest[..16]
+}
+
+/// The doctor's check of what `bridges` holds now.
+fn doctor_check(bridges: &NativeBridges) -> kr_protocol::hostinfo::DoctorCheck {
+    kr_controller::catalogue::native_bridge::check(&bridges.reports().expect("reads"))
+}
+
+/// KR-REQ-11.42: the doctor reports an applied bridge: the package, the application and each file
+/// by its digest, and that it is applied, with no warning. With no bridge it says nothing applies.
+/// Names are what a check's sentence only states by class and length, so what it carries of the
+/// bridge's own words is the digests.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_doctor_reports_an_applied_bridge_and_its_files_by_digest() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let site = GeminiSite::new();
+    let bridges = site.bridges();
+    let none = doctor_check(&bridges);
+    assert_eq!(none.id(), "native-bridges");
+    assert_eq!(none.status, DoctorStatus::NotApplicable, "{none:?}");
+
+    bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("applies");
+
+    let reports = bridges.reports().expect("reads");
+    let [report] = reports.as_slice() else {
+        panic!("one bridge: {reports:?}");
+    };
+    assert_eq!(report.application.as_deref(), Some("Gemini CLI"));
+    let mut files: Vec<(&str, &str)> = report
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.digest.as_str()))
+        .collect();
+    files.sort_unstable();
+    let mut expected = [
+        (GEMINI_RECORD_PATH, GEMINI_RECORD_DIGEST),
+        (GEMINI_MANIFEST_PATH, GEMINI_MANIFEST_DIGEST),
+        (GEMINI_HOOKS_PATH, GEMINI_HOOKS_DIGEST),
+    ];
+    expected.sort_unstable();
+    assert_eq!(files, expected, "each file the host published, by digest");
+
+    let check = doctor_check(&bridges);
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    let detail = check.detail();
+    assert!(detail.contains("applied"), "{detail}");
+    for (_, digest) in expected {
+        assert!(detail.contains(short(digest)), "{digest} in {detail}");
+    }
+    assert!(
+        !detail.contains("gemini-cli") && !detail.contains(".gemini"),
+        "a check's sentence states a name or a path by class and length only: {detail}"
+    );
+}
+
+/// KR-REQ-11.42: the doctor warns for a bridge whose recipe is half applied, wherever an
+/// installation stopped, and for one half removed; before anything is recorded there is nothing to
+/// warn of, a bridge that stopped before a removal's first change is still applied, one finished is
+/// applied, and one taken out leaves nothing to report.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_doctor_warns_for_a_bridge_whose_recipe_is_half_applied() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let expected = |bridges: &NativeBridges| match bridges.reports().expect("reads").as_slice() {
+        [] => DoctorStatus::NotApplicable,
+        [report] if report.state == "applied" || report.state == "removed" => DoctorStatus::Ok,
+        [_] => DoctorStatus::Warning,
+        other => panic!("one bridge: {other:?}"),
+    };
+    let (mut warned, mut applied) = (0, 0);
+    for step in 1.. {
+        let site = GeminiSite::new();
+        let bridges = site.bridges();
+        bridges.stop_before(step);
+        if bridges.reconcile(&gemini(), Some(&site.release())).is_ok() {
+            break;
+        }
+        let half = doctor_check(&site.bridges());
+        assert_eq!(
+            half.status,
+            expected(&site.bridges()),
+            "step {step}: {half:?}"
+        );
+        if half.status == DoctorStatus::Warning {
+            warned += 1;
+            assert!(
+                half.detail().contains("applying") || half.detail().contains("unsettled"),
+                "step {step}: {}",
+                half.detail()
+            );
+        }
+        site.bridges()
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("finishes");
+        // Finished, it is applied; where something was made and not yet recorded, the next run
+        // names it and the bridge is not reported as applied until its owner removes it.
+        let finished = doctor_check(&site.bridges());
+        assert_eq!(finished.status, expected(&site.bridges()), "step {step}");
+        if finished.status == DoctorStatus::Ok {
+            applied += 1;
+        } else {
+            assert!(
+                finished.detail().contains("unsettled"),
+                "{}",
+                finished.detail()
+            );
+        }
+    }
+    assert!(
+        warned > 8,
+        "most steps leave a recipe half applied: {warned}"
+    );
+    assert!(
+        applied > 3,
+        "a run that stopped is finished by the next: {applied}"
+    );
+
+    // A removal that stopped part way.
+    let mut removing = 0;
+    for step in 1.. {
+        let site = GeminiSite::new();
+        site.bridges()
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("applies");
+        let bridges = site.bridges();
+        bridges.stop_before(step);
+        if bridges.reconcile(&gemini(), None).is_ok() {
+            break;
+        }
+        let half = doctor_check(&site.bridges());
+        assert_eq!(
+            half.status,
+            expected(&site.bridges()),
+            "removal {step}: {half:?}"
+        );
+        if half.status == DoctorStatus::Warning {
+            removing += 1;
+            assert!(
+                half.detail().contains("removing") || half.detail().contains("unsettled"),
+                "removal {step}: {}",
+                half.detail()
+            );
+        }
+        // A removal that finishes leaves no record of a bridge, so there is nothing to report.
+        site.bridges().reconcile(&gemini(), None).expect("finishes");
+        let removed = doctor_check(&site.bridges());
+        assert_eq!(
+            removed.status,
+            DoctorStatus::NotApplicable,
+            "removal {step}: {removed:?}"
+        );
+    }
+    assert!(removing > 2, "a removal has its own boundaries: {removing}");
+}
+
+/// KR-REQ-11.42: the doctor warns for an applied bridge whose installed files no longer match what
+/// was applied, and says nothing of a bridge nobody changed.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_doctor_warns_for_an_applied_bridge_that_no_longer_matches() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let site = GeminiSite::new();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("applies");
+    assert_eq!(doctor_check(&bridges).status, DoctorStatus::Ok);
+
+    std::fs::write(site.application().join(GEMINI_HOOKS_PATH), b"{}").expect("changed");
+
+    let drifted = doctor_check(&bridges);
+    assert_eq!(drifted.status, DoctorStatus::Warning, "{drifted:?}");
+}
+
+/// KR-REQ-11.42: a recipe the host refuses is reported as refused, and is not a warning: nothing
+/// of it is in place. On Windows every recipe is refused, and the journal says why.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_doctor_reports_a_refused_recipe_as_refused() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let site = GeminiSite::new();
+    let claude_only = NativeBridges::new(BridgeHost {
+        applications: vec![ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: site.root.join("home/.claude"),
+        }],
+        ..site.host()
+    });
+    claude_only
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("reconciles");
+
+    let check = doctor_check(&claude_only);
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    assert!(check.detail().contains("refused"), "{}", check.detail());
 }
