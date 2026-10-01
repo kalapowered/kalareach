@@ -3917,8 +3917,8 @@ impl WorkerService {
         // The action is known and it has no result to return. Section 9 answers that with the
         // receipt as it stands rather than performing the effect a second time or refusing as
         // though the request were malformed: the caller learns the action's real state and can
-        // read it again when it settles. Its error, if it has one, is shown as it is to anybody
-        // but the owner.
+        // read it again when it settles. Its error, if it has one, is shown as it is to the owner
+        // and replaced by a sentence the host composed for anybody else.
         let disclosure = caller.disclosure(
             caller
                 .grant_rights
