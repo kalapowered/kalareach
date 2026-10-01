@@ -1945,8 +1945,7 @@ for one question outside that scope is refused rather than answered empty. The d
 worker's answer on as the worker gave it, and sends a question read with a scope only to a worker
 that says, in its answer to the daemon's hello, that it holds one to it: a worker of an earlier
 build answered with every question it held, so a device's question read to one is refused as
-`UNSUPPORTED_CAPABILITY` before anything reaches it. A read of a retained receipt is held the same
-way. The agent reads name their session inside the
+`UNSUPPORTED_CAPABILITY` before anything reaches it. The agent reads name their session inside the
 subject they read, and that session is the one the grant is checked against and the read is routed
 to. `agent.snapshot` and `agent.approval.inspect` carry retained content, so each goes to the worker
 with the history scope of the device's grant, and the worker holds the answer to it through the
@@ -2297,7 +2296,7 @@ The caller that performs an action always gets its state in the first answer: th
 
 Answering a question needs more than the right to answer. The worker refuses a question the caller's history does not reach, with the refusal it gives for a question it does not hold, so the refusal says nothing about the question's state or text.
 
-The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A worker of an earlier build keeps a retained answer whole and is sent no scope. The daemon uses what such a worker kept, then refuses the device by name rather than show it, and a device can neither answer nor cancel a question there, nor read a receipt.
+The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level, so a worker of an earlier build never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
 
 ### What each store promises
 
