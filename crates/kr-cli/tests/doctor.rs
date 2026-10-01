@@ -519,3 +519,172 @@ fn recording_task_scheduler(root: &std::path::Path, calls: &std::path::Path) -> 
     std::fs::remove_file(calls).expect("forgets the check");
     system_root
 }
+
+/// The functions of a Rust source, each with its name and the text of its body, found by matching
+/// braces outside comments, strings and character literals.
+fn functions(source: &str) -> Vec<(String, String)> {
+    let characters: Vec<char> = source.chars().collect();
+    // The source with every comment, string and character literal blanked, so braces in them
+    // count for nothing and positions still line up.
+    let mut code = characters.clone();
+    let mut at = 0;
+    while at < characters.len() {
+        let rest: String = characters[at..characters.len().min(at + 3)]
+            .iter()
+            .collect();
+        if rest.starts_with("//") {
+            while at < characters.len() && characters[at] != '\n' {
+                code[at] = ' ';
+                at += 1;
+            }
+        } else if rest.starts_with("/*") {
+            while at + 1 < characters.len() && !(characters[at] == '*' && characters[at + 1] == '/')
+            {
+                code[at] = ' ';
+                at += 1;
+            }
+            code[at] = ' ';
+            code[at + 1] = ' ';
+            at += 2;
+        } else if characters[at] == '"' {
+            at += 1;
+            while at < characters.len() && characters[at] != '"' {
+                if characters[at] == '\\' {
+                    code[at] = ' ';
+                    at += 1;
+                }
+                code[at] = ' ';
+                at += 1;
+            }
+            at += 1;
+        } else if characters[at] == '\''
+            && (characters.get(at + 2) == Some(&'\'')
+                || (characters.get(at + 1) == Some(&'\\') && characters.get(at + 3) == Some(&'\'')))
+        {
+            let end = if characters.get(at + 1) == Some(&'\\') {
+                at + 3
+            } else {
+                at + 2
+            };
+            for blanked in &mut code[at + 1..end] {
+                *blanked = ' ';
+            }
+            at = end + 1;
+        } else {
+            at += 1;
+        }
+    }
+    let code: String = code.into_iter().collect();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = code[from..].find("fn ") {
+        let start = from + offset;
+        from = start + 3;
+        let before_ok = code[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric() && before != '_');
+        let name: String = code[start + 3..]
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        if !before_ok || name.is_empty() {
+            continue;
+        }
+        let Some(open) = code[start..].find(['{', ';']).map(|at| start + at) else {
+            continue;
+        };
+        if code[open..].starts_with(';') {
+            continue;
+        }
+        let mut depth = 0_usize;
+        let mut end = open;
+        for (position, character) in code[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + position + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.push((name, source[start..end].to_owned()));
+    }
+    found
+}
+
+/// KR-REQ-29.04: the export's preview is the only place content a person asked to read reaches the
+/// error stream, and it gets there through one reporter function. In the reporter, `write_line`
+/// and `write_prompt` are called only by `write_preview`, which `show_preview` alone calls with the
+/// error stream; the error stream is named by nothing else but the reporter's own `ready` and
+/// `is_terminal`; and no other source file calls `write_line`, `write_prompt` or `write_preview`
+/// but the output module that defines them, the pairing command's terminal, and the crate's tests.
+#[test]
+fn only_the_reporters_preview_writes_content_to_the_error_stream() {
+    fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory)
+            .expect("a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    fn names(functions: &[(String, String)], needle: &str) -> Vec<String> {
+        let mut names: Vec<String> = functions
+            .iter()
+            .filter(|(_, body)| body.contains(needle))
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    sources(&root, &mut found);
+    for path in found {
+        let name = path
+            .strip_prefix(&root)
+            .expect("under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).expect("readable source");
+        let calls = |needle: &str| text.matches(needle).count();
+        match name.as_str() {
+            "output.rs" | "pair.rs" => {}
+            "report.rs" => {
+                let in_report = functions(&text);
+                assert_eq!(names(&in_report, "write_line("), ["write_preview"]);
+                assert!(names(&in_report, "write_prompt(").is_empty());
+                assert_eq!(
+                    names(&in_report, "write_preview("),
+                    ["show_preview", "write_preview"]
+                );
+                assert_eq!(
+                    names(&in_report, "stderr()"),
+                    ["is_terminal", "ready", "show_preview"]
+                );
+                assert_eq!(names(&in_report, "eprintln!"), ["say"]);
+            }
+            "doctor/content/tests.rs" => {
+                assert_eq!(calls("write_line("), 0, "{name}");
+                assert_eq!(calls("write_prompt("), 0, "{name}");
+            }
+            other => {
+                assert_eq!(calls("write_line("), 0, "{other} calls write_line");
+                assert_eq!(calls("write_prompt("), 0, "{other} calls write_prompt");
+                assert_eq!(calls("write_preview("), 0, "{other} calls write_preview");
+            }
+        }
+    }
+}
