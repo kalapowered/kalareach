@@ -1145,6 +1145,95 @@ async fn a_repository_added_from_a_terminal_is_confirmed_on_an_owner_device_and_
     }
 }
 
+/// KR-REQ-07.47: a repository added from a terminal asks for the budgets this host's own
+/// configuration allows, which are the product's defaults unless its owner narrowed them, and the
+/// request repeated until an owner device answers is the one the challenge was asked for. A host
+/// that allows less metadata than the product's default would refuse a request for the default, and
+/// the command has no option to change it. The control is a host with no configured budgets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allows() {
+    use kr_protocol::catalogue::{CatalogueAddParams, CatalogueKind};
+    use kr_protocol::confirmation::ConfirmationSubject;
+    use kr_protocol::hostinfo::configuration::{
+        Change, ConfiguredEnrolmentBudgets, EnrolmentBudgets,
+    };
+    use kr_protocol::scalars::U64;
+    for configured in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let narrowed = ConfiguredEnrolmentBudgets {
+            metadata_bytes: Nullable::some(32 * 1024 * 1024),
+            cached_payload_bytes: Nullable::some(1024 * 1024 * 1024),
+            full_offline_mirror: Nullable::some(false),
+            ..ConfiguredEnrolmentBudgets::default()
+        };
+        let in_force = if configured {
+            kr_cli::doctor::configuration::apply(&temp.environment(), &Change::Enrolment(narrowed))
+                .expect("a configuration document");
+            narrowed.resolve()
+        } else {
+            EnrolmentBudgets::default()
+        };
+        let root = temp.root().join("root.json");
+        std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
+        let root = root.display().to_string();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (_asked, serving) = scripted_daemon(
+            &temp,
+            OwnerDevice {
+                effect: "catalogue.add",
+                refusals: Some(1),
+                expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+                initial_bootstrap: false,
+                answer: added(CatalogueKind::Community),
+            }
+            .script(&temp, Arc::clone(&seen)),
+        );
+        let output = run_kr(
+            &temp,
+            &repo_add_line(&root, "https://repo.example/metadata/"),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let seen = seen.lock().expect("the record");
+        let [ConfirmationSubject::CatalogueAdd(subject)] = seen.subjects.as_slice() else {
+            panic!("one challenge, for a repository: {:?}", seen.subjects);
+        };
+        let wanted = kr_protocol::catalogue::CatalogueBudgets {
+            metadata_bytes: U64::new(in_force.metadata_bytes),
+            metadata_entries: U64::new(in_force.metadata_entries),
+            retained_generations: U64::new(in_force.retained_generations),
+            retained_metadata_bytes: U64::new(in_force.retained_metadata_bytes),
+            payload_cache_bytes: U64::new(in_force.cached_payload_bytes),
+            full_offline_mirror: in_force.full_offline_mirror,
+        };
+        assert_eq!(
+            subject.budgets, wanted,
+            "configured {configured}: the budgets this host allows"
+        );
+        if configured {
+            assert_ne!(
+                subject.budgets.metadata_bytes,
+                U64::new(EnrolmentBudgets::default().metadata_bytes),
+                "the narrowed budget is not the default"
+            );
+        }
+        for effect in &seen.effects {
+            let sent: CatalogueAddParams = effect.to_typed().expect("the request");
+            assert_eq!(
+                &sent,
+                subject.as_ref(),
+                "every request sent is the one the challenge was asked for"
+            );
+        }
+        serving.abort();
+    }
+}
+
 /// KR-REQ-11.42, KR-REQ-07.47: an installation the daemon says needs the owner's confirmation is
 /// asked for on an owner device the same way, and the terminal says what that device is shown: the
 /// release and its grant, and for a native bridge the host's own notice that it runs outside the
