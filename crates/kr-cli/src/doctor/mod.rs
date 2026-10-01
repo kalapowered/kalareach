@@ -15,10 +15,12 @@
 //!
 //! `--bundle <path>` writes a support bundle: software versions, capabilities, the diagnostics and
 //! redacted errors, as one archive. `--include-content` adds the content-bearing diagnostic
-//! export, and the command prints what that export will contain before it writes anything.
+//! export, which leaves out every private session, and the command prints what that export will
+//! contain, and what it left out, before it writes anything.
 
 pub mod bundle;
 pub mod configuration;
+pub mod content;
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -28,7 +30,6 @@ use kr_protocol::hostinfo::{
     EffectiveConfiguration, HostDoctorResult, HostInfoResult,
 };
 
-use crate::error::{CliError, Result};
 use crate::output::{Asked, Document, Line, Request, configured, configured_field};
 use crate::shown::host_text;
 use crate::stdout_line;
@@ -949,56 +950,6 @@ pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareCom
         });
     }
     components
-}
-
-/// The content-bearing diagnostic export, built only when the person selected it.
-///
-/// Section 26 keeps this out of an ordinary bundle: a session's shell command line, its working
-/// directory and its title are the person's own material rather than a software version. So it is
-/// assembled only under `--include-content`, it names what it holds, and the command prints that
-/// before anything is written.
-///
-/// # Errors
-///
-/// Returns an error when the host cannot be asked for its sessions.
-pub async fn content_export(
-    client: &mut kr_ipc::client::LocalClient,
-    environment_id: kr_protocol::ids::EnvironmentId,
-) -> Result<Vec<bundle::Content>> {
-    let listed: kr_protocol::session::SessionListResult = client
-        .request(
-            kr_protocol::method::Method::SessionList,
-            &kr_protocol::session::SessionListParams {
-                environment_id: kr_protocol::scalars::Nullable::some(environment_id),
-                include_closed: true,
-            },
-        )
-        .await
-        .map_err(CliError::Ipc)?
-        .map_err(CliError::Refused)?
-        .to_typed()
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "the host's session list could not be read: {}",
-                Shown::cbor(&error)
-            ))
-        })?;
-    let bytes = serde_json::to_vec_pretty(&listed).map_err(|error| {
-        CliError::Other(shown!(
-            "this export could not be written: {}",
-            Shown::json(&error)
-        ))
-    })?;
-    use kr_protocol::hostinfo::export::Sentence;
-
-    Ok(vec![bundle::Content {
-        entry: bundle::SESSIONS_ENTRY,
-        describes: Sentence::new()
-            .stated("every live and closed session (")
-            .number(listed.sessions.len() as u64)
-            .stated(" of them) with its shell command line, working directory and title"),
-        bytes,
-    }])
 }
 
 #[cfg(test)]
