@@ -17,6 +17,7 @@ import { useKeyboardInset } from '../../src/mobile/useLifecycle'
 class FakeViewport extends EventTarget {
   height = 844
   offsetTop = 0
+  scale = 1
 
   move(height: number, offsetTop: number): void {
     this.height = height
@@ -91,6 +92,25 @@ describe('the shell and the visual viewport', () => {
       viewport.move(362, 337)
     })
     expect(measured()).toEqual({ keyboard: '337px', pan: '337px' })
+  })
+
+  it('takes a pinch zoom for neither a keyboard nor a pan', () => {
+    const viewport = withViewport()
+    render(<Probe />)
+    // A person zoomed in and scrolled down: the visual viewport is smaller and further down inside
+    // the layout viewport, which is the zoom's doing and not a keyboard's or the platform's pan, so
+    // the shell stays where it is and the whole of it can still be reached.
+    viewport.scale = 2
+    act(() => {
+      viewport.move(422, 300)
+    })
+    expect(measured()).toEqual({ keyboard: '0px', pan: '0px' })
+    // Zoomed out again, a keyboard is measured as it was.
+    viewport.scale = 1
+    act(() => {
+      viewport.move(500, 0)
+    })
+    expect(measured()).toEqual({ keyboard: '344px', pan: '0px' })
   })
 
   it('leaves neither behind when the shell goes', () => {

@@ -186,7 +186,8 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
  * viewport to what is visible while it pans, so the height the page has without a keyboard is the
  * larger of the layout viewport's and the visible height and the pan together. The shell goes with
  * the visual viewport (`--pan`), so what it holds stays where the person sees it, and the keyboard
- * is at its foot whether or not the page was panned.
+ * is at its foot whether or not the page was panned. While the page is zoomed in by a pinch, neither
+ * is measured.
  */
 export function useKeyboardInset(): void {
   useEffect(() => {
@@ -194,6 +195,14 @@ export function useKeyboardInset(): void {
     if (!viewport) return
     const root = document.documentElement
     const measure = () => {
+      // A pinch zoom shrinks the visual viewport and moves it about inside the layout viewport as a
+      // keyboard and the platform's pan do, but it is neither: the shell stays where it is, so the
+      // whole of it can be reached, and nothing is taken for a keyboard.
+      if (Math.abs(viewport.scale - 1) > 0.01) {
+        root.style.setProperty('--keyboard', '0px')
+        root.style.setProperty('--pan', '0px')
+        return
+      }
       // The height the page has when no keyboard is up: the layout viewport's, which the platform
       // may shrink to what is visible while it pans to a field, and then the visible height and the
       // pan add up to it.
