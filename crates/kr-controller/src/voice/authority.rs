@@ -73,20 +73,15 @@ impl GrantAuthority {
 /// inside the transaction that writes, once the store's lock is held and immediately before the
 /// record changes.
 ///
-/// The seam only says no, so the refusal here is a generic one. The daemon's own admission keeps
-/// the refusal its check gave, a fence this host owes, a registration it has replaced or a
-/// deadline that has passed, and that is what the daemon tells the caller in place of this.
+/// The refusal is the one the admission gave, a fence this host owes, a registration it has
+/// replaced or a deadline that has passed, under its own code and in its own words.
 fn at_the_write(
     admission: &dyn kr_voice::Admission,
 ) -> impl FnOnce() -> crate::error::Result<()> + '_ {
     move || {
-        if admission.still_admitted() {
-            Ok(())
-        } else {
-            Err(crate::error::ControllerError::PermissionDenied {
-                detail: "the admission this change arrived under no longer stands".to_owned(),
-            })
-        }
+        admission
+            .still_admitted()
+            .map_err(|refusal| crate::error::ControllerError::refused(&refusal))
     }
 }
 

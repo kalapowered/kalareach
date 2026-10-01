@@ -281,7 +281,10 @@ impl VoiceAuthority for Authority {
         plan: &VoiceGrantPlan,
         admission: &dyn kr_voice::Admission,
     ) -> kr_voice::Result<Grant> {
-        assert!(admission.still_admitted(), "a write inside its admission");
+        assert!(
+            admission.still_admitted().is_ok(),
+            "a write inside its admission"
+        );
         let mut store = self.store.lock().expect("the store");
         let grant_id = GrantId::new(Uuid::from_bytes([store.next; 16]));
         store.next = store.next.wrapping_add(1);
@@ -1120,9 +1123,22 @@ struct LapsesOnceRead {
 }
 
 impl kr_voice::Admission for LapsesOnceRead {
-    fn still_admitted(&self) -> bool {
-        self.authority.lookups_started() == self.before
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        if self.authority.lookups_started() == self.before {
+            Ok(())
+        } else {
+            Err(host_refusal())
+        }
     }
+}
+
+/// The refusal this host's admission gives once it lapses, in words only this host would use: the
+/// coordinator carries it back as it is.
+fn host_refusal() -> kr_protocol::error::ProtocolError {
+    kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "this host owes a fence it could not raise".to_owned(),
+    )
 }
 
 /// A start whose admission lapsed while it read the store asks the broker for nothing.
@@ -1168,6 +1184,11 @@ async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothin
         refused.to_protocol_error().code,
         kr_protocol::error::ErrorCode::PermissionDenied,
         "{refused}"
+    );
+    assert_eq!(
+        refused.to_protocol_error().message,
+        "this host owes a fence it could not raise",
+        "the refusal is the one the host's admission gave, in its words"
     );
     assert!(
         fixture.broker.offers().is_empty(),

@@ -67,9 +67,15 @@ impl VoiceError {
     }
 
     /// The protocol error a caller receives.
+    ///
+    /// The host's own refusal is returned as it gave it: its words are not given the code's name a
+    /// second time.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
-        ProtocolError::new(self.code(), self.to_string())
+        match self {
+            Self::Host(refusal) => refusal.clone(),
+            _ => ProtocolError::new(self.code(), self.to_string()),
+        }
     }
 
     /// The refusal reason, when this was one.
