@@ -175,21 +175,42 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+.m-tabbar {
+  /* The weight of the label of the tab the person is on. */
+  --tab-current-weight: 620;
+}
+
 .m-tab[aria-current='page'] {
   color: var(--text);
-  font-weight: 620;
+  font-weight: var(--tab-current-weight);
 }
 
 /*
- * A label stays inside its own tab. Where even the bar's two-row form leaves a tab too narrow for
- * it, it ends in an ellipsis rather than run into the next tab; its whole name stays for a screen
+ * A label stays inside its own tab. Where even the bar's last form leaves a tab too narrow for it,
+ * it ends in an ellipsis rather than run into the next tab; its whole name stays for a screen
  * reader.
+ *
+ * A label keeps the room of its bold form, which the tab the person is on is set in, and is
+ * centred in it: the bar takes the same form and the tabs keep the same widths wherever the person
+ * is, since a face's bold is wider than its regular. The copy that holds the room is empty for a
+ * screen reader and has no height.
  */
 .m-tab-label {
   max-inline-size: 100%;
   overflow: hidden;
+  text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.m-tab-label::after {
+  content: attr(data-label);
+  content: attr(data-label) / '';
+  display: block;
+  block-size: 0;
+  overflow: hidden;
+  visibility: hidden;
+  font-weight: var(--tab-current-weight);
 }
 
 /*
@@ -218,6 +239,12 @@
   align-items: center;
   gap: var(--gap-2);
   padding: var(--gap-1) 0;
+}
+
+/* A tab has no neighbour on its row here, so its glyph and label start on the edge the page's content does. */
+.m-tabbar[data-form='column'] .m-tab {
+  justify-content: start;
+  padding-inline: var(--gap-4);
 }
 
 .m-tab:focus-visible {

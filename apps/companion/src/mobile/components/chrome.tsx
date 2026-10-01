@@ -29,7 +29,9 @@ function layOut(bar: HTMLElement, form: Form): void {
 /**
  * Whether the bar, as it is laid out now, holds its tabs within its width and every label shows its
  * whole word. A label that is a fraction of a pixel short ends in an ellipsis as one that is far
- * short does, so the word as typeset is held to its box to the fraction.
+ * short does, so the word as typeset is held to its box to the fraction. Each label keeps the room
+ * of its bold form whether or not its tab is the current one, so which tab that is changes nothing
+ * measured here.
  */
 function showsEveryLabel(bar: HTMLElement): boolean {
   if (bar.scrollWidth > bar.clientWidth) return false
@@ -125,7 +127,7 @@ export function TabBar({
               <span className="m-tab-badge">{destination.badge > 99 ? '99+' : destination.badge}</span>
             ) : null}
           </span>
-          <span className="m-tab-label">{destination.label}</span>
+          <span className="m-tab-label" data-label={destination.label}>{destination.label}</span>
           {destination.badge && destination.badge > 0 ? (
             <span className="visually-hidden">{`, ${destination.badge} waiting for you`}</span>
           ) : null}
