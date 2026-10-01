@@ -689,9 +689,10 @@ pub fn plan(path: &Path, body: &str, placement: &Placement) -> std::io::Result<C
 
 /// Returns what installing `body` into a file with these contents does, and the contents it leaves.
 fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result<(Change, String)> {
-    // A signed profile is never changed: what PowerShell reads as a signature, and where one leaves
-    // the text it signs, are PowerShell's own rules. The words are looked for in the file as it was
-    // read, before this placement's entry is cut out of it, because that cut can hold the block.
+    // An install never changes a signed profile: what PowerShell reads as a signature, and where
+    // one leaves the text it signs, are PowerShell's own rules. The words are looked for in the
+    // file as it was read, before this placement's entry is cut out of it, because that cut can
+    // hold the block.
     if placement.shell().is_some() && holds_signature_words(existing) {
         return Err(cannot_take_the_entry(SIGNED));
     }
