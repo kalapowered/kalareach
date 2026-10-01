@@ -620,6 +620,8 @@ rather than answered as though it had not moved.
 Questions belong to the session, so these reach the session's worker directly, the way attaching
 does; they keep working while the control daemon is restarting.
 
+The commands `kr question answer`, `kr question cancel`, and `kr question send` check the worker's build, which it states in its answer to the hello, before they send anything. A worker of another protocol version is refused with `UNSUPPORTED_SCHEMA`. The command will also indicate that it didn't send anything. This is necessary because the `kr` sending the command may be unable to correctly interpret the reply from the worker. In this case, use the `kr` of the worker's build.
+
 An answer the worker could not take is kept rather than lost. When the connection to the worker
 fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
 arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
