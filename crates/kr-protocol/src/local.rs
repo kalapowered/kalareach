@@ -386,6 +386,12 @@ pub enum ControllerConnectionRole {
     /// It carries the attention source and text requests and nothing else. A newer one replaces
     /// it, and a replacement generation fences it along with the authority itself.
     Attention,
+    /// The connection the daemon reads this session's description facts over.
+    ///
+    /// It carries the description facts request and nothing else, and holds one of them at a
+    /// time. A newer one replaces it, and a replacement generation fences it along with the
+    /// authority itself.
+    Descriptions,
 }
 
 impl ControllerConnectionRole {
@@ -396,6 +402,7 @@ impl ControllerConnectionRole {
             Self::Authority => "authority",
             Self::Proxy => "proxy",
             Self::Attention => "attention",
+            Self::Descriptions => "descriptions",
         }
     }
 }
@@ -450,6 +457,37 @@ mod tests {
     use crate::envelope::{ControlFrame, ParamsValue, Request};
     use crate::ids::RequestId;
     use crate::method::{Method, MethodVersion};
+
+    /// Each connection role has a wire name of its own, which is what its string is, and the
+    /// daemon's description link is one of them: the worker declares it before it presents a
+    /// generation, as it declares the attention link.
+    #[test]
+    fn every_connection_role_has_its_own_wire_name_and_the_description_link_is_one() {
+        use super::ControllerConnectionRole as Role;
+
+        let roles = [
+            Role::Authority,
+            Role::Proxy,
+            Role::Attention,
+            Role::Descriptions,
+        ];
+        let mut names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
+        for role in roles {
+            assert_eq!(
+                serde_json::to_value(role).expect("a role encodes"),
+                role.as_str(),
+                "the wire string is the name"
+            );
+            let declared = ControlFrame::ControllerRole(role);
+            let encoded = serde_json::to_value(&declared).expect("a frame encodes");
+            let decoded: ControlFrame = serde_json::from_value(encoded).expect("it decodes");
+            assert_eq!(decoded, declared);
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), roles.len(), "no two roles share a name");
+        assert_eq!(Role::Descriptions.as_str(), "descriptions");
+    }
 
     #[test]
     fn a_worker_states_the_clock_floor_it_maps_by_its_identity() {

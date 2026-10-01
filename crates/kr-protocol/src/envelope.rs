@@ -544,4 +544,10 @@ pub enum ControlFrame {
     PrivacyGeneration(crate::privacy::PrivacyGenerationNotice),
     /// The worker's answer: the generation its session holds and where its cleanup stands.
     PrivacyGenerationAck(Box<crate::privacy::PrivacyGenerationAck>),
+    /// The control daemon's request for one session's description facts, on its descriptions
+    /// connection to the worker.
+    DescriptionFacts(crate::describe::DescriptionFactsRequest),
+    /// The worker's answer: the session's facts, or none, with the privacy state they were
+    /// captured under.
+    DescriptionFactsPage(Box<crate::describe::DescriptionFactsPage>),
 }
