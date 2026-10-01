@@ -107,16 +107,18 @@ const isNameByte = (byte) =>
 const TOKEN_REACH = 1024
 
 /**
- * Every place `bytes` holds a name of an earlier identifier, each read from its first character to
- * the end of the run of name characters it starts: `content://` followed by
- * `to.kala.reach.companion.share` answers `to.kala.reach.companion.share`.
+ * Every place `bytes` holds a name of an earlier identifier, each read as the whole run of name
+ * characters it sits in: `content://` followed by `to.kala.reach.companion.share` answers
+ * `to.kala.reach.companion.share`, and a letter before the name is part of it.
  *
  * The rule is the same everywhere and has no exception for what follows or precedes a name: bytes
  * do not say where a string ends (a Rust literal runs into the next one, a binary property list and
- * a protocol buffer put the next object's tag straight after a value), so a hit is never discarded
- * because a letter follows it. A name that only begins like an earlier one is reported too, and
- * fails closed. Linear in the length of `bytes`. `wide` reads the names as UTF-16, which is how a
- * compiled resource table keeps a string.
+ * a protocol buffer put the next object's tag straight after a value, and a length sits straight
+ * before a string), so a hit is never discarded because a letter is next to it. A name that only
+ * begins like an earlier one is reported too. A name is correct only when the whole run is a class
+ * the application defines, so a run that has anything else with it is refused, and a refusal that
+ * is wrong is the failure that can be seen. Linear in the length of `bytes`. `wide` reads the names
+ * as UTF-16, which is how a compiled resource table keeps a string.
  */
 function retiredNamesIn(bytes, wide = false) {
   const unit = wide ? 2 : 1
@@ -126,10 +128,12 @@ function retiredNamesIn(bytes, wide = false) {
   for (const name of RETIRED_NAMES) {
     const wanted = Buffer.from(name, wide ? 'utf16le' : 'utf8')
     for (let at = bytes.indexOf(wanted); at !== -1; at = bytes.indexOf(wanted, at + 1)) {
+      let from = at
       let to = at + wanted.length
+      while (at - from < TOKEN_REACH * unit && nameAt(from - unit)) from -= unit
       while (to - at < TOKEN_REACH * unit && nameAt(to)) to += unit
-      const cut = nameAt(to) ? '\u2026' : ''
-      found.add(bytes.toString(wide ? 'utf16le' : 'latin1', at, to) + cut)
+      const cut = nameAt(from - unit) || nameAt(to) ? '\u2026' : ''
+      found.add(bytes.toString(wide ? 'utf16le' : 'latin1', from, to) + cut)
     }
   }
   return [...found]
@@ -435,6 +439,25 @@ function dump(apk, ...arguments_) {
   return answer.stdout
 }
 
+/** The value of an attribute from what `aapt2 dump xmltree` prints after its opening quote. */
+function valueOfDumpedAttribute(rest) {
+  const middle = '" (Raw: "'
+  if (rest.endsWith('")')) {
+    const half = (rest.length - middle.length - 2) / 2
+    if (
+      Number.isInteger(half) &&
+      half >= 0 &&
+      rest.slice(half, half + middle.length) === middle &&
+      rest.slice(half + middle.length, -2) === rest.slice(0, half)
+    ) {
+      return rest.slice(0, half)
+    }
+  } else if (rest.endsWith('"')) {
+    return rest.slice(0, -1)
+  }
+  return rest
+}
+
 /**
  * Every attribute of every element of a manifest, as `[element, attribute, value]`, from
  * `aapt2 dump xmltree`, which prints each element and then its attributes.
@@ -448,11 +471,14 @@ export function attributesFromTree(tree) {
       element = started[1]
       continue
     }
-    // aapt2 prints a string attribute as its value and then the same text again as `(Raw: "...")`.
-    // The value runs to the last quote that precedes that second copy, so a value that holds
-    // quotes, or the text `(Raw: `, is read whole.
-    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="(.*)"(?: \(Raw: ".*"\))?$/.exec(line)
-    if (attribute && element) values.push([element, attribute[1], attribute[2]])
+    // aapt2 prints a string attribute as its value and then the same text again as `(Raw: "...")`:
+    // `V" (Raw: "V")` after the opening quote. The value is the half that the two copies share, so
+    // a value that holds quotes, or the text `(Raw: `, is read whole. Where the two copies do not
+    // agree, the whole of what the line holds after the opening quote is the value, which can only
+    // make the check read more of the line.
+    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="(.*)$/.exec(line)
+    if (!attribute || !element) continue
+    values.push([element, attribute[1], valueOfDumpedAttribute(attribute[2])])
   }
   return values
 }
