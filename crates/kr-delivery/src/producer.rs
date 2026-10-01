@@ -2665,6 +2665,11 @@ mod tests {
     /// A command that failed in session one, seen at `wall_ms`: an announcement that is not a
     /// pending question or approval.
     fn raise_failure(attention: &mut Attention, sequence: u64, wall_ms: u64) {
+        raise_failure_of(attention, sequence, wall_ms, "cargo test");
+    }
+
+    /// A failure of `command` in session one, seen at `wall_ms`.
+    fn raise_failure_of(attention: &mut Attention, sequence: u64, wall_ms: u64, command: &str) {
         attention
             .apply(
                 &SourceEvent::new(
@@ -2672,7 +2677,7 @@ mod tests {
                     TimestampMs::new(wall_ms),
                     EventKind::CommandCompleted {
                         session_id: session(1),
-                        command: "cargo test".to_owned(),
+                        command: command.to_owned(),
                         exit_code: 101,
                     },
                 ),
@@ -2912,6 +2917,93 @@ mod tests {
             .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
             .expect("production");
         assert_eq!(produced.admitted, 2);
+    }
+
+    /// An announcement quiet hours hold back while privacy mode is on is a decision made while it
+    /// was on, and it is not sent when the hours end after privacy mode has: the time it was
+    /// decided is kept through the release. The control: one decided after privacy mode went off
+    /// and held by the same hours is released and sent as any other is.
+    #[test]
+    fn a_decision_held_by_quiet_hours_during_privacy_mode_is_not_sent_when_they_end_after_it() {
+        use kr_protocol::attention::QuietHours;
+        use kr_protocol::scalars::{Nullable, U64};
+
+        const HOUR: u64 = 3_600_000;
+        let lifted_near = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a time")
+                .as_millis(),
+        )
+        .expect("a time");
+        let minute_of = |at_ms: u64| at_ms / 60_000 % 1_440;
+        // Three hours of quiet hours around the moment privacy mode is turned off.
+        let quiet = QuietHours {
+            start_minute: U64::new(minute_of(lifted_near - 90 * 60_000)),
+            end_minute: U64::new(minute_of(lifted_near + 90 * 60_000)),
+            zone: Nullable::null(),
+        };
+        let mut producer = producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = store();
+        attention
+            .set_quiet_hours(Some(quiet))
+            .expect("the store records the window");
+        producer.journal_mut().fence(1).expect("a fence");
+        let private = PrivacyView {
+            generation: 1,
+            private: true,
+        };
+        // Decided while privacy mode is on, inside the hours: held, so nothing is offered.
+        raise_failure_of(&mut attention, 1, lifted_near - HOUR, "cargo test");
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            private,
+        );
+        assert_eq!(taken.taken, 0, "held back, so nothing to take");
+
+        producer.journal_mut().lift_fence(2).expect("a lift");
+        let lifted = PrivacyView {
+            generation: 2,
+            private: false,
+        };
+        // Decided after the lift, inside the same hours: held too.
+        raise_failure_of(&mut attention, 2, lifted_near + HOUR, "cargo build");
+
+        // The hours end: both are released.
+        let released = attention
+            .tick(reading(3 * HOUR, lifted_near + 3 * HOUR), &|_| {
+                Some(u64::MAX)
+            })
+            .expect("the store records the release");
+        assert_eq!(
+            released
+                .iter()
+                .filter(|outcome| matches!(outcome, kr_attention::engine::Outcome::Released { .. }))
+                .count(),
+            2,
+            "both held decisions are released: {released:?}"
+        );
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            lifted,
+        );
+        assert_eq!(taken.taken, 2);
+        assert_eq!(
+            taken.dropped, 1,
+            "the one decided while privacy mode was on is never sent"
+        );
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(
+            produced.admitted, 2,
+            "the control, decided after the lift, is sent to each phone"
+        );
     }
 
     /// What a grant reaches is decided by its history and by the right each kind of subject asks
