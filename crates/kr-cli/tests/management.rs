@@ -1464,7 +1464,11 @@ async fn a_connection_that_ends_after_a_confirmed_request_leaves_its_outcome_unk
         let (asked, serving) =
             scripted_daemon_that_hangs_up_after(&temp, device(&temp, &seen), effect);
         let (status, refused) = json(&temp, &line);
-        assert_eq!(status, Some(8), "{effect}: {refused}");
+        assert_eq!(
+            status,
+            Some(1),
+            "{effect}: the host refused nothing: {refused}"
+        );
         assert_eq!(refused["code"], "OUTCOME_UNKNOWN", "{effect}: {refused}");
         let message = text(&refused["message"]);
         assert!(message.contains("not known"), "{effect}: {message}");
