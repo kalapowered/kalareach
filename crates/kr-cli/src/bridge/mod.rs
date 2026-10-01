@@ -11,6 +11,8 @@
 //! | --- | --- |
 //! | [`pipe`] | The bounded frame codec over the standard streams, and the refusal that replaces a frame nobody may read |
 //! | [`helper`] | `kr bridge --stdio`: the handshake, the admission rule and the relay |
+//! | [`link`] | The connection an attached terminal speaks over, local or bridged |
+//! | [`session`] | `kr new` and `kr attach` for a session in an enrolled environment |
 //! | [`environments`] | `kr bridge list`, `enrol`, `forget` and `refresh` against this host's own daemon |
 //!
 //! **What the helper refuses, and why it is refused here as well as at the invoker.** The bridges
@@ -29,7 +31,9 @@
 
 pub mod environments;
 pub mod helper;
+pub mod link;
 pub mod pipe;
+pub mod session;
 
 use kr_client::shown::Shown;
 use kr_protocol::identity::{

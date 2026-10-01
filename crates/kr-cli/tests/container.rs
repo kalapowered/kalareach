@@ -92,6 +92,7 @@ fn the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_act
         // The one thing a bridge may never carry.
         origin_ingress: ActorIngress::PairedDevice,
         already_bridged: false,
+        start: false,
         target: BridgeTarget::Controller,
     }));
     {

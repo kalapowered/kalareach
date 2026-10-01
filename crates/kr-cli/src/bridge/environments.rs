@@ -243,6 +243,8 @@ async fn query_helper_identity(
         // This is a person at this host's own command line. Nothing else may reach a bridge.
         origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
         already_bridged: false,
+        // Asking which environment this is starts nothing: enrolment is not a create or an attach.
+        start: false,
         target: kr_protocol::identity::BridgeTarget::Controller,
     };
     let acknowledgement = kr_controller::bridge::invoke::discover(&command, &hello)
@@ -256,7 +258,8 @@ async fn query_helper_identity(
 /// The destination records where a request came from, so the opening names this installation
 /// rather than a value made up for the occasion. A host that has no environment of its own yet
 /// still opens bridges, and says so with the nil identity rather than inventing one.
-fn origin_environment_id() -> EnvironmentId {
+#[must_use]
+pub fn origin_environment_id() -> EnvironmentId {
     kr_ipc::paths::HostPaths::discover()
         .ok()
         .and_then(|paths| resolve::select(&paths, None).ok())
@@ -264,6 +267,81 @@ fn origin_environment_id() -> EnvironmentId {
             || EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
             |known| known.environment_id,
         )
+}
+
+/// The environment a command that creates or attaches acts in.
+#[derive(Debug)]
+pub enum Selected {
+    /// An environment of this installation, on this host.
+    Local(crate::resolve::KnownEnvironment),
+    /// An enrolled environment this host reaches through a process bridge.
+    Enrolled(Box<EnvironmentEnrolment>),
+}
+
+/// Resolves what `--environment` named: one of this host's own environments, else an enrolled one.
+///
+/// A local environment is selected by its identifier, as it always was, and wins. What names no
+/// local environment is looked for in this host's own enrolled environments, by label or by
+/// identifier, which this host's daemon holds: the owner-approved record stays the daemon's, and
+/// a selector that matches two records is refused rather than resolved to the first of them.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] for a name that is neither, for one that matches two enrolled
+/// environments, and for an environment that is not reached by a process bridge, and the daemon's
+/// refusal or a transport failure when its record cannot be read.
+pub async fn selected(paths: &kr_ipc::paths::HostPaths, named: Option<&str>) -> Result<Selected> {
+    let local = match resolve::select(paths, named) {
+        Ok(known) => return Ok(Selected::Local(known)),
+        Err(error @ (CliError::Usage(_) | CliError::HostUnavailable(_))) => error,
+        Err(other) => return Err(other),
+    };
+    let Some(wanted) = named else {
+        return Err(local);
+    };
+    let known = resolve::select(paths, None)?;
+    let mut client = resolve::open_controller(&known.paths, crate::build_id()).await?;
+    let inventory = inventory(&mut client).await?;
+    let mut matched = inventory
+        .rows
+        .into_iter()
+        .filter(|row| row.enrolment.selected_by(wanted));
+    let Some(first) = matched.next() else {
+        // Neither a local environment nor an enrolled one, so what the local lookup said stands.
+        return Err(local);
+    };
+    if matched.next().is_some() {
+        return Err(CliError::Usage(Shown::said(
+            "that name selects more than one enrolled environment; give the environment \
+             identifier",
+        )));
+    }
+    if !first.enrolment.access.is_process_bridge() {
+        return Err(CliError::Usage(Shown::said(
+            "that environment is not reached by a process bridge: run kr on it after logging in \
+             to it, or reach it through its own pairing",
+        )));
+    }
+    Ok(Selected::Enrolled(Box::new(first.enrolment)))
+}
+
+/// Reads the cached inventory over a connection that is already open.
+async fn inventory(client: &mut kr_ipc::client::LocalClient) -> Result<EnvironmentInventoryResult> {
+    let answer = client
+        .request(
+            Method::EnvironmentInventory,
+            &EnvironmentInventoryParams {
+                access: Nullable::null(),
+            },
+        )
+        .await?
+        .map_err(CliError::Refused)?;
+    answer.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer is not an inventory: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 /// Removes one enrolled environment.
@@ -329,21 +407,7 @@ pub async fn refresh(arguments: &BridgeRefreshArguments) -> Result<EnvironmentRe
 /// share a label are told apart. Either way the identity is what every later step compares, and a
 /// selector that matches two records is refused rather than resolved to the first of them.
 async fn labelled(client: &mut kr_ipc::client::LocalClient, label: &str) -> Result<EnvironmentId> {
-    let answer = client
-        .request(
-            Method::EnvironmentInventory,
-            &EnvironmentInventoryParams {
-                access: Nullable::null(),
-            },
-        )
-        .await?
-        .map_err(CliError::Refused)?;
-    let inventory: EnvironmentInventoryResult = answer.to_typed().map_err(|error| {
-        CliError::Other(shown!(
-            "the host's answer is not an inventory: {}",
-            Shown::cbor(&error)
-        ))
-    })?;
+    let inventory = inventory(client).await?;
     let mut matched = inventory
         .rows
         .iter()
