@@ -2517,11 +2517,11 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
 /// key reaches. Another folder's manifest is read as the application reads it, a leading byte order
 /// mark dropped, and one that is there and that this host cannot read whole or parse is a refusal,
 /// never taken for one that is not there. The directory itself under another name (a link to it, a
-/// spelling a volume that ignores case reads alike) is not another folder, and neither is a
-/// hidden one, which Claude Code does not read as a plugin. All are refused before anything is
-/// written. The other folders are read through their paths, as an advisory check beside the walk
-/// the executor makes from one handle: what appears after it is the person's own, as it is after
-/// the install.
+/// spelling a volume that ignores case reads alike) is not another folder, and for Claude Code
+/// neither is a hidden one, which it does not read as a plugin. Every refusal comes before anything
+/// is written. The other folders are read through their paths, as an advisory check beside the
+/// walk the executor makes from one handle: what appears after it is the person's own, as it is
+/// after the install.
 fn place_is_free(
     root: &Dir,
     journal: &Journal,

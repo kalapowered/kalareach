@@ -1178,6 +1178,22 @@ fn a_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
+    // The same, with the directory this host installs into already there and empty: the rule
+    // that skips the directory itself under another name skips nothing else.
+    let site = Site::new();
+    std::fs::create_dir_all(site.application().join("skills/kalareach-channels"))
+        .expect("an empty directory");
+    claim(&site, "a", "kalareach-channels");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("keeps one of two"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
     // The control: a folder of the person's own with another name beside it.
     let site = Site::new();
     claim(&site, "a", "theirs-too");
