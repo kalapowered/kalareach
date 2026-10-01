@@ -323,6 +323,27 @@ pub struct WorkerLaunchSpec {
     /// same connection before anything else does. The worker reads them before it starts the
     /// shell, so a package admitted at launch is there for the shell's first command.
     pub plugins: crate::admission::AdmissionsHeader,
+    /// The environment's privacy state when this worker was launched.
+    ///
+    /// The worker applies it before it starts its shell. A session created while privacy mode is
+    /// on therefore retains nothing from its first byte, and does not wait for the daemon's next
+    /// notice to learn that it is private.
+    pub privacy: PrivacyLaunch,
+}
+
+/// The environment's privacy state, as a worker is told it when it is launched.
+///
+/// It is the generation in force and whether privacy mode is on at it, read by the daemon after
+/// the worker's claim is accepted and before the specification is sent. A change after that reaches
+/// the worker as the daemon's notice of the generation, which the daemon repeats until the worker
+/// says its cleanup is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyLaunch {
+    /// The generation in force. Nought is an environment that has never turned privacy mode on.
+    pub generation: U64,
+    /// Whether privacy mode is on at that generation.
+    pub enabled: bool,
 }
 
 /// What a worker reports once its root shell is running.
@@ -569,6 +590,112 @@ mod tests {
     /// `value` as KR-CBOR-1 writes it.
     fn encoded(value: &impl Serialize) -> CanonicalValue {
         kr_cbor::to_canonical_value(value).expect("encodes")
+    }
+
+    /// A launch specification as the daemon sends it, under `privacy`.
+    fn specification(privacy: PrivacyLaunch) -> WorkerLaunchSpec {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([2; 16]));
+        WorkerLaunchSpec {
+            session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: DisplayNumber::new(1),
+            create: crate::session::SessionCreateParams {
+                environment_id,
+                presentation: crate::session::Presentation::Invisible,
+                shell: Nullable::null(),
+                shell_mode: crate::session::ShellMode::NativeCompat,
+                cwd: Nullable::some("/".to_owned()),
+                dimensions: Nullable::null(),
+                worker_profile: WorkerProfile::HeadlessUser,
+                environment_snapshot: Vec::new(),
+                palette: Nullable::null(),
+                launch_profile: crate::session::LaunchProfile::default(),
+                terminal: Nullable::null(),
+            },
+            shell_package: Nullable::null(),
+            controller_public_key: AuthorisationKey::from_bytes([3; 32]),
+            controller_generation: ControllerGeneration::new(1),
+            release: "0".to_owned(),
+            plugins: crate::admission::AdmissionsHeader {
+                frame: crate::admission::FrameId {
+                    generation: ControllerGeneration::new(1),
+                    revision: U64::new(1),
+                    round: U64::new(1),
+                },
+                parts: 1,
+            },
+            privacy,
+        }
+    }
+
+    /// A launch specification carries the privacy state its worker starts under, a specification
+    /// without it is refused, and so is one that says more of it than a worker understands. A
+    /// daemon speaks only to workers of its own release, so no specification of another shape
+    /// reaches a worker.
+    #[test]
+    fn a_launch_specification_carries_the_privacy_state_its_worker_starts_under() {
+        use crate::envelope::ParamsValue;
+
+        let private = specification(PrivacyLaunch {
+            generation: U64::new(3),
+            enabled: true,
+        });
+        let json = serde_json::to_value(&private).expect("encodes");
+        assert_eq!(
+            json["privacy"],
+            serde_json::json!({ "generation": "3", "enabled": true })
+        );
+        let back: WorkerLaunchSpec = serde_json::from_value(json.clone()).expect("decodes");
+        assert_eq!(back, private);
+
+        let mut without = json.clone();
+        without
+            .as_object_mut()
+            .expect("an object")
+            .remove("privacy");
+        assert!(
+            serde_json::from_value::<WorkerLaunchSpec>(without).is_err(),
+            "a specification that says nothing of privacy mode is refused"
+        );
+        let mut more = json;
+        more["privacy"]["reason"] = serde_json::json!("because");
+        assert!(
+            serde_json::from_value::<WorkerLaunchSpec>(more).is_err(),
+            "so is one that says more than a worker reads"
+        );
+
+        // The same on the wire a worker reads it from.
+        let wire = ParamsValue::from_typed(&private).expect("encodes");
+        assert_eq!(wire.to_typed::<WorkerLaunchSpec>().expect("reads"), private);
+        let CanonicalValue::Map(map) = encoded(&private) else {
+            panic!("a specification is a map");
+        };
+        let entries: Vec<_> = map
+            .into_entries()
+            .into_iter()
+            .filter(|(name, _)| name != "privacy")
+            .collect();
+        let without = ParamsValue::new(CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries(entries).expect("the members"),
+        ));
+        assert!(
+            without.to_typed::<WorkerLaunchSpec>().is_err(),
+            "on the wire too"
+        );
+
+        // Privacy mode off at a later generation is as much a state as on, and travels the same.
+        let off = specification(PrivacyLaunch {
+            generation: U64::new(2),
+            enabled: false,
+        });
+        assert_eq!(
+            ParamsValue::from_typed(&off)
+                .expect("encodes")
+                .to_typed::<WorkerLaunchSpec>()
+                .expect("reads"),
+            off
+        );
     }
 
     #[test]

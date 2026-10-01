@@ -6698,6 +6698,7 @@ export interface WorkerLaunchSpec {
    */
   environment_id: string
   plugins: AdmissionsHeader
+  privacy: PrivacyLaunch
   /**
    * The release string the session reports as its terminal program version.
    */
@@ -6913,6 +6914,23 @@ export interface FrameId {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   round: string
+}
+/**
+ * The environment's privacy state when this worker was launched.
+ *
+ * The worker applies it before it starts its shell. A session created while privacy mode is
+ * on therefore retains nothing from its first byte, and does not wait for the daemon's next
+ * notice to learn that it is private.
+ */
+export interface PrivacyLaunch {
+  /**
+   * Whether privacy mode is on at that generation.
+   */
+  enabled: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
 }
 /**
  * What a worker reports once its root shell is running.

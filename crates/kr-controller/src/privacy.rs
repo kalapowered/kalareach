@@ -139,6 +139,17 @@ pub struct Published {
     pub private: bool,
 }
 
+impl Published {
+    /// Returns this state as a worker is told it in its launch specification.
+    #[must_use]
+    pub const fn to_launch(self) -> kr_protocol::worker::PrivacyLaunch {
+        kr_protocol::worker::PrivacyLaunch {
+            generation: U64::new(self.generation.get()),
+            enabled: self.private,
+        }
+    }
+}
+
 impl PrivacyState {
     /// A state that holds `published`, for this crate's own tests of its readers.
     #[cfg(test)]

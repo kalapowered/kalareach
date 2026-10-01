@@ -297,6 +297,16 @@ impl Controller {
             .ok_or_else(|| {
                 ControllerError::supervision("the first admissions for this worker are empty")
             })?;
+        // The privacy state this worker starts under, read now that its claim is accepted and as
+        // late as it can be before the specification is built. It is read on a thread that may
+        // block: a change of privacy mode holds the state's write side while it waits for the
+        // exchanges already admitted. A worker applies it before it starts its shell, and a change
+        // after this reaches it as the daemon's notice, which its session's obligation, recorded
+        // before this worker was launched, keeps the daemon repeating until it is answered.
+        let privacy = self.privacy.state();
+        let launched_under = tokio::task::spawn_blocking(move || privacy.now())
+            .await
+            .map_err(|error| ControllerError::supervision(error.to_string()))?;
         let mut specification = WorkerLaunchSpec {
             session_id: reservation.session_id,
             session_epoch: SessionEpoch::V1,
@@ -308,6 +318,7 @@ impl Controller {
             controller_generation: self.generation,
             release: self.release.clone(),
             plugins,
+            privacy: launched_under.to_launch(),
         };
         // The specification is one control frame. Beside a create request that leaves too little
         // room, the largest integrations are left out as well. The session starts without them,
