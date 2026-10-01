@@ -195,6 +195,26 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
         admission: &dyn Admission,
     ) -> Result<Grant>;
 
+    /// Writes a grant the coordinator planned in place of the one it replaces, which is withdrawn
+    /// with everything delegated from it, as one change: the whole of it happens or none of it
+    /// does.
+    ///
+    /// The host's authority store does this in one transaction, so a failure of the new grant
+    /// leaves the old one standing and the calls running under it as they were. `admission` is
+    /// asked inside that transaction, as it is for a write or a revocation alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either half cannot be written, or the admission has run out, and then
+    /// nothing is changed.
+    fn replace(
+        &self,
+        replaced: GrantId,
+        plan: &crate::grant::VoiceGrantPlan,
+        now_ms: u64,
+        admission: &dyn Admission,
+    ) -> Result<Grant>;
+
     /// Revokes a grant and everything delegated from it, and reports when.
     ///
     /// `admission` is asked inside the store's own transaction, for the same reason.

@@ -1942,6 +1942,132 @@ fn voice_plan(controller: &Controller) -> kr_voice::VoiceGrantPlan {
     }
 }
 
+/// A voice grant replaced through the seam is one change in the store. A cascade that finds
+/// authority a worker may hold work under, a grant delegated from the voice grant that is not a
+/// voice grant itself, owes a fence, and the fence is published once the change has committed and
+/// not before: a replacement the store refuses leaves the standing grant, what was delegated from
+/// it and the debts of this host as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_grant_replaced_through_the_seam_publishes_the_fence_it_owes_once_it_has_committed()
+{
+    use kr_voice::seams::VoiceAuthority as _;
+
+    let (_temp, controller, _asked) = daemon().await;
+    let (connection_id, _actor_id) = admitted(&controller).await;
+    let authority = crate::voice::GrantAuthority::new(
+        Arc::clone(&controller.sharing),
+        Arc::clone(&controller.devices),
+        controller.sharing.host_device_id(),
+        Arc::downgrade(&controller),
+    );
+    let standing = voice_plan(&controller);
+    let admission =
+        |carried| super::voice_actions::VoiceAdmission::new(Arc::clone(&controller), carried);
+    let written = authority
+        .issue(
+            &standing,
+            &admission(live_admission(&controller, connection_id)),
+        )
+        .expect("a standing voice grant");
+    // A grant delegated from it that is not a voice grant: withdrawing it owes a fence.
+    let delegated = kr_protocol::grant::Grant {
+        grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+        parent_grant_id: Nullable::some(written.grant_id),
+        actions: [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        ..written.clone()
+    };
+    controller
+        .sharing
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: delegated.clone(),
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a delegated grant");
+    // What this host owes, held or already taken up by the debt pass, which a published debt wakes:
+    // the debts in memory and the rows on disk.
+    let owed = |controller: &Controller| {
+        let held = controller.debts();
+        held.published.len()
+            + held.retiring.len()
+            + controller
+                .sharing
+                .grants()
+                .fence_owed()
+                .expect("the debts read")
+                .len()
+    };
+    assert_eq!(owed(&controller), 0);
+    let revision_before = controller.leases.authority_revision();
+
+    // Under an admission that lapsed at the store, nothing changes and nothing is owed.
+    let refused = authority
+        .replace(
+            written.grant_id,
+            &voice_plan(&controller),
+            5,
+            &admission(crate::authority::AdmittedMutation {
+                admitted_revision: kr_protocol::ids::AuthorityRevision::new(u64::MAX),
+                ..live_admission(&controller, connection_id)
+            }),
+        )
+        .expect_err("a revision this host has not reached does not stand");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    let held = |id| {
+        controller
+            .sharing
+            .grants()
+            .record(id)
+            .expect("the store answers")
+            .expect("held")
+    };
+    assert!(held(written.grant_id).revoked_at_ms.is_none());
+    assert!(held(delegated.grant_id).revoked_at_ms.is_none());
+    assert_eq!(
+        owed(&controller),
+        0,
+        "no fence is owed for a change that did not happen"
+    );
+    assert_eq!(
+        controller.leases.authority_revision(),
+        revision_before,
+        "and no barrier advanced the revision for it"
+    );
+
+    // Under an admission that stands, the replacement commits and the fence is published.
+    let replacement = authority
+        .replace(
+            written.grant_id,
+            &voice_plan(&controller),
+            6,
+            &admission(live_admission(&controller, connection_id)),
+        )
+        .expect("the replacement is written");
+    assert!(held(written.grant_id).revoked_at_ms.is_some());
+    assert!(held(delegated.grant_id).revoked_at_ms.is_some());
+    assert!(held(replacement.grant_id).revoked_at_ms.is_none());
+    // The fence the delegated grant's withdrawal owes is published once the change has committed,
+    // which wakes the debt pass: its barrier advances the revision, and that is what is waited for,
+    // by condition, because the pass may already have taken the debt up.
+    super::a_floor_owed_its_record::until(
+        "the barrier for the delegated grant's withdrawal advanced the revision",
+        async || controller.leases.authority_revision() > revision_before,
+    )
+    .await;
+}
+
 /// The voice service's grant seam writes and withdraws only under the admission every service
 /// asks from inside its work. While a fence is owed it writes no voice grant and withdraws
 /// none, and what the caller is told is the fence's own refusal; once the fence is no longer

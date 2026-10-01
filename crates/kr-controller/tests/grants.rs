@@ -389,6 +389,103 @@ fn a_voice_grants_withdrawal_owes_no_fence() {
     );
 }
 
+/// A grant replaced in place is withdrawn and its replacement written in one transaction. The
+/// replacement is refused part way, at the write of the new grant, after the withdrawal has been
+/// made inside the transaction, and the withdrawal goes with it: the grant it replaced stands,
+/// every grant delegated from it stands, and the fence the withdrawal would have owed is not owed.
+/// The control: written, the replacement withdraws the whole subtree and returns its one debt.
+#[test]
+fn a_replacement_the_store_cannot_write_withdraws_nothing() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
+    let standing = grant(
+        1,
+        None,
+        &[
+            ActionRight::VoiceUse,
+            ActionRight::SessionView,
+            ActionRight::SessionShare,
+        ],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(standing.clone()), || Ok(()))
+        .expect("written");
+    let call = grant(
+        2,
+        Some(standing.grant_id),
+        &voice_rights,
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(call.clone()), || Ok(()))
+        .expect("written");
+    let delegated = grant(
+        3,
+        Some(standing.grant_id),
+        &[ActionRight::SessionView],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(delegated.clone()), || Ok(()))
+        .expect("written");
+    let live = |id: GrantId| {
+        directory
+            .record(id)
+            .expect("readable")
+            .expect("held")
+            .revoked_at_ms
+            .is_none()
+    };
+
+    // A replacement that reuses an identity the store holds: the write of it is refused after the
+    // subtree was withdrawn inside the transaction.
+    let clashing = record(grant(2, None, &voice_rights, GrantExpiry::Never));
+    directory
+        .replace(Some(standing.grant_id), 5_000, &clashing, || Ok(()))
+        .expect_err("the replacement cannot be written");
+    assert!(live(standing.grant_id), "the replaced grant stands");
+    assert!(live(call.grant_id), "and so does the call under it");
+    assert!(live(delegated.grant_id), "and so does what was delegated");
+    assert!(
+        directory.fence_owed().expect("readable").is_empty(),
+        "the fence the withdrawal would have owed was rolled back with it"
+    );
+
+    // An admission that lapses at the store changes nothing either, as for a withdrawal alone.
+    let replacement = record(grant(4, None, &voice_rights, GrantExpiry::Never));
+    directory
+        .replace(Some(standing.grant_id), 5_100, &replacement, || {
+            Err(kr_controller::error::ControllerError::PermissionDenied {
+                detail: "the admission no longer stands".to_owned(),
+            })
+        })
+        .expect_err("the admission lapsed");
+    assert!(live(standing.grant_id));
+    assert!(
+        directory
+            .record(replacement.grant.grant_id)
+            .expect("readable")
+            .is_none()
+    );
+
+    // The control: written, the replacement withdraws the whole subtree, and the debt the
+    // delegated grant's withdrawal owes comes back for the caller to publish.
+    let revocation = directory
+        .replace(Some(standing.grant_id), 5_200, &replacement, || Ok(()))
+        .expect("the replacement is written")
+        .expect("it withdrew the grant it replaced");
+    assert_eq!(revocation.revoked.len(), 3);
+    assert!(!live(standing.grant_id));
+    assert!(!live(call.grant_id));
+    assert!(!live(delegated.grant_id));
+    assert!(live(replacement.grant.grant_id));
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![revocation.debt.expect("the delegated grant owes a fence")]
+    );
+}
+
 /// A store an earlier build wrote keyed its fence debt by what it withdrew. That debt is still
 /// owed: it comes forward as one debt under the identity it had, which a barrier retires like any
 /// other, and a second opening changes nothing.
