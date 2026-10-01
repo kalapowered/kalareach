@@ -58,12 +58,25 @@ pub struct DescriptionFacts {
     shared: Arc<Shared>,
 }
 
-#[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
     /// Woken after every change, for the request the daemon has had held.
     changed: tokio::sync::Notify,
+    /// How the repository and the directory a read names are found: the file system's, and in this
+    /// module's own tests one a test holds.
+    reader: Reader,
 }
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Shared")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+type Reader = Arc<dyn Fn(&Read) -> Found + Send + Sync>;
 
 #[derive(Debug)]
 struct State {
@@ -78,7 +91,13 @@ struct State {
     cwd: Option<String>,
     /// How many events have been recorded, which is the next event's place.
     events_recorded: u64,
-    /// The repository read that is running, and the directory waiting behind it.
+    /// How many times privacy mode was enabled or disabled: what a read began under, so that one
+    /// that began before a transition is never applied after it.
+    epoch: u64,
+    /// How many command blocks were recorded: a read applies only when no later block has come,
+    /// since a later block says where the session is now.
+    blocks: u64,
+    /// The directory read that is running, and the one waiting behind it.
     probe: Probe,
 }
 
@@ -93,9 +112,12 @@ struct Record {
     events: VecDeque<Event>,
 }
 
+/// A repository, as it is named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Repository {
+    /// The directory that holds its `.git`.
     name: String,
+    /// The branch its `HEAD` names, when it names one.
     branch: Option<String>,
 }
 
@@ -110,8 +132,31 @@ struct Event {
 enum Probe {
     #[default]
     Idle,
-    /// A read is running, and this directory is waiting behind it, when one is.
-    Running(Option<PathBuf>),
+    /// A read is running, and this one is waiting behind it, when one is.
+    Running(Option<Read>),
+}
+
+/// One read of the directory and repository a command block names.
+#[derive(Clone, Debug)]
+struct Read {
+    /// How many privacy transitions the session had had when the read was asked for.
+    epoch: u64,
+    /// How many command blocks it had recorded, this one included.
+    block: u64,
+    /// The directory the block says the command ran in.
+    directory: PathBuf,
+    /// The root shell's process, when the block says a command has ended and the shell is back at
+    /// its prompt: the directory it is in now is read from the operating system.
+    shell: Option<u64>,
+}
+
+/// What one read found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Found {
+    /// The directory the session is in.
+    directory: PathBuf,
+    /// The repository that directory is inside, when it is inside one.
+    repository: Option<Repository>,
 }
 
 /// What one reading of the record says.
@@ -132,8 +177,13 @@ impl DescriptionFacts {
     /// `private`.
     #[must_use]
     pub fn new(private: bool, generation: PrivacyGeneration) -> Self {
+        Self::reading_with(private, generation, Arc::new(read_from_disk))
+    }
+
+    fn reading_with(private: bool, generation: PrivacyGeneration, reader: Reader) -> Self {
         Self {
             shared: Arc::new(Shared {
+                reader,
                 state: Mutex::new(State {
                     generation: generation.get(),
                     private,
@@ -141,6 +191,8 @@ impl DescriptionFacts {
                     record: Record::default(),
                     cwd: None,
                     events_recorded: 0,
+                    epoch: 0,
+                    blocks: 0,
                     probe: Probe::Idle,
                 }),
                 changed: tokio::sync::Notify::new(),
@@ -179,7 +231,7 @@ impl DescriptionFacts {
     ///
     /// A command starting is also an event, with its program name for a summary. The repository the
     /// directory is in is read on a thread of its own.
-    pub fn note_command(&self, block: &RootCommandBlockParams) {
+    pub fn note_command(&self, block: &RootCommandBlockParams, shell: Option<u64>) {
         let directory = last_component(&block.cwd);
         let application = program_of(&block.command);
         let finished = block.finished();
@@ -190,14 +242,29 @@ impl DescriptionFacts {
                 DescriptionCompletion::Failed
             }
         });
-        let mut probe = None;
+        // A command that has ended leaves the shell at its prompt, where the directory it is in now
+        // is the one to describe: the block says where the command began, which after a `cd` is
+        // not it.
+        let shell = shell.filter(|_| finished);
+        let mut read = None;
         self.change(|state| {
+            state.blocks += 1;
             let mut moved = false;
-            if state.cwd.as_deref() != Some(block.cwd.as_str()) {
+            let moved_directory = state.cwd.as_deref() != Some(block.cwd.as_str());
+            if moved_directory {
                 state.cwd = Some(block.cwd.clone());
-                probe = Some(PathBuf::from(&block.cwd));
                 // A repository belongs to the directory it was read for.
                 moved |= state.record.repository.take().is_some();
+            }
+            // The directory is read at every ending as well as at every change: a branch can be
+            // switched in the directory the session is already in.
+            if moved_directory || finished {
+                read = Some(Read {
+                    epoch: state.epoch,
+                    block: state.blocks,
+                    directory: PathBuf::from(&block.cwd),
+                    shell,
+                });
             }
             if state.record.directory != directory {
                 state.record.directory = directory;
@@ -226,8 +293,8 @@ impl DescriptionFacts {
             }
             moved
         });
-        if let Some(directory) = probe {
-            self.read_repository(directory);
+        if let Some(read) = read {
+            self.read_directory(read);
         }
     }
 
@@ -272,9 +339,7 @@ impl DescriptionFacts {
             let mut state = self.state();
             state.private = true;
             state.generation = generation.get();
-            state.record = Record::default();
-            state.cwd = None;
-            state.revision += 1;
+            state.start_over();
         }
         self.shared.changed.notify_waiters();
     }
@@ -286,9 +351,7 @@ impl DescriptionFacts {
             let mut state = self.state();
             state.private = false;
             state.generation = generation.get();
-            state.record = Record::default();
-            state.cwd = None;
-            state.revision += 1;
+            state.start_over();
         }
         self.shared.changed.notify_waiters();
     }
@@ -318,13 +381,13 @@ impl DescriptionFacts {
         self.shared.changed.notified()
     }
 
-    /// Starts reading the repository above `directory`, or queues it behind the read that runs.
-    fn read_repository(&self, directory: PathBuf) {
+    /// Starts a read, or queues it behind the one that runs, replacing the one already waiting.
+    fn read_directory(&self, read: Read) {
         {
             let mut state = self.state();
             match &mut state.probe {
                 Probe::Running(waiting) => {
-                    *waiting = Some(directory);
+                    *waiting = Some(read);
                     return;
                 }
                 Probe::Idle => state.probe = Probe::Running(None),
@@ -333,27 +396,26 @@ impl DescriptionFacts {
         let facts = self.clone();
         let started = std::thread::Builder::new()
             .name("describe-repository".to_owned())
-            .spawn(move || facts.run_reads(directory));
+            .spawn(move || facts.run_reads(read));
         if started.is_err() {
-            // No thread: the facts go without a repository, and the next directory tries again.
+            // No thread: the facts go without it, and the next command tries again.
             self.state().probe = Probe::Idle;
         }
     }
 
-    /// Reads the directory it was given and then each one that was queued behind it.
-    fn run_reads(&self, mut directory: PathBuf) {
+    /// Does the read it was given and then each one that was queued behind it, applying what each
+    /// finds to the record it was asked for, and to no other.
+    fn run_reads(&self, mut read: Read) {
         loop {
-            let found = repository_above(&directory);
+            let found = (self.shared.reader)(&read);
             let next = {
                 let mut state = self.state();
-                // Applied only to the directory it was read for.
-                let apply =
-                    !state.private && state.cwd.as_deref() == Some(&*directory.to_string_lossy());
-                let moved = apply && state.record.repository != found;
-                if moved {
-                    state.record.repository = found;
-                    state.revision += 1;
-                }
+                // A read applies under the privacy transition it began in and the newest block it
+                // was asked for: a transition between the two, or a newer block, says what it found
+                // is about something else.
+                let current =
+                    !state.private && state.epoch == read.epoch && state.blocks == read.block;
+                let moved = current && state.apply_found(&found);
                 let next = match &mut state.probe {
                     Probe::Running(waiting) => waiting.take(),
                     Probe::Idle => None,
@@ -368,7 +430,7 @@ impl DescriptionFacts {
                 next
             };
             match next {
-                Some(next) => directory = next,
+                Some(next) => read = next,
                 None => return,
             }
         }
@@ -376,6 +438,38 @@ impl DescriptionFacts {
 }
 
 impl State {
+    /// Begins a record of its own at a privacy transition: nothing from before comes with it, and
+    /// no read that began before it applies to it.
+    fn start_over(&mut self) {
+        self.record = Record::default();
+        self.cwd = None;
+        self.revision += 1;
+        self.epoch += 1;
+        if let Probe::Running(waiting) = &mut self.probe {
+            *waiting = None;
+        }
+    }
+
+    /// Takes what a read found into the record, and says whether anything moved and the revision
+    /// with it.
+    fn apply_found(&mut self, found: &Found) -> bool {
+        let mut moved = false;
+        let directory = found.directory.to_string_lossy().into_owned();
+        if self.cwd.as_deref() != Some(directory.as_str()) {
+            self.record.directory = last_component(&directory);
+            self.cwd = Some(directory);
+            moved = true;
+        }
+        if self.record.repository != found.repository {
+            self.record.repository.clone_from(&found.repository);
+            moved = true;
+        }
+        if moved {
+            self.revision += 1;
+        }
+        moved
+    }
+
     fn facts(&self) -> FactsRecord {
         FactsRecord {
             revision: U64::new(self.revision),
@@ -435,22 +529,211 @@ fn last_component(path: &str) -> Option<String> {
         .and_then(clip)
 }
 
-/// The program a command line runs: its first word that is not a variable assignment, without the
-/// directory it was named by, and nothing of its arguments.
+/// The program a command line runs: its first word that is neither a variable assignment nor a
+/// redirection, without the directory it was named by, and nothing of its arguments.
+///
+/// The line is split with the shell's own quoting, so a quoted or escaped value in an assignment
+/// stays inside that assignment and is never read as the program. A line that cannot be read with
+/// certainty up to its program (a quote or a substitution that does not close, a program word that
+/// is itself an expansion or a group) names no program at all: a wrong name is a leak, a missing
+/// one is not. Nothing after the program is read.
 fn program_of(command: &str) -> Option<String> {
-    let word = command.split_whitespace().find(|word| {
-        // `NAME=value` sets a variable for the command that follows it.
-        !word
+    let mut skip_target = false;
+    for word in Words::of(command) {
+        let word = word?;
+        if skip_target {
+            skip_target = false;
+            continue;
+        }
+        if let Some(operator_only) = word.redirection() {
+            // `> file` names its target in the word after it.
+            skip_target = operator_only;
+            continue;
+        }
+        if word.assignment() {
+            continue;
+        }
+        if word.raw.contains(is_shell_syntax) {
+            return None;
+        }
+        let name = word.text.rsplit(['/', '\\']).next().unwrap_or(&word.text);
+        return clip(name);
+    }
+    None
+}
+
+/// One word of a command line: as it was typed, and as the shell reads it with its quotes removed.
+struct Word {
+    raw: String,
+    text: String,
+}
+
+impl Word {
+    /// Whether the word sets a variable for the command after it: `NAME=value`.
+    fn assignment(&self) -> bool {
+        self.raw
             .split_once('=')
             .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(is_variable_character))
-    })?;
-    let word = word.trim_matches(|character| matches!(character, '"' | '\''));
-    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
-    clip(name)
+    }
+
+    /// Whether the word is a redirection, and when it is, whether it is only the operator, so that
+    /// its target is the next word.
+    fn redirection(&self) -> Option<bool> {
+        let rest = self
+            .raw
+            .trim_start_matches(|character: char| character.is_ascii_digit());
+        let operator = |character: char| matches!(character, '<' | '>' | '&');
+        (rest.starts_with(['<', '>']) || rest.starts_with("&>")).then(|| rest.chars().all(operator))
+    }
+}
+
+/// The words of a command line, split as a shell does: single quotes keep everything, double
+/// quotes keep everything but a backslash before `"`, `\`, `$` or a backtick, and a backslash
+/// before whitespace or a quote keeps it in the word. A backslash before anything else stays,
+/// being a Windows path's separator. A word that cannot be read with certainty ends the sequence
+/// with `None`: a quote that does not close, or a substitution or group that could hide words.
+struct Words<'a> {
+    characters: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl<'a> Words<'a> {
+    fn of(command: &'a str) -> Self {
+        Self {
+            characters: command.chars().peekable(),
+        }
+    }
+
+    /// Reads up to the closing quote of a quoted part, adding what is inside to the word.
+    fn quoted(&mut self, quote: char, word: &mut Word) -> Option<()> {
+        word.raw.push(quote);
+        loop {
+            let inside = self.characters.next()?;
+            word.raw.push(inside);
+            if inside == quote {
+                return Some(());
+            }
+            if quote == '"' {
+                match inside {
+                    '`' => return None,
+                    '$' if matches!(self.characters.peek(), Some('(' | '{')) => return None,
+                    '\\' if matches!(self.characters.peek(), Some('"' | '\\' | '$' | '`')) => {
+                        let escaped = self.characters.next()?;
+                        word.raw.push(escaped);
+                        word.text.push(escaped);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            word.text.push(inside);
+        }
+    }
+}
+
+impl Iterator for Words<'_> {
+    type Item = Option<Word>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut word = Word {
+            raw: String::new(),
+            text: String::new(),
+        };
+        let mut open = false;
+        while let Some(character) = self.characters.peek().copied() {
+            if character.is_whitespace() {
+                if open {
+                    break;
+                }
+                self.characters.next();
+                continue;
+            }
+            self.characters.next();
+            open = true;
+            match character {
+                '\'' | '"' => {
+                    if self.quoted(character, &mut word).is_none() {
+                        return Some(None);
+                    }
+                }
+                '\\' => {
+                    word.raw.push(character);
+                    match self.characters.peek().copied() {
+                        Some(next) if next.is_whitespace() || matches!(next, '\'' | '"') => {
+                            self.characters.next();
+                            word.raw.push(next);
+                            word.text.push(next);
+                        }
+                        _ => word.text.push(character),
+                    }
+                }
+                '`' | '(' | ')' => return Some(None),
+                '$' if matches!(self.characters.peek(), Some('(' | '{')) => return Some(None),
+                _ => {
+                    word.raw.push(character);
+                    word.text.push(character);
+                }
+            }
+        }
+        open.then_some(Some(word))
+    }
+}
+
+/// A character that makes a word more than the name of a program.
+const fn is_shell_syntax(character: char) -> bool {
+    matches!(
+        character,
+        '$' | '`'
+            | '('
+            | ')'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '|'
+            | '&'
+            | ';'
+            | '*'
+            | '?'
+            | '['
+            | ']'
+            | '!'
+    )
 }
 
 const fn is_variable_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// Reads what the file system says of one read: the directory it names, and the repository above.
+fn read_from_disk(read: &Read) -> Found {
+    let directory = read
+        .shell
+        .and_then(shell_directory)
+        .unwrap_or_else(|| read.directory.clone());
+    Found {
+        repository: repository_above(&directory),
+        directory,
+    }
+}
+
+/// The directory a shell process is in, as the operating system keeps it, where this platform
+/// can say.
+#[cfg(target_os = "linux")]
+fn shell_directory(pid: u64) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// The directory a shell process is in, as the operating system keeps it, where this platform
+/// can say.
+#[cfg(target_os = "macos")]
+fn shell_directory(pid: u64) -> Option<PathBuf> {
+    crate::broker::commands::working_directory_path_of(pid)
+}
+
+/// No platform record of a shell's directory is read here: the block's own stands.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn shell_directory(_pid: u64) -> Option<PathBuf> {
+    None
 }
 
 /// Reads the repository a directory is inside: the directory that holds a `.git`, as its name,
@@ -596,11 +879,10 @@ mod tests {
             assert_eq!(program_of(line).as_deref(), program, "{line:?}");
         }
         let facts = facts();
-        facts.note_command(&block(
-            "TOKEN=hunter2 deploy --key abc",
-            "/home/a/work",
+        facts.note_command(
+            &block("TOKEN=hunter2 deploy --key abc", "/home/a/work", None),
             None,
-        ));
+        );
         let record = read(&facts);
         assert_eq!(record.application.0.as_deref(), Some("deploy"));
         let encoded = serde_json::to_string(&record).expect("facts encode");
@@ -610,12 +892,55 @@ mod tests {
         );
     }
 
+    /// A quoted or escaped assignment, a redirection and an operator never put a secret or an
+    /// argument where the program name belongs: the program is the first word that is neither an
+    /// assignment nor a redirection, found with the shell's own quoting, and is left out when the
+    /// line cannot be read with certainty.
+    #[test]
+    fn a_quoted_assignment_or_a_redirection_never_becomes_the_program() {
+        for (line, program) in [
+            ("TOKEN='first secret' cargo test", Some("cargo")),
+            ("TOKEN=\"first secret\" cargo test", Some("cargo")),
+            ("TOKEN=first\\ secret cargo test", Some("cargo")),
+            ("A='x y' B=\"p q\" C=r /usr/bin/make all", Some("make")),
+            ("NAME='it'\"'\"'s a secret' deploy", Some("deploy")),
+            ("> out.log cargo build", Some("cargo")),
+            (">out.log cargo build", Some("cargo")),
+            ("2>&1 cargo build", Some("cargo")),
+            ("2> err.log TOKEN='a b' cargo build", Some("cargo")),
+            ("\"/Applications/My App/run\" --flag", Some("run")),
+            // Uncertain: an unterminated quote, a substitution or a group that never closes, and a
+            // word that is itself an expansion say nothing certain about the program.
+            ("TOKEN='first secret cargo test", None),
+            ("TOKEN=\"first secret cargo test", None),
+            ("X=$(echo a b) cargo test", None),
+            ("X=$(echo a b cargo test", None),
+            ("$(pick-a-tool) --now", None),
+            ("`pick-a-tool` --now", None),
+            ("$TOOL --now", None),
+            ("(cd /x && run) --now", None),
+            ("TOKEN='only a secret'", None),
+        ] {
+            assert_eq!(program_of(line).as_deref(), program, "{line:?}");
+        }
+        let facts = facts();
+        facts.note_command(
+            &block("TOKEN='first secret' cargo test", "/home/a/work", None),
+            None,
+        );
+        let record = read(&facts);
+        assert_eq!(record.application.0.as_deref(), Some("cargo"));
+        assert_eq!(record.events[0].summary, "cargo");
+        let encoded = serde_json::to_string(&record).expect("facts encode");
+        assert!(!encoded.contains("secret"), "{encoded}");
+    }
+
     /// A command that has started has no completion, one that has ended has its own, and only
     /// the start is an event: the same command's end is not a second one.
     #[test]
     fn a_command_has_a_completion_only_once_it_has_ended_and_is_one_event() {
         let facts = facts();
-        facts.note_command(&block("cargo test", "/home/a/kalareach", None));
+        facts.note_command(&block("cargo test", "/home/a/kalareach", None), None);
         let started = read(&facts);
         assert_eq!(started.directory.0.as_deref(), Some("kalareach"));
         assert_eq!(started.completion.0, None);
@@ -626,13 +951,13 @@ mod tests {
         );
         assert_eq!(started.events[0].summary, "cargo");
 
-        facts.note_command(&block("cargo test", "/home/a/kalareach", Some(1)));
+        facts.note_command(&block("cargo test", "/home/a/kalareach", Some(1)), None);
         let ended = read(&facts);
         assert_eq!(ended.completion.0, Some(DescriptionCompletion::Failed));
         assert_eq!(ended.events.len(), 1, "the end is not a second event");
         assert!(ended.revision.get() > started.revision.get());
 
-        facts.note_command(&block("make", "/home/a/kalareach", None));
+        facts.note_command(&block("make", "/home/a/kalareach", None), None);
         assert_eq!(
             read(&facts).completion.0,
             None,
@@ -682,7 +1007,7 @@ mod tests {
         );
         let revision = facts.state().revision;
         facts.note_intent("while private");
-        facts.note_command(&block("ls", "/home/a/x", None));
+        facts.note_command(&block("ls", "/home/a/x", None), None);
         facts.note_event(DescriptionEventKind::TaskStarted, "while private");
         facts.note_thread(Some("while private"));
         let held = facts.state();
@@ -793,5 +1118,225 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("a directory outside");
         // The temporary directory sits inside no repository, so nothing is found above it either.
         assert_eq!(repository_above(&outside), None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Reads of the directory and the repository, stepped by the test
+    // -----------------------------------------------------------------------------------------
+
+    /// How long a test waits for a condition it is sure will come.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Waits until `condition` holds, and says what it waited for when it never does.
+    fn until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + WAIT;
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited {WAIT:?} for {what}, and it did not happen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Facts whose reads are the test's: each read announces itself on `entered` and waits for the
+    /// test to hand it what it finds.
+    struct Stepped {
+        facts: DescriptionFacts,
+        entered: std::sync::mpsc::Receiver<Read>,
+        hand_over: std::sync::mpsc::Sender<Found>,
+    }
+
+    impl Stepped {
+        fn new() -> Self {
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (hand_over, handed) = std::sync::mpsc::channel::<Found>();
+            let handed = Mutex::new(handed);
+            let reader: Reader = Arc::new(move |read: &Read| {
+                entered_tx
+                    .send(read.clone())
+                    .expect("the test is listening");
+                handed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv_timeout(WAIT)
+                    .expect("the test hands the read what it finds")
+            });
+            Self {
+                facts: DescriptionFacts::reading_with(false, PrivacyGeneration::new(0), reader),
+                entered,
+                hand_over,
+            }
+        }
+
+        /// Waits for the next read to begin, and returns what it was asked to read.
+        fn next_read(&self) -> Read {
+            self.entered
+                .recv_timeout(WAIT)
+                .expect("a read began within the wait")
+        }
+
+        fn hand_over(&self, directory: &str, repository: Option<(&str, Option<&str>)>) {
+            self.hand_over
+                .send(Found {
+                    directory: PathBuf::from(directory),
+                    repository: repository.map(|(name, branch)| Repository {
+                        name: name.to_owned(),
+                        branch: branch.map(str::to_owned),
+                    }),
+                })
+                .expect("the read is waiting");
+        }
+    }
+
+    /// A read that began before privacy mode was enabled never applies after it was disabled: what
+    /// it found is from before the transition, and the record it would join belongs to the
+    /// generation after it. It is refused when nothing new has been reported since, which is what
+    /// the privacy transition alone says, and when the next command names the same directory. The
+    /// read that began after the transition is the one that applies.
+    #[test]
+    fn a_read_that_began_before_a_privacy_transition_never_applies_after_it() {
+        // Nothing is reported after the transition: only the transition says the read is old.
+        let step = Stepped::new();
+        let facts = &step.facts;
+        facts.note_command(&block("make", "/w/app", None), None);
+        assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
+        facts.fence(PrivacyGeneration::new(1));
+        facts.release(PrivacyGeneration::new(2));
+        step.hand_over("/w/app", Some(("from-before", Some("main"))));
+        until("the read to be dealt with", || {
+            matches!(facts.state().probe, Probe::Idle)
+        });
+        let record = read_at(facts, 2);
+        assert_eq!(record.repository.0, None, "from before the transition");
+        assert_eq!(record.directory.0, None, "from before the transition");
+
+        // The next command names the same directory: the first read is refused, the second applies.
+        let step = Stepped::new();
+        let facts = &step.facts;
+        facts.note_command(&block("make", "/w/app", None), None);
+        assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
+        facts.fence(PrivacyGeneration::new(1));
+        facts.release(PrivacyGeneration::new(2));
+        facts.note_command(&block("make", "/w/app", None), None);
+
+        // The first read answers now, from before the transition. The second begins only once the
+        // first has been dealt with, so its beginning is the point to look from.
+        step.hand_over("/w/app", Some(("from-before", Some("main"))));
+        assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
+        assert_eq!(
+            read_at(facts, 2).repository.0,
+            None,
+            "what the first read found is from before the transition"
+        );
+
+        step.hand_over("/w/app", Some(("after", Some("main"))));
+        until("the read that began after the transition to apply", || {
+            read_at(facts, 2).repository.0.is_some()
+        });
+        assert_eq!(
+            read_at(facts, 2).repository.0.expect("a repository").name,
+            "after"
+        );
+    }
+
+    /// A read for an older command block never applies once a newer block has arrived: it would put
+    /// the directory the session has left back over the one it is in.
+    #[test]
+    fn a_read_for_an_older_block_is_refused_when_a_newer_block_has_arrived() {
+        let step = Stepped::new();
+        let facts = &step.facts;
+        facts.note_command(&block("ls", "/w/a", None), None);
+        assert_eq!(step.next_read().directory, PathBuf::from("/w/a"));
+        facts.note_command(&block("ls", "/w/b", Some(0)), None);
+
+        step.hand_over("/w/a", Some(("a", None)));
+        assert_eq!(step.next_read().directory, PathBuf::from("/w/b"));
+        let record = read(facts);
+        assert_eq!(record.directory.0.as_deref(), Some("b"));
+        assert_eq!(record.repository.0, None, "the first read was refused");
+
+        step.hand_over("/w/b", Some(("b", None)));
+        until("the newer read to apply", || {
+            read(facts).repository.0.is_some()
+        });
+        assert_eq!(read(facts).directory.0.as_deref(), Some("b"));
+    }
+
+    /// A command that ended in another directory than it began in is followed there: the block
+    /// says where it began, and the directory the shell is in now is read when the command has
+    /// ended, so nothing more has to be typed for the facts to be right. The control is a command
+    /// that has only begun, which is not followed anywhere.
+    #[test]
+    fn a_command_that_changed_directory_is_followed_to_where_the_shell_is_now() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let reader: Reader = Arc::new(move |read: &Read| {
+            entered_tx
+                .send(read.clone())
+                .expect("the test is listening");
+            Found {
+                directory: if read.shell == Some(7) {
+                    PathBuf::from("/w/new")
+                } else {
+                    read.directory.clone()
+                },
+                repository: None,
+            }
+        });
+        let facts = DescriptionFacts::reading_with(false, PrivacyGeneration::new(0), reader);
+
+        facts.note_command(&block("cd /w/new", "/w/old", None), Some(7));
+        let started = entered.recv_timeout(WAIT).expect("a read for the start");
+        assert_eq!(
+            started.shell, None,
+            "a command that has begun asks no shell"
+        );
+        until("the start's read to apply", || {
+            facts.state().record.directory.as_deref() == Some("old")
+        });
+
+        facts.note_command(&block("cd /w/new", "/w/old", Some(0)), Some(7));
+        let ended = entered.recv_timeout(WAIT).expect("a read for the end");
+        assert_eq!(
+            ended.shell,
+            Some(7),
+            "a command that has ended asks the shell"
+        );
+        until("the directory the shell is in now", || {
+            facts.state().record.directory.as_deref() == Some("new")
+        });
+        assert_eq!(read(&facts).directory.0.as_deref(), Some("new"));
+    }
+
+    /// The repository is read again when a command ends, not only when the directory changes: a
+    /// branch switched in place is the branch the facts name next.
+    #[test]
+    fn a_branch_switched_in_place_is_the_branch_the_facts_name_when_the_command_ends() {
+        let root = tempfile::tempdir().expect("a directory");
+        let repo = root.path().join("kalareach");
+        std::fs::create_dir_all(repo.join(".git")).expect("a git directory");
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").expect("a HEAD");
+        let cwd = repo.display().to_string();
+
+        let facts = facts();
+        facts.note_command(&block("git switch topic", &cwd, None), None);
+        facts.note_command(&block("git switch topic", &cwd, Some(0)), None);
+        until("the repository to be read", || {
+            read(&facts).repository.0.is_some()
+        });
+        assert_eq!(
+            read(&facts).repository.0.expect("a repository").branch.0,
+            Some("main".to_owned())
+        );
+
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/topic\n").expect("a new HEAD");
+        facts.note_command(&block("git status", &cwd, None), None);
+        facts.note_command(&block("git status", &cwd, Some(0)), None);
+        until("the branch the command left", || {
+            read(&facts)
+                .repository
+                .0
+                .is_some_and(|repository| repository.branch.0.as_deref() == Some("topic"))
+        });
     }
 }

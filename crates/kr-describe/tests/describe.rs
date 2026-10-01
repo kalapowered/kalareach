@@ -1091,7 +1091,8 @@ fn a_private_session_captures_no_context_at_all() {
             kind: kr_describe::context::SemanticEventKind::CommandAccepted,
             summary:
                 kr_describe::context::ProjectText::new("an earlier command").expect("a summary"),
-        }
+        },
+        at(0),
     ));
     service.fence().raise(session(1), PrivacyGeneration::new(1));
     assert_eq!(
@@ -1114,7 +1115,8 @@ fn a_private_session_captures_no_context_at_all() {
             kind: kr_describe::context::SemanticEventKind::CommandAccepted,
             summary:
                 kr_describe::context::ProjectText::new("a private command").expect("a summary"),
-        }
+        },
+        at(0),
     ));
 
     // The cleanup forgets what was captured before the fence, so nothing crosses the boundary.

@@ -123,10 +123,10 @@ fn only_a_meaningful_change_advances_the_revision() {
             directory: "kalareach".to_owned(),
             repository: None,
         },
-        ContextSignal::ForegroundApplication("nvim".to_owned()),
-        ContextSignal::SelectedThread("review".to_owned()),
+        ContextSignal::ForegroundApplication(Some("nvim".to_owned())),
+        ContextSignal::SelectedThread(Some("review".to_owned())),
         ContextSignal::TaskIntent("check the pairing flow".to_owned()),
-        ContextSignal::Completion(Completion::Succeeded),
+        ContextSignal::Completion(Some(Completion::Succeeded)),
     ];
     for signal in signals.clone() {
         assert_eq!(tracker.observe(signal, at(0)), Observed::Pending);
@@ -145,6 +145,59 @@ fn only_a_meaningful_change_advances_the_revision() {
         }
     );
     assert_eq!(tracker.settle(at(60_000)), Settled::NotYet);
+}
+
+/// KR-REQ-22.16: a fact the host no longer has is a change like any other. A completion cleared
+/// when work begins, a thread cleared when it ends and an application that is gone each advance
+/// the revision once and leave nothing of the old value; clearing what is already clear changes
+/// nothing, and a new event is a change that needs no other fact to move with it.
+#[test]
+fn clearing_a_fact_is_a_change_and_so_is_a_new_event() {
+    let mut tracker = ContextTracker::new(2_000);
+    let set = [
+        ContextSignal::ForegroundApplication(Some("cargo".to_owned())),
+        ContextSignal::SelectedThread(Some("review".to_owned())),
+        ContextSignal::Completion(Some(Completion::Failed)),
+    ];
+    for signal in set {
+        assert_eq!(tracker.observe(signal, at(0)), Observed::Pending);
+    }
+    assert!(matches!(
+        tracker.settle(at(2_000)),
+        Settled::Advanced { .. }
+    ));
+
+    let cleared = [
+        ContextSignal::ForegroundApplication(None),
+        ContextSignal::SelectedThread(None),
+        ContextSignal::Completion(None),
+    ];
+    for signal in cleared.clone() {
+        assert_eq!(tracker.observe(signal, at(3_000)), Observed::Pending);
+    }
+    let facts = tracker.facts();
+    assert_eq!(facts.application, None);
+    assert_eq!(tracker.thread(), None);
+    assert_eq!(tracker.completion(), None);
+    for signal in cleared {
+        assert_eq!(
+            tracker.observe(signal, at(3_100)),
+            Observed::Unchanged,
+            "clearing what is clear"
+        );
+    }
+    assert!(matches!(
+        tracker.settle(at(5_000)),
+        Settled::Advanced { .. }
+    ));
+
+    assert_eq!(tracker.settle(at(60_000)), Settled::NotYet);
+    assert_eq!(tracker.note_event(at(60_000)), Observed::Pending);
+    assert_eq!(tracker.settle(at(61_000)), Settled::NotYet, "debounced");
+    assert!(matches!(
+        tracker.settle(at(62_000)),
+        Settled::Advanced { .. }
+    ));
 }
 
 /// KR-REQ-22.16: rapid directory changes coalesce into one revision.

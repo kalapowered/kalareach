@@ -374,6 +374,32 @@ pub struct Applied {
 /// Returns [`ControllerError::Configuration`] when the document may not be edited, when the result
 /// does not validate, or when another writer moved the revision first.
 pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> Result<WrittenEdit> {
+    apply_standing(paths, change, limits, &|write| write())
+}
+
+/// The write an edit makes, handed to the admission that decides whether it may be made.
+pub type Write<'a> = &'a mut dyn FnMut() -> Result<()>;
+
+/// What decides whether an edit's write is made: it is given the write, and runs it or refuses.
+pub type Standing<'a> = &'a (dyn Fn(Write<'_>) -> Result<()> + Sync);
+
+/// [`apply`] for an edit made under an admission: `standing` runs the write, and decides whether it
+/// runs at all.
+///
+/// The admission is asked at the last moment, once the edit lock is held and the edit is read,
+/// validated and ready, and held until the write is done: whatever the edit waited for before that
+/// (another writer's lock, the document's own read) happened before the question, so an admission
+/// that lapsed during it is refused here with nothing written.
+///
+/// # Errors
+///
+/// As [`apply`], and whatever `standing` refuses with, in which case nothing was written.
+pub fn apply_standing(
+    paths: &EnvironmentPaths,
+    change: &Change,
+    limits: HardLimits,
+    standing: Standing<'_>,
+) -> Result<WrittenEdit> {
     // Held across the read, the edit and the replacement, and handed back to the caller so the
     // effects of the edit land before another writer can prepare one.
     let lock = kr_worker::config::lock(paths).map_err(ControllerError::Configuration)?;
@@ -386,7 +412,7 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> R
     if let Some(problem) = refused_ceiling(&edited.document.ceilings, limits) {
         return Err(ControllerError::Configuration(problem.render()));
     }
-    write(paths, &edited)?;
+    standing(&mut || write(paths, &edited))?;
     Ok(WrittenEdit {
         revision: edited.revision,
         effect: edited.effect,

@@ -119,14 +119,14 @@ pub enum ContextSignal {
         /// The repository it is inside, when it is inside one.
         repository: Option<RepositoryFacts>,
     },
-    /// The foreground application changed.
-    ForegroundApplication(String),
-    /// The selected thread changed.
-    SelectedThread(String),
+    /// The foreground application changed, or there is none now.
+    ForegroundApplication(Option<String>),
+    /// The selected thread changed, or the session has none now.
+    SelectedThread(Option<String>),
     /// The task intent changed: what this session has been asked to do.
     TaskIntent(String),
-    /// Work completed, or failed, as the host recorded it.
-    Completion(Completion),
+    /// Work completed, or failed, as the host recorded it, or nothing has since the last work began.
+    Completion(Option<Completion>),
 }
 
 impl ContextSignal {
@@ -714,16 +714,16 @@ impl ContextTracker {
                 changed
             }
             ContextSignal::ForegroundApplication(application) => {
-                let changed = self.application.as_deref() != Some(application.as_str());
+                let changed = self.application != application;
                 if changed {
-                    self.application = Some(application);
+                    self.application = application;
                 }
                 changed
             }
             ContextSignal::SelectedThread(thread) => {
-                let changed = self.thread.as_deref() != Some(thread.as_str());
+                let changed = self.thread != thread;
                 if changed {
-                    self.thread = Some(thread);
+                    self.thread = thread;
                 }
                 changed
             }
@@ -739,9 +739,9 @@ impl ContextTracker {
                 changed
             }
             ContextSignal::Completion(completion) => {
-                let changed = self.completion != Some(completion);
+                let changed = self.completion != completion;
                 if changed {
-                    self.completion = Some(completion);
+                    self.completion = completion;
                 }
                 changed
             }
@@ -749,6 +749,16 @@ impl ContextTracker {
         if !changed {
             return Observed::Unchanged;
         }
+        self.changed(now)
+    }
+
+    /// Records that a semantic event arrived: a change of its own, which starts the debounce or
+    /// joins the one running, whether or not any other fact moved with it.
+    pub fn note_event(&mut self, now: Reading) -> Observed {
+        self.changed(now)
+    }
+
+    fn changed(&mut self, now: Reading) -> Observed {
         self.pending += 1;
         // The window starts at the *first* pending change and is never extended. A session that
         // changes continuously therefore settles every debounce rather than never, which is what

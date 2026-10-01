@@ -95,7 +95,7 @@ pub struct DescribeModule {
     pub(crate) pauses: Pauses,
 }
 
-/// The places in a read or a rename that this crate's own tests stop it at.
+/// The places in a read, a rename or a setting that this crate's own tests stop it at.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct Pauses {
@@ -105,6 +105,9 @@ pub(crate) struct Pauses {
     pub(crate) before_reading: crate::attention::Pause,
     /// With the store and the privacy state held, before the answer is decided.
     pub(crate) before_decision: crate::attention::Pause,
+    /// A configuration change, holding the edit lock with its edit ready, about to ask whether the
+    /// admission still stands.
+    pub(crate) before_configuration: crate::attention::Pause,
 }
 
 /// What one session is shown as.
@@ -593,10 +596,18 @@ impl crate::service::Controller {
                     .params
                     .to_typed()
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                self.apply_configuration(
+                // Admitted when the action was accepted, and asked again at the write: the
+                // configuration's own waits are behind it by then, and the registration is held
+                // standing until the document is written.
+                self.apply_configuration_standing(
                     &kr_protocol::hostinfo::configuration::Change::Descriptions {
                         enabled: params.enabled.0,
                         on_battery: params.on_battery.0,
+                    },
+                    &|write| {
+                        #[cfg(test)]
+                        self.descriptions.pauses.before_configuration.wait();
+                        self.under_registration(&carried, write)?
                     },
                 )
                 .await?;
@@ -795,24 +806,22 @@ impl PrivacySubsystem for DescriptionsPrivacy<'_> {
         // The rows go at once, through the module's own store. What the host holds in memory, its
         // queue and its contexts, goes with a purge it is asked to make and has a bound to make
         // it in; a host that has not finished is not a removal that has, and the caller asks
-        // again.
-        let removed = self
-            .module
-            .store()
-            .remove_generated()
-            .map(|removed| Removed {
-                bytes: removed.bytes,
-                records: removed.records,
-            })
-            .map_err(|error| {
-                Unavailable::new(format!(
-                    "generated descriptions could not be removed: {error}"
-                ))
-            })?;
-        if let Some(host) = self.module.host() {
-            host.purge()?;
-        }
-        Ok(removed)
+        // again. The purge is asked for whatever the store says: a queue that stays while a row
+        // cannot be removed would keep a load running for a session that is private, so the
+        // memory is forgotten whatever the store says, and the refused removal stays owed for the
+        // next try.
+        let removed = self.module.store().remove_generated();
+        let purged = self.module.host().map_or(Ok(()), |host| host.purge());
+        let removed = removed.map_err(|error| {
+            Unavailable::new(format!(
+                "generated descriptions could not be removed: {error}"
+            ))
+        })?;
+        purged?;
+        Ok(Removed {
+            bytes: removed.bytes,
+            records: removed.records,
+        })
     }
 
     fn outstanding(&self) -> std::result::Result<u64, Unavailable> {

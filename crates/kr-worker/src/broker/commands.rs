@@ -1621,6 +1621,17 @@ fn working_directory_of(pid: u64) -> Option<kr_transfer::authority::ObjectIdenti
     })
 }
 
+/// Returns the path of the directory a process works in, as the kernel names it now.
+#[cfg(target_os = "macos")]
+pub(crate) fn working_directory_path_of(pid: u64) -> Option<std::path::PathBuf> {
+    let pid = i32::try_from(pid).ok()?;
+    let info: WorkingDirectories = libproc::proc_pid::pidinfo(pid, 0).ok()?;
+    let path = &info.current.path;
+    let end = path.iter().position(|byte| *byte == 0)?;
+    let text = std::str::from_utf8(&path[..end]).ok()?;
+    (!text.is_empty()).then(|| std::path::PathBuf::from(text))
+}
+
 /// No platform record of a process's working directory is read here, so none is granted.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const fn working_directory_of(_pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {

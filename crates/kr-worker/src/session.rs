@@ -1059,7 +1059,8 @@ impl Session {
     fn record_command_block(&mut self, block: kr_protocol::root::RootCommandBlockParams) {
         // The place a command's directory, program and ending are decided, and the first thing
         // done with it: the description facts take the program name and never the command line.
-        self.description_facts.note_command(&block);
+        let shell = self.root_identity().map(|identity| identity.pid.get());
+        self.description_facts.note_command(&block, shell);
         if let Some(existing) = self
             .command_blocks
             .iter_mut()
