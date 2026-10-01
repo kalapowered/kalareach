@@ -79,8 +79,14 @@ struct Helper {
 impl Helper {
     /// Starts `kr bridge --stdio` against the environment tree given.
     fn start(tree: &kr_ipc::testing::TempHost) -> Self {
+        Self::start_with(tree, &[])
+    }
+
+    /// Starts `kr bridge --stdio` against the tree given, with these variables as well.
+    fn start_with(tree: &kr_ipc::testing::TempHost, extra: &[(&str, &str)]) -> Self {
         let mut child = Command::new(command_binary())
             .args(["bridge", "--stdio"])
+            .envs(extra.iter().copied())
             // The tree is the destination environment. Nothing else about this process's
             // environment reaches the helper's authority: these two say where the sockets are.
             .env(
@@ -156,13 +162,18 @@ fn read_exact(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<()> 
 }
 
 fn hello(ingress: ActorIngress) -> BridgeFrame {
+    hello_to(ingress, false, BridgeTarget::Controller)
+}
+
+fn hello_to(ingress: ActorIngress, start: bool, target: BridgeTarget) -> BridgeFrame {
     BridgeFrame::Hello(Box::new(BridgeHello {
         protocol_version: PROTOCOL_VERSION,
         build_id: BuildId::new("kr/test").expect("a build"),
         origin_environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
         origin_ingress: ingress,
         already_bridged: false,
-        target: BridgeTarget::Controller,
+        start,
+        target,
     }))
 }
 
@@ -174,6 +185,22 @@ async fn stub_controller(
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     answer: std::result::Result<ParamsValue, ProtocolError>,
+) -> tokio::task::JoinHandle<()> {
+    stub_controller_seeing(
+        endpoint,
+        environment_id,
+        answer,
+        u64::from(kr_ipc::paths::current_uid()),
+    )
+    .await
+}
+
+/// [`stub_controller`], naming the user it says it authenticated the caller as.
+async fn stub_controller_seeing(
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    answer: std::result::Result<ParamsValue, ProtocolError>,
+    authenticated_uid: u64,
 ) -> tokio::task::JoinHandle<()> {
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the stub endpoint");
     tokio::spawn(async move {
@@ -191,8 +218,9 @@ async fn stub_controller(
             connection_id,
             environment_id,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            // The helper checks that the daemon it reached authenticated it as the user it runs as.
             peer: LocalPeer {
-                uid: U64::new(0),
+                uid: U64::new(authenticated_uid),
                 gid: U64::new(0),
                 pid: Nullable::null(),
             },
@@ -205,7 +233,9 @@ async fn stub_controller(
             },
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
-            build: None,
+            build: Some(kr_protocol::local::LocalBuild::this(
+                BuildId::new("kr-controller/test").expect("a build"),
+            )),
         };
         if writer
             .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
@@ -467,6 +497,7 @@ fn opening_against(
             origin_environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
             origin_ingress: ActorIngress::LocalIpc,
             already_bridged: false,
+            start: false,
             target,
         },
     }
@@ -744,6 +775,7 @@ async fn a_closed_session_target_returns_session_closed_when_targeted_by_bridge(
         origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
         origin_ingress: ActorIngress::LocalIpc,
         already_bridged: false,
+        start: false,
         target: BridgeTarget::Session {
             session_id: closed_session_id,
         },
@@ -792,6 +824,7 @@ async fn a_journal_left_behind_by_a_live_session_is_not_read_as_a_closure() {
         origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
         origin_ingress: ActorIngress::LocalIpc,
         already_bridged: false,
+        start: false,
         target: BridgeTarget::Session { session_id },
     })));
     let (code, diagnostics) = helper.finish();
@@ -829,4 +862,165 @@ fn a_helper_exits_without_hanging_when_input_remains_open_after_refusal() {
         .expect("the helper exited promptly without waiting for stdin to close");
     assert!(!status.success());
     let _ = waiter.join();
+}
+
+/// The user this process runs as, by the account's own name.
+fn own_account() -> String {
+    let named = Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .expect("id runs");
+    String::from_utf8(named.stdout)
+        .expect("a name")
+        .trim()
+        .to_owned()
+}
+
+/// KR-REQ-03.14, 03.15: what the destination says it is, and where a session created through this
+/// bridge starts, come from the helper's own environment inside it and not from the invoking host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_acknowledgement_carries_the_destinations_own_account_base_and_build() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(ParamsValue::empty())).await;
+    let mut helper = Helper::start_with(
+        &tree,
+        &[
+            ("HOME", "/home/destination-user"),
+            ("LANG", "en_ZA.UTF-8"),
+            // Variables the person who started the helper has set, which are not the destination's
+            // account and which a create must never carry from here to a shell there.
+            ("USER", "name-the-caller-chose"),
+            ("LOGNAME", "name-the-caller-chose"),
+            ("AWS_SECRET_ACCESS_KEY", "a-credential"),
+        ],
+    );
+    helper.write(&hello(ActorIngress::LocalIpc));
+    let BridgeFrame::HelloAck(acknowledgement) = helper.read() else {
+        panic!("expected an acknowledgement");
+    };
+    assert_eq!(acknowledgement.base.home, "/home/destination-user");
+    let names: Vec<&str> = acknowledgement
+        .base
+        .variables
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"HOME") && names.contains(&"LANG"),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .all(|name| { kr_protocol::identity::DESTINATION_BASE_VARIABLES.contains(name) }),
+        "only what the protocol allows is offered: {names:?}"
+    );
+    assert!(
+        !names.contains(&"AWS_SECRET_ACCESS_KEY"),
+        "a credential in the helper's environment is not offered: {names:?}"
+    );
+    // The account is the one the operating system has for this user, not a variable.
+    assert_eq!(acknowledgement.os_user, own_account());
+    assert_ne!(acknowledgement.os_user, "name-the-caller-chose");
+    // The destination's own build and protocol version, as its daemon stated them.
+    assert_eq!(
+        acknowledgement.build,
+        Some(kr_protocol::local::LocalBuild::this(
+            BuildId::new("kr-controller/test").expect("a build")
+        ))
+    );
+    drop(helper.finish());
+    stub.abort();
+}
+
+/// KR-REQ-03.13: a connection says hello once. A second hello carried over an open bridge could
+/// admit the connection again under something else, so it is refused and not carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_hello_is_not_carried_over_an_open_bridge() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(ParamsValue::empty())).await;
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    assert!(matches!(helper.read(), BridgeFrame::HelloAck(_)));
+    helper.write(&BridgeFrame::Control(Box::new(ControlFrame::Hello(
+        kr_protocol::local::LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: BuildId::new("kr/test").expect("a build"),
+            client: kr_protocol::local::LocalClientKind::Cli,
+            capabilities: CanonicalSet::new(),
+            max_receive: ReceiveLimits::default(),
+        },
+    ))));
+    match helper.read() {
+        BridgeFrame::Refused(error) => assert_eq!(error.code, ErrorCode::PermissionDenied),
+        other => panic!("a second hello is refused, not carried: {other:?}"),
+    }
+    drop(helper.finish());
+    stub.abort();
+}
+
+/// KR-REQ-25.26: a socket forwarded from somewhere else is authenticated as whoever forwarded it,
+/// so a daemon that did not see this helper's own user is not this environment's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_that_did_not_authenticate_the_helper_as_its_own_user_is_refused() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let stub = stub_controller_seeing(
+        endpoint,
+        tree.environment_id(),
+        Ok(ParamsValue::empty()),
+        u64::from(kr_ipc::paths::current_uid()) + 1,
+    )
+    .await;
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    match helper.read() {
+        BridgeFrame::Refused(error) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(
+                error.message.contains("not this environment's own"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("a daemon that saw another user is refused: {other:?}"),
+    }
+    drop(helper.finish());
+    stub.abort();
+}
+
+/// KR-REQ-03.14: an opening that may not start anything and finds no daemon says so in a frame. The
+/// invoker that read only the end of the stream could name nothing.
+#[test]
+fn a_destination_with_no_daemon_says_so_in_a_frame_when_nothing_may_be_started() {
+    let tree = kr_ipc::testing::TempHost::create();
+    for target in [
+        BridgeTarget::Controller,
+        BridgeTarget::Session {
+            session_id: SessionId::new(kr_ipc::new_uuid()),
+        },
+    ] {
+        let mut helper = Helper::start(&tree);
+        helper.write(&hello_to(ActorIngress::LocalIpc, false, target));
+        match helper.read() {
+            BridgeFrame::Refused(error) => {
+                assert_ne!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+                assert!(!error.message.is_empty());
+            }
+            other => panic!("expected a refusal naming what is missing, got {other:?}"),
+        }
+        let (code, _) = helper.finish();
+        assert_ne!(code, Some(0));
+    }
 }

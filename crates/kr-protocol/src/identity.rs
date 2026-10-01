@@ -524,6 +524,14 @@ pub struct BridgeHello {
     /// Section 3 puts a federated proxy outside version 1, so a request crosses at most one
     /// bridge. A second hop is refused rather than chained.
     pub already_bridged: bool,
+    /// Whether this invocation may start what it needs inside the destination.
+    ///
+    /// Section 3 leaves starting an environment to refresh, create and attach, and a listing, an
+    /// enrolment or a verification starts nothing. A create or an attach says `true`, and the
+    /// helper then reaches the destination's control daemon through that environment's own
+    /// configured startup when none is running. Everything else says `false`, and a destination
+    /// with no daemon answers that it has none.
+    pub start: bool,
     /// What to reach inside the destination environment.
     pub target: BridgeTarget,
 }
@@ -548,6 +556,88 @@ pub struct BridgeHelloAck {
     pub max_frame_len: U64,
     /// The first action window of this connection, issued by the destination.
     pub action_window: ActionWindow,
+    /// The build of the process the helper reached, stated as that process stated it.
+    ///
+    /// An invoker refuses a destination whose protocol version does not share its compatibility
+    /// level before it sends a request, because the frames that follow are closed schemas. A
+    /// process of a build before this member states none, and is refused the same way.
+    ///
+    /// Remove the default and the omission once no process of a build before this member can
+    /// still be running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<crate::local::LocalBuild>,
+    /// The destination's own starting point for a session created through this bridge.
+    pub base: DestinationBase,
+}
+
+/// The variables a destination offers as the base of a session created through a bridge.
+///
+/// The names an invoker will take from a destination, and no others: what a create sends in its
+/// snapshot becomes the shell's whole environment, and nothing of the invoking host's belongs in
+/// it.
+pub const DESTINATION_BASE_VARIABLES: &[&str] = &[
+    "HOME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_TIME",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TZ",
+    "USER",
+];
+
+/// The most bytes one offered variable's value may hold.
+pub const DESTINATION_BASE_VALUE_LIMIT: usize = 8 * 1024;
+
+/// Where a session created through a bridge starts, and what it starts with, as the destination's
+/// own helper states it.
+///
+/// A person creating a session from another environment has no working directory or variables of
+/// the destination to send: the invoking host's mean nothing there. The helper runs as the
+/// destination's user inside the destination, so what it reads of its own environment is what a
+/// `kr new` run there would have sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationBase {
+    /// The destination user's home directory, where a session starts unless it is told otherwise.
+    pub home: String,
+    /// The helper's own values of [`DESTINATION_BASE_VARIABLES`], in that order, where it has them.
+    pub variables: Vec<crate::session::EnvironmentVariable>,
+}
+
+impl DestinationBase {
+    /// Checks what a destination offered before an invoker builds a create from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason it is not a base this protocol allows: a home that is not an
+    /// absolute path of the destination, a variable outside [`DESTINATION_BASE_VARIABLES`], a name
+    /// offered twice, or a value past [`DESTINATION_BASE_VALUE_LIMIT`].
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.home.is_empty() || !helper_path_is_absolute(&self.home) {
+            return Err("the destination's home directory is not an absolute path");
+        }
+        if self.home.len() > DESTINATION_BASE_VALUE_LIMIT {
+            return Err("the destination's home directory is longer than a variable may be");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for variable in &self.variables {
+            if !DESTINATION_BASE_VARIABLES.contains(&variable.name.as_str()) {
+                return Err("the destination offered a variable this protocol does not take");
+            }
+            if !seen.insert(variable.name.as_str()) {
+                return Err("the destination offered one variable twice");
+            }
+            if variable.value.len() > DESTINATION_BASE_VALUE_LIMIT {
+                return Err("the destination offered a value longer than a variable may be");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One frame on a bridge's standard input or output.

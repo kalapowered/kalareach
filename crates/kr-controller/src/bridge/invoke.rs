@@ -30,14 +30,16 @@
 //! a large frame, and an oversized frame ends the bridge rather than being truncated.
 
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
-use kr_protocol::envelope::{ControlFrame, MutationRequest, Request, Response};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request, Response};
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
-use kr_protocol::hello::ProtocolVersion;
+use kr_protocol::hello::{ActionWindow, PACKAGE_VERSION, ProtocolVersion};
 use kr_protocol::identity::EnvironmentEnrolment;
 use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeHelloAck, BridgeTarget};
 use kr_protocol::ids::{BuildId, EnvironmentId, RequestId};
-use kr_protocol::local::LocalRole;
+use kr_protocol::local::{LocalBuild, LocalRole};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bridge::launch::{self, BridgeCommand, LaunchError};
@@ -48,6 +50,30 @@ use crate::bridge::launch::{self, BridgeCommand, LaunchError};
 /// as long as it stayed silent. Every wait below is bounded by this, and the helper is ended with
 /// the bridge, so a destination that goes quiet costs one refusal rather than a stuck refresh.
 pub const SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long this host waits for the first acknowledgement of an opening that may start what it
+/// needs.
+///
+/// Starting a stopped distribution and then the control daemon inside it takes longer than a
+/// destination that is already serving: a distribution's boot, then the destination's own start
+/// bound for its daemon. The wait is for something this host asked to be started, so it is longer
+/// than [`SILENCE_LIMIT`] and is still a bound.
+pub const START_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long this host waits for the answer to one mutation.
+///
+/// A create waits for its worker for up to thirty seconds inside the destination's daemon, which
+/// says nothing until it has the answer. This is the bound the network door puts on the same wait.
+pub const MUTATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long an attached stream may go without any frame at all, a keepalive included.
+///
+/// The destination's daemon and workers send a keepalive every few seconds, so a stream that says
+/// nothing for this long is not an idle session but a frozen bridge, and it ends.
+pub const STREAM_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How much of a helper's standard error is kept, from the end.
+const DIAGNOSTIC_TAIL: usize = 4096;
 
 /// How long this host waits for a helper to go once it has killed it.
 ///
@@ -125,6 +151,17 @@ pub enum Refusal {
         /// How long it was given.
         waited: std::time::Duration,
     },
+    /// The destination's build does not share this host's compatibility level, so the frames that
+    /// follow could not be read by one side.
+    Level {
+        /// The build the destination stated, or none when it is of a build before the statement.
+        destination: Option<LocalBuild>,
+    },
+    /// The destination sent more than this host will hold for a caller that has not read it.
+    Backlog {
+        /// The bound, in bytes.
+        limit: usize,
+    },
     /// A helper this host started could not be ended, and may still be running.
     ///
     /// Section 7's supervision asks for what survived to be named rather than claimed ended. This
@@ -191,6 +228,31 @@ impl core::fmt::Display for Refusal {
                 "the destination said nothing for {} seconds",
                 waited.as_secs()
             ),
+            Self::Level { destination } => match destination {
+                Some(build) => write!(
+                    formatter,
+                    "the destination runs {} with protocol {}.{}.{} and this host speaks protocol \
+                     {}.{}.{}: update kr in the destination or here so both are of one release",
+                    build.build_id,
+                    build.protocol_version.major,
+                    build.protocol_version.minor,
+                    build.protocol_version.patch,
+                    PACKAGE_VERSION.major,
+                    PACKAGE_VERSION.minor,
+                    PACKAGE_VERSION.patch,
+                ),
+                None => write!(
+                    formatter,
+                    "the destination is of a build that states no protocol version, and this host \
+                     speaks protocol {}.{}.{}: update kr in the destination",
+                    PACKAGE_VERSION.major, PACKAGE_VERSION.minor, PACKAGE_VERSION.patch,
+                ),
+            },
+            Self::Backlog { limit } => write!(
+                formatter,
+                "the destination sent more than {limit} bytes this host had not yet been asked \
+                 for, so the bridge was ended"
+            ),
             Self::Unkillable {
                 program,
                 pid,
@@ -237,6 +299,8 @@ impl From<Refusal> for crate::error::ControllerError {
             | Refusal::ProtocolMajor { .. }
             | Refusal::WrongRole { .. }
             | Refusal::Silent { .. }
+            | Refusal::Level { .. }
+            | Refusal::Backlog { .. }
             | Refusal::Unkillable { .. } => Self::supervision(refusal.to_string()),
         }
     }
@@ -266,6 +330,58 @@ pub struct Invocation {
     stdout: tokio::process::ChildStdout,
     /// What the destination acknowledged: its identity, its user, its role and its bounds.
     acknowledgement: BridgeHelloAck,
+    /// What the helper wrote to its standard error, from the end.
+    diagnostics: Diagnostics,
+}
+
+/// The end of what a helper wrote to its standard error.
+///
+/// Standard error is diagnostic output that belongs to whoever ran the command, and a helper that
+/// writes a line there while a terminal shows a projection of a session would damage the screen it
+/// is describing. So it is read here, kept to its last [`DIAGNOSTIC_TAIL`] bytes, and left for the
+/// caller to say once it is able to.
+#[derive(Clone, Debug, Default)]
+pub struct Diagnostics(Arc<Mutex<DiagnosticTail>>);
+
+#[derive(Debug, Default)]
+struct DiagnosticTail {
+    /// The last bytes written, at most [`DIAGNOSTIC_TAIL`] of them.
+    kept: Vec<u8>,
+    /// How many bytes were written in all.
+    total: u64,
+}
+
+impl Diagnostics {
+    /// How many bytes the helper has written to its standard error.
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).total
+    }
+
+    fn keep(&self, bytes: &[u8]) {
+        let mut tail = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        tail.total = tail.total.saturating_add(bytes.len() as u64);
+        tail.kept.extend_from_slice(bytes);
+        let excess = tail.kept.len().saturating_sub(DIAGNOSTIC_TAIL);
+        if excess > 0 {
+            tail.kept.drain(..excess);
+        }
+    }
+}
+
+/// Reads a helper's standard error until it ends, so a helper that writes a great deal never
+/// blocks on a full pipe.
+fn drain(stderr: tokio::process::ChildStderr, into: Diagnostics) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stderr.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => into.keep(&buffer[..read]),
+            }
+        }
+    })
 }
 
 impl Opening {
@@ -281,7 +397,7 @@ impl Opening {
     /// failing, a frame this host cannot read, a protocol major, a role, an identity that is not
     /// the enrolled one, or the destination's own refusal, including a closed session.
     pub async fn launch(self) -> Result<Invocation, Refusal> {
-        let (child, stdin, stdout, acknowledgement) =
+        let (child, stdin, stdout, acknowledgement, diagnostics) =
             start_and_acknowledge(&self.command, &self.hello).await?;
         // The enrolment is a record of one installation. An environment that answers with another
         // identity is another installation, whatever name it was reached by: a distribution
@@ -298,6 +414,7 @@ impl Opening {
             stdin,
             stdout,
             acknowledgement,
+            diagnostics,
         })
     }
 }
@@ -316,7 +433,8 @@ pub async fn discover(
     command: &BridgeCommand,
     hello: &BridgeHello,
 ) -> Result<BridgeHelloAck, Refusal> {
-    let (child, stdin, stdout, acknowledgement) = start_and_acknowledge(command, hello).await?;
+    let (child, stdin, stdout, acknowledgement, _diagnostics) =
+        start_and_acknowledge(command, hello).await?;
     drop(stdin);
     drop(stdout);
     // Discovery carries no request, so the helper is ended as soon as it has answered, and waited
@@ -377,23 +495,32 @@ async fn start_and_acknowledge(
         tokio::process::ChildStdin,
         tokio::process::ChildStdout,
         BridgeHelloAck,
+        Diagnostics,
     ),
     Refusal,
 > {
-    let mut child = tokio::process::Command::new(&command.program)
+    let mut process = tokio::process::Command::new(&command.program);
+    process
         .args(&command.arguments)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        // Section 3 keeps standard error diagnostic. It belongs to whoever ran the command.
-        .stderr(std::process::Stdio::inherit())
+        // Section 3 keeps standard error diagnostic. It is read here and kept to its end, so it
+        // never reaches a terminal this host is showing something else on.
+        .stderr(std::process::Stdio::piped())
         // A handshake this host refuses ends the helper with it rather than leaving a distribution
         // or a container process running behind a failed connection.
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| Refusal::NotStarted {
-            program: command.program.clone(),
-            detail: error.to_string(),
-        })?;
+        .kill_on_drop(true);
+    // A console's interrupt goes to every process attached to it. The helper has its own group, so
+    // an interrupt aimed at the person's command does not also end the bridge it is using.
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        process.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = process.spawn().map_err(|error| Refusal::NotStarted {
+        program: command.program.clone(),
+        detail: error.to_string(),
+    })?;
 
     let mut stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
         program: command.program.clone(),
@@ -403,9 +530,34 @@ async fn start_and_acknowledge(
         program: command.program.clone(),
         detail: "its standard output is not a pipe".to_owned(),
     })?;
+    let diagnostics = Diagnostics::default();
+    if let Some(stderr) = child.stderr.take() {
+        // The reader ends with the helper's standard error, which closes when the helper does.
+        drop(drain(stderr, diagnostics.clone()));
+    }
 
     write_frame(&mut stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
-    let acknowledgement = match read_frame(&mut stdout).await? {
+    // A helper that was asked to start what it needs is waited for as long as that takes.
+    let limit = if hello.start {
+        START_LIMIT
+    } else {
+        SILENCE_LIMIT
+    };
+    let opening = read_frame_within(&mut stdout, limit)
+        .await
+        .map_err(|refusal| match refusal {
+            // The first frame is what a helper of another release, or a login that wrote to
+            // standard output before it, gets wrong.
+            Refusal::Unreadable { detail } => Refusal::Unreadable {
+                detail: format!(
+                    "{detail}; the helper may be of another release, or the login it runs under \
+                     may write to standard output"
+                ),
+            },
+            other => other,
+        })?
+        .0;
+    let acknowledgement = match opening {
         BridgeFrame::HelloAck(acknowledgement) => *acknowledgement,
         BridgeFrame::Refused(error) => {
             return Err(
@@ -426,6 +578,23 @@ async fn start_and_acknowledge(
             invoker,
         });
     }
+    // The frames that follow are closed schemas, and below 1.0.0 the package's minor number is the
+    // level they are written at. A destination of another level is refused before a request is
+    // sent, and so is one that states none.
+    match acknowledgement.build.as_ref() {
+        Some(build) if build.protocol_version.shares_frames_with(PACKAGE_VERSION) => {}
+        stated => {
+            return Err(Refusal::Level {
+                destination: stated.cloned(),
+            });
+        }
+    }
+    acknowledgement
+        .base
+        .validate()
+        .map_err(|detail| Refusal::Unreadable {
+            detail: detail.to_owned(),
+        })?;
     let expected = match hello.target {
         BridgeTarget::Controller => LocalRole::Controller,
         BridgeTarget::Session { .. } => LocalRole::Worker,
@@ -436,7 +605,7 @@ async fn start_and_acknowledge(
             answered: acknowledgement.role,
         });
     }
-    Ok((child, stdin, stdout, acknowledgement))
+    Ok((child, stdin, stdout, acknowledgement, diagnostics))
 }
 
 impl Invocation {
@@ -458,6 +627,7 @@ impl Invocation {
         self.exchange(
             BridgeFrame::Control(Box::new(ControlFrame::Request(request))),
             request_id,
+            SILENCE_LIMIT,
         )
         .await
     }
@@ -469,9 +639,12 @@ impl Invocation {
     /// As [`Self::request`].
     pub async fn mutate(&mut self, mutation: MutationRequest) -> Result<Response, Refusal> {
         let request_id = mutation.request_id;
+        // A mutation can be the creation of a session, which the destination's daemon does not
+        // answer, or say anything about, until its worker is up.
         self.exchange(
             BridgeFrame::Control(Box::new(ControlFrame::Mutation(Box::new(mutation)))),
             request_id,
+            MUTATION_LIMIT,
         )
         .await
     }
@@ -517,10 +690,11 @@ impl Invocation {
         &mut self,
         frame: BridgeFrame,
         request_id: RequestId,
+        limit: std::time::Duration,
     ) -> Result<Response, Refusal> {
         write_frame(&mut self.stdin, &frame).await?;
         loop {
-            match read_frame(&mut self.stdout).await? {
+            match read_frame_within(&mut self.stdout, limit).await?.0 {
                 BridgeFrame::Control(carried) => match *carried {
                     ControlFrame::Response(response) if response.request_id == request_id => {
                         return Ok(response);
@@ -537,6 +711,309 @@ impl Invocation {
                     );
                 }
                 _ => return Err(Refusal::NotAnAcknowledgement),
+            }
+        }
+    }
+}
+
+/// What the reader of a stream hands to the caller of it.
+#[derive(Debug)]
+struct Pending {
+    /// The frames that have arrived and not been taken, oldest first, each with what it occupied.
+    frames: VecDeque<(ControlFrame, usize)>,
+    /// What those frames occupy together.
+    bytes: usize,
+    /// The action window the destination last issued, which a renewal replaces.
+    window: ActionWindow,
+    /// When the destination last sent anything at all, a keepalive included.
+    last_heard: tokio::time::Instant,
+    /// How the stream ended, once it has. What arrived before the end is still delivered first.
+    ended: Option<Refusal>,
+}
+
+/// What the reader and the caller of a stream share.
+#[derive(Debug)]
+struct Shared {
+    pending: Mutex<Pending>,
+    arrived: tokio::sync::Notify,
+    /// How long the stream may go without any frame before it ends.
+    silence: std::time::Duration,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A bridge that is open and carries a conversation: output, input and answers in any order.
+///
+/// An [`Invocation`] carries one exchange at a time. A terminal attached to a session in another
+/// environment needs more: the destination pushes output while the person types, and neither waits
+/// for the other. So the stream has a reader of its own, which takes frames off the helper's
+/// standard output as they arrive and keeps them, in order, for whoever asks. Four rules hold it.
+///
+/// * **The reader never waits for its caller.** What has arrived and not been taken is held up to
+///   [`kr_protocol::limits::MAX_SEND_QUEUE_BYTES`], the most the destination would queue for a peer
+///   that stopped reading, and a stream past it ends with [`Refusal::Backlog`]. A reader that
+///   waited for a full queue to drain, while its caller waited to write to a helper that was
+///   waiting to write to the reader, would hold all three for good.
+/// * **Reading is cancellable.** [`Self::recv`] waits on that queue and nothing else, so a caller
+///   that drops it in a `select!` loses nothing.
+/// * **The connection's own traffic is not the caller's.** A renewed action window replaces the
+///   one the stream quotes, and a keepalive is not returned; both count as the destination being
+///   heard from, and a stream that is not heard from for [`STREAM_SILENCE_LIMIT`] ends with
+///   [`Refusal::Silent`].
+/// * **What the helper writes to its standard error is kept, not shown.** It is read from the same
+///   place as the rest of a helper's diagnostics, and [`Self::diagnostics`] says how much there was.
+#[derive(Debug)]
+pub struct BridgeStream {
+    program: String,
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::task::JoinHandle<()>,
+    shared: Arc<Shared>,
+    acknowledgement: BridgeHelloAck,
+    diagnostics: Diagnostics,
+}
+
+impl Invocation {
+    /// Turns this invocation into a stream that carries a conversation.
+    ///
+    /// Frames the invocation had not yet taken are not lost: nothing has been read from the
+    /// helper beyond its acknowledgement.
+    #[must_use]
+    pub fn into_stream(self) -> BridgeStream {
+        self.into_stream_within(
+            STREAM_SILENCE_LIMIT,
+            kr_protocol::limits::MAX_SEND_QUEUE_BYTES,
+        )
+    }
+
+    /// [`Self::into_stream`], with the two bounds named.
+    fn into_stream_within(self, silence: std::time::Duration, ceiling: usize) -> BridgeStream {
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(Pending {
+                frames: VecDeque::new(),
+                bytes: 0,
+                window: self.acknowledgement.action_window.clone(),
+                last_heard: tokio::time::Instant::now(),
+                ended: None,
+            }),
+            arrived: tokio::sync::Notify::new(),
+            silence,
+        });
+        let reader = tokio::spawn(read_stream(self.stdout, Arc::clone(&shared), ceiling));
+        BridgeStream {
+            program: self.program,
+            child: self.child,
+            stdin: self.stdin,
+            reader,
+            shared,
+            acknowledgement: self.acknowledgement,
+            diagnostics: self.diagnostics,
+        }
+    }
+}
+
+/// Takes frames off the helper's standard output until it ends, keeping each for the stream's
+/// caller.
+async fn read_stream(mut stdout: tokio::process::ChildStdout, shared: Arc<Shared>, ceiling: usize) {
+    loop {
+        let read = read_frame_unbounded(&mut stdout).await;
+        let mut pending = shared.lock();
+        pending.last_heard = tokio::time::Instant::now();
+        match read {
+            Ok((BridgeFrame::Control(frame), charged)) => match *frame {
+                ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
+                    pending.window = window;
+                }
+                ControlFrame::Event(ControlEvent::Keepalive) => {}
+                other => {
+                    if pending.bytes.saturating_add(charged) > ceiling {
+                        pending.ended = Some(Refusal::Backlog { limit: ceiling });
+                        drop(pending);
+                        shared.arrived.notify_waiters();
+                        return;
+                    }
+                    pending.bytes += charged;
+                    pending.frames.push_back((other, charged));
+                }
+            },
+            Ok((BridgeFrame::Refused(error), _)) => {
+                pending.ended = Some(
+                    if error.code == kr_protocol::error::ErrorCode::SessionClosed {
+                        Refusal::SessionClosed
+                    } else {
+                        Refusal::Destination(error)
+                    },
+                );
+                drop(pending);
+                shared.arrived.notify_waiters();
+                return;
+            }
+            // A second acknowledgement or an opening frame is not something a destination sends in
+            // the middle of a conversation.
+            Ok(_) => {
+                pending.ended = Some(Refusal::NotAnAcknowledgement);
+                drop(pending);
+                shared.arrived.notify_waiters();
+                return;
+            }
+            Err(refusal) => {
+                pending.ended = Some(refusal);
+                drop(pending);
+                shared.arrived.notify_waiters();
+                return;
+            }
+        }
+        drop(pending);
+        shared.arrived.notify_waiters();
+    }
+}
+
+impl BridgeStream {
+    /// What the destination acknowledged.
+    #[must_use]
+    pub const fn acknowledgement(&self) -> &BridgeHelloAck {
+        &self.acknowledgement
+    }
+
+    /// The action window the destination last issued on this connection.
+    ///
+    /// A mutation quotes the window in force when it is built, so this is read at that moment and
+    /// never kept.
+    #[must_use]
+    pub fn action_window(&self) -> ActionWindow {
+        self.shared.lock().window.clone()
+    }
+
+    /// How many bytes the helper has written to its standard error.
+    #[must_use]
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+
+    /// Writes one frame to the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal::Silent`] when the helper does not take it within [`SILENCE_LIMIT`],
+    /// [`Refusal::Stream`] when the stream fails, and [`Refusal::Unreadable`] for a frame past the
+    /// control bound, which is refused rather than truncated.
+    pub async fn send(&mut self, frame: ControlFrame) -> Result<(), Refusal> {
+        write_frame(&mut self.stdin, &BridgeFrame::Control(Box::new(frame))).await
+    }
+
+    /// Takes the oldest frame the destination sent that has not been taken, waiting for one.
+    ///
+    /// Cancelling this loses nothing: what it was waiting for stays where it is. When the stream
+    /// has ended, everything that arrived before the end is returned first, and then the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the stream: the destination's own refusal, a stream or frame failure,
+    /// [`Refusal::Backlog`], or [`Refusal::Silent`] when it was not heard from for
+    /// [`STREAM_SILENCE_LIMIT`].
+    pub async fn recv(&mut self) -> Result<ControlFrame, Refusal> {
+        self.take(|_| true, None).await
+    }
+
+    /// Takes the answer to one request, leaving everything else for [`Self::recv`], in order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recv`], and [`Refusal::Silent`] when no answer came within `limit`.
+    pub async fn response(
+        &mut self,
+        request_id: RequestId,
+        limit: std::time::Duration,
+    ) -> Result<Response, Refusal> {
+        let frame = self
+            .take(
+                |frame| matches!(frame, ControlFrame::Response(response) if response.request_id == request_id),
+                Some(limit),
+            )
+            .await?;
+        match frame {
+            ControlFrame::Response(response) => Ok(response),
+            _ => Err(Refusal::NotAnAcknowledgement),
+        }
+    }
+
+    /// Waits for the first held frame `wanted` accepts, and takes it out of the queue.
+    async fn take(
+        &self,
+        wanted: impl Fn(&ControlFrame) -> bool,
+        limit: Option<std::time::Duration>,
+    ) -> Result<ControlFrame, Refusal> {
+        let asked = tokio::time::Instant::now();
+        loop {
+            let arrived = self.shared.arrived.notified();
+            tokio::pin!(arrived);
+            // Registered before the queue is read, so a frame that arrives in between wakes this.
+            arrived.as_mut().enable();
+            let deadline = {
+                let mut pending = self.shared.lock();
+                if let Some(index) = pending.frames.iter().position(|(frame, _)| wanted(frame)) {
+                    let (frame, charged) = pending
+                        .frames
+                        .remove(index)
+                        .expect("the position was just found");
+                    pending.bytes = pending.bytes.saturating_sub(charged);
+                    return Ok(frame);
+                }
+                if let Some(ended) = pending.ended.clone() {
+                    return Err(ended);
+                }
+                let heard = pending.last_heard + self.shared.silence;
+                match limit {
+                    Some(limit) => heard.min(asked + limit),
+                    None => heard,
+                }
+            };
+            if tokio::time::timeout_at(deadline, arrived).await.is_err() {
+                let pending = self.shared.lock();
+                let silent_since = pending.last_heard + self.shared.silence;
+                if tokio::time::Instant::now() >= silent_since {
+                    return Err(Refusal::Silent {
+                        waited: self.shared.silence,
+                    });
+                }
+                if let Some(limit) = limit
+                    && tokio::time::Instant::now() >= asked + limit
+                {
+                    return Err(Refusal::Silent { waited: limit });
+                }
+            }
+        }
+    }
+
+    /// Ends the stream: the helper's input is closed and the helper is waited for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Invocation::close`].
+    pub async fn close(self) -> Result<(), Refusal> {
+        self.close_within(SILENCE_LIMIT, KILL_LIMIT).await
+    }
+
+    async fn close_within(
+        mut self,
+        silence: std::time::Duration,
+        kill_limit: std::time::Duration,
+    ) -> Result<(), Refusal> {
+        drop(self.stdin);
+        let waited = tokio::time::timeout(silence, self.child.wait()).await;
+        self.reader.abort();
+        match waited {
+            Ok(Ok(_status)) => Ok(()),
+            Ok(Err(error)) => Err(Refusal::Stream {
+                detail: error.to_string(),
+            }),
+            Err(_elapsed) => {
+                end(self.child, &self.program, kill_limit).await?;
+                Err(Refusal::Silent { waited: silence })
             }
         }
     }
@@ -580,25 +1057,34 @@ async fn write_frame_unbounded<W: AsyncWrite + Unpin>(
     })
 }
 
-/// Reads one bridge frame.
+/// Reads one bridge frame, waiting no longer than [`SILENCE_LIMIT`].
 ///
 /// The declared length is checked against section 9's control-frame bound *before* a payload
 /// buffer exists, so a destination that declares a large frame is refused rather than served with
 /// the memory it asked for.
+#[cfg(test)]
 async fn read_frame<R: AsyncRead + Unpin>(source: &mut R) -> Result<BridgeFrame, Refusal> {
-    tokio::time::timeout(SILENCE_LIMIT, read_frame_unbounded(source))
-        .await
-        .unwrap_or(Err(Refusal::Silent {
-            waited: SILENCE_LIMIT,
-        }))
+    Ok(read_frame_within(source, SILENCE_LIMIT).await?.0)
 }
 
-/// Reads one bridge frame, waiting as long as the stream takes.
+/// Reads one bridge frame, waiting no longer than `limit` for it, and says what it occupied.
+async fn read_frame_within<R: AsyncRead + Unpin>(
+    source: &mut R,
+    limit: std::time::Duration,
+) -> Result<(BridgeFrame, usize), Refusal> {
+    tokio::time::timeout(limit, read_frame_unbounded(source))
+        .await
+        .unwrap_or(Err(Refusal::Silent { waited: limit }))
+}
+
+/// Reads one bridge frame, waiting as long as the stream takes, and says what it occupied on the
+/// wire, its length prefix included.
 ///
-/// Every caller reaches this through [`read_frame`], which bounds the wait.
+/// Every caller reaches this through [`read_frame_within`], which bounds the wait, or through the
+/// reader of a stream, whose wait is bounded by the silence of the whole stream.
 async fn read_frame_unbounded<R: AsyncRead + Unpin>(
     source: &mut R,
-) -> Result<BridgeFrame, Refusal> {
+) -> Result<(BridgeFrame, usize), Refusal> {
     let mut prefix = [0_u8; FRAME_LENGTH_PREFIX_LEN];
     source
         .read_exact(&mut prefix)
@@ -618,17 +1104,20 @@ async fn read_frame_unbounded<R: AsyncRead + Unpin>(
         .map_err(|error| Refusal::Stream {
             detail: error.to_string(),
         })?;
-    kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
-        Refusal::Unreadable {
+    let frame = kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits()).map_err(
+        |error| Refusal::Unreadable {
             detail: error.to_string(),
-        }
-    })
+        },
+    )?;
+    Ok((frame, FRAME_LENGTH_PREFIX_LEN + declared))
 }
 
 /// Decides whether a request may cross a bridge, and builds what opens it.
 ///
 /// `actor` is the envelope this host constructed for the request. Nothing the caller supplied is
 /// read here: the ingress comes from that envelope, which the host built from the connection.
+/// `start` is whether the opening may start what it needs inside the destination: a refresh,
+/// enrolment or verification says `false`.
 ///
 /// # Errors
 ///
@@ -642,6 +1131,7 @@ pub fn open(
     origin_environment_id: EnvironmentId,
     build_id: BuildId,
     target: BridgeTarget,
+    start: bool,
 ) -> Result<Opening, Refusal> {
     if !actor.ingress.may_cross_process_bridge() {
         return Err(Refusal::NetworkActor {
@@ -651,6 +1141,36 @@ pub fn open(
     if already_bridged {
         return Err(Refusal::AlreadyBridged);
     }
+    opening(enrolment, origin_environment_id, build_id, target, start)
+}
+
+/// Builds what opens a bridge for a person at this host's own command line.
+///
+/// The command line is the invoker here, not the control daemon acting for a connection, so there
+/// is no envelope to read an ingress from: a person running `kr` at this host is a locally
+/// authenticated invocation by construction, and nothing has crossed a bridge before it. A request
+/// that arrived any other way never reaches this function, because only the command line calls it.
+///
+/// # Errors
+///
+/// Returns [`Refusal::Launch`] when the enrolment names no process bridge or is incomplete.
+pub fn open_for_person(
+    enrolment: &EnvironmentEnrolment,
+    origin_environment_id: EnvironmentId,
+    build_id: BuildId,
+    target: BridgeTarget,
+    start: bool,
+) -> Result<Opening, Refusal> {
+    opening(enrolment, origin_environment_id, build_id, target, start)
+}
+
+fn opening(
+    enrolment: &EnvironmentEnrolment,
+    origin_environment_id: EnvironmentId,
+    build_id: BuildId,
+    target: BridgeTarget,
+    start: bool,
+) -> Result<Opening, Refusal> {
     let command = launch::command(enrolment).map_err(Refusal::Launch)?;
     Ok(Opening {
         command,
@@ -659,9 +1179,11 @@ pub fn open(
             protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
             build_id,
             origin_environment_id,
-            // Carried, not recomputed. This is where the request entered this host.
-            origin_ingress: actor.ingress,
+            // Carried, not recomputed: both entrances above are locally authenticated, which is
+            // the only ingress a bridge carries.
+            origin_ingress: ActorIngress::LocalIpc,
             already_bridged: false,
+            start,
             target,
         },
     })
@@ -728,6 +1250,7 @@ mod tests {
             here(),
             build(),
             BridgeTarget::Controller,
+            false,
         )
         .expect("opened");
         assert_eq!(opening.hello.origin_ingress, ActorIngress::LocalIpc);
@@ -753,6 +1276,7 @@ mod tests {
                 here(),
                 build(),
                 BridgeTarget::Controller,
+                false,
             )
             .expect_err("a refusal");
             assert_eq!(refusal, Refusal::NetworkActor { ingress });
@@ -776,6 +1300,7 @@ mod tests {
             here(),
             build(),
             BridgeTarget::Controller,
+            false,
         )
         .expect_err("a refusal");
         assert_eq!(
@@ -795,6 +1320,7 @@ mod tests {
             here(),
             build(),
             BridgeTarget::Controller,
+            false,
         )
         .expect_err("a refusal");
         assert_eq!(refusal, Refusal::AlreadyBridged);
@@ -811,6 +1337,7 @@ mod tests {
             here(),
             build(),
             BridgeTarget::Controller,
+            false,
         )
         .expect_err("a refusal");
         assert_eq!(
@@ -905,6 +1432,7 @@ mod tests {
                 origin_environment_id: here(),
                 origin_ingress: ActorIngress::LocalIpc,
                 already_bridged: false,
+                start: false,
                 target: BridgeTarget::Controller,
             },
         };
@@ -929,6 +1457,7 @@ mod tests {
             origin_environment_id: here(),
             origin_ingress: ActorIngress::LocalIpc,
             already_bridged: false,
+            start: false,
             target: BridgeTarget::Controller,
         }
     }
@@ -939,6 +1468,13 @@ mod tests {
         let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
         BridgeHelloAck {
             protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            build: Some(kr_protocol::local::LocalBuild::this(
+                kr_protocol::ids::BuildId::new("kr/0.1.0").expect("a build"),
+            )),
+            base: kr_protocol::identity::DestinationBase {
+                home: "/home/kala".to_owned(),
+                variables: Vec::new(),
+            },
             environment_id: here(),
             os_user: "kala".to_owned(),
             role: LocalRole::Controller,
@@ -1156,5 +1692,474 @@ mod tests {
             "{unended:?}"
         );
         assert!(unended.to_string().contains("process 4242"), "{unended}");
+    }
+
+    /// A helper that writes `frames`, one after another, and then waits for its input to close, which
+    /// is what a destination that has nothing more to say looks like from here.
+    #[cfg(unix)]
+    fn writing(frames: &[BridgeFrame], then: &str) -> (tempfile::TempDir, Opening) {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let answer = directory.path().join("answer");
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(
+                FrameCodec::new(StreamKind::Control)
+                    .encode_message(frame)
+                    .expect("the frame encodes"),
+            );
+        }
+        std::fs::write(&answer, bytes).expect("the frames are written");
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    format!("cat \"$1\"; {then}"),
+                    "sh".to_owned(),
+                    answer
+                        .to_str()
+                        .expect("a temporary path is text")
+                        .to_owned(),
+                ],
+            },
+            environment_id: here(),
+            hello: hello(),
+        };
+        (directory, opening)
+    }
+
+    #[cfg(unix)]
+    fn notification(sequence: u64) -> BridgeFrame {
+        BridgeFrame::Control(Box::new(ControlFrame::Notification(
+            kr_protocol::envelope::Notification {
+                stream_id: kr_protocol::ids::StreamId::new("s1").expect("a stream"),
+                sequence: kr_protocol::ids::EventSequence::new(sequence),
+                event_type: kr_protocol::ids::EventType::new("session.output")
+                    .expect("an event type"),
+                payload: kr_protocol::envelope::ParamsValue::empty(),
+            },
+        )))
+    }
+
+    #[cfg(unix)]
+    fn answer_to(request_id: u64) -> BridgeFrame {
+        BridgeFrame::Control(Box::new(ControlFrame::Response(Response {
+            request_id: RequestId::new(request_id),
+            outcome: kr_protocol::envelope::Outcome::Ok(kr_protocol::envelope::ParamsValue::empty()),
+        })))
+    }
+
+    #[cfg(unix)]
+    fn event(event: ControlEvent) -> BridgeFrame {
+        BridgeFrame::Control(Box::new(ControlFrame::Event(event)))
+    }
+
+    #[cfg(unix)]
+    fn renewed(id: &str) -> BridgeFrame {
+        let mut window = acknowledgement().action_window;
+        window.action_window_id = kr_protocol::ids::ActionWindowId::new(id).expect("a window");
+        event(ControlEvent::ActionWindowRenewed(window))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_applies_a_renewed_window_skips_keepalives_and_holds_what_arrives_first() {
+        let (_directory, opening) = writing(
+            &[
+                BridgeFrame::HelloAck(Box::new(acknowledgement())),
+                event(ControlEvent::Keepalive),
+                renewed("w-second"),
+                notification(1),
+                notification(2),
+                answer_to(1),
+                notification(3),
+            ],
+            "exec sleep 600",
+        );
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        assert_eq!(stream.action_window().action_window_id.as_str(), "w-bridge");
+        // The answer is taken from behind two notifications, which stay where they are, in order.
+        let answered = stream
+            .response(RequestId::new(1), SILENCE_LIMIT)
+            .await
+            .expect("the answer arrives");
+        assert_eq!(answered.request_id, RequestId::new(1));
+        // The renewal that came before the answer is applied, so a mutation built now quotes it.
+        assert_eq!(stream.action_window().action_window_id.as_str(), "w-second");
+        let mut sequences = Vec::new();
+        for _ in 0..3 {
+            match stream.recv().await.expect("a held frame") {
+                ControlFrame::Notification(notification) => {
+                    sequences.push(notification.sequence.get());
+                }
+                other => panic!("expected a notification, got {other:?}"),
+            }
+        }
+        assert_eq!(sequences, [1, 2, 3], "what was held comes first, in order");
+        stream
+            .close_within(std::time::Duration::from_millis(200), KILL_LIMIT)
+            .await
+            .expect_err("the helper ignores its closed input and is ended");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_receive_that_is_given_up_on_loses_nothing() {
+        let (_directory, opening) = writing(
+            &[
+                BridgeFrame::HelloAck(Box::new(acknowledgement())),
+                notification(1),
+            ],
+            "exec sleep 600",
+        );
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        // Dropped by a select that another branch won, over and over, while the frame is on its way.
+        // Whatever a receive that did finish returned is kept: the frame must come out exactly once.
+        let mut received = Vec::new();
+        for _ in 0..50 {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                frame = stream.recv() => received.push(frame.expect("a frame")),
+            }
+        }
+        if received.is_empty() {
+            received.push(stream.recv().await.expect("the frame was never lost"));
+        }
+        assert_eq!(received.len(), 1, "the one frame came out once");
+        match &received[0] {
+            ControlFrame::Notification(notification) => assert_eq!(notification.sequence.get(), 1),
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_that_has_ended_hands_over_what_arrived_before_it_ended_and_then_says_how() {
+        let (_directory, opening) = writing(
+            &[
+                BridgeFrame::HelloAck(Box::new(acknowledgement())),
+                notification(1),
+                BridgeFrame::Refused(ProtocolError::new(
+                    ErrorCode::SessionClosed,
+                    "that session is closed",
+                )),
+            ],
+            "exit 0",
+        );
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        assert!(matches!(
+            stream.recv().await,
+            Ok(ControlFrame::Notification(_))
+        ));
+        assert_eq!(
+            stream.recv().await.expect_err("it ended"),
+            Refusal::SessionClosed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_whose_helper_goes_away_ends_with_the_stream_failing_not_with_silence() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "exit 0",
+        );
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream();
+        let ended = stream
+            .recv()
+            .await
+            .expect_err("the end of the stream is an error");
+        assert!(matches!(ended, Refusal::Stream { .. }), "{ended}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_that_is_not_heard_from_ends_instead_of_holding_its_caller() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "exec sleep 600",
+        );
+        let silence = std::time::Duration::from_millis(300);
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(silence, kr_protocol::limits::MAX_SEND_QUEUE_BYTES);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            stream.recv().await.expect_err("nothing is coming"),
+            Refusal::Silent { waited: silence }
+        );
+        assert!(started.elapsed() < silence * 20, "{:?}", started.elapsed());
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_keepalive_counts_as_the_destination_being_heard_from() {
+        // Keepalives arrive faster than the silence bound, for longer than it, and nothing else is
+        // sent: the stream stays up. The helper writes one frame every 100 milliseconds.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let first = directory.path().join("first");
+        let beat = directory.path().join("beat");
+        let encode = |frame: &BridgeFrame| {
+            FrameCodec::new(StreamKind::Control)
+                .encode_message(frame)
+                .expect("the frame encodes")
+        };
+        std::fs::write(
+            &first,
+            encode(&BridgeFrame::HelloAck(Box::new(acknowledgement()))),
+        )
+        .expect("written");
+        std::fs::write(&beat, encode(&event(ControlEvent::Keepalive))).expect("written");
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "cat \"$1\"; i=0; while [ $i -lt 8 ]; do sleep 0.1; cat \"$2\"; i=$((i+1)); done; \
+                     cat \"$3\"; exec sleep 600"
+                        .to_owned(),
+                    "sh".to_owned(),
+                    first.to_str().expect("text").to_owned(),
+                    beat.to_str().expect("text").to_owned(),
+                    {
+                        let last = directory.path().join("last");
+                        std::fs::write(&last, encode(&notification(9))).expect("written");
+                        last.to_str().expect("text").to_owned()
+                    },
+                ],
+            },
+            environment_id: here(),
+            hello: hello(),
+        };
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(
+                std::time::Duration::from_millis(400),
+                kr_protocol::limits::MAX_SEND_QUEUE_BYTES,
+            );
+        let started = std::time::Instant::now();
+        match stream.recv().await.expect("kept up by its keepalives") {
+            ControlFrame::Notification(notification) => assert_eq!(notification.sequence.get(), 9),
+            other => panic!("expected the notification, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() > std::time::Duration::from_millis(700),
+            "the keepalives ran for longer than the bound: {:?}",
+            started.elapsed()
+        );
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_destination_that_sends_more_than_the_bound_ends_the_stream_rather_than_filling_memory()
+     {
+        let (_directory, opening) = writing(
+            &[
+                BridgeFrame::HelloAck(Box::new(acknowledgement())),
+                notification(1),
+                notification(2),
+                notification(3),
+            ],
+            "exec sleep 600",
+        );
+        // Room for two of the three, which are the same size.
+        let one = FRAME_LENGTH_PREFIX_LEN
+            + FrameCodec::new(StreamKind::Control)
+                .encode_message(&notification(1))
+                .expect("encodes")
+                .len()
+            - FRAME_LENGTH_PREFIX_LEN;
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(SILENCE_LIMIT, one * 2 + 1);
+        // Nobody reads, so the third is the one that does not fit. What is held is still there to
+        // be taken, and then the stream says why it ended.
+        let mut taken = 0;
+        let ended = loop {
+            match stream.recv().await {
+                Ok(_) => taken += 1,
+                Err(refusal) => break refusal,
+            }
+        };
+        assert_eq!(taken, 2, "the frames that fit were delivered");
+        assert!(matches!(ended, Refusal::Backlog { .. }), "{ended}");
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_a_helper_writes_to_standard_error_is_kept_and_counted_not_shown() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "echo a diagnostic line >&2; exec sleep 600",
+        );
+        let invocation = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment");
+        let diagnostics = invocation.diagnostics.clone();
+        let started = std::time::Instant::now();
+        while diagnostics.written() == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "nothing was kept"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(diagnostics.written(), "a diagnostic line\n".len() as u64);
+        let _ = invocation
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_destination_of_another_level_is_refused_before_a_request_is_sent() {
+        for build in [
+            None,
+            Some(kr_protocol::local::LocalBuild {
+                build_id: kr_protocol::ids::BuildId::new("kr/0.0.1").expect("a build"),
+                protocol_version: kr_protocol::hello::PackageVersion::new(
+                    PACKAGE_VERSION.major,
+                    PACKAGE_VERSION.minor + 1,
+                    0,
+                ),
+            }),
+        ] {
+            let mut stated = acknowledgement();
+            stated.build.clone_from(&build);
+            let (_directory, opening) =
+                writing(&[BridgeFrame::HelloAck(Box::new(stated))], "exec sleep 600");
+            let refusal = opening.launch().await.expect_err("refused");
+            assert_eq!(refusal, Refusal::Level { destination: build });
+            assert!(refusal.to_string().contains("update kr"), "{refusal}");
+        }
+        // The control: this release's own level is accepted.
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "exec sleep 600",
+        );
+        let invocation = opening
+            .launch()
+            .await
+            .expect("a destination of this level answers");
+        let _ = invocation
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_base_the_protocol_does_not_allow_is_refused_before_a_create_is_built_from_it() {
+        for (what, base) in [
+            (
+                "a variable outside the allowlist",
+                kr_protocol::identity::DestinationBase {
+                    home: "/home/kala".to_owned(),
+                    variables: vec![kr_protocol::session::EnvironmentVariable {
+                        name: "AWS_SECRET_ACCESS_KEY".to_owned(),
+                        value: "x".to_owned(),
+                    }],
+                },
+            ),
+            (
+                "a home that is not absolute",
+                kr_protocol::identity::DestinationBase {
+                    home: "home/kala".to_owned(),
+                    variables: Vec::new(),
+                },
+            ),
+            (
+                "one variable twice",
+                kr_protocol::identity::DestinationBase {
+                    home: "/home/kala".to_owned(),
+                    variables: vec![
+                        kr_protocol::session::EnvironmentVariable {
+                            name: "HOME".to_owned(),
+                            value: "/a".to_owned(),
+                        },
+                        kr_protocol::session::EnvironmentVariable {
+                            name: "HOME".to_owned(),
+                            value: "/b".to_owned(),
+                        },
+                    ],
+                },
+            ),
+        ] {
+            let mut stated = acknowledgement();
+            stated.base = base;
+            let (_directory, opening) =
+                writing(&[BridgeFrame::HelloAck(Box::new(stated))], "exec sleep 600");
+            let refusal = opening.launch().await.expect_err(what);
+            assert!(
+                matches!(refusal, Refusal::Unreadable { .. }),
+                "{what}: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_opening_that_may_start_what_it_needs_waits_longer_for_its_first_answer_and_says_so() {
+        // The two bounds are different on purpose, and ordered: a start waits for a boot and a
+        // daemon, and a mutation waits for the destination's own bound on a create.
+        assert!(START_LIMIT > SILENCE_LIMIT);
+        assert!(MUTATION_LIMIT > SILENCE_LIMIT);
+        let opening = open_for_person(
+            &enrolment(),
+            here(),
+            build(),
+            BridgeTarget::Controller,
+            true,
+        )
+        .expect("a person at this host opens a bridge");
+        assert!(opening.hello.start);
+        assert_eq!(opening.hello.origin_ingress, ActorIngress::LocalIpc);
+        assert!(!opening.hello.already_bridged);
+        // A refresh's opening starts nothing.
+        let refresh = open(
+            &actor(ActorIngress::LocalIpc),
+            false,
+            &enrolment(),
+            here(),
+            build(),
+            BridgeTarget::Controller,
+            false,
+        )
+        .expect("opened");
+        assert!(!refresh.hello.start);
     }
 }
