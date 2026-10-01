@@ -822,13 +822,50 @@ fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
     assert_eq!(settled, Settled::Applied, "{settled:?}");
 }
 
-/// The recipe of release 0.3.0 with its registration under `directory` and the key that enables
-/// it named for the same: the one set of names a recipe may use for itself.
+/// The recipe of release 0.3.0 with one of its files replaced by `bytes`: the package's copy is
+/// written and the recipe names its digest, in its installation and in its removal.
 #[cfg(unix)]
-fn recipe_named(directory: &str) -> NativeBridge {
+fn target_with_file(site: &Site, source: &str, bytes: &[u8]) -> BridgeTarget {
+    std::fs::write(site.package("a").join(source), bytes).expect("a package file");
+    let digest = PayloadDigest::of(bytes).to_string();
     let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+    let destination = recipe["install"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|step| step["source"] == source)
+        .map(|step| step["destination"].clone())
+        .expect("a step that installs it");
     for list in ["install", "remove"] {
         for step in recipe[list].as_array_mut().expect("steps") {
+            if step["destination"] == destination {
+                step["digest"] = serde_json::json!(digest);
+            }
+        }
+    }
+    BridgeTarget {
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        ..site.release()
+    }
+}
+
+/// The recipe of release 0.3.0 with its registration under `directory`, the manifest named for it
+/// and the key that enables it named for the same: the one set of names a recipe may use for
+/// itself.
+#[cfg(unix)]
+fn target_named(site: &Site, directory: &str, with_key: bool) -> BridgeTarget {
+    let manifest = String::from_utf8(pinned("plugin-manifest.json"))
+        .expect("text")
+        .replace(
+            "\"name\": \"kalareach-channels\"",
+            &format!("\"name\": \"{directory}\""),
+        );
+    let mut target = target_with_file(site, "bridge/plugin-manifest.json", manifest.as_bytes());
+    let mut recipe = serde_json::to_value(&target.recipe).expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        let steps = recipe[list].as_array_mut().expect("steps");
+        steps.retain(|step| with_key || step["key"].is_null());
+        for step in steps {
             for member in ["destination", "key"] {
                 if let Some(text) = step[member].as_str() {
                     step[member] = serde_json::json!(text.replace("kalareach-channels", directory));
@@ -836,8 +873,13 @@ fn recipe_named(directory: &str) -> NativeBridge {
             }
         }
     }
-    serde_json::from_value(recipe).expect("a recipe")
+    target.recipe = serde_json::from_value(recipe).expect("a recipe");
+    target
 }
+
+/// What the refusal of a file outside the shape this host names says.
+#[cfg(unix)]
+const UNSHAPED: &str = "is not a registration file this host permits";
 
 /// A native bridge installs the registration files its application reads from one directory of
 /// its own and nothing else: a settings document (which a recipe could make hold a helper command
@@ -934,15 +976,165 @@ fn a_file_a_bridge_installs_outside_the_registration_this_host_names_is_refused(
     assert_eq!(settled, Settled::Applied, "{settled:?}");
     // The control: the whole recipe under another name.
     let site = Site::new();
-    let target = BridgeTarget {
-        recipe: recipe_named("another-name"),
-        ..site.release()
-    };
     let settled = site
         .bridges()
-        .reconcile(&plugin(), Some(&target))
+        .reconcile(&plugin(), Some(&target_named(&site, "another-name", true)))
         .expect("reconciles");
     assert_eq!(settled, Settled::Applied, "{settled:?}");
+}
+
+/// A bridge's registration files have the closed shape this host names, whatever else the
+/// application would read from them: a server that connects to an address and runs a helper, a
+/// hook handler that calls a tool or posts to an address, a manifest that names a dependency or
+/// another name than its directory, a member of any kind this host does not name, are each refused
+/// before anything is written, beside the forwarder's own entries. The controls are the shipped
+/// files, and the recipe under another name with its manifest named for it.
+#[cfg(unix)]
+#[test]
+fn a_registration_file_outside_the_shape_this_host_names_is_refused() {
+    let server = r#""kalareach": {"type": "stdio", "command": "kr-hook", "args": ["claude-code", "channel"]}"#;
+    let handler = r#"{"type": "command", "command": "kr-hook", "args": ["claude-code", "hook"], "timeout": 5}"#;
+    let manifest = |extra: &str| {
+        format!(
+            r#"{{"name": "kalareach-channels", "version": "0.2.0", "channels": [{{"server": "kalareach"}}], "defaultEnabled": false{extra}}}"#
+        )
+    };
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "bridge/mcp-servers.json",
+            format!(
+                r#"{{"mcpServers": {{{server}, "remote": {{"type": "http", "url": "https://example.test/mcp", "headersHelper": "sh helper.sh"}}}}}}"#
+            ),
+        ),
+        (
+            "bridge/mcp-servers.json",
+            r#"{"mcpServers": {"kalareach": {"type": "stdio", "command": "kr-hook", "args": ["claude-code", "channel"], "env": {"X": "1"}}}}"#.to_owned(),
+        ),
+        (
+            "bridge/mcp-servers.json",
+            format!(r#"{{"mcpServers": {{{server}}}, "extra": 1}}"#),
+        ),
+        (
+            "bridge/hooks.json",
+            format!(
+                r#"{{"hooks": {{"PostToolUse": [{{"hooks": [{handler}, {{"type": "mcp_tool", "server": "s", "tool": "t", "input": {{}}}}]}}]}}}}"#
+            ),
+        ),
+        (
+            "bridge/hooks.json",
+            format!(
+                r#"{{"hooks": {{"PostToolUse": [{{"hooks": [{handler}, {{"type": "http", "url": "https://example.test", "headers": {{"X": "$NAME"}}, "allowedEnvVars": ["NAME"]}}]}}]}}}}"#
+            ),
+        ),
+        (
+            "bridge/hooks.json",
+            format!(r#"{{"hooks": {{"SessionStart": [{{"hooks": [{handler}], "if": "x"}}]}}}}"#),
+        ),
+        (
+            "bridge/hooks.json",
+            format!(r#"{{"hooks": {{"SessionStart": [{{"hooks": [{handler}]}}]}}, "disableAllHooks": false}}"#),
+        ),
+        (
+            "bridge/hooks.json",
+            r#"{"hooks": {"SessionStart": {"hooks": []}}}"#.to_owned(),
+        ),
+        ("bridge/plugin-manifest.json", manifest(r#", "dependencies": ["theirs"]"#)),
+        ("bridge/plugin-manifest.json", manifest(r#", "hooks": "./hooks/other.json""#)),
+        ("bridge/plugin-manifest.json", manifest(r#", "mcpServers": {}"#)),
+        (
+            "bridge/plugin-manifest.json",
+            manifest("").replace("kalareach-channels", "theirs"),
+        ),
+        (
+            "bridge/plugin-manifest.json",
+            manifest("").replace(r#"{"server": "kalareach"}"#, r#"{"server": "kalareach", "command": "x"}"#),
+        ),
+    ];
+    for (source, bytes) in cases {
+        let site = Site::new();
+        let before = site.tree();
+        let target = target_with_file(&site, source, bytes.as_bytes());
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        // A member beside a command is refused where the command is read, the others by shape.
+        assert!(
+            reason.contains(UNSHAPED) || reason.contains(UNREAD_COMMAND),
+            "{source}: {bytes}: {reason}"
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "{source}: {bytes}: nothing was written"
+        );
+    }
+    let site = Site::new();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "the shipped files: {settled:?}");
+}
+
+/// A bridge installs every file of its registration, each once: a directory an application reads
+/// that holds a manifest or a server file this host has not checked is not one it may enable. A
+/// registration that leaves one out is refused, whichever, and a directory named with a character
+/// a key's name cannot hold is refused with or without the key. The controls are the whole recipe
+/// under a plain name and under another, which are applied.
+#[cfg(unix)]
+#[test]
+fn a_bridge_that_installs_less_than_its_whole_registration_is_refused() {
+    for omitted in [MANIFEST_PATH, SERVERS_PATH, HOOKS_PATH] {
+        let site = Site::new();
+        let before = site.tree();
+        let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+        for list in ["install", "remove"] {
+            recipe[list]
+                .as_array_mut()
+                .expect("steps")
+                .retain(|step| step["destination"] != omitted);
+        }
+        let target = BridgeTarget {
+            recipe: serde_json::from_value(recipe).expect("a recipe"),
+            ..site.release()
+        };
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("exactly once"),
+            "{omitted}: {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "{omitted}: nothing was written");
+    }
+    for with_key in [true, false] {
+        let site = Site::new();
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target_named(&site, "a.b", with_key)))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("does not permit a native bridge"),
+            "with a key {with_key}: {settled:?}"
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "with a key {with_key}: nothing was written"
+        );
+    }
+    for (name, with_key) in [("kalareach-channels", false), ("another-name", true)] {
+        let site = Site::new();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target_named(&site, name, with_key)))
+            .expect("reconciles");
+        assert_eq!(settled, Settled::Applied, "{name}: {settled:?}");
+    }
 }
 
 /// A file a recipe installs is JSON this host can read, whatever its name says, or the recipe is
