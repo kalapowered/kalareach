@@ -603,11 +603,74 @@ pub struct QuestionCancelParams {
 }
 
 /// The result of `question.answer` and `question.cancel`.
+///
+/// The first five members are the host's own record of the resolution. They carry no content an
+/// application or a person wrote, so every caller that took the action is told them. `question` is
+/// the question as it now stands, and null means the host withheld it: what a question asks, the
+/// context it gives, its choices, who asked it and what was answered are session content, and the
+/// host shows them under the caller's present view authority and history scope. A caller that
+/// sent the answer already holds what it said.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionResolveResult {
-    /// The question as it now stands.
-    pub question: Question,
+    /// The question's identity.
+    pub question_id: QuestionId,
+    /// Its revision after the resolution.
+    pub revision: QuestionRevision,
+    /// Where it stands now.
+    pub state: QuestionState,
+    /// The session that owns it.
+    pub session_id: SessionId,
+    /// When it reached a terminal state.
+    pub resolved_at_ms: Nullable<TimestampMs>,
+    /// The question as it now stands, or null where the host withheld it from this caller.
+    pub question: Nullable<Question>,
+}
+
+impl QuestionResolveResult {
+    /// Returns the result that shows `question` in full.
+    #[must_use]
+    pub fn whole(question: Question) -> Self {
+        let mut result = Self::record_of(&question);
+        result.question = Nullable::some(question);
+        result
+    }
+
+    /// Returns the result of this resolution with the question withheld.
+    #[must_use]
+    pub fn withheld(&self) -> Self {
+        Self {
+            question_id: self.question_id,
+            revision: self.revision,
+            state: self.state,
+            session_id: self.session_id,
+            resolved_at_ms: self.resolved_at_ms,
+            question: Nullable::null(),
+        }
+    }
+
+    /// Returns the question, when the host showed it.
+    #[must_use]
+    pub fn question(&self) -> Option<&Question> {
+        self.question.as_ref()
+    }
+
+    /// Returns the question, when the host showed it, and consumes the result.
+    #[must_use]
+    pub fn into_question(self) -> Option<Question> {
+        self.question.0
+    }
+
+    fn record_of(question: &Question) -> Self {
+        Self {
+            question_id: question.question_id,
+            revision: question.revision,
+            state: question.state,
+            session_id: question.session_id,
+            resolved_at_ms: question.resolved_at_ms,
+            question: Nullable::null(),
+        }
+    }
 }
 
 /// What happened to a question, for the attention feed.
@@ -1024,6 +1087,82 @@ mod tests {
         assert!(build_choices(QuestionKind::Select, &many).is_err());
         let twelve: Vec<QuestionChoice> = (0..12).map(|index| choice(&index.to_string())).collect();
         assert!(build_choices(QuestionKind::Select, &twelve).is_ok());
+    }
+
+    /// A resolved question with text in every place a person or an application wrote some.
+    fn resolved_question() -> Question {
+        let mut resolved = question(QuestionKind::Select, &[choice("deploy"), choice("wait")]);
+        resolved.state = QuestionState::Answered;
+        resolved.revision = QuestionRevision::new(2);
+        resolved.context = "the nightly build is green".to_owned();
+        resolved.source.executable = Nullable::some("/opt/agent/bin/agent".to_owned());
+        resolved.source.agent_label = Nullable::some("the release agent".to_owned());
+        resolved.resolved_at_ms = Nullable::some(TimestampMs::new(9_000));
+        resolved.answer = Nullable::some(AnswerRecord {
+            answer: QuestionAnswer::Other {
+                text: "ship it after lunch".to_owned(),
+            },
+            actor_id: ActorId::new("device:test").expect("a principal"),
+            device_id: Nullable::null(),
+            question_revision: QuestionRevision::new(1),
+            answered_at_ms: TimestampMs::new(9_000),
+        });
+        resolved
+    }
+
+    /// KR-REQ-10.49: a resolution result shows the question whole, and its record of the
+    /// resolution agrees with the question it shows.
+    #[test]
+    fn a_whole_resolution_result_shows_the_question_and_its_record_agrees() {
+        let resolved = resolved_question();
+        let result = QuestionResolveResult::whole(resolved.clone());
+        assert_eq!(result.question_id, resolved.question_id);
+        assert_eq!(result.revision, resolved.revision);
+        assert_eq!(result.state, QuestionState::Answered);
+        assert_eq!(result.session_id, resolved.session_id);
+        assert_eq!(result.resolved_at_ms, resolved.resolved_at_ms);
+        assert_eq!(result.question(), Some(&resolved));
+        let json = serde_json::to_value(&result).expect("encodes");
+        let decoded: QuestionResolveResult = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, result);
+        assert_eq!(decoded.into_question(), Some(resolved));
+    }
+
+    /// KR-REQ-10.49: a withheld resolution result says so with a null question and carries no word
+    /// of the question, the choices, the answer or the source, while the host's own record of the
+    /// resolution stays.
+    #[test]
+    fn a_withheld_resolution_result_is_null_and_carries_none_of_the_content() {
+        let resolved = resolved_question();
+        let whole = QuestionResolveResult::whole(resolved.clone());
+        let withheld = whole.withheld();
+        assert_eq!(withheld.question(), None);
+        assert_eq!(withheld.question_id, resolved.question_id);
+        assert_eq!(withheld.revision, resolved.revision);
+        assert_eq!(withheld.state, QuestionState::Answered);
+        assert_eq!(withheld.session_id, resolved.session_id);
+        assert_eq!(withheld.resolved_at_ms, resolved.resolved_at_ms);
+
+        let json = serde_json::to_value(&withheld).expect("encodes");
+        assert_eq!(json["question"], serde_json::Value::Null);
+        let text = json.to_string();
+        for content in [
+            "which one?",
+            "the nightly build is green",
+            "Label deploy",
+            "Label wait",
+            "ship it after lunch",
+            "/opt/agent/bin/agent",
+            "the release agent",
+            "device:test",
+        ] {
+            assert!(!text.contains(content), "{content:?} is in {text}");
+        }
+        let decoded: QuestionResolveResult = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, withheld);
+
+        // A resolution whose question was withheld stays withheld when withheld again.
+        assert_eq!(withheld.withheld(), withheld);
     }
 
     #[test]

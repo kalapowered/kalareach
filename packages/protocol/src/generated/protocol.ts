@@ -2524,6 +2524,17 @@ export interface Receipt {
    */
   error: ProtocolError | null
   /**
+   * True when the host replaced the message of [`Self::error`] with one of its own, because the
+   * reader is not the local owner. An error's message can quote an upstream, a session or a
+   * person, and it carries no date of its own to hold to a history bound, so only the owner is
+   * shown it again. The code, the retry category and the diagnostic identifier stay.
+   *
+   * It is absent from the wire when it is false, so a receipt the host shows in full is byte
+   * for byte what a reader built before this member expects. Remove the default and the omission
+   * once no worker of a build before this member can still be running.
+   */
+  error_withheld?: boolean
+  /**
    * The method and version the digest covers.
    */
   method: string
@@ -2718,6 +2729,17 @@ export interface Receipt1 {
    * The failure recorded with a refusal, rejection or unknown outcome.
    */
   error: ProtocolError | null
+  /**
+   * True when the host replaced the message of [`Self::error`] with one of its own, because the
+   * reader is not the local owner. An error's message can quote an upstream, a session or a
+   * person, and it carries no date of its own to hold to a history bound, so only the owner is
+   * shown it again. The code, the retry category and the diagnostic identifier stay.
+   *
+   * It is absent from the wire when it is false, so a receipt the host shows in full is byte
+   * for byte what a reader built before this member expects. Remove the default and the omission
+   * once no worker of a build before this member can still be running.
+   */
+  error_withheld?: boolean
   /**
    * The method and version the digest covers.
    */
@@ -6515,6 +6537,17 @@ export interface Receipt2 {
    */
   error: ProtocolError | null
   /**
+   * True when the host replaced the message of [`Self::error`] with one of its own, because the
+   * reader is not the local owner. An error's message can quote an upstream, a session or a
+   * person, and it carries no date of its own to hold to a history bound, so only the owner is
+   * shown it again. The code, the retry category and the diagnostic identifier stay.
+   *
+   * It is absent from the wire when it is false, so a receipt the host shows in full is byte
+   * for byte what a reader built before this member expects. Remove the default and the omission
+   * once no worker of a build before this member can still be running.
+   */
+  error_withheld?: boolean
+  /**
    * The method and version the digest covers.
    */
   method: string
@@ -7678,6 +7711,22 @@ export interface ForwardedMutation {
    * grant to narrow by, and its peer credentials already proved it is this user.
    */
   grant_rights: ActionRight[]
+  /**
+   * The history scope of the grant the host decided this mutation under.
+   *
+   * Section 10 narrows a grant's history in one place, the shared host-side filter, and the
+   * worker applies it to the answer it gives the caller: the first answer to a question, and
+   * the retained answer to a duplicate. The worker holds no grants, so the scope travels with
+   * the mutation. It is absent for a caller acting under no grant. Absence never widens what a
+   * caller is shown: a worker shows retained content without a scope only to a caller it can
+   * see is the local owner.
+   *
+   * It is absent from the wire when it is absent, so a mutation without one is byte for byte
+   * what a worker built before scopes travelled with mutations reads, and the daemon's own link
+   * for a local caller's action never writes one. A daemon sends one only to a worker that states
+   * [`FORWARDED_RESULT_SCOPE`].
+   */
+  history?: HistoryScope | null
   mutation: MutationRequest1
 }
 /**
@@ -7715,6 +7764,37 @@ export interface ActorEnvelope1 {
    */
   ingress:
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
+ */
+export interface HistoryScope {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
+   */
+  named_approvals: PendingResourceId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
 }
 /**
  * A mutation request.
@@ -7844,37 +7924,6 @@ export interface ActorEnvelope2 {
    */
   ingress:
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
-}
-/**
- * How far back a grant may see, and which current resources it names explicitly.
- *
- * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
- * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
- * voice context. A later snapshot or a freshly generated summary never makes older underlying
- * content newly authorised.
- */
-export interface HistoryScope {
-  /**
-   * Whether the currently visible screen is included. This exception never grants inactive
-   * screen buffers, scrollback or the backing transcript.
-   */
-  include_live_screen: boolean
-  /**
-   * The earliest content this grant may see. Null means no retained history at all.
-   */
-  lower_bound_ms: TimestampMs | null
-  /**
-   * Current approvals named explicitly, on the same terms, each by the identity of the one
-   * resource the broker arbitrates for it.
-   *
-   * An upstream's own request identifier does not pick out one request: two connections both
-   * call their first request `1`. A resource identity names exactly one.
-   */
-  named_approvals: PendingResourceId[]
-  /**
-   * Current questions named explicitly, even when they were created before the lower bound.
-   */
-  named_questions: QuestionId[]
 }
 /**
  * A read request.
@@ -21410,45 +21459,19 @@ export interface QuestionReadResult {
 }
 /**
  * The result of `question.answer` and `question.cancel`.
+ *
+ * The first five members are the host's own record of the resolution. They carry no content an
+ * application or a person wrote, so every caller that took the action is told them. `question` is
+ * the question as it now stands, and null means the host withheld it: what a question asks, the
+ * context it gives, its choices, who asked it and what was answered are session content, and the
+ * host shows them under the caller's present view authority and history scope. A caller that
+ * sent the answer already holds what it said.
  */
 export interface QuestionResolveResult {
-  question: Question4
-}
-/**
- * One durable question.
- *
- * This is the whole public view. The caller token is deliberately not a field: it is returned to
- * the source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.
- */
-export interface Question4 {
   /**
-   * The answer, once there is one.
+   * The question as it now stands, or null where the host withheld it from this caller.
    */
-  answer: AnswerRecord | null
-  /**
-   * The options, including the free-text one for `select` and `confirm`.
-   */
-  choices: QuestionChoice[]
-  /**
-   * The concise decision context the source supplied.
-   */
-  context: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  created_at_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * What kind of answer it asks for.
-   */
-  kind: 'input' | 'select' | 'confirm'
-  /**
-   * The question itself.
-   */
-  question: string
+  question: Question | null
   /**
    * One agent-to-user question.
    */
@@ -21458,20 +21481,15 @@ export interface Question4 {
    */
   resolved_at_ms: TimestampMs | null
   /**
-   * Its revision. An answer names the exact revision it is answering.
+   * Its revision after the resolution.
    */
   revision: string
-  /**
-   * The session epoch, fixed at 1 in protocol version 1.
-   */
-  session_epoch: string
   /**
    * One KalaReach terminal session.
    */
   session_id: string
-  source: QuestionSource1
   /**
-   * Where it is in its life.
+   * Where it stands now.
    */
   state: 'pending' | 'answered' | 'cancelled' | 'expired'
 }
@@ -21553,6 +21571,17 @@ export interface Receipt3 {
    * The failure recorded with a refusal, rejection or unknown outcome.
    */
   error: ProtocolError | null
+  /**
+   * True when the host replaced the message of [`Self::error`] with one of its own, because the
+   * reader is not the local owner. An error's message can quote an upstream, a session or a
+   * person, and it carries no date of its own to hold to a history bound, so only the owner is
+   * shown it again. The code, the retry category and the diagnostic identifier stay.
+   *
+   * It is absent from the wire when it is false, so a receipt the host shows in full is byte
+   * for byte what a reader built before this member expects. Remove the default and the omission
+   * once no worker of a build before this member can still be running.
+   */
+  error_withheld?: boolean
   /**
    * The method and version the digest covers.
    */

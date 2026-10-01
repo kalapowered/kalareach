@@ -1112,6 +1112,7 @@ mod tests {
             payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
             accepted_deadline_ms: Nullable::null(),
             error: Nullable::null(),
+            error_withheld: false,
             updated_at_ms: kr_protocol::scalars::TimestampMs::new(0),
         }
     }

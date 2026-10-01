@@ -64,6 +64,7 @@ use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALI
 
 use crate::broker::MAX_SNAPSHOT_RESOURCES;
 use crate::error::{Result, WorkerError};
+use crate::history_filter::retained::{Disclosure, Occasion};
 use kr_protocol::projection::ProjectionEvent;
 
 use crate::output::OutputDelivery;
@@ -1898,8 +1899,10 @@ impl WorkerService {
     /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
     /// worker decides UTC deadlines from the same floor as it does; a worker that maps none states
     /// none. That it reads the history scope a forwarded read carries, which a daemon sends only to
-    /// a worker that says so, and that it holds a question read to that scope, without which a
-    /// daemon sends it no question read with one.
+    /// a worker that says so, that it holds a question read to that scope, without which a daemon
+    /// sends it no question read with one, and that it holds what it retains to the scope a
+    /// forwarded mutation carries, without which a daemon shows a paired device none of a retained
+    /// answer it gives.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
@@ -1909,6 +1912,7 @@ impl WorkerService {
                 [
                     kr_protocol::local::FORWARDED_HISTORY_SCOPE,
                     kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+                    kr_protocol::local::FORWARDED_RESULT_SCOPE,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -3014,7 +3018,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
-            Method::ActionRead => self.action_read(state, &caller.actor_id, &request.params),
+            Method::ActionRead => self.action_read(state, caller, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params, caller),
@@ -3391,7 +3395,10 @@ impl WorkerService {
         self.mutation(
             state,
             &forwarded.mutation,
-            &Caller::forwarded(&forwarded.actor, &forwarded.grant_rights),
+            // The scope the daemon decided this mutation under travels with it: what this worker
+            // shows of the answer, now and when the action is read again, is held to it.
+            &Caller::forwarded(&forwarded.actor, &forwarded.grant_rights)
+                .within(forwarded.history.clone()),
             Freshness::Vouched(deadline),
             proxied,
         )
@@ -3494,7 +3501,7 @@ impl WorkerService {
         // its own effect moved the subject on.
         let work = work_class(method);
         let volatile_permitted = work.survives_a_journal_fault();
-        match self.retained(&actor_id, mutation, digest) {
+        match self.retained(caller, mutation, method, digest) {
             Ok(Some(retained)) => return Ok(Answered::Retained(retained)),
             Ok(None) => {}
             // A journal this host cannot read has no retained action to give back. For an ordinary
@@ -3787,7 +3794,34 @@ impl WorkerService {
                 });
             }
         }
-        Ok(Answered::Performed(value))
+        // What the journal kept is what the effect produced. What this caller is shown of it is
+        // decided now, for this caller, and the kept bytes are not touched.
+        Ok(Answered::Performed(self.shown(
+            caller,
+            method,
+            value,
+            Occasion::First,
+        )?))
+    }
+
+    /// Returns the answer to a mutation as the caller it is for is shown it.
+    ///
+    /// The caller's view comes from the rights the daemon decided the mutation under: content is
+    /// shown only to a caller that holds `session.view` over the session, however far its history
+    /// reaches. The local owner holds no grant and is shown everything.
+    fn shown(
+        &self,
+        caller: &Caller,
+        method: Method,
+        result: ParamsValue,
+        occasion: Occasion,
+    ) -> Result<ParamsValue> {
+        let disclosure = caller.disclosure(
+            caller
+                .grant_rights
+                .contains(&kr_protocol::rights::ActionRight::SessionView),
+        );
+        crate::history_filter::retained::shown_result(&disclosure, method, result, occasion)
     }
 
     /// Returns the bytes the journal keeps as this mutation's intent.
@@ -3846,12 +3880,17 @@ impl WorkerService {
     /// The de-duplication key is the actor and the action together, so this can only ever find the
     /// calling actor's own action. An identifier reused with a different payload is a conflict, not
     /// a second action.
+    ///
+    /// What the caller is shown of it is decided now, for the caller as it is now: the stored
+    /// result and the receipt are not changed ([`Self::shown`]).
     fn retained(
         &self,
-        actor_id: &ActorId,
+        caller: &Caller,
         mutation: &MutationRequest,
+        method: Method,
         digest: kr_protocol::scalars::Digest256,
     ) -> Result<Option<ParamsValue>> {
+        let actor_id = &caller.actor_id;
         let (receipt, result) = {
             let mut session = self.runtime.session();
             let Some(journal) = session.journal_mut() else {
@@ -3871,15 +3910,23 @@ impl WorkerService {
         if let Some(bytes) = result {
             let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
                 .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-            return Ok(Some(ParamsValue::new(value)));
+            return self
+                .shown(caller, method, ParamsValue::new(value), Occasion::Replay)
+                .map(Some);
         }
         // The action is known and it has no result to return. Section 9 answers that with the
         // receipt as it stands rather than performing the effect a second time or refusing as
         // though the request were malformed: the caller learns the action's real state and can
-        // read it again when it settles.
+        // read it again when it settles. Its error, if it has one, is shown as it is to anybody
+        // but the owner.
+        let disclosure = caller.disclosure(
+            caller
+                .grant_rights
+                .contains(&kr_protocol::rights::ActionRight::SessionView),
+        );
         encode(&kr_protocol::receipt::ReceiptResponse {
             request_id: mutation.request_id,
-            receipt,
+            receipt: crate::history_filter::retained::shown_receipt(&disclosure, receipt),
         })
         .map(Some)
     }
@@ -4322,24 +4369,32 @@ impl WorkerService {
                 self.bind_source_in(session, state)?;
                 Ok(())
             }
+            // The answering surface needs `question.respond` and nothing else, so what is decided
+            // here is reach, never view: a question this caller's history does not reach, and
+            // that its grant does not name while it is open, is refused as one the session does
+            // not hold, before anything about it is said.
             Method::QuestionAnswer => {
                 let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Ok(self.questions.check_resolvable(
+                let reach = caller.disclosure(true);
+                Ok(self.questions.check_resolvable_reaching(
                     params.question_id,
                     params.expected_revision,
                     Some(&params.answer),
                     self.question_clock(),
+                    |question| reach.reaches_question(question),
                 )?)
             }
             Method::QuestionCancel => {
                 let params: kr_protocol::question::QuestionCancelParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Ok(self.questions.check_resolvable(
+                let reach = caller.disclosure(true);
+                Ok(self.questions.check_resolvable_reaching(
                     params.question_id,
                     params.expected_revision,
                     None,
                     self.question_clock(),
+                    |question| reach.reaches_question(question),
                 )?)
             }
             // Every agent mutation names one subject, and the subject names this session. What
@@ -5258,18 +5313,27 @@ impl WorkerService {
         encode(&answer)
     }
 
-    /// Returns a retained receipt and its result to the actor that owns it.
+    /// Returns a retained receipt and its result to the actor that owns it, as that actor is shown
+    /// them now.
     ///
     /// The de-duplication key is the actor and the action together, so a lookup here can only ever
     /// find this caller's own action. An identifier belonging to somebody else simply is not
     /// present, which is what keeps an action identifier from being a way to read another actor's
     /// result.
+    ///
+    /// Owning an action identifies its receipt; it does not keep access to what the receipt holds.
+    /// The control daemon checks the caller's present view authority over the session before it
+    /// forwards the read, so this caller holds `session.view` ([`Caller::disclosure`]), and what is
+    /// left is the caller's history: the receipt's error text is shown to the owner alone, and the
+    /// result is built for the caller as [`crate::history_filter::retained::shown_result`] decides.
+    /// What is kept is not changed.
     fn action_read(
         &self,
         state: &ConnectionState,
-        actor_id: &ActorId,
+        caller: &Caller,
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
+        let actor_id = &caller.actor_id;
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
         let mut session = self.runtime.session();
         // A worker serves the receipts of the one session it owns. A read that names a session
@@ -5289,15 +5353,29 @@ impl WorkerService {
             })?;
         let retained = journal.read_result(actor_id, params.action_id)?;
         drop(session);
+        // The daemon decided this read under `session.view` over the routed session.
+        let disclosure = caller.disclosure(true);
         let result = retained
             .map(|bytes| {
-                kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
                     .map(ParamsValue::new)
-                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))
+                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+                // A result is shown by the method that kept it, which the receipt names. A method
+                // this build does not know is shown to the owner as it is and to nobody else.
+                match receipt.method.method() {
+                    Some(method) => crate::history_filter::retained::shown_result(
+                        &disclosure,
+                        method,
+                        value,
+                        Occasion::Replay,
+                    ),
+                    None if disclosure == Disclosure::Whole => Ok(value),
+                    None => Err(crate::history_filter::retained::withheld_entirely()),
+                }
             })
             .transpose()?;
         let answer = kr_protocol::receipt::ActionReadResult {
-            receipt,
+            receipt: crate::history_filter::retained::shown_receipt(&disclosure, receipt),
             result: Nullable(result),
         };
         // The result travels whole with the receipt, so the answer is held to what this connection
@@ -5964,18 +6042,20 @@ impl WorkerService {
             // a source cannot reach it and answer its own question.
             Method::QuestionAnswer => {
                 let params: kr_protocol::question::QuestionAnswerParams = parse(params)?;
-                let (result, _) = self.questions.answer(
+                let (resolution, _) = self.questions.answer(
                     &caller.actor_id,
                     caller.device(),
                     &params,
                     self.question_clock(),
                 )?;
-                Ok((encode(&result)?, AfterEffect::None))
+                // What is kept is the question as it stood, and each reader is shown an answer
+                // built from it ([`Self::shown`]).
+                Ok((encode(&resolution)?, AfterEffect::None))
             }
             Method::QuestionCancel => {
                 let params: kr_protocol::question::QuestionCancelParams = parse(params)?;
-                let (result, _) = self.questions.cancel(&params, self.question_clock())?;
-                Ok((encode(&result)?, AfterEffect::None))
+                let (resolution, _) = self.questions.cancel(&params, self.question_clock())?;
+                Ok((encode(&resolution)?, AfterEffect::None))
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(params)?;
@@ -6230,23 +6310,57 @@ impl Caller {
         &self,
         entry: &kr_protocol::authority::MethodEntry,
     ) -> Option<crate::history_filter::HistoryFilter> {
-        use crate::history_filter::{HistoryFilter, ViewerScope};
+        let session_view = entry.required_rights.iter().any(|required| {
+            required.when == kr_protocol::authority::RightCondition::Always
+                && required.authority
+                    == kr_protocol::authority::RequiredAuthority::Right {
+                        right: kr_protocol::rights::ActionRight::SessionView,
+                    }
+        });
+        self.viewer_scope(session_view)
+            .map(crate::history_filter::HistoryFilter::new)
+    }
+
+    /// Returns what this caller is shown of a retained result: everything, what its history scope
+    /// reaches, or the state of its action alone.
+    ///
+    /// `view` says whether the caller holds `session.view` over the session, which is not what
+    /// [`Self::history_filter`] reads from a method's entry: a retained result is read under the
+    /// present view authority the control daemon decided the request with, which is an
+    /// intersection, not a right the entry names. For a mutation it is the rights the grant
+    /// carried, and for a forwarded `action.read` it is always true, because the daemon forwards
+    /// that read only after it has decided `session.view` over the routed session. The scope's
+    /// reach is built as though the caller held the right, so that whether it may *answer* a
+    /// question is decided by its history and its names alone.
+    ///
+    /// It is built from the same scope as [`Self::history_filter`], so a caller's history
+    /// becomes a viewer's scope in one place.
+    #[must_use]
+    pub fn disclosure(&self, view: bool) -> Disclosure {
+        use crate::history_filter::HistoryFilter;
+        match self.viewer_scope(true) {
+            Some(scope) if scope.is_unrestricted() => Disclosure::Whole,
+            Some(scope) => Disclosure::Scoped {
+                reach: HistoryFilter::new(scope),
+                view,
+            },
+            None => Disclosure::StateOnly,
+        }
+    }
+
+    /// Returns the viewer scope this caller reads under: the scope that came with its frame,
+    /// whoever carries it, else the owner's when this is the local owner, else none.
+    ///
+    /// The one place a caller becomes a viewer's scope. A scope that came with the frame is the
+    /// grant's, and a scope never widens what a caller reads; without one only the local owner
+    /// reads, and it reads everything, because there is no grant to narrow it.
+    fn viewer_scope(&self, session_view: bool) -> Option<crate::history_filter::ViewerScope> {
+        use crate::history_filter::ViewerScope;
 
         if let Some(history) = &self.history {
-            let session_view = entry.required_rights.iter().any(|required| {
-                required.when == kr_protocol::authority::RightCondition::Always
-                    && required.authority
-                        == kr_protocol::authority::RequiredAuthority::Right {
-                            right: kr_protocol::rights::ActionRight::SessionView,
-                        }
-            });
-            return Some(HistoryFilter::new(ViewerScope::from_history(
-                history,
-                session_view,
-            )));
+            return Some(ViewerScope::from_history(history, session_view));
         }
-        self.is_local_owner()
-            .then(|| HistoryFilter::new(ViewerScope::owner()))
+        self.is_local_owner().then(ViewerScope::owner)
     }
 
     /// Returns true when this caller reached the host over a network transport.

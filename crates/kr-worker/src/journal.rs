@@ -1028,6 +1028,7 @@ impl Journal {
             payload_digest: submission.payload_digest,
             accepted_deadline_ms: Nullable(submission.accepted_deadline_ms),
             error: Nullable::null(),
+            error_withheld: false,
             updated_at_ms: submission.now_ms,
         };
         let transaction = self
@@ -2486,6 +2487,7 @@ impl Journal {
                 payload_digest: Digest256::from_bytes([0; 32]),
                 accepted_deadline_ms: Nullable::null(),
                 error: Nullable(Some(ProtocolError::new(code, detail.to_owned()))),
+                error_withheld: false,
                 updated_at_ms: now_ms,
             };
             sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
@@ -3617,6 +3619,7 @@ impl RawReceipt {
                     .map(|deadline| TimestampMs::new(u64::try_from(deadline).unwrap_or(0))),
             ),
             error: Nullable(error),
+            error_withheld: false,
             updated_at_ms: TimestampMs::new(u64::try_from(self.updated_at_ms).unwrap_or(0)),
         })
     }

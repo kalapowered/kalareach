@@ -200,6 +200,26 @@ pub fn holds_question_reads_to_scopes(capabilities: &CanonicalSet<CapabilityId>)
         .any(|capability| capability.as_str() == FORWARDED_QUESTION_SCOPE)
 }
 
+/// The capability a worker states when it holds what it retains to the history scope a forwarded
+/// frame carries: the first answer to a `question.answer` or `question.cancel`, the answer to a
+/// duplicate of any mutation, and the answer to an `action.read`. A control daemon reads it before
+/// it sends a mutation's scope ([`ForwardedMutation::history`]) or a `question.answer`,
+/// `question.cancel` or `action.read` that carries one.
+///
+/// A worker of an earlier build keeps a retained answer whole, so a daemon never passes one of its
+/// retained answers to a paired device. It also ends the link a frame with a member it does not
+/// know arrived on, which is why the member is sent only to a worker that states this.
+pub const FORWARDED_RESULT_SCOPE: &str = "forwarded.result-scope/1";
+
+/// Returns true when a worker's statement says it holds what it retains to a forwarded frame's
+/// history scope ([`FORWARDED_RESULT_SCOPE`]).
+#[must_use]
+pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_RESULT_SCOPE)
+}
+
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
 /// identity, as 32 lowercase hexadecimal digits.
 pub const UTC_FLOOR_PREFIX: &str = "utc-floor/";
@@ -311,6 +331,21 @@ pub struct ForwardedMutation {
     /// long past, because the clock restarts at the boot, so a stale one expires rather than being
     /// honoured.
     pub accepted_deadline_boot_ms: U64,
+    /// The history scope of the grant the host decided this mutation under.
+    ///
+    /// Section 10 narrows a grant's history in one place, the shared host-side filter, and the
+    /// worker applies it to the answer it gives the caller: the first answer to a question, and
+    /// the retained answer to a duplicate. The worker holds no grants, so the scope travels with
+    /// the mutation. It is absent for a caller acting under no grant. Absence never widens what a
+    /// caller is shown: a worker shows retained content without a scope only to a caller it can
+    /// see is the local owner.
+    ///
+    /// It is absent from the wire when it is absent, so a mutation without one is byte for byte
+    /// what a worker built before scopes travelled with mutations reads, and the daemon's own link
+    /// for a local caller's action never writes one. A daemon sends one only to a worker that states
+    /// [`FORWARDED_RESULT_SCOPE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::grant::HistoryScope>,
 }
 
 /// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
@@ -528,6 +563,7 @@ mod tests {
                 },
                 grant_rights: rights.iter().copied().collect(),
                 accepted_deadline_boot_ms: U64::new(5),
+                history: None,
             }))
         };
 
@@ -637,6 +673,128 @@ mod tests {
             kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
             "an earlier worker cannot read a scope"
         );
+    }
+
+    /// A forwarded mutation without a history scope is the frame a worker of an earlier build
+    /// reads, member for member, and a frame such a daemon wrote reads as one without a scope. A
+    /// scope round-trips, and an earlier worker could not read it, which is why a daemon sends one
+    /// only to a worker that states it holds results to a scope.
+    #[test]
+    fn a_forwarded_mutation_without_a_scope_is_the_frame_an_earlier_worker_reads() {
+        use crate::actor::{ActorEnvelope, ActorIngress};
+        use crate::envelope::{ActionTarget, MutationRequest};
+        use crate::grant::HistoryScope;
+        use crate::ids::{
+            ActionId, ActionWindowId, ActorId, ConnectionId, ControllerGeneration, EnvironmentId,
+        };
+        use crate::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64, Uuid};
+
+        /// The frame as a worker built before scopes travelled with mutations declares it.
+        #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Earlier {
+            mutation: MutationRequest,
+            actor: ActorEnvelope,
+            #[serde(with = "super::worker_rights")]
+            grant_rights: CanonicalSet<crate::rights::ActionRight>,
+            accepted_deadline_boot_ms: U64,
+        }
+
+        let mutation = |history: Option<HistoryScope>| super::ForwardedMutation {
+            mutation: MutationRequest {
+                request_id: RequestId::new(1),
+                method: Method::QuestionAnswer.into(),
+                method_version: MethodVersion::V1,
+                action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                grant_id: Nullable::null(),
+                target: ActionTarget {
+                    environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                    session_id: Nullable::null(),
+                    session_epoch: Nullable::null(),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                expected: ParamsValue::empty(),
+                action_window_id: ActionWindowId::new("device:test").expect("a window"),
+                requested_ttl_ms: DurationMs::new(30_000),
+                params: ParamsValue::empty(),
+            },
+            actor: ActorEnvelope {
+                actor_id: ActorId::new("device:test").expect("a principal"),
+                ingress: ActorIngress::PairedDevice,
+                device_id: Nullable::null(),
+                grant_id: Nullable::null(),
+                grant_revision: Nullable::null(),
+                controller_generation: ControllerGeneration::new(1),
+                connection_id: ConnectionId::new(Uuid::from_bytes([3; 16])),
+            },
+            grant_rights: CanonicalSet::new(),
+            accepted_deadline_boot_ms: U64::new(5),
+            history,
+        };
+        let limits = kr_cbor::Limits::DEFAULT;
+
+        let unscoped = mutation(None);
+        let bytes = kr_cbor::to_canonical_vec(&unscoped).expect("encodes");
+        let earlier: Earlier =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("an earlier worker reads it");
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&earlier).expect("encodes"),
+            bytes,
+            "no scope, no member"
+        );
+        let decoded: super::ForwardedMutation =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(
+            decoded, unscoped,
+            "an earlier daemon's frame reads as unscoped"
+        );
+
+        let scoped = mutation(Some(HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(2_000)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        }));
+        let bytes = kr_cbor::to_canonical_vec(&scoped).expect("encodes");
+        let decoded: super::ForwardedMutation =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(decoded, scoped);
+        assert!(
+            kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
+            "an earlier worker cannot read a scope"
+        );
+    }
+
+    #[test]
+    fn a_worker_states_that_it_holds_results_to_a_scope() {
+        use crate::ids::CapabilityId;
+        use crate::scalars::CanonicalSet;
+
+        let statement = |capabilities: &[&str]| -> CanonicalSet<CapabilityId> {
+            capabilities
+                .iter()
+                .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
+                .collect()
+        };
+        assert_eq!(super::FORWARDED_RESULT_SCOPE, "forwarded.result-scope/1");
+        assert!(super::holds_results_to_scopes(&statement(&[
+            super::FORWARDED_RESULT_SCOPE
+        ])));
+        // A worker that reads a scope and holds its question reads to it still keeps a retained
+        // answer whole, and a worker that states nothing at all is the same.
+        assert!(!super::holds_results_to_scopes(&statement(&[
+            super::FORWARDED_HISTORY_SCOPE,
+            super::FORWARDED_QUESTION_SCOPE,
+        ])));
+        assert!(!super::holds_results_to_scopes(&CanonicalSet::new()));
+        // The statements are read apart.
+        assert!(!super::reads_history_scopes(&statement(&[
+            super::FORWARDED_RESULT_SCOPE
+        ])));
+        assert!(!super::holds_question_reads_to_scopes(&statement(&[
+            super::FORWARDED_RESULT_SCOPE
+        ])));
     }
 
     #[test]

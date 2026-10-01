@@ -45,6 +45,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::sharing::LiveScreenPreview;
 
 mod preview;
+pub mod retained;
 
 pub use preview::live_screen_preview;
 

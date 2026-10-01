@@ -641,16 +641,22 @@ methods! {
     QuestionAnswer = "question.answer", QuestionUserInterface,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(QuestionRespond)],
     selectors: [Session, Question],
-    history: NotApplicable, capability: cap("question", QuestionRevision),
+    history: NamedCurrentResources, capability: cap("question", QuestionRevision),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
-    doc: "Answer the exact question revision shown, resolved atomically.";
+    doc: "Answer the exact question revision shown, resolved atomically. Only a question the \
+          caller's history reaches, or its grant names while it is open, can be answered. The \
+          result shows the question under the caller's present view authority and history scope, \
+          and the same holds for a retained copy of it.";
 
     QuestionCancel = "question.cancel", QuestionUserInterface,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(QuestionRespond)],
     selectors: [Session, Question],
-    history: NotApplicable, capability: cap("question", QuestionRevision),
+    history: NamedCurrentResources, capability: cap("question", QuestionRevision),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
-    doc: "Cancel the exact question revision shown, resolved atomically.";
+    doc: "Cancel the exact question revision shown, resolved atomically. Only a question the \
+          caller's history reaches, or its grant names while it is open, can be cancelled. The \
+          result shows the question under the caller's present view authority and history scope, \
+          and the same holds for a retained copy of it.";
 
     // ----- Skill setup ----------------------------------------------------------------------
     AgentToolsInstall = "agent_tools.install", SkillSetup,

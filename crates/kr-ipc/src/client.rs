@@ -601,6 +601,10 @@ impl LocalClient {
     /// the grant it was checked against, and the deadline it accepted; the deadline is on the
     /// machine's own continuous clock so both processes read the same instant.
     ///
+    /// The frame carries no history scope: this is the link a local caller's own action travels,
+    /// and a worker of any build reads it. A scope goes only over a proxy link, to a worker that
+    /// states it holds results to one.
+    ///
     /// # Errors
     ///
     /// Returns the host's error, or a transport failure.
@@ -624,6 +628,7 @@ impl LocalClient {
                     actor: actor.clone(),
                     grant_rights: grant_rights.clone(),
                     accepted_deadline_boot_ms,
+                    history: None,
                 },
             )))
             .await?;
