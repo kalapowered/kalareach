@@ -173,11 +173,18 @@ mod macos {
         returned.max(verdict.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) -> Result<(), String> {
+    /// How long the check waits for something the web view does, before it calls the thing never
+    /// done. What it waits for is the web view's own work: a page that loads, a navigation that
+    /// reaches its handler, a window that opens. On a machine with every core busy that takes as long
+    /// as the machine takes, and the wait ends the moment the thing is done, so the bound only says
+    /// that it will not be.
+    const LIVENESS: Duration = Duration::from_secs(120);
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) -> Result<(), String> {
         let started = Instant::now();
         while !done() {
-            if started.elapsed() > limit {
-                return Err(format!("{what} did not happen within {limit:?}"));
+            if started.elapsed() > LIVENESS {
+                return Err(format!("{what} did not happen within {LIVENESS:?}"));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -192,10 +199,23 @@ mod macos {
         address(window).starts_with("tauri://localhost")
     }
 
-    fn open(app: &AppHandle, label: &str, guarded: bool) -> Result<WebviewWindow, String> {
+    /// The page loads that have finished in a window.
+    type Loads = Arc<std::sync::atomic::AtomicUsize>;
+
+    /// Opens a window on the bundle and waits until its page has loaded: a script sent to a window
+    /// before then is sent to a page that is about to be replaced, and the window already reports
+    /// the bundle's address while its page has not begun to load.
+    fn open(app: &AppHandle, label: &str, guarded: bool) -> Result<(WebviewWindow, Loads), String> {
+        let loads = Loads::default();
+        let counting = Arc::clone(&loads);
         let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
             .title(label)
-            .inner_size(320.0, 240.0);
+            .inner_size(320.0, 240.0)
+            .on_page_load(move |_window, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
         let builder = if guarded {
             companion_tauri::account::navigation::guard(builder, None)
         } else {
@@ -216,27 +236,53 @@ mod macos {
             })
         };
         let window = builder.build().map_err(|error| error.to_string())?;
-        wait_for(
-            &format!("{label} loading the bundle"),
-            Duration::from_secs(20),
-            || bundled(&window),
-        )?;
-        Ok(window)
+        wait_for(&format!("{label}'s page loading"), || {
+            loads.load(std::sync::atomic::Ordering::SeqCst) >= 1 && bundled(&window)
+        })?;
+        Ok((window, loads))
+    }
+
+    /// What a failed wait for a refusal says besides what it waited for: how often the refusal was
+    /// reported, where the window is, and how many loads have finished in it, which tell a refusal
+    /// that never came from one reported twice, and from a page that never loaded.
+    fn refusal_failure(
+        failure: &str,
+        messages: &Messages,
+        refused: &str,
+        window: &WebviewWindow,
+        loads: &Loads,
+    ) -> String {
+        format!(
+            "{failure}; it was reported {} times, the window is at {}, and {} page loads finished",
+            messages.count(refused),
+            address(window),
+            loads.load(std::sync::atomic::Ordering::SeqCst)
+        )
     }
 
     fn check(app: &AppHandle, messages: &Messages) -> Result<(), String> {
         // Navigation, with the production handler: the handler refuses it and the window stays on
         // the bundled interface.
-        let guarded = open(app, "guarded", true)?;
+        let (guarded, loads) = open(app, "guarded", true)?;
         guarded
             .eval(format!("location.assign('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        wait_for(
-            "the production handler refusing the navigation",
-            Duration::from_secs(10),
-            || messages.count(NAVIGATION_REFUSED) == 1,
-        )?;
+        wait_for("the production handler refusing the navigation", || {
+            messages.count(NAVIGATION_REFUSED) >= 1
+        })
+        .map_err(|failure| {
+            refusal_failure(&failure, messages, NAVIGATION_REFUSED, &guarded, &loads)
+        })?;
         std::thread::sleep(Duration::from_secs(2));
+        if messages.count(NAVIGATION_REFUSED) != 1 {
+            return Err(refusal_failure(
+                "the navigation was refused once",
+                messages,
+                NAVIGATION_REFUSED,
+                &guarded,
+                &loads,
+            ));
+        }
         if !bundled(&guarded) {
             return Err(format!(
                 "the guarded window left the bundle for {}",
@@ -249,12 +295,20 @@ mod macos {
         guarded
             .eval(format!("window.open('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        wait_for(
-            "the production handler refusing the popup",
-            Duration::from_secs(10),
-            || messages.count(WINDOW_REFUSED) == 1,
-        )?;
+        wait_for("the production handler refusing the popup", || {
+            messages.count(WINDOW_REFUSED) >= 1
+        })
+        .map_err(|failure| refusal_failure(&failure, messages, WINDOW_REFUSED, &guarded, &loads))?;
         std::thread::sleep(Duration::from_secs(2));
+        if messages.count(WINDOW_REFUSED) != 1 {
+            return Err(refusal_failure(
+                "the popup was refused once",
+                messages,
+                WINDOW_REFUSED,
+                &guarded,
+                &loads,
+            ));
+        }
         let held = app.webview_windows().len();
         if held != 1 {
             return Err(format!("the guarded window's popup made {held} web views"));
@@ -265,53 +319,23 @@ mod macos {
 
         // The controls: without the handlers the same page leaves, and a permissive handler
         // creates the popup, so the two checks above are checks of the handlers.
-        let control = open(app, "control", false)?;
+        let (control, _) = open(app, "control", false)?;
         control
             .eval(format!("window.open('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        wait_for("the control's popup", Duration::from_secs(10), || {
-            app.webview_windows().len() == 3
-        })?;
+        wait_for("the control's popup", || app.webview_windows().len() == 3)?;
         control
             .eval(format!("location.assign('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        wait_for(
-            "the control leaving the bundle",
-            Duration::from_secs(20),
-            || address(&control).starts_with(WEBSITE),
-        )?;
+        wait_for("the control leaving the bundle", || {
+            address(&control).starts_with(WEBSITE)
+        })?;
         // The control's windows have no production handler, so nothing more was refused.
         if messages.count(NAVIGATION_REFUSED) != 1 || messages.count(WINDOW_REFUSED) != 1 {
             return Err("a window without the production handlers reported a refusal".to_owned());
         }
         Ok(())
     }
-    /// A guarded window on the bundle, with a count of the page loads that have finished in it.
-    fn open_counting_loads(
-        app: &AppHandle,
-        label: &str,
-    ) -> Result<(WebviewWindow, Arc<std::sync::atomic::AtomicUsize>), String> {
-        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting = Arc::clone(&loads);
-        let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
-            .title(label)
-            .inner_size(320.0, 240.0)
-            .on_page_load(move |_window, payload| {
-                if payload.event() == tauri::webview::PageLoadEvent::Finished {
-                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-        let window = companion_tauri::account::navigation::guard(builder, None)
-            .build()
-            .map_err(|error| error.to_string())?;
-        wait_for(
-            &format!("{label} loading the bundle"),
-            Duration::from_secs(20),
-            || bundled(&window),
-        )?;
-        Ok((window, loads))
-    }
-
     /// The page-load check: two pages each hold a view, and reloading one ends only its own.
     fn page_load(
         app: &AppHandle,
@@ -321,17 +345,10 @@ mod macos {
     ) -> Result<(), String> {
         use companion_tauri::terminal::{TerminalViewState, TerminalViews};
 
-        // Each page's first load has finished before a view is opened on it, so the load that
-        // ends a view here is the reload and nothing earlier.
-        let (one, one_loads) = open_counting_loads(app, "view-one")?;
-        let (_two, two_loads) = open_counting_loads(app, "view-two")?;
-        for (page, loads) in [("view-one", &one_loads), ("view-two", &two_loads)] {
-            wait_for(
-                &format!("{page}'s first load finishing"),
-                Duration::from_secs(20),
-                || loads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            )?;
-        }
+        // Each page's first load has finished before a view is opened on it, which `open` waits
+        // for, so the load that ends a view here is the reload and nothing earlier.
+        let (one, _) = open(app, "view-one", true)?;
+        let (_two, _) = open(app, "view-two", true)?;
         let heard: Arc<Mutex<Vec<(u8, TerminalViewState)>>> = Arc::default();
         let publish = |page: u8| -> companion_tauri::terminal::Publish {
             let heard = Arc::clone(&heard);
@@ -359,7 +376,7 @@ mod macos {
             two_link.attach().await;
             (one_link, two_link)
         });
-        wait_for("both views attached", Duration::from_secs(10), || {
+        wait_for("both views attached", || {
             heard.lock().expect("the record").len() == 2
         })?;
         if views.held() != 2 {
@@ -376,9 +393,7 @@ mod macos {
                 "the reloaded page's view sent {sent:?} rather than its detach"
             ));
         }
-        wait_for("one view left", Duration::from_secs(10), || {
-            views.held() == 1
-        })?;
+        wait_for("one view left", || views.held() == 1)?;
         let quiet = runtime.block_on(async { two_link.quiet_for(Duration::from_secs(1)).await });
         if !quiet {
             return Err("the other page's view was sent something".to_owned());
