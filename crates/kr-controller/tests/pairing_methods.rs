@@ -2193,7 +2193,7 @@ mod terminal_catalogue {
                 ..
             } => {
                 assert_eq!(package_digest, &install.package_digest);
-                assert_eq!(grant, &install.grant.iter().cloned().collect::<Vec<_>>());
+                assert_eq!(grant, &install.grant);
                 assert_eq!(
                     grant_statement.as_ref(),
                     Some(&statement),
