@@ -880,7 +880,10 @@ mod tests {
     fn device(device_id: DeviceId, grant: Grant) -> DeviceRecord {
         DeviceRecord {
             device_id,
-            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([3; 32]),
+            // One endpoint per device: the directory keeps an endpoint to one record.
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes(
+                [device_id.get().as_bytes()[0]; 32],
+            ),
             device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
             authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([4; 32]),
             stored_envelope: None,
