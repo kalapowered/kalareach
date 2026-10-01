@@ -127,7 +127,10 @@ interface Opening {
   pending: TerminalMove[]
   /** When its moves began to wait without a break, while any wait. */
   since: number | null
-  /** Whether native code has said the view ended: nothing settles a move made after that. */
+  /**
+   * Whether the view has ended, by native code's word or because its open was refused: nothing
+   * settles a move made after that, and the page opens it again when the host connection returns.
+   */
   ended: boolean
   /** The person's newest control request: its number, and whether it takes control. */
   asked: ControlRequest
@@ -297,6 +300,7 @@ export function useTerminalView(
         },
         (failure: unknown) => {
           if (!current) return
+          open.ended = true
           stamps.current += 1
           setHeld({
             sessionId,
@@ -482,17 +486,14 @@ export function useTerminalView(
 
   // A view that has ended opens again when the page hears the host connection come back. A view
   // that is attached is left alone: its link to the session does not go through that connection.
-  const ended = state?.state === 'ended'
-  const endedNow = useRef(ended)
-  useEffect(() => {
-    endedNow.current = ended
-  }, [ended])
+  // The opening records its end when it is published, not when the page has drawn it, so a
+  // connection that returns in between is not lost.
   useEffect(() => {
     let stopped = false
     let stop: (() => void) | null = null
     void port
       .onConnection((connection) => {
-        if (connection.connected && endedNow.current) setAttempt((count) => count + 1)
+        if (connection.connected && opening.current?.ended === true) setAttempt((count) => count + 1)
       })
       .then(
         (unlisten) => {
