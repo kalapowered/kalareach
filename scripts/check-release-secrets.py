@@ -43,6 +43,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -202,11 +203,19 @@ def scan_member(path, data, depth, name=None):
     return scan_bytes(path, data, name)
 
 
-def files_under(directory):
-    for root, directories, names in os.walk(directory):
+def files_under(directory, unread):
+    """Every file under `directory`; a directory that cannot be listed is added to `unread`."""
+    def note(error):
+        unread.append((str(error.filename), f"was not inspected, because it cannot be listed ({reason(error)})"))
+
+    for root, directories, names in os.walk(directory, onerror=note):
         directories.sort()
         for name in sorted(names):
             yield os.path.join(root, name)
+
+
+def reason(error):
+    return error.strerror or type(error).__name__
 
 
 def tracked_files(directory):
@@ -223,7 +232,7 @@ def scan_paths(paths, tracked):
     found = []
     for given in paths:
         if os.path.isdir(given):
-            files = tracked_files(given) if tracked else files_under(given)
+            files = tracked_files(given) if tracked else files_under(given, found)
         elif os.path.isfile(given):
             files = [given]
         else:
@@ -232,11 +241,16 @@ def scan_paths(paths, tracked):
         for path in files:
             if os.path.islink(path):
                 continue
+            # Only a regular file is opened: a pipe or a device would wait for a writer that is
+            # never going to come, and holds no key a release could ship.
             try:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    found.append((path, "was not inspected, because it is not a regular file"))
+                    continue
                 with open(path, "rb") as handle:
                     data = handle.read()
             except OSError as error:
-                found.append((path, f"was not inspected, because it cannot be read ({error.strerror})"))
+                found.append((path, f"was not inspected, because it cannot be read ({reason(error)})"))
                 continue
             found += scan_member(path, data, 0) if path.lower().endswith(ARCHIVE_SUFFIXES) \
                 else scan_bytes(path, data)
@@ -368,6 +382,30 @@ def self_test():
                 failures.append(f"a file that cannot be read stopped the scan with {error!r}")
             if found is not None and not any("not inspected" in what for _, what in found):
                 failures.append(f"a file that cannot be read was counted clean: {found}")
+
+    # A directory that cannot be listed is named as one that was not inspected.
+    if os.name == "posix" and os.geteuid() != 0:
+        with tempfile.TemporaryDirectory(prefix="kalareach-secrets-") as scratch:
+            sealed = os.path.join(scratch, "tree", "sealed")
+            os.makedirs(sealed)
+            with open(os.path.join(sealed, "key.pem"), "wb") as handle:
+                handle.write(b"anything")
+            os.chmod(sealed, 0)
+            try:
+                found = scan_paths([os.path.join(scratch, "tree")], False)
+            finally:
+                os.chmod(sealed, 0o700)
+            if not any("cannot be listed" in what for _, what in found):
+                failures.append(f"a directory that cannot be listed was counted clean: {found}")
+
+    # A pipe in a tree is named, and never opened: opening it would wait for a writer.
+    if hasattr(os, "mkfifo"):
+        with tempfile.TemporaryDirectory(prefix="kalareach-secrets-") as scratch:
+            os.makedirs(os.path.join(scratch, "tree"))
+            os.mkfifo(os.path.join(scratch, "tree", "pipe"))
+            found = scan_paths([os.path.join(scratch, "tree")], False)
+            if not any("not a regular file" in what for _, what in found):
+                failures.append(f"a pipe in a tree was not named: {found}")
 
     # A document too large to read for a private JSON Web Key is refused and never counted as clean.
     global TEXT_LIMIT
