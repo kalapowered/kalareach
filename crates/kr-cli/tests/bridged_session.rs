@@ -243,6 +243,17 @@ impl World {
         if let Some(temporary) = std::env::var_os("TMPDIR") {
             command.env("TMPDIR", temporary);
         }
+        // A rootless container runtime finds its own storage and sockets through these.
+        for variable in [
+            "HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            if let Some(value) = std::env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
         command
     }
 
@@ -867,5 +878,424 @@ async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel(
         String::from_utf8_lossy(&wrong.stderr).contains("different environment"),
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A real container with a Linux `kr` in it.
+
+/// The runtime these use, and the image it starts. The image carries a shell and the C library the
+/// binaries are linked against, and nothing of KalaReach.
+const RUNTIME: &str = "podman";
+const CONTAINER_IMAGE: &str = "docker.io/library/debian:stable-slim";
+
+/// Where the directory holding the Linux programs is mounted inside the container.
+const MOUNTED: &str = "/kr";
+
+fn runtime_available() -> bool {
+    let present = std::process::Command::new(RUNTIME)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !present {
+        eprintln!("skipped, because {RUNTIME} is not installed on this machine");
+    }
+    present
+}
+
+fn podman(arguments: &[&str]) -> std::process::Output {
+    std::process::Command::new(RUNTIME)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the runtime runs")
+}
+
+/// Puts the image in the runtime's store, once per run of this suite, before any container starts.
+fn image_present() {
+    static PULLED: std::sync::Once = std::sync::Once::new();
+    PULLED.call_once(|| {
+        if podman(&["image", "exists", CONTAINER_IMAGE])
+            .status
+            .success()
+        {
+            return;
+        }
+        let pulled = podman(&["pull", "--quiet", CONTAINER_IMAGE]);
+        assert!(
+            pulled.status.success(),
+            "the image is pulled: {}",
+            String::from_utf8_lossy(&pulled.stderr)
+        );
+    });
+}
+
+/// The directory mounted into the container: `kr`, the daemon that adds the one thing a test must
+/// not leave to a keychain (where its keys are kept) before it hands over, and the worker.
+fn programs_for_a_container() -> &'static Path {
+    static PLACED: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    &PLACED
+        .get_or_init(|| {
+            let directory = tempfile::tempdir().expect("a directory on the internal disk");
+            let place = |source: &Path, name: &str| {
+                kr_ipc::testing::place_program(source, &directory.path().join(name));
+            };
+            place(&support::kr(), "kr");
+            place(&beside_this_test("kr-worker"), "kr-worker");
+            place(&beside_this_test("kr-controller"), "kr-controller-real");
+            let script = directory.path().join("kr-controller.text");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nexec {MOUNTED}/kr-controller-real --secret-store file \"$@\"\n"
+                ),
+            )
+            .expect("writes the daemon script");
+            kr_ipc::testing::place_program(&script, &directory.path().join("kr-controller"));
+            let path = directory.path().to_path_buf();
+            (directory, path)
+        })
+        .1
+}
+
+/// A container this test made, removed by the identifier the runtime issued however the test ends.
+struct Container {
+    id: String,
+    name: String,
+}
+
+impl Container {
+    fn start() -> Self {
+        image_present();
+        let name = format!("kr-acc-{}", &kr_ipc::new_uuid().to_string()[..8]);
+        let mount = format!("{}:{MOUNTED}:ro", programs_for_a_container().display());
+        let started = podman(&[
+            "run",
+            "--detach",
+            "--pull=never",
+            "--name",
+            &name,
+            "--user",
+            "root",
+            "--volume",
+            &mount,
+            "--",
+            CONTAINER_IMAGE,
+            "sleep",
+            "900",
+        ]);
+        assert!(
+            started.status.success(),
+            "the container starts: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let printed = String::from_utf8_lossy(&started.stdout).into_owned();
+        let id = printed
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("the runtime printed an identifier")
+            .trim()
+            .to_owned();
+        assert!(
+            kr_protocol::identity::is_container_identifier(&id),
+            "the runtime issued a whole identifier: {id}"
+        );
+        Self { id, name }
+    }
+
+    /// Runs one command inside, as root, and says what it printed.
+    fn inside(&self, arguments: &[&str]) -> std::process::Output {
+        let mut command = vec!["exec", "--user", "root", "--", self.id.as_str()];
+        command.extend_from_slice(arguments);
+        podman(&command)
+    }
+
+    /// Chooses the standalone start for the daemon in this container, as a person sets one up,
+    /// then starts the daemon and waits until it answers.
+    fn serve(&self) {
+        let chosen = self.inside(&[
+            &format!("{MOUNTED}/kr"),
+            "host",
+            "startup",
+            "--set",
+            "standalone",
+        ]);
+        assert!(
+            chosen.status.success(),
+            "{}",
+            String::from_utf8_lossy(&chosen.stderr)
+        );
+        let started = podman(&[
+            "exec",
+            "--detach",
+            "--user",
+            "root",
+            "--",
+            &self.id,
+            &format!("{MOUNTED}/kr-controller"),
+            "--worker",
+            &format!("{MOUNTED}/kr-worker"),
+        ]);
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let deadline = Instant::now() + LIVENESS_DEADLINE;
+        while !self
+            .inside(&[&format!("{MOUNTED}/kr"), "list"])
+            .status
+            .success()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon in the container did not answer"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The environment identity the daemon in this container reports for itself.
+    fn environment_id(&self) -> String {
+        let doctor = self.inside(&[&format!("{MOUNTED}/kr"), "--json", "doctor"]);
+        assert!(
+            doctor.status.success(),
+            "{}",
+            String::from_utf8_lossy(&doctor.stderr)
+        );
+        let document: Value = serde_json::from_slice(&doctor.stdout).expect("doctor printed JSON");
+        document["environment_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("doctor names the environment: {document}"))
+            .to_owned()
+    }
+
+    fn state(&self) -> String {
+        let inspected = podman(&[
+            "container",
+            "inspect",
+            "--format",
+            "{{.State.Status}}",
+            "--",
+            &self.id,
+        ]);
+        String::from_utf8_lossy(&inspected.stdout).trim().to_owned()
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        // By the identifier this test recorded, never by a name somebody else might hold now.
+        let _ = podman(&["rm", "--force", "--time", "0", "--", &self.id]);
+        let _ = &self.name;
+    }
+}
+
+impl World {
+    /// Enrols the container by the identifier its runtime issued, asking its helper which
+    /// environment it is.
+    fn enrol_container(&self, container: &Container, label: &str) -> Value {
+        let helper = format!("{MOUNTED}/kr");
+        let enrolled = self.run(&[
+            "--json",
+            "bridge",
+            "enrol",
+            "--access",
+            "container",
+            "--label",
+            label,
+            "--target",
+            &container.id,
+            "--user",
+            "root",
+            "--helper",
+            &helper,
+            "--probe",
+        ]);
+        assert!(
+            enrolled.status.success(),
+            "{}; it said {}",
+            String::from_utf8_lossy(&enrolled.stdout),
+            String::from_utf8_lossy(&enrolled.stderr)
+        );
+        serde_json::from_slice(&enrolled.stdout).expect("kr printed JSON")
+    }
+}
+
+/// KR-REQ-03.17: an enrolled container, reached by the identifier its runtime issued and by the user
+/// and helper the record names, answers a real bridge: the identity it reports is the one its own
+/// daemon has, the host holds a record of the channel, and a session made through it is in the
+/// container and nowhere else. The Linux `kr`, `kr-controller` and `kr-worker` run inside a real
+/// container; nothing stands in for the runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there() {
+    if !runtime_available() {
+        return;
+    }
+    let container = Container::start();
+    container.serve();
+    let world = World::start().await;
+
+    let row = world.enrol_container(&container, "box");
+    assert_eq!(
+        row["row"]["enrolment"]["environment_id"],
+        container.environment_id(),
+        "the identity is the container's own daemon's: {row}"
+    );
+    assert_eq!(
+        row["row"]["enrolment"]["target"], container.id,
+        "and the record keeps the identifier the runtime issued, not its name: {row}"
+    );
+
+    let refreshed = world.run(&["--json", "bridge", "refresh", "box"]);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        refreshed["verification"]["environment_id"],
+        container.environment_id(),
+        "{refreshed}"
+    );
+    assert_eq!(
+        refreshed["verification"]["role"], "controller",
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["row"]["status"], "running", "{refreshed}");
+    assert_eq!(
+        refreshed["row"]["readiness"]["channel_scoped"], true,
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["started"], false, "{refreshed}");
+
+    let created = world.run(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--environment",
+        "box",
+        "--shell",
+        "/bin/sh",
+        "--startup",
+        "interactive",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}; it said {}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("kr printed JSON");
+    assert_eq!(created["state"], "live", "{created}");
+    assert_eq!(
+        created["environment_id"],
+        container.environment_id(),
+        "{created}"
+    );
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_owned();
+
+    // The session is the container's: its own `kr` lists it, and its worker is a process there.
+    let listed = container.inside(&[&format!("{MOUNTED}/kr"), "--json", "list"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("kr printed JSON");
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.iter().any(|entry| entry["session_id"] == session)),
+        "{listed}"
+    );
+    assert!(
+        container.inside(&["/bin/sh", "-c", "ls /proc/[0-9]*/exe | head -c 0; for p in /proc/[0-9]*; do case \"$(readlink $p/exe)\" in */kr-worker) exit 0;; esac; done; exit 1"])
+            .status
+            .success(),
+        "a kr-worker is running inside the container"
+    );
+    let here = world.run(&["--json", "list"]);
+    let here: Value = serde_json::from_slice(&here.stdout).expect("kr list printed JSON");
+    assert_eq!(here["sessions"].as_array().map_or(0, Vec::len), 0, "{here}");
+}
+
+/// KR-REQ-03.14, 03.17: a stopped container is listed from the cache and started by nothing but a
+/// refresh that is told to, a create or an attach; the container's own daemon is then started by the
+/// container's own startup, and the identity is the one it had before it stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
+    if !runtime_available() {
+        return;
+    }
+    let container = Container::start();
+    container.serve();
+    let world = World::start().await;
+    let enrolled = world.enrol_container(&container, "box");
+    let identity = container.environment_id();
+    assert_eq!(enrolled["row"]["enrolment"]["environment_id"], identity);
+
+    let stopped = podman(&["stop", "--time", "0", "--", &container.id]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_eq!(container.state(), "exited");
+
+    // A listing and a plain refresh read and observe, and start nothing.
+    let listed = world.run(&["--json", "bridge", "list"]);
+    assert!(listed.status.success());
+    let observed = world.run(&["--json", "bridge", "refresh", "box"]);
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let observed: Value = serde_json::from_slice(&observed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        observed["row"]["status"], "environment_stopped",
+        "{observed}"
+    );
+    assert_eq!(observed["verification"], Value::Null, "{observed}");
+    assert_eq!(
+        container.state(),
+        "exited",
+        "neither a listing nor a refresh starts a container"
+    );
+
+    // A create is allowed to: the container, and then the daemon its own startup chooses.
+    let created = world.run(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--environment",
+        "box",
+        "--shell",
+        "/bin/sh",
+        "--startup",
+        "interactive",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}; it said {}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("kr printed JSON");
+    assert_eq!(
+        container.state(),
+        "running",
+        "the create started the container"
+    );
+    assert_eq!(created["state"], "live", "{created}");
+    assert_eq!(
+        created["environment_id"], identity,
+        "the same installation answered after it stopped: {created}"
     );
 }
