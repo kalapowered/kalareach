@@ -1551,7 +1551,12 @@ impl DescriptionService {
             let session_id = dispatched.job.session_id;
             let cancelled = dispatched.cancellation.is_cancelled();
             let ran_at = dispatched.produced_under.context_revision;
-            let stop = if cancelled {
+            let stop = if cancelled
+                // A fence raised while this job was being dispatched finds no token to cancel, as
+                // it is raised before the job's is registered: the job is stopped here instead, at
+                // the next look, whatever the fence's own cancellation reached.
+                || self.fence.is_fenced(&session_id)
+            {
                 Stop::Cancelled
             } else if dispatched.outlived || !self.live_sessions.contains(&session_id) {
                 Stop::Closed

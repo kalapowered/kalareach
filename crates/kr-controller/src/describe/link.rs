@@ -60,9 +60,10 @@ impl Links {
         let task = tokio::spawn(async move {
             let mut pause = FIRST_RELINK;
             loop {
-                let Some(held) = host.upgrade() else {
+                // A host that is gone or has stopped has no use for a page: the task ends.
+                if !host.upgrade().is_some_and(|held| held.runs()) {
                     return;
-                };
+                }
                 let connected = tokio::time::timeout(
                     CONNECT_WAIT,
                     Controller::connect_role(
@@ -74,9 +75,8 @@ impl Links {
                 .await;
                 if let Ok(Ok(client)) = connected {
                     pause = FIRST_RELINK;
-                    read(client, &held, session_id).await;
+                    read(client, &host, session_id).await;
                 }
-                drop(held);
                 tokio::time::sleep(pause).await;
                 pause = (pause * 2).min(MAX_RELINK);
             }
@@ -120,7 +120,7 @@ impl Drop for Links {
 /// Keeps one request held over an open connection until it fails, handing each page to the host.
 async fn read(
     mut client: kr_ipc::client::LocalClient,
-    host: &Arc<DescribeHost>,
+    host: &Weak<DescribeHost>,
     session_id: SessionId,
 ) {
     let mut after = 0_u64;
@@ -157,6 +157,11 @@ async fn read(
         if let Some(facts) = &page.facts.0 {
             after = after.max(facts.revision.get());
         }
+        // Upgraded only to hand the page over, and never held across a wait: a host that is gone
+        // or has stopped ends this connection's reading.
+        let Some(host) = host.upgrade().filter(|host| host.runs()) else {
+            return;
+        };
         host.page(session_id, page);
     }
 }
