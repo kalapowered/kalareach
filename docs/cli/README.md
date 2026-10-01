@@ -1117,7 +1117,8 @@ community repository. In both cases it asks for the budgets the host says it all
 `catalogue.list` reports them, and for no capability beyond the default. If no owner device answers
 before the challenge ends, the command exits with `OWNER_CONFIRMATION_REQUIRED` and says that
 nothing was changed. A host that does not answer a request the command sent, or a connection that
-ends after it, leaves the outcome unknown, and the command says so. If the host has no owner device
+ends after it, leaves the outcome unknown: the command says so, with `OUTCOME_UNKNOWN`, and exits
+1, because the host refused nothing. If the host has no owner device
 yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
 owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
 
