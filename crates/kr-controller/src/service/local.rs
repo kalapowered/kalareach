@@ -142,9 +142,9 @@ impl Controller {
         matches!(tokio::time::timeout(bound, written).await, Ok(Ok(())))
     }
 
-    /// Arms the pause a retry stops at once it has found its retained answer, before the
-    /// admission it arrived under is asked again. Returns the end that says the retry has
-    /// arrived, and the end that lets it go. The pause fires once.
+    /// Arms the pause the next call stops at once it has looked for a retained answer, whether or
+    /// not it found one, before the admission it arrived under is asked again. Returns the end that
+    /// says the call has arrived, and the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]
     pub fn pause_retained_lookup(
         &self,
