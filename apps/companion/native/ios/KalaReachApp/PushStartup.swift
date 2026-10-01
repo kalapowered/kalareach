@@ -31,7 +31,6 @@ enum PushStartup {
                 NSLog("KalaReach: Firebase skipped, this build holds no GoogleService-Info.plist")
             case .configureFirebase:
                 FirebaseApp.configure()
-                Messaging.messaging().delegate = TokenListener.shared
                 PushRegistration.shared.onTokenUsable = { Messaging.messaging().apnsToken = $0 }
             case .addTokenMethods:
                 let added = installTokenMethods()
@@ -73,7 +72,7 @@ enum PushStartup {
         let outcome = DelegateMethods.install(
             on: delegateClass,
             received: { token in
-                NSLog("KalaReach: the system gave this device an APNs token of %d bytes", token.count)
+                NSLog("KalaReach: the system gave this device an APNs token of %ld bytes", token.count)
                 PushRegistration.shared.registered(deviceToken: token)
             },
             refused: { error in
@@ -85,14 +84,5 @@ enum PushStartup {
         UIApplication.shared.delegate = nil
         UIApplication.shared.delegate = delegate
         return true
-    }
-}
-
-/// Hears Firebase's registration token, which counts once the APNs token has been mapped.
-final class TokenListener: NSObject, MessagingDelegate {
-    static let shared = TokenListener()
-
-    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
-        PushRegistration.shared.fcmTokenReceived(fcmToken)
     }
 }

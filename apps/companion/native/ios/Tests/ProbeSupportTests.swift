@@ -130,5 +130,16 @@ final class ProbeSupportTests: XCTestCase {
         let sorted = DeliveredMarks.sort([odd], nonce: "7")
         XCTAssertEqual(sorted.matching.count, 0)
     }
+
+    // MARK: One report
+
+    func testOnlyTheFirstClaimReports() {
+        var report = OneReport()
+        XCTAssertFalse(report.claimed)
+        XCTAssertTrue(report.claim())
+        XCTAssertTrue(report.claimed)
+        XCTAssertFalse(report.claim(), "a late answer after a timeout leaves nothing behind")
+        XCTAssertFalse(report.claim())
+    }
 }
 #endif

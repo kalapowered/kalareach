@@ -7,6 +7,7 @@
 //  run before anything else has had a chance to write to it.
 //
 
+import UserNotifications
 import XCTest
 
 final class LaunchPlanTests: XCTestCase {
@@ -92,5 +93,13 @@ final class LaunchPlanTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testTheSystemsSettingIsReadWithoutAskingAndOnlyAYesAgrees() {
+        XCTAssertEqual(PushPermission(status: .authorized), .granted)
+        XCTAssertEqual(PushPermission(status: .provisional), .granted)
+        XCTAssertEqual(PushPermission(status: .ephemeral), .granted)
+        XCTAssertEqual(PushPermission(status: .denied), .refused)
+        XCTAssertEqual(PushPermission(status: .notDetermined), .unknown)
     }
 }

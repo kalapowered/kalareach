@@ -1,78 +1,18 @@
 //
-//  The two tokens push needs, and the order they count in.
+//  When the APNs token goes to Firebase, and what that lets a check ask for.
 //
-//  The system gives this device an APNs token and Firebase gives it a registration token. A
-//  registration token Firebase issues before the APNs token has been mapped to it cannot be
-//  delivered to, so it is held and does not count until the APNs token is there. And the APNs
-//  token is given to Firebase, which makes an installation and a registration token of its own
-//  from it, only once the person has agreed to notifications: registering for a token needs no
-//  agreement, so the token can arrive first and waits.
+//  The system gives this device an APNs token, and Firebase makes a registration token from it. A
+//  registration token is for one APNs token: it can be asked for only once Firebase has been given
+//  the current one, so none made earlier is ever used. And Firebase makes an installation and a
+//  registration token of its own from the APNs token it is given, which is for a person who has
+//  agreed to notifications: registering for a token needs no agreement, so the token can arrive
+//  first, and waits.
 //
 
 import XCTest
 
 final class PushRegistrationTests: XCTestCase {
     private let apnsToken = Data([0x0a, 0x1b, 0x2c, 0x3d])
-
-    func testAFirebaseTokenDoesNotCountBeforeTheAPNsTokenIsMapped() {
-        let registration = PushRegistration()
-        registration.fcmTokenReceived("fcm-token-1")
-        XCTAssertNil(registration.fcmToken)
-    }
-
-    func testTheHeldTokenCountsOnceTheAPNsTokenIsMapped() {
-        let registration = PushRegistration()
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.registered(deviceToken: apnsToken)
-        XCTAssertEqual(registration.fcmToken, "fcm-token-1")
-        XCTAssertEqual(registration.state, .registered(token: "0a1b2c3d"))
-    }
-
-    func testANewerTokenReplacesTheOneThatCounted() {
-        let registration = PushRegistration()
-        registration.registered(deviceToken: apnsToken)
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.fcmTokenReceived("fcm-token-2")
-        XCTAssertEqual(registration.fcmToken, "fcm-token-2")
-    }
-
-    func testANewAPNsTokenDropsTheRegistrationTokenMadeFromTheOldOne() {
-        // Firebase makes a new registration token when the APNs token changes. Until it has, the old
-        // one is for a device address that is gone.
-        let registration = PushRegistration()
-        registration.registered(deviceToken: apnsToken)
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.registered(deviceToken: Data([0x01, 0x02]))
-        XCTAssertNil(registration.fcmToken)
-        registration.fcmTokenReceived("fcm-token-2")
-        XCTAssertEqual(registration.fcmToken, "fcm-token-2")
-    }
-
-    func testTheSameAPNsTokenAgainKeepsTheRegistrationToken() {
-        let registration = PushRegistration()
-        registration.registered(deviceToken: apnsToken)
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.registered(deviceToken: apnsToken)
-        XCTAssertEqual(registration.fcmToken, "fcm-token-1")
-    }
-
-    func testTheSystemRefusingToRegisterTakesTheTokenAway() {
-        let registration = PushRegistration()
-        registration.registered(deviceToken: apnsToken)
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.failed(with: NSError(domain: "test", code: 1))
-        XCTAssertNil(registration.fcmToken)
-    }
-
-    func testAnEmptyTokenIsNoToken() {
-        let registration = PushRegistration()
-        registration.registered(deviceToken: apnsToken)
-        registration.fcmTokenReceived("fcm-token-1")
-        registration.fcmTokenReceived(nil)
-        XCTAssertNil(registration.fcmToken)
-    }
-
-    // MARK: When the APNs token goes to Firebase
 
     private func registration(collecting given: Box<[Data]>) -> PushRegistration {
         let registration = PushRegistration()
@@ -136,6 +76,77 @@ final class PushRegistrationTests: XCTestCase {
         registration.registered(deviceToken: apnsToken)
         XCTAssertEqual(given.value, [])
         XCTAssertEqual(registration.permission, .refused)
+    }
+
+    // MARK: What may be asked for
+
+    func testNothingMayBeAskedForUntilFirebaseHasTheAPNsToken() {
+        let given = Box<[Data]>([])
+        let neither = registration(collecting: given)
+        XCTAssertFalse(neither.tokenHandedToFirebase)
+        let tokenOnly = registration(collecting: given)
+        tokenOnly.registered(deviceToken: apnsToken)
+        XCTAssertFalse(tokenOnly.tokenHandedToFirebase, "no answer to the permission yet")
+        let agreementOnly = registration(collecting: given)
+        agreementOnly.permissionKnown(.granted)
+        XCTAssertFalse(agreementOnly.tokenHandedToFirebase, "no token yet")
+    }
+
+    func testItMayBeAskedForOnceBothAreHereInEitherOrder() {
+        let given = Box<[Data]>([])
+        let tokenFirst = registration(collecting: given)
+        tokenFirst.registered(deviceToken: apnsToken)
+        tokenFirst.permissionKnown(.granted)
+        XCTAssertTrue(tokenFirst.tokenHandedToFirebase)
+        let agreementFirst = registration(collecting: given)
+        agreementFirst.permissionKnown(.granted)
+        agreementFirst.registered(deviceToken: apnsToken)
+        XCTAssertTrue(agreementFirst.tokenHandedToFirebase)
+    }
+
+    func testItIsNotHandedOverWithNowhereToHandItTo() {
+        // Before Firebase is started nothing can take the token, and it has not been handed over.
+        let registration = PushRegistration()
+        registration.permissionKnown(.granted)
+        registration.registered(deviceToken: apnsToken)
+        XCTAssertFalse(registration.tokenHandedToFirebase)
+    }
+
+    func testTakingTheAgreementBackWithdrawsIt() {
+        let given = Box<[Data]>([])
+        let registration = registration(collecting: given)
+        registration.permissionKnown(.granted)
+        registration.registered(deviceToken: apnsToken)
+        registration.permissionKnown(.refused)
+        XCTAssertFalse(registration.tokenHandedToFirebase)
+        registration.permissionKnown(.granted)
+        XCTAssertTrue(registration.tokenHandedToFirebase, "and agreeing again gives it back")
+    }
+
+    func testANewAPNsTokenIsHandedOverBeforeAnythingMayBeAskedForAgain() {
+        let given = Box<[Data]>([])
+        let registration = registration(collecting: given)
+        registration.permissionKnown(.granted)
+        registration.registered(deviceToken: apnsToken)
+        // The callback decides what happens at the moment of the hand-over: at that moment the new
+        // token is not yet counted as handed over.
+        var seenAtHandOver: Bool?
+        registration.onTokenUsable = { _ in seenAtHandOver = registration.tokenHandedToFirebase }
+        registration.registered(deviceToken: Data([0x01, 0x02]))
+        XCTAssertEqual(seenAtHandOver, false)
+        XCTAssertTrue(registration.tokenHandedToFirebase)
+    }
+
+    func testARegistrationThatFailedAndThenGivesANewTokenNeedsTheNewTokenHandedOver() {
+        let given = Box<[Data]>([])
+        let registration = registration(collecting: given)
+        registration.permissionKnown(.granted)
+        registration.registered(deviceToken: apnsToken)
+        registration.failed(with: NSError(domain: "test", code: 1))
+        XCTAssertFalse(registration.tokenHandedToFirebase)
+        registration.registered(deviceToken: Data([0x09]))
+        XCTAssertTrue(registration.tokenHandedToFirebase)
+        XCTAssertEqual(given.value.last, Data([0x09]))
     }
 }
 
