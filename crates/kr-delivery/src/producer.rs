@@ -3254,6 +3254,55 @@ mod tests {
         assert_eq!(producer.journal().pending_count().expect("a count"), 0);
     }
 
+    /// A reminder about a question is dated by the question, never by the moment it fired: a
+    /// question asked before a grant's history began is not a future event for that grant because a
+    /// reminder about it came later. The control: the question's own audience has the same time.
+    #[test]
+    fn a_reminder_is_dated_by_its_question_and_not_by_when_it_fired() {
+        use kr_protocol::attention::IDLE_REMINDER_MS;
+
+        let mut attention = store();
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Questions, 1),
+                    TimestampMs::new(NOON),
+                    EventKind::QuestionPending {
+                        question_id: kr_protocol::ids::QuestionId::new(Uuid::from_bytes([8; 16])),
+                        session_id: session(1),
+                        verified: true,
+                        pending_since_ms: TimestampMs::new(NOON),
+                        pending_since_anchor: Some(kr_attention::time::Anchor::new(
+                            kr_attention::time::BootMark::from_bytes([7; 16]),
+                            0,
+                        )),
+                        summary: "which branch?".to_owned(),
+                    },
+                ),
+                reading(0, NOON),
+            )
+            .expect("the store records the question");
+        attention
+            .tick(reading(IDLE_REMINDER_MS, NOON + IDLE_REMINDER_MS), &|_| {
+                Some(IDLE_REMINDER_MS)
+            })
+            .expect("the store decides the reminder");
+        let engine = attention.engine().expect("the store is this owner's");
+        let audience_of = |rule: AttentionRule| {
+            let item = engine
+                .items()
+                .find(|item| item.rule == rule)
+                .unwrap_or_else(|| panic!("an item for {rule:?}"));
+            Audience::of_item(engine, item).expect("an audience")
+        };
+        assert_eq!(audience_of(AttentionRule::PendingInput).at_ms(), NOON);
+        assert_eq!(
+            audience_of(AttentionRule::InputIdleReminder).at_ms(),
+            NOON,
+            "the reminder fired later, and says it is about the earlier question"
+        );
+    }
+
     #[test]
     fn every_attention_rule_maps_to_one_of_the_six_alerts() {
         for rule in [
