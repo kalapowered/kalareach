@@ -378,10 +378,12 @@ fn install_startup(package: &Package, home: &Path, prompt: &str, profile: Profil
                 // The entries go in as `kr shell install` puts them: the one that opens the bridge
                 // is the first thing in the first profile and the one that checks the reader is the
                 // last thing in the last.
-                for target in startup::powershell_targets(all_hosts, current_host) {
+                for target in
+                    startup::powershell_targets(&package.executable, all_hosts, current_host)
+                {
                     let body = startup::entry(&target, &package.startup_entry, false)
                         .expect("the package's entry is text");
-                    startup::install(&target.path, &body, target.placement)
+                    startup::install(&target.path, &body, &target.placement)
                         .expect("the entry goes into the profile");
                 }
             }

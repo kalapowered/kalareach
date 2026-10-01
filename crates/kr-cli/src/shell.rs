@@ -274,9 +274,9 @@ pub fn install(
             ))
         };
         let change = if dry_run {
-            startup::plan(&entry.file, body, *placement).map_err(io_failure)?
+            startup::plan(&entry.file, body, placement).map_err(io_failure)?
         } else {
-            startup::install(&entry.file, body, *placement, record).map_err(io_failure)?
+            startup::install(&entry.file, body, placement, record).map_err(io_failure)?
         };
         entry.change = Some(change);
         // A dry run reports what is there; a real one reports what it just wrote.
@@ -663,7 +663,7 @@ mod tests {
         )
         .expect("the path is text");
         assert_eq!(
-            startup::install(&zshrc, &body, Placement::End, &record).expect("installs"),
+            startup::install(&zshrc, &body, &Placement::End, &record).expect("installs"),
             Change::Added
         );
         // The install that wrote it recorded the file.
