@@ -213,7 +213,7 @@ applied to something else.
 
 ## What an answer returns
 
-Calling `question.answer` or `question.cancel` will always provide the question identity, revision, state, and resolution time to the caller that performed the action. However, the question itself will only be provided if it is reachable in the present authority of the caller, and `question` is `null` where the host held it back. For example, if a device has `question.respond` but not `session.view`, `question` will be `null`; it is also `null` for a device whose history begins after the question was asked. A retried answer and `action.read` follow the same rule at the moment they are read. The local owner will always see the question. A device may only answer a question its history reaches, or one its grant names while it is open.
+`question.answer` and `question.cancel` always return the identity, revision, state and resolution time of the question to the caller that performed the action. They return the question itself only if the caller holds `session.view`, and `question` is `null` where the host held it back. In particular, a device that holds `question.respond` without `session.view` gets `null` in the first answer it receives. A retried answer and `action.read` are reads of the receipt: they need `session.view` over the session at the moment they are made, and a device without it is refused. A device with it is shown the question only if its history reaches the question then. Note that a grant's naming of a question covers the first answer and nothing later. The local owner is always shown the question. A device may only answer a question its history reaches, or one its grant names while it is open.
 
 ## Installing the skill
 

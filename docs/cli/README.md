@@ -616,7 +616,7 @@ rather than answered as though it had not moved.
 Questions belong to the session, so these reach the session's worker directly, the way attaching
 does; they keep working while the control daemon is restarting.
 
-The commands `kr question answer`, `kr question cancel`, and `kr question send` check the worker's build, which it states in its answer to the hello, before they send anything. A worker of another protocol version is refused with `UNSUPPORTED_SCHEMA`. The command will also indicate that it didn't send anything. This is necessary because the `kr` sending the command may be unable to correctly interpret the reply from the worker. In this case, use the `kr` of the worker's build.
+The commands `kr question answer`, `kr question cancel`, and `kr question send` check the worker's build, which it states in its answer to the hello, before they send an answer or a cancellation. If the worker announces a protocol version whose major number (or minor number if below 1.0) is different from the one of the running instance of `kr`, or does not announce a build at all, the worker will be refused with the error `UNSUPPORTED_SCHEMA`, and the command will say that nothing was sent, because it can't be sure to properly read the worker's reply. In that case, use the `kr` of the build the worker is using.
 
 An answer the worker could not take is kept rather than lost. When the connection to the worker
 fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
