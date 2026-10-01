@@ -98,48 +98,42 @@ impl Link for LocalClient {
         self.action_window().action_window_id.clone()
     }
 
-    fn request<T: serde::Serialize + ?Sized>(
+    async fn request<T: serde::Serialize + ?Sized>(
         &mut self,
         method: Method,
         params: &T,
-    ) -> impl Future<Output = Result<Answer>> {
-        async move {
-            Self::request(self, method, params)
-                .await
-                .map_err(CliError::from)
-        }
+    ) -> Result<Answer> {
+        Self::request(self, method, params)
+            .await
+            .map_err(CliError::from)
     }
 
-    fn mutate<T: serde::Serialize + ?Sized>(
+    async fn mutate<T: serde::Serialize + ?Sized>(
         &mut self,
         method: Method,
         action_id: ActionId,
         target: ActionTarget,
         params: &T,
-    ) -> impl Future<Output = Result<Answer>> {
-        async move {
-            Self::mutate(self, method, action_id, target, params)
-                .await
-                .map_err(CliError::from)
-        }
+    ) -> Result<Answer> {
+        Self::mutate(self, method, action_id, target, params)
+            .await
+            .map_err(CliError::from)
     }
 
-    fn recv(&mut self) -> impl Future<Output = Result<ControlFrame>> {
-        async move { Self::recv(self).await.map_err(CliError::from) }
+    async fn recv(&mut self) -> Result<ControlFrame> {
+        Self::recv(self).await.map_err(CliError::from)
     }
 
-    fn send(&mut self, frame: ControlFrame) -> impl Future<Output = Result<()>> {
-        async move {
-            self.writer()
-                .write_message(&frame)
-                .await
-                .map_err(CliError::from)
-        }
+    async fn send(&mut self, frame: ControlFrame) -> Result<()> {
+        self.writer()
+            .write_message(&frame)
+            .await
+            .map_err(CliError::from)
     }
 
-    fn finish(self) -> impl Future<Output = ()> {
+    async fn finish(self) {
         // A socket has nothing left to say, and closes when it is dropped.
-        async move { drop(self) }
+        drop(self);
     }
 }
 
@@ -262,32 +256,30 @@ impl Link for BridgedLink {
         }
     }
 
-    fn recv(&mut self) -> impl Future<Output = Result<ControlFrame>> {
-        async move { self.stream.recv().await.map_err(failed) }
+    async fn recv(&mut self) -> Result<ControlFrame> {
+        self.stream.recv().await.map_err(failed)
     }
 
-    fn send(&mut self, frame: ControlFrame) -> impl Future<Output = Result<()>> {
-        async move { self.stream.send(frame).await.map_err(failed) }
+    async fn send(&mut self, frame: ControlFrame) -> Result<()> {
+        self.stream.send(frame).await.map_err(failed)
     }
 
-    fn finish(self) -> impl Future<Output = ()> {
-        async move {
-            let diagnostics = self.diagnostics();
-            let ended = self.close().await;
-            // What the helper wrote to its standard error is the destination's to write, so it is
-            // counted and not repeated.
-            let written = diagnostics.written();
-            if written > 0 {
-                crate::report::say(&shown!(
-                    "kr: the bridge helper wrote {} bytes to its standard error",
-                    written
-                ));
-            }
-            // The attachment has ended already; a helper that would not end is a process this
-            // command names, and no longer waits for.
-            if let Err(refusal) = ended {
-                crate::report::say(&kr_client::shown::Said::said(&failed(refusal)));
-            }
+    async fn finish(self) {
+        let diagnostics = self.diagnostics();
+        let ended = self.close().await;
+        // What the helper wrote to its standard error is the destination's to write, so it is
+        // counted and not repeated.
+        let written = diagnostics.written();
+        if written > 0 {
+            crate::report::say(&shown!(
+                "kr: the bridge helper wrote {} bytes to its standard error",
+                written
+            ));
+        }
+        // The attachment has ended already; a helper that would not end is a process this command
+        // names, and no longer waits for.
+        if let Err(refusal) = ended {
+            crate::report::say(&kr_client::shown::Said::said(&failed(refusal)));
         }
     }
 }
