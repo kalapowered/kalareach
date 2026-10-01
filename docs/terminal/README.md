@@ -1394,17 +1394,18 @@ it clears the pending wrap, so the next character lands on the last column and t
 the next row.
 
 iTerm2 alone differs on a wide character or an emoji one column from the edge, which it wraps as
-xterm does where the grid and Terminal.app leave it on the last column. At the start of a line it
-gives a combining mark a cell of its own. It also differs on the emoji presentation selector, which
-makes U+2764 two cells. It draws regional-indicator pairs and flags four cells wide where the grid
-and Terminal.app draw two. It draws a joined family as one cluster of two cells where the grid gives
-six and Terminal.app eight. And it does not apply line-feed mode.
+xterm does where the grid and Terminal.app leave it on the last column. It also differs on a
+combining mark at the start of a line, which it gives a cell of its own, and on the emoji
+presentation selector, which makes U+2764 two cells. It draws regional-indicator pairs and flags
+four cells wide where the grid and Terminal.app draw two. It draws a joined family as one cluster of
+two cells where the grid gives six and Terminal.app eight. And it does not apply line-feed mode.
 
 The remainder of the matrix in section 27 (Ghostty, WezTerm, VS Code's terminal, a VTE terminal and
 Windows Terminal) has not been measured here. `QUALIFIED_TERMINALS` stays a list of `TERM` names the
 client reports: a `TERM` names an entry, not a build or a configuration, and these records show that
 two builds that both report `xterm-256color` disagree with each other and with the grid on rules a
 direct attachment depends on.
+
 
 ## Fixtures
 
