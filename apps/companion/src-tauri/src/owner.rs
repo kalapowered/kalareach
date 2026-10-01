@@ -22,12 +22,12 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
-    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown, shows_value,
+    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown_host, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
 use kr_protocol::ids::{ConfirmationId, DeviceId};
-use kr_protocol::pairing::{SensitiveAction, group_verification_value};
+use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
 
 use crate::device::Device;
@@ -121,7 +121,7 @@ pub struct Owner {
     /// The reference each challenge is shown by, with when it expires, kept for the challenge's
     /// whole life: a request that leaves the list while its host is out of contact comes back
     /// under the same reference, so what the page did with it, such as setting it aside, holds.
-    references: Mutex<BTreeMap<ConfirmationId, (String, u64)>>,
+    references: Mutex<BTreeMap<ConfirmationId, Shown>>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -240,7 +240,7 @@ impl Owner {
         // A challenge's reference outlives its host's visits until the challenge expires, and no
         // longer, whether or not any host is left to visit.
         let now = self.device.pairing().clock.wall_clock_ms();
-        lock(&self.references).retain(|_, (_, expires_at_ms)| *expires_at_ms > now);
+        lock(&self.references).retain(|_, shown| shown.expires_at_ms > now);
         let before = lock(&self.entries).len();
         lock(&self.entries).retain(|entry| owns(&entry.host));
         if lock(&self.entries).len() != before {
@@ -326,7 +326,7 @@ impl Owner {
         let host_name = host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned());
         let now = self.device.pairing().clock.wall_clock_ms();
         let mut references = lock(&self.references);
-        references.retain(|_, (_, expires_at_ms)| *expires_at_ms > now);
+        references.retain(|_, shown| shown.expires_at_ms > now);
         let mut entries = lock(&self.entries);
         let before: Vec<(String, RequestView)> = entries
             .iter()
@@ -335,16 +335,8 @@ impl Owner {
             .collect();
         let mut kept: Vec<Entry> = Vec::new();
         for listed in listed.into_iter().filter(|listed| !listed.answered) {
-            let reference = references
-                .entry(listed.request.confirmation_id)
-                .or_insert_with(|| {
-                    (
-                        kr_ipc::new_uuid().to_string(),
-                        listed.request.expires_at_ms.get(),
-                    )
-                })
-                .0
-                .clone();
+            let reference =
+                reference_for(&mut references, &listed, || kr_ipc::new_uuid().to_string());
             let view = describe(&reference, &host_name, &listed, now);
             kept.push(Entry {
                 reference,
@@ -365,6 +357,42 @@ impl Owner {
             (self.changed)();
         }
     }
+}
+
+/// The reference a challenge was listed under, and what it showed when it was.
+struct Shown {
+    reference: String,
+    expires_at_ms: u64,
+    request: OwnerConfirmationRequest,
+    subject: std::result::Result<Subject, CannotCheck>,
+}
+
+/// The reference `listed` is shown by. It is the one its challenge already has while the host lists
+/// the very same challenge, so what the page did with it holds. A challenge the host changed under
+/// the same identifier, in its request or in what it approves, is a new request: it is listed under
+/// a reference made by `fresh`, and a review of the old reference reaches nothing.
+fn reference_for(
+    references: &mut BTreeMap<ConfirmationId, Shown>,
+    listed: &Listed,
+    fresh: impl FnOnce() -> String,
+) -> String {
+    if let Some(known) = references.get(&listed.request.confirmation_id)
+        && known.request == listed.request
+        && known.subject == listed.subject
+    {
+        return known.reference.clone();
+    }
+    let reference = fresh();
+    references.insert(
+        listed.request.confirmation_id,
+        Shown {
+            reference: reference.clone(),
+            expires_at_ms: listed.request.expires_at_ms.get(),
+            request: listed.request.clone(),
+            subject: listed.subject.clone(),
+        },
+    );
+    reference
 }
 
 /// What a host holds now of a request this computer showed.
@@ -400,10 +428,7 @@ fn held_now<'a>(holding: &'a [Listed], shown: &Listed) -> Held<'a> {
 /// host or a person wrote it: the page is shown it as the dialog's line shows it.
 fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> RequestView {
     let expires_at_ms = listed.request.expires_at_ms.get();
-    let name = match shown(host_name, HOST_NAME_CHARS) {
-        name if name.is_empty() => UNNAMED_HOST.to_owned(),
-        name => name,
-    };
+    let name = shown_host(host_name, HOST_NAME_CHARS);
     let unchecked = |title: &str| RequestView {
         reference: reference.to_owned(),
         host_name: name.clone(),
@@ -690,7 +715,7 @@ mod tests {
     use kr_crypto::keys::DeviceKeys;
     use kr_protocol::confirmation::{CatalogueTrustPlan, PluginInstallPlan};
     use kr_protocol::invitation::PairCandidateView;
-    use kr_protocol::pairing::{DeviceName, DevicePlatform, OwnerConfirmationRequest};
+    use kr_protocol::pairing::{DeviceName, DevicePlatform};
     use kr_protocol::scalars::{CanonicalSet, Digest256, Nonce256, Nullable, TimestampMs, Uuid};
 
     const NOW: u64 = 1_790_000_000_000;
@@ -1049,6 +1074,50 @@ mod tests {
         assert_eq!((view.notice, view.statement), (None, None));
     }
 
+    /// KR-REQ-07.47: a request keeps its reference for as long as the host lists the very same
+    /// challenge, so what the page did with it holds, and a challenge the host changed under the
+    /// same identifier is a new request under a new reference: a click on what the person read
+    /// before the change reaches nothing, and the page lists the changed request as new.
+    #[test]
+    fn a_challenge_the_host_changed_under_one_identifier_is_listed_under_a_new_reference() {
+        let mut references = BTreeMap::new();
+        let shown = an_enrolment();
+        let first = reference_for(&mut references, &shown, || "first".to_owned());
+        let again = reference_for(&mut references, &shown, || "another".to_owned());
+        assert_eq!((first.as_str(), again.as_str()), ("first", "first"));
+        // Answered is not part of what was shown.
+        let mut answered = shown.clone();
+        answered.answered = true;
+        assert_eq!(
+            reference_for(&mut references, &answered, || "another".to_owned()),
+            "first"
+        );
+        let mut moved = shown.clone();
+        if let Ok(Subject::CatalogueAdd(plan)) = &mut moved.subject {
+            plan.targets_url = "https://elsewhere.example/targets/".to_owned();
+        }
+        let changed = reference_for(&mut references, &moved, || "second".to_owned());
+        assert_eq!(changed, "second");
+        // The change is the one now kept, and the earlier text is not listed again under it.
+        assert_eq!(
+            reference_for(&mut references, &moved, || "third".to_owned()),
+            "second"
+        );
+        let mut digest = moved.clone();
+        digest.request.action_digest = Digest256::from_bytes([9; 32]);
+        assert_eq!(
+            reference_for(&mut references, &digest, || "third".to_owned()),
+            "third"
+        );
+        // Another challenge has a reference of its own.
+        let mut other = shown;
+        other.request.confirmation_id = ConfirmationId::new(Uuid::from_bytes([77; 16]));
+        assert_eq!(
+            reference_for(&mut references, &other, || "fourth".to_owned()),
+            "fourth"
+        );
+    }
+
     /// KR-REQ-10.06: the name a host goes by is text the host or a person chose. The page puts it in
     /// its title and its lines, so it reaches the page as the platform's dialog shows it: on one
     /// line, without a character that hides or reorders text, and shortened, for a request that was
@@ -1075,6 +1144,13 @@ mod tests {
                     "{raw:?}"
                 );
             }
+            // The name on the page is the name in the dialog's line.
+            let view = describe("a reference", raw, &checked, NOW);
+            let detail = view.detail.expect("a request this computer checked");
+            assert!(
+                detail.contains(&format!(" to {}, which may", view.host_name)),
+                "{raw:?}: {detail}"
+            );
         }
     }
 
