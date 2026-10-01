@@ -110,6 +110,37 @@ async function withTextSize(page: Page, size: string): Promise<void> {
   }, size)
 }
 
+/** Where the focus is, as the element's tag and id, or `body` where nothing holds it. */
+async function focusedNow(page: Page): Promise<string> {
+  return page.evaluate(() =>
+    document.activeElement === document.body
+      ? 'body'
+      : `${document.activeElement?.tagName.toLowerCase()}#${document.activeElement?.id}`
+  )
+}
+
+/**
+ * Where this engine leaves the focus when a button a pointer pressed goes from the page. Engines and
+ * their ports differ: some focus a button that a press lands on, so the focus goes with it, and some
+ * focus the nearest element that can take it, which stays. What a page leaves alone is therefore
+ * found by pressing a stand-in that sits beside `beside`, in the same parent, and taking it away as
+ * the page takes a button away.
+ */
+async function whereAPressedButtonLeavesTheFocus(page: Page, beside: Locator): Promise<string> {
+  await beside.evaluate((control) => {
+    const standIn = document.createElement('button')
+    standIn.type = 'button'
+    standIn.id = 'stand-in-for-a-pressed-button'
+    standIn.textContent = 'Stand-in'
+    control.after(standIn)
+  })
+  await page.locator('#stand-in-for-a-pressed-button').click()
+  await page.evaluate(() => {
+    document.getElementById('stand-in-for-a-pressed-button')?.remove()
+  })
+  return focusedNow(page)
+}
+
 /**
  * Holds a test to its text size having been the page's from its first frame: a size set after the
  * page loaded lays the page out once at the base size first, and a layout that only holds after a
@@ -1208,10 +1239,12 @@ test.describe("the program's keyboard", () => {
         window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
       })
       const again = page.getByRole('button', { name: 'Attach again' })
+      let leftByEngine = ''
       if (by === 'keyboard') {
         await again.focus()
         await page.keyboard.press('Enter')
       } else {
+        leftByEngine = await whereAPressedButtonLeavesTheFocus(page, again)
         await again.click()
       }
       await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
@@ -1220,15 +1253,9 @@ test.describe("the program's keyboard", () => {
         await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
       } else {
         await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
-        // Where the engine leaves the focus of a pressed button that goes: WebKit never focused
-        // the button, so the page's own main is where a press lands; Chromium had, and has none.
-        expect(
-          await page.evaluate(() =>
-            document.activeElement === document.body
-              ? 'body'
-              : `${document.activeElement?.tagName.toLowerCase()}#${document.activeElement?.id}`
-          )
-        ).toBe(test.info().project.name === 'webkit' ? 'main#main' : 'body')
+        expect(await focusedNow(page), 'the focus is where this engine leaves a pressed button that goes').toBe(
+          leftByEngine
+        )
       }
     })
 
@@ -1243,10 +1270,12 @@ test.describe("the program's keyboard", () => {
         window.krTestHost?.terminalViews.at(-1)?.end('The session ended.')
       })
       const again = page.getByRole('button', { name: 'Attach again' })
+      let leftByEngine = ''
       if (by === 'keyboard') {
         await again.focus()
         await page.keyboard.press('Enter')
       } else {
+        leftByEngine = await whereAPressedButtonLeavesTheFocus(page, again)
         await again.click()
       }
       await expect(page.getByTestId('attach-again')).toHaveCount(0)
@@ -1255,15 +1284,9 @@ test.describe("the program's keyboard", () => {
         await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
       } else {
         await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
-        // Where the engine leaves the focus of a pressed button that goes: WebKit never focused
-        // the button, so the page's own main is where a press lands; Chromium had, and has none.
-        expect(
-          await page.evaluate(() =>
-            document.activeElement === document.body
-              ? 'body'
-              : `${document.activeElement?.tagName.toLowerCase()}#${document.activeElement?.id}`
-          )
-        ).toBe(test.info().project.name === 'webkit' ? 'main#main' : 'body')
+        expect(await focusedNow(page), 'the focus is where this engine leaves a pressed button that goes').toBe(
+          leftByEngine
+        )
       }
     })
   }
