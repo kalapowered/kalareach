@@ -585,7 +585,7 @@ pub fn config_secrets(text: &str) -> Result<Vec<String>, String> {
 /// # Errors
 ///
 /// Returns why a credentials file or the configuration cannot be read, or that none holds a string.
-pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
+pub fn login_strings_read(data: &Path) -> Result<Vec<String>, String> {
     let mut values = Vec::new();
     let credentials = data.join("credentials");
     for entry in std::fs::read_dir(&credentials)
@@ -616,7 +616,32 @@ pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
     if values.is_empty() {
         return Err("no login file or configuration of the person's holds a string".to_owned());
     }
-    if values.iter().any(|value| !searchable(value)) {
+    Ok(values)
+}
+
+/// The strings of the login's files that a search can be run for, and whether any other was found:
+/// one a result could not be kept clear of, which stops the part.
+#[must_use]
+pub fn split_searchable(values: Vec<String>) -> (Vec<String>, bool) {
+    let total = values.len();
+    let kept: Vec<String> = values
+        .into_iter()
+        .filter(|value| searchable(value))
+        .collect();
+    let refused = kept.len() < total;
+    (kept, refused)
+}
+
+/// [`login_strings_read`], where every string can be searched for.
+///
+/// # Errors
+///
+/// Returns what [`login_strings_read`] returns, or [`UNSEARCHABLE`] where a string holds a quote, a
+/// brace, a bracket, a backslash or a control character.
+pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
+    let values = login_strings_read(data)?;
+    let (values, refused) = split_searchable(values);
+    if refused {
         return Err(UNSEARCHABLE.to_owned());
     }
     Ok(values)
@@ -1547,6 +1572,17 @@ mod tests {
         assert!(
             login_strings(&data).is_err(),
             "a brace in a key of the configuration"
+        );
+        // What a refused look still found is searched for: the strings that can be, and that one
+        // was refused.
+        let found = login_strings_read(&data).expect("read whole");
+        assert_eq!(
+            split_searchable(found),
+            (vec!["ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned()], true)
+        );
+        assert_eq!(
+            split_searchable(vec!["a".repeat(16)]),
+            (vec!["a".repeat(16)], false)
         );
         let _ = std::fs::remove_dir_all(&data);
     }

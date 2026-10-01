@@ -136,6 +136,8 @@ fn guard_class(what: &str) -> &'static str {
         "uncharged_turns"
     } else if what.contains(TREE_BROKEN) {
         "isolation_not_established"
+    } else if what.contains(LOGIN_LOOK_FAILED) {
+        "secret_found"
     } else {
         "guarded_file_changed"
     }
@@ -268,8 +270,8 @@ struct Registry {
 }
 
 impl Guards {
-    /// What changed since the part started, where anything did: a file of the person's that no
-    /// part may change, one the person's own programs also write that now holds `needles` (the
+    /// What changed since the part started, where anything did: a look at the login's files that
+    /// failed, a file of the person's that no part may change, one the person's own programs also write that now holds `needles` (the
     /// part's mark or the run's directory), a line that was there in a file only appended to, or
     /// a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
@@ -370,6 +372,8 @@ impl Guards {
     fn note(&self, run: &Run, provenance: &Provenance) {
         {
             let Ok(mut last) = self.last_noted.lock() else {
+                self.login_look_failed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             };
             if last.is_some_and(|at| at.elapsed() < GUARD_WATCH) {
@@ -378,10 +382,21 @@ impl Guards {
             *last = Some(std::time::Instant::now());
         }
         if let Some(data) = &self.login_data {
-            match confine::login_strings(data) {
+            // What a look finds that a search can be run for is kept even where another string it
+            // found cannot be: the look then failed, and the part stops, but its other strings are
+            // still searched for.
+            match confine::login_strings_read(data) {
                 Ok(strings) => {
-                    if let Ok(mut seen) = self.login_seen.lock() {
-                        seen.extend(strings);
+                    let (strings, refused) = confine::split_searchable(strings);
+                    match self.login_seen.lock() {
+                        Ok(mut seen) => seen.extend(strings),
+                        Err(_) => self
+                            .login_look_failed
+                            .store(true, std::sync::atomic::Ordering::SeqCst),
+                    }
+                    if refused {
+                        self.login_look_failed
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 Err(_) => self
@@ -735,8 +750,8 @@ fn guards_hold_while_waiting(stage: &Stage<'_, '_>) {
     }
 }
 
-/// Stops the part at once when a file of the person's that no part may change has changed since the
-/// part started, or one the person's own programs also write has changed to hold the part's mark or
+/// Stops the part at once when a look at the login's files failed, a file of the person's that no
+/// part may change has changed since the part started, or one the person's own programs also write has changed to hold the part's mark or
 /// the run's directory; or when either cannot be read; or when the watcher has found so.
 fn guards_hold(stage: &Stage<'_, '_>) {
     let Some(guards) = stage.guards else {
@@ -1107,10 +1122,14 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
     let mut values = setup.secrets.clone();
     let mut login_unread = None;
     let mut known: std::collections::BTreeSet<String> = values.iter().cloned().collect();
-    match confine::login_strings(&data) {
+    match confine::login_strings_read(&data) {
         Ok(now) => {
+            let (now, refused) = confine::split_searchable(now);
             known.extend(now.iter().cloned());
             values.extend(now);
+            if refused {
+                login_unread = Some(confine::UNSEARCHABLE.to_owned());
+            }
         }
         Err(why) => login_unread = Some(why),
     }
@@ -8026,15 +8045,44 @@ fn a_probe_runs_in_a_group_of_its_own_that_goes_whole_and_is_refused_after_a_sto
     );
 }
 
+/// Guards that watch nothing, whose only state is whether a look at the login's files failed.
+fn bare_guards(failed_look: bool) -> Guards {
+    Guards {
+        home: std::env::temp_dir(),
+        files: Vec::new(),
+        before: Vec::new(),
+        guarded: Vec::new(),
+        shared: Vec::new(),
+        append_only: Vec::new(),
+        workspaces: None,
+        subagents: None,
+        agent_names: Vec::new(),
+        other_writer: std::sync::atomic::AtomicBool::new(false),
+        login_look_failed: std::sync::atomic::AtomicBool::new(failed_look),
+        last_noted: std::sync::Mutex::new(None),
+        login_data: None,
+        login_seen: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        read_at: std::sync::Mutex::new(None),
+        changed: std::sync::Mutex::new(None),
+        watching: std::sync::atomic::AtomicBool::new(false),
+        registry: std::sync::Mutex::new(Registry::default()),
+        agents: std::sync::Mutex::new(Vec::new()),
+        stopped: std::sync::Mutex::new(None),
+    }
+}
+
 #[test]
 fn a_failed_look_at_the_logins_files_stops_the_part_before_its_next_prompt() {
-    let failed = std::sync::atomic::AtomicBool::new(false);
-    assert_eq!(failed_look(&failed), None);
-    failed.store(true, std::sync::atomic::Ordering::SeqCst);
-    let why = failed_look(&failed).expect("a stop");
-    assert!(why.contains("the login's files"));
+    assert_eq!(bare_guards(false).change(&[]), None);
+    let why = bare_guards(true).change(&[]).expect("a stop");
+    assert_eq!(why, LOGIN_LOOK_FAILED);
     assert!(
-        why.chars().count() > 0 && !why.contains('"'),
+        !why.contains('"'),
         "what it says quotes nothing of the files"
+    );
+    assert_eq!(
+        guard_class(&why),
+        "secret_found",
+        "the record says a string of the files is the cause, not a changed file"
     );
 }
