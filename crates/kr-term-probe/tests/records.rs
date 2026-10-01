@@ -151,11 +151,17 @@ fn reference() -> String {
 
 /// The cells of one table row.
 fn cells(line: &str) -> Vec<String> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_owned())
-        .collect()
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    line.split('|').map(|cell| cell.trim().to_owned()).collect()
+}
+
+/// Whether `cell` is a separator cell: a run of hyphens, with a colon at either end for alignment.
+fn is_separator_cell(cell: &str) -> bool {
+    let cell = cell.strip_prefix(':').unwrap_or(cell);
+    let cell = cell.strip_suffix(':').unwrap_or(cell);
+    !cell.is_empty() && cell.chars().all(|character| character == '-')
 }
 
 /// The header cells and the rows of the table whose header line begins with `header`. The line
@@ -171,11 +177,7 @@ fn table(reference: &str, header: &str) -> Result<(Vec<String>, Vec<Vec<String>>
             .ok_or_else(|| format!("the reference has no table headed {header:?}"))?,
     );
     let separator = cells(lines.next().unwrap_or_default());
-    if separator.len() != head.len()
-        || !separator
-            .iter()
-            .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
-    {
+    if separator.len() != head.len() || !separator.iter().all(|cell| is_separator_cell(cell)) {
         return Err(format!(
             "the table headed {header:?} has {separator:?} for a separator under {} header cells",
             head.len()
@@ -286,8 +288,9 @@ fn shown_name(record: &Value) -> Result<&str, String> {
     }
 }
 
-/// The steps either record answered and differs on. A step a terminal gave no position for is
-/// counted in the summary's last column and has no cell to compare.
+/// The steps a terminal answered and differs on, in either record. A terminal that gave no
+/// position for such a step has `silent` in its cell, and is counted in the summary's last column.
+/// A step that no terminal answered and differs on has no row.
 fn differing_steps(records: &[(PathBuf, Value)]) -> Vec<&str> {
     records[0].1["steps"]
         .as_array()
@@ -306,6 +309,49 @@ fn differing_steps(records: &[(PathBuf, Value)]) -> Vec<&str> {
             })
         })
         .collect()
+}
+
+/// The cell a step has in the step table for one terminal.
+fn expected_cell(step: &Value) -> String {
+    if step["agrees"] == true {
+        "agrees".to_owned()
+    } else if step["terminal"].is_null() {
+        "silent".to_owned()
+    } else {
+        format!(
+            "{} / **{}**",
+            position(&step["canonical"]),
+            position(&step["terminal"])
+        )
+    }
+}
+
+/// A terminal that agrees has `agrees`, one that differs has the grid's cell and its own in bold,
+/// and one that gave no answer to a step the other differs on has `silent`.
+#[test]
+fn a_cell_says_agrees_where_the_cursor_is_or_silent() {
+    let step = |canonical: Option<(u32, u32)>, terminal: Option<(u32, u32)>, agrees: bool| {
+        let cell = |at: Option<(u32, u32)>| {
+            at.map_or(
+                Value::Null,
+                |(row, col)| serde_json::json!({ "row": row, "col": col }),
+            )
+        };
+        serde_json::json!({
+            "canonical": cell(canonical),
+            "terminal": cell(terminal),
+            "agrees": agrees,
+        })
+    };
+    assert_eq!(
+        expected_cell(&step(Some((1, 3)), Some((1, 3)), true)),
+        "agrees"
+    );
+    assert_eq!(
+        expected_cell(&step(Some((1, 79)), Some((1, 80)), false)),
+        "1;79 / **1;80**"
+    );
+    assert_eq!(expected_cell(&step(Some((1, 79)), None, false)), "silent");
 }
 
 /// What the reference holds for the records: a row of the first table for each terminal, with its
@@ -419,17 +465,7 @@ fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), 
                     "{id}: the bytes written do not make the step's bytes"
                 ));
             }
-            let expected = if step["agrees"] == true {
-                "agrees".to_owned()
-            } else if step["terminal"].is_null() {
-                return Err(format!("{id}: a step with no answer is in the table"));
-            } else {
-                format!(
-                    "{} / **{}**",
-                    position(&step["canonical"]),
-                    position(&step["terminal"])
-                )
-            };
+            let expected = expected_cell(step);
             if row[column] != expected {
                 return Err(format!(
                     "{id}: the table says {:?} for {} and the record has {expected:?}",
@@ -521,11 +557,20 @@ fn damaged_copies(reference: &str) -> Vec<(&'static str, String, &'static str)> 
             "summary header",
         ),
         (
-            "the two terminals' names swapped in the step table's header",
+            "one terminal's name written for both in the step table's header",
             replaced(
                 reference,
                 "| Terminal.app 2.15, 80 by 24 |",
                 "| iTerm2 2.15, 80 by 24 |",
+            ),
+            "step table's header",
+        ),
+        (
+            "the two terminals' names swapped in the step table's header",
+            replaced(
+                reference,
+                "| Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 37 |",
+                "| iTerm2 2.15, 80 by 24 | Terminal.app 3.7.1, 179 by 37 |",
             ),
             "step table's header",
         ),
@@ -594,6 +639,29 @@ fn damaged_copies(reference: &str) -> Vec<(&'static str, String, &'static str)> 
                 "| --- | --- |",
             ),
             "separator",
+        ),
+        (
+            "a separator cell that is not a run of hyphens",
+            replaced(
+                reference,
+                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| --- | --- | --- | --- | --- | --- | ---:--- |",
+            ),
+            "separator",
+        ),
+        (
+            "a separator cell of colons",
+            replaced(
+                reference,
+                "| --- | --- | --- | --- |",
+                "| --- | --- | ::: | --- |",
+            ),
+            "separator",
+        ),
+        (
+            "an extra empty cell in front of a row",
+            replaced(reference, feed, &format!("|{feed}")),
+            "cells where the header has",
         ),
     ]
 }
