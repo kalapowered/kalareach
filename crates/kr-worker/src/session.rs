@@ -46,6 +46,7 @@ use crate::journal::Journal;
 use crate::output::{EffectOutcome, OutputHub, OutputStream, OwedEffect};
 use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
+use kr_term::sideeffect::{SideEffect, SideEffectDestination};
 
 /// What section 7 tells a caller whose attachment this host cannot name.
 pub const DETACH_HINT: &str = "Use kr detach --attachment <id> to detach";
@@ -3186,6 +3187,49 @@ impl Session {
         false
     }
 
+    /// Records a side effect as a durable host event.
+    ///
+    /// What is kept is what the effect asked for and where in the stream it happened. A journal that
+    /// cannot take it has faulted, and says so to everything that reads the journal's condition.
+    fn record_host_event(&mut self, effect: &SideEffect) {
+        if let Some(journal) = self.journal.as_mut() {
+            let _ = journal.record_host_event(effect, kr_ipc::now_ms());
+        }
+    }
+
+    /// Delivers one side effect to the attachment it was routed to, or records it.
+    ///
+    /// The destination is the attachment that held the input lease, at the epoch it held it, when
+    /// the application caused the effect, and it is the destination only while it still does: the
+    /// lease can end between the engine routing an effect and this delivering it, and an effect is
+    /// never handed to whoever holds the lease next. An effect with no destination left, or one the
+    /// destination's stream has no room for or is not taking, is a durable host event, so nothing
+    /// the application asked for leaves the session unrecorded. A queue with no room also tells the
+    /// attachment to begin again, and it is one of the attachments this returns.
+    fn deliver_effect(
+        &mut self,
+        owed: &OwedEffect,
+        oldest: u64,
+        resynchronised: &mut Vec<AttachmentId>,
+    ) {
+        let SideEffectDestination::Attachment { id, epoch } = owed.effect.destination else {
+            self.record_host_event(&owed.effect);
+            return;
+        };
+        if self.lease.holder() != Some(id) || self.lease.epoch() != epoch.get() {
+            self.record_host_event(&owed.effect);
+            return;
+        }
+        match self.hub.publish_effect(id, owed, oldest) {
+            EffectOutcome::Queued => {}
+            EffectOutcome::Overflowed => {
+                resynchronised.push(id);
+                self.record_host_event(&owed.effect);
+            }
+            EffectOutcome::Refused => self.record_host_event(&owed.effect),
+        }
+    }
+
     /// Delivers one interpreted batch to the attachments and the application.
     ///
     /// The order this runs in is the contract:
@@ -3229,9 +3273,7 @@ impl Session {
         for effect in filtered.host_events {
             // Nothing holds the input lease, so there is no terminal this belongs to. Section 8
             // makes it a durable host event rather than something shown to whoever is watching.
-            if let Some(journal) = self.journal.as_mut() {
-                let _ = journal.record_host_event(&effect, kr_ipc::now_ms());
-            }
+            self.record_host_event(&effect);
         }
         let oldest = self.history.oldest_retained_cursor();
         let next = self.history.next_cursor();
@@ -3297,16 +3339,10 @@ impl Session {
         );
         pieces.extend(filtered.effects.into_iter().map(Piece::Effect));
         pieces.sort_by_key(Piece::order);
-        let holder = self.lease.holder();
         for piece in pieces {
             match piece {
                 Piece::Effect(owed) => {
-                    if let Some(holder) = holder
-                        && self.hub.publish_effect(holder, &owed, oldest)
-                            == EffectOutcome::Overflowed
-                    {
-                        resynchronised.push(holder);
-                    }
+                    self.deliver_effect(&owed, oldest, &mut resynchronised);
                 }
                 Piece::Span(cursor, bytes) => {
                     resynchronised.extend(self.hub.publish_direct(
