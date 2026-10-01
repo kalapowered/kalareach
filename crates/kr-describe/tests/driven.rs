@@ -1456,6 +1456,44 @@ fn a_pause_between_a_failure_and_its_retry_keeps_the_retry_used() {
     assert_eq!(service.scheduler().queued(), 0);
 }
 
+/// KR-REQ-24.11: a job that was dispatched while a fence was being raised is stopped at the next
+/// look. A fence raised from another thread cancels the running job's token, and a job whose token
+/// is not registered yet has none to cancel; so the service stops a running job whose session is
+/// fenced itself. The control is the same job with no fence, which runs on.
+#[test]
+fn a_job_whose_session_was_fenced_as_it_was_dispatched_is_cancelled_at_the_next_look() {
+    for fenced in [false, true] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let (sent, id, _) = next_job(&mut service, at(3_000));
+        if fenced {
+            // Raised without the cancellation that would have found the job's token.
+            service
+                .fence()
+                .raise(session(1), kr_worker::privacy::PrivacyGeneration::new(1));
+        }
+        let next = service
+            .next(&roomy(), sent.after_ms(10))
+            .expect("an instruction");
+        if fenced {
+            assert_eq!(
+                next,
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                }
+            );
+            assert_eq!(
+                service.next(&roomy(), sent.after_ms(20)).expect("a wait"),
+                Instruction::Wait { until_ms: None },
+                "the cancellation is sent once"
+            );
+        } else {
+            assert_eq!(next, Instruction::Wait { until_ms: None }, "left alone");
+        }
+    }
+}
+
 /// KR-REQ-22.16: a semantic event is a change of the context. One that arrives with nothing else
 /// moved starts the debounce, and a job follows it; the same event again is the event already
 /// held, and starts nothing.

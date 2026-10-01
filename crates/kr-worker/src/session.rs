@@ -1083,7 +1083,12 @@ impl Session {
         // The place a command's directory, program and ending are decided, and the first thing
         // done with it: the description facts take the program name and never the command line.
         let shell = self.root_identity().map(|identity| identity.pid.get());
-        self.description_facts.note_command(&block, shell);
+        // The shell the bridge declared, which decides what a command line may start with.
+        let kind = self
+            .fence
+            .as_ref()
+            .and_then(|driver| driver.phase().shell());
+        self.description_facts.note_command(&block, shell, kind);
         if let Some(existing) = self
             .command_blocks
             .iter_mut()
