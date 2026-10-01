@@ -348,7 +348,19 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
     // The system takes the process away. Nothing tells the page; the next run is a new process
     // that finds a record and no marker of a clean exit.
     first.unmount()
-    render(wrap('ios', storage))
+    // The host does not answer a read about the session, so the draft is kept and detached; a host
+    // that did would bind it again, which is the recovery test's to prove.
+    const { port } = fakeHost()
+    const silent: HostPort = {
+      ...port,
+      sessionRead: () =>
+        Promise.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+    }
+    render(
+      <AppProvider port={silent}>
+        <MobileApp surface="ios" storage={storage} />
+      </AppProvider>
+    )
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await person.click(await screen.findByRole('button', { name: /Session 1/ }))
     expect(await screen.findByLabelText('Message this session')).toHaveValue('half a thought')
