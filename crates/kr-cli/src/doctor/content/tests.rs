@@ -987,7 +987,8 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
     );
     for readable in [
         "[home]/projects/ordinary --password [redacted]",
-        "-e \\\"PASSWORD=[redacted]\\\"",
+        // The shell path holds a quoted argument around a credential: the field is withheld.
+        "[withheld: ",
         "https://[redacted]@host/",
         "/bin/zsh",
         "TOKEN=[redacted]",

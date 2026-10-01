@@ -314,149 +314,254 @@ fn a_value_is_read_as_a_shell_word() {
     );
 }
 
-/// KR-REQ-29.04: a whole assignment inside quotes, the form `docker -e`, `env` and `--build-arg`
-/// take, is one value to its closing quote, which stays; without a space it is the same.
+/// KR-REQ-29.04: where a quote could surround a credential's value, the field is withheld: one
+/// before the value that opens and one at or after it that closes. A quote is a quote or a
+/// character of a name (`Tom's`, `Rock 'n Roll`) and the text cannot say which, so no reading of
+/// it is trusted to end the value. Every input here is one that a reading of the quotes left a
+/// marker in the text for: the quoted-argument forms of `docker -e`, `env` and `sh -c`,
+/// apostrophes in a path before a credential, quotes of the other kind, an escaped quote and the
+/// quote at a boundary.
 #[test]
-fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
-    for (text, expected) in [
-        (
-            format!("docker run -e \"PASSWORD=two {MARKER}\" img"),
-            "docker run -e \"PASSWORD=[redacted]\" img".to_owned(),
-        ),
-        (
-            format!("env 'TOKEN=a {MARKER}' cmd"),
-            "env 'TOKEN=[redacted]' cmd".to_owned(),
-        ),
-        (
-            format!("tool \"--password=a {MARKER}\" next"),
-            "tool \"--password=[redacted]\" next".to_owned(),
-        ),
-        (
-            format!("tool \"--password={MARKER}\" next"),
-            "tool \"--password=[redacted]\" next".to_owned(),
-        ),
-    ] {
-        let said = redacted(&text);
-        assert_eq!(said, expected, "{text}");
-        assert!(!said.contains(MARKER), "{said}");
-    }
-    // The shell's two ways of writing an apostrophe inside single quotes: the argument's own quote
-    // is the one that is followed by whitespace or the end, and the value runs to it.
-    for (text, expected) in [
-        (
-            format!("env 'TOKEN=it'\\''s {MARKER}' cmd"),
-            "env 'TOKEN=[redacted]' cmd".to_owned(),
-        ),
-        (
-            format!("env 'TOKEN=it'\"'\"'s {MARKER}' cmd"),
-            "env 'TOKEN=[redacted]' cmd".to_owned(),
-        ),
-        // Apostrophes in a path that balance each other leave no quote open where a value starts,
-        // so the credential after them is read as a word.
-        (
-            format!("/Users/Tom's Tools/o'neil/run TOKEN='abc {MARKER} def'"),
-            "/Users/Tom's Tools/o'neil/run TOKEN=[redacted]".to_owned(),
-        ),
-        (
-            format!("/Users/Tom's Tools/o'neil/run --password 'abc {MARKER}'"),
-            "/Users/Tom's Tools/o'neil/run --password [redacted]".to_owned(),
-        ),
-        (
-            format!("-e \"PASSWORD=\"{MARKER} img"),
-            "-e \"PASSWORD=[redacted] img".to_owned(),
-        ),
-    ] {
-        let said = redacted(&text);
-        assert_eq!(said, expected, "{text}");
-        assert!(!said.contains(MARKER), "{said}");
-    }
-    // Quotes inside the script of `sh -c`, escaped and of the other kind: the value runs to the
-    // quote that closes the argument it is in, so nothing of it is left and nothing after it goes.
-    for (text, expected) in [
-        (
-            format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
-            "sh -c \"A=1 SECRET=[redacted]\" tail".to_owned(),
-        ),
-        (
-            format!("sh -c \"export SECRET=\\\"two {MARKER}\\\"\""),
-            "sh -c \"export SECRET=[redacted]\"".to_owned(),
-        ),
-        (
-            format!("sh -c \"env 'TOKEN=a {MARKER}' cmd\" tail"),
-            "sh -c \"env 'TOKEN=[redacted]\" tail".to_owned(),
-        ),
-        (
-            format!("sh -c \"tool --password \\\"a {MARKER}\\\"\" tail"),
-            "sh -c \"tool --password [redacted]\" tail".to_owned(),
-        ),
-        // The argument's own quote closes in the middle of it, and the text ends there.
-        (
-            format!("-e \"PASSWORD=\"{MARKER}"),
-            "-e \"PASSWORD=[redacted]".to_owned(),
-        ),
-        (
-            format!("env 'TOKEN=a'{MARKER}"),
-            "env 'TOKEN=[redacted]".to_owned(),
-        ),
-        // The argument ends at its own closing quote, whatever follows it.
-        (
-            format!("env \"TOKEN={MARKER}\" keep \"two words\""),
-            "env \"TOKEN=[redacted]\" keep \"two words\"".to_owned(),
-        ),
-        (
-            format!("curl \"https://h/a?token={MARKER}\" next"),
-            "curl \"https://h/a?token=[redacted]\" next".to_owned(),
-        ),
-        (
-            format!("sh -c \"tool --password {MARKER}\""),
-            "sh -c \"tool --password [redacted]\"".to_owned(),
-        ),
-        // An escaped quote is not an opening one: the value is the quoted word after it.
-        (
-            format!("\\\"TOKEN=\"abc {MARKER}\""),
-            "\\\"TOKEN=[redacted]".to_owned(),
-        ),
-        // An assignment after the `=` of another opens an argument too.
-        (
-            format!("FOO=\"TOKEN=a {MARKER}\" next"),
-            "FOO=\"TOKEN=[redacted]\" next".to_owned(),
-        ),
-    ] {
-        let said = redacted(&text);
-        assert_eq!(said, expected, "{text}");
-        assert!(!said.contains(MARKER), "{said}");
-    }
-    // A quote that no argument opened, an apostrophe in a word such as `Tom's`, still open where a
-    // credential's value starts: the text after it reads the other way round and where the value
-    // ends cannot be told, so the field is withheld, whatever the later quotes do. Without a
-    // credential name the text is untouched.
+fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
     for text in [
+        // The whole assignment is a quoted argument.
+        format!("docker run -e \"PASSWORD=two {MARKER}\" img"),
+        format!("env 'TOKEN=a {MARKER}' cmd"),
+        format!("tool \"--password=a {MARKER}\" next"),
+        format!("tool \"--password={MARKER}\" next"),
+        format!("env 'TOKEN=it'\\''s {MARKER}' cmd"),
+        format!("env 'TOKEN=it'\"'\"'s {MARKER}' cmd"),
+        format!("-e \"PASSWORD=\"{MARKER} img"),
+        format!("-e \"PASSWORD=\"{MARKER}"),
+        format!("env 'TOKEN=a'{MARKER}"),
+        format!("env \"TOKEN={MARKER}\" keep \"two words\""),
+        format!("curl \"https://h/a?token={MARKER}\" next"),
+        // The script of `sh -c`, with escaped quotes and quotes of the other kind inside.
+        format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
+        format!("sh -c \"export SECRET=\\\"two {MARKER}\\\"\""),
+        format!("sh -c \"env 'TOKEN=a {MARKER}' cmd\" tail"),
+        format!("sh -c \"tool --password \\\"a {MARKER}\\\"\" tail"),
+        format!("sh -c \"tool --password {MARKER}\""),
+        // An apostrophe in a path before the credential, with a later quote that closes it, or
+        // that is the value's own.
+        format!("/Users/Tom's Tools/o'neil/run TOKEN='abc {MARKER} def'"),
+        format!("/Users/Tom's Tools/o'neil/run --password 'abc {MARKER}'"),
         format!("/Users/Tom's Tools/run TOKEN='abc {MARKER} def'"),
-        format!("/Users/Tom's Tools/run --password 'abc {MARKER}'"),
-        format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y"),
         format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y/o'neil"),
         format!("/Users/Tom's x TOKEN='abc {MARKER}' y/o'neil"),
         format!("/Users/Tom's x --password 'abc {MARKER}' y/o'neil"),
         format!("/Users/Tom's x TOKEN=a'b {MARKER}'c y/o'neil"),
-        format!("/Users/Tom's x TOKEN='abc {MARKER} y/o"),
-        format!("/Users/Tom's x --password 'abc {MARKER} y/o"),
         format!("/Users/Tom's x TOKEN=abc' {MARKER} y/o"),
         format!("/Users/Tom's x TOKEN=' {MARKER} y/o"),
         format!("/Users/Tom's x --password abc' {MARKER} y/o"),
+        format!("/Users/Tom's x TOKEN=abc {MARKER} y/o'neil"),
+        // The apostrophe that a later quote closes is the opening quote of the argument.
+        format!("/Users/Tom's x 'TOKEN=abc {MARKER}' z/o'neil"),
+        format!("/Users/Tom's x 'tool --password abc {MARKER}' z/o'neil"),
+        format!("/Users/Tom's \"x o'neil TOKEN=abc {MARKER}\" z a\"b"),
+        format!("a\"b x \"TOKEN=abc {MARKER}\" c\"d"),
         format!("a\"b TOKEN=x {MARKER}\""),
+        format!("echo prefix\" TOKEN=abc {MARKER}\" tail"),
+        // A word-start apostrophe in a path, and a quote right at the end of the value.
+        format!("/tmp/Rock 'n Roll/run TOKEN='abc {MARKER}' y/o'neil"),
+        format!("/tmp/Rock 'n Roll/run --password 'abc {MARKER}' y/o'neil"),
+        format!("/tmp/Rock 'n Roll/run TOKEN=abc' {MARKER}/y"),
+        format!("/tmp/Rock 'n Roll/run TOKEN=' {MARKER}/y"),
+        // An escaped quote before the value and the value's own quotes.
+        format!("\\\"TOKEN=\"abc {MARKER}\""),
     ] {
+        let said = redacted(&text);
         assert_eq!(
-            redacted(&text),
+            said,
             format!("[withheld: {} characters]", text.chars().count()),
             "{text}"
         );
+        assert!(!said.contains(MARKER), "{said}");
     }
-    assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
-    // A quote that is never closed around the assignment withholds the field.
+    // A quote never closed after the value withholds the field, with a quote before it or not.
     let unclosed = format!("run -e \"PASSWORD=two {MARKER}");
     assert_eq!(
         redacted(&unclosed),
         format!("[withheld: {} characters]", unclosed.chars().count())
+    );
+}
+
+/// KR-REQ-29.04: the controls of the rule above. Where there is no quote before a value, or none at
+/// or after it, no quote can surround it and it is read as a word, and the text around it is as it
+/// was: quotes before it that nothing could close, a value's own quotes, a quote after it, quotes
+/// of values before it.
+#[test]
+fn a_value_no_quote_can_surround_is_replaced_and_its_neighbours_stay() {
+    for (text, expected) in [
+        (
+            format!("FOO=\"a b\" TOKEN={MARKER} cmd"),
+            "FOO=\"a b\" TOKEN=[redacted] cmd".to_owned(),
+        ),
+        (
+            format!("git commit -m \"x y\" --password {MARKER}"),
+            "git commit -m \"x y\" --password [redacted]".to_owned(),
+        ),
+        (
+            format!("/Users/o'neil/x's TOKEN=a{MARKER}"),
+            "/Users/o'neil/x's TOKEN=[redacted]".to_owned(),
+        ),
+        (
+            format!("/Users/o'neil/x's --password {MARKER}"),
+            "/Users/o'neil/x's --password [redacted]".to_owned(),
+        ),
+        (
+            format!("TOKEN='a b {MARKER}' next \"x\""),
+            "TOKEN=[redacted] next \"x\"".to_owned(),
+        ),
+        (
+            format!("--password 'abc {MARKER}' and 'next'"),
+            "--password [redacted] and 'next'".to_owned(),
+        ),
+        (
+            format!("run TOKEN={MARKER} 'next arg'"),
+            "run TOKEN=[redacted] 'next arg'".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+    // An apostrophe nothing closes, with a credential in the text, withholds the field whether or
+    // not a quote surrounds the value; without a credential the text is untouched.
+    let open = format!("/Users/Tom's Tools/run TOKEN={MARKER}");
+    assert_eq!(
+        redacted(&open),
+        format!("[withheld: {} characters]", open.chars().count())
+    );
+    assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
+}
+
+/// Where the word that holds the value starting at `start` ends when each quote character before
+/// `start` is a quote (`structural`) or an ordinary character, as a shell reads the quotes that are
+/// quotes: at the first whitespace outside a quote, with a backslash escaping the next character
+/// outside single quotes. Every quote character at or after `start` is a quote. `None` when a quote
+/// that is a quote never closes.
+fn word_end_when(text: &str, start: usize, structural: &[bool]) -> Option<usize> {
+    let characters: Vec<(usize, char)> = text.char_indices().collect();
+    let mut ordinal = 0;
+    let mut open: Option<char> = None;
+    let mut index = 0;
+    let quote_character = |ordinal: &mut usize, offset: usize, character: char| {
+        let is_quote = matches!(character, '\'' | '"');
+        let quote = is_quote && (offset >= start || structural[*ordinal]);
+        if is_quote && offset < start {
+            *ordinal += 1;
+        }
+        quote
+    };
+    while index < characters.len() {
+        let (offset, character) = characters[index];
+        let quote_here = quote_character(&mut ordinal, offset, character);
+        match open {
+            Some(quote) => {
+                if quote_here && character == quote {
+                    open = None;
+                } else if quote == '"' && character == '\\' {
+                    index += 1;
+                    if let Some(&(next_offset, next)) = characters.get(index) {
+                        quote_character(&mut ordinal, next_offset, next);
+                    }
+                }
+            }
+            None => {
+                if quote_here {
+                    open = Some(character);
+                } else if character == '\\' {
+                    index += 1;
+                    if let Some(&(next_offset, next)) = characters.get(index) {
+                        quote_character(&mut ordinal, next_offset, next);
+                    }
+                } else if matches!(character, ' ' | '\t' | '\n') && offset >= start {
+                    return Some(offset);
+                }
+            }
+        }
+        index += 1;
+    }
+    open.is_none().then_some(text.len())
+}
+
+/// KR-REQ-29.04: no reading of the quotes before a value leaves part of the value in the text. A
+/// quote before a credential is a quote or a character of a path (`Tom's`, `Rock 'n Roll`), and the
+/// text cannot say which. So for every text built from quotes, backslashes, spaces and letters with
+/// one credential in it, and for every way of reading each quote character before the credential
+/// as a quote or as an ordinary character, the value that reading gives is replaced whole, or the
+/// field is withheld. The check tries every reading; it does not name the inputs a reviewer found.
+/// Quotes in the value itself are read as a shell reads them.
+#[test]
+fn no_reading_of_the_quotes_before_a_value_leaves_it_in_the_text() {
+    const PIECES: [&str; 6] = ["a", "b", " ", "'", "\"", "\\"];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |bound: usize| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(seed >> 33).unwrap_or(0) % bound
+    };
+    let mut readings = 0_u64;
+    let mut leaks = Vec::new();
+    for _ in 0..200_000 {
+        let length = 4 + next(9);
+        let mut pieces: Vec<&str> = (0..length).map(|_| PIECES[next(PIECES.len())]).collect();
+        let credential = if next(2) == 0 {
+            "TOKEN="
+        } else {
+            "--password "
+        };
+        pieces.insert(next(pieces.len() + 1), credential);
+        let text = pieces.concat();
+        let at = text.find(credential).expect("the credential was inserted");
+        // The option form is read at the start of a word.
+        if credential == "--password "
+            && text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| !before.is_whitespace())
+        {
+            continue;
+        }
+        let start = at + credential.len();
+        let said = redacted(&text);
+        if said.starts_with("[withheld: ") {
+            continue;
+        }
+        let kept = said.find(REDACTED).map_or(start, |position| {
+            text.len() - said[position + REDACTED.len()..].len()
+        });
+        let before = text[..start]
+            .chars()
+            .filter(|c| matches!(c, '\'' | '"'))
+            .count();
+        for mask in 0..(1_u32 << before) {
+            let structural: Vec<bool> = (0..before).map(|bit| mask >> bit & 1 == 1).collect();
+            let Some(end) = word_end_when(&text, start, &structural) else {
+                continue;
+            };
+            readings += 1;
+            // The quote that closes the argument the credential is in is not part of the value.
+            let closes_it = end > start
+                && matches!(text[..end].chars().next_back(), Some('\'' | '"'))
+                && word_end_when(&text[..end - 1], start, &structural).is_none();
+            let required = if closes_it { end - 1 } else { end };
+            if kept < required {
+                leaks.push(format!(
+                    "{text:?} -> {said:?} (reading {mask:b}: value to {required})"
+                ));
+                break;
+            }
+        }
+    }
+    assert!(readings > 80_000, "the check made {readings} readings");
+    assert!(
+        leaks.is_empty(),
+        "{} leaks, first: {:?}",
+        leaks.len(),
+        &leaks[..leaks.len().min(5)]
     );
 }
 
