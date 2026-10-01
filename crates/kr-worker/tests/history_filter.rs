@@ -219,12 +219,16 @@ fn derived_data_names_the_interval_and_resources_it_was_built_from() {
 
 /// A terminal that printed something before the invitation, then switched to an application.
 fn engine_with_two_buffers() -> TerminalEngine {
-    let mut engine = TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid");
+    let mut engine = TerminalEngine::new(
+        dimensions(80, 24),
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("a canonical grid");
     let mut stream = Vec::new();
     stream.extend_from_slice(b"AWS_SECRET_ACCESS_KEY=printed-before-the-invitation\r\n");
     stream.extend_from_slice(b"\x1b[?1049h");
     stream.extend_from_slice(b"the application's screen\r\n");
-    engine.feed(0, &stream, LaneGate::default(), 0);
+    engine.feed(0, &stream, LaneGate::default());
     engine
 }
 
@@ -234,7 +238,6 @@ fn installed_buffers(engine: &mut TerminalEngine, scope: Scope) -> Vec<Projected
             Window::live(dimensions(80, 24)),
             ProjectionResetReason::Attached,
             LaneGate::default(),
-            0,
             kr_worker::output::DEFAULT_SEND_QUEUE_BYTES,
             scope,
         )

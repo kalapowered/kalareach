@@ -459,19 +459,50 @@ fn a_trace_that_replays_or_cannot_be_run_has_nothing_to_minimise() {
     assert!(trace::minimise(&malformed).is_err_and(|error| error.contains("no client nobody")));
 }
 
-/// A trace that turns its input into a bracketed paste and then asks the terminal where its cursor
-/// is, or asks nothing more while the paste is open.
-fn asking(while_pasting: bool) -> Trace {
-    let paste = if while_pasting {
-        r#"{ "do": "input", "client": "a", "text": "\u001b[200~pasted" },"#
+/// What the profile answers to `query`, as the session's own engine words it.
+fn reply_to(query: &[u8]) -> Vec<u8> {
+    let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+        size: kr_term::budget::GridSize { cols: 20, rows: 3 },
+        ..kr_term::engine::EngineConfig::DEFAULT
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    let _ = engine.feed(query, 0);
+    let open = kr_term::lane::LaneGate::default();
+    engine
+        .lane_mut()
+        .drain(open, usize::MAX, 0)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("the profile answers {query:?}"))
+        .bytes()
+        .to_vec()
+}
+
+/// A bytes as the hexadecimal a trace spells it in.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A reply batch a trace expects the terminal's writer to take.
+fn reply(bytes: &[u8]) -> String {
+    format!(r#"{{"batch":"reply","hex":"{}"}}"#, hex(bytes))
+}
+
+/// A trace in which the application turns bracketed paste on, a person starts pasting, the
+/// application asks where the cursor is, `between` happens while the question waits behind the
+/// paste, and the person ends the paste. The writer then takes the end of the paste and, when the
+/// reply is still owed, the reply.
+fn waiting_behind_a_paste(between: &str, answered: bool) -> Trace {
+    let owed = if answered {
+        format!(",{}", reply(b"\x1b[1;3R"))
     } else {
-        ""
+        String::new()
     };
     Trace::parse(&format!(
         r#"{{
   "format": "kalareach.trace/1",
-  "name": "asking",
-  "about": "a question asked with the input side open or holding a paste",
+  "name": "waiting-behind-a-paste",
+  "about": "a question asked while the person's paste is open, answered when it ends",
   "columns": 20,
   "rows": 3,
   "wall_ms": 1790000000000,
@@ -479,64 +510,147 @@ fn asking(while_pasting: bool) -> Trace {
     {{ "do": "output", "text": "\u001b[?2004h$ " }},
     {{ "do": "attach", "client": "a", "form": "direct" }},
     {{ "do": "acquire", "client": "a" }},
-    {paste}
-    {{ "do": "output", "text": "\u001b[6n" }}
+    {{ "do": "input", "client": "a", "text": "\u001b[200~pasted" }},
+    {{ "do": "take_input", "expect": [
+      {{ "batch": "lease_changed" }},
+      {{ "batch": "input", "client": "a", "text": "\u001b[200~pasted", "paste": ["opens"] }} ] }},
+    {{ "do": "output", "text": "\u001b[6n" }},
+    {{ "do": "take_input", "expect": [] }},
+    {between}
+    {{ "do": "input", "client": "a", "text": "\u001b[201~" }},
+    {{ "do": "take_input", "expect": [
+      {{ "batch": "input", "client": "a", "text": "\u001b[201~", "paste": ["closes"] }}{owed} ] }}
   ]
 }}"#
     ))
     .unwrap_or_else(|error| panic!("{error}"))
 }
 
-#[test]
-fn a_question_asked_while_a_paste_holds_its_reply_back_is_refused_as_decided_on_the_hosts_clock() {
-    let stopped = trace::replay(&asking(true)).expect_err("the reply waits on the host's clock");
-    assert_eq!(
-        (stopped.step, stopped.cause),
-        (Some(4), Cause::Malformed),
-        "{stopped}"
-    );
-    assert!(stopped.what.contains("host's own clock"), "{stopped}");
-    let open = trace::replay(&asking(false));
-    assert!(open.is_ok(), "{open:?}");
+fn replays_as_written(trace: &Trace) {
+    if let Err(stopped) = trace::replay(trace) {
+        panic!("{stopped}");
+    }
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: a reply held behind the person's open paste is written when the
+/// paste ends, so long as it has waited less than two seconds on the clock the session decides by.
 #[test]
-fn a_trace_whose_replies_are_more_than_one_read_writes_is_refused_and_a_smaller_one_is_not() {
-    let asking = |queries: usize| {
-        let asks: String = (0..queries)
-            .map(|index| format!("\\u001b]4;{index};?\\u0007"))
-            .collect();
-        Trace::parse(&format!(
-            r#"{{"format":"kalareach.trace/1","name":"colours","about":"{queries} palette queries",
-                "columns":20,"rows":3,"wall_ms":1790000000000,
-                "steps":[{{"do":"output","text":"{asks}"}}]}}"#
-        ))
-        .unwrap_or_else(|error| panic!("{error}"))
-    };
-    let stopped = trace::replay(&asking(200)).expect_err("more replies than one read writes");
-    assert_eq!(
-        (stopped.step, stopped.cause),
-        (Some(0), Cause::Malformed),
-        "{stopped}"
-    );
-    assert!(stopped.what.contains("bytes waiting"), "{stopped}");
-    let few = trace::replay(&asking(20));
-    assert!(few.is_ok(), "{few:?}");
+fn a_reply_held_behind_a_paste_is_written_when_the_paste_ends_within_two_seconds() {
+    replays_as_written(&waiting_behind_a_paste(
+        r#"{ "do": "advance", "ms": 1900 },"#,
+        true,
+    ));
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: and dropped, not written into a conversation that has moved on, once
+/// it has waited longer than that.
 #[test]
-fn a_trace_that_asks_more_questions_than_the_session_answers_in_a_second_is_refused() {
-    let many = "\\u001b[5n".repeat(257);
+fn a_reply_held_behind_a_paste_is_dropped_when_it_has_waited_over_two_seconds() {
+    replays_as_written(&waiting_behind_a_paste(
+        r#"{ "do": "advance", "ms": 2100 },"#,
+        false,
+    ));
+}
+
+/// Section 9: a step of the wall clock moves neither decision. A reply that has waited 1.5 s is
+/// still owed after the wall clock is stepped an hour forward and then two hours back, and one that
+/// has waited 2.5 s is dropped although the wall clock was last stepped back by ten seconds.
+#[test]
+fn a_step_of_the_wall_clock_neither_drops_a_held_reply_nor_keeps_it_longer() {
+    replays_as_written(&waiting_behind_a_paste(
+        r#"{ "do": "step_wall", "ms": 3600000 },
+    { "do": "advance", "ms": 1000 },
+    { "do": "step_wall", "ms": -7200000 },
+    { "do": "advance", "ms": 500 },"#,
+        true,
+    ));
+    replays_as_written(&waiting_behind_a_paste(
+        r#"{ "do": "step_wall", "ms": -10000 },
+    { "do": "advance", "ms": 2500 },"#,
+        false,
+    ));
+}
+
+/// KR-REQ-08.49: the replies a read may write are bounded to 4 KiB, and the rest wait for a later
+/// read and are written, in order, while they are inside the two seconds they may wait.
+#[test]
+fn replies_past_one_reads_budget_are_written_by_later_reads_while_they_are_fresh() {
+    let answer = reply_to(b"\x1b[>q");
+    let per_read = 4096 / answer.len();
+    let asked = 200;
+    assert!(
+        per_read < asked,
+        "{asked} questions are more than one read writes, {per_read}"
+    );
+    let batch = |count: usize| vec![reply(&answer); count].join(",");
+    let mut steps = vec![format!(
+        r#"{{ "do": "output", "text": "{}" }}"#,
+        "\\u001b[>q".repeat(asked)
+    )];
+    let mut owed = asked;
+    while owed > 0 {
+        let now = owed.min(per_read);
+        steps.push(format!(
+            r#"{{ "do": "take_input", "expect": [{}] }}"#,
+            batch(now)
+        ));
+        owed -= now;
+        steps.push(r#"{ "do": "advance", "ms": 100 }"#.to_owned());
+        steps.push(r#"{ "do": "settle" }"#.to_owned());
+    }
+    steps.push(r#"{ "do": "take_input", "expect": [] }"#.to_owned());
     let trace = Trace::parse(&format!(
-        r#"{{"format":"kalareach.trace/1","name":"many","about":"257 questions","columns":20,
-            "rows":3,"wall_ms":1790000000000,"steps":[{{"do":"output","text":"{many}"}}]}}"#
+        r#"{{"format":"kalareach.trace/1","name":"replies-past-a-read","about":"{asked} questions",
+            "columns":20,"rows":3,"wall_ms":1790000000000,"steps":[{}]}}"#,
+        steps.join(",")
     ))
     .unwrap_or_else(|error| panic!("{error}"));
-    let stopped = trace::replay(&trace).expect_err("too many questions");
-    assert_eq!(
-        (stopped.step, stopped.cause),
-        (Some(0), Cause::Malformed),
-        "{stopped}"
-    );
-    assert!(stopped.what.contains("257 questions"), "{stopped}");
+    replays_as_written(&trace);
+}
+
+/// KR-REQ-08.49: and the ones that have waited past two seconds are dropped, not written by the read
+/// that comes after.
+#[test]
+fn replies_past_one_reads_budget_are_dropped_when_the_next_read_comes_after_two_seconds() {
+    let answer = reply_to(b"\x1b[>q");
+    let per_read = 4096 / answer.len();
+    let asked = 200;
+    let trace = Trace::parse(&format!(
+        r#"{{"format":"kalareach.trace/1","name":"replies-past-a-read","about":"{asked} questions",
+            "columns":20,"rows":3,"wall_ms":1790000000000,"steps":[
+              {{ "do": "output", "text": "{}" }},
+              {{ "do": "take_input", "expect": [{}] }},
+              {{ "do": "advance", "ms": 2500 }},
+              {{ "do": "settle" }},
+              {{ "do": "take_input", "expect": [] }}
+            ]}}"#,
+        "\\u001b[>q".repeat(asked),
+        vec![reply(&answer); per_read].join(",")
+    ))
+    .unwrap_or_else(|error| panic!("{error}"));
+    replays_as_written(&trace);
+}
+
+/// KR-REQ-08.49: the session answers 256 questions a second. A 257th in the same moment is dropped
+/// and so is one asked straight after, and one asked once the clock has moved a second is answered.
+#[test]
+fn the_257th_question_in_a_second_is_dropped_and_the_next_second_answers_again() {
+    let answer = reply_to(b"\x1b[5n");
+    let trace = Trace::parse(&format!(
+        r#"{{"format":"kalareach.trace/1","name":"questions-a-second","about":"257 questions",
+            "columns":20,"rows":3,"wall_ms":1790000000000,"steps":[
+              {{ "do": "output", "text": "{}" }},
+              {{ "do": "take_input", "expect": [{}] }},
+              {{ "do": "output", "text": "\u001b[5n" }},
+              {{ "do": "take_input", "expect": [] }},
+              {{ "do": "advance", "ms": 1000 }},
+              {{ "do": "output", "text": "\u001b[5n" }},
+              {{ "do": "take_input", "expect": [{}] }}
+            ]}}"#,
+        "\\u001b[5n".repeat(257),
+        vec![reply(&answer); 256].join(","),
+        reply(&answer)
+    ))
+    .unwrap_or_else(|error| panic!("{error}"));
+    replays_as_written(&trace);
 }

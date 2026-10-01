@@ -488,7 +488,10 @@ impl Session {
         // them at once instead of one refusal at a time.
         crate::attachments::admit(config.dimensions)?;
         let pty = Pty::open(config.dimensions)?;
-        let engine = crate::projection::TerminalEngine::new(config.dimensions)?;
+        let engine = crate::projection::TerminalEngine::new(
+            config.dimensions,
+            Arc::clone(&config.time.continuous),
+        )?;
         let mut history = match config.spool_directory.as_ref() {
             Some(directory) => {
                 OutputHistory::with_spool(config.resident_bytes, directory, SpoolLayout::DEFAULT)?
@@ -1400,7 +1403,7 @@ impl Session {
         // this session's budget is refused with the grid unchanged.
         let previous = self.pty.dimensions();
         self.pty.resize(dimensions)?;
-        if let Err(error) = self.engine.resize(dimensions, kr_ipc::now_ms().get()) {
+        if let Err(error) = self.engine.resize(dimensions) {
             // Back to the size the grid still has. A second window-change notification is visible
             // to the application; a kernel and a grid that disagree for the rest of the session
             // are not, until something draws in the wrong place.
@@ -1519,8 +1522,7 @@ impl Session {
         let gate = self.lane_gate();
         let keyboard = self.attachments.keyboard_control(attachment_id);
         let (cursor, restoration, settled) =
-            self.engine
-                .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard, scope);
+            self.engine.restoration(dimensions, gate, keyboard, scope);
         // Taking a snapshot settles the screen, and whatever that released belongs to the
         // attachments that were already watching. Delivering it here is what stops one client's
         // snapshot swallowing a character that was owed to another.
@@ -1666,7 +1668,7 @@ impl Session {
         // This attachment is named as the one installing, because a join is a fresh start whatever
         // it was being served a moment ago: an attachment that is already forwarding and asks for
         // a screen is asking to begin again, and beginning again has to meet a boundary.
-        self.settle_forwarding(kr_ipc::now_ms().get(), Some(attachment_id));
+        self.settle_forwarding(Some(attachment_id));
         if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
             // The screen is settled here, before this attachment has a queue, and whatever that
             // released is delivered to the attachments that were already watching. Settling inside
@@ -1853,7 +1855,7 @@ impl Session {
         // attach reports is the answer the session will act on, rather than one that changes
         // between the attach and the subscription. This attachment has nothing to continue from,
         // so it is the one installing.
-        self.settle_forwarding(kr_ipc::now_ms().get(), Some(attachment_id));
+        self.settle_forwarding(Some(attachment_id));
         if let Some(settled) = self
             .attachments
             .summaries()
@@ -2817,7 +2819,8 @@ impl Session {
     /// physical terminal the middle of an escape sequence. Until a boundary arrives it is held, and
     /// section 8's 250 ms is the point at which the answer becomes "stay projected" rather than
     /// "wait": waiting longer would not make the stream safer, it would only delay the screen.
-    fn settle_forwarding(&mut self, now_ms: u64, installing: Option<AttachmentId>) {
+    fn settle_forwarding(&mut self, installing: Option<AttachmentId>) {
+        let now_ms = self.engine.now_ms();
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
         let projected: std::collections::BTreeSet<AttachmentId> = self
@@ -2909,9 +2912,7 @@ impl Session {
         }
         let cursor = self.history.append(bytes);
         let gate = self.lane_gate();
-        let filtered = self
-            .engine
-            .feed(cursor, bytes, gate, kr_ipc::now_ms().get());
+        let filtered = self.engine.feed(cursor, bytes, gate);
         // The application is the only thing that decides whether bracketed paste is on, and the
         // canonical parser is the only thing that knows what it decided: a sequence split across
         // two reads, and one that appears inside a string and sets nothing, are both answered
@@ -2999,9 +3000,7 @@ impl Session {
     /// screen that has stopped changing is only final once this has run. The read loop calls it
     /// when a read finds nothing waiting.
     pub fn quiesce_output(&mut self) -> Vec<AttachmentId> {
-        let filtered = self
-            .engine
-            .quiesce(self.lane_gate(), kr_ipc::now_ms().get());
+        let filtered = self.engine.quiesce(self.lane_gate());
         self.deliver(filtered)
     }
 
@@ -3014,7 +3013,7 @@ impl Session {
     /// gate calls this.
     pub fn pump_replies(&mut self) {
         let gate = self.lane_gate();
-        let replies = self.engine.drain_replies(gate, kr_ipc::now_ms().get());
+        let replies = self.engine.drain_replies(gate);
         self.queue_replies(replies);
     }
 
@@ -3124,7 +3123,6 @@ impl Session {
             crate::snapshot::Owed::Update(update) => update,
             crate::snapshot::Owed::Snapshot(reason) => {
                 let gate = self.lane_gate();
-                let now = kr_ipc::now_ms().get();
                 // The subscriber's own send queue is what a screen has to fit: this is the one
                 // message a client cannot use part of, so a screen too large for that queue is cut
                 // to it and marked degraded rather than refused for ever.
@@ -3135,7 +3133,7 @@ impl Session {
                 let window = self.window_of(attachment_id, dimensions);
                 match self
                     .engine
-                    .projection_install(window, reason, gate, now, budget, scope)
+                    .projection_install(window, reason, gate, budget, scope)
                 {
                     Ok((update, settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,
@@ -3289,7 +3287,7 @@ impl Session {
         }
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
-        self.settle_forwarding(kr_ipc::now_ms().get(), None);
+        self.settle_forwarding(None);
         let projected = self.attachments.projected();
         if !projected.is_empty() {
             // Taking a snapshot settles the screen, which releases whatever the engine was holding
@@ -3297,7 +3295,7 @@ impl Session {
             // inside the first projected subscriber's repaint when a direct attachment was owed
             // them.
             let gate = self.lane_gate();
-            let settled = self.engine.quiesce(gate, kr_ipc::now_ms().get());
+            let settled = self.engine.quiesce(gate);
             filtered.absorb(settled);
         }
         self.queue_replies(filtered.replies);

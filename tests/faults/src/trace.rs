@@ -12,15 +12,12 @@
 //! whose expectation did not hold. Beside what a trace states, every attach checks the screen the
 //! client is restored to, and no terminal of another size may be handed raw output.
 //!
-//! The session still decides three things on the host's own clock, which a trace does not move: a
-//! reply to a question the application asks while the person's input is inside a paste or a held
-//! delimiter waits until that closes and is dropped after two seconds, the replies of one read
-//! past a byte budget wait for a later read and are dropped after the same two seconds, and replies
-//! past 256 a second are dropped. A replay could then turn on how fast the machine ran it, so
-//! [`replay`] refuses a trace that reaches any of them: an output that asks a question while the
-//! input side holds the reply back, one that asks for more reply bytes than the session writes in
-//! one read, or more than 256 questions in all. The questions and replies are counted by an engine
-//! of the profile reading the same output.
+//! Every window the session decides is on the continuous clock the replay moves, so a trace says
+//! exactly what it expects of each: a reply to a question the application asks while the person's
+//! input is inside a paste waits until that closes and is dropped after two seconds, the replies of
+//! one read past a byte budget wait for a later read and are dropped after the same two seconds, and
+//! replies past 256 a second are dropped until the clock has moved on. A step of the wall clock
+//! moves none of them.
 //!
 //! [`minimise`] takes a failing trace down to steps from which no single one can be taken and the
 //! trace still fail at the same step, which is the trace worth keeping once the race it shows is
@@ -48,8 +45,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kr_protocol::projection::ProjectedBuffer;
-use kr_term::budget::GridSize;
-use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::{ClipboardSelection, SideEffectKind};
 use kr_worker::action::time::{Discontinuity, ExpiringObject, Validity};
 use kr_worker::journal::Journal;
@@ -494,21 +489,11 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         journal.as_ref().map(JournalHome::path),
     )
     .map_err(|what| stopped(None, Cause::Malformed, what))?;
-    let reference = Engine::new(EngineConfig {
-        size: GridSize {
-            cols: u32::from(trace.columns),
-            rows: u32::from(trace.rows),
-        },
-        ..EngineConfig::DEFAULT
-    })
-    .map_err(|error| stopped(None, Cause::Malformed, error.to_string()))?;
     let mut replay = Replay {
         time,
         stage,
         clients: BTreeMap::new(),
         epochs: BTreeMap::new(),
-        reference,
-        questions: 0,
         journal_home: journal,
         gaps: (0, 0),
     };
@@ -534,10 +519,6 @@ struct Replay {
     clients: BTreeMap<String, usize>,
     /// Which client took each lease epoch.
     epochs: BTreeMap<u64, String>,
-    /// An engine of the profile reading the same output, which counts the questions it asks.
-    reference: Engine,
-    /// How many questions the output has asked so far.
-    questions: usize,
     /// Where the session's journal was made, kept until the replay ends.
     journal_home: Option<JournalHome>,
     /// How many intervals the journal held written down when the session opened it, and how many
@@ -583,10 +564,6 @@ fn gaps_written_down(owed: usize, recorded: Option<&str>, stored: &[&str]) -> Re
     }
 }
 
-/// The most questions a trace may ask: the session drops replies past this many a second of the
-/// host's own clock.
-const MOST_QUESTIONS: usize = 256;
-
 type StepResult = Result<(), (Cause, String)>;
 
 fn malformed(what: String) -> (Cause, String) {
@@ -602,7 +579,6 @@ impl Replay {
         match step {
             Step::Output { text, hex } => {
                 let bytes = bytes_of(text.as_deref(), hex.as_deref()).map_err(malformed)?;
-                self.questions_on_the_clock(&bytes)?;
                 self.stage.ingest(&bytes).map_err(malformed)?;
             }
             Step::Settle => self.stage.settle().map_err(malformed)?,
@@ -709,61 +685,6 @@ impl Replay {
                     .join("; "),
             ))
         }
-    }
-
-    /// Refuses an output whose replies the session would decide on the host's own clock.
-    fn questions_on_the_clock(&mut self, bytes: &[u8]) -> StepResult {
-        // The reference answers on a clock that never moves, so its own lane refuses what a moving
-        // one would take later: a question whose reply it refused or dropped is still one asked. A
-        // reply merged into a later one was counted when it was taken.
-        let before = self.reference.lane().degradation();
-        let answered =
-            self.reference.feed(bytes, 0).responses + self.reference.quiesce(0).responses;
-        let after = self.reference.lane().degradation();
-        let refused = (after.over_budget - before.over_budget)
-            + (after.dropped - before.dropped)
-            + (after.oversized - before.oversized);
-        let asked = answered + usize::try_from(refused).unwrap_or(usize::MAX);
-        if asked == 0 {
-            return Ok(());
-        }
-        let session = self.stage.session();
-        if session.paste_open() || session.paste_deadline().is_some() {
-            return Err(malformed(format!(
-                "this output asks {asked} question(s) while the input side holds a paste or a \
-                 delimiter open, and the session keeps the reply until that closes and drops it \
-                 after two seconds of the host's own clock, which a trace does not move"
-            )));
-        }
-        // The session writes one read's replies up to a byte budget and keeps the rest for a later
-        // read, which drops them after two seconds of the host's own clock. The reference takes the
-        // same batch off its lane, so what stays in it is what the session would keep waiting.
-        let allowed = kr_term::lane::LaneGate {
-            paste_open: false,
-            backend_handles_paste_interleave: false,
-            human_frame_open: false,
-        };
-        self.reference
-            .lane_mut()
-            .drain(allowed, kr_worker::projection::MAX_REPLY_BYTES, 0);
-        let waiting = self.reference.lane().queued_bytes();
-        if waiting > 0 {
-            return Err(malformed(format!(
-                "this output asks for more reply bytes than the session writes in one read ({}), \
-                 leaves {waiting} bytes waiting for a later read, and drops them after two seconds \
-                 of the host's own clock, which a trace does not move",
-                kr_worker::projection::MAX_REPLY_BYTES
-            )));
-        }
-        self.questions += asked;
-        if self.questions > MOST_QUESTIONS {
-            return Err(malformed(format!(
-                "the trace has asked {} questions, and the session drops replies past \
-                 {MOST_QUESTIONS} a second of the host's own clock, which a trace does not move",
-                self.questions
-            )));
-        }
-        Ok(())
     }
 
     /// Lets the session's journal grow again and has the session try to leave its fault, then
