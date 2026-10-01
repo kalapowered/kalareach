@@ -71,54 +71,72 @@ enum DeviceProbe {
 
     // MARK: The keychain
 
-    private static func groups() -> [String] {
-        [PreviewKeyLocation.shared.accessGroup, PreviewKeyLocation.resolvedPrivateGroup()].compactMap { $0 }
+    /// The two groups, or nil when this build names only one: a count of one says nothing about the
+    /// other.
+    private static func groups() -> [String]? {
+        KeychainAnswer.groupsToCount(shared: PreviewKeyLocation.shared.accessGroup, private: PreviewKeyLocation.resolvedPrivateGroup())
     }
 
-    /// How many items each query finds, by attributes alone.
-    private static func counted(_ plan: KeychainSweepPlan) -> (total: Int, facts: [String: String]) {
+    /// How many items each query finds, by attributes alone, and which queries could not be answered.
+    ///
+    /// A query that failed is not an empty group: only "found some" and "not found" count.
+    private static func counted(_ plan: KeychainSweepPlan) -> (total: Int, failures: [String], facts: [String: String]) {
         var total = 0
+        var failures: [String] = []
         var facts: [String: String] = [:]
         for each in plan.countQueries() {
             var result: CFTypeRef?
             let status = SecItemCopyMatching(each.query as CFDictionary, &result)
             let found = status == errSecSuccess ? ((result as? [[String: Any]])?.count ?? 0) : 0
-            total += found
             let itemClass = each.query[kSecClass as String].map { "\($0)" } ?? "?"
-            facts["count.\(each.group).\(itemClass)"] = "\(found) status=\(status)"
+            switch KeychainAnswer.counted(status: status, found: found) {
+            case .found(let count):
+                total += count
+                facts["count.\(each.group).\(itemClass)"] = "\(count) status=\(status)"
+            case .failed:
+                failures.append("\(each.group).\(itemClass)=\(status)")
+                facts["count.\(each.group).\(itemClass)"] = "failed status=\(status)"
+            }
         }
-        return (total, facts)
+        return (total, failures, facts)
     }
 
     private static func count() {
-        let named = groups()
-        guard !named.isEmpty else {
-            finish(.count, ["error": "this build names no keychain group"])
+        guard let named = groups() else {
+            finish(.count, ["error": "this build does not name both keychain groups", "ok": "0"])
             return
         }
-        var (total, facts) = counted(KeychainSweepPlan(groups: named))
-        facts["total"] = String(total)
+        let counts = counted(KeychainSweepPlan(groups: named))
+        var facts = counts.facts
+        facts["total"] = String(counts.total)
         facts["groups"] = named.joined(separator: ",")
+        facts["ok"] = counts.failures.isEmpty ? "1" : "0"
+        if !counts.failures.isEmpty { facts["failed"] = counts.failures.joined(separator: ",") }
         finish(.count, facts)
     }
 
     private static func sweep() {
-        let named = groups()
-        guard !named.isEmpty else {
-            finish(.sweep, ["error": "this build names no keychain group"])
+        guard let named = groups() else {
+            finish(.sweep, ["error": "this build does not name both keychain groups", "ok": "0"])
             return
         }
         let plan = KeychainSweepPlan(groups: named)
         var facts: [String: String] = [:]
+        var failures: [String] = []
         for each in plan.deleteQueries() {
             let status = SecItemDelete(each.query as CFDictionary)
             let itemClass = each.query[kSecClass as String].map { "\($0)" } ?? "?"
             facts["delete.\(each.group).\(itemClass)"] = "status=\(status)"
+            if !KeychainAnswer.deleteLeftNothing(status: status) { failures.append("delete.\(each.group).\(itemClass)=\(status)") }
         }
         let remaining = counted(plan)
         facts.merge(remaining.facts) { current, _ in current }
+        failures += remaining.failures
         facts["remaining"] = String(remaining.total)
-        facts["ok"] = remaining.total == 0 ? "1" : "0"
+        // Clean only when nothing is left and every answer was an answer: a refusal is not an empty
+        // group.
+        facts["ok"] = remaining.total == 0 && failures.isEmpty ? "1" : "0"
+        if !failures.isEmpty { facts["failed"] = failures.joined(separator: ",") }
         finish(.sweep, facts)
     }
 
@@ -188,57 +206,89 @@ enum DeviceProbe {
 
         // The test asks for the permission here, which the product does not at launch.
         PushRegistration.shared.start()
-        waitForToken(tries: 0, nonce: nonce, facts: facts)
+        waitForToken(tries: 0, nonce: nonce, facts: facts, fetching: false)
     }
 
-    private static func waitForToken(tries: Int, nonce: String, facts: [String: String]) {
+    /// Set once the check has reported, so that a late answer or a timeout cannot report again.
+    private static var pushReported = false
+
+    private static func reportPush(_ facts: [String: String]) {
+        guard !pushReported else { return }
+        pushReported = true
+        finish(.push, facts)
+    }
+
+    private static func waitForToken(tries: Int, nonce: String, facts: [String: String], fetching: Bool) {
+        guard !pushReported else { return }
         var facts = facts
-        if PushRegistration.shared.state == .refused {
+        var fetching = fetching
+        let registration = PushRegistration.shared
+        if registration.permission == .refused || registration.state == .refused {
             facts["permission"] = "refused"
-            finish(.push, facts)
+            reportPush(facts)
             return
         }
-        if case .registered = PushRegistration.shared.state {
-            // The permission is there, so Firebase may now make a registration token on its own.
+        // Only the person's own answer starts this: the launch has registered for a token already,
+        // and that says nothing about the permission.
+        if registration.permission == .granted, case .registered = registration.state, !fetching {
+            fetching = true
+            facts["permission"] = "granted"
+            // Agreed, so Firebase may make a registration token on its own from now on. The one this
+            // check sends to is asked for after the APNs token has gone to Firebase, and arrives once
+            // Firebase has the mapping.
             Messaging.messaging().isAutoInitEnabled = true
-            if let token = PushRegistration.shared.fcmToken {
-                let file: [String: String] = [
-                    "nonce": nonce,
-                    "group": PreviewKeyLocation.resolvedPrivateGroup() ?? "",
-                    "fcm_token": token,
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: file) {
-                    try? data.write(to: container().appendingPathComponent("probe-push.json"))
+            let known = facts
+            Messaging.messaging().token { token, error in
+                DispatchQueue.main.async {
+                    var facts = known
+                    guard let token, error == nil else {
+                        let failure = error as NSError?
+                        facts["token"] = "error"
+                        facts["token.error"] = failure.map { "\($0.domain)/\($0.code)" } ?? "none"
+                        reportPush(facts)
+                        return
+                    }
+                    let file: [String: String] = [
+                        "nonce": nonce,
+                        "group": PreviewKeyLocation.resolvedPrivateGroup() ?? "",
+                        "fcm_token": token,
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: file) {
+                        try? data.write(to: container().appendingPathComponent("probe-push.json"))
+                    }
+                    facts["token"] = "ready"
+                    reportPush(facts)
                 }
-                facts["token"] = "ready"
-                finish(.push, facts)
-                return
             }
         }
         guard tries < 240 else {
             facts["token"] = "timeout"
-            facts["state"] = "\(PushRegistration.shared.state)"
-            finish(.push, facts)
+            facts["state"] = "\(registration.state)"
+            facts["permission"] = "\(registration.permission)"
+            reportPush(facts)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            waitForToken(tries: tries + 1, nonce: nonce, facts: facts)
+            waitForToken(tries: tries + 1, nonce: nonce, facts: facts, fetching: fetching)
         }
     }
 
     private static func pushRead() {
+        // The nonce of the send being read, which the push check filed with its token.
+        let filed = (try? Data(contentsOf: container().appendingPathComponent("probe-push.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
+        let nonce = filed?["nonce"]
         UNUserNotificationCenter.current().getDeliveredNotifications { delivered in
+            let sorted = DeliveredMarks.sort(delivered.map { $0.request.content.userInfo }, nonce: nonce)
             var facts: [String: String] = ["delivered": String(delivered.count)]
-            var index = 0
-            for notification in delivered {
-                let info = notification.request.content.userInfo
-                guard info["kr_probe_nonce"] != nil else { continue }
-                index += 1
+            for (offset, info) in sorted.matching.enumerated() {
                 for key in ["kr_ext_reason", "kr_ext_shared_match", "kr_ext_shared_unavailable", "kr_ext_private_status", "kr_ext_private_data"] {
-                    if let value = info[key] { facts["n\(index).\(key)"] = "\(value)" }
+                    if let value = info[key] { facts["n\(offset + 1).\(key)"] = "\(value)" }
                 }
             }
-            facts["marked"] = String(index)
+            facts["marked"] = String(sorted.matching.count)
+            facts["other_marked"] = String(sorted.otherMarked)
+            facts["nonce.known"] = nonce == nil ? "0" : "1"
             facts["presented_in_front"] = String(NotificationRecorder.presented())
             UNUserNotificationCenter.current().removeAllDeliveredNotifications()
             DispatchQueue.main.async { finish(.pushRead, facts) }

@@ -884,6 +884,62 @@ fn push_on_ios_is_wired_without_borrowing_the_delegate_or_the_account_configurat
     );
 }
 
+/// The application's launch never asks the person for notifications, and it keeps its delegate.
+///
+/// The launch reads where the permission stands and registers for a token, which shows nothing; the
+/// ask belongs where the person can see why, so no file of the launch path names the call that
+/// shows the prompt or the push registration's own start, which makes it. And the delegate that is
+/// set to nil and back to reset the system's cache of the methods it answers is held first: its
+/// property does not keep it alive, and nothing else of the application does.
+#[test]
+fn the_launch_never_asks_for_notifications_and_keeps_its_delegate() {
+    let root = crate_root();
+    let native = root.join("../native/ios");
+    let text = |relative: &str| {
+        std::fs::read_to_string(native.join(relative))
+            .unwrap_or_else(|error| panic!("{relative} could not be read: {error}"))
+    };
+    for file in [
+        "KalaReachApp/KRNativeLaunch.swift",
+        "KalaReachApp/PushStartup.swift",
+        "KalaReachApp/LaunchHook.m",
+        "KalaReachNative/LaunchPlan.swift",
+        "KalaReachNative/DelegateMethods.swift",
+    ] {
+        let source = text(file);
+        for asking in [
+            "requestAuthorization",
+            "PushRegistration.shared.start(",
+            "registration.start(",
+        ] {
+            assert!(
+                !source.contains(asking),
+                "{file} asks for notifications with {asking}"
+            );
+        }
+    }
+
+    let startup = text("KalaReachApp/PushStartup.swift");
+    assert!(
+        startup.contains("private static var heldDelegate: UIApplicationDelegate?"),
+        "the delegate is held in a stored property of the type"
+    );
+    let held = startup
+        .find("heldDelegate = delegate")
+        .expect("the delegate is held");
+    let reset = startup
+        .find("UIApplication.shared.delegate = nil")
+        .expect("the delegate is reset");
+    assert!(held < reset, "the delegate is held before it is reset");
+    assert_eq!(
+        startup
+            .matches("UIApplication.shared.delegate = delegate")
+            .count(),
+        1,
+        "the delegate is set back once"
+    );
+}
+
 /// Every file of the application that the repository holds, as a path relative to it.
 ///
 /// What a build leaves beside them (generated projects, caches, symbolic links to libraries) is

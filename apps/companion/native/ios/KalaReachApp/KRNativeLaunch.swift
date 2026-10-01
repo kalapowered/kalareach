@@ -4,7 +4,8 @@
 //  `LaunchHook.m` calls `didFinishLaunching` when the system says the application has launched. What
 //  happens next is `LaunchPlan`'s decision, made from three facts: which device check a debug build
 //  was started for, whether the build holds Firebase configuration, and where the person's answer to
-//  the notification permission stands. This file only carries the plan out.
+//  the notification permission stands. This file reads the facts and carries the plan out. It reads
+//  the permission and never asks for it.
 //
 
 import Foundation
@@ -24,20 +25,23 @@ final class KRNativeLaunch: NSObject {
 
         // The modes that look at the keychain before anything writes to it need no answer about
         // the permission, and wait for none.
-        let early = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, authorisation: .notDetermined)
+        let early = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, permission: .unknown)
         if let mode = debugMode, early == [.runDebugMode(mode)] {
             PushStartup.carryOut(early)
             return
         }
         UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let authorisation: PushAuthorisation
+            let permission: PushPermission
             switch settings.authorizationStatus {
-            case .authorized, .provisional, .ephemeral: authorisation = .authorised
-            case .denied: authorisation = .denied
-            default: authorisation = .notDetermined
+            case .authorized, .provisional, .ephemeral: permission = .granted
+            case .denied: permission = .refused
+            default: permission = .unknown
             }
-            let plan = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, authorisation: authorisation)
-            DispatchQueue.main.async { PushStartup.carryOut(plan) }
+            let plan = LaunchPlan.decide(debugMode: debugMode, hasFirebaseConfiguration: configured, permission: permission)
+            DispatchQueue.main.async {
+                PushRegistration.shared.permissionKnown(permission)
+                PushStartup.carryOut(plan)
+            }
         }
     }
 }

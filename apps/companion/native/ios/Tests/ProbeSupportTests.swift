@@ -78,5 +78,57 @@ final class ProbeSupportTests: XCTestCase {
         report.set("status", "done")
         XCTAssertEqual(report.text, "count=0\nstatus=done")
     }
+
+    // MARK: What a keychain answer means for a count
+
+    func testAnItemNotFoundIsAnEmptyGroupAndNothingElseIs() {
+        XCTAssertEqual(KeychainAnswer.counted(status: errSecItemNotFound, found: 0), .found(0))
+        XCTAssertEqual(KeychainAnswer.counted(status: errSecSuccess, found: 3), .found(3))
+        for status in [errSecMissingEntitlement, errSecParam, errSecInteractionNotAllowed, errSecAuthFailed, -1] {
+            XCTAssertEqual(KeychainAnswer.counted(status: status, found: 0), .failed(status), "status \(status)")
+        }
+    }
+
+    func testASweepIsCleanOnlyWhenEveryDeleteSucceededOrFoundNothing() {
+        XCTAssertTrue(KeychainAnswer.deleteLeftNothing(status: errSecSuccess))
+        XCTAssertTrue(KeychainAnswer.deleteLeftNothing(status: errSecItemNotFound))
+        XCTAssertFalse(KeychainAnswer.deleteLeftNothing(status: errSecMissingEntitlement))
+        XCTAssertFalse(KeychainAnswer.deleteLeftNothing(status: errSecInteractionNotAllowed))
+    }
+
+    func testBothGroupsAreRequiredForACount() {
+        XCTAssertEqual(KeychainAnswer.groupsToCount(shared: "A", private: "B"), ["A", "B"])
+        XCTAssertNil(KeychainAnswer.groupsToCount(shared: nil, private: "B"))
+        XCTAssertNil(KeychainAnswer.groupsToCount(shared: "A", private: nil))
+        XCTAssertNil(KeychainAnswer.groupsToCount(shared: nil, private: nil))
+    }
+
+    // MARK: Which delivered notification belongs to the send being read
+
+    private func marked(_ nonce: String?) -> [AnyHashable: Any] {
+        var info: [AnyHashable: Any] = ["aps": ["alert": "x"]]
+        if let nonce { info["kr_probe_nonce"] = nonce }
+        return info
+    }
+
+    func testOnlyANotificationWithTheNonceOfThisSendCounts() {
+        let sorted = DeliveredMarks.sort([marked("old"), marked("current"), marked(nil), marked("older")], nonce: "current")
+        XCTAssertEqual(sorted.matching.count, 1)
+        XCTAssertEqual(sorted.matching.first?["kr_probe_nonce"] as? String, "current")
+        XCTAssertEqual(sorted.otherMarked, 2, "an earlier send's is reported and does not count")
+    }
+
+    func testWithNoNonceForThisSendNothingMatches() {
+        let sorted = DeliveredMarks.sort([marked("old"), marked(nil)], nonce: nil)
+        XCTAssertEqual(sorted.matching.count, 0)
+        XCTAssertEqual(sorted.otherMarked, 1)
+    }
+
+    func testANoteThatIsNotAStringIsNotAMatch() {
+        var odd: [AnyHashable: Any] = [:]
+        odd["kr_probe_nonce"] = 7
+        let sorted = DeliveredMarks.sort([odd], nonce: "7")
+        XCTAssertEqual(sorted.matching.count, 0)
+    }
 }
 #endif
