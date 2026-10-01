@@ -18,7 +18,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
-import { missingFrom, packagesOf, requestFrom } from './android-classes.mjs'
+import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-classes.mjs'
 
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
@@ -48,8 +48,11 @@ function uleb(value) {
  * behind entries that are not class names at all, the type table points into them in another, and
  * `class_defs` points into the type table in a third -- so that a reader that took any one index
  * for any other would answer wrongly here.
+ *
+ * `constants` are strings the code carries that are no class's name, which sit in the string table
+ * and nowhere else.
  */
-function dex({ defined = [], referenced = [] } = {}) {
+function dex({ defined = [], referenced = [], constants = [] } = {}) {
   const descriptorOf = (name) => `L${name.replaceAll('.', '/')};`
   // Every class the file names. The superclass every real class has comes first, and the merely
   // mentioned ones next, so a class_defs index is never the type index it holds.
@@ -57,7 +60,11 @@ function dex({ defined = [], referenced = [] } = {}) {
   // A real string table holds method and field names as well as class names. Enough of them come
   // first here that a descriptor's string index is never its type index, and the descriptors
   // behind them run in the opposite order to the type table.
-  const strings = [...types.map((_, index) => `member${index}`), ...[...types].reverse()]
+  const strings = [
+    ...types.map((_, index) => `member${index}`),
+    ...constants,
+    ...[...types].reverse()
+  ]
   const typeStringIndex = types.map((descriptor) => strings.indexOf(descriptor))
   const definedTypeIndex = defined.map((name) => types.indexOf(descriptorOf(name)))
   typeStringIndex.forEach((stringIndex, typeIndex) => {
@@ -265,6 +272,35 @@ expect(
     }
   ]),
   'refused: dex version 099 is not read here'
+)
+
+// -- the strings a dex carries -------------------------------------------------------------------
+// The identifier check reads every string, which is how it finds a name the code carries as a
+// constant. It must see the constants, the descriptors of the classes and nothing in between.
+
+const carried = definedStrings(dex({ defined: [PRESENT[0]], constants: ['to.kala.reach.push'] }))
+held(
+  'a constant the code carries is read from the string table',
+  'true',
+  String(carried.includes('to.kala.reach.push'))
+)
+held(
+  'a class descriptor is read from the string table in its own form',
+  'true',
+  String(carried.includes('Lto/kala/reach/companion/push/KalaReachMessagingService;'))
+)
+held(
+  'the string table is read whole, and nothing else is taken for part of it',
+  JSON.stringify(
+    [
+      'Ljava/lang/Object;',
+      'Lto/kala/reach/companion/push/KalaReachMessagingService;',
+      'member0',
+      'member1',
+      'to.kala.reach.push'
+    ].sort()
+  ),
+  JSON.stringify([...carried].sort())
 )
 
 // -- which packages a build is checked against --------------------------------------------------

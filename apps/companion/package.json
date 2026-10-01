@@ -20,7 +20,9 @@
     "tauri": "tauri",
     "android": "node scripts/android.mjs",
     "android:classes": "node scripts/android-classes.mjs",
-    "test:android-classes": "node scripts/android-classes-selftest.mjs"
+    "test:android-classes": "node scripts/android-classes-selftest.mjs",
+    "identifiers": "node scripts/identifiers.mjs",
+    "test:identifiers": "node scripts/identifiers-selftest.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",

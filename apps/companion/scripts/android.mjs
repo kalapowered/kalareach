@@ -12,12 +12,13 @@
 // again.
 //
 // After the build it reads the packaged application back and refuses one that is missing the
-// hand-written native classes.
+// hand-written native classes or that carries an identifier other than the application's.
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { packagesOf, requestFrom, verify } from './android-classes.mjs'
+import { problemsInPackage, report } from './identifiers.mjs'
 import { toolPath } from './tools.mjs'
 
 /** Every Android target this build could be asked for. */
@@ -170,4 +171,9 @@ try {
   console.error(failure.message)
   process.exit(1)
 }
-process.exit(verify(packages) ? 0 : 1)
+// The same packages are read for the application identifier: the package the manifest declares,
+// the names it derives from it and the names an earlier identifier left in the code. Both checks
+// run, so one failing does not hide the other.
+const hasClasses = verify(packages)
+const hasIdentifier = report(packages, problemsInPackage)
+process.exit(hasClasses && hasIdentifier ? 0 : 1)
