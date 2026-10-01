@@ -19,7 +19,9 @@
 #   4. Windows reaches each distribution through the process bridge alone, learns that
 #      distribution's own environment identity, and gets an answer to a real read across it.
 #   5. A listing of stopped distributions comes from the cache and starts nothing. A refresh that
-#      was told to start one does.
+#      was told to start one does. So does creating a session in one from Windows, which also has
+#      the distribution's own startup start the control daemon inside it, and so does attaching to
+#      a session there, which is told by the distribution that the session has closed.
 #   6. The bridge behaves the same in NAT and in mirrored networking mode, which is what decides
 #      whether any automatic behaviour is needed.
 #
@@ -1341,6 +1343,12 @@ pass "a refresh opens a bridge to each distribution and carries a read to its ow
 # ---------------------------------------------------------------------------------------------
 step "5. A listing reads the cache and starts nothing"
 
+# The distribution's own choice of how its control daemon is started when none is running, which
+# is what a create or an attach that starts the distribution then relies on. Setting it starts
+# nothing.
+inside "$second" "'$helper_path' host startup --set standalone" >"$run_dir/startup-second.log" 2>&1 ||
+  fail "the second distribution could not choose how its daemon is started: $(cat "$run_dir/startup-second.log")"
+
 wsl.exe -t "$second" >/dev/null 2>&1 || fail "the second distribution could not be stopped"
 sleep 2
 [ "$(state_of "$second")" = "Stopped" ] ||
@@ -1386,6 +1394,72 @@ esac
 [ "$(state_of "$second")" = "Stopped" ] ||
   fail "the listing started $second, which a listing must never do"
 pass "the listing reported the stopped distribution from the cache and started nothing"
+
+# Creating a session is the other action that starts what it names, and it starts more than a
+# refresh does: the distribution, and then the control daemon inside it, which the distribution's
+# own startup starts. Nothing here starts a daemon by hand.
+"$kr_exe" --json new --invisible --environment second --shell /bin/sh >"$run_dir/new-stopped.json" 2>&1 ||
+  fail "creating a session in the stopped distribution failed: $(cat "$run_dir/new-stopped.json")"
+created_doc="$(compact <"$run_dir/new-stopped.json")"
+[ "$(state_of "$second")" = "Running" ] ||
+  fail "creating a session did not start $second"
+created_here="$(printf '%s' "$created_doc" | json_string session_id)"
+[ -n "$created_here" ] ||
+  fail "the create named no session: $created_doc"
+case "$created_doc" in
+  *"\"environment_id\":\"$second_id\""*) : ;;
+  *) fail "the session was not created in $second's environment $second_id: $created_doc" ;;
+esac
+# The session starts where the user in the distribution starts, which the destination said and
+# this host did not: the working directory of the command that asked is a Windows one.
+# shellcheck disable=SC2016  # the variable is read inside the distribution, not here
+home_inside="$(inside "$second" 'printf %s "$HOME"')" ||
+  fail "$second could not say where its user's home is"
+case "$created_doc" in
+  *"\"cwd\":\"$home_inside\""*) : ;;
+  *) fail "the session did not start in $second's home $home_inside: $created_doc" ;;
+esac
+# Nothing in the daemon started for it is this script's to end except by the identifier recorded
+# here: the one control daemon the distribution is running, which its own startup made.
+inside "$second" 'pgrep -x kr-controller | head -n 1 >/tmp/kr-acc-controller.pid' ||
+  fail "$second could not name the daemon its own startup made"
+inside "$second" "'$helper_path' --json list" | compact |
+  grep -q "\"session_id\":\"$created_here\"" ||
+  fail "$second does not list $created_here, the session created in it through the bridge"
+"$kr_exe" --json list | compact | grep -q "\"session_id\":\"$created_here\"" &&
+  fail "the Windows daemon lists $created_here, which lives in $second"
+pass "creating a session in the stopped distribution started it and its daemon, and the session lives there"
+
+# Attaching is the third action that starts what it names. After the session has closed and the
+# distribution has stopped, the bridge asks the distribution what became of it, which takes the
+# distribution's daemon, and the answer is that the session closed.
+inside "$second" "'$helper_path' close $created_here" >/dev/null ||
+  fail "$second could not close $created_here"
+wsl.exe -t "$second" >/dev/null 2>&1 || fail "the second distribution could not be stopped again"
+sleep 2
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "$second is not stopped, so the attach below would prove nothing"
+attach_code=0
+"$kr_exe" --json attach "$created_here" --environment second >"$run_dir/attach-closed.json" 2>&1 ||
+  attach_code=$?
+[ "$attach_code" -ne 0 ] ||
+  fail "attaching to the closed session $created_here succeeded: $(cat "$run_dir/attach-closed.json")"
+attached="$(compact <"$run_dir/attach-closed.json")"
+case "$attached" in
+  *'"code":"SESSION_CLOSED"'*) : ;;
+  *) fail "attaching to the closed session did not answer SESSION_CLOSED: $attached" ;;
+esac
+case "$attached" in
+  *'"closure":{'*) : ;;
+  *) fail "the refusal did not say how the session ended: $attached" ;;
+esac
+[ "$(state_of "$second")" = "Running" ] ||
+  fail "attaching did not start $second, which it needs to ask what became of the session"
+pass "attaching to a closed session in the stopped distribution said how it ended"
+wsl.exe -t "$second" >/dev/null 2>&1 || fail "the second distribution could not be stopped for the refresh below"
+sleep 2
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "$second is not stopped, so the refresh below would prove nothing"
 
 # Starting the distribution again is one step; the daemon inside it is another, because stopping a
 # distribution ends every process in it. The refresh below starts the distribution, and the bridge
