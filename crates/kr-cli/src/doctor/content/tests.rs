@@ -880,13 +880,15 @@ fn entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
 async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints_or_writes() {
     use kr_protocol::session::ClosureRecord;
 
-    const MARKERS: [&str; 6] = [
+    const MARKERS: [&str; 8] = [
         "kr-marker-token-1",
         "kr-marker-pass-2",
         "kr-marker-url-3",
         "kr-marker-quoted-4",
         "kr-marker-signal-5",
         "kr-marker-equals-6",
+        "kr-marker-overlap-7",
+        "kr-marker-apostrophe-8",
     ];
     let mut planted = listed(1);
     planted.shell_path = format!("/opt/tools/sh --password {}", MARKERS[1]);
@@ -910,7 +912,10 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
         closed_at_ms: TimestampMs::new(2_000),
     });
     let mut ordinary = listed(3);
-    ordinary.cwd = "/home/tom/projects/ordinary".to_owned();
+    ordinary.cwd = format!(
+        "/home/tom/projects/ordinary --password TOKEN=\"two words {}\" --url=\"https://o'neil:{}@host/\"",
+        MARKERS[6], MARKERS[7]
+    );
     ordinary.shell_path = "/bin/zsh".to_owned();
     let mut host = Changing::new(
         vec![report(0, false, &[])],
@@ -977,7 +982,8 @@ async fn planted_credentials_in_every_text_field_reach_nothing_the_export_prints
         "what is written is what was shown"
     );
     for readable in [
-        "[home]/projects/ordinary",
+        "[home]/projects/ordinary --password [redacted]",
+        "https://[redacted]@host/",
         "/bin/zsh",
         "TOKEN=[redacted]",
         "--password [redacted]",
@@ -1095,7 +1101,8 @@ async fn the_preview_states_what_the_export_cannot_promise() {
     for stated in [
         "A filter is not a guarantee that no secret remains",
         "the home directory of the user running this command",
-        "after this preview is printed, or after the bundle is written, cannot recall either",
+        "after the host was last read does not stop this preview or the write",
+        "after this preview is printed or the bundle is written cannot recall either",
         "finished its cleanup is in the content once privacy mode is off",
         "ordinary terminal output",
         "any device viewing the session can read",
@@ -1133,11 +1140,20 @@ async fn a_dropped_session_the_host_stops_listing_does_not_fail_the_export() {
 #[test]
 fn invisible_characters_outside_the_basic_plane_are_escaped_as_pairs() {
     let mut closed = listed(4);
-    closed.cwd = "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}/\u{1f600}".to_owned();
+    closed.cwd =
+        "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}\u{890}\u{110bd}\u{13430}/\u{1f600}".to_owned();
     let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
     let composed = compose(&Reading { listed: selection }, &[], &rules()).expect("composes");
     let text = composed.text();
-    for hidden in ['\u{e0041}', '\u{fe0f}', '\u{34f}', '\u{1d173}'] {
+    for hidden in [
+        '\u{e0041}',
+        '\u{fe0f}',
+        '\u{34f}',
+        '\u{1d173}',
+        '\u{890}',
+        '\u{110bd}',
+        '\u{13430}',
+    ] {
         assert!(!text.contains(hidden), "{hidden:?} is in {text}");
     }
     assert!(text.contains("\\udb40\\udc41"), "{text}");
@@ -1148,15 +1164,15 @@ fn invisible_characters_outside_the_basic_plane_are_escaped_as_pairs() {
     let record: serde_json::Value = serde_json::from_str(text).expect("still JSON");
     assert_eq!(
         record["sessions"][0]["cwd"],
-        "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}/\u{1f600}"
+        "/work/\u{e0041}\u{fe0f}\u{34f}\u{1d173}\u{890}\u{110bd}\u{13430}/\u{1f600}"
     );
 }
 
-/// KR-REQ-29.04: the types hold "written only after it was shown": an `Approved` is made only by
-/// the export, which approves after printing, so a run whose preview was never printed has no
-/// approval to hand the archive. The control is the run that printed.
+/// KR-REQ-29.04: a confirmed run prints the preview exactly once and approves. That nothing is
+/// approved before the print is held by the failing-preview tests above (a preview that cannot be
+/// printed leaves no approval) and by the types: only the export makes an approval.
 #[tokio::test]
-async fn nothing_is_approved_before_the_preview_has_printed() {
+async fn a_confirmed_run_prints_the_preview_once_and_approves() {
     let printed = std::cell::Cell::new(false);
     let order = std::cell::RefCell::new(Vec::new());
     let digest = exported(

@@ -82,14 +82,15 @@ struct Host {
 }
 
 /// Whether the process `pid` has ended: it is gone, or it is a zombie nobody has waited for. Asked
-/// of `ps`, which says both the same way on every Unix this runs on.
-fn has_ended(pid: u64) -> bool {
+/// of `ps`, which says both the same way on every Unix this runs on. `Err` says `ps` could not be
+/// asked, which the cleanup reports without panicking, because it runs while a failure may unwind.
+fn has_ended(pid: u64) -> Result<bool, String> {
     let listed = std::process::Command::new("/bin/ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
-        .expect("ps runs");
+        .map_err(|error| format!("ps could not be run: {error}"))?;
     let state = String::from_utf8_lossy(&listed.stdout);
-    state.trim().is_empty() || state.trim().starts_with('Z')
+    Ok(state.trim().is_empty() || state.trim().starts_with('Z'))
 }
 
 impl Drop for Host {
@@ -129,7 +130,15 @@ impl Host {
         let session_id: kr_protocol::ids::SessionId = session.parse().ok()?;
         let descriptor = self.temp.environment().descriptor_file(session_id);
         let started = Instant::now();
-        while descriptor.exists() || worker.is_some_and(|pid| !has_ended(pid)) {
+        loop {
+            let running = match worker.map(has_ended) {
+                Some(Ok(ended)) => !ended,
+                Some(Err(failure)) => return Some(failure),
+                None => false,
+            };
+            if !descriptor.exists() && !running {
+                break;
+            }
             if started.elapsed() >= LIVENESS_DEADLINE {
                 return Some(format!(
                     "session {session}'s worker (process {worker:?}) did not end: its descriptor \

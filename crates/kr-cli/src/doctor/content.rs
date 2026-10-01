@@ -499,9 +499,10 @@ impl Composed {
              the text, and so does a user name elsewhere in a path."
         ));
         lines.push(stdout_line!(
-            "Privacy mode turned on after this preview is printed, or after the bundle is \
-             written, cannot recall either. A session that was created while privacy mode was on \
-             and has finished its cleanup is in the content once privacy mode is off."
+            "Privacy mode turned on after the host was last read does not stop this preview or \
+             the write, and turned on after this preview is printed or the bundle is written \
+             cannot recall either. A session that was created while privacy mode was on and has \
+             finished its cleanup is in the content once privacy mode is off."
         ));
         lines.push(stdout_line!(
             "This preview is ordinary terminal output: in a KalaReach session it becomes that \
@@ -557,7 +558,8 @@ impl Preview {
 
 /// An export that may be written: it was composed, shown, and is the content a person was shown.
 ///
-/// Only [`Composed::approve`] makes one, so nothing that was not shown can reach the archive:
+/// Only the export makes one, after it has printed the content and compared its digest, so nothing
+/// that was not shown can reach the archive:
 ///
 /// ```compile_fail
 /// fn forge(content: kr_cli::doctor::bundle::Content) -> kr_cli::doctor::content::Approved {
@@ -670,6 +672,7 @@ const fn hides(character: char) -> bool {
             | '\u{061c}'
             | '\u{06dd}'
             | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
             | '\u{08e2}'
             | '\u{115f}'..='\u{1160}'
             | '\u{17b4}'..='\u{17b5}'
@@ -682,6 +685,9 @@ const fn hides(character: char) -> bool {
             | '\u{feff}'
             | '\u{ffa0}'
             | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
             | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0000}'..='\u{e0fff}'

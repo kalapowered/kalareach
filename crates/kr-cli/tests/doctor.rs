@@ -675,8 +675,15 @@ fn only_the_reporters_preview_writes_content_to_the_error_stream() {
                     ["is_terminal", "ready", "show_preview"]
                 );
                 assert_eq!(names(&in_report, "eprintln!"), ["say"]);
+                // The counts over the whole file, so a function this reading cannot parse, a macro
+                // or a closure is counted too.
+                assert_eq!(calls("write_line("), 1, "{name}");
+                assert_eq!(calls("write_prompt("), 0, "{name}");
+                assert_eq!(calls("write_preview("), 2, "{name}");
+                assert_eq!(calls("stderr()"), 3, "{name}");
+                assert_eq!(calls("eprintln!"), 1, "{name}");
             }
-            "doctor/content/tests.rs" => {
+            "doctor/content.rs" | "doctor/content/tests.rs" => {
                 assert_eq!(calls("write_line("), 0, "{name}");
                 assert_eq!(calls("write_prompt("), 0, "{name}");
             }
@@ -684,6 +691,9 @@ fn only_the_reporters_preview_writes_content_to_the_error_stream() {
                 assert_eq!(calls("write_line("), 0, "{other} calls write_line");
                 assert_eq!(calls("write_prompt("), 0, "{other} calls write_prompt");
                 assert_eq!(calls("write_preview("), 0, "{other} calls write_preview");
+                // The way to an approval with no preview: only the content module and its tests
+                // call it.
+                assert_eq!(calls("export_with("), 0, "{other} calls export_with");
             }
         }
     }
