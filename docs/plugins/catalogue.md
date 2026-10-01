@@ -463,22 +463,24 @@ that writes nothing:
   back, and when a replacement keeps its protection: one with an access-control list, one in a
   directory that would give its replacement one, and one another user owns are refused.
 
-Every file the recipe installs is JSON this host can read, whatever its name says, and every command
-in one is the forwarder, in a form this host reads: its name alone, with the application and the
-surface as the two arguments in a list, or one line of its name, the application and the surface,
-separated by single spaces. An object that holds a command carries only a type, a name, the command,
-its arguments and a time limit, so that nothing beside the command can run it in another place or
-environment.
+Every file the recipe installs is JSON this host can read, and has the closed shape this host names
+for it: only the members listed, with the kinds of value listed, and nothing else. A hooks file
+holds events, groups and handlers whose kind is `command`; a server file holds servers that start a
+program; a manifest holds text members, its channels and whether it is on by default, and is named
+for the directory it is in. A handler of another kind, a server that connects to an address, a
+dependency and any other member are refused. Every command in them is the forwarder, in a form this
+host reads: its name alone, with the application and the surface as the two arguments in a list, or
+one line of its name, the application and the surface, separated by single spaces.
 
 A bridge places only what this host names for its application. For Claude Code that is three files,
 `.claude-plugin/plugin.json`, `.mcp.json` and `hooks/hooks.json`, in one directory `skills/<name>/`,
 and the one key that enables them, `enabledPlugins.<name>@skills-dir` in `settings.json`, set to
 `true`, for the same name. For Gemini CLI it is three files in `extensions/<name>/` and no key. A
-destination or a key that is not on that list is refused, and so is a name in another case. A bridge
-therefore never writes a settings document, never enables a plugin it did not install, and no value
-it adds can hold a command.
+recipe installs every one of the files, once. A destination or a key that is not on that list is
+refused, and so is a name in another case. A bridge therefore never installs a settings document of
+its own, never enables a plugin it did not install, and no value it adds can hold a command.
 
-This host does not read what else a registration file asks the application to do. The owner's
+What the forwarder does once the application starts it is the publisher's own, and the owner's
 confirmation of the publisher's statement is the only control on that.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the

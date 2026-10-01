@@ -50,6 +50,7 @@
 mod check;
 mod journal;
 pub(crate) mod json;
+mod shapes;
 mod tree;
 
 use std::collections::BTreeSet;
@@ -818,8 +819,7 @@ impl NativeBridges {
         // registration files in one directory of the application's own, and the one key that
         // enables them. Nothing else a bridge adds can hold a command, so none is left unread.
         permitted(recipe)?;
-        let registered = sources.clone();
-        let facts = registration(&registered, &forwarder)?;
+        let facts = registration(&sources, &forwarder, recipe.application.as_str())?;
         // The forwarder a registration starts reports for the application it names, and a
         // launch of this package admits only its own: a registration for another package's
         // application would be a bridge no launch of either could use.
@@ -2250,6 +2250,7 @@ fn package_name(plugin_id: &PluginId) -> &str {
 fn registration(
     sources: &[(String, Vec<u8>)],
     forwarder: &Path,
+    application: &str,
 ) -> std::result::Result<Option<RecordedFacts>, String> {
     let mut applications = BTreeSet::new();
     let mut surfaces = BTreeSet::new();
@@ -2263,6 +2264,18 @@ fn registration(
             ));
         };
         invocations(&value, destination, &mut applications, &mut surfaces)?;
+        // Then the file's own shape, which is closed: what the commands are is read above, and
+        // what else the file asks the application to do is only what this host names for it.
+        let (directory, tail) = destination
+            .split_once('/')
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .ok_or_else(|| format!("{destination} is not in a directory of its own"))?;
+        shapes::check(application, directory, tail, &value).map_err(|why| {
+            format!(
+                "{destination} is not a registration file this host permits a native bridge \
+                 for {application} to install: {why}"
+            )
+        })?;
     }
     let mut named = applications.into_iter();
     let Some(application) = named.next() else {
@@ -2408,6 +2421,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     };
     let application = &recipe.application;
     let mut name: Option<&str> = None;
+    let mut placed_tails: Vec<&str> = Vec::new();
     // The files first, whatever order the recipe lists its steps in: the key is held to the
     // directory they are in.
     for step in &recipe.install {
@@ -2418,7 +2432,9 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                     .strip_prefix(layout.root)
                     .and_then(|rest| rest.strip_prefix('/'))
                     .and_then(|rest| rest.split_once('/'))
-                    .filter(|(_, tail)| layout.tails.contains(tail));
+                    .filter(|(directory, tail)| {
+                        plain_name(directory) && layout.tails.contains(tail)
+                    });
                 let Some((directory, _)) = placed else {
                     return Err(format!(
                         "the recipe installs {destination}, which this host does not permit a \
@@ -2436,8 +2452,25 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                     ));
                 }
                 name = Some(directory);
+                placed_tails.push(destination);
             }
         }
+    }
+    // Every file of the registration, and each once: an application reads the files beside the
+    // ones a recipe leaves out, and a directory that holds another manifest or server file is
+    // not one this host has checked.
+    let tails_missing = layout.tails.iter().find(|tail| {
+        placed_tails
+            .iter()
+            .filter(|destination| destination.ends_with(&format!("/{tail}")))
+            .count()
+            != 1
+    });
+    if let Some(tail) = tails_missing {
+        return Err(format!(
+            "the recipe does not install {tail} exactly once, and this host does not permit a \
+             native bridge for {application} to install less than every file of its registration"
+        ));
     }
     for step in &recipe.install {
         if let BridgeStep::AddConfigurationKey { file, key, value } = step {
