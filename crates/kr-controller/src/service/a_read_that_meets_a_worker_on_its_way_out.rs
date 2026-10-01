@@ -392,7 +392,7 @@ impl Scripted {
 }
 
 /// A closure of `session_id` that a close requested.
-fn closure_of(session_id: SessionId) -> ClosureRecord {
+pub(super) fn closure_of(session_id: SessionId) -> ClosureRecord {
     ClosureRecord {
         session_id,
         session_epoch: SessionEpoch::V1,
