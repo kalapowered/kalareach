@@ -1483,11 +1483,23 @@ fn name_the_policy(hosted: &Hosted, policy: kr_protocol::admission::RevocationPo
     .expect("the document");
 }
 
+/// The catalogue's records, where a test reads or edits them while the daemon is stopped.
+fn catalogue_records(environment: &kr_ipc::paths::EnvironmentPaths) -> std::path::PathBuf {
+    environment
+        .state_dir()
+        .join("catalogue")
+        .join(kr_plugin_catalogue::db::DATABASE_FILE)
+}
+
 /// KR-REQ-25.22: no snapshot a restarted daemon computes for a worker that outlived the last one
 /// carries the policy the catalogue recorded rather than the one this host's configuration
 /// decides. The document is already accepted and only the catalogue's record differs (a store
 /// restored from an older copy), so no acceptance at start puts the policy in force: it is put in
 /// force when the catalogue opens, before the cadence that sends the first round starts.
+///
+/// The record that differs is a commit made before the daemon has counted its workers, and a
+/// release an upgrade left, which a surviving worker may still hold, is still there once the
+/// daemon has started: a commit forgets a retired release only once the workers are counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configuration_decides() {
     use kr_protocol::admission::RevocationPolicy;
@@ -1502,6 +1514,7 @@ async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configura
         "control: the worker was handed the policy the document names"
     );
 
+    let environment_id = hosted.tree.environment_id();
     hosted
         .restart_after(|environment| {
             let mut catalogue = Catalogue::open(
@@ -1514,8 +1527,36 @@ async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configura
             catalogue
                 .set_disable_policy(kr_plugin_catalogue::DisablePolicy::WarnOnly)
                 .expect("the older record");
+            drop(catalogue);
+            rusqlite::Connection::open(catalogue_records(environment))
+                .expect("the catalogue's records")
+                .execute(
+                    "INSERT INTO retired_releases
+                         (environment_id, plugin_id, package_digest, enrolment_key,
+                          repository_id, cap)
+                     VALUES (?1, 'kalareach/example', ?2, ?3, 'development', '[]')",
+                    rusqlite::params![
+                        environment_id.to_string(),
+                        kr_plugin_sdk::digest::PayloadDigest::of(b"a release").to_string(),
+                        kr_plugin_catalogue::EnrolmentKey::generate()
+                            .expect("a key")
+                            .as_str(),
+                    ],
+                )
+                .expect("a retired release");
         })
         .await;
+    let retired: i64 = rusqlite::Connection::open(catalogue_records(&hosted.tree.environment()))
+        .expect("the catalogue's records")
+        .query_row("SELECT COUNT(*) FROM retired_releases", [], |row| {
+            row.get(0)
+        })
+        .expect("a count");
+    assert_eq!(
+        retired, 1,
+        "the commit that put the policy in force when the catalogue opened forgot a release \
+         before the workers were counted"
+    );
     assert!(hosted.counted_once_known().await.is_present());
     let carried = hosted.controller().catalogue().policies_carried();
     assert!(!carried.is_empty(), "the worker was sent a round");
