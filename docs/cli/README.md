@@ -880,19 +880,19 @@ so is a session that was created when privacy mode was on but has completed its 
 This first reads whether the host is in privacy mode, then reads the sessions, and then reads
 whether the host is in privacy mode again. If the host is in privacy mode at either read, or if the
 generation of privacy mode changes between the two reads of privacy mode, this will not export any
-sessions and print the number of sessions that it left out and the reason why. (If privacy mode is
-off at the second read but changed since the first, the reason will tell you to run the command
-again.) If any other error occurs while reading the privacy mode or the sessions, this will fail
-(and not write anything on disk). An empty bundle (with no sessions) is valid, so this will exit as
-if it were only running diagnostics, for example by printing:
+sessions and, if the host lists any, print the number of sessions that it left out and the reason
+why. (If privacy mode is off at the second read but changed since the first, the reason will tell
+you to run the command again.) If any other error occurs while reading the privacy mode or the
+sessions, this will fail (and not write anything on disk). An empty bundle (with no sessions) is
+valid, so this will exit as if it were only running diagnostics, for example by printing:
 
 ```text
   content/sessions.json: the shell, working directory and closure of 0 sessions, redacted by session-content-1 and printed before it was written (digest 9f2c...); 2 sessions left out: privacy mode is on
 ```
 
 The content preview, the manifest, and the `content_left_out` key of the JSON document produced when
-using the `--json` option, will all include the number of sessions that were not exported and the
-reason why.
+using the `--json` option, will all include the number of sessions that were left out for each
+reason.
 
 #### What it shows and what it removes
 
@@ -928,26 +928,28 @@ followed by a lower-case letter. In other words, something like `PWD` would not 
 word, or a word with both quoted and unquoted parts (for example `abc"d e"`), is the value. A quote
 can be a quote or a character of a name, such as the apostrophe in `/Users/Tom's x` or in `Rock 'n
 Roll`, and the text cannot say which. As it is impossible to know which, if a quote is seen before
-the value of a credential, it is assumed that the quote might be quoting the value (which might even
-be open until the end of the text), and the whole field will not be included and its length will be
-reported; this includes an assignment in a quoted argument such as `"PASSWORD=two words"` or in the
-script of a `sh -c` command. Similarly, if a quote is part of the value and it cannot be closed, it
-is assumed that the value might be quoted and will not be included. Finally, if a field contains an
-assignment or option with a name that appears to be a credential and a value, and the field ends
-with an open quote (probably one used in a word, for example an apostrophe in a path), the field
-will not be included and its length will be reported.
+the value of an assignment or option whose name appears to be a credential, it is assumed that the
+quote might be quoting the value (which might even be open until the end of the text), and the whole
+field will not be included and its length will be reported; this includes an assignment in a quoted
+argument such as `"PASSWORD=two words"` or in the script of a `sh -c` command. Similarly, if a quote
+is part of the value and it cannot be closed, it is assumed that the value might be quoted and the
+whole field will not be included. Finally, if a field contains an assignment or option with a name
+that appears to be a credential and a value, and the field ends with an open quote (probably one
+used in a word, for example an apostrophe in a path), the field will not be included and its length
+will be reported.
 
 A filter is not a guarantee that no secret remains, and this one cannot tell a secret from other
 text by its value. It has no rule for positional secrets, plain path components, values to `-p` and
 `-u user:secret`, values of an `Authorization` header, connection string components, passwords that
 include non-escaped `/`, `?` or `#` in URLs, options that start with only one `-` such as
-`-password`, a quoted option name, `--user u:secret`, a quote character that is part of a secret
-(`TOKEN='it's a secret'`), a value in `$'...'` quoting, or user names included in paths (except your
-home directory); a secret in one of these forms stays unless another rule happens to match it, as
-one named `Password=...` in a connection string would be. Please look over the content in the
-preview and make sure there is nothing you don't want to share before continuing. Note that some
-invisible characters, such as text direction overrides and zero-width characters, will be written as
-escapes, so that what you see on the screen is what is in the file.
+`-password`, a quoted option name, `--user u:secret`, a quote character that is part of a secret, a
+value in `$'...'` quoting, a value with a command substitution, backticks or `${...}` in it, or user
+names included in paths (except your home directory); a secret in one of these forms stays unless
+another rule happens to match it, as one named `Password=...` in a connection string would be.
+Please look over the content in the preview and make sure there is nothing you don't want to share
+before continuing. Note that some invisible characters, such as text direction overrides and
+zero-width characters, will be written as escapes, so that what you see on the screen is what is in
+the file.
 
 #### Writing it
 
@@ -978,9 +980,9 @@ command line with `--confirm-content`, the content will be printed again, and wi
 bundle. Otherwise, the command will exit with a non-zero status (1), will not print the content, and
 will not write the bundle (if there was already a file at the bundle path, it will not be changed).
 If you want to exclude any session from the content, pass its id on the command line with
-`--exclude-session`. Be sure to pass it both times, as it will be part of the digest. When this
-command is run not from a terminal, without either `--preview` or `--confirm-content`, it will fail
-with a usage error before it consults the host.
+`--exclude-session`. Be sure to pass it both times, as leaving a session out changes the content and
+the counts that the digest covers. When this command is run not from a terminal, without either
+`--preview` or `--confirm-content`, it will fail with a usage error before it consults the host.
 
 When `--json` is passed on the command line, when the content is either previewed or approved for
 export, the document printed will have a `content_digest` field, a `content_left_out` field, a
