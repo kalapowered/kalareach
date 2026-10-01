@@ -78,21 +78,21 @@ fn nothing_is_private_where_privacy_mode_was_never_on() {
 }
 
 /// KR-REQ-29.04: while privacy mode is on, every session is private, live or closed, whether or
-/// not the host lists it as owing anything: the switch is one for the environment.
+/// not the host lists it as owing anything: the switch is one for the environment. Said as on when
+/// it is on at the second read, and as changed when it was on at the first and is off at the second:
+/// what was read across a change is out either way.
 #[test]
 fn every_session_is_private_while_privacy_mode_is_on_at_either_read() {
-    for (before, after) in [
-        (report(1, true, &[]), report(1, true, &[])),
-        (report(1, true, &[]), report(1, false, &[])),
-        (report(0, false, &[]), report(1, true, &[])),
+    for (before, after, why) in [
+        (report(1, true, &[]), report(1, true, &[]), Why::PrivacyOn),
+        (report(0, false, &[]), report(1, true, &[]), Why::PrivacyOn),
+        (report(1, true, &[]), report(2, false, &[]), Why::Moved),
+        (report(1, true, &[]), report(1, false, &[]), Why::Moved),
     ] {
         let selection = select(&before, vec![listed(1), listed(2)], &after);
         assert_eq!(
             outcome(&selection),
-            vec![
-                (session_id(1), Some(Why::PrivacyOn)),
-                (session_id(2), Some(Why::PrivacyOn))
-            ],
+            vec![(session_id(1), Some(why)), (session_id(2), Some(why))],
             "on at {} then {}",
             before.enabled,
             after.enabled
@@ -214,7 +214,7 @@ fn the_export_names_what_is_in_and_says_why_the_rest_is_out() {
     assert_eq!(
         content.describe().as_str(),
         "  content/sessions.json: the shell, working directory and closure of 2 sessions; 1 session \
-         left out: it still owes the cleanup privacy mode asked for"
+         left out: privacy cleanup is still owed"
     );
 }
 
@@ -237,4 +237,97 @@ fn an_export_with_every_session_out_is_an_empty_list_that_says_so() {
         "  content/sessions.json: the shell, working directory and closure of 0 sessions; 2 sessions \
          left out: privacy mode is on"
     );
+}
+
+/// KR-REQ-29.04: the record of a closed session holds the closure's closed words and numbers and
+/// counts what it stopped and what survived; the names and descriptions the closure carries are
+/// text the record does not repeat, and the field list is exactly the one the design names.
+#[test]
+fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else() {
+    use kr_protocol::session::{ClosureRecord, SurvivingResource, TerminatedProcess};
+
+    let marker = "kr-marker-5d2a";
+    let mut closed = listed(4);
+    closed.state = SessionState::Closed;
+    closed.closure = Nullable::some(ClosureRecord {
+        session_id: session_id(4),
+        session_epoch: SessionEpoch::V1,
+        reason: ClosureReason::RootSignal,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::some("SIGTERM".to_owned()),
+        terminated: vec![TerminatedProcess {
+            identity: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                9,
+            ),
+            name: Nullable::some(marker.to_owned()),
+            forced: true,
+        }],
+        surviving: vec![
+            SurvivingResource {
+                kind: marker.to_owned(),
+                detail: marker.to_owned(),
+            },
+            SurvivingResource {
+                kind: "desktop".to_owned(),
+                detail: marker.to_owned(),
+            },
+        ],
+        ownership_coverage: OwnershipCoverage::Incomplete,
+        durability: Durability::Volatile,
+        closed_at_ms: TimestampMs::new(2_000),
+    });
+    let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
+    let content = compose(&Reading { listed: selection })
+        .expect("composes")
+        .into_content();
+    let text = String::from_utf8(content.bytes).expect("text");
+    assert!(
+        !text.contains(marker),
+        "no name or description is repeated: {text}"
+    );
+    let record: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let session = &record["sessions"][0];
+    let keys = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        keys(session),
+        [
+            "closure",
+            "created_at_ms",
+            "cwd",
+            "display_number",
+            "session_id",
+            "shell",
+            "shell_mode",
+            "state",
+            "worker_profile"
+        ]
+    );
+    assert_eq!(
+        keys(&session["closure"]),
+        [
+            "closed_at_ms",
+            "durability",
+            "ownership_coverage",
+            "reason",
+            "root_exit_code",
+            "root_signal",
+            "surviving_count",
+            "terminated_count"
+        ]
+    );
+    assert_eq!(session["closure"]["terminated_count"], 1);
+    assert_eq!(session["closure"]["surviving_count"], 2);
+    assert_eq!(session["closure"]["ownership_coverage"], "incomplete");
+    assert_eq!(session["closure"]["durability"], "volatile");
+    assert_eq!(session["closure"]["root_signal"], "SIGTERM");
+    assert_eq!(session["closure"]["reason"], "root_signal");
 }

@@ -131,8 +131,10 @@ impl Why {
     pub const fn said(self) -> &'static str {
         match self {
             Self::PrivacyOn => "privacy mode is on",
-            Self::Moved => "privacy mode changed while the sessions were read",
-            Self::OwesCleanup => "it still owes the cleanup privacy mode asked for",
+            Self::Moved => {
+                "privacy mode changed while the sessions were read (run the command again)"
+            }
+            Self::OwesCleanup => "privacy cleanup is still owed",
         }
     }
 
@@ -183,12 +185,13 @@ pub fn select(
     sessions: Vec<SessionSummary>,
     after: &PrivacyReport,
 ) -> Vec<Listed> {
-    // Every session while privacy mode is on at either read. A generation that moved with the mode
-    // off at both ends means privacy mode was on and off again in between, which no list read
-    // across it can be told from one read after it.
-    let all = if before.enabled || after.enabled {
+    // Every session, when privacy mode is on now or was on, or changed, while the list was read.
+    // It is on now when the second read says so. Otherwise a mode that was on at the first read, or
+    // a generation that moved with the mode off at both ends, means it was turned off, or on and
+    // off again, in between; no list read across a change can be told from one read after it.
+    let all = if after.enabled {
         Some(Why::PrivacyOn)
-    } else if before.generation != after.generation {
+    } else if before.enabled || before.generation != after.generation {
         Some(Why::Moved)
     } else {
         None
