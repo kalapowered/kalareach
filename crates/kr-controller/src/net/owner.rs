@@ -262,6 +262,23 @@ impl OwnerAuthority {
         }
     }
 
+    /// Refuses a caller that is not this host's owner, which is whom owner confirmations are
+    /// asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for a caller without owner authority, and an error when the
+    /// owner records cannot be read.
+    pub fn require_owner(&self, caller: &Caller) -> Result<()> {
+        if caller.is_owner(self.rows.lifetimes())? {
+            Ok(())
+        } else {
+            Err(ControllerError::PermissionDenied {
+                detail: "only this host's owner asks for an owner confirmation".to_owned(),
+            })
+        }
+    }
+
     /// Issues the challenge for one resolved action.
     ///
     /// `action` is the caller's action and the digest of its whole mutation. The challenge an
@@ -282,11 +299,7 @@ impl OwnerAuthority {
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationRequestResult> {
-        if !caller.is_owner(self.rows.lifetimes())? {
-            return Err(ControllerError::PermissionDenied {
-                detail: "only this host's owner asks for an owner confirmation".to_owned(),
-            });
-        }
+        self.require_owner(caller)?;
         let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
         let mut state = self.state();
         // Asked under the lock every challenge is issued under, so two copies of one request meet
@@ -499,8 +512,14 @@ impl OwnerAuthority {
         Ok(confirmed)
     }
 
-    /// Spends, once, the oldest answered challenge that equals `expectation`, and returns the
-    /// evidence of it, for an effect whose caller presents no proof of its own.
+    /// Spends, once, the oldest answered challenge that equals `expectation` and was shown to the
+    /// owner device as `shows` accepts, and returns the evidence of it, for an effect whose caller
+    /// presents no proof of its own.
+    ///
+    /// An effect that is spent from a recorded answer takes only a challenge the host described
+    /// from the request itself: a challenge a caller described has the same action and digest
+    /// and was shown to the owner as the caller's own words, so `shows` is what keeps one from
+    /// standing in for the other.
     ///
     /// What an owner device recorded through `owner.confirmation.complete` is verified again here
     /// against the owner devices of this host as they stand now, the challenge is consumed, and
@@ -517,9 +536,10 @@ impl OwnerAuthority {
     pub fn spend_answered(
         &self,
         expectation: &ConfirmationExpectation<'_>,
+        shows: &dyn Fn(&ConfirmationDisplay) -> bool,
         effect: &str,
     ) -> Result<ConfirmedAction> {
-        let (spendable, mut state) = self.spend(expectation)?;
+        let (spendable, mut state) = self.spend(expectation, shows)?;
         let confirmed = ConfirmedAction::verify(
             expectation,
             &mut state.ledger,
@@ -746,7 +766,8 @@ impl OwnerAuthority {
         })
     }
 
-    /// Takes the oldest answered challenge that equals `expectation`, member for member.
+    /// Takes the oldest answered challenge that equals `expectation`, member for member, and was
+    /// shown to the owner device as `shows` accepts.
     ///
     /// The challenge stays in the ledger: the effect consumes it through the approval, and does so
     /// exactly once. The returned guard is the ledger it consumes it from.
@@ -757,6 +778,7 @@ impl OwnerAuthority {
     pub fn spend(
         &self,
         expectation: &ConfirmationExpectation<'_>,
+        shows: &dyn Fn(&ConfirmationDisplay) -> bool,
     ) -> Result<(Spendable, MutexGuard<'_, Challenges>)> {
         let enrolment = self.enrolment()?;
         let mut state = self.state();
@@ -764,7 +786,11 @@ impl OwnerAuthority {
         let mut candidates: Vec<&Entry> = state
             .entries
             .values()
-            .filter(|entry| entry.answer.is_some() && expectation.require(&entry.request).is_ok())
+            .filter(|entry| {
+                entry.answer.is_some()
+                    && shows(&entry.display)
+                    && expectation.require(&entry.request).is_ok()
+            })
             .collect();
         if candidates.is_empty() {
             return Err(confirmation_required(
@@ -823,7 +849,7 @@ impl OwnerAuthority {
         expectation: &ConfirmationExpectation<'_>,
         effect: &str,
     ) -> Result<()> {
-        let (spendable, mut state) = self.spend(expectation)?;
+        let (spendable, mut state) = self.spend(expectation, &|_| true)?;
         kr_pairing::confirm::accept_confirmation(
             &mut state.ledger,
             &self.clock,
