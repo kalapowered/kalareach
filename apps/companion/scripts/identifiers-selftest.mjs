@@ -128,7 +128,7 @@ for (const [what, text, expected] of [
   ['a name that continues with an underscore is found', 'to.kala.reach.companion_preferences', ['to.kala.reach.companion_preferences']],
   ['a name that continues with a digit is found', 'to.kala.companion2', ['to.kala.companion2']],
   ['a name that continues with a dollar is found', 'to.kala.reach.companion$Inner', ['to.kala.reach.companion$Inner']],
-  ['a name is found even with a letter before it', 'xto.kala.companion', ['to.kala.companion']]
+  ['a name is found with the letters that run into it', 'xto.kala.companion', ['xto.kala.companion']]
 ]) {
   held(what, JSON.stringify(expected), JSON.stringify(retiredTokens(text)))
 }
@@ -172,6 +172,11 @@ heldProblems(
   'a class defined under the identifier before the namespace was kept is still refused',
   problemsInDex([dex({ defined: ['to.kala.companion.MainActivity'] })]),
   ['the name to.kala.companion.MainActivity']
+)
+heldProblems(
+  'a class the dex defines with a letter run into it is not that class, and is refused',
+  problemsInDex([dex({ defined: [WORKER], constants: [`x${WORKER}`] })]),
+  [`the name x${WORKER}`]
 )
 heldProblems(
   'a sentence that names a defined class is not a stale name',
@@ -259,13 +264,13 @@ const TREE = `
     E: manifest (line=2)
       A: package="to.kala.reach" (Raw: "to.kala.reach")
       E: permission (line=56)
-        A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" (Raw: "x")
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" (Raw: "to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION")
       E: application (line=62)
         E: provider (line=125)
-          A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="to.kala.reach.fileprovider" (Raw: "x")
+          A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="to.kala.reach.fileprovider" (Raw: "to.kala.reach.fileprovider")
           A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
         E: service (line=130)
-          A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.companion.push.PreviewWorker" (Raw: "x")
+          A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.companion.push.PreviewWorker" (Raw: "to.kala.reach.companion.push.PreviewWorker")
 `
 held(
   'a manifest dump gives up the package and every attribute of every element, in order',
@@ -299,6 +304,21 @@ held(
   'a value that holds the text the dump prints after it is read whole, in a dump with CRLF line ends',
   JSON.stringify([['meta-data', 'value', 'before" (Raw: to.kala.reach.companion.old)']]),
   JSON.stringify(attributesFromTree(RAW_INSIDE))
+)
+const RAW_QUOTED = `
+    E: manifest (line=2)
+      E: application (line=62)
+        E: meta-data (line=70)
+          A: http://schemas.android.com/apk/res/android:value(0x01010024)="before" (Raw: "to.kala.reach.companion.old")" (Raw: "before" (Raw: "to.kala.reach.companion.old")")
+          A: http://schemas.android.com/apk/res/android:label(0x01010001)="odd" (Raw: "other")
+`
+held(
+  'a value that holds the whole marker the dump prints after it, with its own quotes, is read whole',
+  JSON.stringify([
+    ['meta-data', 'value', 'before" (Raw: "to.kala.reach.companion.old")'],
+    ['meta-data', 'label', 'odd" (Raw: "other")']
+  ]),
+  JSON.stringify(attributesFromTree(RAW_QUOTED))
 )
 heldProblems(
   'a name of an earlier identifier inside such a value is found',
@@ -511,7 +531,7 @@ expectBundle(
 expectBundle(
   'an earlier name run into the next string by a letter, as literals sit in a library, is found',
   { library: 'KalaReach0.1.0to.kala.companionindex.html' },
-  ['base/lib/arm64-v8a/libapp.so carries to.kala.companionindex.html']
+  ['base/lib/arm64-v8a/libapp.so carries KalaReach0.1.0to.kala.companionindex.html']
 )
 expectBundle(
   'an earlier name followed by a protocol-buffer tag that is a letter is found',
@@ -519,9 +539,14 @@ expectBundle(
   ['base/assets/index.js carries to.kala.companion2']
 )
 expectBundle(
-  'an earlier name run into a length byte that is a letter is found whole from its first character',
+  'an earlier name with a length byte that is a letter run into it is found with that byte',
   { page: Buffer.concat([Buffer.from([0x36]), Buffer.from('to.kala.reach.companion.push.Gone')]) },
-  ['base/assets/index.js carries to.kala.reach.companion.push.Gone']
+  ['base/assets/index.js carries 6to.kala.reach.companion.push.Gone']
+)
+expectBundle(
+  'a class the application defines with a letter run into it is not the class, and is refused',
+  { page: `x${WORKER}` },
+  [`base/assets/index.js carries x${WORKER}`]
 )
 
 // -- an iOS application bundle ---------------------------------------------------------------------
