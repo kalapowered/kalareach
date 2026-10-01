@@ -91,15 +91,23 @@ limits of what it claims.
 
 When the integration reports that its hooks are live, which is after every startup file has run, the
 Zsh package lists each dynamic module the shell holds that did not come from the package's own
-module directory. For each one it reads the undefined symbols in the module's file (Mach-O, fat
-files included, and ELF64) and asks the running shell whether the shell, the modules already loaded
-or the module's own libraries provide each name. A module from the package's own tree is skipped by
-a path check, and a name the module imports weakly is not judged. The report says, for each module,
+module directory. That directory is read from where the running executable is (`<prefix>/bin/zsh`
+gives `<prefix>/lib/zsh/<version>`), never from where the integration was loaded, so a copy of the
+editor a person puts first on their module path does not make its neighbours the package's.
+
+Each module is judged as the shell loaded it. The check reads the module's undefined symbols from the
+tables the loader bound it with, which are in memory (the dynamic section on Linux, the `__LINKEDIT`
+segment on macOS), and opens no file: the name a module was loaded by can be removed or replaced
+afterwards, and the file then found is not the code the shell runs. It asks the running shell
+whether the shell, the modules already loaded, the module's own libraries or a module of the package
+that is not loaded yet provide each name; a name bound to a symbol version is asked for under that
+version, in the module's own libraries. A name the module imports weakly is not judged. The report
+says, for each module,
 
 * `bound`: every name resolves;
 * `missing`: the first name that does not, with the module and its path;
-* `not_read`: why the file could not be inspected (unreadable, too large, a format the reader does
-  not know, a path the loader does not give).
+* `not_read`: why the module could not be inspected (the loader does not say where it mapped the
+  module, a table that is not one this reads, a platform whose format it does not know).
 
 The worker refuses the session on `missing` and on `not_read`, because an inspection that cannot be
 made whole is not a pass. The create answers `SHELL_INTEGRATION_UNSUPPORTED` with the reason
@@ -110,20 +118,24 @@ be checked. The Bash, Fish and PowerShell bridges send an empty list.
 
 `crates/kr-shell-integration/tests/module_abi.rs` compiles modules as a person compiles one, against
 the headers of this repository's own Zsh package (`tests/shells/zsh/native-module-abi/`), loads each
-from a startup file into the built package, and reads the report the shell sends.
+from a startup file into the built package, and reads the report the shell sends. It runs on macOS
+and on Linux.
 
 | Module | What it is | Result |
 | --- | --- | --- |
 | compatible | imports only what the package provides | loads, `bound`, the session may qualify |
 | newer | also calls a function no editor of this release has | loads, `missing` naming that function, the session is refused with `module_tree_unsupported` |
+| newer, then removed | the startup file that loaded it removes its file | still `missing`: the module the shell holds is judged |
+| newer, then replaced | the startup file puts a module that binds where its file was | still `missing`; and a compatible module replaced by a newer one is still `bound` |
 | lazy | imports from a package module that is not loaded yet | `bound`: the shell loads that module on demand |
 | weak | imports a name it is content to lose | `bound` |
-| removed | loads, and its file is removed by the startup file that loaded it | `not_read`, refused with the module named and why it could not be checked |
 | a file the loader refuses | not a module in any format the shell loads | the loader reports it; the report has no entry, and the session is not refused for a module that never loaded |
 | the package's own modules, loaded from another directory | what a module of the shell's own kind imports | every one `bound` |
 
 The newer module is the control that matters: the loader accepts it, which is the false ready state
-the check exists to prevent, and the check refuses it.
+the check exists to prevent, and the check refuses it. `not_read` and the refusal it carries are
+proved in the contract's own tests; no module the shell's loader accepts leaves the bridge unable to
+read it.
 
 ### What it does not detect
 
@@ -138,34 +150,37 @@ the check exists to prevent, and the check refuses it.
 * **A module loaded after the hooks go live**: a later `precmd`, `zle-line-init`, deferred or
   on-demand loading, or a `module_path` the person extended after the check.
 * **A module the loader refuses.** The loader reports that itself.
+* **A module in the package's own directory.** What is loaded from there is taken to be the
+  package's. That directory is the installation's own, and a program that can write into it can
+  replace the shell as well.
 * **Loadable builtins and modules of other shells**: Bash's `enable -f`, Fish and PowerShell's
   binary modules. PowerShell's own editor range is enforced by the PSReadLine package, and this
   proof does not cover it.
 
 ### What the check costs at activation
 
-The check runs once per session, when the hooks go live, on the shell's own thread, and reads only
-regular files, each at most 64 MiB. A shell that loaded no module of its own pays for the list and
-a path check per package module. Each module of the person's own adds one read of its file and one
-lookup per undefined name.
+The check runs once per session, when the hooks go live, inside the shell, and opens no file for a
+module. A shell that loaded no module of its own pays for the list and a path check per package
+module. Each module of the person's own adds a walk of its symbol table and one lookup per
+undefined name. A name that nothing loaded provides sends one pass over the package's own modules,
+which are in the installation's own directory; a module that binds every name never does.
 
 Measured from a timer around the whole check in a session under the built package, median of ten
-sessions per row, file cache warm:
+sessions per row:
 
 | The shell holds | Apple M4 Pro, macOS 26 | AMD EPYC 7502P, Linux (glibc 2.43) |
 | --- | --- | --- |
-| no module of its own | 0.12 ms | 0.10 ms |
-| 1 small module | 0.22 ms | 0.16 ms |
-| 3 small modules | 0.28 ms | 0.17 ms |
-| 8 small modules | 0.62 ms | 0.43 ms |
-| 10 of the package's own modules, read from another directory | 2.2 ms | 0.73 ms |
-| about 35 of the package's own modules, read from another directory | 4.7 ms | 1.8 ms |
+| no module of its own | 0.10 ms | 0.11 ms |
+| 1 small module | 0.18 ms | 0.15 ms |
+| 3 small modules | 0.26 ms | 0.19 ms |
+| 8 small modules | 0.37 ms | 0.24 ms |
+| 10 of the package's own modules, read from another directory | 1.7 ms | 0.69 ms |
+| about 35 of the package's own modules, read from another directory | 2.7 ms | 1.4 ms |
 
 A `.zshrc` that loads the package's own modules pays only the path check. One that loads a few
-modules of its own pays about a tenth of a millisecond for each. The last two rows are the worst
-case, every one of the package's dozens of modules read as if it were the person's, and they stay
-under five milliseconds. A cold read adds the time to fetch each module's file from disk, which
-these figures leave out.
+modules of its own pays under a tenth of a millisecond for each. The last two rows are the worst
+case, every one of the package's dozens of modules checked as if it were the person's, and they stay
+under three milliseconds.
 
 
 ## Requalifying a package
