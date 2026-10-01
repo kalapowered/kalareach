@@ -1145,6 +1145,29 @@ impl Store {
         self.root.join("packages").join(manifest_digest.to_string())
     }
 
+    /// Returns the manifest of an activated package, in the bytes its hash names.
+    ///
+    /// `None` is a package that is not activated here or whose manifest holds other bytes, which
+    /// are answers about the package and not failures: a caller that wants the manifest goes to
+    /// the payload cache or the repository instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the file is there and cannot be read.
+    pub fn installed_manifest(
+        &self,
+        manifest_digest: PayloadDigest,
+    ) -> CatalogueResult<Option<Vec<u8>>> {
+        let path = self
+            .package_dir(manifest_digest)
+            .join(kr_plugin_sdk::package::MANIFEST_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok((PayloadDigest::of(&bytes) == manifest_digest).then_some(bytes)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(CatalogueError::storage(&path, &source)),
+        }
+    }
+
     /// Returns the file one cached payload sits in.
     #[must_use]
     pub fn payload_path(&self, digest: PayloadDigest) -> PathBuf {
