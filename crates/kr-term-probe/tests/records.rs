@@ -5,8 +5,8 @@
 //! corpus changes, a record that still passes would be a claim about steps that no longer exist,
 //! so these tests fail until the terminal is measured again. If only the grid changes, what the
 //! terminal answered still holds: the grid's half of each record (`canonical`,
-//! `canonical_pending_wrap`, `agrees` and the summary) is computed again from the same bytes, as
-//! `run::canonical` does, and the tests fail until it is.
+//! `canonical_pending_wrap`, `canonical_library`, `agrees` and the summary) is computed again from
+//! the same bytes, as `run::canonical` does, and the tests fail until it is.
 
 use std::path::{Path, PathBuf};
 
@@ -119,7 +119,7 @@ fn every_summary_counts_its_steps_and_every_answer_is_one_terminal_reported() {
         assert_eq!(
             record["canonical_library"],
             kr_term::unicode::LIBRARY.revision,
-            "{} was measured against another revision of the grid's library",
+            "{} holds a grid half computed against another revision of the library; compute it again",
             path.display()
         );
         assert!(
@@ -158,28 +158,57 @@ fn cells(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// The header cells and the rows of the table whose header line begins with `header`.
+/// The header cells and the rows of the table whose header line begins with `header`. The line
+/// under the header has to be a separator of as many cells, and every row as many cells as the
+/// header.
 fn table(reference: &str, header: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
     let mut lines = reference
         .lines()
         .skip_while(|line| !line.starts_with(header));
-    let head = lines
-        .next()
-        .ok_or_else(|| format!("the reference has no table headed {header:?}"))?;
-    let rows = lines
-        .skip(1)
-        .take_while(|line| line.starts_with('|'))
-        .map(cells)
-        .collect();
-    Ok((cells(head), rows))
+    let head = cells(
+        lines
+            .next()
+            .ok_or_else(|| format!("the reference has no table headed {header:?}"))?,
+    );
+    let separator = cells(lines.next().unwrap_or_default());
+    if separator.len() != head.len()
+        || !separator
+            .iter()
+            .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+    {
+        return Err(format!(
+            "the table headed {header:?} has {separator:?} for a separator under {} header cells",
+            head.len()
+        ));
+    }
+    let mut rows = Vec::new();
+    for line in lines.take_while(|line| line.starts_with('|')) {
+        let row = cells(line);
+        if row.len() != head.len() {
+            return Err(format!(
+                "the row {line:?} has {} cells where the header has {}",
+                row.len(),
+                head.len()
+            ));
+        }
+        rows.push(row);
+    }
+    Ok((head, rows))
 }
+
+/// The most bytes one cell of the reference may ask for in a run of the letter `a`.
+const MOST_REPEATED: usize = 4096;
 
 /// The bytes a step's cell in the reference writes, for a window of `cols` by `rows`: `\e`, `\n`,
 /// `\r` and `\u{...}` for a character, `a×columns` and `a×(columns-1)` for the letter `a` once for
-/// each of that many columns, and `<columns>` and `<rows>` for the window's size.
+/// each of that many columns, and `<columns>` and `<rows>` for the window's size. The cell is
+/// wrapped in one pair of backticks.
 fn written_bytes(notation: &str, cols: u32, rows: u32) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    let mut rest = notation.trim_matches('`');
+    let mut rest = notation
+        .strip_prefix('`')
+        .and_then(|text| text.strip_suffix('`'))
+        .ok_or_else(|| format!("{notation:?}: a notation not wrapped in backticks"))?;
     while !rest.is_empty() {
         if let Some(tail) = rest.strip_prefix("\\e") {
             bytes.push(0x1b);
@@ -210,12 +239,19 @@ fn written_bytes(notation: &str, cols: u32, rows: u32) -> Result<Vec<u8>, String
                 let offset: i64 = offset
                     .parse()
                     .map_err(|_| format!("{notation:?}: {offset:?} is not an offset"))?;
-                (i64::from(cols) + offset, tail)
+                let count = i64::from(cols)
+                    .checked_add(offset)
+                    .ok_or_else(|| format!("{notation:?}: the count overflows"))?;
+                (count, tail)
             } else {
                 return Err(format!("{notation:?}: a× is not followed by a count"));
             };
             let count = usize::try_from(count)
-                .map_err(|_| format!("{notation:?}: a count below zero for {cols} columns"))?;
+                .ok()
+                .filter(|count| *count <= MOST_REPEATED)
+                .ok_or_else(|| {
+                    format!("{notation:?}: a count of {count} for {cols} columns is out of range")
+                })?;
             bytes.resize(bytes.len() + count, b'a');
             rest = tail;
         } else if let Some(tail) = rest.strip_prefix("<columns>") {
@@ -237,88 +273,25 @@ fn written_bytes(notation: &str, cols: u32, rows: u32) -> Result<Vec<u8>, String
     Ok(bytes)
 }
 
-fn position(value: &Value) -> Result<String, String> {
-    if value.is_null() {
-        return Err("a step the terminal did not answer has no cell in the reference".to_owned());
-    }
-    Ok(format!("{};{}", value["row"], value["col"]))
+fn position(value: &Value) -> String {
+    format!("{};{}", value["row"], value["col"])
 }
 
-/// What the reference holds for the records: a row of the first table for each terminal, with its
-/// version, window and counts, and a row of the second for every step either terminal differs on,
-/// in the corpus's order, with the bytes written for each window and each terminal's cell.
-fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), String> {
-    let (_, summary) = table(reference, "| Terminal | Version | Window |")?;
-    for (_, record) in records {
-        let (cols, rows) = window(record);
-        let version = record["launcher"]["version"].as_str().ok_or("a version")?;
-        let build = record["launcher"]["build"].as_str().ok_or("a build")?;
-        let shown = if build == version {
-            version.to_owned()
-        } else {
-            format!("{version} ({build})")
-        };
-        let found: Vec<&Vec<String>> = summary
-            .iter()
-            .filter(|row| row[2] == format!("{cols} by {rows}") && row[1].starts_with(version))
-            .collect();
-        let [row] = found.as_slice() else {
-            return Err(format!(
-                "the summary has {} rows for version {version} in a window of {cols} by {rows}",
-                found.len()
-            ));
-        };
-        let counts = &record["summary"];
-        for (cell, expected) in [
-            (&row[1], shown),
-            (&row[3], counts["steps"].to_string()),
-            (&row[4], counts["agree"].to_string()),
-            (&row[5], counts["differ"].to_string()),
-            (&row[6], counts["unanswered"].to_string()),
-        ] {
-            if *cell != expected {
-                return Err(format!(
-                    "the summary row for {version} says {cell:?} where the record has {expected:?}"
-                ));
-            }
-        }
+/// How the reference names the application a record measured.
+fn shown_name(record: &Value) -> Result<&str, String> {
+    match record["launcher"]["application"].as_str() {
+        Some("Terminal") => Ok("Terminal.app"),
+        Some(other) => Ok(other),
+        None => Err("a record names no application".to_owned()),
     }
-    if summary.len() != records.len() {
-        return Err(format!(
-            "the summary has {} rows for {} records",
-            summary.len(),
-            records.len()
-        ));
-    }
+}
 
-    let (head, rows_written) = table(reference, "| Step | Bytes after a reset |")?;
-    if head.len() != 2 + records.len() {
-        return Err(format!(
-            "the step table has {} columns for {} records",
-            head.len(),
-            records.len()
-        ));
-    }
-    let columns: Vec<usize> = records
-        .iter()
-        .map(|(_, record)| {
-            let (cols, rows) = window(record);
-            let version = record["launcher"]["version"].as_str().expect("a version");
-            let wanted = format!("{version}, {cols} by {rows}");
-            let found: Vec<usize> = (2..head.len())
-                .filter(|&at| head[at].ends_with(&wanted))
-                .collect();
-            match found.as_slice() {
-                [at] => Ok(*at),
-                _ => Err(format!(
-                    "the step table has no single column for {wanted:?}"
-                )),
-            }
-        })
-        .collect::<Result<_, _>>()?;
-
-    let corpus = records[0].1["steps"].as_array().expect("steps");
-    let differing: Vec<&str> = corpus
+/// The steps either record answered and differs on. A step a terminal gave no position for is
+/// counted in the summary's last column and has no cell to compare.
+fn differing_steps(records: &[(PathBuf, Value)]) -> Vec<&str> {
+    records[0].1["steps"]
+        .as_array()
+        .expect("steps")
         .iter()
         .map(|step| step["id"].as_str().expect("an id"))
         .filter(|id| {
@@ -327,13 +300,102 @@ fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), 
                     .as_array()
                     .expect("steps")
                     .iter()
-                    .any(|step| step["id"] == *id && step["agrees"] == false)
+                    .any(|step| {
+                        step["id"] == *id && step["agrees"] == false && !step["terminal"].is_null()
+                    })
             })
         })
-        .collect();
+        .collect()
+}
+
+/// What the reference holds for the records: a row of the first table for each terminal, with its
+/// name, version, window and counts under the header the table is given, and a row of the second
+/// for every step either terminal differs on, in the corpus's order, with the bytes written for
+/// each window and each terminal's cell under a header that names that terminal, its version and
+/// its window.
+fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), String> {
+    const SUMMARY_HEADER: [&str; 7] = [
+        "Terminal", "Version", "Window", "Steps", "Agree", "Differ", "Silent",
+    ];
+    let (head, summary) = table(reference, "| Terminal | Version | Window |")?;
+    if head != SUMMARY_HEADER {
+        return Err(format!(
+            "the summary header is {head:?}, not {SUMMARY_HEADER:?}"
+        ));
+    }
+    if summary.len() != records.len() {
+        return Err(format!(
+            "the summary has {} rows for {} records",
+            summary.len(),
+            records.len()
+        ));
+    }
+    for (_, record) in records {
+        let name = shown_name(record)?;
+        let (cols, rows) = window(record);
+        let version = record["launcher"]["version"].as_str().ok_or("a version")?;
+        let build = record["launcher"]["build"].as_str().ok_or("a build")?;
+        let shown = if build == version {
+            version.to_owned()
+        } else {
+            format!("{version} ({build})")
+        };
+        let found: Vec<&Vec<String>> = summary.iter().filter(|row| row[0] == name).collect();
+        let [row] = found.as_slice() else {
+            return Err(format!(
+                "the summary has {} rows for {name}, not one",
+                found.len()
+            ));
+        };
+        let counts = &record["summary"];
+        for (cell, expected) in [
+            (&row[1], shown),
+            (&row[2], format!("{cols} by {rows}")),
+            (&row[3], counts["steps"].to_string()),
+            (&row[4], counts["agree"].to_string()),
+            (&row[5], counts["differ"].to_string()),
+            (&row[6], counts["unanswered"].to_string()),
+        ] {
+            if *cell != expected {
+                return Err(format!(
+                    "the summary row for {name} says {cell:?} where the record has {expected:?}"
+                ));
+            }
+        }
+    }
+
+    let (head, rows_written) = table(reference, "| Step | Bytes after a reset |")?;
+    if head.len() != 2 + records.len() || head[0] != "Step" || head[1] != "Bytes after a reset" {
+        return Err(format!(
+            "the step table's header is {head:?}, for a step, its bytes and {} terminals",
+            records.len()
+        ));
+    }
+    let columns: Vec<usize> = records
+        .iter()
+        .map(|(_, record)| {
+            let (cols, rows) = window(record);
+            let version = record["launcher"]["version"].as_str().expect("a version");
+            let wanted = format!("{} {version}, {cols} by {rows}", shown_name(record)?);
+            let found: Vec<usize> = (2..head.len()).filter(|&at| head[at] == wanted).collect();
+            match found.as_slice() {
+                [at] => Ok(*at),
+                _ => Err(format!(
+                    "the step table's header {head:?} has no single column {wanted:?}"
+                )),
+            }
+        })
+        .collect::<Result<_, String>>()?;
+
+    let differing = differing_steps(records);
     let written: Vec<&str> = rows_written
         .iter()
-        .map(|row| row[0].trim_matches('`'))
+        .map(|row| {
+            row[0]
+                .strip_prefix('`')
+                .and_then(|id| id.strip_suffix('`'))
+                .unwrap_or(&row[0])
+        })
         .collect();
     if written != differing {
         return Err(format!(
@@ -342,15 +404,14 @@ fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), 
         ));
     }
 
-    for row in &rows_written {
-        let id = row[0].trim_matches('`');
+    for (row, id) in rows_written.iter().zip(&written) {
         for ((_, record), &column) in records.iter().zip(&columns) {
             let (cols, rows) = window(record);
             let step = record["steps"]
                 .as_array()
                 .expect("steps")
                 .iter()
-                .find(|step| step["id"] == id)
+                .find(|step| step["id"] == *id)
                 .ok_or_else(|| format!("{id} is in a record no more"))?;
             let bytes = written_bytes(&row[1], cols, rows)?;
             if bytes != hex(step["bytes"].as_str().expect("bytes")) {
@@ -360,11 +421,13 @@ fn check_reference(reference: &str, records: &[(PathBuf, Value)]) -> Result<(), 
             }
             let expected = if step["agrees"] == true {
                 "agrees".to_owned()
+            } else if step["terminal"].is_null() {
+                return Err(format!("{id}: a step with no answer is in the table"));
             } else {
                 format!(
                     "{} / **{}**",
-                    position(&step["canonical"])?,
-                    position(&step["terminal"])?
+                    position(&step["canonical"]),
+                    position(&step["terminal"])
                 )
             };
             if row[column] != expected {
@@ -388,78 +451,194 @@ fn the_reference_says_what_the_records_say() {
     }
 }
 
-/// The check above is not vacuous: a table with one fact changed, a row missing or a row added is
-/// refused, each in a copy of the reference.
+/// `reference` with the first `from` written as `to`; `from` has to be there.
+fn replaced(reference: &str, from: &str, to: &str) -> String {
+    assert!(
+        reference.contains(from),
+        "the reference no longer holds {from:?}"
+    );
+    reference.replacen(from, to, 1)
+}
+
+/// Copies of the reference with one thing wrong each, and the words the refusal has to hold, so a
+/// copy refused for another reason is a failure too.
+fn damaged_copies(reference: &str) -> Vec<(&'static str, String, &'static str)> {
+    let swapped_names = replaced(
+        &replaced(
+            &replaced(reference, "| Terminal.app | 2.15", "| @@ | 2.15"),
+            "| iTerm2 | 3.7.1 |",
+            "| Terminal.app | 3.7.1 |",
+        ),
+        "| @@ |",
+        "| iTerm2 |",
+    );
+    let feed =
+        "| `controls.line-feed-mode-adds-a-return` | `\\e[20habc\\n` | agrees | 2;1 / **2;4** |";
+    let a_row_added = replaced(reference, feed, &format!("{feed}\n{feed}"));
+    let a_row_missing: String = reference
+        .lines()
+        .filter(|line| !line.starts_with("| `emoji.joined-family-then-ascii` |"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(a_row_missing, reference, "the row is there");
+    vec![
+        (
+            "a cell moved",
+            replaced(reference, "| 5;6 / **1;1** |", "| 5;6 / **1;2** |"),
+            "the table says",
+        ),
+        (
+            "a byte changed",
+            replaced(
+                reference,
+                r"`\e[5;6H\e[s\e[1;1H\e[u`",
+                r"`\e[5;6H\e[s\e[1;1H\e[v`",
+            ),
+            "the bytes written",
+        ),
+        (
+            "a count changed",
+            replaced(
+                reference,
+                "| 136 | 115 | 21 | 0 |",
+                "| 136 | 116 | 20 | 0 |",
+            ),
+            "the summary row for",
+        ),
+        (
+            "a window changed",
+            replaced(reference, "| 80 by 24 | 136 |", "| 80 by 25 | 136 |"),
+            "the summary row for",
+        ),
+        (
+            "the two terminals' names swapped in the summary",
+            swapped_names,
+            "the summary row for",
+        ),
+        (
+            "two of the summary's labels swapped",
+            replaced(reference, "| Agree | Differ |", "| Differ | Agree |"),
+            "summary header",
+        ),
+        (
+            "the two terminals' names swapped in the step table's header",
+            replaced(
+                reference,
+                "| Terminal.app 2.15, 80 by 24 |",
+                "| iTerm2 2.15, 80 by 24 |",
+            ),
+            "step table's header",
+        ),
+        (
+            "a digit added to a version in the step table's header",
+            replaced(
+                reference,
+                "| iTerm2 3.7.1, 179 by 37 |",
+                "| iTerm2 13.7.1, 179 by 37 |",
+            ),
+            "step table's header",
+        ),
+        (
+            "a step that differs renamed in the table",
+            replaced(
+                reference,
+                "| `controls.line-feed-mode-adds-a-return` |",
+                "| `controls.line-feed-mode-adds-a-return-too` |",
+            ),
+            "the step table lists",
+        ),
+        (
+            "a step that agrees put in the table",
+            replaced(
+                reference,
+                "| `addressing.save-and-restore-csi` |",
+                "| `addressing.absolute` |",
+            ),
+            "the step table lists",
+        ),
+        ("a row added", a_row_added, "the step table lists"),
+        ("a row missing", a_row_missing, "the step table lists"),
+        (
+            "a cell added to a row",
+            replaced(reference, feed, &format!("{} extra |", feed)),
+            "cells where the header has",
+        ),
+        (
+            "a cell missing from a row",
+            replaced(reference, "| agrees | 2;1 / **2;4** |", "| agrees |"),
+            "cells where the header has",
+        ),
+        (
+            "a closing backtick missing",
+            replaced(
+                reference,
+                r"`\e[5;6H\e[s\e[1;1H\e[u`",
+                r"`\e[5;6H\e[s\e[1;1H\e[u",
+            ),
+            "backticks",
+        ),
+        (
+            "an extreme repeat count",
+            replaced(
+                reference,
+                r"`a×columns\e[D`",
+                r"`a×(columns+9223372036854775807)\e[D`",
+            ),
+            "count",
+        ),
+        (
+            "a separator of the wrong width",
+            replaced(
+                reference,
+                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| --- | --- |",
+            ),
+            "separator",
+        ),
+    ]
+}
+
+/// The check above is not vacuous: each copy of the reference with one thing wrong is refused,
+/// and for its own reason, and the reference as it is is accepted.
 #[test]
 fn a_damaged_reference_is_refused() {
     let reference = reference();
     let records = records();
-    let damages: [(&str, &str, &str); 6] = [
-        ("a cell moved", "| 5;6 / **1;1** |", "| 5;6 / **1;2** |"),
-        (
-            "a byte changed",
-            r"`\e[5;6H\e[s\e[1;1H\e[u`",
-            r"`\e[5;6H\e[s\e[1;1H\e[v`",
-        ),
-        (
-            "a count changed",
-            "| 136 | 115 | 21 | 0 |",
-            "| 136 | 116 | 20 | 0 |",
-        ),
-        (
-            "a window changed",
-            "| 80 by 24 | 136 |",
-            "| 80 by 25 | 136 |",
-        ),
-        (
-            "a step that differs is no longer in the table",
-            "| `controls.line-feed-mode-adds-a-return` |",
-            "| `controls.line-feed-mode-adds-a-return-too` |",
-        ),
-        (
-            "a step that agrees is in the table",
-            "| `addressing.save-and-restore-csi` |",
-            "| `addressing.absolute` |",
-        ),
-    ];
-    for (what, from, to) in damages {
-        assert!(
-            reference.contains(from),
-            "{what}: the reference no longer holds {from:?}"
-        );
-        let damaged = reference.replacen(from, to, 1);
-        assert!(
-            check_reference(&damaged, &records).is_err(),
-            "{what}: a damaged reference was accepted"
-        );
+    let mut wrong = Vec::new();
+    for (what, damaged, refusal) in damaged_copies(&reference) {
+        match check_reference(&damaged, &records) {
+            Ok(()) => wrong.push(format!("{what}: accepted")),
+            Err(message) if !message.contains(refusal) => {
+                wrong.push(format!(
+                    "{what}: refused as {message:?}, not for {refusal:?}"
+                ));
+            }
+            Err(_) => {}
+        }
     }
-    let without_a_row: String = reference
-        .lines()
-        .filter(|line| !line.starts_with("| `emoji.joined-family-then-ascii` |"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(without_a_row.len() < reference.len(), "the row is there");
-    assert!(
-        check_reference(&without_a_row, &records).is_err(),
-        "a reference with a row missing was accepted"
-    );
-    assert!(
-        check_reference(&reference, &records).is_ok(),
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(
+        check_reference(&reference, &records),
+        Ok(()),
         "the reference itself is accepted"
     );
 }
 
-/// Whether a path in `text` begins with `~` and a name: `~anne`, which is what replacing a home
-/// directory by its text wherever it occurs leaves of `/Users/anne` when the home directory is
-/// `/Users/ann`. A bare `~` or `~/` is the home directory written as the probe writes it.
+/// Whether `text` holds a `~` that begins a word and has a name straight after it: `~anne`, which
+/// is what replacing a home directory by its text wherever it occurs leaves of `/Users/anne` when
+/// the home directory is `/Users/ann`. A tilde after a letter or a digit (`a~b`) is part of a name,
+/// and a bare `~` or `~/` is the home directory written as the probe writes it.
 fn begins_a_path_with_a_tilde_and_a_name(text: &str) -> bool {
     text.char_indices().any(|(at, character)| {
         character == '~'
-            && (at == 0 || matches!(text.as_bytes()[at - 1], b':' | b' '))
+            && !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
             && text[at + 1..]
                 .chars()
                 .next()
-                .is_some_and(|next| !matches!(next, '/' | ':' | ' '))
+                .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '.' | '-'))
     })
 }
 
@@ -474,6 +653,8 @@ fn a_tilde_with_a_name_after_it_is_found_and_the_home_directory_written_whole_is
         "~jo x",
         "x ~jo",
         "/a:~/b:~jo",
+        "HOME=~anne",
+        "\"~anne\"",
     ] {
         assert!(
             begins_a_path_with_a_tilde_and_a_name(text),
@@ -489,6 +670,7 @@ fn a_tilde_with_a_name_after_it_is_found_and_the_home_directory_written_whole_is
         "/opt:~/bin:~",
         "a~b",
         "/Applications/a~b.app",
+        "HOME=~/x",
         "",
     ] {
         assert!(
