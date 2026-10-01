@@ -40,6 +40,16 @@ enum GenericReason: String, Equatable {
     case timedOut = "timed_out"
 }
 
+extension PreviewDecision {
+    /// A name for what was decided, which a device check reads back.
+    var reasonName: String {
+        switch self {
+        case .reveal: return "revealed"
+        case let .generic(reason): return reason.rawValue
+        }
+    }
+}
+
 /// Opens a sealed preview. The production implementation is the shared client's own primitive.
 protocol PreviewOpening {
     /// Returns the plaintext, or throws when the ciphertext does not authenticate.
