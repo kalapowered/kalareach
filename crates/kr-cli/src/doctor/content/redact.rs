@@ -13,32 +13,33 @@
 //! * **Assignments.** A name, then `=`, then a value: when the name says credential, the value
 //!   becomes `[redacted]`. The name is the run of letters, digits, `_`, `.` and `-` before the
 //!   `=`, wherever the `=` is: `TOKEN=x`, `--password=x`, `?token=x` and `/tmp/TOKEN=x` all
-//!   match. A value that starts with a quote runs to its closing quote and any other value to the
-//!   next whitespace.
+//!   match. The value is read as a shell reads a word: it runs to the first whitespace that is not
+//!   inside a quote and not escaped, so `abc"d e"` and `'it'\''s here'` are one value each.
 //! * **Options.** `--option value`, where the option says credential and no `=` follows it: the
 //!   next word becomes `[redacted]`, unless it is another `--option`. Short options are not
 //!   covered: `-p` is a port as often as it is a password.
 //! * **URL user information.** Each `scheme://user:password@host` has what is before the `@` of
 //!   its authority replaced, wherever in the text it sits, inside a value or not.
 //!
-//! A value that starts with a quote and never closes cannot be told apart from the rest of the
-//! field, so the whole field is withheld, as its length.
+//! A value with a quote that never closes cannot be told apart from the rest of the field, so the
+//! whole field is withheld, as its length.
 //!
 //! # What a name says
 //!
 //! A name says credential when its letters, run together, contain `password`, `passwd`,
 //! `passphrase`, `secret`, `token`, `credential`, `apikey`, `privatekey` or `bearer`, or when one of
 //! its parts is `pass`, `auth`, `authorization`, `key` or `cookie`. Parts are split at every
-//! character that is not a letter or a digit and between a lower-case and an upper-case letter, so
-//! `accessKeyId` and `X-Auth-Key` match and `KEYBOARD` and `PWD` do not. The list errs wide:
+//! character that is not a letter or a digit, between a lower-case letter or a digit and an
+//! upper-case letter, and before the last capital of a run of capitals, so `accessKeyId`,
+//! `X-Auth-Key`, `S3Key` and `HTTPAuth` match and `KEYBOARD` and `PWD` do not. The list errs wide:
 //! `tokenizer` matches too.
 //!
 //! # What it does not do
 //!
 //! It does not find a credential by its value. A secret that is a positional word, a plain path
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
-//! part of a connection string whose name is not on the list, or a name nobody listed stays in the
-//! text. So does a user name anywhere in a path but the home directory's. The preview shows
+//! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
+//! or `#` in a URL, or a name nobody listed stays in the text. So does a user name anywhere in a path but the home directory's. The preview shows
 //! everything that will be written, and a person can leave a session out.
 
 use std::borrow::Cow;
@@ -191,12 +192,14 @@ fn credentials(text: &str) -> Option<String> {
 fn userinfo(text: &str, spans: &mut Vec<Span>) {
     for (at, _) in text.match_indices("://") {
         let start = at + 3;
-        // An authority ends where a URL's does. A quote does not end it: an apostrophe is a valid
-        // character of user information, and a quote that closes the argument the URL is in comes
-        // after the host, so it is never between the user information and its `@`.
+        // An authority ends at the first `/`, `?` or `#`, or at whitespace. A quote does not end
+        // it: an apostrophe is a valid character of user information, and a quote that closes the
+        // argument the URL is in comes after the host, so it is never between the user information
+        // and its `@`. A backslash does not end it either: `DOMAIN\user:password@proxy` is user
+        // information in the form Windows proxies are written in.
         let end = text[start..]
             .find(|character: char| {
-                matches!(character, '/' | '?' | '#' | '\\') || character.is_whitespace()
+                matches!(character, '/' | '?' | '#') || character.is_whitespace()
             })
             .map_or(text.len(), |offset| start + offset);
         if let Some(last) = text[start..end].rfind('@') {
@@ -275,31 +278,30 @@ fn options(text: &str, spans: &mut Vec<Span>) -> Option<()> {
     Some(())
 }
 
-/// Where a value that starts at `start` ends: after its closing quote when it starts with one, and
-/// at the next whitespace otherwise. `None` when its quote never closes.
+/// Where a value that starts at `start` ends, read as a shell reads a word: at the first whitespace
+/// that is not inside a quote and not escaped, so `abc"d e"` and `'it'\''s here'` are one value
+/// each. `None` when a quote never closes: the rest of the field cannot be told from the value.
 fn value_end(text: &str, start: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
     let mut characters = text[start..].char_indices();
-    match characters.next() {
-        None => Some(start),
-        Some((_, quote @ ('"' | '\''))) => {
-            let mut escaped = false;
-            for (offset, character) in characters {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' && quote == '"' {
-                    escaped = true;
-                } else if character == quote {
-                    return Some(start + offset + 1);
-                }
+    while let Some((offset, character)) = characters.next() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            // Inside double quotes a backslash escapes the next character; inside single quotes it
+            // is a character.
+            Some('"') if character == '\\' => {
+                characters.next();
             }
-            None
+            Some(_) => {}
+            None if character.is_whitespace() => return Some(start + offset),
+            None if matches!(character, '"' | '\'') => quote = Some(character),
+            None if character == '\\' => {
+                characters.next();
+            }
+            None => {}
         }
-        Some(_) => Some(
-            text[start..]
-                .find(char::is_whitespace)
-                .map_or(text.len(), |offset| start + offset),
-        ),
     }
+    quote.is_none().then_some(text.len())
 }
 
 /// Whether a character can be part of the name of an assignment or an option.
@@ -334,7 +336,7 @@ fn says_credential(name: &str) -> bool {
 }
 
 /// A name's parts, lower-cased: split at every character that is not a letter or a digit, between a
-/// lower-case letter and an upper-case one, and before the last capital of a run of capitals that a
+/// lower-case letter or a digit and an upper-case letter, and before the last capital of a run of capitals that a
 /// lower-case letter follows (`HTTPAuth` is `http` and `auth`).
 fn parts(name: &str) -> Vec<String> {
     let characters: Vec<char> = name.chars().collect();
@@ -350,7 +352,8 @@ fn parts(name: &str) -> Vec<String> {
         if let Some(previous) = index.checked_sub(1).map(|before| characters[before])
             && !part.is_empty()
         {
-            let lower_then_upper = previous.is_ascii_lowercase() && character.is_ascii_uppercase();
+            let lower_then_upper = (previous.is_ascii_lowercase() || previous.is_ascii_digit())
+                && character.is_ascii_uppercase();
             let end_of_a_run = previous.is_ascii_uppercase()
                 && character.is_ascii_uppercase()
                 && characters
