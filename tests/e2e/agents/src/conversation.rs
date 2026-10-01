@@ -1,6 +1,8 @@
 //! What a part reads in an agent's own record of a conversation: a file of JSON lines, one per
 //! prompt, reply, tool call or event, each told apart by a mark the build list names.
 
+use crate::build::RequestRecord;
+
 /// The identifier a conversation line gives the tool call it records or answers: its first string
 /// member named `call_id`, at any depth.
 #[must_use]
@@ -86,9 +88,13 @@ pub fn answers(
     Ok(counted.len())
 }
 
-/// Whether the agent's own record of its latest request for approval after line `after` of `text`
-/// names `command` and the folder `cwd` it runs in: the last line holding `marker` is JSON whose
-/// `request.display.command` is `command` and whose `request.display.cwd` is `cwd`.
+/// Whether the agent's own record of its latest request for approval after line `after` of `text` is
+/// one of the tool the part asked it to use, is still pending, and names `command` and the folder
+/// `cwd` it runs in. The last line holding `request.line` must be JSON with `kind` `approval`, an
+/// `id` and a `toolCallId` that its `request` repeats, `request.toolName` the tool named,
+/// `request.agentId` the main agent, `request.display.command` the command and
+/// `request.display.cwd` the folder; and no later line holding `request.resolved_line` may name its
+/// `id`, since an answered request is not the dialog on the screen.
 ///
 /// # Errors
 ///
@@ -96,26 +102,54 @@ pub fn answers(
 pub fn request_names(
     text: &str,
     after: Option<usize>,
-    marker: &str,
+    request: &RequestRecord,
     command: &str,
     cwd: &str,
 ) -> Result<(), String> {
-    let line = text
+    let (at, line) = text
         .lines()
         .enumerate()
-        .filter(|(index, line)| after.is_none_or(|from| *index > from) && line.contains(marker))
-        .map(|(_, line)| line)
+        .filter(|(index, line)| {
+            after.is_none_or(|from| *index > from) && line.contains(request.line.as_str())
+        })
         .last()
         .ok_or_else(|| "the conversation holds no record of a request for approval".to_owned())?;
     let record: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| format!("the request's record is not JSON: {error}"))?;
-    let display = &record["request"]["display"];
-    let names = |key: &str| display[key].as_str().unwrap_or_default().to_owned();
-    if names("command") != command {
+    let words =
+        |holder: &serde_json::Value, key: &str| holder[key].as_str().unwrap_or_default().to_owned();
+    if words(&record, "kind") != "approval" {
+        return Err("the record is not a request for approval".to_owned());
+    }
+    let id = words(&record, "id");
+    let details = &record["request"];
+    if id.is_empty() || words(details, "id") != id {
+        return Err("the request's record has no identifier, or two".to_owned());
+    }
+    let call = words(&record, "toolCallId");
+    if call.is_empty() || words(details, "toolCallId") != call {
+        return Err("the request's record names no tool call, or two".to_owned());
+    }
+    if words(details, "toolName") != request.tool {
+        return Err("the request's record is for another tool".to_owned());
+    }
+    if words(&record, "agentId") != "main" || words(details, "agentId") != "main" {
+        return Err("the request's record is not the main agent's".to_owned());
+    }
+    let display = &details["display"];
+    if words(display, "command") != command {
         return Err("the request's record names another command".to_owned());
     }
-    if names("cwd") != cwd {
+    if words(display, "cwd") != cwd {
         return Err("the request's record names another folder to run it in".to_owned());
+    }
+    let answered = text.lines().skip(at + 1).any(|later| {
+        later.contains(request.resolved_line.as_str())
+            && serde_json::from_str::<serde_json::Value>(later)
+                .is_ok_and(|answer| words(&answer, "id") == id)
+    });
+    if answered {
+        return Err("the request's record has been answered already".to_owned());
     }
     Ok(())
 }
@@ -217,36 +251,64 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_approval_is_the_command_and_the_folder_the_agent_recorded() {
-        let request = |command: &str, cwd: &str| {
+    fn a_request_for_approval_is_the_pending_one_for_the_tool_with_the_command_and_the_folder() {
+        let request = |id: &str, tool: &str, command: &str, cwd: &str| {
             format!(
-                "{{\"type\":\"interaction.request\",\"request\":{{\"display\":{{\"kind\":\"command\",\"command\":\"{command}\",\"cwd\":\"{cwd}\"}}}}}}\n"
+                "{{\"type\":\"interaction.request\",\"agentId\":\"main\",\"id\":\"{id}\",\"kind\":\"approval\",\"toolCallId\":\"call-{id}\",\"request\":{{\"id\":\"{id}\",\"agentId\":\"main\",\"toolCallId\":\"call-{id}\",\"toolName\":\"{tool}\",\"display\":{{\"kind\":\"command\",\"command\":\"{command}\",\"cwd\":\"{cwd}\"}}}}}}\n"
             )
         };
-        let marker = r#""type":"interaction.request""#;
+        let resolved = |id: &str| {
+            format!(
+                "{{\"type\":\"interaction.resolved\",\"id\":\"{id}\",\"response\":{{\"decision\":\"approved\"}}}}\n"
+            )
+        };
+        let record = RequestRecord {
+            line: r#""type":"interaction.request""#.to_owned(),
+            resolved_line: r#""type":"interaction.resolved""#.to_owned(),
+            tool: "Bash".to_owned(),
+        };
         let text = format!(
             "{{\"type\":\"turn.prompt\"}}\n{}{}",
-            request("echo a >> a", "/r/w"),
-            request("echo kr1 >> a", "/r/w")
+            request("a", "Bash", "echo a >> a", "/r/w"),
+            request("b", "Bash", "echo kr1 >> a", "/r/w")
         );
         assert_eq!(
-            request_names(&text, Some(0), marker, "echo kr1 >> a", "/r/w"),
+            request_names(&text, Some(0), &record, "echo kr1 >> a", "/r/w"),
             Ok(())
         );
         assert!(
-            request_names(&text, Some(0), marker, "echo a >> a", "/r/w").is_err(),
+            request_names(&text, Some(0), &record, "echo a >> a", "/r/w").is_err(),
             "the latest request is the one read"
         );
-        assert!(request_names(&text, Some(0), marker, "echo kr1 >> a", "/elsewhere").is_err());
+        assert!(request_names(&text, Some(0), &record, "echo kr1 >> a", "/elsewhere").is_err());
         assert!(
-            request_names(&text, Some(3), marker, "echo kr1 >> a", "/r/w").is_err(),
+            request_names(&text, Some(3), &record, "echo kr1 >> a", "/r/w").is_err(),
             "nothing after that line"
         );
+        // Another tool's request, an answered one, another request answered and a record that
+        // contradicts itself.
+        let other_tool = format!(
+            "{{\"type\":\"turn.prompt\"}}\n{}",
+            request("c", "Write", "echo kr1 >> a", "/r/w")
+        );
+        assert!(request_names(&other_tool, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
+        let answered = format!("{text}{}", resolved("b"));
+        assert!(request_names(&answered, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
+        let another_answered = format!("{text}{}", resolved("a"));
+        assert_eq!(
+            request_names(&another_answered, Some(0), &record, "echo kr1 >> a", "/r/w"),
+            Ok(()),
+            "the answer to another request does not answer this one"
+        );
+        let torn = text.replace("call-b\",\"request", "call-x\",\"request");
+        assert!(request_names(&torn, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
+        let subagent = text.replace("\"agentId\":\"main\"", "\"agentId\":\"agent-0\"");
+        assert!(request_names(&subagent, Some(0), &record, "echo a >> a", "/r/w").is_err());
         assert!(
             request_names(
                 "not json with the mark \"type\":\"interaction.request\"\n",
                 None,
-                marker,
+                &record,
                 "c",
                 "d"
             )

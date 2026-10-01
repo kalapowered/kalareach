@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use toml_edit::{DocumentMut, Item};
 
 /// The directory of the person's data that holds the trust records.
 pub const TRUST: &str = "workspace-trust";
@@ -340,33 +341,37 @@ pub fn current_secrets(data: &Path, slot: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-/// The files of the two login slots as the configuration names them: the credentials file and the
-/// lock of the OAuth key of the managed provider, by name only, or nothing where it names none.
-#[must_use]
-pub fn active_slot(config: &str, provider_table: &str) -> Option<String> {
-    let header = format!("[{provider_table}.oauth]");
-    let mut inside = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            inside = line == header;
-            continue;
-        }
-        if inside
-            && let Some(value) = line
-                .strip_prefix("key")
-                .map(str::trim_start)
-                .and_then(|rest| rest.strip_prefix('='))
-        {
-            return value
-                .trim()
-                .trim_matches('"')
-                .rsplit('/')
-                .next()
-                .map(str::to_owned);
+/// The keys of a table path written as a header, `providers."managed:x"` as `["providers", "managed:x"]`.
+fn header_path(header: &str) -> Option<Vec<String>> {
+    let document: DocumentMut = format!("[{header}]").parse().ok()?;
+    let mut path = Vec::new();
+    let mut table = document.as_table();
+    while table.len() == 1 {
+        let (key, item) = table.iter().next()?;
+        path.push(key.to_owned());
+        match item.as_table() {
+            Some(inner) => table = inner,
+            None => break,
         }
     }
-    None
+    Some(path)
+}
+
+/// The name of the credentials file the configuration's OAuth key for the provider's table gives, as
+/// the last part of that key, or nothing where it names none.
+#[must_use]
+pub fn active_slot(config: &str, provider_table: &str) -> Option<String> {
+    let document: DocumentMut = config.parse().ok()?;
+    let mut item = document.as_item();
+    for key in header_path(provider_table)? {
+        item = item.get(&key)?;
+    }
+    item.get("oauth")?
+        .get("key")?
+        .as_str()?
+        .rsplit('/')
+        .next()
+        .map(str::to_owned)
 }
 
 /// What the person's configuration sets that changes what an unasked tool or a permission does,
@@ -377,11 +382,14 @@ pub struct Settings {
     pub rules: usize,
     /// Those that allow a tool that is not one of an MCP server's (`mcp__` patterns).
     pub allow_built_in: usize,
-    /// Whether it turns on the mode that runs everything without asking, or names a permission
-    /// mode other than manual.
+    /// Whether it has a key that sets the permission mode or turns on the mode that runs
+    /// everything without asking.
     pub mode_not_manual: bool,
-    /// Whether it lists extra skill directories, hooks or plugins.
+    /// Whether it lists extra skill or agent directories, hooks or plugins.
     pub loads_more: bool,
+    /// How many of its keys the plan does not know: the plan runs on a configuration made of the
+    /// settings it has read the pinned build's use of, and on no other.
+    pub unlisted: usize,
 }
 
 impl Settings {
@@ -391,69 +399,121 @@ impl Settings {
         if self.allow_built_in > 0 {
             Some("the configuration allows a built-in tool without asking")
         } else if self.mode_not_manual {
-            Some("the configuration sets a permission mode other than manual")
+            Some("the configuration sets a permission mode")
         } else if self.loads_more {
-            Some("the configuration loads skills, hooks or plugins of its own")
+            Some("the configuration loads skills, agents, hooks or plugins of its own")
+        } else if self.unlisted > 0 {
+            Some("the configuration has settings the plan has not read the pinned build's use of")
         } else {
             None
         }
     }
 }
 
-/// What the configuration `text` (TOML) sets that `Settings` counts. Only the text of the rules'
-/// `pattern` and `decision` lines and the names of a few keys and tables are read.
-#[must_use]
-pub fn settings_of(text: &str) -> Settings {
+/// The top-level keys the configuration may have: the login, the models, the permission rules, the
+/// web services (whose credentials the run's variables drop), and the model's thinking.
+const SETTINGS_KEYS: [&str; 6] = [
+    "default_model",
+    "models",
+    "permission",
+    "providers",
+    "services",
+    "thinking",
+];
+
+/// The keys that set the permission mode, in any form the pinned build reads.
+const MODE_KEYS: [&str; 6] = [
+    "yolo",
+    "default_yolo",
+    "default_permission_mode",
+    "permission_mode",
+    "plan_mode",
+    "default_plan_mode",
+];
+
+/// The keys that load more than the run's own: skills, agents, hooks and plugins.
+const LOADING_KEYS: [&str; 5] = [
+    "extra_skill_dirs",
+    "extra_agent_dirs",
+    "merge_all_available_skills",
+    "hooks",
+    "plugins",
+];
+
+/// The keys of a permission rule.
+const RULE_KEYS: [&str; 4] = ["decision", "scope", "pattern", "reason"];
+
+/// What the configuration `text` sets that [`Settings`] counts: the configuration is parsed as TOML
+/// and every key is held against the lists above, so a key in a form no line reader would find
+/// (single quotes, a comment, an inline table) is found as well, and one the plan does not know is
+/// counted and stops the run.
+///
+/// # Errors
+///
+/// Returns that the configuration is not TOML.
+pub fn settings_of(text: &str) -> Result<Settings, String> {
+    let document: DocumentMut = text
+        .parse()
+        .map_err(|error| format!("the configuration is not TOML: {error}"))?;
     let mut settings = Settings::default();
-    let mut table = String::new();
-    let mut decision = String::new();
-    let mut pattern = String::new();
-    let mut rule_open = false;
-    let finish = |settings: &mut Settings, decision: &str, pattern: &str, open: bool| {
-        if open {
-            settings.rules += 1;
-            if decision == "allow" && !pattern.starts_with("mcp__") {
-                settings.allow_built_in += 1;
-            }
-        }
-    };
-    let quoted = |value: &str| value.trim().trim_matches('"').to_owned();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            finish(&mut settings, &decision, &pattern, rule_open);
-            decision.clear();
-            pattern.clear();
-            rule_open = line == "[[permission.rules]]";
-            table = line.trim_matches(|c| c == '[' || c == ']').to_owned();
-            if table.starts_with("hooks") || table.starts_with("plugins") {
-                settings.loads_more = true;
-            }
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
-        match (table.as_str(), key) {
-            ("permission.rules", "decision") if rule_open => decision = quoted(value),
-            ("permission.rules", "pattern") if rule_open => pattern = quoted(value),
-            ("", "yolo") | ("permission", "yolo") => {
-                if value != "false" {
-                    settings.mode_not_manual = true;
+    for (key, item) in document.iter() {
+        if MODE_KEYS.contains(&key) {
+            settings.mode_not_manual = true;
+        } else if LOADING_KEYS.contains(&key) {
+            settings.loads_more = true;
+        } else if !SETTINGS_KEYS.contains(&key) {
+            settings.unlisted += 1;
+        } else if key == "permission" {
+            let Some(permission) = item.as_table_like() else {
+                settings.unlisted += 1;
+                continue;
+            };
+            for (inner, rules) in permission.iter() {
+                if inner != "rules" {
+                    if MODE_KEYS.contains(&inner) || inner == "mode" {
+                        settings.mode_not_manual = true;
+                    } else {
+                        settings.unlisted += 1;
+                    }
+                    continue;
+                }
+                let tables: Vec<&dyn toml_edit::TableLike> = match rules {
+                    Item::ArrayOfTables(array) => array
+                        .iter()
+                        .map(|table| table as &dyn toml_edit::TableLike)
+                        .collect(),
+                    Item::Value(toml_edit::Value::Array(array)) => array
+                        .iter()
+                        .filter_map(|value| value.as_inline_table())
+                        .map(|table| table as &dyn toml_edit::TableLike)
+                        .collect(),
+                    _ => {
+                        settings.unlisted += 1;
+                        Vec::new()
+                    }
+                };
+                for rule in tables {
+                    settings.rules += 1;
+                    settings.unlisted += rule
+                        .iter()
+                        .filter(|(name, _)| !RULE_KEYS.contains(name))
+                        .count();
+                    let text = |name: &str| rule.get(name).and_then(Item::as_str);
+                    match text("decision") {
+                        Some("allow") => {
+                            if !text("pattern").is_some_and(|pattern| pattern.starts_with("mcp__"))
+                            {
+                                settings.allow_built_in += 1;
+                            }
+                        }
+                        Some("deny" | "ask") => {}
+                        _ => settings.unlisted += 1,
+                    }
                 }
             }
-            ("permission", "mode") | ("", "permission_mode") => {
-                if quoted(value) != "manual" {
-                    settings.mode_not_manual = true;
-                }
-            }
-            ("", "extra_skill_dirs" | "hooks" | "plugins") => settings.loads_more = true,
-            _ => {}
         }
     }
-    finish(&mut settings, &decision, &pattern, rule_open);
-    settings
+    Ok(settings)
 }
 
 /// What the person's data directory says before a part starts, read once: the login slot in use,
@@ -518,7 +578,7 @@ impl Setup {
         other_logins.sort();
         Ok(Self {
             slot,
-            settings: settings_of(&config),
+            settings: settings_of(&config)?,
             servers: names,
             secrets,
             other_logins,
@@ -545,6 +605,9 @@ pub struct Layout {
     pub shells: PathBuf,
     /// The person's data directory the agent shares with their own sessions.
     pub data: PathBuf,
+    /// The directory of sessions the agent files the run's folder under: the only one of its
+    /// sessions it may write.
+    pub bucket: PathBuf,
     /// The person's home, of which the profile denies the rest.
     pub person: PathBuf,
     /// The credentials file of the login in use, by name: the one file of the credentials
@@ -568,6 +631,7 @@ impl Layout {
             ("BUILD", text(&self.build)),
             ("SHELLS", text(&self.shells)),
             ("DATA", text(&self.data)),
+            ("BUCKET", text(&self.bucket)),
             ("PERSON", text(&self.person)),
             ("SLOT", format!("{}.json", self.slot)),
             ("PROXY_PORT", self.proxy_port.to_string()),
@@ -716,33 +780,90 @@ mod tests {
             Some("kimi-code-env-0123456789abcdef".to_owned())
         );
         assert_eq!(active_slot(config, "providers.other"), None);
+        // Quotes and a comment, which a line reader takes for part of the name.
+        let quoted =
+            "[providers.'managed:kimi-code'.oauth]\nkey = 'oauth/kimi-code-env-0123' # the login\n";
+        assert_eq!(
+            active_slot(quoted, "providers.\"managed:kimi-code\""),
+            Some("kimi-code-env-0123".to_owned())
+        );
+        assert_eq!(active_slot("not = [toml", "providers.x"), None);
     }
 
     #[test]
     fn the_settings_that_would_let_a_tool_run_unasked_are_counted_by_name() {
-        let quiet = "default_model = \"x\"\n[[permission.rules]]\ndecision = \"allow\"\nscope = \"user\"\npattern = \"mcp__a__b\"\n\n[[permission.rules]]\ndecision = \"deny\"\npattern = \"Bash\"\n\n[thinking]\nenabled = true\n";
-        let settings = settings_of(quiet);
+        let quiet = "default_model = \"x\"\n[[permission.rules]]\ndecision = \"allow\"\nscope = \"user\"\npattern = \"mcp__a__b\"\n\n[[permission.rules]]\ndecision = \"deny\"\npattern = \"Bash\"\n\n[thinking]\nenabled = true\n[services.search]\nbase_url = \"x\"\n";
+        let settings = settings_of(quiet).expect("TOML");
         assert_eq!(
             settings,
             Settings {
                 rules: 2,
                 allow_built_in: 0,
                 mode_not_manual: false,
-                loads_more: false
+                loads_more: false,
+                unlisted: 0,
             }
         );
         assert_eq!(settings.problem(), None);
         let allows = quiet.replace("mcp__a__b", "Read");
         assert_eq!(
-            settings_of(&allows).problem(),
+            settings_of(&allows).expect("TOML").problem(),
             Some("the configuration allows a built-in tool without asking")
         );
-        assert!(settings_of("yolo = true\n").mode_not_manual);
-        assert!(!settings_of("yolo = false\n").mode_not_manual);
-        assert!(settings_of("[permission]\nmode = \"auto\"\n").mode_not_manual);
-        assert!(!settings_of("[permission]\nmode = \"manual\"\n").mode_not_manual);
-        assert!(settings_of("[[hooks]]\nevent = \"x\"\n").loads_more);
-        assert!(settings_of("extra_skill_dirs = [\"a\"]\n").loads_more);
+        assert!(settings_of("not = [toml").is_err());
+    }
+
+    #[test]
+    fn a_setting_in_any_form_the_pinned_build_reads_is_found_and_an_unknown_one_stops_the_run() {
+        let stops = |text: &str| settings_of(text).expect("TOML").problem().is_some();
+        // The mode, under each key the pinned build reads it from.
+        for text in [
+            "yolo = true\n",
+            "yolo = false\n",
+            "default_yolo = true\n",
+            "default_permission_mode = \"yolo\"\n",
+            "default_permission_mode = 'auto'\n",
+            "permission_mode = \"auto\" # a comment\n",
+            "[permission]\nmode = \"auto\"\n",
+            "[permission]\ndefault_permission_mode = \"yolo\"\n",
+            "plan_mode = true\n",
+        ] {
+            assert!(stops(text), "{text:?} sets the mode");
+        }
+        // An allow rule for a built-in tool, in the forms a line reader would miss.
+        for text in [
+            "[[permission.rules]]\ndecision = 'allow'\npattern = 'Bash'\n",
+            "[[permission.rules]]\ndecision = \"allow\" # always\npattern = \"Read\"\n",
+            "[permission]\nrules = [{ decision = \"allow\", pattern = \"Bash\" }]\n",
+            "[[permission.rules]]\npattern = \"Bash\"\ndecision = \"allow\"\n",
+        ] {
+            let settings = settings_of(text).expect("TOML");
+            assert_eq!(
+                settings.allow_built_in, 1,
+                "{text:?} allows a built-in tool"
+            );
+            assert!(settings.problem().is_some());
+        }
+        // Rules for an MCP server's tools, in the same forms, are fine.
+        for text in [
+            "[[permission.rules]]\ndecision = 'allow'\npattern = 'mcp__a'\n",
+            "[permission]\nrules = [{ decision = \"allow\", pattern = \"mcp__a__b\" }]\n",
+        ] {
+            assert_eq!(settings_of(text).expect("TOML").problem(), None, "{text:?}");
+        }
+        for text in [
+            "[[hooks]]\nevent = \"x\"\n",
+            "extra_skill_dirs = [\"a\"]\n",
+            "extra_agent_dirs = [\"a\"]\n",
+            "[plugins]\nx = 1\n",
+            "loop_control = { x = 1 }\n",
+            "[background]\nkeep_alive_on_exit = true\n",
+            "[[permission.rules]]\ndecision = \"maybe\"\n",
+            "[[permission.rules]]\ndecision = \"deny\"\nunknown = 1\n",
+            "[permission]\nother = 1\n",
+        ] {
+            assert!(stops(text), "{text:?} is not a setting the plan has read");
+        }
     }
 
     #[test]
@@ -756,6 +877,7 @@ mod tests {
             build: "/t/kimi".into(),
             shells: "/s".into(),
             data: "/p/.kimi-code".into(),
+            bucket: "/p/.kimi-code/sessions/wd_w_0123456789ab".into(),
             person: "/p".into(),
             slot: "kimi-code-env-0123".into(),
             proxy_port: 4242,
@@ -776,6 +898,11 @@ mod tests {
             words
                 .windows(2)
                 .any(|pair| pair == ["-D", "DATA=/p/.kimi-code"])
+        );
+        assert!(
+            words
+                .windows(2)
+                .any(|pair| pair == ["-D", "BUCKET=/p/.kimi-code/sessions/wd_w_0123456789ab"])
         );
         let tail: Vec<&str> = words[words.len() - 5..]
             .iter()
