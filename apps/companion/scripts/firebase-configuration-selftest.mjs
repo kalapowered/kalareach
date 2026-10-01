@@ -4,8 +4,9 @@
 // The configuration belongs to the account that owns the Firebase project and is not in this
 // repository, so a build copies it from the path `KR_GOOGLE_SERVICE_INFO` names. Three things must
 // hold and none can be seen from a successful build. A debug build without the file runs and says
-// it left Firebase alone. A release build without it fails, because a release that cannot receive a
-// notification is not one to ship. And a copy an earlier build left in the product never survives
+// it left Firebase alone; one told of a file that is not there fails, since a mistyped path would
+// otherwise give a build that quietly cannot receive a notification. A release build without it
+// fails, because a release that cannot receive a notification is not one to ship. And a copy an earlier build left in the product never survives
 // into a build that has none, which would put one account's configuration in another's build.
 // The step is a script of its own so it can be run here, with the variables Xcode gives it.
 import { spawnSync } from 'node:child_process'
@@ -63,7 +64,8 @@ held('a debug build without the variable carries no file', null, bare.copied)
 held('a debug build without the variable says Firebase is left alone', true, /Firebase is left alone/.test(bare.output))
 
 const missing = build({ configuration: 'debug', plist: join(work, 'not-there.plist') })
-held('a debug build whose file is not there runs and carries none', 'ok', missing.status === 0 && missing.copied === null ? 'ok' : `status ${missing.status}, copied ${missing.copied}`)
+held('a debug build whose file is not there fails and carries none', 'ok', missing.status !== 0 && missing.copied === null ? 'ok' : `status ${missing.status}, copied ${missing.copied}`)
+held('a debug build whose file is not there says which file', true, missing.output.includes('not-there.plist'))
 
 const release = build({ configuration: 'release' })
 held('a release build without the variable fails', true, release.status !== 0)

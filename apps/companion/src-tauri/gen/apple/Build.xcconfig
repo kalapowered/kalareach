@@ -2,8 +2,11 @@
 //
 // The Firebase configuration and the signing choices belong to whoever builds, not to this
 // repository, so they come from `Local.xcconfig`, which the repository ignores and a build reads
-// when it exists. A build with no such file is the build the repository describes: the same
-// settings on the command line of `xcodebuild` take precedence over it.
+// when it exists. A build with no such file is the build the repository describes. `tauri ios
+// build` starts `xcodebuild` itself, and an environment variable it was started with is not a
+// build setting, so this file is how those values reach the build; `xcodebuild` run directly can
+// also take them on its command line, which wins over this file. Paths are written out in full: a
+// build setting does not expand `~`.
 //
 //   KR_GOOGLE_SERVICE_INFO   the path of this account's GoogleService-Info.plist
 //   KR_SIGN_STYLE            Manual, to sign with the profiles below; Automatic otherwise
