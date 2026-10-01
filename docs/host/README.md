@@ -1105,9 +1105,9 @@ member that can ring, copy, notify, download, launch or ask anything. A terminal
 when the history happened does not have the history happen to it.
 
 Asking for the screen again over the same connection replaces that connection's subscription at a
-frame boundary. The old stream will finish sending the frame it is currently working on, but no
-further output will be written to it other than any enqueued side effects, which will be written or
-recorded as described below, after which the new screen will be sent.
+frame boundary. The old stream will finish sending a frame that is already part way to the client,
+but no further output will be written to it other than any enqueued side effects, which will be
+written or recorded as described below, after which the new screen will be sent.
 
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
 apply. What it leaves out is counted rather than assumed away — the saved cursor and keyboard
