@@ -262,10 +262,11 @@ impl Outcome {
     /// class added. A part that passed or did not run is a failure then, so its test fails and the
     /// record says why the agent stops.
     ///
-    /// Where what is left still holds one (a number's digits, or the part's own name), a result of
-    /// the part, its process numbers and the stop alone, then of the stop alone with the part and
-    /// test named `?`: that last form holds none of any string a search can be run for, which
-    /// [`crate::confine::searchable`] holds to a text no such string is part of.
+    /// Where what is left still holds one (a number's digits, the process numbers, or the part's
+    /// own name), a result of the part, its process numbers and the stop alone, or, where that holds
+    /// one too, of the stop alone with the part and test named `?`: that last form holds none of any
+    /// string a search can be run for, which [`crate::confine::searchable`] holds to a text no such
+    /// string is part of.
     #[must_use]
     pub fn without(mut self, values: &[String]) -> Self {
         if !self.mentions(values) {
@@ -300,8 +301,8 @@ impl Outcome {
             return kept;
         }
         // What is left holds one still: the part's name or the process numbers, or the digits of a
-        // number. The result then keeps what it can, the part and its process numbers first, so the
-        // harness can still read it, and the last form keeps nothing a string could be part of.
+        // number. The result then keeps the part and its process numbers where it can, so the
+        // harness can still read it, and else nothing a string could be part of.
         let terminal = |part: &str, test: &str, pids: Option<&Value>| {
             let mut evidence = json!({ "stop_agent": true });
             if let (Some(pids), Some(evidence)) = (pids, evidence.as_object_mut()) {
@@ -318,15 +319,14 @@ impl Outcome {
         };
         let part = if held(&kept.part) { "?" } else { &kept.part };
         let test = if held(&kept.test) { "?" } else { &kept.test };
-        for (part, test, pids) in [(part, test, pids.as_ref()), ("?", "?", pids.as_ref())] {
-            let result = terminal(part, test, pids);
-            if !result.mentions(values) {
-                return result;
-            }
+        let result = terminal(part, test, pids.as_ref());
+        if !result.mentions(values) {
+            return result;
         }
         // Every string a search is run for ([`crate::confine::searchable`]) holds none of the quotes,
         // braces and brackets this text is made of, and its longest run between them is shorter than
-        // any such string: none can be part of it.
+        // any such string: none can be part of it. The harness, which finds a part's process numbers
+        // by the part's name, then stops everything, as it does for a result with none.
         terminal("?", "?", None)
     }
 
@@ -598,8 +598,6 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(longest < crate::confine::SECRET_LENGTH, "{last}");
-        let printed = format!("{}{}", kept.part, kept.reason.as_deref().unwrap_or(""));
-        assert!(printed.chars().count() < crate::confine::SECRET_LENGTH);
     }
 
     #[test]

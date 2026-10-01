@@ -465,6 +465,11 @@ pub fn titled_conversations(
     Ok(count)
 }
 
+/// What is said of a string of a login's files that [`searchable`] refuses: one word, shorter than
+/// any string searched for, so what is said can itself hold none. A string of the files is never
+/// quoted, and neither is any word of its own around it.
+pub const UNSEARCHABLE: &str = "unsearchable";
+
 /// Whether a string of a login's files can be held out of a part's result by replacing it: it holds
 /// no quote, brace, bracket or backslash and no control character, which the text of a result is made
 /// of. A string that holds one could be part of the result's own words and syntax, which cannot be
@@ -477,8 +482,9 @@ pub fn searchable(string: &str) -> bool {
 }
 
 /// How many characters a string of a login's files has at least to be searched for: shorter ones
-/// (a type, a scope, a name) are not secrets and would match ordinary text. A result that held one
-/// is cleared of it by [`crate::outcome::Outcome::without`], whose fixed words are all shorter.
+/// (a type, a scope, a name) are not secrets and would match ordinary text. The text of the last
+/// form of a result that held one is made of runs shorter than this between the characters
+/// [`searchable`] refuses, so no string searched for can be part of it.
 pub const SECRET_LENGTH: usize = 16;
 
 /// The strings of at least [`SECRET_LENGTH`] characters a JSON document holds, at any depth: what a
@@ -611,11 +617,7 @@ pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
         return Err("no login file or configuration of the person's holds a string".to_owned());
     }
     if values.iter().any(|value| !searchable(value)) {
-        return Err(
-            "a string of the login's files holds a quote, a brace, a bracket, a backslash or a \
-             control character, so a result of the part could not be kept clear of it"
-                .to_owned(),
-        );
+        return Err(UNSEARCHABLE.to_owned());
     }
     Ok(values)
 }
@@ -1518,6 +1520,11 @@ mod tests {
         )
         .expect("write");
         let refused = login_strings(&data).expect_err("a quote in a string of the files");
+        assert_eq!(refused, UNSEARCHABLE);
+        assert!(
+            refused.chars().count() < SECRET_LENGTH,
+            "what is said holds no string"
+        );
         assert!(
             !refused.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
                 && !refused.contains("in a value of the file"),

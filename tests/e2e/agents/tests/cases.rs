@@ -97,6 +97,19 @@ const ISOLATION_UNPROVEN: &str =
 /// more, and its agent stops.
 const GUARD_CHANGED: &str = "the part's guards found what stops it:";
 
+/// What a guard says of a look at the login's files that failed: whether the files held a string
+/// the search cannot be run for, or could not be read, what they held then is not known, and no
+/// further prompt may be submitted on it.
+const LOGIN_LOOK_FAILED: &str =
+    "a look at the login's files failed while the part ran, so what they held is not known";
+
+/// The stop a failed look makes, where one failed.
+fn failed_look(failed: &std::sync::atomic::AtomicBool) -> Option<String> {
+    failed
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .then(|| LOGIN_LOOK_FAILED.to_owned())
+}
+
 /// What a guard says of a subagent's start, which the part's turn ledger cannot count.
 const SUBAGENT_STARTED: &str = "a subagent started:";
 
@@ -260,6 +273,9 @@ impl Guards {
     /// part's mark or the run's directory), a line that was there in a file only appended to, or
     /// a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
+        if let Some(why) = failed_look(&self.login_look_failed) {
+            return Some(why);
+        }
         let now = match guarded_files(&self.home, &self.files, needles) {
             Ok(now) => now,
             Err(why) => return Some(why),
@@ -8007,5 +8023,18 @@ fn a_probe_runs_in_a_group_of_its_own_that_goes_whole_and_is_refused_after_a_sto
         grouped_output(refused, Some(&registry))
             .is_err_and(|why| why.contains("changed before it could run")),
         "a probe after a stop is refused"
+    );
+}
+
+#[test]
+fn a_failed_look_at_the_logins_files_stops_the_part_before_its_next_prompt() {
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(failed_look(&failed), None);
+    failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let why = failed_look(&failed).expect("a stop");
+    assert!(why.contains("the login's files"));
+    assert!(
+        why.chars().count() > 0 && !why.contains('"'),
+        "what it says quotes nothing of the files"
     );
 }
