@@ -2824,25 +2824,10 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // has failed, so a full journal must not take it away. This is a mutation, so it passes the
     // posture check, the duplicate-suppression read and the outstanding read, each of which the
     // full store can refuse.
-    let interrupted: kr_protocol::input::InputLeaseResult = client
-        .mutate(
-            Method::InputInterrupt,
-            ActionId::new(kr_ipc::new_uuid()),
-            target(&host),
-            &kr_protocol::input::InputInterruptParams {
-                session_id: host.session_id,
-                attachment_id: attachment.attachment.attachment_id,
-                epoch: lease.lease.epoch,
-                action: kr_protocol::input::InterruptAction::NativeInterrupt,
-            },
-        )
-        .await
-        .expect("reaches the worker")
-        .map(|value| value.to_typed().expect("decodes"))
-        .expect("a full store does not take the interrupt away");
+    // Each interrupt the application has not said it took is sent again, and each one is accepted
+    // by the full store: an interrupt that reaches a shell just before it waits is taken late.
+    let interrupted = interrupt_until_said(&host, &mut client, &attachment, &lease).await;
     assert_eq!(interrupted.lease.epoch, lease.lease.epoch);
-    // And it interrupted the application.
-    produced(&host.runtime, b"kr-interrupted.").await;
 
     // And nothing can replay it: the store holds no record of the action at all, so there is no
     // dispatch marker for a recovery to turn into an uncertain outcome.
@@ -3038,7 +3023,8 @@ async fn every_character_typed_after_an_interrupt_reaches_the_application() {
     }
 }
 
-/// Interrupts the application until it has said it took the interrupt.
+/// Interrupts the application until it has said it took the interrupt, and returns the lease the
+/// last interrupt was accepted under.
 ///
 /// A shell runs a trap for a signal that reaches it while it waits for input. A signal that reaches
 /// it just before it starts to wait is held until something wakes the wait: the next line, or
@@ -3054,11 +3040,11 @@ async fn interrupt_until_said(
     client: &mut LocalClient,
     attachment: &kr_protocol::attachment::SessionAttachResult,
     lease: &kr_protocol::input::InputAcquireResult,
-) {
+) -> kr_protocol::input::InputLeaseResult {
     let said = carried_times(&retained(&host.runtime), b"kr-interrupted.") + 1;
     let started = tokio::time::Instant::now();
     loop {
-        let _: kr_protocol::input::InputLeaseResult = client
+        let sent: kr_protocol::input::InputLeaseResult = client
             .mutate(
                 Method::InputInterrupt,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -3073,10 +3059,10 @@ async fn interrupt_until_said(
             .await
             .expect("reaches the worker")
             .map(|value| value.to_typed().expect("decodes"))
-            .expect("takes the interrupt");
+            .expect("the worker takes the interrupt");
         for _ in 0..25 {
             if carried_times(&retained(&host.runtime), b"kr-interrupted.") >= said {
-                return;
+                return sent;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
