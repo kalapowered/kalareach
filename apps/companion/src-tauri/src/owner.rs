@@ -1103,7 +1103,10 @@ mod tests {
     #[test]
     fn a_challenge_the_host_still_holds_as_shown_is_the_one_reviewed() {
         let shown = an_enrolment();
-        assert!(is_unchanged(&held_now(&[shown.clone()], &shown)));
+        assert!(is_unchanged(&held_now(
+            std::slice::from_ref(&shown),
+            &shown
+        )));
         let answered = held_after(&shown, |held| held.answered = true);
         assert!(is_unchanged(&held_now(&answered, &shown)));
     }
