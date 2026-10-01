@@ -203,6 +203,11 @@
   white-space: nowrap;
 }
 
+/* While the bar decides its form, every label is set as the current tab's is: the widest it is set. */
+.m-tabbar[data-measuring] .m-tab-label {
+  font-weight: var(--tab-current-weight);
+}
+
 .m-tab-label::after {
   content: attr(data-label);
   content: attr(data-label) / '';
@@ -284,6 +289,11 @@
 
 :root[data-theme='dark'] .m-tab-badge {
   color: var(--bg);
+}
+
+/* Beside its glyph a word starts where the glyph's gap ends, whatever room its bold form keeps. */
+.m-tabbar[data-form] .m-tab-label {
+  text-align: start;
 }
 
 /*

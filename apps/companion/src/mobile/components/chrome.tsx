@@ -29,9 +29,9 @@ function layOut(bar: HTMLElement, form: Form): void {
 /**
  * Whether the bar, as it is laid out now, holds its tabs within its width and every label shows its
  * whole word. A label that is a fraction of a pixel short ends in an ellipsis as one that is far
- * short does, so the word as typeset is held to its box to the fraction. Each label keeps the room
- * of its bold form whether or not its tab is the current one, so which tab that is changes nothing
- * measured here.
+ * short does, so the word as typeset is held to its box to the fraction. The labels are measured in
+ * the bold weight of the tab the person is on, the widest a label is ever set in, whichever tab
+ * that is now: what the bar can hold never depends on where the person is.
  */
 function showsEveryLabel(bar: HTMLElement): boolean {
   if (bar.scrollWidth > bar.clientWidth) return false
@@ -49,11 +49,13 @@ function showsEveryLabel(bar: HTMLElement): boolean {
 
 /**
  * The first form in which the bar shows every label as the text is set, or the last, where a label
- * can only end in an ellipsis. Each form is tried in turn and the bar is left as it was found, so
- * the answer never depends on the form the bar is in, and nothing is drawn in between.
+ * can only end in an ellipsis. Each form is tried in turn, with every label in its bold weight, and
+ * the bar is left as it was found, so the answer never depends on the form the bar is in or on the
+ * tab the person is on, and nothing is drawn in between.
  */
 function formThatFits(bar: HTMLElement): Form {
   const found = bar.getAttribute('data-form')
+  bar.setAttribute('data-measuring', '')
   try {
     for (const form of FORMS) {
       layOut(bar, form)
@@ -61,6 +63,7 @@ function formThatFits(bar: HTMLElement): Form {
     }
     return 'column'
   } finally {
+    bar.removeAttribute('data-measuring')
     if (found === null) bar.removeAttribute('data-form')
     else bar.setAttribute('data-form', found)
   }

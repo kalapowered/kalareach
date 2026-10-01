@@ -1995,16 +1995,26 @@ test.describe("the phone's tab bar", () => {
   // tab the person is on is set in (its letters are spaced wider wherever the bold weight is set): the
   // widths a label has differ from one platform's system font to the next, and from one tab to the
   // next.
-  const FACES: readonly { readonly name: string; readonly shot: string; readonly rule?: string; readonly spacing?: string }[] = [
+  interface Face {
+    readonly name: string
+    readonly shot: string
+    /** The letter spacing the face adds, in em. */
+    readonly em?: number
+    /** Whether the spacing is added only where the bold weight is set. */
+    readonly boldOnly?: boolean
+  }
+  const FACES: readonly Face[] = [
     { name: '', shot: '' },
-    { name: ' in a face a quarter wider', shot: '-wider-0.12em', rule: ':root .m-tab-label { letter-spacing: 0.12em; }', spacing: '0.12em' },
-    { name: ' in a face wider still', shot: '-wider-0.24em', rule: ':root .m-tab-label { letter-spacing: 0.24em; }', spacing: '0.24em' },
-    {
-      name: ' in a face with a wide bold',
-      shot: '-wide-bold',
-      rule: ":root .m-tab[aria-current='page'] .m-tab-label, :root .m-tab-label::after { letter-spacing: 0.2em; }"
-    }
+    { name: ' in a face a quarter wider', shot: '-wider-0.12em', em: 0.12 },
+    { name: ' in a face wider still', shot: '-wider-0.24em', em: 0.24 },
+    { name: ' in a face with a wide bold', shot: '-wide-bold', em: 0.2, boldOnly: true }
   ]
+  const faceRule = (face: Face): string | undefined =>
+    face.em === undefined
+      ? undefined
+      : face.boldOnly === true
+        ? `:root .m-tab[aria-current='page'] .m-tab-label, :root .m-tab-label::after, :root .m-tabbar[data-measuring] .m-tab-label { letter-spacing: ${face.em}em; }`
+        : `:root .m-tab-label { letter-spacing: ${face.em}em; }`
   const CASES = SIZES.flatMap((seen) => FACES.map((face) => ({ seen, face })))
 
   for (const surface of ['ios', 'android'] as const) {
@@ -2012,7 +2022,8 @@ test.describe("the phone's tab bar", () => {
       test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}${face.name}`, async ({
         page
       }) => {
-        if (face.rule !== undefined) await withLabelFace(page, face.rule)
+        const rule = faceRule(face)
+        if (rule !== undefined) await withLabelFace(page, rule)
         await onPhone(page, surface, seen)
         const tabs = page.getByRole('navigation', { name: 'Sections' }).getByRole('button')
         await expect(tabs).toHaveCount(4)
@@ -2080,15 +2091,20 @@ test.describe("the phone's tab bar", () => {
           }
         }
         // A face's rule is in force: a page rule that took it back would leave a case that proves nothing.
-        if (face.spacing !== undefined) {
-          expect(
-            await tabs.first().locator('.m-tab-label').evaluate((label) => getComputedStyle(label).letterSpacing),
-            'the face is in force'
-          ).not.toBe('normal')
+        if (face.em !== undefined) {
+          const set = await tabs.first().locator('.m-tab-label').evaluate(
+            (label, pseudo) => {
+              const style = getComputedStyle(label, pseudo)
+              return { spacing: parseFloat(style.letterSpacing), size: parseFloat(style.fontSize) }
+            },
+            face.boldOnly === true ? '::after' : null
+          )
+          expect(set.spacing, 'the face is in force').toBeCloseTo(face.em * set.size, 1)
         }
-        // The bar keeps its form and its tabs where they are as the person moves from one destination
-        // to the next: a label that is bolder on the tab the person is on is no reason for the bar to
-        // take another form.
+        // The bar keeps its form and its tabs where they are, and every label whole, wherever the
+        // person is: a label is bolder on the tab the person is on, and which tab that is must not
+        // change what the bar can hold. The bar is made to measure again on each tab, by a pixel's
+        // change of the screen's width, and the tabs are visited again from the first.
         const shape = async () =>
           page.evaluate(() => {
             const bar = document.querySelector('.m-tabbar') as HTMLElement
@@ -2097,7 +2113,16 @@ test.describe("the phone's tab bar", () => {
               tabs: Array.from(bar.querySelectorAll('.m-tab')).map((tab) => {
                 const box = tab.getBoundingClientRect()
                 const label = tab.querySelector('.m-tab-label') as HTMLElement
-                return { left: box.left, top: box.top, width: box.width, height: box.height, cut: label.scrollWidth - label.clientWidth }
+                const word = document.createRange()
+                word.selectNodeContents(label)
+                return {
+                  left: box.left,
+                  top: box.top,
+                  width: box.width,
+                  height: box.height,
+                  cut: label.scrollWidth - label.clientWidth,
+                  short: word.getBoundingClientRect().width - label.getBoundingClientRect().width
+                }
               })
             }
           })
@@ -2113,18 +2138,28 @@ test.describe("the phone's tab bar", () => {
               })
           )
         const resting = await shape()
-        for (const [index, name] of ['Attention', 'Sessions', 'Hosts', 'Account'].entries()) {
-          await tabs.nth(index).click()
-          await expect(tabs.nth(index)).toHaveAttribute('aria-current', 'page')
-          await settle()
+        const holds = async (where: string) => {
           const moved = await shape()
-          expect.soft(moved.form, `the bar's form on ${name}`).toBe(resting.form)
+          expect.soft(moved.form, `the bar's form ${where}`).toBe(resting.form)
           for (const [at, each] of moved.tabs.entries()) {
-            expect.soft(each.cut, `${name} is current: tab ${at + 1} is whole`).toBeLessThanOrEqual(1)
+            expect.soft(each.cut, `${where}: tab ${at + 1} is whole`).toBeLessThanOrEqual(1)
+            expect.soft(each.short, `${where}: tab ${at + 1} shows its whole word`).toBeLessThanOrEqual(0.05)
             for (const key of ['left', 'top', 'width', 'height'] as const) {
-              expect.soft(each[key], `${name} is current: tab ${at + 1}'s ${key}`).toBeCloseTo(resting.tabs[at]?.[key] ?? -1, 0)
+              expect.soft(each[key], `${where}: tab ${at + 1}'s ${key}`).toBeCloseTo(resting.tabs[at]?.[key] ?? -1, 0)
             }
           }
+        }
+        for (const [index, name] of ['Attention', 'Sessions', 'Hosts', 'Account', 'Attention'].entries()) {
+          const at = index % 4
+          await tabs.nth(at).click()
+          await expect(tabs.nth(at)).toHaveAttribute('aria-current', 'page')
+          await settle()
+          await holds(`on ${name} after the press`)
+          await page.setViewportSize({ width: seen.width + 1, height: seen.height })
+          await settle()
+          await page.setViewportSize({ width: seen.width, height: seen.height })
+          await settle()
+          await holds(`on ${name} after the screen changed width`)
         }
         // The widest count a badge shows, 99+, stays clear of its own label.
         const badge = page.locator('.m-tab-badge')
