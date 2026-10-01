@@ -27,6 +27,9 @@ links to its document.
 | `delivery.destination.secret.set` | write | `local_ipc` | Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does. | [Delivery: Credentials](../delivery/README.md) |
 | `privacy.set` | write | `local_ipc` | Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands and changes nothing about the host. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands. | [Host: Privacy mode](../host/README.md) |
 | `privacy.status` | read | `local_ipc`, `paired_device` | Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host. | [Host: Privacy mode](../host/README.md) |
+| `description.setup` | read | `local_ipc`, `paired_device` | What session descriptions offer on this host: the profile, its exact size and where the fetch would reach before anything is fetched, how a fetch is going, the two settings, and what state inference is in. | [Descriptions: The model](../describe/README.md) |
+| `description.configure` | write | `local_ipc` | Turn session descriptions on or off, or allow inference on battery, at the host itself. The setting is recorded in the host's configuration and applies at once: turning them off cancels the work in flight and ends the description process. | [Descriptions: The model](../describe/README.md) |
+| `description.download` | write | `local_ipc` | Start or cancel the fetch of the selected profile's files, at the host itself. A fetch needs no account, checks every file against the profile before it keeps it, and a cancellation deletes what it had written. | [Descriptions: The model](../describe/README.md) |
 
 ## Pairing
 
