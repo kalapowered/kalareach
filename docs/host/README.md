@@ -3158,15 +3158,15 @@ stands under the revision the mutation was admitted at, then whether its accepte
 passed. The service asks it under its own lock at each place a mutation starts a new effect, and
 every commit that makes such an effect durable runs while the daemon's connection table is held,
 from the check to the end of the commit. This way any withdrawal of the connection will either be
-committed before the check or after the commit of the mutation. If the check fails, the action
-writes nothing, and the refusal is not kept as its answer: the same action sent again under an
-admission that stands is decided as a first admission. Finishing an effect that is already begun,
-such as completing a publication or a cancellation whose claim is committed, and the recovery at
-startup are not new effects, and the service does not ask again for them. A request whose envelope
-names a different session from the object its parameters name is refused, because the receipt would
-otherwise name a session the effect never touched. A retry after a lost reply is answered from the
-retained record before the freshness window is considered, because the retry carries the window it
-was first admitted under.
+committed before the check or after the commit of the mutation. If the check fails, nothing the
+action began becomes durable or visible, and the refusal is not kept as its answer: the same action
+sent again under an admission that stands is decided as a first admission. Finishing an effect that
+is already begun, such as completing a publication or a cancellation whose claim is committed, and
+the recovery at startup are not new effects, and the service does not ask again for them. A request
+whose envelope names a different session from the object its parameters name is refused, because the
+receipt would otherwise name a session the effect never touched. A retry after a lost reply is
+answered from the retained record before the freshness window is considered, because the retry
+carries the window it was first admitted under.
 
 A 1 MiB attachment chunk does not fit a control frame, so chunk traffic has its own endpoint,
 `t.sock`, framed at the attachment bound. Everything else about that connection is the control

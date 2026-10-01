@@ -3,8 +3,10 @@
 //! The service takes its own lock and opens its own transaction after whatever the host checked
 //! before it was called. Each mutation that begins an effect asks the host again, under that lock,
 //! before its first write, and runs the commit that makes the effect durable through the host. A
-//! host that answers no at either place leaves the store and the staging area as they were, under
-//! its own refusal.
+//! host that answers no at either place leaves the store as it was and nothing visible in the
+//! staging area, under its own refusal. (A chunk's bytes are written into the incomplete file
+//! before its row is committed, so a host that answers no at the commit leaves bytes there that no
+//! row names.)
 //!
 //! The hook here is the host's side: it can be made to refuse when asked, or to stand when asked
 //! and refuse when the commit is run, which is a withdrawal landing between the two.
@@ -280,6 +282,97 @@ fn a_conflicting_chunk_the_host_refuses_invalidates_nothing() {
             )
             .expect("reads the status");
         assert_eq!(status.state, UploadState::Receiving, "{refuses:?}");
+    }
+}
+
+/// KR-REQ-09.09: an upload past its expiry is marked expired by a chunk or a finish only under an
+/// admission that stands, whether the host's answer is no when it is asked or when the expiry's
+/// commit runs. The control: under one that stands the call finds the expiry, writes it through the
+/// host, and refuses as an upload that has ended.
+#[test]
+fn an_expiry_a_call_finds_is_written_only_under_an_admission_that_stands() {
+    for method in ["upload.chunk", "upload.finish"] {
+        for refuses in REFUSALS {
+            let harness = Harness::create();
+            let bytes = pattern(4096);
+            let begun = harness
+                .begin(&bytes, "application/octet-stream", "notes.bin")
+                .expect("reserves the upload");
+            harness
+                .send_all(begun.transfer_id, &bytes)
+                .expect("sends every chunk");
+            harness
+                .clock
+                .advance(kr_protocol::transfer::UNFINISHED_UPLOAD_LIFETIME.get());
+            let host = Host::new(refuses);
+            let performed = action(&harness, method, &bytes, &host);
+            let outcome = if method == "upload.chunk" {
+                harness
+                    .send_as(begun.transfer_id, &bytes, 0, Some(&performed))
+                    .map(|_| ())
+            } else {
+                harness
+                    .finish_as(begun.transfer_id, &bytes, Some(&performed))
+                    .map(|_| ())
+            };
+            assert_not_admitted(outcome, refuses, &host);
+            let status = harness
+                .service
+                .upload_status(
+                    &harness.actor,
+                    &UploadStatusParams {
+                        transfer_id: begun.transfer_id,
+                    },
+                )
+                .expect("reads the status");
+            assert_eq!(
+                status.state,
+                UploadState::Receiving,
+                "{method} {refuses:?}: the expiry is not written"
+            );
+        }
+
+        let harness = Harness::create();
+        let bytes = pattern(4096);
+        let begun = harness
+            .begin(&bytes, "application/octet-stream", "notes.bin")
+            .expect("reserves the upload");
+        harness
+            .send_all(begun.transfer_id, &bytes)
+            .expect("sends every chunk");
+        harness
+            .clock
+            .advance(kr_protocol::transfer::UNFINISHED_UPLOAD_LIFETIME.get());
+        let host = Host::new(Refuses::Never);
+        let performed = action(&harness, method, &bytes, &host);
+        let error = if method == "upload.chunk" {
+            harness
+                .send_as(begun.transfer_id, &bytes, 0, Some(&performed))
+                .expect_err("an expired upload takes no chunk")
+        } else {
+            harness
+                .finish_as(begun.transfer_id, &bytes, Some(&performed))
+                .expect_err("an expired upload is not finished")
+        };
+        assert!(
+            matches!(error, TransferError::WrongState { .. }),
+            "{method}: {error:?}"
+        );
+        assert_eq!(
+            host.committed.load(Ordering::SeqCst),
+            1,
+            "{method}: the expiry was written through the host"
+        );
+        let status = harness
+            .service
+            .upload_status(
+                &harness.actor,
+                &UploadStatusParams {
+                    transfer_id: begun.transfer_id,
+                },
+            )
+            .expect("reads the status");
+        assert_eq!(status.state, UploadState::Expired, "{method}");
     }
 }
 
