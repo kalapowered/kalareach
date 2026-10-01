@@ -271,9 +271,9 @@ struct Registry {
 
 impl Guards {
     /// What changed since the part started, where anything did: a look at the login's files that
-    /// failed, a file of the person's that no part may change, one the person's own programs also write that now holds `needles` (the
-    /// part's mark or the run's directory), a line that was there in a file only appended to, or
-    /// a file that cannot be read.
+    /// failed, a file of the person's that no part may change, one the person's own programs also
+    /// write that now holds `needles` (the part's mark or the run's directory), a line that was
+    /// there in a file only appended to, or a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
         if let Some(why) = failed_look(&self.login_look_failed) {
             return Some(why);
@@ -366,6 +366,32 @@ impl Guards {
         })
     }
 
+    /// Reads the login's files again and keeps every string they hold that a search can be run for.
+    /// A look that cannot read them, or that finds a string a search cannot be run for, has failed,
+    /// and the part stops on it; what else the look found is kept all the same.
+    fn look_at_login(&self) {
+        let Some(data) = &self.login_data else {
+            return;
+        };
+        let fail = || {
+            self.login_look_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        match confine::login_strings_read(data) {
+            Ok(strings) => {
+                let (strings, refused) = confine::split_searchable(strings);
+                match self.login_seen.lock() {
+                    Ok(mut seen) => seen.extend(strings),
+                    Err(_) => fail(),
+                }
+                if refused {
+                    fail();
+                }
+            }
+            Err(_) => fail(),
+        }
+    }
+
     /// Looks at what changes beneath the part without being a file of the person's: every string the
     /// login's files hold now is kept for the search after the part, and a process of the agent's
     /// name that is not the run's is noted. At most once every [`GUARD_WATCH`], by whoever asks.
@@ -381,29 +407,7 @@ impl Guards {
             }
             *last = Some(std::time::Instant::now());
         }
-        if let Some(data) = &self.login_data {
-            // What a look finds that a search can be run for is kept even where another string it
-            // found cannot be: the look then failed, and the part stops, but its other strings are
-            // still searched for.
-            match confine::login_strings_read(data) {
-                Ok(strings) => {
-                    let (strings, refused) = confine::split_searchable(strings);
-                    match self.login_seen.lock() {
-                        Ok(mut seen) => seen.extend(strings),
-                        Err(_) => self
-                            .login_look_failed
-                            .store(true, std::sync::atomic::Ordering::SeqCst),
-                    }
-                    if refused {
-                        self.login_look_failed
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-                Err(_) => self
-                    .login_look_failed
-                    .store(true, std::sync::atomic::Ordering::SeqCst),
-            }
-        }
+        self.look_at_login();
         if self.agent_names.is_empty() {
             return;
         }
@@ -751,8 +755,9 @@ fn guards_hold_while_waiting(stage: &Stage<'_, '_>) {
 }
 
 /// Stops the part at once when a look at the login's files failed, a file of the person's that no
-/// part may change has changed since the part started, or one the person's own programs also write has changed to hold the part's mark or
-/// the run's directory; or when either cannot be read; or when the watcher has found so.
+/// part may change has changed since the part started, or one the person's own programs also write
+/// has changed to hold the part's mark or the run's directory; or when either cannot be read; or
+/// when the watcher has found so.
 fn guards_hold(stage: &Stage<'_, '_>) {
     let Some(guards) = stage.guards else {
         return;
@@ -1134,7 +1139,12 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
         Err(why) => login_unread = Some(why),
     }
     let mut intermediate = 0;
-    if let Some(seen) = guards.and_then(|guards| guards.login_seen.lock().ok()) {
+    if let Some(seen) = guards.map(|guards| {
+        guards
+            .login_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }) {
         intermediate = seen
             .iter()
             .filter(|string| !known.contains(*string))
@@ -8085,4 +8095,74 @@ fn a_failed_look_at_the_logins_files_stops_the_part_before_its_next_prompt() {
         "secret_found",
         "the record says a string of the files is the cause, not a changed file"
     );
+}
+
+#[test]
+fn a_look_at_the_logins_files_keeps_what_it_can_search_for_and_fails_on_what_it_cannot() {
+    let data = std::env::temp_dir().join(format!("kr-guard-look-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(data.join("credentials")).expect("directories");
+    std::fs::write(data.join("config.toml"), "default_model = \"x\"\n").expect("write");
+    let write = |text: &str| {
+        std::fs::write(data.join("credentials/a.json"), text).expect("write");
+    };
+    let mut guards = bare_guards(false);
+    guards.login_data = Some(data.clone());
+    // A string a search can be run for is kept and the look has not failed.
+    write(r#"{"access":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}"#);
+    guards.look_at_login();
+    assert!(
+        !guards
+            .login_look_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(
+        guards
+            .login_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned()]
+    );
+    // A refresh that adds a string a search cannot be run for: the look fails, and the string that
+    // can be searched for is kept all the same.
+    write(r#"{"access":"ZYXWVUTSRQPONMLKJIHGFEDCBA","other":"has \"a quote\" in it of length"}"#);
+    guards.look_at_login();
+    assert!(
+        guards
+            .login_look_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert!(
+        guards
+            .login_seen
+            .lock()
+            .expect("seen")
+            .contains("ZYXWVUTSRQPONMLKJIHGFEDCBA"),
+        "the look's other string is kept"
+    );
+    assert!(
+        guards
+            .login_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .all(|string| confine::searchable(string)),
+        "nothing kept is a string a search cannot be run for"
+    );
+    // A file that is not JSON is a look that failed.
+    let again = {
+        let mut guards = bare_guards(false);
+        guards.login_data = Some(data.clone());
+        guards
+    };
+    write("{ not json");
+    again.look_at_login();
+    assert!(
+        again
+            .login_look_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let _ = std::fs::remove_dir_all(&data);
 }
