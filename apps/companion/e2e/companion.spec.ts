@@ -2965,6 +2965,9 @@ test.describe('pairing', () => {
             title: 'Pair a new device',
             detail: 'studio will let pixel-8 view sessions, for 1 hour.',
             value: 'f3c1 46fd',
+            facts: [],
+            notice: null,
+            statement: null,
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           },
@@ -2974,6 +2977,9 @@ test.describe('pairing', () => {
             title: 'Confirm a request from build-box',
             detail: null,
             value: null,
+            facts: [],
+            notice: null,
+            statement: null,
             expires_at_ms: Date.now() + 90_000,
             checkable: false
           }
@@ -3000,6 +3006,104 @@ test.describe('pairing', () => {
     await rows.nth(0).getByTestId('not-now').click()
     await expect(page.getByTestId('confirmations')).toHaveCount(0)
   })
+
+  // KR-REQ-11.42: a repository's root and an installation with a native bridge are listed with
+  // everything the confirmation covers, the host's own notice first and the publisher's words
+  // after it, quoted and named; a 64-character hash breaks inside its row, and nothing makes the
+  // page scroll sideways at the narrowest screen the application supports.
+  test('an enrolment and a native bridge installation are listed whole and fit a narrow screen', async ({
+    page
+  }) => {
+    await open(page)
+    const hash = ['1a2b3c4d', '5e6f7081', '92a3b4c5', 'd6e7f809', '1a2b3c4d', '5e6f7081', '92a3b4c5', 'd6e7f809']
+    await page.evaluate((groups) => {
+      window.krTestHost?.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          {
+            reference: 'request-1',
+            host_name: 'studio',
+            title: 'Trust a plugin repository',
+            detail:
+              'Trust the plugin repository community on studio, served from repo.example: its root starts 1a2b 3c4d, and its packages may hold 1 capability beyond the default.',
+            value: null,
+            facts: [
+              { label: 'Name', value: 'community', code: false },
+              { label: 'Kind', value: 'A community repository', code: false },
+              { label: 'Metadata at', value: 'https://repo.example/plugins/community/metadata/', code: true },
+              { label: 'Targets at', value: 'https://repo.example/plugins/community/targets/', code: true },
+              { label: 'Root', value: groups.join(' '), code: true },
+              { label: 'Root keys', value: 'f14e4ac91420a6515eb9ae321fcba909420d2cd09cf8c5fd42244af8f0e5fdf2', code: true },
+              { label: 'Beyond the default', value: 'terminal.stream', code: true },
+              { label: 'Offline copy', value: 'Not kept', code: false }
+            ],
+            notice: null,
+            statement: null,
+            expires_at_ms: Date.now() + 120_000,
+            checkable: true
+          },
+          {
+            reference: 'request-2',
+            host_name: 'studio',
+            title: 'Install a plugin',
+            detail:
+              'Install kalareach/claude-code 0.3.0 from community on studio, granting 2 capabilities, among them a native bridge that runs outside the plugin sandbox; package starts 1a2b 3c4d.',
+            value: null,
+            facts: [
+              { label: 'Plugin', value: 'kalareach/claude-code 0.3.0', code: true },
+              { label: 'From', value: 'community', code: false },
+              { label: 'Package hash', value: groups.join(' '), code: true },
+              { label: 'Granted', value: 'approval.respond, native_bridge.install', code: true }
+            ],
+            notice:
+              "This package installs a native bridge: code in the application's own directory that runs with the application's permissions, outside the plugin sandbox. The publisher's own statement of what it does follows.",
+            statement:
+              'Installs three registration files under your own Claude Code directory, where they apply to every project and every later session.',
+            expires_at_ms: Date.now() + 120_000,
+            checkable: true
+          }
+        ]
+      })
+    }, hash)
+    const rows = page.getByTestId('confirmation-row')
+    await expect(rows).toHaveCount(2)
+    await expect(rows.nth(0).getByTestId('confirmation-facts')).toContainText('Metadata at')
+    await expect(rows.nth(1).getByTestId('confirmation-notice')).toContainText('outside the plugin sandbox')
+    await expect(rows.nth(1).getByTestId('confirmation-statement')).toContainText('The publisher says')
+    await still(page, 'owner-confirmations-11.42-wide')
+    await rows.nth(1).screenshot({
+      path: shot(`owner-install-11.42-wide-${test.info().project.name}`),
+      animations: 'disabled'
+    })
+
+    for (const width of [320, 390]) {
+      await page.setViewportSize({ width, height: 900 })
+      expect
+        .soft(
+          await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth),
+          `the page at ${width}px`
+        )
+        .toBeLessThanOrEqual(1)
+      for (const index of [0, 1]) {
+        const row = rows.nth(index)
+        const spill = await row.evaluate((element) => {
+          const box = element.getBoundingClientRect()
+          return Math.max(
+            0,
+            ...[...element.querySelectorAll<HTMLElement>('dd, blockquote, p')].map(
+              (child) => child.getBoundingClientRect().right - box.right
+            )
+          )
+        })
+        expect.soft(spill, `row ${index} at ${width}px`).toBeLessThanOrEqual(1)
+      }
+      await still(page, `owner-confirmations-11.42-${width}`)
+      await rows.nth(1).screenshot({
+        path: shot(`owner-install-11.42-${width}-${test.info().project.name}`),
+        animations: 'disabled'
+      })
+    }
+  })
 })
 
 test.describe('a control that commits on a completed action', () => {
@@ -3023,6 +3127,9 @@ test.describe('a control that commits on a completed action', () => {
               title: 'Pair a new device',
               detail: null,
               value: 'f3c1 46fd',
+              facts: [],
+              notice: null,
+              statement: null,
               expires_at_ms: Date.now() + 120_000,
               checkable: true
             }

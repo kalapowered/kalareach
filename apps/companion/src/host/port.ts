@@ -318,6 +318,14 @@ export interface PasteView {
 /** The ceremony this computer offers an owner. */
 export type CeremonyKind = 'touch_id' | 'password' | 'windows_hello' | 'none'
 
+/** One fact a confirmation names: what it is, and its exact value. */
+export interface ConfirmationFact {
+  readonly label: string
+  readonly value: string
+  /** True for an address, a hash or a list of identifiers, which is read character by character. */
+  readonly code: boolean
+}
+
 /** One confirmation a host this computer owns asks for. */
 export interface ConfirmationRequest {
   readonly reference: string
@@ -325,6 +333,12 @@ export interface ConfirmationRequest {
   readonly title: string
   readonly detail: string | null
   readonly value: string | null
+  /** Everything the confirmation covers beyond the sentence, one fact to a line. */
+  readonly facts: readonly ConfirmationFact[]
+  /** What the host says in its own words about code it would place outside the plugin sandbox. */
+  readonly notice: string | null
+  /** What the publisher says in its own words about the release, quoted apart from the host's. */
+  readonly statement: string | null
   readonly expires_at_ms: number
   readonly checkable: boolean
 }
