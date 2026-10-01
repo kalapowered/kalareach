@@ -2158,6 +2158,60 @@ mod tests {
         directory.join("session.sqlite")
     }
 
+    /// A ledger in prompt mode takes the store's lock without waiting for it, and waits as long as
+    /// the busy timeout again once it is not: what its connection is set to says so, which tells a
+    /// finish that would wait out the busy timeout from one that does not without a clock. The
+    /// answer a refused write gives is a store that is busy, which is not a fault of it.
+    #[test]
+    fn a_prompt_ledger_does_not_wait_for_the_stores_lock_and_waits_again_afterwards() {
+        let file = ledger_path();
+        let health = JournalHealth::shared();
+        let ledger = Ledger::open(Some(&file), std::sync::Arc::clone(&health)).expect("opens");
+        let timeout = |ledger: &Ledger| -> u128 {
+            ledger
+                .connection
+                .pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
+                .map(|millis| u128::try_from(millis).unwrap_or(0))
+                .expect("the timeout reads")
+        };
+        assert_eq!(
+            timeout(&ledger),
+            BUSY_TIMEOUT.as_millis(),
+            "it waits to begin with"
+        );
+
+        ledger.set_prompt(true).expect("the ledger is made prompt");
+        assert_eq!(timeout(&ledger), 0, "a prompt ledger does not wait");
+        // The control: another connection holds the store's write lock, and the write is refused
+        // as a store that is busy, which the journal's condition is not told of.
+        let holder = rusqlite::Connection::open(&file).expect("the store opens");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the write lock is taken");
+        let refused = ledger.put_binding(&BindingRecord {
+            binding_id: binding(),
+            application_instance_id: instance(),
+            grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            trust: None,
+            bound_at: TimestampMs::new(5),
+            release: None,
+            frame: None,
+            executable: None,
+            connector_digest: None,
+        });
+        assert!(
+            matches!(refused, Err(BrokerError::LedgerUnavailable { .. })),
+            "a busy store is refused, not failed: {refused:?}"
+        );
+        assert!(health.is_healthy(), "a busy store is not a failed one");
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("the lock is let go");
+
+        ledger.set_prompt(false).expect("the ledger waits again");
+        assert_eq!(timeout(&ledger), BUSY_TIMEOUT.as_millis(), "it waits again");
+    }
+
     fn instance() -> ApplicationInstanceId {
         ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
     }
