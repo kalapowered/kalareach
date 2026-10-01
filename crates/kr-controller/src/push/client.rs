@@ -35,6 +35,40 @@ use crate::error::{ControllerError, Result};
 /// The route a delivery is presented on.
 pub const DELIVER_ROUTE: &str = "/api/push/deliver";
 
+/// The codes a gateway names a refusal by, which are the only words of an answer this host repeats.
+///
+/// A gateway's own words are the gateway's, and one that repeats what it was sent repeats the
+/// bearer credential. So an answer's body is read by the envelope decoder and never turned into
+/// text: a refusal is recorded by its status and, when it names one of these codes exactly, by
+/// that code, as this host's own constant.
+pub const GATEWAY_CODES: [&str; 20] = [
+    "UNAUTHENTICATED",
+    "REAUTHENTICATION_REQUIRED",
+    "FORBIDDEN",
+    "RATE_LIMITED",
+    "QUOTA_EXHAUSTED",
+    "NOT_CONFIGURED",
+    "INTERNAL",
+    "INVALID_REQUEST",
+    "INVALID_ARGUMENT",
+    "NOT_FOUND",
+    "METHOD_NOT_ALLOWED",
+    "ID_CONFLICT",
+    "CONFLICT",
+    "REQUEST_FENCED",
+    "COLLECTION_ABSENT",
+    "KEY_EPOCH_RETIRED",
+    "SIGNED_BEFORE_CUTOFF",
+    "COLLECTION_DELETED",
+    "SERVICE_UNAVAILABLE",
+    "OUTCOME_UNKNOWN",
+];
+
+/// The code of [`GATEWAY_CODES`] that `named` is exactly, as this host's own constant.
+pub(super) fn known_code(named: &str) -> Option<&'static str> {
+    GATEWAY_CODES.iter().copied().find(|code| *code == named)
+}
+
 /// The most bytes this client reads from an answer.
 ///
 /// An acknowledgement is a few hundred bytes. An answer past this reached the host, so whatever
@@ -100,7 +134,8 @@ impl GatewayClient {
     /// What one answer from the gateway means for the request that received it.
     ///
     /// A success is read through the client's one reader, so a text that names a member twice
-    /// decides nothing, and what a failure says is where the text failed, never what it held.
+    /// decides nothing, and what a failure says is where the text failed, never what it held. No
+    /// other answer's body is read at all: its status is what is recorded.
     fn answered(answer: &ServiceHttpAnswer, notification_id: NotificationId) -> SendOutcome {
         if answer.body.len() > MAX_ANSWER_BYTES {
             return SendOutcome::Unknown {
@@ -111,7 +146,6 @@ impl GatewayClient {
                 ),
             };
         }
-        let text = String::from_utf8_lossy(&answer.body);
         match answer.status {
             200 => match kr_client::services::json::read::<Envelope>(&answer.body) {
                 Ok(Envelope {
@@ -129,12 +163,12 @@ impl GatewayClient {
             // for a credential it cannot read or match and 403 for one aimed at another
             // authorisation; both mean the same thing to this host.
             401 | 403 => SendOutcome::Forbidden {
-                detail: format!("the gateway refused the credential: {text}"),
+                detail: format!("the gateway refused the credential ({})", answer.status),
             },
             // A 429 is the gateway asking for later, and it claims the identifier before it
             // sends anything, so nothing was dispatched.
             429 => SendOutcome::NotDispatched {
-                detail: format!("the gateway asked for later: {text}"),
+                detail: "the gateway asked for later (429)".to_owned(),
             },
             // Any other 4xx is a request this host has to change: a schema failure or an
             // authorisation the gateway does not hold. Section 23 says a configuration or software
@@ -147,7 +181,7 @@ impl GatewayClient {
                 suppression: kr_protocol::scalars::Nullable::null(),
             })),
             status => SendOutcome::Unknown {
-                detail: format!("the gateway answered {status}: {text}"),
+                detail: format!("the gateway answered {status}"),
             },
         }
     }
@@ -299,6 +333,17 @@ mod tests {
         )
     }
 
+    /// The answer of a gateway with this status and this body.
+    fn answered_with(status: u16, body: &str) -> SendOutcome {
+        GatewayClient::answered(
+            &ServiceHttpAnswer {
+                status,
+                body: body.as_bytes().to_vec(),
+            },
+            notification(),
+        )
+    }
+
     /// KR-REQ-04.19: the gateway's answer is read through the client's one reader. One that names
     /// a member twice decides nothing, whichever member it is, so the outcome is unknown and the
     /// delivery is not presented again; and no detail repeats what the answer held.
@@ -332,5 +377,29 @@ mod tests {
 
         // The control: the same answer naming its members once is the gateway's decision.
         assert!(matches!(answered(answer), SendOutcome::Decided(_)));
+    }
+
+    /// What a gateway answers with is read by the envelope decoder and never turned into text: a
+    /// body that repeats the bearer, under every status that is not a success, leaves no detail
+    /// holding any of it, and a status that is a decision is still read as one.
+    #[test]
+    fn no_answer_that_is_not_a_decision_is_quoted_in_an_outcome() {
+        for status in [301, 302, 401, 403, 429, 500, 502, 503] {
+            let outcome = answered_with(status, MARKER);
+            let (SendOutcome::Forbidden { detail }
+            | SendOutcome::NotDispatched { detail }
+            | SendOutcome::Unknown { detail }) = &outcome
+            else {
+                panic!("{status} is not a decision: {outcome:?}");
+            };
+            assert!(!detail.contains(MARKER), "{status}: {detail}");
+            assert!(detail.contains(&status.to_string()), "{status}: {detail}");
+        }
+        // The other 4xx is a refusal that carries no text at all, and a decision is a decision.
+        assert!(matches!(
+            answered_with(418, MARKER),
+            SendOutcome::Decided(ack) if ack.state == PushDeliveryState::Refused
+        ));
+        assert!(matches!(answered(queued()), SendOutcome::Decided(_)));
     }
 }
