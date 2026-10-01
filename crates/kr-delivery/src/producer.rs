@@ -558,10 +558,11 @@ impl Fate {
                 Self::Drop
             };
         }
-        // The store decided it at a time of its own. One decided at or before the moment privacy
-        // mode was last turned off may have been decided while it was on, and what was decided
-        // while it was on is never sent once it is off.
-        let decided_at_ms = item.last_notified_ms.map_or(0, |at| at.get());
+        // The store decided it at a time of its own, which quiet hours do not move when they
+        // release it. One decided at or before the moment privacy mode was last turned off may have
+        // been decided while it was on, and what was decided while it was on is never sent once it
+        // is off.
+        let decided_at_ms = item.decided_at_ms.map_or(0, |at| at.get());
         if lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms {
             return Self::Drop;
         }
