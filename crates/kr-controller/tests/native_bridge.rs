@@ -4288,10 +4288,10 @@ fn kr_req_11_42_the_gemini_cli_recipe_writes_its_three_files_and_nothing_else() 
 }
 
 /// KR-REQ-11.42: a Gemini CLI bridge does not install into an extension directory that is already
-/// there with content of the person's own, or beside another extension that names the same, and a
-/// manifest it cannot read is never taken for one that is not there. Each is refused before
-/// anything is written; the controls are an extension of another name beside it, with or without a
-/// byte order mark, which are applied.
+/// there with content of the person's own, or beside another extension that names the same, hidden
+/// or not, and a manifest it cannot read is never taken for one that is not there. Each is refused
+/// before anything is written; the controls are an extension of another name beside it, with or
+/// without a byte order mark, which are applied.
 #[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_gemini_cli_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
@@ -4302,7 +4302,8 @@ fn kr_req_11_42_a_gemini_cli_bridge_does_not_install_into_a_place_that_is_somebo
     };
     let named = br#"{"name": "kalareach", "version": "1"}"#;
     let with_mark = |bytes: &[u8]| [b"\xEF\xBB\xBF".as_slice(), bytes].concat();
-    let refused_cases: [(&str, Box<dyn Fn(&GeminiSite)>, &str); 3] = [
+    type Prepare<'a> = Box<dyn Fn(&GeminiSite) + 'a>;
+    let refused_cases: [(&str, Prepare<'_>, &str); 4] = [
         (
             "content already in the directory",
             Box::new(|site| {
@@ -4321,6 +4322,12 @@ fn kr_req_11_42_a_gemini_cli_bridge_does_not_install_into_a_place_that_is_somebo
             "a manifest with a byte order mark",
             Box::new(|site| extension(site, "other", &with_mark(named))),
             "extensions/other",
+        ),
+        // Nothing says Gemini CLI skips a hidden folder, so one holding the name is another.
+        (
+            "a hidden folder of the same name",
+            Box::new(|site| extension(site, ".backup", named)),
+            "keeps one of two",
         ),
     ];
     for (what, prepare, says) in refused_cases {
