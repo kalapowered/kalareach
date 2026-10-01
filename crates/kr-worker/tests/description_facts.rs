@@ -295,6 +295,42 @@ async fn until_held(host: &Host, count: usize) {
     .expect("the worker holds the request");
 }
 
+/// Waits until the session's retained output carries `marker` `count` times: the terminal's own
+/// echo of what was typed, and the program's answer to it.
+async fn until_echoed(host: &Host, marker: &str, count: usize) {
+    let marker = marker.as_bytes();
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let mut seen = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            let page = host
+                .runtime
+                .session()
+                .history_page(cursor, 1024 * 1024)
+                .expect("reads the retained output");
+            if page.bytes.as_slice().is_empty() {
+                break;
+            }
+            seen.extend_from_slice(page.bytes.as_slice());
+            cursor = page.next_cursor.get();
+        }
+        if seen
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count()
+            >= count
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the typed input was not echoed in time"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Types into the terminal as the view holding the lease does.
 fn type_in(host: &mut Host, sequence: u64, bytes: &[u8]) {
     host.runtime
@@ -519,13 +555,14 @@ async fn keystrokes_resizes_and_queries_move_no_revision_and_answer_no_page() {
             .expect("the owner resizes");
         assert_eq!(session.geometry().dimensions, Dimensions::new(100, 30));
     }
-    // Held for a while: nothing a keystroke, a resize or a query did answers it.
-    send(&mut link, request(2, 0, 2_000, Some(0))).await;
-    let quiet = page(&mut link).await;
+    // The shell has read the input once its terminal has echoed the line back and the program has
+    // answered it: only then is "nothing was recorded" a statement about the input.
+    until_echoed(&host, "hello", 2).await;
+    let quiet = ask(&mut link, 2, 0, 0, Some(0)).await;
     assert_eq!(quiet.request_id, RequestId::new(2));
     assert_eq!(
         quiet.facts.0, None,
-        "the request ran to the end of its wait with nothing new: {quiet:?}"
+        "nothing a keystroke, a resize or a query did is a fact: {quiet:?}"
     );
 
     // The control: a command block moves it.

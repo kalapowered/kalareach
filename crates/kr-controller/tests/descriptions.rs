@@ -281,6 +281,42 @@ impl Worker {
         self.runtime.flush_input();
     }
 
+    /// Waits until the session's retained output carries `marker` `count` times: the terminal's
+    /// own echo of what was typed, and the program's answer to it.
+    async fn until_echoed(&self, marker: &str, count: usize) {
+        let marker = marker.as_bytes();
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let mut seen = Vec::new();
+            let mut cursor = 0_u64;
+            loop {
+                let page = self
+                    .runtime
+                    .session()
+                    .history_page(cursor, 1024 * 1024)
+                    .expect("reads the retained output");
+                if page.bytes.as_slice().is_empty() {
+                    break;
+                }
+                seen.extend_from_slice(page.bytes.as_slice());
+                cursor = page.next_cursor.get();
+            }
+            if seen
+                .windows(marker.len())
+                .filter(|window| *window == marker)
+                .count()
+                >= count
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the typed input was not echoed in time"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The facts revision the worker has reached, which only a fact moves.
     fn revision(&self, generation: u64) -> u64 {
         self._service
@@ -777,6 +813,9 @@ async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job
             .resize(VIEW, Dimensions::new(100, 30), epoch)
             .expect("the owner resizes");
     }
+    // The shell has read the input once its terminal has echoed the line back and the program has
+    // answered it: only then is "no fact moved" a statement about the input.
+    environment.workers[0].until_echoed("hello", 2).await;
     assert_eq!(
         environment.workers[0].revision(0),
         revision,
@@ -1360,16 +1399,8 @@ async fn a_load_is_cancelled_by_privacy_mode_though_the_stored_rows_cannot_be_re
 /// publishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_result_that_arrives_after_privacy_mode_was_enabled_is_never_published() {
-    let script = Script {
-        ignore_token_ms: 2_000,
-        produce_when_cancelled: true,
-        ..Script::default()
-    };
-    let environment = Environment::start(Setup {
-        script: script.clone(),
-        ..Setup::new()
-    })
-    .await;
+    // The control: the same session and the same job, left alone, is published.
+    let environment = Environment::start(Setup::new()).await;
     let session_id = environment.workers[0].session_id;
     environment.workers[0].report("make", "/home/a/kalareach", None);
     environment
@@ -1379,8 +1410,14 @@ async fn a_result_that_arrives_after_privacy_mode_was_enabled_is_never_published
         .await;
     environment.stop().await;
 
+    // The job runs until it is cancelled and then answers all the same, as a model that does not
+    // look at its token would: the result can only arrive after privacy mode was enabled.
     let environment = Environment::start(Setup {
-        script,
+        script: Script {
+            generate_until_cancelled: true,
+            produce_when_cancelled: true,
+            ..Script::default()
+        },
         ..Setup::new()
     })
     .await;
@@ -1390,10 +1427,14 @@ async fn a_result_that_arrives_after_privacy_mode_was_enabled_is_never_published
     assert!(environment.privacy(true).await.enabled);
     environment.until_privacy_settled().await;
     assert_eq!(environment.figures().in_flight, 0, "the job has answered");
+    let counted = environment.figures().jobs;
     assert_eq!(
-        environment.figures().jobs.published,
-        0,
-        "and what it produced was refused"
+        counted.published, 0,
+        "and what it produced was not published"
+    );
+    assert!(
+        counted.refused + counted.cancelled >= 1,
+        "the job was ended, and counted so: {counted:?}"
     );
     let shown = environment.describe(session_id).await;
     assert_eq!(shown.source, LabelSource::Metadata);
