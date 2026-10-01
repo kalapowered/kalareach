@@ -144,7 +144,7 @@ async fn create_over(link: &mut BridgedLink, new: &NewSession) -> Result<Created
         dimensions: Nullable(new.dimensions),
         worker_profile: profile,
         environment_snapshot: base.variables,
-        palette: Nullable(new.palette.clone()),
+        palette: Nullable(new.palette),
         launch_profile: new.launch_profile.clone(),
         terminal: Nullable::null(),
     };
