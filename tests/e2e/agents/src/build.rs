@@ -442,6 +442,11 @@ pub struct Confinement {
     /// Where the person's servers are named and where the project's file that switches them off
     /// goes.
     pub servers: ProjectServers,
+    /// The command that starts a fresh conversation without a request to the model, and the text the
+    /// agent shows once it has: sent after the checks, so their shell lines are not in the
+    /// conversation the part's turns are in.
+    #[serde(default)]
+    pub new_session: Option<Keys>,
     /// The names the agent's processes go by in the process table, in either of its columns (the
     /// program's own name, and the title the agent gives itself): a process of the person's with
     /// one of them is another writer of the data directory.

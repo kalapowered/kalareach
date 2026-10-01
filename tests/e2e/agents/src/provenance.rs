@@ -1096,7 +1096,6 @@ impl Drop for StopSampling<'_> {
     }
 }
 
-/// Keeps the first problem.
 /// The place in `words` of the first that `command` holds as a whole word, compared without regard
 /// to case: with no letter or digit on either side of it, so `dtt-mcp` and `dtt/mcp` hold `dtt`
 /// and `dttx` does not.
@@ -1114,6 +1113,7 @@ fn names_a_word(command: &str, words: &[String]) -> Option<usize> {
     })
 }
 
+/// Keeps the first problem.
 fn problem(seen: &mut Seen, why: String) {
     if seen.problem.is_none() {
         seen.problem = Some(why);
@@ -1357,8 +1357,7 @@ fn resolved(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A process's first file is its executable even when `lsof` gives it no name: a later
-    /// mapping never takes its place, so what the process runs is not established.
+    /// A command line names a forbidden word only as a whole word.
     #[test]
     fn a_command_line_names_a_forbidden_word_only_as_a_whole_word() {
         let words = vec!["pushary".to_owned(), "dtt".to_owned()];
@@ -1379,6 +1378,8 @@ mod tests {
         assert_eq!(names_a_word("echo dtt", &[String::new()]), None);
     }
 
+    /// A process's first file is its executable even when `lsof` gives it no name: a later
+    /// mapping never takes its place, so what the process runs is not established.
     #[test]
     fn a_first_file_without_a_name_is_kept_as_the_unnamed_executable() {
         let text = "p42\nftxt\nD0x1000012\ni7\nftxt\nD0x1000012\ni8\nn/usr/lib/dyld\n";

@@ -100,6 +100,10 @@ const GUARD_CHANGED: &str = "the part's guards found what stops it:";
 /// What a guard says of a subagent's start, which the part's turn ledger cannot count.
 const SUBAGENT_STARTED: &str = "a subagent started:";
 
+/// What a guard says of a prompt in the agent's record that no person typed, whose request to the
+/// model the part's turns do not include.
+const UNCHARGED_PROMPT: &str = "a prompt that no person typed is in the agent's record:";
+
 /// What a guard says of a process beneath the agent that the isolation was to prevent.
 const TREE_BROKEN: &str = "a process beneath the agent broke its isolation:";
 
@@ -115,6 +119,8 @@ fn tree_broken(provenance: &Provenance) -> Option<String> {
 fn guard_class(what: &str) -> &'static str {
     if what.contains(SUBAGENT_STARTED) {
         "subagent_started"
+    } else if what.contains(UNCHARGED_PROMPT) {
+        "uncharged_turns"
     } else if what.contains(TREE_BROKEN) {
         "isolation_not_established"
     } else {
@@ -206,6 +212,10 @@ struct Guards {
     /// data directory is not the part's, so nothing is put back over it.
     agent_names: Vec<String>,
     other_writer: std::sync::atomic::AtomicBool,
+    /// Whether a look at the login's files failed while the part ran, so the strings they held at
+    /// that moment are not known, and when the process table and the files were last read.
+    login_look_failed: std::sync::atomic::AtomicBool,
+    last_noted: std::sync::Mutex<Option<std::time::Instant>>,
     /// The person's data directory, where the login's files are read again at each look, and every
     /// string they held at any look: the agent may refresh its token more than once while it runs.
     login_data: Option<PathBuf>,
@@ -250,8 +260,6 @@ impl Guards {
     /// part's mark or the run's directory), a line that was there in a file only appended to, or
     /// a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
-        self.note_login_strings();
-        self.note_other_writers();
         let now = match guarded_files(&self.home, &self.files, needles) {
             Ok(now) => now,
             Err(why) => return Some(why),
@@ -316,6 +324,15 @@ impl Guards {
         {
             return Some(format!("{SUBAGENT_STARTED} {why}"));
         }
+        if let Some(bucket) = self.subagents.as_deref()
+            && let Ok(prompts) = confine::wire_prompts(bucket)
+            && prompts.other > 0
+        {
+            return Some(format!(
+                "{UNCHARGED_PROMPT} {} of another origin than a person's",
+                prompts.other
+            ));
+        }
         self.before.iter().zip(&now).find_map(|(first, second)| {
             let changed = first.sha256 != second.sha256;
             if changed && self.guarded.contains(&first.relative) {
@@ -331,31 +348,53 @@ impl Guards {
         })
     }
 
-    /// Keeps every string the login's files hold now, for the search after the part.
-    fn note_login_strings(&self) {
-        let Some(data) = &self.login_data else {
-            return;
-        };
-        if let Ok(strings) = confine::login_strings(data)
-            && let Ok(mut seen) = self.login_seen.lock()
+    /// Looks at what changes beneath the part without being a file of the person's: every string the
+    /// login's files hold now is kept for the search after the part, and a process of the agent's
+    /// name that is not the run's is noted. At most once every [`GUARD_WATCH`], by whoever asks.
+    fn note(&self, run: &Run, provenance: &Provenance) {
         {
-            seen.extend(strings);
+            let Ok(mut last) = self.last_noted.lock() else {
+                return;
+            };
+            if last.is_some_and(|at| at.elapsed() < GUARD_WATCH) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
         }
-    }
-
-    /// Notes a process of the agent's name that is not one of the part's own: any process of that
-    /// name when the process table cannot be read, since none can then be ruled out.
-    fn note_other_writers(&self) {
+        if let Some(data) = &self.login_data {
+            match confine::login_strings(data) {
+                Ok(strings) => {
+                    if let Ok(mut seen) = self.login_seen.lock() {
+                        seen.extend(strings);
+                    }
+                }
+                Err(_) => self
+                    .login_look_failed
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
+            }
+        }
         if self.agent_names.is_empty() {
             return;
         }
-        let own: Vec<u64> = self
-            .agents
-            .lock()
-            .map(|agents| agents.iter().map(|identity| identity.pid.get()).collect())
-            .unwrap_or_default();
-        let other = match agent_processes(&self.agent_names) {
-            Ok(pids) => pids.into_iter().any(|pid| !own.contains(&u64::from(pid))),
+        // The part's own are the processes beneath the run's recorded ones, the sessions' root shells
+        // and the agent's registered processes, whether or not a launch has registered its agent yet.
+        let mut roots: Vec<u32> = run
+            .owned()
+            .into_iter()
+            .map(|owned| owned.identity)
+            .chain(provenance.watched())
+            .chain(
+                self.agents
+                    .lock()
+                    .map(|agents| agents.clone())
+                    .unwrap_or_default(),
+            )
+            .filter_map(|identity| u32::try_from(identity.pid.get()).ok())
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        let other = match agent_processes_outside(&self.agent_names, &roots) {
+            Ok(others) => !others.is_empty(),
             Err(_) => true,
         };
         if other {
@@ -468,6 +507,7 @@ const GUARD_WATCH: Duration = Duration::from_millis(250);
 /// and its outcome says so.
 fn watch_guards(guards: &Guards, run: &Run, provenance: &Provenance, needles: &[&str]) {
     while guards.watching.load(std::sync::atomic::Ordering::SeqCst) {
+        guards.note(run, provenance);
         if let Some(what) = guards.change(needles).or_else(|| tree_broken(provenance)) {
             guards.trip(what, run, provenance);
             return;
@@ -671,6 +711,7 @@ fn guards_hold(stage: &Stage<'_, '_>) {
         panic!("{GUARD_CHANGED} {what}");
     }
     let root = stage.run.root().display().to_string();
+    guards.note(stage.run, stage.provenance);
     if let Some(what) = guards
         .change(&[stage.mark, root.as_str()])
         .or_else(|| tree_broken(stage.provenance))
@@ -724,16 +765,22 @@ impl Ending {
     }
 }
 
-/// The numbers of the processes whose name, in either column of the process table (the program's own
-/// name and the title it gave itself), is one of `names`. The agent renames itself, so the program's
-/// name alone would miss it.
+/// What `ps` says: the processes whose name, in either column of the process table (the program's
+/// own name and the title it gave itself), is one of `names`, and each process's parent. The agent
+/// renames itself, so the program's name alone would miss it.
+struct ProcessView {
+    named: Vec<u32>,
+    parents: std::collections::BTreeMap<u32, u32>,
+}
+
+/// Reads the process table.
 ///
 /// # Errors
 ///
 /// Returns why the process list could not be read: the answer is then not "none".
-fn agent_processes(names: &[String]) -> Result<Vec<u32>, String> {
+fn process_view(names: &[String]) -> Result<ProcessView, String> {
     let listing = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ucomm=,comm="])
+        .args(["-axo", "pid=,ppid=,ucomm=,comm="])
         .output()
         .map_err(|error| format!("the process list cannot be read: {error}"))?;
     if !listing.status.success() {
@@ -742,26 +789,72 @@ fn agent_processes(names: &[String]) -> Result<Vec<u32>, String> {
             listing.status
         ));
     }
-    Ok(agent_pids_in(
-        &String::from_utf8_lossy(&listing.stdout),
-        names,
-    ))
+    Ok(view_of(&String::from_utf8_lossy(&listing.stdout), names))
 }
 
-/// The numbers `agent_processes` takes from `listing`, the lines of `ps -axo pid=,ucomm=,comm=`.
-fn agent_pids_in(listing: &str, names: &[String]) -> Vec<u32> {
-    listing
-        .lines()
-        .filter_map(|line| {
-            let (pid, rest) = line.trim().split_once(' ')?;
-            let pid = pid.parse::<u32>().ok()?;
-            rest.split_whitespace()
-                .any(|word| {
-                    names
-                        .iter()
-                        .any(|name| word == name || word.rsplit('/').next() == Some(name.as_str()))
-                })
-                .then_some(pid)
+/// The view of `listing`, the lines of `ps -axo pid=,ppid=,ucomm=,comm=`.
+fn view_of(listing: &str, names: &[String]) -> ProcessView {
+    let mut view = ProcessView {
+        named: Vec::new(),
+        parents: std::collections::BTreeMap::new(),
+    };
+    for line in listing.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(pid), Some(parent)) = (
+            words.next().and_then(|word| word.parse::<u32>().ok()),
+            words.next().and_then(|word| word.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        view.parents.insert(pid, parent);
+        if words.any(|word| {
+            names
+                .iter()
+                .any(|name| word == name || word.rsplit('/').next() == Some(name.as_str()))
+        }) {
+            view.named.push(pid);
+        }
+    }
+    view
+}
+
+/// The numbers of the processes of the agent's names.
+///
+/// # Errors
+///
+/// Returns why the process list could not be read.
+fn agent_processes(names: &[String]) -> Result<Vec<u32>, String> {
+    process_view(names).map(|view| view.named)
+}
+
+/// The processes of the agent's names that are not beneath one of `roots`: a process is the part's
+/// own when walking up its parents reaches one of them.
+///
+/// # Errors
+///
+/// Returns why the process list could not be read.
+fn agent_processes_outside(names: &[String], roots: &[u32]) -> Result<Vec<u32>, String> {
+    let view = process_view(names)?;
+    Ok(outside_of(&view, roots))
+}
+
+fn outside_of(view: &ProcessView, roots: &[u32]) -> Vec<u32> {
+    view.named
+        .iter()
+        .copied()
+        .filter(|pid| {
+            let mut at = *pid;
+            // A chain is at most as long as the table; a loop is not the part's.
+            for _ in 0..=view.parents.len() {
+                if roots.contains(&at) {
+                    return false;
+                }
+                match view.parents.get(&at) {
+                    Some(parent) if *parent != at && *parent != 0 => at = *parent,
+                    _ => return true,
+                }
+            }
+            true
         })
         .collect()
 }
@@ -927,6 +1020,13 @@ struct Searched {
     login_unread: Option<String>,
     /// What shows that the agent started a subagent, where anything does.
     subagent: Option<String>,
+    /// How many strings the login's files held at some look while the part ran that they held
+    /// neither before the part nor after it: a token the agent refreshed more than once.
+    intermediate: usize,
+    /// Whether a look at the login's files failed while the part ran.
+    look_failed: bool,
+    /// Whether a process of the agent's name that is not the run's was seen while the part ran.
+    other_writer: bool,
     /// The prompts the agent's own record holds, by who made them, or why they could not be counted.
     wire: Result<confine::WirePrompts, String>,
 }
@@ -949,15 +1049,45 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
     // ran, and those they hold now.
     let mut values = setup.secrets.clone();
     let mut login_unread = None;
-    if let Some(seen) = guards.and_then(|guards| guards.login_seen.lock().ok()) {
-        values.extend(seen.iter().cloned());
-    }
+    let mut known: std::collections::BTreeSet<String> = values.iter().cloned().collect();
     match confine::login_strings(&data) {
-        Ok(now) => values.extend(now),
+        Ok(now) => {
+            known.extend(now.iter().cloned());
+            values.extend(now);
+        }
         Err(why) => login_unread = Some(why),
+    }
+    let mut intermediate = 0;
+    if let Some(seen) = guards.and_then(|guards| guards.login_seen.lock().ok()) {
+        intermediate = seen
+            .iter()
+            .filter(|string| !known.contains(*string))
+            .count();
+        values.extend(seen.iter().cloned());
     }
     values.sort();
     values.dedup();
+    // What the proxy refused and tunnelled to goes to the part's log before the search, so the
+    // search finds nothing the part writes after it.
+    if let Some(proxy) = &login.proxy {
+        proxy.settle(Duration::from_secs(3));
+        let names = proxy.refused_authorities();
+        if !names.is_empty() {
+            eprintln!("the proxy refused, in order: {}", names.join("; "));
+        }
+        for tunnel in &proxy.tunnels() {
+            eprintln!(
+                "the proxy tunnelled to {} through {} at {} ms: {}",
+                tunnel.authority,
+                tunnel.address,
+                tunnel.opened_ms,
+                tunnel.carried.map_or_else(
+                    || "still open".to_owned(),
+                    |(sent, received)| format!("sent {sent} bytes, received {received}")
+                )
+            );
+        }
+    }
     let bytes: Vec<&[u8]> = values.iter().map(String::as_bytes).collect();
     let mut places: Vec<PathBuf> = vec![
         bucket.clone(),
@@ -965,7 +1095,18 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
         data.join("file-history"),
         data.join("logs"),
         data.join("workspaces.json"),
+        data.join("device_id"),
+        data.join("region"),
+        data.join("migrations-effort.json"),
     ];
+    // The part's own evidence, written so far: the harness searches it again at the end for the
+    // strings it read before and after, and this finds those a second refresh left between them.
+    if let Some(evidence) = std::env::var_os(kr_e2e_agents::account::KEY_SCAN_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| PathBuf::from(value).parent().map(Path::to_path_buf))
+    {
+        places.push(evidence);
+    }
     places.extend(
         login
             .account
@@ -990,7 +1131,12 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
     });
     let in_run = files_holding_any(root, &bytes);
     let mut in_data = 0;
-    let mut complete = login_unread.is_none() && in_run.complete();
+    let look_failed = guards.is_some_and(|guards| {
+        guards
+            .login_look_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    });
+    let mut complete = login_unread.is_none() && !look_failed && in_run.complete();
     for place in &places {
         let scan = files_holding_any(place, &bytes);
         in_data += scan.held_by.len();
@@ -1004,6 +1150,17 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
         complete,
         login_unread,
         subagent: confine::subagent_started(&bucket),
+        intermediate,
+        look_failed: guards.is_some_and(|guards| {
+            guards
+                .login_look_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }),
+        other_writer: guards.is_some_and(|guards| {
+            guards
+                .other_writer
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }),
         wire: confine::wire_prompts(&bucket),
     })
 }
@@ -1045,6 +1202,22 @@ fn confine_close(
         let _ = std::fs::remove_dir_all(&bucket);
     }
     let bucket_left = bucket.exists();
+    // The record the agent keeps of the files a tool edited, for the run's folder: a refused edit
+    // leaves none, and any that exists is the run's own, since its name is the folder's.
+    let file_history = data
+        .join("file-history")
+        .join(confine::workdir_key(&folder));
+    let file_history_removed = usize::from(file_history.exists());
+    if ended && file_history.exists() {
+        let _ =
+            std::fs::remove_dir_all(&file_history).or_else(|_| std::fs::remove_file(&file_history));
+    }
+    if file_history.exists() {
+        stop.push((
+            "run_data_left",
+            "the run's file-history record could not be removed".to_owned(),
+        ));
+    }
     if trust_left > 0 || bucket_left {
         stop.push((
             "run_data_left",
@@ -1131,10 +1304,16 @@ fn confine_close(
                 searched.in_run,
                 searched.in_data,
                 if searched.complete { "" } else { "not " },
-                searched
-                    .login_unread
-                    .as_ref()
-                    .map_or_else(String::new, |why| format!(" ({why})"))
+                searched.login_unread.as_ref().map_or_else(
+                    || {
+                        if searched.look_failed {
+                            " (a look at the login's files failed while the part ran)".to_owned()
+                        } else {
+                            String::new()
+                        }
+                    },
+                    |why| format!(" ({why})")
+                )
             ),
         ));
     }
@@ -1183,24 +1362,7 @@ fn confine_close(
             format!("{SUBAGENT_STARTED} {why}, and its requests to the model are not turns the ledger counts"),
         ));
     }
-    let names = proxy.refused_authorities();
-    if !names.is_empty() {
-        eprintln!("the proxy refused, in order: {}", names.join("; "));
-    }
-    proxy.settle(Duration::from_secs(3));
     let tunnels = proxy.tunnels();
-    for tunnel in &tunnels {
-        eprintln!(
-            "the proxy tunnelled to {} through {} at {} ms: {}",
-            tunnel.authority,
-            tunnel.address,
-            tunnel.opened_ms,
-            tunnel.carried.map_or_else(
-                || "still open".to_owned(),
-                |(sent, received)| format!("sent {sent} bytes, received {received}")
-            )
-        );
-    }
     let by_host: Vec<serde_json::Value> = confinement
         .hosts
         .iter()
@@ -1244,9 +1406,10 @@ fn confine_close(
             "unasked_tools": confinement.unasked_tools,
             "settings": { "rules": setup.settings.rules, "allow_built_in": setup.settings.allow_built_in, "mode_manual": !setup.settings.mode_not_manual && setup.settings.unlisted == 0, "loads_more": setup.settings.loads_more, "unlisted": setup.settings.unlisted },
             "servers_switched_off": setup.servers.len(),
-            "left_in_data": { "trust_records_removed": trust_removed, "trust_records_left": trust_left, "sessions_bucket_existed": bucket_existed, "sessions_bucket_left": bucket_left },
+            "left_in_data": { "trust_records_removed": trust_removed, "trust_records_left": trust_left, "sessions_bucket_existed": bucket_existed, "sessions_bucket_left": bucket_left, "file_history_removed": file_history_removed },
             "workspaces": workspaces.map(|(additive, restored)| json!({ "additive": additive, "restored": restored })),
-            "secrets": { "strings": searched.strings, "found_in_run": searched.in_run, "found_in_data": searched.in_data, "places_in_data": searched.places, "complete": searched.complete },
+            "secrets": { "strings": searched.strings, "found_in_run": searched.in_run, "found_in_data": searched.in_data, "places_in_data": searched.places, "intermediate": searched.intermediate, "complete": searched.complete },
+            "other_writer_seen": searched.other_writer,
             "subagent_started": searched.subagent.is_some(),
             "turns": turns,
             "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
@@ -1779,6 +1942,8 @@ fn staged(
                 .map(|confinement| confinement.process_names.clone())
                 .unwrap_or_default(),
             other_writer: std::sync::atomic::AtomicBool::new(false),
+            login_look_failed: std::sync::atomic::AtomicBool::new(false),
+            last_noted: std::sync::Mutex::new(None),
             login_data: login
                 .account
                 .confinement
@@ -2100,6 +2265,12 @@ fn staged(
     // file of the person's that must not change did.
     let mut stop = watched_stop;
     stop.extend(confinement_stop);
+    // A look the stop of the watcher did not see: the sample taken once the part's steps ended.
+    if guard_change.is_none()
+        && let Some(what) = tree_broken(&provenance)
+    {
+        stop.push(("isolation_not_established", what));
+    }
     if let Some(what) = &guard_change {
         stop.push((
             guard_class(what),
@@ -3137,6 +3308,25 @@ impl Logged {
             );
         }
         confine_checks(stage, &mut logged);
+        // The checks' shell lines are in the agent's record of its first conversation, and would go
+        // to its model with the first prompt: a launch that does not resume one starts a fresh
+        // conversation for the part's own turns. (A launch that resumes one has put them in it.)
+        if extra.is_empty()
+            && let Some(new_session) = stage
+                .login
+                .and_then(|login| login.account.confinement.as_ref())
+                .and_then(|confinement| confinement.new_session.as_ref())
+        {
+            logged.type_text(stage, &new_session.input);
+            std::thread::sleep(Duration::from_millis(300));
+            logged.type_text(stage, &account.submit);
+            let _ = logged.wait_for(
+                stage,
+                &new_session.shows,
+                "the agent starts a fresh conversation",
+            );
+            let _ = logged.wait_idle(stage, "the composer is back after the fresh conversation");
+        }
         guards_hold(stage);
         assert!(
             !account.stop_before_turns,
@@ -3224,27 +3414,45 @@ impl Logged {
             .unwrap_or_else(|why| panic!("{why}"));
         stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         self.turns += 1;
+        // A dialog the agent raised before this takes a typed digit as a choice, and the key that
+        // submits picks the choice shown first, which may approve a command or change the agent's
+        // mode: a fresh screen is read before the text is typed and again before the key goes, and a
+        // dialog on either is refused and fails the part.
+        self.no_dialog_now(stage, "before the part typed a prompt");
         self.type_text(stage, text);
         // Keys that arrive together can be read as one paste, whose line end is text and not a
         // submission, so the submission follows on its own.
         std::thread::sleep(Duration::from_millis(300));
-        // The key that submits also answers a dialog: on one the agent raised meanwhile it picks the
-        // choice shown first, which may approve a command or change the agent's mode. So the screen
-        // is read once more, and a dialog on it is refused and fails the part before the key goes.
-        self.screen.pump(stage, Duration::from_millis(50));
-        let rows = self.screen.view.rows();
-        let account = login.account();
+        self.no_dialog_now(stage, "where the part was about to submit");
+        self.type_text(stage, key);
+    }
+
+    /// Reads a fresh screen of the session, as a new attachment is drawn it, and where a dialog of
+    /// the agent's shows refuses it with the agent's own key and fails the part: a cached view that
+    /// had stopped updating would hide one.
+    fn no_dialog_now(&mut self, stage: &Stage<'_, '_>, when: &str) {
+        let account = stage.login.expect("a part with a login").account();
+        let rows = fresh_rows(stage, &self.agent.session);
         if let Some(shown) = Self::dialogs(account)
             .into_iter()
             .find(|needle| rows.iter().any(|row| row.contains(needle)))
         {
-            self.refuse(stage, shown, "a dialog where the part was about to submit");
+            let key = if shown == account.approval.shows {
+                account.approval.deny.clone()
+            } else {
+                account.approval.refusal().to_owned()
+            };
+            self.type_text(stage, &key);
+            if let Ok(mut declined) = stage.declined.lock() {
+                declined.push(format!(
+                    "a dialog showing {shown:?} {when}, refused with {key:?}"
+                ));
+            }
             panic!(
-                "a dialog showing {shown:?} was on the screen where the part was about to submit, \
-                 so the key that submits was not sent"
+                "a dialog showing {shown:?} was on the screen {when}, so no prompt or key that \
+                 submits was sent"
             );
         }
-        self.type_text(stage, key);
     }
 
     /// Waits until the device's view shows `needle`, text only the agent's model could have
@@ -7462,25 +7670,47 @@ fn a_conversation_search_skips_only_files_unchanged_since_before_the_agent_start
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A default keychain is said by its kind, compared as a path: a name that only begins like the
-/// login keychain's is another keychain, and no name is said.
 /// The agent renames itself: the program is `kimi` and the table's other column shows the title it
-/// gave itself, `kimi-code`. A process of either name is the agent's, wherever its file is.
+/// gave itself, `kimi-code`. A process of either name is the agent's, wherever its file is, and it is
+/// the part's own only when a run's process is among its parents.
 #[test]
-fn a_process_of_the_agent_is_found_by_the_program_s_name_or_the_title_it_gave_itself() {
+fn a_process_of_the_agent_is_found_by_either_name_and_is_the_parts_own_by_its_parents() {
     let names = ["kimi".to_owned(), "kimi-code".to_owned()];
-    // The shape of the rows of a real listing (`ps -axo pid=,ucomm=,comm=`) while the agent ran: the
-    // agent's own row, the system's, and one with a path.
-    let listing = " 4907 kimi             kimi-code\n 4829 zsh              /bin/zsh\n\
-                    \u{20}  77 kimi             /Users/someone/.kimi-code/bin/kimi\n\
-                    \u{20} 880 kimi-code-helper  kimi-code-helper\n\
-                    \u{20} 901 bash             /bin/bash\n";
-    assert_eq!(agent_pids_in(listing, &names), vec![4907, 77]);
-    assert_eq!(agent_pids_in("", &names), Vec::<u32>::new());
-    assert_eq!(agent_pids_in("not a listing\n", &names), Vec::<u32>::new());
+    // The shape of the rows of a real listing (`ps -axo pid=,ppid=,ucomm=,comm=`) while the agent
+    // ran: the agent's own row beneath a shell, the shell, a row with a path, and an unrelated one.
+    let listing = " 4907  4829 kimi             kimi-code\n 4829  4821 zsh              /bin/zsh\n\
+                    \u{20}  77     1 kimi             /Users/someone/.kimi-code/bin/kimi\n\
+                    \u{20} 880   500 kimi-code-helper  kimi-code-helper\n\
+                    \u{20} 901     1 bash             /bin/bash\n";
+    let view = view_of(listing, &names);
+    assert_eq!(view.named, vec![4907, 77]);
+    assert_eq!(
+        outside_of(&view, &[4829]),
+        vec![77],
+        "beneath the session's shell is the part's"
+    );
+    assert_eq!(
+        outside_of(&view, &[4907]),
+        vec![77],
+        "a registered agent is its own"
+    );
+    assert_eq!(
+        outside_of(&view, &[]),
+        vec![4907, 77],
+        "with no roots nothing is the part's"
+    );
+    assert_eq!(
+        outside_of(&view, &[4821]),
+        vec![77],
+        "the root may be further up"
+    );
+    assert!(view_of("", &names).named.is_empty());
+    assert!(view_of("not a listing\n", &names).named.is_empty());
     assert!(agent_processes(&["no-such-program-kr".to_owned()]).is_ok_and(|pids| pids.is_empty()));
 }
 
+/// A default keychain is said by its kind, compared as a path: a name that only begins like the
+/// login keychain's is another keychain, and no name is said.
 #[test]
 fn a_default_keychain_is_said_by_its_kind_compared_as_a_path() {
     let home = Path::new("/Users/someone");
