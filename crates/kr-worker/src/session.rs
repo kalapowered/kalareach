@@ -2396,7 +2396,8 @@ impl Session {
         if queued.saturating_add(claimed) > MAX_QUEUED_INPUT_BYTES {
             return Err(WorkerError::ResourceUnavailable {
                 detail: format!(
-                    "the application is not reading its input and {MAX_QUEUED_INPUT_BYTES} bytes                      are already waiting for it, so these bytes were not accepted"
+                    "the application is not reading its input and {MAX_QUEUED_INPUT_BYTES} bytes \
+                     are already waiting for it, so these bytes were not accepted"
                 ),
             });
         }

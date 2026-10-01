@@ -962,6 +962,15 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
         kr_protocol::error::ErrorCode::ResourceUnavailable,
         "the refusal names the reason rather than acknowledging bytes nothing has taken"
     );
+    let said = refusal.to_string();
+    assert!(
+        said.contains(" bytes are already waiting for it, so these bytes were not accepted"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("  "),
+        "a run of spaces in the wording: {said:?}"
+    );
     assert!(
         accepted > 0,
         "an application that is not reading still accepts what fits"
