@@ -68,7 +68,7 @@ fn configured() -> EffectiveConfiguration {
     effective
 }
 
-fn result() -> HostDoctorResult {
+pub(in crate::doctor) fn result() -> HostDoctorResult {
     HostDoctorResult::new(checks(), configured())
 }
 
@@ -567,12 +567,12 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
 fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("support.tar");
-    let content = vec![bundle::Content {
-        entry: bundle::SESSIONS_ENTRY,
-        describes: kr_protocol::hostinfo::export::Sentence::new()
+    let content = vec![bundle::Content::new(
+        bundle::SESSIONS_ENTRY,
+        kr_protocol::hostinfo::export::Sentence::new()
             .stated("every live and closed session with its shell command line"),
-        bytes: br#"{"sessions": []}"#.to_vec(),
-    }];
+        br#"{"sessions": []}"#.to_vec(),
+    )];
     assert!(
         content[0]
             .describe()
@@ -669,12 +669,11 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         result(),
         Vec::new(),
     );
-    let content = vec![bundle::Content {
-        entry: LONG_ENTRY_NAME,
-        describes: kr_protocol::hostinfo::export::Sentence::new()
-            .stated("a name longer than a header holds"),
-        bytes: Vec::new(),
-    }];
+    let content = vec![bundle::Content::new(
+        LONG_ENTRY_NAME,
+        kr_protocol::hostinfo::export::Sentence::new().stated("a name longer than a header holds"),
+        Vec::new(),
+    )];
     let refused = bundle::write(&directory.path().join("support.tar"), &bundle, &content)
         .expect_err("a name the header cannot carry");
     assert!(
