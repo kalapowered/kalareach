@@ -881,18 +881,30 @@ impl ArchiveService {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// Reads one retained receipt of a closed session.
+    /// Reads one retained receipt of a closed session, as its reader is shown it.
+    ///
+    /// `owner` says whether the reader is the owner at this machine on its own socket. The owner
+    /// is shown the receipt and its result whole. Any other reader is shown the state of the
+    /// action and none of what it carries: the error's text and a question's content are withheld,
+    /// and a close's description of the session with them, because a closed session's history is
+    /// not the reader's to be shown by a later read ([`kr_worker::history_filter::retained`]).
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::UnknownSession`] when this host holds no journal for the
-    /// session, and an invalid-argument failure when no receipt answers.
+    /// session, an invalid-argument failure when no receipt answers, and a refusal when the
+    /// result is one a reader who is not the owner is not shown at all.
     pub fn receipt(
         &self,
         session_id: SessionId,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
+        owner: bool,
     ) -> Result<ActionReadResult> {
+        use kr_worker::history_filter::retained::{
+            Disclosure, Occasion, shown_receipt, shown_result, withheld_entirely,
+        };
+
         self.bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         if !path.exists() {
@@ -911,15 +923,32 @@ impl ArchiveService {
         let retained = journal
             .read_result(actor_id, action_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let disclosure = if owner {
+            Disclosure::Whole
+        } else {
+            Disclosure::StateOnly
+        };
+        let refused = |error: kr_worker::error::WorkerError| {
+            ControllerError::refused(&error.to_protocol_error())
+        };
         let result = retained
             .map(|bytes| {
-                kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
                     .map(kr_protocol::envelope::ParamsValue::new)
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                // A result is shown by the method that kept it, which the receipt names. A method
+                // this build does not know is the owner's to read as it is, and nobody else's.
+                match receipt.method.method() {
+                    Some(method) => {
+                        shown_result(&disclosure, method, value, Occasion::Replay).map_err(refused)
+                    }
+                    None if owner => Ok(value),
+                    None => Err(refused(withheld_entirely())),
+                }
             })
             .transpose()?;
         Ok(ActionReadResult {
-            receipt,
+            receipt: shown_receipt(&disclosure, receipt),
             result: Nullable(result),
         })
     }

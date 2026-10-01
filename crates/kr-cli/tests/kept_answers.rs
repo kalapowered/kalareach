@@ -67,6 +67,9 @@ enum Behaviour {
     TakesAnswersAndRepliesUnreadably,
     /// Takes an answer, makes the store of kept answers read-only, and replies.
     TakesAnswersAndLocksTheStore,
+    /// Is of an earlier build: it states no build in its answer to the hello, so what it replies
+    /// to an answer is not a shape this command is sure to read.
+    IsOfAnEarlierBuild,
 }
 
 /// Which environment the scripted session runs in.
@@ -499,6 +502,11 @@ async fn serve_one(
         return;
     };
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let earlier = state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .behaviour
+        == Behaviour::IsOfAnEarlierBuild;
     let acknowledgement = kr_protocol::local::LocalHelloAck {
         selected_version: PROTOCOL_VERSION,
         role: kr_protocol::local::LocalRole::Worker,
@@ -520,7 +528,12 @@ async fn serve_one(
         },
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
-        build: None,
+        // A worker of this build states it, as every worker does.
+        build: (!earlier).then(|| {
+            kr_protocol::local::LocalBuild::this(
+                kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+            )
+        }),
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
@@ -782,6 +795,46 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_nothing_is_sent() {
     assert_eq!(document["state"], "answered", "{document}");
     assert_eq!(host.answers_received(), 1);
     assert!(!host.kept().exists(), "an answer that went is not kept");
+}
+
+/// KR-REQ-10.49: an answer or a cancellation is not sent to a worker whose reply this command may
+/// not read. A worker of an earlier build keeps the whole question in its reply and a later one may
+/// hold it back, and a command that sent the action and then could not read the reply would leave
+/// its person unsure whether it was taken. Nothing is sent, and the refusal says so and says what
+/// to use. The control, a worker that states this build, takes the answer and the cancellation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_49_nothing_is_sent_to_a_worker_whose_reply_this_command_may_not_read() {
+    let host = Host::start(Behaviour::IsOfAnEarlierBuild).await;
+    let question = host.question();
+    for line in [
+        vec!["question", "answer", &question, "--choice", "left"],
+        vec!["question", "cancel", &question],
+    ] {
+        let (status, document) = host.json(&line);
+        assert_ne!(status, Some(0), "{line:?}: {document}");
+        assert_eq!(document["ok"], Value::Bool(false), "{line:?}: {document}");
+        assert_eq!(
+            document["code"],
+            Value::String("UNSUPPORTED_SCHEMA".to_owned()),
+            "{line:?}: {document}"
+        );
+        let message = document["message"].as_str().expect("a message");
+        assert!(message.contains("earlier build"), "{message}");
+        assert!(message.contains("nothing was sent"), "{message}");
+        assert_eq!(host.answers_received(), 0, "{line:?}: nothing was sent");
+        assert_eq!(host.state().question.state, QuestionState::Pending);
+    }
+    assert!(
+        !host.kept().exists(),
+        "a refused answer is not kept as one a host could not take"
+    );
+
+    // The control: a worker that states this build.
+    let host = Host::start(Behaviour::Serves).await;
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(host.answers_received(), 1);
 }
 
 /// KR-REQ-11.63: an answer its worker could not take that cannot be kept on this device either is

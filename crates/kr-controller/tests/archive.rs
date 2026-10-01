@@ -134,6 +134,7 @@ fn a_closed_session_is_served_from_what_it_left_behind() {
             session_id,
             &actor,
             kr_worker::journal::action_id_from([1; 16]),
+            true,
         )
         .expect("reads the receipt");
     assert_eq!(
@@ -176,6 +177,7 @@ fn recovery_resolves_what_a_crashed_worker_left_unfinished() {
             session_id,
             &actor,
             kr_worker::journal::action_id_from([2; 16]),
+            true,
         )
         .expect("reads the receipt");
     assert_eq!(
@@ -188,6 +190,7 @@ fn recovery_resolves_what_a_crashed_worker_left_unfinished() {
             session_id,
             &actor,
             kr_worker::journal::action_id_from([1; 16]),
+            true,
         )
         .expect("reads the receipt");
     assert_eq!(
@@ -1557,4 +1560,214 @@ fn what_is_left_of_an_ended_worker_that_cannot_be_removed_stops_the_import() {
             "the journal is left as it was"
         );
     }
+}
+
+/// A question answered by `device:phone`, with text where content is kept.
+fn answered_question() -> kr_protocol::question::Question {
+    use kr_protocol::ids::{ApplicationInstanceId, ConnectionId, QuestionId, QuestionRevision};
+    use kr_protocol::question::{
+        AnswerRecord, QuestionAnswer, QuestionKind, QuestionSource, QuestionState,
+    };
+    use kr_protocol::scalars::Uuid;
+
+    kr_protocol::question::Question {
+        question_id: QuestionId::new(Uuid::from_bytes([1; 16])),
+        revision: QuestionRevision::new(2),
+        state: QuestionState::Answered,
+        session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+        session_epoch: SessionEpoch::V1,
+        kind: QuestionKind::Confirm,
+        context: "Two tests are failing.".to_owned(),
+        question: "Push the branch anyway?".to_owned(),
+        choices: Vec::new(),
+        source: QuestionSource {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            process: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                11,
+            ),
+            executable: Nullable::null(),
+            agent_label: Nullable::some("the release agent".to_owned()),
+            connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+            launch_channel: false,
+            session_member: true,
+            ancestry: true,
+            agent_binding_revision: Nullable::null(),
+        },
+        created_at_ms: TimestampMs::new(1_000),
+        expires_at_ms: TimestampMs::new(61_000),
+        answer: Nullable::some(AnswerRecord {
+            answer: QuestionAnswer::Decision { decided: true },
+            actor_id: ActorId::new("test:archive").expect("an actor"),
+            device_id: Nullable::null(),
+            question_revision: QuestionRevision::new(1),
+            answered_at_ms: TimestampMs::new(1_001),
+        }),
+        resolved_at_ms: Nullable::some(TimestampMs::new(1_001)),
+    }
+}
+
+/// Settles the action `byte` of a session's journal as applied, with `result` kept for it.
+fn settled_with(
+    archive: &ArchiveService,
+    session_id: SessionId,
+    byte: u8,
+    method: kr_protocol::method::Method,
+    result: &kr_protocol::envelope::ParamsValue,
+) {
+    let mut journal = journal_for(archive, session_id);
+    let mut accepted = submission(byte);
+    accepted.method = method.into();
+    journal.accept(&accepted).expect("an accepted intent");
+    let actor = accepted.actor_id.clone();
+    let action = accepted.action_id;
+    journal
+        .mark_dispatching(actor.clone(), action, kr_ipc::now_ms())
+        .expect("a dispatch marker");
+    journal
+        .settle(
+            actor,
+            action,
+            kr_protocol::receipt::ReceiptState::Applied,
+            Some(&kr_cbor::encode(result.as_value())),
+            None,
+            kr_ipc::now_ms(),
+        )
+        .expect("settles");
+}
+
+/// KR-REQ-10.49 and KR-REQ-23.34: the archive shows a closed session's receipts as their reader may
+/// see them. The owner at this machine reads a retained question and a close's description whole.
+/// Any other reader is told the state of the action: the question's text, its choices, who asked
+/// and what was answered are withheld, the description of the session goes, and a receipt's error
+/// text is replaced. What is kept is not changed by either read.
+#[test]
+fn kr_req_10_49_a_closed_sessions_receipts_are_shown_whole_to_the_owner_and_as_state_to_anybody_else()
+ {
+    use kr_protocol::envelope::ParamsValue;
+    use kr_protocol::method::Method;
+
+    let (_temp, archive) = host();
+    let session_id = session();
+    let actor = ActorId::new("test:archive").expect("an actor");
+
+    let resolution = kr_worker::questions::Resolution {
+        question: answered_question(),
+    };
+    settled_with(
+        &archive,
+        session_id,
+        1,
+        Method::QuestionAnswer,
+        &ParamsValue::from_typed(&resolution).expect("encodes"),
+    );
+    let closed = kr_protocol::session::SessionCloseResult {
+        session_id,
+        state: kr_protocol::session::SessionState::Closed,
+        durability: Durability::Durable,
+        closure: Nullable::null(),
+        session: Some(summary(session_id)),
+    };
+    settled_with(
+        &archive,
+        session_id,
+        2,
+        Method::SessionClose,
+        &ParamsValue::from_typed(&closed).expect("encodes"),
+    );
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal.accept(&submission(3)).expect("an accepted intent");
+        journal
+            .reject(
+                actor.clone(),
+                kr_worker::journal::action_id_from([3; 16]),
+                kr_protocol::receipt::RejectionReason::StalePreconditions,
+                Some(kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::PermissionDenied,
+                    "the agent quoted /home/person/notes",
+                )),
+                kr_ipc::now_ms(),
+            )
+            .expect("rejects");
+    }
+    let read = |byte: u8, owner: bool| {
+        archive
+            .receipt(
+                session_id,
+                &actor,
+                kr_worker::journal::action_id_from([byte; 16]),
+                owner,
+            )
+            .expect("reads the receipt")
+    };
+
+    // The question.
+    let owner = read(1, true);
+    let shown: kr_protocol::question::QuestionResolveResult = owner
+        .result
+        .as_ref()
+        .expect("a result")
+        .to_typed()
+        .expect("a resolution result");
+    assert_eq!(shown.question(), Some(&answered_question()));
+    let other = read(1, false);
+    let withheld: kr_protocol::question::QuestionResolveResult = other
+        .result
+        .as_ref()
+        .expect("a result")
+        .to_typed()
+        .expect("a resolution result");
+    assert_eq!(withheld.question(), None);
+    assert_eq!(
+        withheld.state,
+        kr_protocol::question::QuestionState::Answered
+    );
+    let text = serde_json::to_string(&other).expect("encodes");
+    for content in [
+        "Push the branch anyway?",
+        "Two tests are failing.",
+        "the release agent",
+    ] {
+        assert!(!text.contains(content), "{content:?} in {text}");
+    }
+
+    // The close's description.
+    let described = |read: &kr_protocol::receipt::ActionReadResult| {
+        kr_worker::history_filter::retained::member(
+            read.result.as_ref().expect("a result"),
+            "session",
+        )
+        .is_some()
+    };
+    assert!(described(&read(2, true)), "the owner reads the description");
+    assert!(!described(&read(2, false)), "nobody else does");
+
+    // The error text of a refused action.
+    let own = read(3, true);
+    assert!(!own.receipt.error_withheld);
+    assert!(
+        own.receipt
+            .error
+            .as_ref()
+            .expect("an error")
+            .message
+            .contains("/home/person/notes")
+    );
+    let theirs = read(3, false);
+    assert!(theirs.receipt.error_withheld);
+    let error = theirs.receipt.error.as_ref().expect("an error");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(!error.message.contains("/home/person/notes"));
+
+    // What the journal keeps is the bytes it kept.
+    let kept = Journal::open_read_only(archive.paths().journal_database(session_id))
+        .expect("opens")
+        .read_result(&actor, kr_worker::journal::action_id_from([1; 16]))
+        .expect("reads")
+        .expect("a result is kept");
+    let kept: kr_worker::questions::Resolution =
+        kr_cbor::from_canonical_slice(&kept, &kr_cbor::Limits::DEFAULT).expect("the stored form");
+    assert_eq!(kept, resolution);
 }

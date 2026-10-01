@@ -71,6 +71,14 @@ pub(super) struct Scripted {
     generations: std::sync::Mutex<Vec<kr_protocol::ids::ControllerGeneration>>,
     /// How many connections it has accepted.
     connections: AtomicUsize,
+    /// Whether it states that it holds what it retains to the history scope a forwarded frame
+    /// carries, as a worker of this build does.
+    holds_results_to_scopes: AtomicBool,
+    /// Every mutation a daemon forwarded to it, in the order they came.
+    forwarded: std::sync::Mutex<Vec<kr_protocol::local::ForwardedMutation>>,
+    /// The receipts it keeps with no result, by the action they belong to: the method, and the
+    /// failure the receipt records.
+    receipts_only: std::sync::Mutex<BTreeMap<ActionId, (Method, ProtocolError)>>,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -98,7 +106,56 @@ impl Scripted {
             answered: std::sync::Mutex::new(BTreeMap::new()),
             generations: std::sync::Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
+            holds_results_to_scopes: AtomicBool::new(true),
+            forwarded: std::sync::Mutex::new(Vec::new()),
+            receipts_only: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Has this worker state what a worker built before results were held to a scope states: that
+    /// it reads a scope and holds a question read to it, and nothing more. It keeps an answer
+    /// whole, and ends the link a mutation that carries a scope arrived on.
+    pub(super) fn built_before_results_were_held_to_scopes(&self) {
+        self.holds_results_to_scopes.store(false, Ordering::Release);
+    }
+
+    /// What this worker states about itself in its answer to a hello.
+    fn stated(&self) -> kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId> {
+        let mut stated = vec![
+            kr_protocol::local::FORWARDED_HISTORY_SCOPE,
+            kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+        ];
+        if self.holds_results_to_scopes.load(Ordering::Acquire) {
+            stated.push(kr_protocol::local::FORWARDED_RESULT_SCOPE);
+        }
+        stated
+            .into_iter()
+            .map(|capability| {
+                kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
+            })
+            .collect()
+    }
+
+    /// Every mutation a daemon forwarded to this worker, in the order they came.
+    pub(super) fn forwarded(&self) -> Vec<kr_protocol::local::ForwardedMutation> {
+        self.forwarded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Keeps a receipt for `action_id` that records `failure` and holds no result, as a worker's
+    /// journal holds a refused action's.
+    pub(super) fn kept_without_a_result(
+        &self,
+        action_id: ActionId,
+        method: Method,
+        failure: ProtocolError,
+    ) {
+        self.receipts_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(action_id, (method, failure));
     }
 
     /// How many connections this worker has accepted, from any daemon.
@@ -183,6 +240,25 @@ impl Scripted {
     /// How this worker answers `action.read`: the receipt of a close it kept an answer to, with
     /// that answer, and otherwise a refusal.
     fn receipt(&self, request: &Request) -> ControlFrame {
+        if let Some(params) = request
+            .params
+            .to_typed::<kr_protocol::receipt::ActionReadParams>()
+            .ok()
+            && let Some((method, failure)) = self
+                .receipts_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&params.action_id)
+                .cloned()
+        {
+            return respond(
+                request.request_id,
+                &kr_protocol::receipt::ActionReadResult {
+                    receipt: self.receipt_of(params.action_id, method, Some(failure)),
+                    result: Nullable::null(),
+                },
+            );
+        }
         let kept = request
             .params
             .to_typed::<kr_protocol::receipt::ActionReadParams>()
@@ -207,23 +283,38 @@ impl Scripted {
         respond(
             request.request_id,
             &kr_protocol::receipt::ActionReadResult {
-                receipt: kr_protocol::receipt::Receipt {
-                    action_id,
-                    actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
-                    method: Method::SessionClose.into(),
-                    method_version: MethodVersion::V1,
-                    revision: U64::new(2),
-                    state: kr_protocol::receipt::ReceiptState::Applied,
-                    reason: Nullable::null(),
-                    payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
-                    accepted_deadline_ms: Nullable::null(),
-                    error: Nullable::null(),
-                    error_withheld: false,
-                    updated_at_ms: kr_ipc::now_ms(),
-                },
+                receipt: self.receipt_of(action_id, Method::SessionClose, None),
                 result: Nullable::some(answer),
             },
         )
+    }
+
+    /// The receipt this worker keeps for `action_id`, as it settled: applied, or refused with
+    /// `failure`.
+    fn receipt_of(
+        &self,
+        action_id: ActionId,
+        method: Method,
+        failure: Option<ProtocolError>,
+    ) -> kr_protocol::receipt::Receipt {
+        kr_protocol::receipt::Receipt {
+            action_id,
+            actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            revision: U64::new(2),
+            state: if failure.is_some() {
+                kr_protocol::receipt::ReceiptState::Refused
+            } else {
+                kr_protocol::receipt::ReceiptState::Applied
+            },
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable(failure),
+            error_withheld: false,
+            updated_at_ms: kr_ipc::now_ms(),
+        }
     }
 
     /// Puts the session in `state`, which every later answer says.
@@ -366,7 +457,7 @@ fn serve_scripted(
                         &endpoint_text,
                         connection_id,
                         &peer,
-                        &kr_protocol::scalars::CanonicalSet::new(),
+                        &script.stated(),
                     );
                     let answers = match (handshake, frame) {
                         (Some(answers), _) => answers,
@@ -401,24 +492,72 @@ fn serve_scripted(
                                 vec![respond(request.request_id, &answer)]
                             }
                         }
-                        (None, ControlFrame::Forwarded(forwarded))
-                            if forwarded.mutation.method == Method::SessionClose.into() =>
-                        {
-                            let (answer, kept) =
-                                script.close(identity.session_id(), forwarded.mutation.action_id);
-                            let response = Response {
-                                request_id: forwarded.mutation.request_id,
-                                outcome: Outcome::Ok(answer),
-                            };
-                            // A forwarded action this worker has answered before is answered
-                            // from what it kept. The frame says so to a proxy, which forwards for
-                            // somebody whose receipts are not its own; the daemon's own link is
-                            // answered as a local caller's action always is.
-                            vec![if kept && proxy {
-                                ControlFrame::RetainedResponse(Box::new(response))
+                        (None, ControlFrame::Forwarded(forwarded)) => {
+                            script
+                                .forwarded
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((*forwarded).clone());
+                            if forwarded.mutation.method != Method::SessionClose.into() {
+                                // Any other action is answered from the receipt this worker keeps
+                                // for it, when it keeps one, and refused otherwise.
+                                let kept = script
+                                    .receipts_only
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get(&forwarded.mutation.action_id)
+                                    .cloned();
+                                let request_id = forwarded.mutation.request_id;
+                                vec![match kept {
+                                    Some((method, failure)) => {
+                                        let response = Response {
+                                            request_id,
+                                            outcome: Outcome::Ok(
+                                                ParamsValue::from_typed(
+                                                    &kr_protocol::receipt::ReceiptResponse {
+                                                        request_id,
+                                                        receipt: script.receipt_of(
+                                                            forwarded.mutation.action_id,
+                                                            method,
+                                                            Some(failure),
+                                                        ),
+                                                    },
+                                                )
+                                                .expect("encodes"),
+                                            ),
+                                        };
+                                        if proxy {
+                                            ControlFrame::RetainedResponse(Box::new(response))
+                                        } else {
+                                            ControlFrame::Response(response)
+                                        }
+                                    }
+                                    None => ControlFrame::Response(Response {
+                                        request_id,
+                                        outcome: Outcome::Error(ProtocolError::new(
+                                            ErrorCode::ResourceUnavailable,
+                                            "this worker performs no action but a close",
+                                        )),
+                                    }),
+                                }]
                             } else {
-                                ControlFrame::Response(response)
-                            }]
+                                let (answer, kept) = script
+                                    .close(identity.session_id(), forwarded.mutation.action_id);
+                                let response = Response {
+                                    request_id: forwarded.mutation.request_id,
+                                    outcome: Outcome::Ok(answer),
+                                };
+                                // A forwarded action this worker has answered before is
+                                // answered from what it kept. The frame says so to a proxy, which
+                                // forwards for somebody whose receipts are not its own; the
+                                // daemon's own link is answered as a local caller's action
+                                // always is.
+                                vec![if kept && proxy {
+                                    ControlFrame::RetainedResponse(Box::new(response))
+                                } else {
+                                    ControlFrame::Response(response)
+                                }]
+                            }
                         }
                         (None, ControlFrame::ForwardedRead(forwarded))
                             if forwarded.request.method == Method::ActionRead.into() =>
