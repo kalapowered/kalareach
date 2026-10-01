@@ -165,6 +165,9 @@ struct Members {
 pub struct WorkerBridge {
     generation: ControllerGeneration,
     members: Mutex<Members>,
+    /// Whether every worker this daemon inherited is a member. Until then the bridge cannot say
+    /// what the workers hold live, and says so.
+    members_known: std::sync::atomic::AtomicBool,
     /// How many times a pass of the admissions cadence was asked for ahead of its tick, for this
     /// host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -172,15 +175,26 @@ pub struct WorkerBridge {
 }
 
 impl WorkerBridge {
-    /// A bridge with no members, for the daemon generation `generation`.
+    /// A bridge with no members, for the daemon generation `generation`, which does not yet know
+    /// the workers that outlived the daemon before this one: until [`Self::members_known`] says it
+    /// does, every answer to the catalogue is that a worker is pending, so a commit made before
+    /// the workers are counted forgets no release one of them may still hold.
     #[must_use]
     pub fn new(generation: ControllerGeneration) -> Self {
         Self {
             generation,
             members: Mutex::new(Members::default()),
+            members_known: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             passes_asked: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Says that every worker the previous daemon left is a member now, or was found to have
+    /// ended, so the members are the whole account of what the workers hold.
+    pub fn members_known(&self) {
+        self.members_known
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Notes that a pass of the admissions cadence was asked for ahead of its tick.
@@ -594,6 +608,9 @@ impl BrokerBridge for WorkerBridge {
                 }
             }
         }
+        if !self.members_known.load(std::sync::atomic::Ordering::SeqCst) {
+            pending.push("a worker this daemon has not counted yet".to_owned());
+        }
         pending.dedup();
         LivePackages {
             releases: releases.into_values().collect(),
@@ -607,6 +624,24 @@ mod tests {
     use super::*;
     use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, PublisherId};
     use kr_protocol::scalars::{Nullable, Uuid};
+
+    /// A bridge that has counted every worker there is to count, as a daemon's is once it has
+    /// seeded its members.
+    fn known_bridge(generation: u64) -> WorkerBridge {
+        let bridge = WorkerBridge::new(ControllerGeneration::new(generation));
+        bridge.members_known();
+        bridge
+    }
+
+    /// A bridge that has not counted the workers the last daemon left says a worker is pending,
+    /// whatever the revision, and says none once it has.
+    #[test]
+    fn a_bridge_that_has_not_counted_the_workers_reports_one_pending() {
+        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        assert_eq!(bridge.live_packages(5).pending.len(), 1);
+        bridge.members_known();
+        assert!(bridge.live_packages(5).pending.is_empty());
+    }
 
     fn session(n: u8) -> SessionId {
         SessionId::new(Uuid::from_bytes([n; 16]))
@@ -648,7 +683,7 @@ mod tests {
     /// never sent a round, and it leaves only when its process has ended.
     #[test]
     fn a_fence_before_the_first_snapshot_keeps_the_member_until_its_end() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(1));
+        let bridge = known_bridge(1);
         let member = session(9);
         bridge.claimed(member, Some(process(9)));
         bridge.fenced(member);
@@ -680,7 +715,7 @@ mod tests {
 
     #[test]
     fn a_member_is_pending_until_it_answers_a_frame_of_this_generation_at_the_revision() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         assert_eq!(bridge.live_packages(5).pending.len(), 1);
         let frame = bridge
@@ -697,7 +732,7 @@ mod tests {
 
     #[test]
     fn an_older_answer_or_one_naming_a_frame_not_kept_changes_nothing() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         let first = bridge
             .next_frame(member, 5, BTreeSet::new())
@@ -734,7 +769,7 @@ mod tests {
     #[test]
     fn a_member_that_never_answers_keeps_four_frame_records_and_a_late_answer_to_a_retired_one_is_dropped()
      {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         let frames: Vec<FrameId> = (0..10)
             .map(|_| {
@@ -764,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_release_the_frame_did_not_cover_is_discovered_and_not_reconciled() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         let frame = bridge
             .next_frame(member, 5, BTreeSet::new())
@@ -787,7 +822,7 @@ mod tests {
 
     #[test]
     fn a_fenced_or_closed_member_is_never_rounded_and_stays_pending_until_it_ends() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let fenced = recorded(&bridge, 1);
         let closed = recorded(&bridge, 2);
         bridge.fenced(fenced);
@@ -810,7 +845,7 @@ mod tests {
 
     #[test]
     fn counts_come_only_from_reports_used_after_the_mark() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         let covered: BTreeSet<ReleaseKey> = std::iter::once(key_of(&release(1))).collect();
         let frame = bridge
@@ -847,7 +882,7 @@ mod tests {
     /// the binding, it needs none.
     #[test]
     fn a_member_reporting_a_binding_due_to_end_needs_a_round_until_its_report_omits_it() {
-        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let bridge = known_bridge(3);
         let member = recorded(&bridge, 1);
         let covered: BTreeSet<ReleaseKey> = std::iter::once(key_of(&release(1))).collect();
         let installed = |key: &ReleaseKey| *key == key_of(&release(1));

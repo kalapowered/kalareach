@@ -857,10 +857,14 @@ whose payloads are no longer cached is refused as unavailable offline, because t
 root to verify a fetch against.
 
 An installed release whose manifest carries a native bridge recipe, installed with
-`native_bridge.install` granted, has the recipe applied in the application's own directory once the
-installation has committed; removing the package, or a grant that withdraws that capability, takes
-it out again, and enabling or disabling the package leaves it. After every plugin change, and each
-time the daemon starts, the package's bridge is brought to what its installation wants, so a recipe
+`native_bridge.install` granted, has the recipe applied in the application's own directory while the
+installation stands: the package is enabled, its repository has not revoked the release and the
+organisation's adapter allowlist, where there is one, names it. Disabling the package, a revocation,
+a list that no longer names it, a grant that withdraws that capability and removing the package each
+take the recipe out again, whatever the disable policy says about live bindings, and the installation
+stays. After every plugin change, every synchronisation, pin and removal, every change of the
+allowlist, and each time the daemon starts, the package's bridge is brought to what its
+installation wants, so a recipe
 a stopped daemon left part way is finished or taken out before anything else is served. The recipe
 keeps a journal of its own for each package under `native-bridges/` in the environment's state
 directory, apart from the catalogue's records, and never changes a method's answer or receipt: an

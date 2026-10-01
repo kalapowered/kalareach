@@ -9,8 +9,11 @@
 //!
 //! # When a recipe is in place
 //!
-//! A recipe is wanted while its package is installed, the installation's effective grants hold
-//! `native_bridge.install` and the installed manifest carries one. [`NativeBridges::reconcile`]
+//! A recipe is wanted while its package is installed and enabled, its repository has not revoked the
+//! release, the organisation's adapter allowlist (where there is one) names it, the installation's
+//! effective grants hold `native_bridge.install` and the installed manifest carries one: a
+//! registration is the package running in the application's name, so it follows the standing the
+//! admissions decide. [`NativeBridges::reconcile`]
 //! compares that with the journal: a wanted release that is not applied is applied, a release the
 //! installation moved on from is removed first, and one no longer wanted is removed. None of it
 //! changes what the catalogue answered: the installation is committed before the recipe runs, and
