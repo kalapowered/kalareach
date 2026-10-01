@@ -891,7 +891,8 @@ qualification may not do.
    digest, the create request without its environment variables, the allocated session identifier
    and display number, and the launch phase. Display numbers increase and are never reused.
 2. The reservation moves to `spawned` **before** anything starts, because a worker can reach the
-   rendezvous socket the instant the service manager starts it.
+   rendezvous socket the instant the service manager starts it. Before that, while privacy mode is
+   on, the daemon records the session's obligation (see *Privacy mode*).
 3. The service manager starts the worker. Its job definition carries only non-secret facts: the
    reservation, the session, the environment, the display number, the rendezvous address and the
    two directory roots.
@@ -900,9 +901,11 @@ qualification may not do.
    identifier and the kernel's record of its start — with what the launcher reported. Exactly one
    rendezvous per reservation succeeds; a second is refused, recorded, and fences the reservation.
 5. The daemon sends the launch specification over that private channel: the create request with the
-   creator's environment variables, taken from memory, its own public key and its generation.
-6. The worker creates the pseudo-terminal, launches the root shell, binds its endpoint and reports
-   itself ready. The daemon records the worker's public key inside the same transaction that marks
+   creator's environment variables, taken from memory, its own public key, its generation and the
+   privacy state in force.
+6. The worker creates the pseudo-terminal, applies the privacy state, launches the root shell, binds
+   its endpoint and reports itself ready. The daemon records the worker's public key inside the same
+   transaction that marks
    the session live, then publishes the descriptor.
 
 The create token is the request's action identifier. A retry with the same payload resolves to the
@@ -2844,15 +2847,17 @@ nothing about the host. Both answer one report: the generation, whether the last
 effect, what each session still owes, what the daemon keeps and why, and what had already left this
 host.
 
-Turning it on writes the record first, in one transaction with an obligation for every session the
-environment holds content for: every worker the registry records and every session whose journal or
-spool is still on the disk. The admission the request carries is asked again immediately before
-that write, so an action whose deadline passed, or whose authority was withdrawn, while it waited
-changes nothing. The write happens inside the backup store's own hold together with the backup
-fence, so no backup decision falls between the two, and no exchange with a delivery destination
-falls between the record and the moment the new state is published, because the send gate below is
-held shut across both. Only then are the daemon's own subsystems taken through the four steps: the
-backup service, the delivery outbox and the stored descriptions.
+The act of turning it on writes the record first, in a single transaction that records an obligation
+for every session for which the environment has content, including every worker recorded in the
+registry, every launch whose worker may still start or may be running without a record (reservation
+spawned, reservation claimed, or post-claim fence), and every session for which a journal or spool
+remains on disk. The admission the request carries is asked again immediately before that write, so
+an action whose deadline passed, or whose authority was withdrawn, while it waited changes nothing.
+The write happens inside the backup store's own hold together with the backup fence, so no backup
+decision falls between the two, and no exchange with a delivery destination falls between the record
+and the moment the new state is published, because the send gate below is held shut across both.
+Only then are the daemon's own subsystems taken through the four steps: the backup service, the
+delivery outbox and the stored descriptions.
 
 Each session is told the generation by the daemon, on a tick once a second, over the connection the
 daemon holds to its worker. The worker raises its attention transition, applies the generation to
@@ -2861,6 +2866,16 @@ time, until it answers that its cleanup is complete, and only that answer ends i
 session whose worker ended first keeps its obligation, reported as unavailable with the archive
 named as what holds its output, because an ended worker is no evidence that what it retained is
 gone.
+
+Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
+obligation before it asks for the worker. That write waits for whatever holds the record, a change
+of privacy mode among it, and if the obligation cannot be written the create starts nothing. When
+the worker's claim is accepted, it is given a launch specification that includes the generation in
+force and whether privacy mode is on. The worker writes the generation into its journal and turns
+off output retention before launching the shell. If it can't write the generation, it doesn't start.
+When the tick's first notice reaches the worker, it already has the generation, and the attention
+store joins at that notice. If privacy mode has changed after the specification was read, the worker
+learns about it the same way it does for any other session, via the tick.
 
 The report says complete only when every subsystem has nothing outstanding and every obligation has
 ended. A step a store refused is owed, with the store's reason, and the tick tries it again on a
@@ -2874,11 +2889,14 @@ Turning it off is refused while a daemon subsystem, or a session whose worker is
 still start, owes cleanup, and the refusal names what is owed. A session whose worker has ended does
 not hold it back, because nothing resumes in its store, and its obligation stays recorded. A session
 counts as ended only when the registry shows its launch is over: it has no reservation, or one whose
-launch produced no worker or whose session has closed. A session whose worker has not reported yet
-is one this host has not reached, and it holds turning privacy mode off back until its worker
-answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the next
-generation is recorded first, the backup fence is released under it, the delivery fence is lifted,
-and each live session is told until it answers.
+launch failed after a worker claimed it, or whose session has closed. A session whose worker has not
+reported yet is one this host has not reached, and it holds turning privacy mode off back until its
+worker answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the
+next generation is recorded first, the backup fence is released under it, the delivery fence is
+lifted, and each live session is told until it answers. When a launch never handed a worker its
+launch specification, the registry shows it. In other words, it failed, or was fenced, before any
+worker claimed it, or its launcher ended without claiming it. Since no shell ran, there's nothing to
+retain. The obligation is deleted from the record and the session is not reported as ended.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
 about an earlier one, is admitted under the privacy state the record publishes: only while privacy
@@ -3057,26 +3075,23 @@ reason to keep output.
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
 
-* **A session whose launch was fenced is not reached again.** A second claim on a reservation that
-  a worker has already claimed fences it, and the first worker's ready report is then refused;
-  that worker goes on with its session and is never recorded. A launch does not claim twice in the
-  ordinary way. A worker whose reservation is fenced is also left out of the directory a start
-  rebuilds. It is not told the generation, so it keeps what its session prints while privacy mode
-  is on, and the report keeps listing the session as awaiting its worker. The registry says
-  something may still run there, so this host does not take the session for ended: if it owes
-  cleanup, `kr privacy off` stays refused, also after a restart, until a closure is recorded for
-  the session.
+* **A session whose reservation was fenced after its claim is not reached again.** A second claim on
+  a reservation that a worker has already claimed fences it (when the first worker tried to report
+  ready it was refused, and it carried on with its session anyway and is never recorded). Note that
+  a launch does not normally claim a reservation twice. If, however, privacy mode was on when the
+  worker was launched or is turned on afterwards, the session owes its cleanup like any other: the
+  report lists it, and `kr privacy off` stays refused until its worker says its cleanup is complete.
+  A worker that was never recorded is told nothing after its launch specification, and nothing
+  records a closure for it, not even a restart of the daemon, so for that session the refusal is for
+  good. A worker that was recorded remains in the directory, and is told its generation, until the
+  daemon's next start; at that start it is left out of the directory and is in the same situation as
+  a worker that was never recorded.
 
-* **A session created while privacy mode is on learns the generation from the tick.** Its worker
-  is told on a tick after it starts rather than before its shell runs, and its obligation is
-  written when the tick first sees it running. A tick tells the workers that are due one after
-  another, each exchange with a timeout of its own, and a worker that does not answer is told again
-  on a schedule that doubles from one second to a minute. Output the session prints before its
-  worker has applied the generation may therefore be retained for as long as that takes, and is
-  removed when the worker applies it. Until the tick first sees it running, the session has no
-  obligation on record, so turning privacy mode off in that gap does not wait for it: its worker is
-  then never told the generation it started under, and what it printed while privacy mode was on
-  stays.
+* **A worker that claims its reservation and then fails keeps its obligation.** A worker that
+  reports it could not start after it claimed its reservation, or that ended before it said its
+  cleanup was complete, is taken for ended. Its obligation is preserved, and the report names the
+  archive as what holds whatever it kept. Differently, a launch that fails before any claim is
+  forgotten, since it ran no shell.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps. No description process runs on this host, so there is no
@@ -3932,9 +3947,10 @@ Privacy mode reports complete only once the daemon has recorded the new generati
 on the current attention connection says when it names that generation. Until then the worker's
 attention subsystem reports one piece of cleanup outstanding, and with no daemon it stays that way.
 One transition is raised at a time: a second waits until the first is settled, and one its caller
-abandons is settled when it is dropped. The caller that enables privacy mode is the one that
-raises the transition first and settles it after; nothing in this build turns privacy mode on (see
-*What privacy mode does not reach yet*), so the barrier and the leases are here for that caller.
+abandons is settled when it is dropped. Workers raise a transition when the daemon tells them that a
+new generation has turned on privacy mode, and settle it afterwards. If the worker is started while
+privacy mode is already active, no transition will be raised, since no attention connection or text
+lease exists before its shell is started.
 
 ## Notification delivery
 
