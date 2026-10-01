@@ -880,8 +880,8 @@ exports a session that was created when privacy mode was on but has completed it
 
 It reads the privacy mode, then it reads the sessions, and it reads the privacy mode again. If the
 privacy mode is on at either read, or if it detects a change in the generation number of the privacy
-mode between the two reads, it does not export any sessions, it emits a message saying so, and tells
-you to run this command again after a change to the privacy mode. If it encounters an error while
+mode between the two reads, it does not export any sessions and says why; when privacy mode changed
+between the reads, the message tells you to run this command again. If it encounters an error while
 reading the privacy mode or while reading the sessions it fails without writing anything to disk. A
 bundle with no sessions included is a valid bundle, so the command exits as the diagnostics alone
 would have:
@@ -898,42 +898,46 @@ them.
 
 The content preview is written to the error stream, so `--json` keeps standard output for its
 document. The content preview includes the text of the file it will write, with a digest of that
-text and of what was left out, and a reminder of the filter's limit. It removes credentials first,
-according to the rules listed below, which it names `session-content-1` in the file and in the
-manifest.
+text and of how many sessions were left out for each reason (the digest does not name the sessions
+left out), and a reminder of the filter's limit. It removes credentials first, according to the
+rules listed below, which it names `session-content-1` in the file and in the manifest.
 
 - It replaces the value of an assignment with a name that says credential, such as `TOKEN=...`,
   `--password=...` or `?token=...`, with `[redacted]`.
 - It replaces the value that follows an option with a name that says credential, when you did not
   use an equals sign to separate the option and its value, such as `--password x`, with
-  `[redacted]`.
+  `[redacted]`, unless that value is itself an option that starts with `--`.
 - It replaces the user information of a URL, such as `https://user:secret@host/`, with
   `[redacted]@`.
-- It replaces the value of your home directory where a path starts with `[home]`.
+- It replaces the value of your home directory (`HOME`, or `USERPROFILE` on Windows) where a path
+  starts with `[home]`, unless that value is empty, a root or not an absolute path.
 
-A name says credential when it contains password, passwd, passphrase, secret, token, credential,
-apikey, privatekey or bearer, or when it contains pass, auth, authorization, key or cookie as one of
-its parts. It considers two words to be separate when it finds any character that is not a letter or
-a digit between them, between a lower-case letter or a digit and a capital, or when capitals are
-followed by lower-case letters, before the last capital. It does not redact `PWD` for instance, but
-it does redact `tokenizer`. It reads the value of a credential as a shell would read a word. If you
-quote the word, or if the word contains both quoted and unquoted parts, such as `abc"d e"`, it
-considers the word to be the value of the credential. If the assignment is in a quoted argument,
-such as `"PASSWORD=two words"` or in the script of a `sh -c` command, it considers all the content
-until the closing quote of the argument to be the value of the credential. If the quote does not
-close, it does not include the whole field in the export, and it reports its length. If the field
-contains a credential with a value and the field ends with an open quote, such as an apostrophe in a
-path, it does not include the field and it reports its length.
+A name is made of ASCII letters, digits, `_`, `.` and `-`. It says credential when its letters,
+without the punctuation and in either case, contain password, passwd, passphrase, secret, token,
+credential, apikey, privatekey or bearer (so `TOK_EN` counts), or when it contains pass, auth,
+authorization, key or cookie as one of its parts. It considers two words to be separate when it
+finds any character that is not a letter or a digit between them, between a lower-case letter or a
+digit and a capital, or when capitals are followed by lower-case letters, before the last capital.
+It does not redact `PWD` for instance, but it does redact `tokenizer`. It reads the value of a
+credential as a shell would read a word. If you quote the word, or if the word contains both quoted
+and unquoted parts, such as `abc"d e"`, it considers the word to be the value of the credential. If
+the assignment is in a quoted argument, such as `"PASSWORD=two words"` or in the script of a `sh -c`
+command, it considers all the content until the closing quote of the argument to be the value of the
+credential. If the quote does not close, it does not include the whole field in the export, and it
+reports its length. If the field contains a credential with a value and the field ends with an open
+quote, such as an apostrophe in a path, it does not include the field and it reports its length.
 
 A filter is not a guarantee that no secret remains, and this one cannot tell a secret from other
-text by its value. It does not filter positional secrets, plain path components, values to `-p` and
+text by its value. It has no rule for positional secrets, plain path components, values to `-p` and
 `-u user:secret`, values of an `Authorization` header, connection string components, passwords that
 include non-escaped `/`, `?` or `#` in URLs, options that start with only one `-` such as
 `-password`, a quoted option name, `--user u:secret`, or user names included in paths (except your
-home directory). Please look over the content in the preview and make sure there is nothing you
-don't want to share before continuing. Note that invisible characters that can be used to alter the
-way text is displayed in a terminal, like text direction overrides and zero-width marks, will be
-written as escapes, so the text on your screen is the text in the file.
+home directory); a secret in one of these forms stays unless another rule happens to match it, as
+one named `Password=...` in a connection string would be. Please look over the content in the
+preview and make sure there is nothing you don't want to share before continuing. Note that
+invisible characters that can be used to alter the way text is displayed in a terminal, like text
+direction overrides and zero-width marks, will be written as escapes, so the text on your screen is
+the text in the file.
 
 #### Writing it
 
@@ -942,10 +946,10 @@ you want the content to be written to the bundle. If you instead type one of the
 above, the content will be printed again but with that session excluded. Entering anything else or
 ending the input will make the command exit with status 1 without writing the file. (An identifier
 that is not in the content is asked about again.) If you type yes , the host will be read again and
-the content will be written if its digest is the same as shown above. The content will not be
-written if the content, or what has been left out of it, has changed since it was first read, for
-example because privacy mode went on. This reduces the window between the last time the content was
-read and the point it will be written, but it does not remove it entirely.
+the content will be written if its digest is the same as that of the preview shown last. The content
+will not be written if the content, or how many sessions were left out for each reason, has changed
+since that preview, for example because privacy mode went on. This reduces the window between the
+last time the content was read and the point it will be written, but it does not remove it entirely.
 
 If you are not running this command from a terminal, you will need to run it twice. The first time,
 add the `--preview` option; it will print the content as above, but it will not write anything. The
@@ -967,10 +971,11 @@ excluded is part of the digest. In non-terminal environments, running this comma
 
 If `--json` is provided, the document printed for a previewed or approved content export will
 include `content_digest`, `content_left_out` and `content_written` fields. The `bundle` field will
-only be present if the bundle has been written. For failures, including when the export has been
-refused or declined, the content could not be read, the content could not be printed in a preview or
-the bundle could not be written, the document printed will not include either the `bundle` field or
-those fields.
+only be present if the bundle has been written. When the export fails, because it was refused or
+declined, the content could not be read, the content could not be printed in a preview or the bundle
+could not be written, the document printed is a failure document and includes neither the `bundle`
+field nor those fields. A bundle that was written while a diagnostic did not pass is described in
+the usual document, with `ok` false.
 
 #### What it cannot do
 
