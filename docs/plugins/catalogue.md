@@ -477,15 +477,30 @@ A bridge places only what this host names for its application. For Claude Code t
 and the one key that enables them, `enabledPlugins.<name>@skills-dir` in `settings.json`, set to
 `true`, for the same name. For Gemini CLI it is three files in `extensions/<name>/` and no key. A
 recipe installs every one of the files, once. A destination or a key that is not on that list is
-refused, and so is a name in another case. The directory is one the host makes: one that is already
-there with anything in it besides this registration, or another folder beside it whose manifest has
-the same name, is refused, because the application would enable it with the registration. A bridge
-therefore never installs a settings document of its own, enables only the plugin its files make, and
-no value it adds can hold a command.
+refused, and so is a name in another case.
+
+The host makes the directory, or uses one that is already there when it holds nothing but empty
+directories, or when its own record shows that it made that very directory. It tells the two apart
+by the directory's identity, never by its path. A directory with anything else in it is refused,
+because the application enables everything in a plugin's directory along with the plugin.
+
+A folder beside it whose manifest has the same name is refused for another reason. The application
+keeps the first plugin of each name, so the key that enables this registration could reach that one
+instead. The host reads each manifest the way the application does, past a leading byte order mark.
+When a manifest is there and the host cannot read it whole or parse it, the host refuses the install
+and names the folder. The directory itself under another name, such as a link to it, is not another
+folder. For Claude Code a hidden folder is not either, because Claude Code does not read it as a
+plugin.
+
+These checks run before anything is written and are not repeated while the files are placed, so
+content that appears later is the person's own. A bridge therefore never installs a settings
+document of its own, and no value it adds can hold a command.
 
 What the publisher chooses is which of the forwarder's events and which surface the registration
-starts it for, and what the package does with what the forwarder carries. The owner's confirmation
-of the publisher's statement is the only control on that.
+starts it for, and what the package does with what the forwarder carries. The text the application
+shows is the publisher's too: the manifest's description and display name, and the names of the
+server and its channels. The owner's confirmation of the publisher's statement is the only control
+on any of it.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
