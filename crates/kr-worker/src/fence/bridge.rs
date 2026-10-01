@@ -106,19 +106,21 @@ impl BridgeServer {
             ) else {
                 continue;
             };
+            // What the shell cannot do is kept for the create that is waiting on it, which then says
+            // why. It is kept before the answer is written: a shell that has already closed its end
+            // is one whose answer cannot be written, and the create still has to be told.
+            if let HandshakeOutcome::Refused(refused) = &outcome {
+                let _ = self.runtime.drive_fence(|driver| {
+                    driver.handshake_refused(refused);
+                    crate::fence::Effects::default()
+                });
+            }
             if writer.send_handshake(&outcome).await.is_err() {
                 continue;
             }
+            // A refused bridge is told why and the connection ends. It is not a loss: nothing was
+            // registered, so there is nothing for the session to lose.
             let HandshakeOutcome::Accepted(accepted) = &outcome else {
-                // A refused bridge is told why and the connection ends. It is not a loss: nothing
-                // was registered, so there is nothing for the session to lose. What the shell
-                // cannot do is kept for the create that is waiting on it, which then says why.
-                if let HandshakeOutcome::Refused(refused) = &outcome {
-                    let _ = self.runtime.drive_fence(|driver| {
-                        driver.handshake_refused(refused);
-                        crate::fence::Effects::default()
-                    });
-                }
                 continue;
             };
             let Some(observed) = observe(&peer).process else {
