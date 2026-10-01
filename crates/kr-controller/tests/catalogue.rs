@@ -3367,6 +3367,14 @@ mod native_bridges {
             .await
     }
 
+    /// Installs release 0.3.0 with the owner's confirmation and enables it, which is when its
+    /// recipe is wanted.
+    async fn installed_and_enabled(host: &Host, digest: &str) -> wire::PluginInstallResult {
+        let installed = ok(install(host, digest, true).await);
+        let _: wire::PluginEnableResult = ok(plugin_change(host, Method::PluginEnable).await);
+        installed
+    }
+
     /// Serves one plugin mutation that needs no confirmation.
     async fn plugin_change(host: &Host, method: Method) -> ControlFrame {
         let params = match method {
@@ -3456,13 +3464,14 @@ mod native_bridges {
         expected
     }
 
-    /// KR-REQ-11.42: an installation the owner confirmed applies its release's recipe once the
-    /// installation has committed; a refused confirmation installs nothing and writes nothing; a
-    /// disable and an enable leave the registration; a removal restores Claude Code's directory.
-    /// On Windows the installation commits and its recipe is refused and recorded, and nothing is
-    /// written in Claude Code's directory at any step.
+    /// KR-REQ-11.42: an installation the owner confirmed applies its release's recipe once it is
+    /// enabled and committed, and not while it is only installed; a refused confirmation installs
+    /// nothing and writes nothing; a disable takes the registration out and an enable puts it back;
+    /// a removal restores Claude Code's directory. On Windows the recipe is refused and recorded
+    /// when it is wanted, and nothing is written in Claude Code's directory at any step.
     #[tokio::test]
-    async fn kr_req_11_42_a_confirmed_installation_applies_the_recipe_and_its_removal_undoes_it() {
+    async fn kr_req_11_42_a_confirmed_installation_applies_the_recipe_once_enabled_and_its_removal_undoes_it()
+     {
         let site = Site::new();
         let host = host(&site);
         let digest = synchronised(&host).await;
@@ -3483,8 +3492,26 @@ mod native_bridges {
                 .is_empty()
         );
 
+        // Installed and not enabled: the owner has confirmed the grant and has not turned the
+        // package on, so nothing runs in the application's name.
         let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
         assert_eq!(installed.plugin.package_digest, digest);
+        assert_eq!(
+            site.tree(),
+            before,
+            "an installation that is not enabled places nothing"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        assert!(
+            host.module
+                .native_bridges()
+                .reports()
+                .expect("reads")
+                .is_empty()
+        );
+
+        // Control: enabling it applies the recipe.
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginEnable).await);
         let placed = if cfg!(windows) {
             before.clone()
         } else {
@@ -3509,15 +3536,15 @@ mod native_bridges {
             assert_eq!(facts.forwarder, site.root.join("bin/kr-hook"));
         }
 
-        for method in [Method::PluginDisable, Method::PluginEnable] {
-            let _: wire::PluginEnableResult = ok(plugin_change(&host, method).await);
-            assert_eq!(
-                site.tree(),
-                placed,
-                "{}: the registration stays with the installation",
-                method.as_str()
-            );
-        }
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginDisable).await);
+        assert_eq!(
+            site.tree(),
+            before,
+            "a disabled package's registration is taken out"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginEnable).await);
+        assert_eq!(site.tree(), placed, "enabling it again puts it back");
 
         let _: wire::PluginRemoveResult = ok(plugin_change(&host, Method::PluginRemove).await);
         assert_eq!(
@@ -3544,7 +3571,7 @@ mod native_bridges {
         let host = host(&site);
         let digest = synchronised(&host).await;
         let before = site.tree();
-        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
         if cfg!(windows) {
             assert_eq!(site.tree(), before);
             refused_on_windows(&host, &digest);
@@ -3602,7 +3629,7 @@ mod native_bridges {
         let site = Site::new();
         let mut host = host(&site);
         let digest = synchronised(&host).await;
-        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
         let after = site.tree();
         let before_restart = bridge_facts(&host, &digest);
         if cfg!(windows) {
@@ -3620,13 +3647,13 @@ mod native_bridges {
         assert_eq!(site.tree(), after, "nothing was written again");
     }
 
-    /// Installs Claude Code's package with its bridge stopped part way, enables it, and returns
+    /// Installs Claude Code's package and enables it with its bridge stopped part way, and returns
     /// the package hash: the bridge is not applied.
     #[cfg(unix)]
     async fn stopped_part_way(host: &Host) -> String {
         let digest = synchronised(host).await;
-        host.module.native_bridges().stop_before(20);
         let _: wire::PluginInstallResult = ok(install(host, &digest, true).await);
+        host.module.native_bridges().stop_before(20);
         let _: wire::PluginEnableResult = ok(plugin_change(host, Method::PluginEnable).await);
         assert!(bridge_facts(host, &digest).is_none(), "stopped part way");
         host.module.native_bridges().stop_before(0);
@@ -3777,6 +3804,7 @@ mod native_bridges {
         let site = Site::new();
         let host = host(&site);
         let digest = synchronised(&host).await;
+        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
         let (entered, entering) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let entered = std::sync::Mutex::new(entered);
@@ -3810,9 +3838,9 @@ mod native_bridges {
             drop(release);
             (snapshot.map(|_| ()), revision, waited)
         };
-        let (installed, (snapshot, revision, waited)) =
-            tokio::join!(install(&host, &digest, true), asking);
-        let _: wire::PluginInstallResult = ok(installed);
+        let (enabled, (snapshot, revision, waited)) =
+            tokio::join!(plugin_change(&host, Method::PluginEnable), asking);
+        let _: wire::PluginEnableResult = ok(enabled);
         assert_eq!(
             snapshot.map_err(|error| error.code),
             Err(ErrorCode::ResourceUnavailable)
@@ -3835,9 +3863,9 @@ mod native_bridges {
         let mut host = host(&site);
         let digest = synchronised(&host).await;
         let before = site.tree();
-        host.module.native_bridges().stop_before(20);
-
         let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        host.module.native_bridges().stop_before(20);
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginEnable).await);
 
         assert_eq!(
             installed.plugin.package_digest, digest,
@@ -3878,7 +3906,7 @@ mod native_bridges {
         let digest = synchronised(&host).await;
         let before = site.tree();
 
-        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let installed: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
 
         assert_eq!(installed.plugin.package_digest, digest);
         assert_eq!(site.tree(), before, "nothing was placed");
@@ -4012,7 +4040,7 @@ mod native_bridges {
         let digest = synchronised(&host).await;
         let before = site.tree();
 
-        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
         assert_eq!(site.tree(), before, "no record: nothing was placed");
 
         signed_again(
@@ -4038,6 +4066,119 @@ mod native_bridges {
             applied(&before, &generation()),
             "the synchronised record applies the recipe"
         );
+        assert!(bridge_facts(&host, &digest).is_some());
+    }
+    /// Marks release 0.3.0's entry revoked, as a later generation publishes it.
+    #[cfg(unix)]
+    fn revoked(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+        entry.revocation = Nullable(Some(kr_plugin_sdk::catalogue::RevocationRecord {
+            reason: kr_plugin_sdk::catalogue::RevocationReason::Vulnerable,
+            revoked_at: kr_plugin_sdk::scalars::TimestampMs::new(1_760_000_100_000),
+            statement: kr_plugin_sdk::text::Summary::new("Replaced by 0.3.1")
+                .expect("a valid statement"),
+        }));
+    }
+
+    /// KR-REQ-11.42, KR-REQ-25.22: a release its repository revokes keeps no registration in the
+    /// application's directory. A synchronisation that publishes the revocation takes the recipe
+    /// out and the installation stays; the control is a generation that revokes nothing, which
+    /// leaves the registration where it is.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_revoked_release_keeps_no_registration() {
+        let site = Site::new();
+        let host = host(&site);
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let keys = signed_again(&host, home.path(), None, 1, None).await;
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &generation());
+        assert_eq!(site.tree(), placed, "applied");
+
+        signed_again(&host, home.path(), Some(keys.clone()), 2, None).await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            placed,
+            "a generation that revokes nothing leaves the registration"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+
+        signed_again(&host, home.path(), Some(keys), 3, Some(revoked)).await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            before,
+            "the revoked release's registration is out"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .is_some(),
+            "the installation stays"
+        );
+    }
+
+    /// KR-REQ-11.42, KR-REQ-18.06: a package the organisation's adapter allowlist does not name
+    /// keeps no registration, and lifting the list, or naming the package, puts it back. The
+    /// controls are a list that names the package and no list at all.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_package_the_allowlist_does_not_name_keeps_no_registration() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &host.working);
+        assert_eq!(site.tree(), placed, "applied");
+
+        let naming = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+        let put = |set| async { host.module.put_allowed_adapters(set).await.expect("put") };
+
+        assert!(put(naming("kalareach/claude-code")).await);
+        assert_eq!(site.tree(), placed, "a list that names it leaves it");
+        assert!(bridge_facts(&host, &digest).is_some());
+
+        assert!(put(naming("kalareach/codex")).await);
+        assert_eq!(
+            site.tree(),
+            before,
+            "a list that does not name it takes it out"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        {
+            let catalogue = host.module.catalogue().lock().await;
+            assert!(
+                catalogue
+                    .installation(host.environment_id, &claude_code())
+                    .expect("readable")
+                    .is_some(),
+                "the installation stays"
+            );
+        }
+
+        assert!(
+            !put(naming("kalareach/codex")).await,
+            "the same list moves nothing"
+        );
+        assert_eq!(site.tree(), before);
+        assert!(put(None).await);
+        assert_eq!(site.tree(), placed, "with no list it is back");
         assert!(bridge_facts(&host, &digest).is_some());
     }
 }

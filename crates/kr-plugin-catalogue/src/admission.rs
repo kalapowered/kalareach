@@ -368,6 +368,31 @@ impl AdmissionPlan {
     }
 }
 
+/// Says why an installation is left out by its standing alone, before anything about its package
+/// is read: it is disabled, its release is revoked, or the organisation's allowlist does not name
+/// it. `None` where it stands.
+///
+/// This is the one place that decides it, for the admissions and for everything else that acts on
+/// an installation in an application's name (a native bridge), so no second reading of "may this
+/// run" can disagree. A revocation is what a person can act on, so it is what an installation the
+/// allowlist also leaves out is reported as.
+pub(crate) fn left_out_by_standing(
+    installation: &Installation,
+    revocation: Option<RevocationRecord>,
+    allowed: Option<&BTreeSet<PluginId>>,
+) -> Option<NotAdmittedReason> {
+    if !installation.enabled {
+        return Some(NotAdmittedReason::Disabled);
+    }
+    if let Some(record) = revocation {
+        return Some(NotAdmittedReason::Revoked(record));
+    }
+    if allowed.is_some_and(|allowed| !allowed.contains(&installation.plugin_id)) {
+        return Some(NotAdmittedReason::NotAllowed);
+    }
+    None
+}
+
 /// Reads what the records and the current indexes say about one environment's admissions.
 ///
 /// # Errors
@@ -437,18 +462,8 @@ pub(crate) fn plan(
             package_digest: installation.package_digest,
             reason,
         };
-        if !installation.enabled {
-            not_admitted.push(refuse(NotAdmittedReason::Disabled));
-            continue;
-        }
-        // A revocation is what a person can act on, so it is what an installation the allowlist
-        // also leaves out is reported as.
-        if let Some(record) = revocation {
-            not_admitted.push(refuse(NotAdmittedReason::Revoked(record)));
-            continue;
-        }
-        if !permitted(&installation.plugin_id) {
-            not_admitted.push(refuse(NotAdmittedReason::NotAllowed));
+        if let Some(reason) = left_out_by_standing(installation, revocation, allowed) {
+            not_admitted.push(refuse(reason));
             continue;
         }
         let builds = match (entry.as_ref(), host.os, host.architecture) {
