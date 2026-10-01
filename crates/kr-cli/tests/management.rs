@@ -975,19 +975,22 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
         revoked_grants: [GrantId::new(Uuid::from_bytes([0x61; 16]))]
             .into_iter()
             .collect(),
-        barrier: RevocationBarrier {
-            authority_revision: AuthorityRevision::new(2),
-            workers: vec![WorkerBarrier {
+        revoked_grants_total: kr_protocol::scalars::U64::new(1),
+        barrier: RevocationBarrier::new(
+            AuthorityRevision::new(2),
+            vec![WorkerBarrier {
                 session_id: session,
                 state: BarrierState::Pending,
                 acknowledged_revision: Nullable::null(),
                 rejected_actions: Vec::new(),
+                rejected_actions_total: kr_protocol::scalars::U64::new(0),
                 possibly_executed: Vec::new(),
+                possibly_executed_total: kr_protocol::scalars::U64::new(0),
                 omitted_actions: kr_protocol::scalars::U64::new(0),
                 names_pending: kr_protocol::scalars::U64::new(0),
                 detail: "the worker has not answered yet".to_owned(),
             }],
-        },
+        ),
     };
     let listed = ParamsValue::from_typed(&listed).expect("a listing");
     let revoked = ParamsValue::from_typed(&revoked).expect("a revocation");

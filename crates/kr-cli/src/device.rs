@@ -138,12 +138,16 @@ fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
     if waiting.is_empty() {
         return None;
     }
+    // A cut list names the workers still waiting before any that is not, so what it shows is a
+    // floor: how many are waiting in all is not said.
+    let cut = revoked.barrier.workers_total.get() > revoked.barrier.workers.len() as u64;
     Some(CliError::Unfinished {
         code: ErrorCode::ResourceUnavailable,
         message: shown!(
-            "the revocation of device {} is recorded and still pending: {} session \
+            "the revocation of device {} is recorded and still pending: {}{} session \
              worker{} {} not fenced it yet, and asking again reports how far it has got",
             device,
+            if cut { "at least " } else { "" },
             waiting.len(),
             if waiting.len() == 1 { "" } else { "s" },
             if waiting.len() == 1 { "has" } else { "have" }
@@ -197,12 +201,17 @@ fn revocation_document(revoked: &RevocationResult) -> Document {
         .with("authority_revision", closed(&revoked.authority_revision))
         .with("revoked_grants", closed(&revoked.revoked_grants))
         .with(
+            "revoked_grants_total",
+            closed(&revoked.revoked_grants_total),
+        )
+        .with(
             "barrier",
             Document::new()
                 .with(
                     "authority_revision",
                     closed(&revoked.barrier.authority_revision),
                 )
+                .with("workers_total", closed(&revoked.barrier.workers_total))
                 .with(
                     "workers",
                     revoked
@@ -261,6 +270,14 @@ fn revocation_document(revoked: &RevocationResult) -> Document {
                                         })
                                         .collect::<Vec<_>>(),
                                 )
+                                .with(
+                                    "rejected_actions_total",
+                                    closed(&worker.rejected_actions_total),
+                                )
+                                .with(
+                                    "possibly_executed_total",
+                                    closed(&worker.possibly_executed_total),
+                                )
                                 .with("omitted_actions", closed(&worker.omitted_actions))
                                 .with("names_pending", closed(&worker.names_pending))
                                 .with(
@@ -286,7 +303,7 @@ fn revocation_document(revoked: &RevocationResult) -> Document {
 /// no name for, or anything else the host says about it. Every action a worker could not show did
 /// not run before the revocation reached it is named too.
 fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
-    let grants = revoked.revoked_grants.len();
+    let grants = usize::try_from(revoked.revoked_grants_total.get()).unwrap_or(usize::MAX);
     let barrier = &revoked.barrier;
     let mut lines = vec![if barrier.holds() {
         stdout_line!(
@@ -353,6 +370,33 @@ fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
                 crate::shown::wire_word(action.state)
             ));
         }
+        // An answer carries as many of the names as one frame can, and says how many there were.
+        let left_out = worker
+            .possibly_executed_total
+            .get()
+            .saturating_sub(worker.possibly_executed.len() as u64);
+        if left_out > 0 {
+            lines.push(stdout_line!(
+                "  session {}: {} more action{} may have run before the revocation, and {} not \
+                 named here",
+                worker.session_id,
+                left_out,
+                if left_out == 1 { "" } else { "s" },
+                if left_out == 1 { "is" } else { "are" }
+            ));
+        }
+    }
+    let workers_left_out = barrier
+        .workers_total
+        .get()
+        .saturating_sub(barrier.workers.len() as u64);
+    if workers_left_out > 0 {
+        lines.push(stdout_line!(
+            "{} more session worker{} {} not listed here.",
+            workers_left_out,
+            if workers_left_out == 1 { "" } else { "s" },
+            if workers_left_out == 1 { "is" } else { "are" }
+        ));
     }
     lines
 }
@@ -462,7 +506,9 @@ mod tests {
             state,
             acknowledged_revision: Nullable::null(),
             rejected_actions: Vec::new(),
+            rejected_actions_total: U64::new(0),
             possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
             omitted_actions: U64::new(0),
             names_pending: U64::new(0),
             detail: detail.to_owned(),
@@ -473,10 +519,8 @@ mod tests {
         RevocationResult {
             authority_revision: AuthorityRevision::new(4),
             revoked_grants: CanonicalSet::new(),
-            barrier: RevocationBarrier {
-                authority_revision: AuthorityRevision::new(4),
-                workers,
-            },
+            revoked_grants_total: U64::new(0),
+            barrier: RevocationBarrier::new(AuthorityRevision::new(4), workers),
         }
     }
 
@@ -583,6 +627,43 @@ mod tests {
             text.contains("Every affected session's worker has fenced it."),
             "{text}"
         );
+    }
+
+    /// KR-REQ-09.12: an answer the host cut says so. The grants are counted from the total, a
+    /// cut list of workers that still has a pending one is a floor and is called one, and names left
+    /// out are counted.
+    #[test]
+    fn an_answer_the_host_cut_says_how_much_it_left_out() {
+        let device = DeviceId::new(Uuid::from_bytes([1; 16]));
+        let mut cut = revoked(vec![worker(2, BarrierState::Pending, "")]);
+        cut.revoked_grants_total = U64::new(9_000);
+        cut.barrier.workers_total = U64::new(5_000);
+        cut.barrier.workers[0].possibly_executed_total = U64::new(7);
+        let text = written(revocation(device, &cut));
+        assert!(text.contains("9000 grants revoked"), "{text}");
+        assert!(
+            text.contains("4999 more session workers are not listed here."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "7 more actions may have run before the revocation, and are not named here"
+            ),
+            "{text}"
+        );
+        let error = pending(device, &cut).expect("a pending barrier");
+        assert!(
+            error
+                .to_string()
+                .contains("at least 1 session worker has not fenced it"),
+            "{error}"
+        );
+
+        let whole = revoked(vec![worker(2, BarrierState::Pending, "")]);
+        let text = written(revocation(device, &whole));
+        assert!(!text.contains("not listed here"), "{text}");
+        let error = pending(device, &whole).expect("a pending barrier");
+        assert!(!error.to_string().contains("at least"), "{error}");
     }
 
     #[test]
