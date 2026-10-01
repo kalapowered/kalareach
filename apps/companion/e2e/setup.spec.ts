@@ -67,7 +67,7 @@ test.describe('the first-start assistant', () => {
   test('checks the application identity before it guides a single permission', async ({ page }) => {
     await openSetup(page)
     const identity = page.getByTestId('setup-identity')
-    await expect(identity).toContainText('to.kala.reach')
+    await expect(identity.getByRole('heading', { name: 'to.kala.reach', exact: true })).toBeVisible()
     await expect(identity).toContainText('Stable identity')
     await expect(page.getByTestId('setup-ceiling-identity')).toContainText(
       'perform the operation the permission guards'

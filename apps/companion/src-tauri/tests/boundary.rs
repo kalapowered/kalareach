@@ -467,9 +467,10 @@ fn the_mobile_bundle_names_a_platform_floor_and_no_release_identity() {
         configuration["bundle"]["android"]["minSdkVersion"],
         serde_json::json!(29)
     );
-    // A signing identity, a development team and a provisioning profile belong to whoever holds
-    // the accounts, not to this repository. Inventing one here would produce a build that looks
-    // signed and is not.
+    // A signing identity, a development team and a provisioning profile are not stated in the
+    // Tauri configuration: inventing one here would produce a build that looks signed and is not.
+    // The one thing the repository does name is the Apple team, once, in the iOS project, which the
+    // identifier test below holds; the certificate and the profile belong to whoever signs.
     for invented in [
         "developmentTeam",
         "provisioningProfile",
@@ -695,6 +696,23 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
             "the generated project names {identifier}"
         );
     }
+    // The team reaches the project Xcode reads: every value in it is the one team, and none is
+    // narrowed to a single SDK, which would leave a build for another SDK under a different team.
+    assert!(
+        !pbxproj.contains("DEVELOPMENT_TEAM["),
+        "the generated project narrows its team to one SDK"
+    );
+    let teams: Vec<&str> = pbxproj
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("DEVELOPMENT_TEAM = "))
+        .collect();
+    assert!(!teams.is_empty(), "the generated project names no team");
+    for team in teams {
+        assert_eq!(
+            team, "L775WGST9V;",
+            "the generated project names another team"
+        );
+    }
     for generated in [
         "gen/apple/companion-tauri_iOS/Info.plist",
         "gen/apple/companion-tauri_iOS/companion-tauri_iOS.entitlements",
@@ -728,43 +746,65 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
     );
 }
 
-/// Every file of the application, but not what a build leaves beside them.
-fn application_files(directory: &Path, found: &mut Vec<PathBuf>) {
-    const LEFT_BY_BUILDS: [&str; 10] = [
-        "node_modules",
-        "target",
-        "dist",
-        "build",
-        ".gradle",
-        "Externals",
-        "assets",
-        "playwright-report",
-        "test-results",
-        ".build",
-    ];
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+/// Every file of the application that the repository tracks, as a path relative to it.
+///
+/// What a build leaves beside them (generated projects, caches, symbolic links to libraries) is
+/// not what ships, and reading it would make this test depend on what happened to be built here.
+fn tracked_files(application: &Path) -> Vec<String> {
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(application)
+        .output()
+        .expect("git can list the application's tracked files");
+    assert!(
+        listed.status.success(),
+        "git could not list the application's tracked files: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8(name.to_vec()).expect("a tracked file has a UTF-8 name"))
+        .collect()
+}
+
+/// The dotted name a line holds at `at`, up to the first character a name cannot hold.
+fn dotted_name_at(line: &str, at: usize) -> &str {
+    let rest = &line[at..];
+    let end = rest
+        .find(|character: char| !(character.is_alphanumeric() || "_.$".contains(character)))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Whether a dotted name under the kept namespace names a class or a package: its segments after
+/// the namespace are package names in lower case and then either a class in capitals or nothing
+/// (a trailing dot makes it a package prefix). `to.kala.reach.companion.fileprovider` and
+/// `to.kala.reach.companion.share` are names a build would file state under, not classes.
+fn names_a_class_or_package(name: &str, namespace: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            if !LEFT_BY_BUILDS.contains(&name.to_string_lossy().as_ref()) {
-                application_files(&path, found);
-            }
-        } else {
-            found.push(path);
-        }
-    }
+    let mut segments: Vec<&str> = rest.split('.').collect();
+    let last = segments.pop().unwrap_or("");
+    let package = |segment: &str| segment.chars().next().is_some_and(char::is_lowercase);
+    !segments.is_empty()
+        && segments.iter().all(|segment| package(segment))
+        && (last.is_empty() || last.chars().next().is_some_and(char::is_uppercase))
 }
 
 /// The names an earlier identifier and an earlier Apple team gave the application are gone.
 ///
 /// The Kotlin and Java package `to.kala.reach.companion` stays: it is a code namespace, the
 /// manifest and the packaging check name classes by it, and renaming it would only move files. So
-/// it may appear where it names a package or a class, which is a `package` or `import` line, the
-/// manifest's components and the packaging check's class names, and nowhere else. A string under
-/// it anywhere else is a name that should have followed the application identifier.
+/// it may appear where it names a package or a class: a `package` or `import` line, and a class or
+/// package name in the manifest and in the packaging check's class names. A name under it anywhere
+/// else, a notification channel or an authority or a store, is a name that should have followed the
+/// application identifier.
 #[test]
 fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
     const KEPT_NAMESPACE: &str = "to.kala.reach.companion";
@@ -783,37 +823,42 @@ fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
         .parent()
         .expect("the crate sits inside the application's directory")
         .to_owned();
-    let mut files = Vec::new();
-    application_files(&application, &mut files);
+    let files = tracked_files(&application);
     assert!(
         files.len() > 100,
-        "the walk found the application's files: {}",
+        "the application's tracked files were listed: {}",
         files.len()
     );
     let mut stale = Vec::new();
-    for path in files {
-        let relative = path
-            .strip_prefix(&application)
-            .expect("a file of the application")
-            .to_string_lossy()
-            .replace('\\', "/");
+    for relative in files {
         if REFUSES_THEM.contains(&relative.as_str()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let path = application.join(&relative);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("{} could not be read: {error}", path.display()));
+        // A file that is not text (an image, a font) names no identifier a person wrote.
+        let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
         for (number, line) in text.lines().enumerate() {
             let place = format!("{relative}:{}: {}", number + 1, line.trim());
             if line.contains("to.kala.companion") || line.contains("JT6GW3W9W6") {
                 stale.push(place);
-            } else if line.contains(KEPT_NAMESPACE) {
-                let trimmed = line.trim_start();
-                let names_a_package = trimmed.starts_with(&format!("package {KEPT_NAMESPACE}"))
-                    || trimmed.starts_with(&format!("import {KEPT_NAMESPACE}"));
-                if !names_a_package && !NAMES_CLASSES.contains(&relative.as_str()) {
-                    stale.push(place);
-                }
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(&format!("package {KEPT_NAMESPACE}"))
+                || trimmed.starts_with(&format!("import {KEPT_NAMESPACE}"))
+            {
+                continue;
+            }
+            let all_name_classes = line.match_indices(KEPT_NAMESPACE).all(|(at, _)| {
+                NAMES_CLASSES.contains(&relative.as_str())
+                    && names_a_class_or_package(dotted_name_at(line, at), KEPT_NAMESPACE)
+            });
+            if line.contains(KEPT_NAMESPACE) && !all_name_classes {
+                stale.push(place);
             }
         }
     }
