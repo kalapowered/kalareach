@@ -270,12 +270,18 @@ enrolled presence signer and no terminal, refuses every confirmation: the termin
 over because the host has had an owner, a former owner device's proof no longer answers, the
 enrolled signer's channel is refused, and an answer an owner device gave before its revocation is
 spent on nothing afterwards (`a_headless_host_with_no_owner_device_refuses_every_confirmation` in
-`crates/kr-controller/tests/pairing_methods.rs`). The catalogue's two decisions carry their proof
-inline, and it has to be an owner device's own, on its own channel, for exactly that decision:
-`plugin.grant` refuses a stranger's key, the owner's key on the bootstrap's channel, a proof of
-another capability set and a proof a grant already spent
-(`a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else` in
-`crates/kr-controller/tests/network_catalogue.rs`).
+`crates/kr-controller/tests/pairing_methods.rs`). The catalogue's decisions need an owner device's
+own proof, on its own channel, for exactly that decision. For `plugin.grant` the proof is passed
+inline with the request, and the host refuses a stranger's key, the owner's key on the bootstrap's
+channel, a proof of another capability set and a proof a grant already spent (see
+`a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else` in
+`crates/kr-controller/tests/network_catalogue.rs`). For `catalogue.add` and `plugin.install` the
+proof can be passed inline with the request too, and an installation needs it only when it goes
+beyond what is already permitted or installs a native bridge. Terminals do not have the owner's key,
+so they do not send a proof with the request. Instead the host spends the one answer an owner device
+recorded for exactly that request, and only for a challenge the host described itself (see
+`a_recorded_owner_answer_lets_catalogue_add_enrol_a_repository_once` in
+`crates/kr-controller/tests/pairing_methods.rs`).
 
 ## The PAKE profile
 
