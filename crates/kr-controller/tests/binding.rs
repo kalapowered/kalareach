@@ -266,6 +266,12 @@ impl Hosted {
     /// Stops the daemon and starts another on the same tree, the way a restart of the host does:
     /// every durable record stays, nothing held in memory does, and the workers go on running.
     async fn restart(&mut self) {
+        self.restart_after(|_| ()).await;
+    }
+
+    /// [`Self::restart`], with `between` run once the daemon has stopped and before the next one
+    /// starts: the workers are still running, and nothing holds the environment's records.
+    async fn restart_after(&mut self, between: impl FnOnce(&kr_ipc::paths::EnvironmentPaths)) {
         for serving in self.serving.drain(..) {
             serving.abort();
             let _ = serving.await;
@@ -281,6 +287,7 @@ impl Hosted {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
+        between(&self.tree.environment());
         self.run().await;
     }
 
@@ -1477,25 +1484,38 @@ fn name_the_policy(hosted: &Hosted, policy: kr_protocol::admission::RevocationPo
 }
 
 /// KR-REQ-25.22: no snapshot a restarted daemon computes for a worker that outlived the last one
-/// carries the policy the catalogue recorded before the restart rather than the one this host's
-/// configuration decides. The cadence that sends the first round starts before the document is
-/// accepted, so the policy is put in force when the catalogue opens; the configuration suite holds
-/// that ordering by construction, and this case shows it with a real worker.
+/// carries the policy the catalogue recorded rather than the one this host's configuration
+/// decides. The document is already accepted and only the catalogue's record differs (a store
+/// restored from an older copy), so no acceptance at start puts the policy in force: it is put in
+/// force when the catalogue opens, before the cadence that sends the first round starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configuration_decides() {
     use kr_protocol::admission::RevocationPolicy;
     let mut hosted = Hosted::start().await;
     let _session = hosted.session().await;
+    name_the_policy(&hosted, RevocationPolicy::DisableAtOnce);
+    drop(hosted.controller().effective_configuration().await);
     assert!(hosted.counted_once_known().await.is_present());
     assert_eq!(
-        hosted.controller().catalogue().policies_carried(),
-        [RevocationPolicy::WarnOnly],
-        "control: the worker was handed warn only before the document named anything"
+        hosted.controller().catalogue().policies_carried().last(),
+        Some(&RevocationPolicy::DisableAtOnce),
+        "control: the worker was handed the policy the document names"
     );
 
-    // The document is edited while no daemon reads it: the restart is what meets it.
-    name_the_policy(&hosted, RevocationPolicy::DisableAtOnce);
-    hosted.restart().await;
+    hosted
+        .restart_after(|environment| {
+            let mut catalogue = Catalogue::open(
+                &environment.state_dir().join("catalogue"),
+                Arc::new(RepositoryTransport::local_only(
+                    "this test reaches no repository",
+                )),
+            )
+            .expect("the catalogue's records");
+            catalogue
+                .set_disable_policy(kr_plugin_catalogue::DisablePolicy::WarnOnly)
+                .expect("the older record");
+        })
+        .await;
     assert!(hosted.counted_once_known().await.is_present());
     let carried = hosted.controller().catalogue().policies_carried();
     assert!(!carried.is_empty(), "the worker was sent a round");
@@ -1503,7 +1523,7 @@ async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configura
         carried
             .iter()
             .all(|policy| *policy == RevocationPolicy::DisableAtOnce),
-        "no snapshot the restarted daemon computed carried the policy before it: {carried:?}"
+        "no snapshot the restarted daemon computed carried the recorded policy: {carried:?}"
     );
 }
 

@@ -127,6 +127,11 @@ impl Controller {
         let accepted_budgets = accepted_document
             .as_ref()
             .map(|document| crate::config::catalogue::budgets(&document.ceilings));
+        // And the disable policy it accepted, which a startup reading that decides nothing leaves
+        // in force over a catalogue record that is new or older than the document.
+        let accepted_policy = accepted_document
+            .as_ref()
+            .map(|document| crate::config::ceilings::disable_policy(&document.ceilings).value);
         let mut accepted_configuration = crate::config::AcceptedState {
             revision: durably_accepted.revision,
             document: accepted_document,
@@ -172,7 +177,9 @@ impl Controller {
             Self::proxy_of(&started)?.as_ref(),
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
             startup_budgets.or(accepted_budgets).unwrap_or_default(),
-            startup_policy,
+            startup_policy.or(accepted_policy),
+            // No organisation policy reaches this host yet, so every adapter is allowed.
+            None,
         )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening

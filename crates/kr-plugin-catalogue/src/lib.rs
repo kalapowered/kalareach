@@ -849,36 +849,54 @@ impl Catalogue {
         })
     }
 
-    /// Says why an installation does not stand, before anything about its package is read, or
-    /// `None` where it does: it is disabled, the current generation of its origin revoked its exact
-    /// package hash, or the organisation's allowlist does not name it.
-    ///
-    /// It is the decision the admissions make first, so whatever acts on an installation in an
-    /// application's name follows the same one.
+    /// Returns the current generation's entry for an installation's exact release, read once: the
+    /// revocation and the signed builds the release carries. `None` where its origin publishes
+    /// nothing about it.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the record or the index cannot be read.
+    pub fn release_entry(
+        &self,
+        installation: &Installation,
+    ) -> CatalogueResult<Option<IndexEntry>> {
+        self.read_kept(|records| {
+            admission::current_entry(
+                &self.root,
+                records,
+                &installation.enrolment,
+                &installation.plugin_id,
+                installation.package_digest,
+            )
+        })
+    }
+
+    /// Returns whether the organisation's allowlist, where there is one, names the package.
+    #[must_use]
+    pub fn allows(&self, plugin_id: &PluginId) -> bool {
+        self.allowed_adapters
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(plugin_id))
+    }
+
+    /// Says why an installation does not stand, before anything about its package is read, or
+    /// `None` where it does: it is disabled, the current generation of its origin revoked its exact
+    /// package hash (`entry`, from [`Self::release_entry`]; `None` says nothing is known to be
+    /// revoked), or the organisation's allowlist does not name it.
+    ///
+    /// It is the decision the admissions make first, so whatever acts on an installation in an
+    /// application's name follows the same one.
+    #[must_use]
     pub fn standing(
         &self,
         installation: &Installation,
-    ) -> CatalogueResult<Option<NotAdmittedReason>> {
-        let revocation = self
-            .read_kept(|records| {
-                admission::current_entry(
-                    &self.root,
-                    records,
-                    &installation.enrolment,
-                    &installation.plugin_id,
-                    installation.package_digest,
-                )
-            })?
-            .and_then(|entry| entry.revocation.0);
-        Ok(admission::left_out_by_standing(
+        entry: Option<&IndexEntry>,
+    ) -> Option<NotAdmittedReason> {
+        admission::left_out_by_standing(
             installation,
-            revocation,
+            entry.and_then(|entry| entry.revocation.0.clone()),
             self.allowed_adapters.as_ref(),
-        ))
+        )
     }
 
     /// Returns the builds the current generation of an installation's origin names for its exact
