@@ -54,6 +54,56 @@ impl Summary {
     }
 }
 
+/// The launcher's facts with what identifies the account taken out, so a record can be kept in a
+/// repository.
+///
+/// A record names programs and application bundles. It does not name a home directory, a user or a
+/// session. The programs the window descends from are written as their names alone, and the home
+/// directory, where one is written, becomes `~`. An application's own directory, such as
+/// `/Applications/iTerm.app`, stays: every installation of that application has it.
+#[must_use]
+pub fn keep_private(mut launcher: serde_json::Value, home: Option<&str>) -> serde_json::Value {
+    if let Some(ancestors) = launcher
+        .get_mut("ancestors")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for ancestor in ancestors {
+            if let Some(path) = ancestor.as_str() {
+                *ancestor = serde_json::Value::String(program_name(path).to_owned());
+            }
+        }
+    }
+    if let Some(home) = home.filter(|home| home.len() > 1) {
+        write_home_as_tilde(&mut launcher, home);
+    }
+    launcher
+}
+
+/// The last component of the path to a program, leaving a login shell's leading `-` where the
+/// program was started as one.
+fn program_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn write_home_as_tilde(value: &mut serde_json::Value, home: &str) {
+    match value {
+        serde_json::Value::String(text) if text.contains(home) => {
+            *text = text.replace(home, "~");
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                write_home_as_tilde(item, home);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values_mut() {
+                write_home_as_tilde(field, home);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Report {
     /// Builds the record for a run.
     #[must_use]

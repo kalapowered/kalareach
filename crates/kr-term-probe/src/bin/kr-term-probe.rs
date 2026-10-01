@@ -17,7 +17,7 @@ mod unix {
 
     use kr_term_probe::corpus;
     use kr_term_probe::replies;
-    use kr_term_probe::report::Report;
+    use kr_term_probe::report::{self, Report};
     use kr_term_probe::run::{self, Terminal};
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios};
 
@@ -129,6 +129,8 @@ mod unix {
             let measured = run::measure_all(&mut terminal, &corpus::steps(cols, rows), cols, rows)?;
             (identity, measured)
         };
+        let home = std::env::var("HOME").ok();
+        let launcher = report::keep_private(launcher, home.as_deref());
         let report = Report::new(launcher, identity, (cols, rows), measured);
         let mut text = serde_json::to_string_pretty(&report)?;
         text.push('\n');
