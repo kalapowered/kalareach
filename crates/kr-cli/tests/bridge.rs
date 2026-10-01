@@ -86,7 +86,20 @@ impl Helper {
 
     /// Starts `kr bridge --stdio` against the tree given, with these variables as well.
     fn start_with(tree: &kr_ipc::testing::TempHost, extra: &[(&str, &str)]) -> Self {
-        let mut child = Command::new(command_binary())
+        Self::start_without(tree, extra, &[])
+    }
+
+    /// Starts `kr bridge --stdio` as [`Self::start_with`] does, with these variables absent.
+    fn start_without(
+        tree: &kr_ipc::testing::TempHost,
+        extra: &[(&str, &str)],
+        absent: &[&str],
+    ) -> Self {
+        let mut command = Command::new(command_binary());
+        for name in absent {
+            command.env_remove(name);
+        }
+        let mut child = command
             .args(["bridge", "--stdio"])
             .envs(extra.iter().copied())
             // The tree is the destination environment. Nothing else about this process's
@@ -973,6 +986,61 @@ async fn the_acknowledgement_carries_the_destinations_own_account_base_and_build
     );
     drop(helper.finish());
     stub.abort();
+}
+
+/// KR-REQ-03.14, 03.15: a session created through a bridge starts in a home it also has, whatever
+/// the helper's own `HOME` was. A destination whose login gave the helper no `HOME`, or one that is
+/// not an absolute path, still offers a home directory, and the snapshot a shell is started with
+/// names that same directory as `HOME` rather than carrying nothing or the invalid value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_home_a_session_starts_in_is_the_home_it_is_given() {
+    // The login's own `HOME`: kept as it is.
+    let (home, variable) = base_for(&[("HOME", "/home/destination-user")], &[]).await;
+    assert_eq!(home, "/home/destination-user");
+    assert_eq!(variable.as_deref(), Some("/home/destination-user"));
+    // No `HOME`, a relative one and an empty one: the directory the base names, as an absolute
+    // path, and the snapshot's `HOME` is that same directory.
+    for (what, set, absent) in [
+        ("absent", &[][..], &["HOME"][..]),
+        ("relative", &[("HOME", "relative/home")][..], &[][..]),
+        ("empty", &[("HOME", "")][..], &[][..]),
+    ] {
+        let (home, variable) = base_for(set, absent).await;
+        assert!(
+            home.starts_with('/'),
+            "{what}: the home offered is an absolute path: {home:?}"
+        );
+        assert_eq!(
+            variable.as_deref(),
+            Some(home.as_str()),
+            "{what}: the snapshot's HOME is the directory the session starts in"
+        );
+    }
+}
+
+/// What a helper acknowledges as the destination's home and its snapshot's `HOME`, started with
+/// these variables set and these absent.
+async fn base_for(set: &[(&str, &str)], absent: &[&str]) -> (String, Option<String>) {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(ParamsValue::empty())).await;
+    let mut helper = Helper::start_without(&tree, set, absent);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    let BridgeFrame::HelloAck(acknowledgement) = helper.read() else {
+        panic!("expected an acknowledgement");
+    };
+    let variable = acknowledgement
+        .base
+        .variables
+        .iter()
+        .find(|variable| variable.name == "HOME")
+        .map(|variable| variable.value.clone());
+    drop(helper.finish());
+    stub.abort();
+    (acknowledgement.base.home.clone(), variable)
 }
 
 /// KR-REQ-03.13: a connection says hello once. A second hello carried over an open bridge could
