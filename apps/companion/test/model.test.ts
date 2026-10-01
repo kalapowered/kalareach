@@ -300,6 +300,34 @@ describe('drafts', () => {
     expect(rebind(draft, null, 'att-2').state).toBe('orphaned')
   })
 
+  it('offers a rebind to a detached draft only', () => {
+    const bound = edit(startDraft('d1', target, 0), 'text', 1)
+    const detached = connectionLost(bound)
+    const conflicted = rebind(detached, { ...target, agentBindingRevision: '9' }, 'att-2')
+    const orphaned = rebind(detached, null, 'att-2')
+    // A draft that is not detached has no association to restore, and a conflict or an orphan is
+    // for the person to settle: what the host reports now changes none of the three.
+    expect(rebind(bound, { ...target, agentBindingRevision: '9' }, 'att-2')).toBe(bound)
+    expect(rebind(conflicted, target, 'att-2')).toBe(conflicted)
+    expect(rebind(orphaned, target, 'att-2')).toBe(orphaned)
+  })
+
+  it('binds a draft that holds nothing, or never learnt its conversation, to the one now current', () => {
+    const moved = { ...target, agentBindingRevision: '9' }
+    const empty = connectionLost(startDraft('d1', target, 0))
+    expect(rebind(empty, moved, 'att-2')).toMatchObject({ state: 'bound', target: moved })
+    const early = connectionLost(
+      edit(
+        startDraft('d2', { sessionId: 's1', applicationInstanceId: null, agentBindingRevision: null }, 0),
+        'written before the agent was read',
+        1
+      )
+    )
+    expect(rebind(early, target, 'att-2')).toMatchObject({ state: 'bound', target })
+    // Another session is still a session that has gone.
+    expect(rebind(early, { ...target, sessionId: 's2' }, 'att-2').state).toBe('orphaned')
+  })
+
   it('never submits a conflicted draft, and clears the conflict only on an explicit retarget', () => {
     const conflicted = rebind(
       connectionLost(edit(startDraft('d1', target, 0), 'text', 1)),
