@@ -40,6 +40,7 @@ const ESTABLISHED_CHECKS: &[&str] = &[
     "workers",
     "sleep-setting",
     "authority-revision",
+    "descriptions",
 ];
 
 fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {

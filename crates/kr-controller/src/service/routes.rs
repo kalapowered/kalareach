@@ -235,6 +235,7 @@ impl Controller {
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
             Method::PrivacyStatus => self.privacy_status().await,
+            Method::DescriptionSetup => self.description_setup(),
             // A session's name is the environment's metadata, filtered for whoever asks. The owner
             // at this machine reaches the whole of every session's history.
             Method::SessionDescribe => {
@@ -690,7 +691,10 @@ impl Controller {
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the
             // claim before it is answered, so a retry is answered from that record.
-            Method::PrivacySet | Method::SessionRename => {
+            Method::PrivacySet
+            | Method::SessionRename
+            | Method::DescriptionConfigure
+            | Method::DescriptionDownload => {
                 let claimed = kr_protocol::digest::mutation_digest(mutation, actor_id)
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
                     .and_then(|digest| {
@@ -704,7 +708,13 @@ impl Controller {
                 match claimed {
                     Ok(crate::grants::ActionClaim::Claimed { hold }) => {
                         let outcome = if method == Method::PrivacySet {
-                            self.privacy_set(mutation, carried).await
+                            let outcome = self.privacy_set(mutation, carried).await;
+                            // The state is published: the description host looks again, with its
+                            // fences following it.
+                            self.descriptions.wake_host();
+                            outcome
+                        } else if crate::describe::serves(method) {
+                            self.description_write(method, mutation, carried).await
                         } else {
                             let summary = match mutation.target.session_id.as_ref().copied() {
                                 Some(session_id) => self.session_summary(session_id).await,

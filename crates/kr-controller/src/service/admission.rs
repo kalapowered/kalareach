@@ -666,6 +666,26 @@ impl Controller {
                 }
                 let _: kr_protocol::privacy::PrivacySetParams = parse(&mutation.params)?;
             }
+            // The description settings and the fetch of the model's files belong to the
+            // environment: the target names it and no session.
+            _ if crate::describe::serves(method) => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(format!(
+                        "{} acts on this environment's descriptions, not on one session",
+                        entry.name
+                    )));
+                }
+                match method {
+                    Method::DescriptionConfigure => {
+                        let _: kr_protocol::describe::DescriptionConfigureParams =
+                            parse(&mutation.params)?;
+                    }
+                    _ => {
+                        let _: kr_protocol::describe::DescriptionDownloadParams =
+                            parse(&mutation.params)?;
+                    }
+                }
+            }
             // A rename acts on a session, and the session it acts on is the one its target names.
             Method::SessionRename => {
                 let named = mutation

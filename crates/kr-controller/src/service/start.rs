@@ -56,6 +56,125 @@ pub const BOOT_FILE: &str = "boot";
 const BOOT_FILE_LIMIT: u64 = 1_024;
 
 impl Controller {
+    /// Starts the description host and the reading of every session's facts, once, at the daemon's
+    /// start: the host takes the owner's settings from the configuration document, finds the
+    /// description process beside the daemon, and tracks every session the directory holds.
+    ///
+    /// A host that cannot start leaves the daemon serving pins and deterministic titles, as one
+    /// without descriptions does: descriptions are never what stops a daemon.
+    pub(crate) async fn start_descriptions(self: &std::sync::Arc<Self>) {
+        let settings = self.description_settings();
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let placed = self.description_placement(&state_dir);
+        let setup = crate::describe::host::Setup {
+            environment_id: self.paths.environment_id(),
+            launch: kr_describe::supervise::Launch {
+                program: placed.program,
+                arguments: vec![
+                    "--runtime-dir".into(),
+                    self.paths.runtime_dir().as_os_str().to_owned(),
+                ],
+                working_directory: state_dir.clone(),
+                environment: placed.environment,
+                models: crate::describe::host::models_dir(&state_dir),
+            },
+            state_dir,
+            build: self.build_id.as_str().to_owned(),
+            catalogue: placed.catalogue,
+            settings,
+            clock: placed.clock,
+            privacy: self.privacy.state(),
+            conditions: placed.conditions,
+        };
+        let started =
+            tokio::task::spawn_blocking(move || crate::describe::host::DescribeHost::start(setup))
+                .await;
+        let host = match started {
+            Ok(Ok(host)) => host,
+            Ok(Err(error)) => {
+                eprintln!("kr-controller: descriptions are not generated on this host: {error}");
+                return;
+            }
+            Err(_) => return,
+        };
+        if self.descriptions.set_host(host).is_err() {
+            return;
+        }
+        let workers: Vec<crate::directory::KnownWorker> =
+            self.directory.lock().await.iter().cloned().collect();
+        for worker in workers {
+            self.describe_worker(&worker);
+        }
+    }
+
+    /// Starts tracking one session the directory holds, and reading its facts.
+    pub(crate) fn describe_worker(&self, worker: &crate::directory::KnownWorker) {
+        let Some(host) = self.descriptions.host().cloned() else {
+            return;
+        };
+        let descriptor = &worker.descriptor;
+        host.session_opened(
+            descriptor.session_id,
+            descriptor.session_epoch,
+            kr_describe::context::ContextBinding::new(format!(
+                "display-{}/epoch-{}",
+                descriptor.display_number.get(),
+                descriptor.session_epoch.get()
+            )),
+        );
+        self.descriptions
+            .watch_links(self.me.clone(), &host, worker.clone());
+    }
+
+    /// Tells the description host a session closed, and stops reading its facts.
+    pub(crate) fn describe_session_closed(&self, session_id: SessionId) {
+        self.descriptions.stop_links(session_id);
+        if let Some(host) = self.descriptions.host() {
+            host.session_closed(session_id);
+        }
+    }
+
+    /// The owner's settings for descriptions, as the configuration document now says them: each
+    /// is on, or off for battery, unless the document chooses otherwise.
+    pub(crate) fn description_settings(&self) -> kr_describe::resource::ResourceSettings {
+        let resolver = self.configuration();
+        let loaded = resolver.loaded();
+        let section = loaded
+            .document
+            .as_ref()
+            .map(|document| &document.descriptions);
+        kr_describe::resource::ResourceSettings {
+            enabled: section
+                .and_then(|section| section.enabled())
+                .unwrap_or(true),
+            on_battery: section
+                .and_then(|section| section.on_battery())
+                .unwrap_or(false),
+            ..kr_describe::resource::ResourceSettings::default()
+        }
+    }
+
+    /// Where the description process is, what it is told, which profiles it may choose from, and
+    /// the clock and conditions the host reads: the shipped ones, unless a test placed others.
+    fn description_placement(&self, state_dir: &std::path::Path) -> crate::describe::Placement {
+        #[cfg(feature = "testing")]
+        if let Some(hooked) = crate::describe::hooks::placement_for(state_dir) {
+            return hooked;
+        }
+        let _ = state_dir;
+        crate::describe::Placement {
+            program: self.worker_program.parent().map_or_else(
+                || std::path::PathBuf::from("kr-describe-inference"),
+                |directory| directory.join("kr-describe-inference"),
+            ),
+            environment: Vec::new(),
+            catalogue: kr_describe::profile::catalogue::Catalogue::builtin()
+                .unwrap_or_else(|_| unreachable!("this build ships profiles it can run")),
+            clock: crate::describe::host::Clock::default(),
+            conditions: None,
+        }
+    }
+
     /// Starts the daemon: takes the lock, advances the generation and rebuilds the directory.
     ///
     /// # Errors
@@ -580,6 +699,8 @@ impl Controller {
         // Every session the attention store reads: the live ones over their workers, and the ones
         // whose closure an earlier daemon recorded and which the store has not finished yet.
         controller.start_attention().await;
+        // And every session's facts for the descriptions, over the workers the directory holds.
+        controller.start_descriptions().await;
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
