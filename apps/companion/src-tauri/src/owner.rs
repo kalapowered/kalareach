@@ -217,12 +217,10 @@ impl Owner {
         // A session that answers now, and the challenge as the host holds it now: one the host
         // no longer holds open cannot be confirmed any more.
         let (confirmations, holding) = self.reach(&host).await.ok_or_else(out_of_contact)?;
-        let outcome = match holding
-            .iter()
-            .find(|held| held.request.confirmation_id == listed.request.confirmation_id)
-        {
-            Some(current) => confirmations.review(current, &*self.ceremony).await,
-            None => ReviewOutcome::Expired,
+        let outcome = match held_now(&holding, &listed) {
+            Held::Unchanged(current) => confirmations.review(current, &*self.ceremony).await,
+            Held::Changed => ReviewOutcome::CannotCheck,
+            Held::Gone => ReviewOutcome::Expired,
         };
         self.refresh(&host).await;
         Ok(outcome)
@@ -363,6 +361,35 @@ impl Owner {
         if before != after {
             (self.changed)();
         }
+    }
+}
+
+/// What a host holds now of a request this computer showed.
+enum Held<'a> {
+    /// The same challenge, as shown: the person is asked about exactly what the page listed.
+    Unchanged(&'a Listed),
+    /// A challenge under the same identifier that is not the one shown, in its request or in what
+    /// it approves. It is not offered to the ceremony, because the person would confirm words the
+    /// page never listed.
+    Changed,
+    /// No challenge the host still holds open.
+    Gone,
+}
+
+/// What `holding`, the challenges the host holds now, says of `shown`, the request the page listed.
+///
+/// The identifier finds the challenge; the whole request and what it approves decide whether it is
+/// the one shown. Whether the host lists it as answered is not part of what was shown.
+fn held_now<'a>(holding: &'a [Listed], shown: &Listed) -> Held<'a> {
+    match holding
+        .iter()
+        .find(|held| held.request.confirmation_id == shown.request.confirmation_id)
+    {
+        Some(current) if current.request == shown.request && current.subject == shown.subject => {
+            Held::Unchanged(current)
+        }
+        Some(_) => Held::Changed,
+        None => Held::Gone,
     }
 }
 
@@ -1012,5 +1039,85 @@ mod tests {
         let view = describe("a reference", "studio", &a_device_being_added(), NOW);
         assert!(view.facts.is_empty());
         assert_eq!((view.notice, view.statement), (None, None));
+    }
+
+    /// An enrolment as a host lists it.
+    fn an_enrolment() -> Listed {
+        listed_subject(
+            Subject::CatalogueAdd(enrolment()),
+            SensitiveAction::TrustRepositoryRoot,
+        )
+    }
+
+    /// What the host holds under `shown`'s identifier, once `change` has been applied to it.
+    fn held_after(shown: &Listed, change: impl FnOnce(&mut Listed)) -> Vec<Listed> {
+        let mut held = shown.clone();
+        change(&mut held);
+        vec![held]
+    }
+
+    fn is_unchanged(held: &Held<'_>) -> bool {
+        matches!(held, Held::Unchanged(_))
+    }
+
+    /// KR-REQ-07.47: a request the page listed is reviewed only while the host still holds that
+    /// very challenge. One that was refreshed unchanged, or that the host now lists as answered, is
+    /// the request shown.
+    #[test]
+    fn a_challenge_the_host_still_holds_as_shown_is_the_one_reviewed() {
+        let shown = an_enrolment();
+        assert!(is_unchanged(&held_now(&[shown.clone()], &shown)));
+        let answered = held_after(&shown, |held| held.answered = true);
+        assert!(is_unchanged(&held_now(&answered, &shown)));
+    }
+
+    /// KR-REQ-07.47: a host that changed a fact between the page's listing and the review keeps
+    /// the confirmation's identifier, and its changed enrolment can say the same line in a dialog,
+    /// so the review compares the whole request and what it approves: a challenge that differs in
+    /// either is not offered to the ceremony.
+    #[test]
+    fn a_challenge_that_changed_under_the_same_identifier_is_not_the_one_shown() {
+        let shown = an_enrolment();
+        let digest_of_another_address = Digest256::from_bytes([9; 32]);
+        // The address the repository serves from changed, and the digest was recomputed to cover it.
+        let moved = held_after(&shown, |held| {
+            if let Ok(Subject::CatalogueAdd(plan)) = &mut held.subject {
+                plan.targets_url = "https://elsewhere.example/targets/".to_owned();
+            }
+            held.request.action_digest = digest_of_another_address;
+        });
+        assert!(matches!(held_now(&moved, &shown), Held::Changed));
+        // Only what it approves changed.
+        let subject_only = held_after(&shown, |held| {
+            if let Ok(Subject::CatalogueAdd(plan)) = &mut held.subject {
+                plan.ceiling.insert("terminal.input".to_owned());
+            }
+        });
+        assert!(matches!(held_now(&subject_only, &shown), Held::Changed));
+        // Only the request changed: its digest, or the time it stops being accepted.
+        let digest_only = held_after(&shown, |held| {
+            held.request.action_digest = digest_of_another_address;
+        });
+        assert!(matches!(held_now(&digest_only, &shown), Held::Changed));
+        let later = held_after(&shown, |held| {
+            held.request.expires_at_ms = TimestampMs::new(NOW + 3_600_000);
+        });
+        assert!(matches!(held_now(&later, &shown), Held::Changed));
+        // What the host holds can no longer be checked.
+        let unreadable = held_after(&shown, |held| {
+            held.subject = Err(CannotCheck::DigestMismatch);
+        });
+        assert!(matches!(held_now(&unreadable, &shown), Held::Changed));
+    }
+
+    /// A request the host no longer holds, or holds under another identifier, is gone.
+    #[test]
+    fn a_challenge_the_host_no_longer_holds_is_gone() {
+        let shown = an_enrolment();
+        assert!(matches!(held_now(&[], &shown), Held::Gone));
+        let other = held_after(&shown, |held| {
+            held.request.confirmation_id = ConfirmationId::new(Uuid::from_bytes([77; 16]));
+        });
+        assert!(matches!(held_now(&other, &shown), Held::Gone));
     }
 }
