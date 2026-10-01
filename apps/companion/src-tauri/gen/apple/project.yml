@@ -13,6 +13,12 @@ packages:
   WebRTC:
     url: https://github.com/stasel/WebRTC
     revision: 4266157cd08f92115de885ab12d87196a8db87e1
+  # Push through Firebase, which the gateway delivers to. Messaging alone is linked: nothing else of
+  # Firebase is needed, and the analytics library would write an installation of its own. Pinned by
+  # revision for the same reason as the media library above.
+  Firebase:
+    url: https://github.com/firebase/firebase-ios-sdk
+    revision: 8c29ca981990a32e626c8617544fa65d22b1834f
 configs:
   debug: debug
   release: release
@@ -121,6 +127,9 @@ targets:
       # directory so regenerating the project never touches it.
       - path: ../../../native/ios/KalaReachNative
       - path: ../../../native/ios/Shared
+      # Starting push at launch, and the device checks of a debug build. Only this application
+      # compiles it: the native tests build the decisions without the Firebase library or a launch.
+      - path: ../../../native/ios/KalaReachApp
       - path: assets
         buildPhase: resources
         type: folder
@@ -159,6 +168,10 @@ targets:
         # goes. Named for the same reason as the shared one: Swift does not expand a build variable
         # inside a string literal, so the expanded value has to be written by the build.
         KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach
+        # Firebase wraps no method of the application's delegate, which belongs to the windowing
+        # library, and makes no registration token until the person has agreed to notifications.
+        FirebaseAppDelegateProxyEnabled: false
+        FirebaseMessagingAutoInitEnabled: false
         UIBackgroundModes:
           - remote-notification
           # An explicitly started voice call keeps running when the screen locks. Section 15
@@ -210,6 +223,8 @@ targets:
       # framework is embedded and re-signed by this build because the downloaded one is unsigned.
       - package: WebRTC
         product: WebRTC
+      - package: Firebase
+        product: FirebaseMessaging
       - sdk: AVFoundation.framework
       - sdk: UserNotifications.framework
       # The shared client reads this device's own network interfaces to decide how it can reach a
@@ -222,6 +237,26 @@ targets:
       - sdk: Security.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
+    postBuildScripts:
+      # The Firebase configuration belongs to the account that owns the project, not to this
+      # repository, so the build copies it from the path `KR_GOOGLE_SERVICE_INFO` names. A debug
+      # build without it runs and leaves Firebase alone; a release build without it fails, because
+      # a release that cannot receive a notification is not one to ship. A copy an earlier build
+      # left in the product is removed first, so a build without the file never carries another's.
+      - script: |
+          set -eu
+          destination="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist"
+          rm -f "${destination}"
+          if [ -n "${KR_GOOGLE_SERVICE_INFO:-}" ] && [ -f "${KR_GOOGLE_SERVICE_INFO}" ]; then
+            cp "${KR_GOOGLE_SERVICE_INFO}" "${destination}"
+          elif [ "${CONFIGURATION}" = "release" ]; then
+            echo "error: a release build needs KR_GOOGLE_SERVICE_INFO to name a GoogleService-Info.plist" >&2
+            exit 1
+          else
+            echo "note: no GoogleService-Info.plist named by KR_GOOGLE_SERVICE_INFO, so Firebase is left alone"
+          fi
+        name: Copy Firebase configuration
+        basedOnDependencyAnalysis: false
     preBuildScripts:
       - script: pnpm tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
