@@ -225,15 +225,29 @@ async fn stub_controller_seeing(
     answer: std::result::Result<ParamsValue, ProtocolError>,
     authenticated_uid: u64,
 ) -> tokio::task::JoinHandle<()> {
+    stub_controller_hearing(endpoint, environment_id, answer, authenticated_uid, None).await
+}
+
+/// [`stub_controller_seeing`], keeping the hello it was sent where the test can read it.
+async fn stub_controller_hearing(
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    answer: std::result::Result<ParamsValue, ProtocolError>,
+    authenticated_uid: u64,
+    heard: Option<std::sync::Arc<std::sync::Mutex<Option<kr_protocol::local::LocalHello>>>>,
+) -> tokio::task::JoinHandle<()> {
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the stub endpoint");
     tokio::spawn(async move {
         let Ok((connection, _peer)) = listener.accept().await else {
             return;
         };
         let (mut reader, mut writer) = kr_ipc::framed::split(connection, StreamKind::Control);
-        let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
+        let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await else {
             return;
         };
+        if let Some(heard) = heard {
+            *heard.lock().expect("the slot") = Some(hello);
+        }
         let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
         let acknowledgement = LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
@@ -981,6 +995,7 @@ async fn a_second_hello_is_not_carried_over_an_open_bridge() {
             client: kr_protocol::local::LocalClientKind::Cli,
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
+            origin: None,
         },
     ))));
     match helper.read() {
@@ -1047,4 +1062,45 @@ fn a_destination_with_no_daemon_says_so_in_a_frame_when_nothing_may_be_started()
         let (code, _) = helper.finish();
         assert_ne!(code, Some(0));
     }
+}
+
+/// KR-REQ-03.13, KR-ACC-021: the helper tells the destination where the invocation it carries
+/// began, in the hello it makes to the destination's daemon, and that is the invoker's own
+/// declaration and never a thing the destination's own side made up. A helper that is not asked to
+/// carry one tells it nothing, so the daemon sees a client of its own as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_helper_tells_the_destination_where_the_invocation_began() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let stub = stub_controller_hearing(
+        endpoint,
+        tree.environment_id(),
+        Ok(ParamsValue::empty()),
+        u64::from(kr_ipc::paths::current_uid()),
+        Some(std::sync::Arc::clone(&heard)),
+    )
+    .await;
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    assert!(matches!(helper.read(), BridgeFrame::HelloAck(_)));
+    let said = heard
+        .lock()
+        .expect("the slot")
+        .clone()
+        .expect("the destination was sent a hello");
+    assert_eq!(
+        said.origin,
+        Some(kr_protocol::local::BridgeOrigin {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            ingress: ActorIngress::LocalIpc,
+        }),
+        "the destination hears the origin the invoker declared"
+    );
+    assert_eq!(said.client, kr_protocol::local::LocalClientKind::Cli);
+    drop(helper.finish());
+    stub.abort();
 }

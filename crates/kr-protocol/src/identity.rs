@@ -898,6 +898,7 @@ mod tests {
             origin_environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([3; 16])),
             origin_ingress: ActorIngress::LocalIpc,
             already_bridged: false,
+            start: true,
             target: BridgeTarget::Controller,
         }));
         let bytes = kr_cbor::to_canonical_vec(&hello).expect("encodes");
@@ -912,6 +913,16 @@ mod tests {
             protocol_version: crate::hello::PROTOCOL_VERSION,
             environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([4; 16])),
             os_user: "kala".to_owned(),
+            build: Some(crate::local::LocalBuild::this(
+                BuildId::new("kr/0.1.0").expect("a build"),
+            )),
+            base: DestinationBase {
+                home: "/home/kala".to_owned(),
+                variables: vec![crate::session::EnvironmentVariable {
+                    name: "HOME".to_owned(),
+                    value: "/home/kala".to_owned(),
+                }],
+            },
             role: LocalRole::Controller,
             connection_id: ConnectionId::new(crate::scalars::Uuid::from_bytes([5; 16])),
             boot_identity: BootIdentity {

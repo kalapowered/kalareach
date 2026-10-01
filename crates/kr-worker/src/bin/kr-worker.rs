@@ -166,6 +166,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             client: LocalClientKind::Worker,
             capabilities: kr_protocol::scalars::CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: None,
         }))
         .await?;
     let acknowledgement: ControlFrame = reader.read_message().await?;

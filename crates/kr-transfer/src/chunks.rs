@@ -89,6 +89,7 @@ impl ChunkChannel {
                 client: LocalClientKind::Cli,
                 capabilities: CanonicalSet::new(),
                 max_receive: ReceiveLimits::default(),
+                origin: None,
             }))
             .await?;
         let acknowledgement = match reader.read_message().await? {
