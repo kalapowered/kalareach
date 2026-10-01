@@ -117,21 +117,9 @@ between the two would let another writer put a batch in front of one the machine
 grouping the actions by kind would tell the bridge a detach had happened before the attachment was
 gone, or interrupt an application before the launch that interrupt revoked had been called off.
 
-The driver tells the machine of every byte the host puts into the terminal, not only a person's. The
-host's own answer to a question the application asked holds no lease and is never held behind an
-exchange, so it can reach the reader after the reader proved its queues clear. The driver reports it
-as a `host_reply_queued` stimulus when the answer is queued, ahead of anything the machine publishes
-because of it. An answer that arrives while an exchange is in flight withholds the fence that
-exchange would have published, one that arrives after publication invalidates the fence, and a
-launch reserved on the fence is revoked as queued prior input. The reader's next idle callback asks
-again, and its own snapshot is what accounts for the bytes. An answer the writer has not yet written
-when an exchange begins is told to the machine again as that exchange's own, from a count the writer
-keeps and lowers once each piece has reached the terminal. The writer lowers it after the write
-returns, so an exchange that begins between the two is withheld for bytes the reader already has; the
-reader asks again at its next idle report, which a reader that reports idle once until the next key
-makes at that key. The order is the safe one and is kept. The writer drops an answer whose response
-lane deadline passed while it waited for a terminal that would not take it, before its first byte and
-never part way through.
+The driver tells the machine about every byte the host puts into the terminal, not only a person's. The host's answer to a question the application asked holds no lease and is never held behind an exchange, so it can reach the reader after the reader has proved its queues clear. The driver tells the machine about those bytes by giving them to it as a `host_reply_queued` stimulus when they are queued, before anything the machine publishes because of them. If those bytes arrive while an exchange is in progress, the driver withholds the corresponding fence from publication. If they arrive after the fence has been published, the driver invalidates the fence, and a launch reserved on that fence is revoked as queued prior input. Either way, the reader's next idle callback asks again, and its own snapshot accounts for the bytes.
+
+An answer the writer has not written when an exchange begins is reported again as that exchange's own. The number of such bytes is tracked by the writer and decremented each time it successfully writes something to the terminal. The writer lowers the count after the write returns, so an exchange that begins between the two steps is withheld for bytes the reader already has. The reader asks again at its next idle report, and a reader that reports idle only once until the next key asks at that key. The writer lowers the count in that order on purpose, and the order stays. The writer drops an answer whose response lane deadline passed while it waited for a terminal that would not take it, before its first byte and never part way through.
 
 | Action | What the worker does |
 | --- | --- |
@@ -264,7 +252,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the one login file Bash reads |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
-| PowerShell | the two per-user profiles that PowerShell itself names, added to rather than replaced: the entry that opens the bridge is the first thing in the profile every host reads, and the entry that checks the reader is the last thing in the profile its own host reads |
+| PowerShell | the two per-user profiles PowerShell itself names, added to and never replaced: the entry that opens the bridge goes below the prologue of the profile every host reads, and the entry that checks the reader goes at the end of the profile its own host reads |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
 integration <<<`, and its body is one line that sources the package's own file. Nothing of the
@@ -272,57 +260,25 @@ integration's logic is copied into the user's configuration, so upgrading the pa
 runs without rewriting anything they own. Nothing replaces `.bashrc`, points a shell at another
 `ZDOTDIR`, substitutes an `--rcfile` or disables a profile.
 
-PowerShell's first entry loads the module that opens the bridge, and the session takes no input from
-outside until the bridge has authenticated, so a profile that asks a question ahead of the entry
-would ask one nobody could answer. The entry therefore goes first: `kr shell install` puts it in
-the per-user profile that every host reads, below what PowerShell requires to come first, so that a
-question the person's own profiles ask, in that file or in the one their host reads after it, is asked
-of a shell whose bridge is open. What has to stay first is a question for PowerShell's grammar, so
-PowerShell answers it: the PowerShell this host would launch parses the profile, and the entry goes
-on the line after the last `using` statement or `param` block, at a line end the parser itself
-reports, which is never inside a string, a here-string or a comment. A byte-order mark is the file's
-encoding and belongs to no line. The profile is parsed again with the entry in it, and an entry that
-would add an error the profile did not have is refused by name and writes nothing: a profile that
-already has an error, such as a `using module` for a module that is not installed, keeps it. The
-install moves an entry an earlier install left somewhere else. Where the two profiles are one file,
-as when one is a link to the other, that file gets this entry and no other. A question asked in an
-all-users profile, which an administrator owns and PowerShell reads before any of the user's, still
-runs before the bridge exists and cannot be answered. Every other shell's reader comes with the shell
-itself and its entry only says, after the user's configuration, that the hooks are live, so those
-entries stay last.
+PowerShell's first entry loads the module that opens the bridge. The session takes no input from outside until the bridge has authenticated, so a profile that asks a question before the entry would ask one nobody can answer. `kr shell install` therefore puts the entry in the per-user profile that every host reads, below the parts PowerShell requires to come first. A question that the person's profiles ask, in that file or in the one their host reads after it, is then asked of a shell whose bridge is open. Those parts are the `using` statements and a script `param` block, and where they end is a question about PowerShell's grammar, so PowerShell answers it: the PowerShell this host would launch parses the profile and reports where the last `using` statement or `param` block ends. The entry goes on the next line, and only when the rest of that line holds nothing but whitespace, a semicolon or a comment, because an entry cannot go in the middle of a line without moving what follows it. A byte-order mark is the file's encoding and belongs to no line. The install refuses by name, and writes nothing, for a profile that has another statement on that line, one with a comment or string that runs over its line end, a signed one, and one whose line ends are a lone carriage return.
 
-The second entry is the last thing in the profile PowerShell's own host reads, which is the last
-profile it runs. It asks the module whether the host would still call the module's read-line entry
-point. The module goes in front of that entry point when it loads, so a command of the same name that
-a later profile defines takes the host's calls away from the module: the session would stay
-authenticated and not ready with nothing to say why. What decides is whose command the host would
-run, not what its text says. A function that replaces the entry point, one that wraps the function it
-replaced, one that calls the editor directly and an alias are all the host's reader being somebody
-else's rather than the editor the package was qualified against, and each is refused by name, as
-`reader_replaced`, through an integration loss that closes the session being created; the loss's
-detail starts with that name, and nothing the reader sends after a loss that closes the session says
-the hooks are live. The editor imported again puts its own function back, which is the qualified
-reader, so the module goes back in front of it. A tool whose setup wraps the read-line entry point
-has to be guarded on `$env:KR_SESSION` to stay out of a KalaReach shell. A profile that leaves the
-entry point alone is never asked anything. The check runs where the last profile reaches its end: a
-terminating error, `return` or `exit` in that profile before it, and a change made after the
-profiles have run, are not seen by it. The module qualifies the editor when it loads and again when
-the hooks activate after the profile, because a profile that runs in between can import another one.
+After placing the entry, the install parses the profile again with the entry in it. It refuses the entry unless the entry sits among whole statements. The entry may add no parse error the profile did not have. Every top-level statement must lie wholly between the entry's two marker lines or wholly outside them, and no statement or block may hold the markers inside it. The statements outside must be the profile's own, with the same text in the same order, and so must its `using` statements and `param` block. A profile that already has an error, such as a `using module` for a module that is not installed, does not run and keeps its error. If PowerShell does not start, or does not answer within a minute, the install writes nothing and says so. A question asked in an all-users profile, which an administrator owns and PowerShell reads before any of the user's, still runs before the bridge exists and cannot be answered. The other shells load their reader with the shell itself, and their entry only says, after the user's configuration, that the hooks are live, so those entries stay last.
 
-PowerShell's profile paths differ by edition, by platform and by whether the user's Documents
-directory is redirected, so they are not derived: the shell this host would launch is asked for
-`$PROFILE.CurrentUserAllHosts` and `$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host
-where no PowerShell answers has no profile to add an entry to rather than one this host guessed.
+The second entry checks the reader. It has markers of its own, `# >>> KalaReach reader check >>>` and `# <<< KalaReach reader check <<<`, and it is the last thing in the profile PowerShell's own host reads, which is the last profile PowerShell runs. Because the two entries have separate markers, one file can hold both, as when one profile is a link to the other, and removal takes out each. The entry asks the module whether the host would still call the module's read-line entry point. The module goes in front of that entry point when it loads, so a command of the same name that a later profile defines takes the host's calls away from the module, and the session would stay authenticated and not ready with nothing to say why. The check decides by identity. The command the host would run is the module's own function, the editor's own function, or somebody else's reader. A function that replaces the entry point, one that wraps the function it replaced, one that calls the editor directly, one made inside the editor's module scope, and an alias are each somebody else's reader. Each is refused by name as `reader_replaced`, through an integration loss that closes the session being created. The loss's detail starts with that name, and nothing the reader sends after a loss that closes the session says the hooks are live. The editor imported again puts its own function back, which is the qualified reader, so the module goes back in front of it. A tool whose setup wraps the read-line entry point has to be guarded on `$env:KR_SESSION` to stay out of a KalaReach shell. A profile that leaves the entry point alone is never asked anything.
+
+The check sees what the profile has done by the time the profile reaches its end. It does not see a terminating error, `return` or `exit` in that profile before the check, text added after the check, or a change made after the profiles have run. A person who edits their profile runs `kr shell install` again to put the check last. The module qualifies the editor when it loads and again when the hooks activate after the profile, because a profile that runs in between can import another one.
+
+PowerShell's profile paths differ by edition, by platform and by whether the user's Documents directory is redirected, so they are not derived: the shell this host would launch is asked for `$PROFILE.CurrentUserAllHosts` and `$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host where no PowerShell answers has no profile to add an entry to rather than one this host guessed. Of all the shells, only PowerShell's profile is read to place an entry, and PowerShell itself does the reading: its parser says where the prologue ends and checks the result.
 
 `kr shell install --nsh-bypass` adds the documented session-local bypass for a known auto-wrapper:
 `NSH_NO_WRAP=1`, set only where the worker exported the bridge, which is a KalaReach-created shell.
 It changes no other setting of that tool and affects no ordinary terminal.
 
-Nothing decides where an entry goes by reading what is inside a startup file, and the one text
+For every shell but PowerShell, nothing decides where an entry goes by reading what is inside a startup file, and the one text
 match made on one is the marker, matched as whole lines: a file that prints or talks about the
 marker holds no entry, and removal takes out nothing of the person's own.
 
-Nothing decides where an entry goes by reading what is inside a startup file. A login Bash reads
+For every shell but PowerShell, nothing decides where an entry goes by reading what is inside a startup file. A login Bash reads
 exactly one of `.bash_profile`, `.bash_login` and `.profile`, and the entry goes in the first of
 those that exists, or in `.bash_profile` when none does. Whether that file happens to run `.bashrc`
 is not asked: reading a person's shell text without a shell is guesswork, and a guess that goes the

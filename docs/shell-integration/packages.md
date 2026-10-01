@@ -218,31 +218,11 @@ states they wait in are observable, and puts its end-of-file decision on the con
 front of whatever was bound there. It calls the editor's published API and reads the editor's own
 key queue, which is what a fence rests on and what the editor publishes no count of.
 
-The editor's own queue is read live and refused when it cannot be: the two fields exist, the editor
-has an instance, the instance has a queue and the queue answers with a count. A build that renames
-the queue, has none, or holds something that is not a queue is refused as `psreadline_queue_unreadable`
-when the module loads, and again when the hooks activate after the profile, because a profile that
-runs in between can import another editor. An editor whose queue stops answering later reports its
-queues as not drained rather than empty.
+The editor's own queue is read live and refused when it cannot be: the two fields exist, the editor has an instance, the instance has a queue and the queue answers with a count. A build that renames the queue, has none, or holds something that is not a queue is refused as `psreadline_queue_unreadable` when the module loads, and again when the hooks activate after the profile, because a profile that runs in between can import another editor. An editor whose queue stops answering later reports its queues as not drained rather than empty.
 
-The module goes in front of the host's read-line entry point when it loads, before the person's
-profiles run. A profile that defines a command of the same name, whether a function that replaces the
-entry point, wraps the one before it or calls the editor directly, or an alias, is refused as
-`reader_replaced` by a check the last profile ends with, and the session being created closes with
-that loss. The check looks at whose command the host would run and not at its text; the editor
-imported again puts its own function back and the module goes back in front of it.
+The module goes in front of the host's read-line entry point when it loads, before the person's profiles run. A check that ends the last profile asks whether the host would still call the module's own function or the editor's own function, by identity and not by text or module name. Any other command under that name is refused as `reader_replaced`, and the session being created closes with that loss. The commands refused are a function that replaces the entry point, one that wraps the one before it, one that calls the editor directly, one made inside the editor's module scope, and an alias. The editor imported again puts its own function back, and the module goes back in front of it.
 
-Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt
-ends the shell the way the editor's own would; when a wrapped handler is what runs, the exit the
-editor signals is recognised through the exception chain and carried out by replacing the empty line
-with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. And the
-module binds only a chord the editor stores under the spelling it was given: the editor keeps
-`Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that
-chord would take the plain question mark over and whatever the person had there would go. Such a
-chord is left alone, and a configured gesture whose chord is one is refused as
-`gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as
-`psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound
-safely.
+Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt ends the shell the way the editor's own would. When a wrapped handler runs, the exit the editor signals is recognised through the exception chain and carried out by replacing the empty line with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. The module also binds only a chord that the editor stores under the spelling it was given. The editor keeps `Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that chord would take over the plain question mark and whatever the person had there would go. The module leaves such a chord alone, and a configured gesture whose chord is one is refused as `gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as `psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound safely.
 
 `Publish-KalaReachQualification` is what `scripts/build-shells.sh` is for the others: it checks the
 editor against the range the manifest pins, records what it found, installs the module and the
