@@ -8,11 +8,12 @@
 //! repositories are real ones, built with installed Git in a directory on the internal disk.
 //!
 //! Every command runs at least once, and each command family is refused once by the daemon for
-//! something it does not have. One case is answered by a scripted daemon instead: an installation
-//! that needs the owner's confirmation. The catalogue refuses an unknown repository before it
-//! decides whether an installation needs a confirmation, and a repository is added only with an
-//! owner device's signed confirmation, which nothing in this suite has, so a real daemon never
-//! reaches that answer here.
+//! something it does not have. The owner's confirmation of a repository's root and of an
+//! installation is answered by a scripted daemon instead: a real daemon needs a paired owner
+//! device to answer a challenge, which nothing in this suite has, and the catalogue refuses an
+//! unknown repository before it decides whether an installation needs a confirmation. The
+//! scripted daemon issues the challenge, lists what an owner device is shown for it, and refuses
+//! the request as needing the confirmation until it decides an owner device has answered.
 
 #![cfg(unix)]
 
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
@@ -616,10 +618,11 @@ async fn a_paired_device_is_listed_and_revoked() {
     );
 }
 
-/// KR-REQ-07.47: every `kr plugin` and `kr plugin repo` operation is a client of its own method. The
-/// two lists answer; each operation on a repository or a package this host does not have is the
-/// daemon's own refusal; and adding a repository is refused before anything is sent, because only
-/// an owner device confirms a trust root.
+/// KR-REQ-07.47, KR-REQ-10.52: every `kr plugin` and `kr plugin repo` operation is a client of its
+/// own method. The two lists answer; each operation on a repository or a package this host does
+/// not have is the daemon's own refusal; and adding a repository asks the host for the owner
+/// device's challenge, which a host that is not on the network has no owner device to give: it
+/// answers `HOST_NOT_CONFIGURED`, naming the network selection, and nothing is enrolled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_plugin_operation_reaches_its_method() {
     let host = Host::start().await;
@@ -646,8 +649,8 @@ async fn every_plugin_operation_reaches_its_method() {
         "--targets-url",
         "https://example.invalid/targets/",
     ]);
-    assert_eq!(added["code"], "OWNER_CONFIRMATION_REQUIRED", "{added}");
-    assert!(text(&added["message"]).contains("owner device"), "{added}");
+    assert_eq!(added["code"], "HOST_NOT_CONFIGURED", "{added}");
+    assert!(text(&added["message"]).contains("network"), "{added}");
     let repositories = host.kr_json(&["plugin", "repo", "list"]);
     assert_eq!(
         repositories["catalogues"],
@@ -692,12 +695,12 @@ async fn every_plugin_operation_reaches_its_method() {
 /// What a scripted daemon was asked, method by method.
 type Asked = Arc<Mutex<Vec<String>>>;
 
-/// What a scripted daemon answers one method with.
-type Script = Box<dyn Fn(&str) -> Result<ParamsValue, ProtocolError> + Send + Sync>;
+/// What a scripted daemon answers one method with, given the method and what it was sent.
+type Script = Box<dyn Fn(&str, &ParamsValue) -> Result<ParamsValue, ProtocolError> + Send + Sync>;
 
 /// A script that answers every method the same way.
 fn always(answer: Result<ParamsValue, ProtocolError>) -> Script {
-    Box::new(move |_| answer.clone())
+    Box::new(move |_, _| answer.clone())
 }
 
 /// Serves local callers on `temp`'s endpoint, answering every request and mutation as `script`
@@ -753,16 +756,20 @@ fn scripted_daemon(
                 continue;
             }
             while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                let (request_id, method) = match &frame {
-                    ControlFrame::Request(request) => {
-                        (request.request_id, request.method.as_str().to_owned())
-                    }
-                    ControlFrame::Mutation(mutation) => {
-                        (mutation.request_id, mutation.method.as_str().to_owned())
-                    }
+                let (request_id, method, params) = match &frame {
+                    ControlFrame::Request(request) => (
+                        request.request_id,
+                        request.method.as_str().to_owned(),
+                        request.params.clone(),
+                    ),
+                    ControlFrame::Mutation(mutation) => (
+                        mutation.request_id,
+                        mutation.method.as_str().to_owned(),
+                        mutation.params.clone(),
+                    ),
                     _ => continue,
                 };
-                let outcome = match script(&method) {
+                let outcome = match script(&method, &params) {
                     Ok(value) => Outcome::Ok(value),
                     Err(error) => Outcome::Error(error),
                 };
@@ -780,7 +787,7 @@ fn scripted_daemon(
     (asked, serving)
 }
 
-/// The installation line both cases below run.
+/// The installation line the cases below run.
 fn install_line() -> Vec<&'static str> {
     vec![
         "plugin",
@@ -791,44 +798,220 @@ fn install_line() -> Vec<&'static str> {
         "--digest",
         PACKAGE_DIGEST,
         "--grant",
-        "kr.native_bridge.install/1",
+        "approval.respond",
     ]
 }
 
-/// KR-REQ-07.47: an installation the daemon says needs the owner's confirmation, and that carries
-/// none, is refused: the command says it is confirmed and installed from an owner device, exits
-/// with a status other than zero, and asks the daemon for nothing more than the installation, so
-/// no confirmation is left waiting that nothing could spend. The control is the same installation
-/// answered with a result, which the command reports.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_device() {
-    let temp = kr_ipc::testing::TempHost::create();
-    let (asked, serving) = scripted_daemon(
-        &temp,
-        always(Err(ProtocolError::new(
-            ErrorCode::OwnerConfirmationRequired,
-            "the installation may do more than its repository permits by itself",
-        ))),
-    );
-    let (status, refused) = json(&temp, &install_line());
-    assert_eq!(status, Some(8), "{refused}");
-    assert_eq!(refused["code"], "OWNER_CONFIRMATION_REQUIRED", "{refused}");
-    let message = text(&refused["message"]);
-    assert!(message.contains("owner device"), "{message}");
-    assert!(
-        message.contains("more than its repository permits"),
-        "the daemon's reason is kept: {message}"
-    );
-    assert_eq!(
-        *asked.lock().expect("the record"),
-        ["plugin.install"],
-        "the installation was asked for once and nothing else was"
-    );
-    serving.abort();
+/// An installation whose grant holds a native bridge.
+fn native_bridge_install_line() -> Vec<&'static str> {
+    vec![
+        "plugin",
+        "install",
+        "community",
+        PACKAGE,
+        "0.1.0",
+        "--digest",
+        PACKAGE_DIGEST,
+        "--grant",
+        "native_bridge.install",
+    ]
+}
 
-    // The control: the same installation, answered.
-    let temp = kr_ipc::testing::TempHost::create();
-    let installed = kr_protocol::catalogue::PluginInstallResult {
+/// What a scripted daemon saw of an owner confirmation: the subjects it was asked a challenge for
+/// and the parameters of every request of the effect itself.
+#[derive(Default)]
+struct Seen {
+    subjects: Vec<kr_protocol::confirmation::ConfirmationSubject>,
+    effects: Vec<ParamsValue>,
+}
+
+/// The publisher's own words for the release the installation cases name.
+const STATEMENT: &str =
+    "Adds one registration file under the application's own directory, which it runs.";
+
+/// A scripted daemon's owner device: the challenge it issues, what a device is shown for it, and
+/// the answer the effect gets once a device has answered.
+struct OwnerDevice {
+    /// The method the effect is.
+    effect: &'static str,
+    /// How many requests of the effect are refused as needing the confirmation before an owner
+    /// device answers, and none ever when the device never does.
+    refusals: Option<usize>,
+    /// When the challenge expires, in UTC milliseconds.
+    expires_at_ms: u64,
+    /// Whether this host has no owner yet.
+    initial_bootstrap: bool,
+    /// What the effect answers once an owner device has answered.
+    answer: ParamsValue,
+}
+
+impl OwnerDevice {
+    fn challenge(
+        &self,
+        temp: &kr_ipc::testing::TempHost,
+    ) -> kr_protocol::confirmation::OwnerConfirmationRequestResult {
+        use kr_protocol::ids::ConfirmationId;
+        use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction};
+        use kr_protocol::scalars::{Digest256, Nonce256};
+        let keys = kr_crypto::keys::DeviceKeys::generate()
+            .expect("keys")
+            .public_keys();
+        let _ = temp;
+        kr_protocol::confirmation::OwnerConfirmationRequestResult {
+            request: OwnerConfirmationRequest {
+                confirmation_id: ConfirmationId::new(Uuid::from_bytes([1; 16])),
+                action: if self.effect == "catalogue.add" {
+                    SensitiveAction::TrustRepositoryRoot
+                } else {
+                    SensitiveAction::GrantExecutableCapability
+                },
+                action_digest: Digest256::from_bytes([2; 32]),
+                destination_keys: Nullable::null(),
+                destination_rights: CanonicalSet::new(),
+                host_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+                host_endpoint_id: keys.transport,
+                nonce: Nonce256::from_bytes([4; 32]),
+                expires_at_ms: TimestampMs::new(self.expires_at_ms),
+            },
+            initial_bootstrap: self.initial_bootstrap,
+        }
+    }
+
+    /// What an owner device is shown for the subject the terminal asked a challenge for, built
+    /// from the plan the host builds so that it says what the host would.
+    fn shown(
+        subject: &kr_protocol::confirmation::ConfirmationSubject,
+    ) -> kr_protocol::confirmation::ConfirmationDisplay {
+        use kr_protocol::confirmation::{
+            CatalogueTrustPlan, ConfirmationSubject, PluginInstallPlan,
+        };
+        match subject {
+            ConfirmationSubject::CatalogueAdd(params) => CatalogueTrustPlan::of_request(
+                params,
+                "a".repeat(64),
+                ["key-one".to_owned()].into_iter().collect(),
+            )
+            .display(),
+            ConfirmationSubject::PluginInstall(params) => PluginInstallPlan {
+                environment_id: params.environment_id,
+                catalogue_id: params.catalogue_id.clone(),
+                ceiling: CanonicalSet::new(),
+                plugin_id: params.plugin_id.clone(),
+                version: params.version.clone(),
+                package_digest: params.package_digest.clone(),
+                grant: params.grant.iter().cloned().collect(),
+                grant_statement: params
+                    .grant
+                    .iter()
+                    .any(|name| name == "native_bridge.install")
+                    .then(|| STATEMENT.to_owned()),
+            }
+            .display(),
+            other => panic!("a terminal asks for no challenge for {other:?}"),
+        }
+    }
+
+    /// The script: it issues the challenge, lists what is shown, and refuses the effect as
+    /// needing the confirmation until an owner device has answered.
+    fn script(self, temp: &kr_ipc::testing::TempHost, seen: Arc<Mutex<Seen>>) -> Script {
+        use kr_protocol::confirmation::{
+            ConfirmationSubject, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
+            PendingConfirmation,
+        };
+        let challenge = self.challenge(temp);
+        Box::new(move |method, params| match method {
+            "owner.confirmation.request" => {
+                let asked: OwnerConfirmationRequestParams = params.to_typed().expect("the subject");
+                seen.lock()
+                    .expect("the record")
+                    .subjects
+                    .push(asked.subject);
+                Ok(ParamsValue::from_typed(&challenge).expect("a challenge"))
+            }
+            "owner.confirmation.pending" => {
+                let subject: ConfirmationSubject = seen
+                    .lock()
+                    .expect("the record")
+                    .subjects
+                    .last()
+                    .cloned()
+                    .expect("a challenge was asked for first");
+                Ok(ParamsValue::from_typed(&OwnerConfirmationPendingResult {
+                    pending: vec![PendingConfirmation {
+                        request: challenge.request.clone(),
+                        display: Self::shown(&subject),
+                        answered: false,
+                    }],
+                })
+                .expect("a list"))
+            }
+            effect if effect == self.effect => {
+                let mut seen = seen.lock().expect("the record");
+                seen.effects.push(params.clone());
+                match self.refusals {
+                    Some(refusals) if seen.effects.len() > refusals => Ok(self.answer.clone()),
+                    _ => Err(ProtocolError::new(
+                        ErrorCode::OwnerConfirmationRequired,
+                        "no owner device has answered this",
+                    )),
+                }
+            }
+            other => Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("{other} was not expected"),
+            )),
+        })
+    }
+}
+
+/// A repository added from a terminal, as the command line names it.
+fn repo_add_line<'a>(root: &'a str, metadata_url: &'a str) -> Vec<&'a str> {
+    vec![
+        "plugin",
+        "repo",
+        "add",
+        "community",
+        "--root",
+        root,
+        "--metadata-url",
+        metadata_url,
+        "--targets-url",
+        "file:///srv/community/targets/",
+    ]
+}
+
+/// The result a repository's `catalogue.add` answers once an owner device has confirmed it.
+fn added(kind: kr_protocol::catalogue::CatalogueKind) -> ParamsValue {
+    use kr_protocol::catalogue::{CatalogueAddResult, CatalogueBudgets, CatalogueSummary};
+    use kr_protocol::scalars::U64;
+    ParamsValue::from_typed(&CatalogueAddResult {
+        catalogue: CatalogueSummary {
+            catalogue_id: "community".to_owned(),
+            kind,
+            metadata_url: "https://repo.example/metadata/".to_owned(),
+            targets_url: "https://repo.example/targets/".to_owned(),
+            root_digest: "a".repeat(64),
+            generation: Nullable::null(),
+            pinned_generation: Nullable::null(),
+            budgets: CatalogueBudgets {
+                metadata_bytes: U64::new(1),
+                metadata_entries: U64::new(1),
+                retained_generations: U64::new(1),
+                retained_metadata_bytes: U64::new(1),
+                payload_cache_bytes: U64::new(1),
+                full_offline_mirror: false,
+            },
+            ceiling: Vec::new(),
+            entries: U64::new(0),
+            synced_at_ms: Nullable::null(),
+        },
+    })
+    .expect("a result")
+}
+
+/// The result a package's `plugin.install` answers once an owner device has confirmed it.
+fn installed(temp: &kr_ipc::testing::TempHost) -> ParamsValue {
+    ParamsValue::from_typed(&kr_protocol::catalogue::PluginInstallResult {
         plugin: kr_protocol::catalogue::PluginSummary {
             plugin_id: kr_protocol::ids::PluginId::new(PACKAGE).expect("a package"),
             catalogue_id: "community".to_owned(),
@@ -842,16 +1025,310 @@ async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_
             admission: kr_protocol::scalars::Nullable::null(),
         },
         capabilities: Vec::new(),
-    };
+    })
+    .expect("a result")
+}
+
+/// KR-REQ-07.47, KR-REQ-10.05: a repository added from a terminal asks the host for the challenge
+/// that confirms exactly this request, says that an owner device has to confirm it and what that
+/// device is shown, repeats the request with no proof until the host spends the owner device's
+/// answer, and reports the repository. The subject the challenge was asked for is the request
+/// that is then sent, no proof beside it, and a repository at a `file` location is a local one and
+/// at any other a community one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_added_from_a_terminal_is_confirmed_on_an_owner_device_and_added() {
+    use kr_protocol::catalogue::{CatalogueAddParams, CatalogueKind};
+    use kr_protocol::confirmation::ConfirmationSubject;
+    for (metadata_url, kind) in [
+        ("https://repo.example/metadata/", CatalogueKind::Community),
+        ("file:///srv/community/metadata/", CatalogueKind::Local),
+    ] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let root = temp.root().join("root.json");
+        std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
+        let root = root.display().to_string();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (asked, serving) = scripted_daemon(
+            &temp,
+            OwnerDevice {
+                effect: "catalogue.add",
+                refusals: Some(2),
+                expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+                initial_bootstrap: false,
+                answer: added(kind),
+            }
+            .script(&temp, Arc::clone(&seen)),
+        );
+
+        let output = run_kr(&temp, &repo_add_line(&root, metadata_url));
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{said}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            said.contains("An owner device is asked to trust the root"),
+            "the terminal says that an owner device has to confirm, and what: {said}"
+        );
+        assert!(
+            said.contains("key-one"),
+            "the key the owner is trusting: {said}"
+        );
+        assert!(said.contains("community"), "the repository: {said}");
+
+        let seen = seen.lock().expect("the record");
+        let [ConfirmationSubject::CatalogueAdd(subject)] = seen.subjects.as_slice() else {
+            panic!("one challenge, for a repository: {:?}", seen.subjects);
+        };
+        assert_eq!(subject.kind, kind);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&subject.root)
+                .expect("the root travels as standard base64"),
+            br#"{"signed":"a root"}"#,
+            "the root is the file's bytes"
+        );
+        assert!(
+            subject.owner_confirmation.0.is_none(),
+            "no proof beside the subject"
+        );
+        assert_eq!(
+            seen.effects.len(),
+            3,
+            "two refusals and the request the host spent"
+        );
+        for effect in &seen.effects {
+            let sent: CatalogueAddParams = effect.to_typed().expect("the request");
+            assert_eq!(
+                &sent,
+                subject.as_ref(),
+                "every request sent is the exact one the challenge was asked for"
+            );
+        }
+        let methods = asked.lock().expect("the record").clone();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|name| *name == "owner.confirmation.request")
+                .count(),
+            1,
+            "one challenge, not one for each repeat: {methods:?}"
+        );
+        assert!(
+            methods.iter().all(|name| matches!(
+                name.as_str(),
+                "owner.confirmation.request" | "owner.confirmation.pending" | "catalogue.add"
+            )),
+            "{methods:?}"
+        );
+        drop(seen);
+
+        // The same command for a script: the challenge it waited on is in the document.
+        let (status, document) = json(&temp, &repo_add_line(&root, metadata_url));
+        assert_eq!(status, Some(0), "{document}");
+        assert_eq!(
+            document["catalogue"]["catalogue_id"], "community",
+            "{document}"
+        );
+        assert!(
+            document["confirmation"]["confirmation_id"].is_string(),
+            "{document}"
+        );
+        assert!(
+            document["confirmation"]["expires_at_ms"].is_string()
+                || document["confirmation"]["expires_at_ms"].is_number(),
+            "{document}"
+        );
+        serving.abort();
+    }
+}
+
+/// KR-REQ-11.42, KR-REQ-07.47: an installation the daemon says needs the owner's confirmation is
+/// asked for on an owner device the same way, and the terminal says what that device is shown: the
+/// release and its grant, and for a native bridge the host's own notice that it runs outside the
+/// plugin sandbox, apart from what the publisher says it does. The control is an installation the
+/// daemon answers at once, which asks no owner device for anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_confirmed_on_an_owner_device_is_installed_with_the_publishers_words() {
+    use kr_protocol::catalogue::PluginInstallParams;
+    use kr_protocol::confirmation::{ConfirmationSubject, NATIVE_BRIDGE_NOTICE};
+    let temp = kr_ipc::testing::TempHost::create();
+    let seen = Arc::new(Mutex::new(Seen::default()));
     let (asked, serving) = scripted_daemon(
         &temp,
-        always(Ok(ParamsValue::from_typed(&installed).expect("a result"))),
+        OwnerDevice {
+            effect: "plugin.install",
+            refusals: Some(3),
+            expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+            initial_bootstrap: false,
+            answer: installed(&temp),
+        }
+        .script(&temp, Arc::clone(&seen)),
     );
+    let output = run_kr(&temp, &native_bridge_install_line());
+    let said = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{said}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains("An owner device is asked to install"),
+        "{said}"
+    );
+    assert!(
+        said.contains(NATIVE_BRIDGE_NOTICE),
+        "the host's own notice that a native bridge runs outside the sandbox: {said}"
+    );
+    assert!(
+        said.contains(&format!("the publisher says: {STATEMENT}")),
+        "the publisher's words, apart from the host's: {said}"
+    );
+    assert!(said.contains("Installed"), "{said}");
+    let seen = seen.lock().expect("the record");
+    let [ConfirmationSubject::PluginInstall(subject)] = seen.subjects.as_slice() else {
+        panic!("one challenge, for an installation: {:?}", seen.subjects);
+    };
+    assert!(subject.owner_confirmation.0.is_none());
+    assert_eq!(
+        seen.effects.len(),
+        4,
+        "the first request and two repeats refused, then the one spent"
+    );
+    for effect in &seen.effects {
+        let sent: PluginInstallParams = effect.to_typed().expect("the request");
+        assert_eq!(
+            &sent,
+            subject.as_ref(),
+            "the request is the one the challenge names"
+        );
+    }
+    assert_eq!(
+        asked
+            .lock()
+            .expect("the record")
+            .first()
+            .map(String::as_str),
+        Some("plugin.install"),
+        "an installation is asked for first, as one that needs no confirmation is"
+    );
+    serving.abort();
+
+    // The control: an installation the daemon answers at once, which asks no owner device.
+    let temp = kr_ipc::testing::TempHost::create();
+    let (asked, serving) = scripted_daemon(&temp, always(Ok(installed(&temp))));
     let (status, document) = json(&temp, &install_line());
     assert_eq!(status, Some(0), "{document}");
     assert_eq!(document["plugin"]["plugin_id"], PACKAGE, "{document}");
+    assert!(document.get("confirmation").is_none(), "{document}");
     assert_eq!(*asked.lock().expect("the record"), ["plugin.install"]);
     serving.abort();
+}
+
+/// KR-REQ-07.47: when no owner device answers, the command waits until the challenge's own
+/// deadline and ends with a refusal that says nothing was changed, whichever of the two commands
+/// it is. The control is the same installation with an owner device that answers, above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_that_never_answers_ends_at_the_challenges_deadline_and_changes_nothing() {
+    use kr_protocol::catalogue::CatalogueKind;
+    for effect in ["plugin.install", "catalogue.add"] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let root = temp.root().join("root.json");
+        std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
+        let root = root.display().to_string();
+        let expires_at_ms = kr_ipc::now_ms().get() + 2_500;
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (asked, serving) = scripted_daemon(
+            &temp,
+            OwnerDevice {
+                effect,
+                refusals: None,
+                expires_at_ms,
+                initial_bootstrap: false,
+                answer: added(CatalogueKind::Community),
+            }
+            .script(&temp, Arc::clone(&seen)),
+        );
+        let line = if effect == "plugin.install" {
+            install_line()
+        } else {
+            repo_add_line(&root, "https://repo.example/metadata/")
+        };
+        let (status, refused) = json(&temp, &line);
+        assert!(
+            kr_ipc::now_ms().get() >= expires_at_ms,
+            "{effect}: the command waited for the challenge to run out"
+        );
+        assert_eq!(status, Some(8), "{effect}: {refused}");
+        assert_eq!(refused["code"], "OWNER_CONFIRMATION_REQUIRED", "{refused}");
+        let message = text(&refused["message"]);
+        assert!(message.contains("no owner device confirmed"), "{message}");
+        assert!(message.contains("Nothing was changed"), "{message}");
+        let methods = asked.lock().expect("the record").clone();
+        assert!(
+            methods.iter().filter(|name| *name == effect).count() >= 2,
+            "{effect}: the request was repeated until the deadline: {methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|name| *name == "owner.confirmation.request")
+                .count(),
+            1,
+            "{methods:?}"
+        );
+        serving.abort();
+    }
+}
+
+/// KR-REQ-10.52: a host that has no owner device yet has nobody to confirm, and the terminal says
+/// so at once and how to pair the first one, without waiting for a challenge nobody can answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_no_owner_device_is_told_how_to_pair_one_and_nothing_waits() {
+    use kr_protocol::catalogue::CatalogueKind;
+    for effect in ["plugin.install", "catalogue.add"] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let root = temp.root().join("root.json");
+        std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
+        let root = root.display().to_string();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (asked, serving) = scripted_daemon(
+            &temp,
+            OwnerDevice {
+                effect,
+                refusals: None,
+                expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+                initial_bootstrap: true,
+                answer: added(CatalogueKind::Community),
+            }
+            .script(&temp, Arc::clone(&seen)),
+        );
+        let line = if effect == "plugin.install" {
+            install_line()
+        } else {
+            repo_add_line(&root, "https://repo.example/metadata/")
+        };
+        let (status, refused) = json(&temp, &line);
+        assert_eq!(status, Some(8), "{effect}: {refused}");
+        assert_eq!(refused["code"], "OWNER_CONFIRMATION_REQUIRED", "{refused}");
+        let message = text(&refused["message"]);
+        assert!(message.contains("kr pair invite --owner"), "{message}");
+        assert!(message.contains("Nothing was changed"), "{message}");
+        let methods = asked.lock().expect("the record").clone();
+        let expected: &[&str] = if effect == "plugin.install" {
+            &["plugin.install", "owner.confirmation.request"]
+        } else {
+            &["owner.confirmation.request"]
+        };
+        assert_eq!(
+            methods, expected,
+            "nothing is repeated for an owner nobody can be"
+        );
+        serving.abort();
+    }
 }
 
 /// KR-REQ-07.47: an apply the daemon began and did not finish is not a success. The command exits
@@ -993,7 +1470,7 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
     let revoked = ParamsValue::from_typed(&revoked).expect("a revocation");
     let (asked, serving) = scripted_daemon(
         &temp,
-        Box::new(move |method| match method {
+        Box::new(move |method, _| match method {
             "device.list" => Ok(listed.clone()),
             "device.revoke" => Ok(revoked.clone()),
             other => Err(ProtocolError::new(

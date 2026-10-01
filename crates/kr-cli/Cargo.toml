@@ -17,6 +17,8 @@ name = "kr-attach-guard"
 path = "src/bin/kr-attach-guard.rs"
 
 [dependencies]
+# The trust root a repository is added with travels in the request as standard base64.
+base64.workspace = true
 clap.workspace = true
 # A release archive `kr host update` stages: gzip, then tar.
 flate2.workspace = true
