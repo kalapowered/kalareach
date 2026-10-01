@@ -760,7 +760,8 @@ pub fn decide_activated_modules(
         return Err(BridgeRefused::new(
             QualificationReason::ModuleTreeUnsupported,
             format!(
-                "module {} imports {import}, which this reader ({reader_abi}) does not provide",
+                "module {} imports {import}, which neither this reader ({reader_abi}) nor anything else \
+                 the shell holds provides",
                 module.name
             ),
         ));
@@ -1136,8 +1137,8 @@ mod tests {
         assert_eq!(refused.code(), ErrorCode::ShellIntegrationUnsupported);
         assert_eq!(
             refused.error.message,
-            "module kr_user imports zle_abi_newer_entry, which this reader (zle-5.9) does not \
-             provide"
+            "module kr_user imports zle_abi_newer_entry, which neither this reader (zle-5.9) nor \
+             anything else the shell holds provides"
         );
     }
 

@@ -5014,9 +5014,10 @@ async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() 
     assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
     assert_eq!(
         error.message,
-        "module_tree_unsupported: module kr_user imports zle_abi_newer_entry, which this reader \
-         (zle-5.9) does not provide; rebuild the module for this reader, stop loading it in \
-         KalaReach sessions, or create the session with --shell-mode native_compat"
+        "module_tree_unsupported: module kr_user imports zle_abi_newer_entry, which neither this \
+         reader (zle-5.9) nor anything else the shell holds provides; rebuild the module for this \
+         reader, load the module that provides the name before it, stop loading it in KalaReach \
+         sessions, or create the session with --shell-mode native_compat"
     );
     // The session that was being created is closed, and it was never ready.
     tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
@@ -5070,7 +5071,7 @@ async fn a_session_that_closed_after_it_qualified_is_not_answered_ready() {
     assert_eq!(error.code, ErrorCode::ShellIntegrationUnsupported);
     assert_eq!(
         error.message,
-        "the session ended before its root integration qualified"
+        "the session ended before the create was answered"
     );
     wired.close().await;
 }
