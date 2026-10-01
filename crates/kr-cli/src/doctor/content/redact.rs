@@ -22,8 +22,9 @@
 //!   its authority replaced, wherever in the text it sits, inside a value or not.
 //!
 //! A value with a quote that never closes cannot be told apart from the rest of the field, so the
-//! whole field is withheld, as its length. A quote that a path opened and nothing closed counts: a
-//! credential after it withholds the field too.
+//! whole field is withheld, as its length. So is a field with a credential name in it and a quote
+//! open at its end, an apostrophe in a path that nothing closed: every quote after it reads the
+//! other way, and where a value ends cannot be told.
 //!
 //! # What a name says
 //!
@@ -59,7 +60,8 @@ const HOME: &str = "[home]";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Paths {
     /// Whether upper and lower case letters are the same letter, as the file system folds them:
-    /// compared as capitals, so the two lower-case sigmas are one.
+    /// compared as capitals or as lower case, so the two lower-case sigmas are one and so are the
+    /// Kelvin sign and `k`.
     pub ignores_case: bool,
     /// Whether `\` separates the parts of a path as `/` does.
     pub backslash_separates: bool,
@@ -77,7 +79,8 @@ impl Paths {
 
     fn same(self, a: char, b: char) -> bool {
         a == b
-            || (self.ignores_case && a.to_uppercase().eq(b.to_uppercase()))
+            || (self.ignores_case
+                && (a.to_uppercase().eq(b.to_uppercase()) || a.to_lowercase().eq(b.to_lowercase())))
             || (self.backslash_separates && self.separates(a) && self.separates(b))
     }
 
@@ -157,10 +160,17 @@ struct Span {
 /// Replaces each credential `text` spells, or says it cannot: `None` when a credential's value
 /// starts with a quote that never closes.
 fn credentials(text: &str) -> Option<String> {
-    let mut spans = Vec::new();
+    let mut named = Vec::new();
+    assignments(text, &mut named)?;
+    options(text, &mut named)?;
+    // A quote that is open at the end of the text, an apostrophe in a path that nothing closed,
+    // turns every quote after it the other way, so where a credential's value ends cannot be told:
+    // with a credential name in the text, the field is withheld.
+    if !named.is_empty() && quote_at(text, text.len()).is_some() {
+        return None;
+    }
+    let mut spans = named;
     userinfo(text, &mut spans);
-    assignments(text, &mut spans)?;
-    options(text, &mut spans)?;
     Some(replace_spans(text, spans))
 }
 
@@ -227,12 +237,18 @@ fn assignments(text: &str, spans: &mut Vec<Span>) -> Option<()> {
             .rev()
             .take_while(|character| is_name_character(*character))
             .count();
-        let name = &text[equals - name..equals];
-        if name.is_empty() || !says_credential(name) {
+        let name_start = equals - name;
+        if name == 0 || !says_credential(&text[name_start..equals]) {
             continue;
         }
         let start = equals + 1;
-        let end = value_end(text, start, quote_at(text, start))?;
+        // A name straight after a quote that opens there is an assignment that is a whole argument:
+        // `-e "PASSWORD=two words"`, `env 'TOKEN=a b'`. Its value runs to that quote's close. In
+        // any other place the value is a word, read from where it starts.
+        let end = match opening_quote_before(text, name_start) {
+            Some(quote) => value_end_in(text, start, quote)?,
+            None => value_end(text, start)?,
+        };
         if end > start {
             spans.push(Span {
                 start,
@@ -275,20 +291,22 @@ fn options(text: &str, spans: &mut Vec<Span>) -> Option<()> {
         if start >= text.len() || text[start..].starts_with("--") {
             continue;
         }
-        let end = value_end(text, start, quote_at(text, start))?;
-        spans.push(Span {
-            start,
-            end,
-            with: REDACTED,
-        });
+        let end = value_end(text, start)?;
+        if end > start {
+            spans.push(Span {
+                start,
+                end,
+                with: REDACTED,
+            });
+        }
     }
     Some(())
 }
 
 /// One character of a word read as a shell reads it: moves `quote` when the character opens or
 /// closes a quote, skips what a backslash escapes, and says whether the character is whitespace
-/// outside every quote, which is where a word ends. Only the ASCII whitespace a shell splits on
-/// counts: a no-break space is a character of its word.
+/// outside every quote, which is where a word ends. Only the space, tab and newline a shell splits
+/// on count: a carriage return or a no-break space is a character of its word.
 fn step(
     quote: &mut Option<char>,
     character: char,
@@ -302,7 +320,7 @@ fn step(
             rest.next();
         }
         Some(_) => {}
-        None if character.is_ascii_whitespace() => return true,
+        None if matches!(character, ' ' | '\t' | '\n') => return true,
         None if matches!(character, '"' | '\'') => *quote = Some(character),
         None if character == '\\' => {
             rest.next();
@@ -312,36 +330,65 @@ fn step(
     false
 }
 
-/// The quote that is open at `position`, reading the text from its start as a shell reads it: the
-/// quote a whole assignment such as `-e "PASSWORD=two words"` sits in. A quote that opened in a
-/// path earlier in the text and never closed counts too, which withholds the field when a
-/// credential follows it: the rest of the text cannot be told from the value.
+/// The quote that is open at `position`, reading the text from its start as a shell reads it.
 fn quote_at(text: &str, position: usize) -> Option<char> {
-    let mut quote = None;
+    let mut open = None;
     let mut characters = text[..position].char_indices();
     while let Some((_, character)) = characters.next() {
-        step(&mut quote, character, &mut characters);
+        step(&mut open, character, &mut characters);
     }
-    quote
+    open
 }
 
-/// Where a value that starts at `start` ends, read as a shell reads a word that begins inside
-/// `quote`: at the first whitespace that is not inside a quote and not escaped, so `abc"d e"` and
-/// `'it'\''s here'` are one value each, and so is the rest of a quoted assignment. `None` when a
-/// quote never closes: the rest of the field cannot be told from the value.
-fn value_end(text: &str, start: usize, mut quote: Option<char>) -> Option<usize> {
-    let around = quote;
+/// The quote that opens straight before `position`, when one does: the character before it is a
+/// quote, and reading the text from its start as a shell reads it, that quote is not the close of an
+/// earlier one.
+fn opening_quote_before(text: &str, position: usize) -> Option<char> {
+    let quote = text[..position].chars().next_back()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+    quote_at(text, position - quote.len_utf8())
+        .is_none()
+        .then_some(quote)
+}
+
+/// Where a value that starts at `start` ends, read as a shell reads a word: at the first whitespace
+/// that is not inside a quote and not escaped, so `abc"d e"` and `'it'\''s here'` are one value
+/// each. `None` when a quote never closes: the rest of the field cannot be told from the value.
+fn value_end(text: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
     let mut characters = text[start..].char_indices();
     while let Some((offset, character)) = characters.next() {
-        // The quote the assignment itself sits in ends the value, and stays in the text.
-        if around.is_some() && quote == around && Some(character) == around {
-            return Some(start + offset);
-        }
         if step(&mut quote, character, &mut characters) {
             return Some(start + offset);
         }
     }
     quote.is_none().then_some(text.len())
+}
+
+/// Where a value that starts at `start` ends when it sits in an argument that `outer` opened: at
+/// the `outer` quote that closes the argument, which stays in the text, so the whole argument is the
+/// assignment. A quote of that kind closes the argument only when whitespace or the end of the text
+/// follows it: in `'TOKEN=it'\''s here'` the first one is part of how the shell spells an
+/// apostrophe. `None` when the argument never closes.
+fn value_end_in(text: &str, start: usize, outer: char) -> Option<usize> {
+    let mut quote = Some(outer);
+    let mut characters = text[start..].char_indices();
+    while let Some((offset, character)) = characters.next() {
+        if quote == Some(outer) && character == outer {
+            let after = text[start + offset + character.len_utf8()..].chars().next();
+            if after.is_none_or(|next| matches!(next, ' ' | '\t' | '\n')) {
+                return Some(start + offset);
+            }
+        }
+        // The argument ends at whitespace outside every quote, which can come once the quote that
+        // opened it has closed in the middle of it (`"PASSWORD="secret`).
+        if step(&mut quote, character, &mut characters) {
+            return Some(start + offset);
+        }
+    }
+    None
 }
 
 /// Whether a character can be part of the name of an assignment or an option.

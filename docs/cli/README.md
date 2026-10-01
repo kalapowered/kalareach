@@ -917,7 +917,8 @@ authorization, key or cookie. `PWD` would not be redacted but `tokenizer` would 
 a name that says credential is read as a shell reads a word, so a quoted string, or a word made of
 quoted and unquoted parts such as `abc"d e"`, is the credential value, as is the rest of an
 assignment that is itself inside quotes, such as `"PASSWORD=two words"`. If the quote is not closed
-the entire field will be withheld and its length reported.
+the entire field will be withheld and its length reported, and so is a field with a credential name
+in it and a quote left open at its end, such as an apostrophe in a path.
 
 A filter is not a guarantee that no secret remains, and this one cannot tell a secret from other
 text by its value. It does not filter positional secrets, plain path components, values to `-p` and
@@ -956,11 +957,11 @@ invocations, because the digest covers what was left out. Invocations without ei
 `--confirm-content` in non-terminal environments will fail with a usage error before the host is
 consulted.
 
-When `--json` is provided and the export is not refused, the `content_digest`, `content_left_out`
-and `content_written` fields will be present in the output document when the export is neither
-refused nor followed by a failure to write the bundle. The `bundle` field will only be present if
-the bundle has been written. Refusing or declining the export operation results in a regular failure
-document without `bundle` and without these fields.
+When `--json` is provided, the `content_digest`, `content_left_out` and `content_written` fields
+will be present in the output document of an export that was previewed or approved. The `bundle`
+field will only be present if the bundle has been written. A failure document, which a refused or
+declined export, a failed read, a preview that cannot be printed and a bundle that cannot be written
+each give, has neither `bundle` nor these fields.
 
 #### What it cannot do
 
