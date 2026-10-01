@@ -2418,9 +2418,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                     .strip_prefix(layout.root)
                     .and_then(|rest| rest.strip_prefix('/'))
                     .and_then(|rest| rest.split_once('/'))
-                    .filter(|(directory, tail)| {
-                        plain_name(directory) && layout.tails.contains(tail)
-                    });
+                    .filter(|(_, tail)| layout.tails.contains(tail));
                 let Some((directory, _)) = placed else {
                     return Err(format!(
                         "the recipe installs {destination}, which this host does not permit a \
