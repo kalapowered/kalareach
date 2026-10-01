@@ -91,6 +91,9 @@ enum Message {
     Purge { done: SyncSender<()> },
     /// Something the host reads changed: the privacy state, a clock a test moved, the conditions.
     Wake,
+    /// Fails the host's thread, for this crate's own tests of what a failing thread leaves behind.
+    #[cfg(test)]
+    Fail,
 }
 
 /// What the host publishes about the service after each turn, for a reader of `session.describe`.
@@ -301,9 +304,6 @@ impl DescribeHost {
             std::thread::Builder::new()
                 .name("describe-host".to_owned())
                 .spawn(move || {
-                    // Cleared however the thread ends, a panic included: a host that is gone owes
-                    // privacy mode nothing, and says it is not running.
-                    let _exit = Exit(Arc::clone(&shared));
                     Thread {
                         shared,
                         driver,
@@ -420,6 +420,12 @@ impl DescribeHost {
     /// on, and the caller asks again. A host that does not run owes nothing.
     pub(crate) fn purge(&self) -> std::result::Result<(), Unavailable> {
         if !self.shared.running.load(Ordering::Acquire) {
+            // Nothing will take what is waiting in the slots, and it is not left in memory.
+            self.shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
             return Ok(());
         }
         let (done, answered) = std::sync::mpsc::sync_channel(1);
@@ -495,6 +501,11 @@ impl Drop for Exit {
     fn drop(&mut self) {
         self.0.running.store(false, Ordering::Release);
         self.0.purges_owed.store(0, Ordering::Release);
+        self.0
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -533,6 +544,9 @@ struct Thread {
 
 impl Thread {
     fn run(mut self) {
+        // Cleared however the thread ends, a panic included: a host that is gone owes privacy
+        // mode nothing, holds nothing in its slots and says it is not running.
+        let _exit = Exit(Arc::clone(&self.shared));
         while self.shared.running.load(Ordering::Acquire) {
             let now = self.clock.now();
             self.take_messages(now);
@@ -572,6 +586,9 @@ impl Thread {
                     self.driver
                         .service_mut()
                         .session_opened(session_id, epoch, binding);
+                    // The service forgot the session's events; so does the host's cursor, or the
+                    // events its worker still holds would be taken for ones it had seen.
+                    self.last_event.remove(&session_id);
                     // A session opened while privacy mode is on is fenced from the start, at the
                     // generation in force.
                     let published = self.privacy.now();
@@ -614,6 +631,8 @@ impl Thread {
                     let _ = done.send(());
                 }
                 Message::Wake => {}
+                #[cfg(test)]
+                Message::Fail => panic!("the host's thread fails, as a test asked"),
             }
         }
     }
@@ -907,14 +926,13 @@ fn read_conditions_until_stopped(
     every: Duration,
 ) {
     while shared.running.load(Ordering::Acquire) {
+        // Stamped before the reading is taken, so it is never taken for newer than it is.
+        let at_ms = clock.now().monotonic_ms();
         let conditions = read();
         *shared
             .reading
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Taken {
-            at_ms: clock.now().monotonic_ms(),
-            conditions,
-        });
+            .unwrap_or_else(PoisonError::into_inner) = Some(Taken { at_ms, conditions });
         shared.waker.wake();
         let until = std::time::Instant::now() + every;
         while shared.running.load(Ordering::Acquire) && std::time::Instant::now() < until {
@@ -1301,6 +1319,33 @@ mod tests {
         });
     }
 
+    /// A reading is as old as the moment it was begun at: one that took over a minute to take is
+    /// not used, though it was stored a moment ago.
+    #[test]
+    fn a_reading_that_took_over_a_minute_to_take_is_as_old_as_when_it_began() {
+        use kr_describe::budget::GIB;
+        use kr_describe::resource::{PowerSource, ThermalState};
+
+        let (_directory, host) = thread(state(0, false));
+        let roomy = HostConditions::measured(
+            16 * GIB,
+            12 * GIB,
+            PowerSource::Mains,
+            ThermalState::Nominal,
+        );
+        read_conditions_until_stopped(
+            &host.shared,
+            &host.clock,
+            &|| {
+                host.clock.skew_ms.fetch_add(61_000, Ordering::AcqRel);
+                host.shared.running.store(false, Ordering::Release);
+                roomy
+            },
+            Duration::from_millis(1),
+        );
+        assert_ne!(host.conditions(), roomy, "the reading is over a minute old");
+    }
+
     /// A purge the host's thread does not answer within its bound is unavailable, and stays owed
     /// until the thread has made it, which it does when it turns; one it answers is done and owes
     /// nothing; and a host whose thread is gone owes none, so privacy mode is never kept waiting
@@ -1390,20 +1435,93 @@ mod tests {
     }
 
     /// What the host's thread leaves behind is cleared when it ends by unwinding as well as by
-    /// returning: a host that panicked is not running, and owes privacy mode no purge.
+    /// returning: a host whose thread failed is not running, owes privacy mode no purge and holds
+    /// nothing in its slots.
     #[test]
     fn a_host_thread_that_panics_is_not_left_running_or_owing_a_purge() {
         let (_directory, host) = thread(state(0, false));
         host.shared.purges_owed.store(3, Ordering::Release);
         let shared = Arc::clone(&host.shared);
-        let ended = std::thread::spawn(move || {
-            let _exit = Exit(shared);
-            panic!("the host's thread fails");
-        })
-        .join();
+        // Kept to the end: dropping a handle stops its host.
+        let handle = DescribeHost {
+            shared: Arc::clone(&shared),
+            thread: Mutex::new(None),
+        };
+        handle.page(session(), Box::new(page(0)));
+        shared
+            .inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(Message::Fail)
+            .expect("the host is listening");
+        let ended = std::thread::spawn(move || host.run()).join();
         assert!(ended.is_err(), "the thread panicked");
-        assert!(!host.shared.running.load(Ordering::Acquire));
-        assert_eq!(host.shared.purges_owed.load(Ordering::Acquire), 0);
+        assert!(!shared.running.load(Ordering::Acquire));
+        assert_eq!(shared.purges_owed.load(Ordering::Acquire), 0);
+        assert!(
+            shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is left in the slots"
+        );
+        drop(handle);
+    }
+
+    /// A host that has stopped forgets the pages waiting for it when it is asked to purge, and
+    /// owes nothing.
+    #[test]
+    fn a_purge_of_a_host_that_has_stopped_empties_its_slots() {
+        let (_directory, host) = thread(state(0, false));
+        let handle = DescribeHost {
+            shared: Arc::clone(&host.shared),
+            thread: Mutex::new(None),
+        };
+        handle.page(session(), Box::new(page(0)));
+        handle.shared.running.store(false, Ordering::Release);
+        assert_eq!(handle.purge(), Ok(()));
+        assert!(
+            handle
+                .shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    /// A session opened again starts its events from nothing: the host's cursor of what it took is
+    /// forgotten with the service's own, and the events its worker still holds are taken again.
+    #[test]
+    fn a_session_opened_again_takes_the_events_its_worker_still_holds() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let (_directory, mut host) = thread(state(0, false));
+        let page_of = |revision: u64| {
+            page_with(0, revision, |facts| {
+                facts.events = vec![kr_protocol::describe::DescriptionEvent {
+                    cursor: U64::new(0),
+                    kind: DescriptionEventKind::CommandAccepted,
+                    summary: "cargo".to_owned(),
+                }];
+            })
+        };
+        host.apply(session(), &page_of(1), now);
+        assert_eq!(host.last_event.get(&session()), Some(&0));
+        host.shared
+            .inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(Message::Opened {
+                session_id: session(),
+                epoch: SessionEpoch::V1,
+                binding: ContextBinding::new("display-1/epoch-1"),
+            })
+            .expect("the host is listening");
+        host.take_messages(now);
+        assert_eq!(host.last_event.get(&session()), None, "forgotten with it");
+        host.apply(session(), &page_of(2), now);
+        assert_eq!(host.last_event.get(&session()), Some(&0), "taken again");
     }
 
     /// A session opened while privacy mode is on is fenced from the start at the generation in
