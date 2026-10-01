@@ -14,7 +14,7 @@ use kr_client::shown::Shown;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 
-use kr_ipc::client::LocalClient;
+use crate::bridge::link::Link;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
@@ -376,8 +376,8 @@ pub struct Attachment {
 ///
 /// Returns the host's refusal, or a transport failure.
 pub async fn attach(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     dimensions: Dimensions,
     claim_geometry: bool,
     probe: bool,
@@ -389,7 +389,7 @@ pub async fn attach(
         requested.insert(AttachmentCapability::Geometry);
     }
     let params = SessionAttachParams {
-        session_id: descriptor.session_id,
+        session_id: attaching.session_id,
         mode: AttachMode::Terminal,
         claim_geometry,
         dimensions: Nullable::some(dimensions),
@@ -400,7 +400,7 @@ pub async fn attach(
         requested,
     };
     let result: SessionAttachResult =
-        call(client, Method::SessionAttach, target(descriptor), &params).await?;
+        call(client, Method::SessionAttach, attaching.target(), &params).await?;
     let attachment_id = result.attachment.attachment_id;
     // Implicit acquisition, because this is the local operating-system path: the worker
     // authenticated the caller by peer credentials. A network client cannot assert that, and the
@@ -413,9 +413,9 @@ pub async fn attach(
     let lease = match call::<_, InputAcquireResult>(
         client,
         Method::InputAcquire,
-        target(descriptor),
+        attaching.target(),
         &InputAcquireParams {
-            session_id: descriptor.session_id,
+            session_id: attaching.session_id,
             attachment_id,
             expected_epoch: Nullable::null(),
         },
@@ -493,15 +493,15 @@ fn version(version: PackageVersion) -> Shown {
 ///
 /// Returns the host's refusal, or a transport failure.
 pub async fn take_geometry(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     attachment_id: AttachmentId,
     expected_epoch: kr_protocol::ids::GeometryEpoch,
 ) -> Result<kr_protocol::attachment::GeometryResult> {
     call(
         client,
         Method::TerminalGeometryTransfer,
-        target(descriptor),
+        attaching.target(),
         &kr_protocol::attachment::TerminalGeometryTransferParams {
             attachment_id,
             expected_geometry_epoch: expected_epoch,
@@ -516,11 +516,11 @@ pub async fn take_geometry(
 ///
 /// Returns the host's refusal, or a transport failure.
 pub async fn resize(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     params: &kr_protocol::attachment::TerminalResizeParams,
 ) -> Result<kr_protocol::attachment::GeometryResult> {
-    call(client, Method::TerminalResize, target(descriptor), params).await
+    call(client, Method::TerminalResize, attaching.target(), params).await
 }
 
 /// Returns the guard executable of this command's own release, which sits beside this one.
@@ -551,7 +551,7 @@ pub const DETACH_TOKEN_VARIABLE: &str = "KR_DETACH_TOKEN";
 ///
 /// Returns the host's refusal, or a transport failure.
 pub async fn detach_attachment(
-    client: &mut LocalClient,
+    client: &mut impl Link,
     descriptor: &WorkerDescriptor,
     attachment_id: Option<AttachmentId>,
 ) -> Result<kr_protocol::attachment::SessionDetachResult> {
@@ -581,7 +581,7 @@ pub async fn detach_attachment(
 ///
 /// Returns the host's refusal, or a transport failure.
 pub async fn subscribe(
-    client: &mut LocalClient,
+    client: &mut impl Link,
     session_id: SessionId,
     attachment_id: AttachmentId,
     from_cursor: Option<u64>,
@@ -623,20 +623,54 @@ pub fn spawn_input_reader(
     receiver
 }
 
-/// Returns the action target that names this worker's session.
-#[must_use]
-pub fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
-    ActionTarget {
-        environment_id: descriptor.environment_id,
-        session_id: Nullable::some(descriptor.session_id),
-        session_epoch: Nullable::some(SessionEpoch::V1),
-        application_instance_id: Nullable::null(),
-        agent_binding_revision: Nullable::null(),
+/// What an attachment needs to know of the session it attaches to.
+///
+/// A session on this host is named by the descriptor its worker published. A session in another
+/// environment has no descriptor here, because the worker's endpoint and key are that
+/// environment's own, so what the attachment uses is what both have: the session, the environment
+/// it is in, and the number a person knows it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attaching {
+    /// The session.
+    pub session_id: SessionId,
+    /// The environment it runs in.
+    pub environment_id: kr_protocol::ids::EnvironmentId,
+    /// The number a person selects it by inside that environment.
+    pub display_number: DisplayNumber,
+}
+
+impl From<&WorkerDescriptor> for Attaching {
+    fn from(descriptor: &WorkerDescriptor) -> Self {
+        Self {
+            session_id: descriptor.session_id,
+            environment_id: descriptor.environment_id,
+            display_number: descriptor.display_number,
+        }
     }
 }
 
+impl Attaching {
+    /// The action target that names this session.
+    #[must_use]
+    pub fn target(&self) -> ActionTarget {
+        ActionTarget {
+            environment_id: self.environment_id,
+            session_id: Nullable::some(self.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        }
+    }
+}
+
+/// Returns the action target that names this worker's session.
+#[must_use]
+pub fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
+    Attaching::from(descriptor).target()
+}
+
 async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
-    client: &mut LocalClient,
+    client: &mut impl Link,
     method: Method,
     target: ActionTarget,
     params: &P,

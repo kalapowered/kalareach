@@ -25,14 +25,17 @@
 //! can widen it, and no environment variable is read for it.
 
 use kr_client::shown;
-use kr_client::shown::Shown;
+use kr_client::shown::{Said, Shown};
 use std::io::{Read, Write};
 
 use kr_ipc::paths::HostPaths;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
-use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeHelloAck, BridgeTarget};
+use kr_protocol::identity::{
+    BridgeFrame, BridgeHello, BridgeHelloAck, BridgeTarget, DESTINATION_BASE_VARIABLES,
+    DestinationBase,
+};
 use kr_protocol::scalars::U64;
 
 use crate::bridge::pipe::{self, PipeError};
@@ -55,6 +58,12 @@ pub enum Refusal {
     AlreadyBridged,
     /// The session target has closed.
     SessionClosed,
+    /// A frame to be carried says hello again.
+    ///
+    /// A connection says hello once. The destination admits a connection under what its hello
+    /// declared, so a second one carried over an open bridge would be a way to admit it again
+    /// under something else.
+    SecondHello,
 }
 
 impl Refusal {
@@ -70,6 +79,7 @@ impl Refusal {
             }
             Self::AlreadyBridged => "a request crosses at most one process bridge",
             Self::SessionClosed => "that session is closed",
+            Self::SecondHello => "a bridge says hello once, and a second one is not carried",
         }
     }
 
@@ -81,7 +91,9 @@ impl Refusal {
             // failures. The two admission rules are authority failures, and both say the same
             // thing, because the difference between them tells a caller nothing it may act on.
             Self::NotAHandshake | Self::ProtocolMajor => ErrorCode::UnsupportedSchema,
-            Self::RemoteOrigin | Self::AlreadyBridged => ErrorCode::PermissionDenied,
+            Self::RemoteOrigin | Self::AlreadyBridged | Self::SecondHello => {
+                ErrorCode::PermissionDenied
+            }
             Self::SessionClosed => ErrorCode::SessionClosed,
         };
         kr_client::error::refusal(code, Shown::said(self.message()))
@@ -214,32 +226,14 @@ async fn relay(
         return refuse(output, refusal);
     }
 
-    let paths = HostPaths::discover()?;
-    let known = resolve::select(&paths, environment)?;
-    let (client, role) = match hello.target {
-        BridgeTarget::Controller => (
-            resolve::open_controller(&known.paths, crate::build_id()).await?,
-            kr_protocol::local::LocalRole::Controller,
-        ),
-        BridgeTarget::Session { session_id } => {
-            match resolve::find(
-                &paths,
-                &resolve::SessionSelector::Identifier(session_id),
-                Some(known.environment_id),
-            ) {
-                Ok((_, descriptor)) => (
-                    resolve::open_worker(&descriptor, crate::build_id()).await?,
-                    kr_protocol::local::LocalRole::Worker,
-                ),
-                Err(CliError::UnknownSession(_)) => {
-                    if is_destination_session_closed(&known.paths, session_id).await {
-                        return refuse(output, Refusal::SessionClosed);
-                    }
-                    return Err(CliError::UnknownSession(shown!("{}", session_id)));
-                }
-                Err(other) => return Err(other),
-            }
-        }
+    let (client, role) = match reach(&hello, environment).await {
+        Ok(reached) => reached,
+        // Everything that stops the helper before it can acknowledge is said to the invoker as a
+        // refusal. An invoker that read only the end of the stream could name nothing, and the
+        // person would be told that a bridge failed when what failed is a daemon that is not
+        // there, or a session that is not.
+        Err(Unreached::Refusal(refusal)) => return refuse(output, refusal),
+        Err(Unreached::Error(error)) => return refuse_with(output, &error),
     };
     let (mut reader, mut writer, acknowledgement) = client.into_halves();
 
@@ -251,12 +245,14 @@ async fn relay(
         &BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
             protocol_version: acknowledgement.selected_version,
             environment_id: acknowledgement.environment_id,
-            os_user: os_user(),
+            os_user: account().name,
             role,
             connection_id: acknowledgement.connection_id,
             boot_identity: acknowledgement.boot_identity.clone(),
             max_frame_len: U64::new(pipe::max_frame_len() as u64),
             action_window: acknowledgement.action_window,
+            build: acknowledgement.build.clone(),
+            base: base(),
         })),
     )
     .map_err(|error| transport(&error))?;
@@ -276,6 +272,9 @@ async fn relay(
                     // Carried unchanged: the bytes are what a payload digest was taken over, and
                     // re-encoding them would risk changing what the caller signed for.
                     BridgeFrame::Control(carried) => {
+                        if matches!(*carried, kr_protocol::envelope::ControlFrame::Hello(_)) {
+                            return refuse(output, Refusal::SecondHello);
+                        }
                         // Except for one thing this side has to decide: a request crosses at most
                         // one bridge. The destination will serve what arrives here as an ordinary
                         // local request, so a method that opens a bridge of its own would chain one
@@ -302,6 +301,178 @@ async fn relay(
             },
         }
     }
+}
+
+/// What stopped the helper before it could acknowledge.
+enum Unreached {
+    /// One of the helper's own admission rules.
+    Refusal(Refusal),
+    /// A failure to reach the destination's daemon or worker, in the command's own terms.
+    Error(CliError),
+}
+
+impl From<CliError> for Unreached {
+    fn from(error: CliError) -> Self {
+        Self::Error(error)
+    }
+}
+
+/// Connects to what the opening asked for inside this environment.
+///
+/// A destination that was just started has no control daemon yet. An opening that may start what
+/// it needs reaches the daemon the way `kr new` does, through this environment's own configured
+/// startup, so a destination with none configured says what to set up rather than being started
+/// in a way its owner did not choose. An opening that may not start anything finds the daemon
+/// running or says that it is not.
+async fn reach(
+    hello: &BridgeHello,
+    environment: Option<&str>,
+) -> std::result::Result<(kr_ipc::client::LocalClient, kr_protocol::local::LocalRole), Unreached> {
+    let paths = HostPaths::discover().map_err(CliError::from)?;
+    let known = resolve::select(&paths, environment)?;
+    let (client, role) = match hello.target {
+        BridgeTarget::Controller => (
+            controller(&paths, &known, hello.start).await?,
+            kr_protocol::local::LocalRole::Controller,
+        ),
+        BridgeTarget::Session { session_id } => {
+            match resolve::find(
+                &paths,
+                &resolve::SessionSelector::Identifier(session_id),
+                Some(known.environment_id),
+            ) {
+                Ok((_, descriptor)) => (
+                    resolve::open_worker(&descriptor, crate::build_id()).await?,
+                    kr_protocol::local::LocalRole::Worker,
+                ),
+                Err(CliError::UnknownSession(_)) => {
+                    // No worker publishes a descriptor for it, so the daemon's retained record is
+                    // what says whether it closed. After a stop of the whole environment that
+                    // daemon has to be started to be asked, which an attach is allowed to do.
+                    if is_destination_session_closed(&paths, &known, session_id, hello.start).await
+                    {
+                        return Err(Unreached::Refusal(Refusal::SessionClosed));
+                    }
+                    return Err(CliError::UnknownSession(shown!("{}", session_id)).into());
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+    };
+    // The destination authenticates this helper by its operating-system credentials, and says
+    // which user it saw. A socket forwarded from somewhere else is authenticated as whoever
+    // forwarded it, so a daemon that did not see this helper's own user is not this
+    // environment's: socket forwarding alone does not install the integration.
+    let own = u64::from(kr_ipc::paths::current_uid());
+    if client.acknowledgement().peer.uid.get() != own {
+        return Err(Unreached::Error(CliError::Refused(
+            kr_client::error::refusal(
+                ErrorCode::PermissionDenied,
+                Shown::said(
+                    "the daemon behind this endpoint did not authenticate this helper as the \
+                     user it runs as, so it is not this environment's own",
+                ),
+            ),
+        )));
+    }
+    Ok((client, role))
+}
+
+/// Reaches the control daemon, starting it only where the opening may.
+async fn controller(
+    paths: &HostPaths,
+    known: &resolve::KnownEnvironment,
+    start: bool,
+) -> Result<kr_ipc::client::LocalClient> {
+    if !start {
+        return resolve::open_controller(&known.paths, crate::build_id()).await;
+    }
+    let (client, started) = crate::startup::open_or_start(paths, known).await?;
+    if let Some(started) = started {
+        // Diagnostic output, which is where a person reading the log looks for what a helper did.
+        crate::report::say(&shown!("kr: {}", started.describe(known.environment_id)));
+    }
+    Ok(client)
+}
+
+/// What this helper's user is called, and where its home is, as the destination's account records
+/// them.
+struct Account {
+    name: String,
+    home: Option<String>,
+}
+
+/// Reads the account this process runs as.
+///
+/// The name is the account's own and not a variable a caller could have set: `USER` and `LOGNAME`
+/// are whatever the process that started the helper put there. A destination that records no
+/// account for the user is said by its number.
+fn account() -> Account {
+    let uid = kr_ipc::paths::current_uid();
+    #[cfg(unix)]
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
+                return Account {
+                    name: fields[0].to_owned(),
+                    home: Some(fields[5].to_owned()).filter(|home| !home.is_empty()),
+                };
+            }
+        }
+    }
+    // A destination whose accounts are not in that file (a directory service) answers `id`, which
+    // asks the system's own database for the name of this process's user.
+    #[cfg(unix)]
+    if let Ok(named) = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        && named.status.success()
+        && let Ok(name) = String::from_utf8(named.stdout)
+        && !name.trim().is_empty()
+    {
+        return Account {
+            name: name.trim().to_owned(),
+            home: None,
+        };
+    }
+    Account {
+        name: format!("uid {uid}"),
+        home: None,
+    }
+}
+
+/// Where a session created through this bridge starts, and with what, as this helper's own
+/// environment states it.
+///
+/// What a `kr new` run here would have sent, and nothing from the host the bridge was opened from.
+/// A destination that has no home to offer starts a session at its root.
+fn base() -> DestinationBase {
+    // The home the user's login gave this process, which `wsl.exe --user` and a container
+    // runtime's exec set for the user they run it as, and else the account's own record of it.
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| home.starts_with('/'))
+        .or_else(|| account().home)
+        .filter(|home| home.starts_with('/'))
+        .unwrap_or_else(|| "/".to_owned());
+    let variables = DESTINATION_BASE_VARIABLES
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| kr_protocol::session::EnvironmentVariable {
+                    name: (*name).to_owned(),
+                    value,
+                })
+        })
+        .filter(|variable| {
+            variable.value.len() <= kr_protocol::identity::DESTINATION_BASE_VALUE_LIMIT
+        })
+        .collect();
+    DestinationBase { home, variables }
 }
 
 /// Waits for the invoker's first frame.
@@ -370,6 +541,24 @@ fn refuse(output: &mut impl Write, refusal: Refusal) -> Result<()> {
     Err(CliError::Refused(error))
 }
 
+/// Writes a refusal that is the command's own failure to reach the destination, and reports it.
+fn refuse_with(output: &mut impl Write, error: &CliError) -> Result<()> {
+    let refusal = match error {
+        CliError::Refused(refused) | CliError::ServiceRefused { error: refused, .. } => {
+            refused.clone()
+        }
+        CliError::Unfinished { code, message } => kr_client::error::refusal(*code, message.clone()),
+        CliError::UnknownSession(said) => {
+            kr_client::error::refusal(ErrorCode::UnknownSession, said.clone())
+        }
+        other => kr_client::error::refusal(ErrorCode::EnvironmentUnavailable, other.said()),
+    };
+    crate::report::say(&shown!("kr bridge: {}", Shown::protocol(&refusal)));
+    pipe::write_frame(output, &BridgeFrame::Refused(refusal.clone()))
+        .map_err(|failure| transport(&failure))?;
+    Err(CliError::Refused(refusal))
+}
+
 /// Asks the destination environment whether one session has closed.
 ///
 /// Section 3: an old closed session still answers `SESSION_CLOSED`. The only thing that establishes
@@ -382,10 +571,12 @@ fn refuse(output: &mut impl Write, refusal: Refusal) -> Result<()> {
 /// still running, which is worse than saying the session is not known: a daemon that cannot be
 /// reached has not told this helper anything, and the caller is told exactly that.
 async fn is_destination_session_closed(
-    paths: &kr_ipc::paths::EnvironmentPaths,
+    paths: &HostPaths,
+    known: &resolve::KnownEnvironment,
     session_id: kr_protocol::ids::SessionId,
+    start: bool,
 ) -> bool {
-    let Ok(mut client) = resolve::open_controller(paths, crate::build_id()).await else {
+    let Ok(mut client) = controller(paths, known, start).await else {
         return false;
     };
     let params = kr_protocol::session::SessionReadParams { session_id };
@@ -403,18 +594,6 @@ async fn is_destination_session_closed(
     }
 }
 
-/// The operating-system user this helper runs as, as the destination names it.
-fn os_user() -> String {
-    for variable in ["USER", "LOGNAME", "USERNAME"] {
-        if let Ok(value) = std::env::var(variable)
-            && !value.is_empty()
-        {
-            return value;
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +608,7 @@ mod tests {
             origin_environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
             origin_ingress: ingress,
             already_bridged: false,
+            start: false,
             target: BridgeTarget::Controller,
         }
     }
