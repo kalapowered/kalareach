@@ -5,7 +5,9 @@
 //  delegate belongs to the windowing library and Firebase would wrap methods of it that have
 //  nothing to do with push, among them the ones that receive the sign-in's callback address. So the
 //  two methods the system calls with an APNs token are given to the delegate here, once, before the
-//  application registers, and the token they receive is handed to Firebase and recorded.
+//  application registers. The token they receive is recorded, and is handed to Firebase once the
+//  person has agreed to notifications: Firebase makes an installation and a registration token of
+//  its own from it, and that is not for a person who has not agreed.
 //
 
 import FirebaseCore
@@ -30,12 +32,17 @@ enum PushStartup {
             case .configureFirebase:
                 FirebaseApp.configure()
                 Messaging.messaging().delegate = TokenListener.shared
+                PushRegistration.shared.onTokenUsable = { Messaging.messaging().apnsToken = $0 }
             case .addTokenMethods:
-                if installTokenMethods() {
-                    NSLog("KalaReach: the application delegate now receives APNs tokens")
-                } else {
-                    NSLog("KalaReach: the application delegate already answers for APNs tokens, so none reaches Firebase")
-                }
+                let added = installTokenMethods()
+                NSLog(
+                    added
+                        ? "KalaReach: the application delegate now receives APNs tokens"
+                        : "KalaReach: the application delegate already answers for APNs tokens, so none reaches Firebase"
+                )
+                #if DEBUG
+                ProbeSurface.shared.show("tokenmethods", added ? "added" : "refused")
+                #endif
             case .registerForRemoteNotifications:
                 UIApplication.shared.registerForRemoteNotifications()
             case .setAutoInit(let on):
@@ -44,38 +51,40 @@ enum PushStartup {
         }
     }
 
+    /// The delegate, held for the life of the process.
+    ///
+    /// The application's delegate property does not keep its delegate alive, and the windowing
+    /// library keeps none of its own: the system makes the delegate when the process starts. Setting
+    /// the property to nil and back, as `installTokenMethods` does, must not be the moment the last
+    /// reference ends.
+    private static var heldDelegate: UIApplicationDelegate?
+
     /// Gives the delegate's class the two methods the system calls with an APNs token or a refusal.
     ///
     /// The class is read from the delegate itself rather than named, because the windowing library
-    /// declares its delegate at run time. Both additions have to succeed: a method the class already
+    /// declares its delegate at run time. Both are added or neither is: a method the class already
     /// answers is somebody else's, and replacing it would take the token from them. The delegate is
     /// set again afterwards because the system remembers which of these methods it answers.
     private static func installTokenMethods() -> Bool {
         guard let delegate = UIApplication.shared.delegate, let delegateClass = object_getClass(delegate) else {
             return false
         }
-        let received: @convention(block) (AnyObject, UIApplication, Data) -> Void = { _, _, token in
-            Messaging.messaging().apnsToken = token
-            PushRegistration.shared.registered(deviceToken: token)
-        }
-        let refused: @convention(block) (AnyObject, UIApplication, NSError) -> Void = { _, _, error in
-            PushRegistration.shared.failed(with: error)
-        }
-        let added = class_addMethod(
-            delegateClass,
-            NSSelectorFromString("application:didRegisterForRemoteNotificationsWithDeviceToken:"),
-            imp_implementationWithBlock(received),
-            "v@:@@"
+        heldDelegate = delegate
+        let outcome = DelegateMethods.install(
+            on: delegateClass,
+            received: { token in
+                NSLog("KalaReach: the system gave this device an APNs token of %d bytes", token.count)
+                PushRegistration.shared.registered(deviceToken: token)
+            },
+            refused: { error in
+                NSLog("KalaReach: the system would not register this device for notifications (%ld)", error.code)
+                PushRegistration.shared.failed(with: error)
+            }
         )
-        let failed = class_addMethod(
-            delegateClass,
-            NSSelectorFromString("application:didFailToRegisterForRemoteNotificationsWithError:"),
-            imp_implementationWithBlock(refused),
-            "v@:@@"
-        )
+        guard outcome == .added else { return false }
         UIApplication.shared.delegate = nil
         UIApplication.shared.delegate = delegate
-        return added && failed
+        return true
     }
 }
 

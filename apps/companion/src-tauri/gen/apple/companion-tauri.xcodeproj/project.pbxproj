@@ -28,6 +28,7 @@
 		4E93831717B567BEBE15595F /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */; };
 		5A7CC9F06D58FF0A7A9952AC /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
+		5A94C4DABBA16388CEDFCEEA /* DelegateMethods.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12639EB0D5C8EE0E5505664F /* DelegateMethods.swift */; };
 		5B75B7779EBDB43EFCF66B13 /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
 		5D27A11CFB87F37C191F9A5F /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 343C7C2C560F586215BF9C3F /* UIKit.framework */; };
 		5E149929F729886E49F1C45D /* KalaReachNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -59,6 +60,7 @@
 		CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
 		CCD9B0A8CD4FBCFE1F2A4A8D /* KRNativeLaunch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D97820B51FD28859F00F528 /* KRNativeLaunch.swift */; };
 		CCEAD023F0BB224C5E3793BF /* VoiceCaptureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */; };
+		CE2CF57A676E67F797676673 /* DelegateMethods.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12639EB0D5C8EE0E5505664F /* DelegateMethods.swift */; };
 		D083E29944EC99532644A8F4 /* ProbeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A99D51E204CF08E48F0D7 /* ProbeSupport.swift */; };
 		D1FD9FFA3E55CF47F92920CB /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2DF4188C16A66634654971D /* WebKit.framework */; };
 		D26D8A0C5A3E07A571DCCEBE /* PushStartup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD790CB946E32C30357728DA /* PushStartup.swift */; };
@@ -68,6 +70,7 @@
 		E696F6641926E184464CDA27 /* ProbeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A99D51E204CF08E48F0D7 /* ProbeSupport.swift */; };
 		E8C021C2AAA31205088A0B5C /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
 		EC85B29AE92893AB8A5572F3 /* ExtensionProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */; };
+		F040591E06FD762E7F2DEA18 /* DelegateMethodsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */; };
 		F04163155A595CF98164B6A6 /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
 		F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 019E652DB2C27D9CDAB07505 /* UserNotifications.framework */; };
 		F4DE4E78D9BA87F6373E92C0 /* VoiceCaptureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */; };
@@ -109,6 +112,7 @@
 		02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		0F27CA2E0B14038A22B9EF0C /* identity.rs */ = {isa = PBXFileReference; path = identity.rs; sourceTree = "<group>"; };
 		0FEF54BF56555825E7EE8283 /* VoiceCeremonyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCeremonyTests.swift; sourceTree = "<group>"; };
+		12639EB0D5C8EE0E5505664F /* DelegateMethods.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateMethods.swift; sourceTree = "<group>"; };
 		149887EB50C7C76EF2A3D3ED /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		14EA6778E306DFA8DC4625F9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		15C964AFE64445D908AF5275 /* links.rs */ = {isa = PBXFileReference; path = links.rs; sourceTree = "<group>"; };
@@ -160,6 +164,7 @@
 		867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KalaReachNativeTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8792536F137C0F4CC4172B35 /* VoiceCaptureState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCaptureState.swift; sourceTree = "<group>"; };
 		887BFCE065F103DCEEC3E5F7 /* verify.rs */ = {isa = PBXFileReference; path = verify.rs; sourceTree = "<group>"; };
+		8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateMethodsTests.swift; sourceTree = "<group>"; };
 		9036197802CA380577FAE896 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		953403801C4BBC825A98C1E9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionProbe.swift; sourceTree = "<group>"; };
@@ -351,6 +356,7 @@
 			isa = PBXGroup;
 			children = (
 				2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */,
+				12639EB0D5C8EE0E5505664F /* DelegateMethods.swift */,
 				7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */,
 				B30A99D51E204CF08E48F0D7 /* ProbeSupport.swift */,
 				529A8B9ADD788615F4718EB0 /* PushRegistration.swift */,
@@ -447,6 +453,7 @@
 		A9A55303B287F5C61BAEEC6A /* Tests */ = {
 			isa = PBXGroup;
 			children = (
+				8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */,
 				465801722BC2B2B9CACC69F2 /* ExtensionProbeTests.swift */,
 				E8D926690334E315AA0773F5 /* LaunchPlanTests.swift */,
 				706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */,
@@ -738,6 +745,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */,
+				CE2CF57A676E67F797676673 /* DelegateMethods.swift in Sources */,
+				F040591E06FD762E7F2DEA18 /* DelegateMethodsTests.swift in Sources */,
 				0136D075C0906D197FCC7A72 /* ExtensionProbe.swift in Sources */,
 				5EE3C2419E61AFE699067F1E /* ExtensionProbeTests.swift in Sources */,
 				1B1725B261E3503461B41CFD /* LaunchPlan.swift in Sources */,
@@ -767,6 +776,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */,
+				5A94C4DABBA16388CEDFCEEA /* DelegateMethods.swift in Sources */,
 				6EE6D79D43246CA480737C10 /* DeviceProbe.swift in Sources */,
 				7A6B27860E765547E301BC04 /* ExtensionProbe.swift in Sources */,
 				CCD9B0A8CD4FBCFE1F2A4A8D /* KRNativeLaunch.swift in Sources */,
