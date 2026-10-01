@@ -172,8 +172,17 @@ async fn host() -> Host {
 
 /// Attaches a terminal of the session's own size that only watches, over `client`'s connection.
 async fn attach(client: &mut LocalClient, host: &Host) -> AttachmentId {
+    attach_asking(client, host, false).await
+}
+
+/// Attaches a terminal of the session's own size over `client`'s connection, asking for input as
+/// well when `input` says so.
+async fn attach_asking(client: &mut LocalClient, host: &Host, input: bool) -> AttachmentId {
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
+    if input {
+        requested.insert(AttachmentCapability::Input);
+    }
     let attached: kr_protocol::attachment::SessionAttachResult = client
         .mutate(
             Method::SessionAttach,
@@ -418,5 +427,108 @@ async fn a_subscription_replaced_part_way_through_a_frame_leaves_the_stream_whol
     assert!(
         !host.service.part_way_through_a_frame(second),
         "and nothing is left part way to the client"
+    );
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38: a side effect already queued on a subscription that another
+/// replaces is still written, once, ahead of the new subscription's first frame.
+///
+/// The set-up is the one above: the first attachment, which holds the input lease, is part way
+/// through a frame its client has not read, and a bell the application rings is queued behind the
+/// frame. The replacement is the stream's end for everything else on the old subscription, which the
+/// new screen covers; a bell is not on any screen, so it is the one thing that is not covered, and
+/// losing it with the queue would be a side effect that reached nobody and was recorded nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_side_effect_queued_on_a_replaced_subscription_is_still_written_once() {
+    let host = host().await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let first = attach_asking(&mut client, &host, true).await;
+    let second = attach(&mut client, &host).await;
+    let _keys =
+        common::take_the_keys(&mut client, host.environment_id, host.session_id, first).await;
+    client
+        .request(Method::EventsSubscribe, &subscription(&host, first))
+        .await
+        .expect("the call reaches the worker")
+        .expect("the first subscription succeeds");
+    loop {
+        if let ControlFrame::Notification(_) =
+            next(&mut client, "before the first subscription's screen").await
+        {
+            break;
+        }
+    }
+
+    let pause = host.service.pause_before_replacing_delivery();
+    let params = ParamsValue::from_typed(&subscription(&host, second)).expect("encodes");
+    client
+        .writer()
+        .write_message(&ControlFrame::Request(Request {
+            request_id: RequestId::new(REPLACING),
+            method: Method::EventsSubscribe.into(),
+            method_version: MethodVersion::V1,
+            params,
+        }))
+        .await
+        .expect("the replacing request reaches the worker");
+    loop {
+        if let ControlFrame::Response(response) =
+            next(&mut client, "before the answer to the replacing request").await
+            && response.request_id.get() == REPLACING
+        {
+            break;
+        }
+    }
+    tokio::time::timeout(LIVENESS_DEADLINE, pause.arrived)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the connection to answer"))
+        .expect("the connection says it has answered");
+
+    // The delivery being replaced stops part way through the frame that carries the batch, with the
+    // bell and the line queued behind it.
+    write_output(&host, &vec![b'x'; BATCH_BYTES]);
+    write_output(&host, b"\x07\r\nkr-after-the-replacement\r\n");
+    until(
+        "the delivery being replaced to stop part way through a frame",
+        || host.service.part_way_through_a_frame(first),
+    )
+    .await;
+    drop(pause.release);
+    tokio::time::timeout(LIVENESS_DEADLINE, pause.replaced)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the replacement"))
+        .expect("the connection says it has replaced the first delivery");
+
+    // Everything the old subscription sent after the replacing answer, and then everything the new
+    // one did, whose first notification is the one numbered 0.
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    let mut replaced = false;
+    while !carries(&new, AFTER) {
+        let ControlFrame::Notification(notification) =
+            next(&mut client, "after the replacement").await
+        else {
+            continue;
+        };
+        replaced |= notification.sequence.get() == 0;
+        if notification.event_type.as_str() != "session.output" {
+            continue;
+        }
+        let event = notification
+            .payload
+            .to_typed::<OutputEvent>()
+            .expect("an output event decodes");
+        let into = if replaced { &mut new } else { &mut old };
+        into.extend_from_slice(event.bytes.as_slice());
+    }
+    assert_eq!(
+        old.iter().filter(|byte| **byte == 0x07).count(),
+        1,
+        "the bell reached the terminal on the subscription it was queued on"
+    );
+    assert!(
+        !new.contains(&0x07),
+        "and is not written again on the one that replaced it"
     );
 }
