@@ -741,7 +741,8 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         .unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(
         resolved
-            .question
+            .question()
+            .expect("the host shows the device that answered the question it answered")
             .answer
             .0
             .as_ref()

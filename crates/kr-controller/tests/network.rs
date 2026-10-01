@@ -3761,11 +3761,12 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
         .to_typed()
         .expect("decodes");
     assert_eq!(
-        resolved.question.state,
+        resolved.state,
         kr_protocol::question::QuestionState::Answered
     );
     let record = resolved
-        .question
+        .question()
+        .expect("the responder's grant reaches the question it answered, so it is shown it")
         .answer
         .as_ref()
         .expect("the answer is recorded");

@@ -854,6 +854,7 @@ mod tests {
             payload_digest: Digest256::from_bytes([0; 32]),
             accepted_deadline_ms: Nullable::null(),
             error: Nullable::null(),
+            error_withheld: false,
             updated_at_ms: TimestampMs::new(0),
         }
     }

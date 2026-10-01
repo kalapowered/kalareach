@@ -21,8 +21,8 @@ use kr_protocol::ids::{
     SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
-    Question, QuestionAnswer, QuestionAnswerParams, QuestionChoice, QuestionKind, QuestionSource,
-    QuestionState,
+    Question, QuestionAnswer, QuestionAnswerParams, QuestionChoice, QuestionKind,
+    QuestionResolveResult, QuestionSource, QuestionState,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 
@@ -146,7 +146,7 @@ impl Host {
         question.revision = QuestionRevision::new(question.revision.get() + 1);
     }
 
-    fn take(&self, params: &QuestionAnswerParams) -> Result<Question, ClientError> {
+    fn take(&self, params: &QuestionAnswerParams) -> Result<QuestionResolveResult, ClientError> {
         let mut questions = self.questions.lock().expect("the lock");
         let question = questions
             .iter_mut()
@@ -171,7 +171,7 @@ impl Host {
         }
         question.state = QuestionState::Answered;
         question.revision = QuestionRevision::new(question.revision.get() + 1);
-        Ok(question.clone())
+        Ok(QuestionResolveResult::whole(question.clone()))
     }
 }
 
@@ -196,7 +196,7 @@ impl QuestionHost for Host {
         &self,
         _target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> impl Future<Output = Result<Question, ClientError>> + Send {
+    ) -> impl Future<Output = Result<QuestionResolveResult, ClientError>> + Send {
         self.answers.lock().expect("the lock").push(params.clone());
         let line = *self.line.lock().expect("the lock");
         let outcome = match line {

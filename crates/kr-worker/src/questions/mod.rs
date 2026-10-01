@@ -33,7 +33,7 @@ use kr_protocol::question::{
     QuestionAnswer, QuestionAnswerParams, QuestionCancelOwnParams, QuestionCancelParams,
     QuestionCreateParams, QuestionCreateResult, QuestionEvent, QuestionEventKind,
     QuestionOwnResult, QuestionReadOwnParams, QuestionReadParams, QuestionReadResult,
-    QuestionResolveResult, QuestionState, bounded_expiry, build_choices, check_answer, check_text,
+    QuestionState, bounded_expiry, build_choices, check_answer, check_text,
 };
 
 pub use crate::questions::binding::{
@@ -43,6 +43,20 @@ pub use crate::questions::error::{QuestionError, Result, SETUP_INSTRUCTION};
 pub use crate::questions::store::Now;
 
 use crate::questions::store::{Resolved, Store};
+
+/// What one resolution of a question left behind, as this worker keeps it.
+///
+/// It is the question as it stood once the answer or the cancellation was recorded, and it is what
+/// the journal retains as the action's result. It is never what a caller is sent: each answer is
+/// built from it for the reader who is to see it
+/// ([`crate::history_filter::retained::shown_result`]), so what a reader is shown follows its
+/// authority at the moment it reads, and what is kept does not change.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resolution {
+    /// The question as it stood after the resolution.
+    pub question: Question,
+}
 
 /// The session's questions, and the waiters watching them.
 #[derive(Debug)]
@@ -205,12 +219,40 @@ impl Questions {
         answer: Option<&QuestionAnswer>,
         now: Now,
     ) -> Result<()> {
+        self.check_resolvable_reaching(question_id, expected, answer, now, |_| true)
+    }
+
+    /// Checks that a question can still be resolved by a caller whose history reaches it, and that
+    /// the answer fits its form.
+    ///
+    /// What the caller's history reaches is decided first, after the question's own deadline has
+    /// been applied and before anything else about it is said: a question the caller's history does
+    /// not reach is refused exactly as one this session does not hold is, so the refusal tells it
+    /// nothing about the question's state, its revision or its form. What is left is
+    /// [`Self::check_resolvable`]'s order, which the answering surfaces rely on: the form, then
+    /// whether it has ended, then the revision.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::check_resolvable`], and [`QuestionError::Unknown`] for a question `reaches` does
+    /// not admit.
+    pub fn check_resolvable_reaching(
+        &self,
+        question_id: kr_protocol::ids::QuestionId,
+        expected: kr_protocol::ids::QuestionRevision,
+        answer: Option<&QuestionAnswer>,
+        now: Now,
+        reaches: impl FnOnce(&Question) -> bool,
+    ) -> Result<()> {
         let mut store = self.locked()?;
         let expired = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let question = store.read(question_id);
         drop(store);
         self.woken_by(&expired);
         let question = question?;
+        if !reaches(&question) {
+            return Err(crate::questions::error::unknown(question_id));
+        }
         if let Some(answer) = answer {
             check_answer(&question, answer)?;
         }
@@ -387,7 +429,7 @@ impl Questions {
         device_id: Option<DeviceId>,
         params: &QuestionAnswerParams,
         now: Now,
-    ) -> Result<(QuestionResolveResult, Vec<QuestionEvent>)> {
+    ) -> Result<(Resolution, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let question = store.read(params.question_id)?;
@@ -404,7 +446,7 @@ impl Questions {
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
-        Ok((QuestionResolveResult { question }, events))
+        Ok((Resolution { question }, events))
     }
 
     /// Cancels a question from the answering surface.
@@ -416,7 +458,7 @@ impl Questions {
         &self,
         params: &QuestionCancelParams,
         now: Now,
-    ) -> Result<(QuestionResolveResult, Vec<QuestionEvent>)> {
+    ) -> Result<(Resolution, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let resolved = store.cancel(params.question_id, params.expected_revision, now)?;
@@ -424,7 +466,7 @@ impl Questions {
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
-        Ok((QuestionResolveResult { question }, events))
+        Ok((Resolution { question }, events))
     }
 
     /// Expires whatever is due, and returns the transitions that happened.

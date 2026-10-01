@@ -40,6 +40,7 @@ fn receipt(state: ReceiptState, revision: u64) -> Receipt {
         payload_digest: Digest256::from_bytes([0; 32]),
         accepted_deadline_ms: Nullable::null(),
         error: Nullable::null(),
+        error_withheld: false,
         updated_at_ms: TimestampMs::new(1_789_012_345_678),
     }
 }

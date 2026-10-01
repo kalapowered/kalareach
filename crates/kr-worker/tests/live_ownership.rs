@@ -622,6 +622,7 @@ async fn forward<T: serde::Serialize>(
         // A person on this machine acts under no grant, so there are no rights to narrow them by.
         grant_rights: CanonicalSet::new(),
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
+        history: None,
     }));
     exchange(daemon, frame, request_id).await
 }
@@ -797,7 +798,7 @@ async fn kr_req_24_06_a_daemon_restart_keeps_the_receipt_the_approval_and_the_qu
     .expect("the answer is admitted")
     .to_typed()
     .expect("decodes");
-    assert_eq!(answered.question.state, QuestionState::Answered);
+    assert_eq!(answered.state, QuestionState::Answered);
     let told = read_back(&host, question_id, caller_token);
     let record = told.answer.as_ref().expect("the agent is told the answer");
     assert_eq!(record.answer, QuestionAnswer::Decision { decided: true });
@@ -935,7 +936,7 @@ async fn kr_req_24_06_a_plugin_that_reconnects_finds_the_receipt_the_approval_an
     .expect("the owner answers")
     .to_typed()
     .expect("decodes");
-    assert_eq!(resolved.question.state, QuestionState::Answered);
+    assert_eq!(resolved.state, QuestionState::Answered);
     assert!(
         read_back(&host, question_id, caller_token)
             .answer
