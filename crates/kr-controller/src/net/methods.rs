@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use kr_protocol::confirmation::{
-    OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams, OwnerConfirmationRequestParams,
+    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
+    OwnerConfirmationRequestParams,
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId};
@@ -159,6 +160,28 @@ impl Controller {
         match method {
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
+                // A repository's root and an installation are described by the catalogue, from
+                // the exact request and the records it holds, and the pairing service issues the
+                // challenge for what it resolved.
+                if matches!(
+                    params.subject,
+                    ConfirmationSubject::CatalogueAdd(_) | ConfirmationSubject::PluginInstall(_)
+                ) {
+                    // A retried request is answered with the challenge it was given, before
+                    // anything about the subject is resolved again.
+                    let resolved = self
+                        .catalogue
+                        .resolve_confirmation(&params.subject)
+                        .await
+                        .map_err(|error| ControllerError::Refused {
+                            code: error.code,
+                            detail: error.message,
+                        })?;
+                    return blocking(move || {
+                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                    })
+                    .await;
+                }
                 blocking(move || {
                     pairing.request_confirmation(&caller, &params, action, admission.as_ref())
                 })

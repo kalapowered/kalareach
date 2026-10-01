@@ -434,6 +434,18 @@ impl PairingHost {
                 display: ConfirmationDisplay::EstablishClock,
                 first_owner: false,
             },
+            ConfirmationSubject::CatalogueAdd(_) | ConfirmationSubject::PluginInstall(_) => {
+                // These two are the catalogue's to describe: what an owner is shown comes from
+                // the repository's own records and its verified release, which only the daemon's
+                // catalogue module reads, so the daemon resolves them and asks through
+                // [`Self::request_resolved`].
+                return Err(ControllerError::Refused {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "a repository's root and an installation are described by this \
+                             host's catalogue, not by the pairing service"
+                        .to_owned(),
+                });
+            }
             ConfirmationSubject::Described(described) => {
                 if !described.is_describable() {
                     return Err(ControllerError::Refused {
@@ -453,6 +465,26 @@ impl PairingHost {
                 }
             }
         };
+        self.owner.request(caller, resolved, action, admission)
+    }
+
+    /// `owner.confirmation.request` for a subject the catalogue has already resolved into what
+    /// the challenge names and what an owner device is shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal [`OwnerAuthority::request`] decides: a caller without owner authority,
+    /// a reused action, or a host the records of which cannot be read.
+    pub fn request_resolved(
+        &self,
+        caller: &Caller,
+        resolved: Resolved,
+        action: (ActionId, Digest256),
+        admission: &dyn Fn() -> Result<()>,
+    ) -> Result<OwnerConfirmationRequestResult> {
+        if let Some(requested) = self.owner.requested(caller, action) {
+            return requested;
+        }
         self.owner.request(caller, resolved, action, admission)
     }
 
@@ -1670,6 +1702,16 @@ impl crate::sharing::OwnerConfirmations for PairingHost {
             .map_err(|error| ControllerError::PermissionDenied {
                 detail: error.to_string(),
             })
+    }
+
+    fn accept_recorded(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+    ) -> Result<crate::sharing::ConfirmedAction> {
+        let rights = CanonicalSet::new();
+        let expectation = self.owner.expectation(action, action_digest, None, &rights);
+        self.owner.spend_answered(&expectation, "catalogue")
     }
 
     fn host_device_id(&self) -> DeviceId {
