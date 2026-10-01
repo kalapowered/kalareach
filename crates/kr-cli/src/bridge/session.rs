@@ -101,6 +101,7 @@ kr_client::debug_as_name!(Found);
 /// opening says that it may start what it needs, so the helper in a destination with no daemon
 /// reaches the destination's own configured startup rather than failing for want of one.
 async fn open(enrolment: &EnvironmentEnrolment, target: BridgeTarget) -> Result<BridgedLink> {
+    started(enrolment).await?;
     let opening = invoke::open_for_person(
         enrolment,
         environments::origin_environment_id(),
@@ -111,6 +112,47 @@ async fn open(enrolment: &EnvironmentEnrolment, target: BridgeTarget) -> Result<
     .map_err(failed)?;
     let invocation = opening.launch().await.map_err(failed)?;
     Ok(BridgedLink::new(invocation.into_stream()))
+}
+
+/// Starts the container an enrolment names, when it is stopped.
+///
+/// A WSL distribution is started by running the helper in it, and that is all starting one takes. A
+/// container's runtime refuses to run anything in a stopped container, so it is started first, by
+/// the platform's own command and only here, where a create or an attach asked for it. A
+/// distribution, and a container that is already running, are left as they are.
+async fn started(enrolment: &EnvironmentEnrolment) -> Result<()> {
+    use kr_controller::bridge::platform::PlatformObserver;
+    use kr_controller::bridge::store::Observer as _;
+    use kr_protocol::identity::{EnvironmentAccess, EnvironmentPresence};
+
+    if enrolment.access != EnvironmentAccess::Container {
+        return Ok(());
+    }
+    let enrolment = enrolment.clone();
+    tokio::task::spawn_blocking(move || {
+        if PlatformObserver.observe(&enrolment)? == EnvironmentPresence::Running {
+            return Ok(());
+        }
+        PlatformObserver.start(&enrolment)?;
+        match PlatformObserver.observe(&enrolment)? {
+            EnvironmentPresence::Running => Ok(()),
+            _ => Err(kr_controller::error::ControllerError::supervision(
+                "the container was asked to start and is not running".to_owned(),
+            )),
+        }
+    })
+    .await
+    .map_err(|_| CliError::Other(Shown::said("starting the container did not finish")))?
+    // What the runtime printed is the runtime's to write and is not repeated.
+    .map_err(
+        |_: kr_controller::error::ControllerError| CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: Shown::said(
+                "the container this environment names could not be started; start it with its \
+             runtime, or check that the runtime is installed",
+            ),
+        },
+    )
 }
 
 /// Creates a session in an enrolled environment.
