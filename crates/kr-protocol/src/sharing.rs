@@ -37,7 +37,7 @@ use crate::ids::{
 };
 use crate::pairing::OwnerConfirmationProof;
 use crate::rights::ActionRight;
-use crate::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs};
+use crate::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
 
 /// How long a session invitation lasts when the issuer chooses nothing, in milliseconds.
 ///
@@ -544,10 +544,260 @@ pub struct GrantRevokeParams {
 pub struct RevocationResult {
     /// The revision this revocation advanced to.
     pub authority_revision: AuthorityRevision,
-    /// Every grant it revoked: the named one and its descendants.
+    /// The grants it revoked, the named one and its descendants, in identity order, cut to what
+    /// one answer carries. `revoked_grants_total` says how many there were.
     pub revoked_grants: CanonicalSet<GrantId>,
+    /// How many grants it revoked, counted before the list above was cut.
+    pub revoked_grants_total: U64,
     /// The per-worker completion status.
     pub barrier: RevocationBarrier,
+}
+
+/// What an answer may spend of the decoder's limits, less what the frame around it needs.
+///
+/// A revocation takes effect whatever the size of what it withdrew, and the caller is owed an answer
+/// that decodes: the decoder refuses a collection above 4,096 members, a frame above 65,536 items
+/// and a frame above 1 MiB. The frame's own fields take a few items and a few bytes, so the answer
+/// is held to the limits less this much.
+const FRAME_RESERVE_ITEMS: usize = 64;
+/// See [`FRAME_RESERVE_ITEMS`].
+const FRAME_RESERVE_BYTES: usize = 4 * 1024;
+
+/// What one member of an answer costs the decoder: the items it counts and the bytes it takes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cost {
+    items: usize,
+    bytes: usize,
+}
+
+impl Cost {
+    /// The cost of `value` as one member of an array, its own header excluded.
+    fn of<T: Serialize>(value: &T) -> Option<Self> {
+        let value = kr_cbor::to_canonical_value(value).ok()?;
+        Some(Self {
+            items: items_of(&value),
+            bytes: kr_cbor::encoded_len(&value),
+        })
+    }
+}
+
+/// How many items the decoder counts in `value`: each value is one, and each map entry's key is
+/// one more.
+fn items_of(value: &kr_cbor::CanonicalValue) -> usize {
+    use kr_cbor::CanonicalValue;
+
+    match value {
+        CanonicalValue::Array(members) => 1 + members.iter().map(items_of).sum::<usize>(),
+        CanonicalValue::Map(entries) => {
+            1 + entries
+                .entries()
+                .iter()
+                .map(|(_, member)| 1 + items_of(member))
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
+/// The bytes an array's header takes for `members` members.
+const fn array_header(members: usize) -> usize {
+    match members {
+        0..=23 => 1,
+        24..=255 => 2,
+        256..=65_535 => 3,
+        _ => 5,
+    }
+}
+
+/// What is left to spend, and what one list has taken of it.
+#[derive(Clone, Copy, Debug)]
+struct Pool {
+    items: usize,
+    bytes: usize,
+}
+
+impl Pool {
+    /// Takes one more member, growing a list that holds `held` members already, when it fits.
+    fn take(&mut self, member: Cost, held: usize) -> bool {
+        let header = array_header(held + 1) - array_header(held);
+        let cost = Cost {
+            items: member.items,
+            bytes: member.bytes + header,
+        };
+        if cost.items > self.items || cost.bytes > self.bytes {
+            return false;
+        }
+        self.items -= cost.items;
+        self.bytes -= cost.bytes;
+        true
+    }
+}
+
+/// The longest prefix of `members`, in the order given, that one list may keep: each member
+/// measured once, the list held to the collection bound and to what is left in `pool`, and stopped
+/// at the first member that does not fit.
+fn prefix_within<T: Serialize>(members: Vec<T>, pool: &mut Pool, collection: usize) -> Vec<T> {
+    let mut kept = Vec::new();
+    for member in members {
+        if kept.len() == collection {
+            break;
+        }
+        let Some(cost) = Cost::of(&member) else {
+            break;
+        };
+        if !pool.take(cost, kept.len()) {
+            break;
+        }
+        kept.push(member);
+    }
+    kept
+}
+
+impl RevocationResult {
+    /// An answer made of what a revocation did, cut so that it decodes.
+    ///
+    /// Every total is counted before anything is cut, and each list is cut to a prefix in identity
+    /// order, so the same revocation always answers with the same members. The cut is measured and
+    /// not estimated: each member is encoded once and counted as the decoder counts, array headers
+    /// included, and the three lists (the grants, every worker's rejected actions and every worker's
+    /// possibly executed actions) each spend a third of what the answer's own fields leave of the
+    /// decoder's limits (4,096 members a collection, 65,536 items and 1 MiB a frame).
+    ///
+    /// The worker list is cut as well, when a host holds more workers than a frame can carry. The
+    /// workers whose barrier has not held are kept before any that has, and at least one of them
+    /// whenever there is one, so what the caller reads of the cut barrier ([`RevocationBarrier::holds`])
+    /// is what it would read of the whole. Their totals say what was left out.
+    ///
+    /// `barrier` is whole: each of its totals is how many its list held.
+    #[must_use]
+    pub fn bounded(
+        authority_revision: AuthorityRevision,
+        revoked_grants: impl IntoIterator<Item = GrantId>,
+        barrier: RevocationBarrier,
+    ) -> Self {
+        use crate::action::BarrierState;
+
+        let limits = kr_cbor::Limits::DEFAULT;
+        let collection = limits.max_collection_len;
+        let revoked: CanonicalSet<GrantId> = revoked_grants.into_iter().collect();
+        let revoked_grants_total = U64::new(revoked.len() as u64);
+        let workers_total = U64::new(
+            barrier
+                .workers_total
+                .get()
+                .max(barrier.workers.len() as u64),
+        );
+        let RevocationBarrier {
+            authority_revision: barrier_revision,
+            workers,
+            ..
+        } = barrier;
+
+        // The answer with every list empty: what the answer's own fields cost.
+        let shell = |workers: Vec<crate::action::WorkerBarrier>| Self {
+            authority_revision,
+            revoked_grants: CanonicalSet::new(),
+            revoked_grants_total,
+            barrier: RevocationBarrier {
+                authority_revision: barrier_revision,
+                workers,
+                workers_total,
+            },
+        };
+        let bare = shell(Vec::new());
+        let fixed = Cost::of(&bare).unwrap_or_default();
+        let mut left = Pool {
+            items: limits
+                .max_items
+                .saturating_sub(FRAME_RESERVE_ITEMS)
+                .saturating_sub(fixed.items),
+            bytes: limits
+                .max_message_len
+                .saturating_sub(FRAME_RESERVE_BYTES)
+                .saturating_sub(fixed.bytes),
+        };
+
+        // The workers kept: those whose barrier has not held first, then session order, each
+        // measured with its lists empty and the first pending one always kept.
+        let mut order: Vec<usize> = (0..workers.len()).collect();
+        order.sort_by_key(|&index| {
+            (
+                workers[index].state != BarrierState::Pending,
+                workers[index].session_id,
+            )
+        });
+        let mut keep = vec![false; workers.len()];
+        let mut kept = 0_usize;
+        for index in order {
+            let emptied = crate::action::WorkerBarrier {
+                rejected_actions: Vec::new(),
+                possibly_executed: Vec::new(),
+                ..workers[index].clone()
+            };
+            let cost = Cost::of(&emptied).unwrap_or_default();
+            let pending = workers[index].state == BarrierState::Pending;
+            let first_pending = pending
+                && !keep
+                    .iter()
+                    .zip(&workers)
+                    .any(|(held, worker)| *held && worker.state == BarrierState::Pending);
+            let fits = kept < collection && left.take(cost, kept);
+            if !fits && !first_pending {
+                continue;
+            }
+            if !fits {
+                // Whatever the frame has left, the barrier is read as it would be whole.
+                left.items = left.items.saturating_sub(cost.items);
+                left.bytes = left.bytes.saturating_sub(cost.bytes);
+            }
+            keep[index] = true;
+            kept += 1;
+        }
+        let mut workers: Vec<crate::action::WorkerBarrier> = workers
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(worker, keep)| keep.then_some(worker))
+            .collect();
+        workers.sort_by_key(|worker| worker.session_id);
+
+        // The three lists each take a third of what is left.
+        let share = Pool {
+            items: left.items / 3,
+            bytes: left.bytes / 3,
+        };
+        let mut grants = share;
+        let mut rejected = share;
+        let mut possibly = share;
+        let revoked_grants: CanonicalSet<GrantId> =
+            prefix_within(revoked.iter().copied().collect(), &mut grants, collection)
+                .into_iter()
+                .collect();
+        for worker in &mut workers {
+            let mut names = std::mem::take(&mut worker.rejected_actions);
+            names.sort_by(|a, b| (&a.actor_id, a.action_id).cmp(&(&b.actor_id, b.action_id)));
+            worker.rejected_actions_total =
+                U64::new(worker.rejected_actions_total.get().max(names.len() as u64));
+            worker.rejected_actions = prefix_within(names, &mut rejected, collection);
+            let mut names = std::mem::take(&mut worker.possibly_executed);
+            names.sort_by(|a, b| (a.action_id, &a.actor_id).cmp(&(b.action_id, &b.actor_id)));
+            worker.possibly_executed_total =
+                U64::new(worker.possibly_executed_total.get().max(names.len() as u64));
+            worker.possibly_executed = prefix_within(names, &mut possibly, collection);
+        }
+        let mut answer = shell(workers);
+        answer.revoked_grants = revoked_grants;
+        answer
+    }
+
+    /// Whether this answer decodes inside the decoder's limits, with the frame around it.
+    #[must_use]
+    pub fn fits_a_frame(&self) -> bool {
+        let limits = kr_cbor::Limits::DEFAULT;
+        Cost::of(self).is_some_and(|cost| {
+            cost.items <= limits.max_items - FRAME_RESERVE_ITEMS
+                && cost.bytes <= limits.max_message_len - FRAME_RESERVE_BYTES
+        })
+    }
 }
 
 /// Parameters of `grant.list`.

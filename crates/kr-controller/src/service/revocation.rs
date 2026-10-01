@@ -289,11 +289,20 @@ impl Controller {
         // named one revision and carried a barrier for another would be evidence of no single
         // moment.
         let barrier = self.barrier(own).await?;
-        Ok(kr_protocol::sharing::RevocationResult {
-            authority_revision: barrier.authority_revision,
-            revoked_grants,
+        // Cut to what one control frame carries: a revocation takes effect whatever it withdrew,
+        // and the caller is owed an answer it can decode. Every total is counted before the cut.
+        let answer = kr_protocol::sharing::RevocationResult::bounded(
+            barrier.authority_revision,
+            revoked_grants.iter().copied(),
             barrier,
-        })
+        );
+        if !answer.fits_a_frame() {
+            eprintln!(
+                "kr-controller: the answer to a revocation is larger than one control frame can \
+                 carry even when cut, so its caller cannot read it; the revocation has taken effect"
+            );
+        }
+        Ok(answer)
     }
 
     /// Changes this host's policy and writes the result down.

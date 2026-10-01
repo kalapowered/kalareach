@@ -524,19 +524,24 @@ impl AuthorityBarrier {
                 continue;
             }
             seen.push(*session_id);
-            reported.push(Self::describe(
-                &status,
-                &ended,
-                &fences,
-                *session_id,
-                revision,
-            ));
+            let described = Self::describe(&status, &ended, &fences, *session_id, revision);
+            // A worker this daemon no longer lists and has confirmed ended, whose fence named
+            // nothing under this revision, states nothing: it can no longer dispatch, and there is
+            // no action to name. Listing it would only make every revocation's answer longer by
+            // one entry for every session this daemon has ever closed.
+            if described.state == BarrierState::Ended
+                && described.rejected_actions.is_empty()
+                && described.possibly_executed.is_empty()
+                && described.names_pending.get() == 0
+                && described.omitted_actions.get() == 0
+                && described.detail.is_empty()
+            {
+                continue;
+            }
+            reported.push(described);
         }
         reported.sort_by_key(|worker| worker.session_id);
-        RevocationBarrier {
-            authority_revision: revision,
-            workers: reported,
-        }
+        RevocationBarrier::new(revision, reported)
     }
 
     fn describe(
@@ -634,9 +639,15 @@ impl AuthorityBarrier {
             rejected_actions: fence
                 .map(|report| report.rejected.clone())
                 .unwrap_or_default(),
+            rejected_actions_total: kr_protocol::scalars::U64::new(
+                fence.map_or(0, |report| report.rejected.len() as u64),
+            ),
             possibly_executed: fence
                 .map(|report| report.possibly_executed.clone())
                 .unwrap_or_default(),
+            possibly_executed_total: kr_protocol::scalars::U64::new(
+                fence.map_or(0, |report| report.possibly_executed.len() as u64),
+            ),
             omitted_actions: kr_protocol::scalars::U64::new(omitted_names),
             names_pending: kr_protocol::scalars::U64::new(pending_names),
             detail,
@@ -1123,6 +1134,56 @@ mod tests {
             "{:?}",
             report.workers[0].detail
         );
+    }
+
+    /// KR-REQ-09.12: a revocation's answer is not made longer by every session this daemon has
+    /// closed. A worker the directory no longer lists, confirmed ended, whose fence named nothing
+    /// under this revision, states nothing and is left out; one that names an action, one still
+    /// pending, and one the directory lists are reported as before.
+    #[test]
+    fn an_ended_worker_the_directory_no_longer_lists_is_reported_only_when_it_states_something() {
+        let barrier = barrier();
+        let rev = AuthorityRevision::new(4);
+        // Bound and ended, never having answered anything.
+        barrier.bind(session(1));
+        barrier.worker_ended(session(1));
+        // Acknowledged with names, then ended.
+        let named = barrier.bind(session(2));
+        assert!(barrier.acknowledge(
+            session(2),
+            named,
+            rev,
+            evidence(vec![action(10)], vec![possibly_executed(11)]),
+        ));
+        barrier.worker_ended(session(2));
+        // Acknowledged naming nothing, then ended.
+        let bare = barrier.bind(session(3));
+        assert!(barrier.acknowledge(session(3), bare, rev, evidence(Vec::new(), Vec::new())));
+        barrier.worker_ended(session(3));
+        // Lost rather than confirmed ended.
+        barrier.bind(session(4));
+        // Ended, and still listed by the directory.
+        barrier.bind(session(5));
+        barrier.worker_ended(session(5));
+
+        let report = barrier.report(rev, [session(5)]);
+        let listed: Vec<SessionId> = report
+            .workers
+            .iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![session(2), session(4), session(5)],
+            "{report:?}"
+        );
+        assert_eq!(report.workers_total.get(), 3);
+        assert_eq!(report.workers[0].state, BarrierState::Ended);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+        assert_eq!(report.workers[0].rejected_actions_total.get(), 1);
+        assert_eq!(report.workers[0].possibly_executed_total.get(), 1);
+        assert_eq!(report.workers[1].state, BarrierState::Pending);
+        assert_eq!(report.pending(), vec![session(4)]);
     }
 
     /// The evidence one fence pass reported, complete in one page.

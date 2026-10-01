@@ -29230,16 +29230,21 @@
           "description": "The revision being installed."
         },
         "workers": {
-          "description": "One entry per affected worker.",
+          "description": "One entry per affected worker, in session order, cut to what one answer carries.\n\nA cut keeps every worker whose barrier has not held before any that has, and at least one\nof them whenever there is one, so a reader finds the barrier held on the cut list exactly\nwhen it holds on the whole. `workers_total` says how many there were.",
           "items": {
             "$ref": "#/$defs/WorkerBarrier"
           },
           "type": "array"
+        },
+        "workers_total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many workers were affected, counted before the list above was cut."
         }
       },
       "required": [
         "authority_revision",
-        "workers"
+        "workers",
+        "workers_total"
       ],
       "type": "object"
     },
@@ -29359,17 +29364,22 @@
           "description": "The per-worker completion status."
         },
         "revoked_grants": {
-          "description": "Every grant it revoked: the named one and its descendants.",
+          "description": "The grants it revoked, the named one and its descendants, in identity order, cut to what\none answer carries. `revoked_grants_total` says how many there were.",
           "items": {
             "$ref": "#/$defs/GrantId"
           },
           "type": "array",
           "uniqueItems": true
+        },
+        "revoked_grants_total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many grants it revoked, counted before the list above was cut."
         }
       },
       "required": [
         "authority_revision",
         "revoked_grants",
+        "revoked_grants_total",
         "barrier"
       ],
       "type": "object"
@@ -34967,18 +34977,26 @@
           "description": "How many affected actions the worker could hold no name for.\n\nNought in every ordinary case, because the names are kept in the worker's journal and\ndelivered a page at a time. Anything else is a worker that could not record a name at all."
         },
         "possibly_executed": {
-          "description": "The actions whose dispatch transition had already won the serial race.\n\nEach one's receipt state says how much is known about what it did; the list is\nnot only the uncertain ones.",
+          "description": "The actions whose dispatch transition had already won the serial race, in identity order\n(action, then actor), cut to what one answer carries. `possibly_executed_total` says how\nmany there were.\n\nEach one's receipt state says how much is known about what it did; the list is\nnot only the uncertain ones.",
           "items": {
             "$ref": "#/$defs/PossiblyExecutedAction"
           },
           "type": "array"
         },
+        "possibly_executed_total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many actions had already won the serial race, counted before the list above was cut."
+        },
         "rejected_actions": {
-          "description": "The undispatched intents the fence rejected.",
+          "description": "The undispatched intents the fence rejected, in identity order (actor, then action), cut to\nwhat one answer carries. `rejected_actions_total` says how many there were.",
           "items": {
             "$ref": "#/$defs/FencedAction"
           },
           "type": "array"
+        },
+        "rejected_actions_total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many undispatched intents the fence rejected, counted before the list above was cut."
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
@@ -34994,7 +35012,9 @@
         "state",
         "acknowledged_revision",
         "rejected_actions",
+        "rejected_actions_total",
         "possibly_executed",
+        "possibly_executed_total",
         "omitted_actions",
         "names_pending",
         "detail"

@@ -22634,9 +22634,17 @@ export interface RevocationBarrier {
    */
   authority_revision: string
   /**
-   * One entry per affected worker.
+   * One entry per affected worker, in session order, cut to what one answer carries.
+   *
+   * A cut keeps every worker whose barrier has not held before any that has, and at least one
+   * of them whenever there is one, so a reader finds the barrier held on the cut list exactly
+   * when it holds on the whole. `workers_total` says how many there were.
    */
   workers: WorkerBarrier[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workers_total: string
 }
 /**
  * One worker's half of a revocation barrier.
@@ -22659,16 +22667,27 @@ export interface WorkerBarrier {
    */
   omitted_actions: string
   /**
-   * The actions whose dispatch transition had already won the serial race.
+   * The actions whose dispatch transition had already won the serial race, in identity order
+   * (action, then actor), cut to what one answer carries. `possibly_executed_total` says how
+   * many there were.
    *
    * Each one's receipt state says how much is known about what it did; the list is
    * not only the uncertain ones.
    */
   possibly_executed: PossiblyExecutedAction[]
   /**
-   * The undispatched intents the fence rejected.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  possibly_executed_total: string
+  /**
+   * The undispatched intents the fence rejected, in identity order (actor, then action), cut to
+   * what one answer carries. `rejected_actions_total` says how many there were.
    */
   rejected_actions: FencedAction[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rejected_actions_total: string
   /**
    * One KalaReach terminal session.
    */
@@ -22692,9 +22711,14 @@ export interface RevocationResult {
   authority_revision: string
   barrier: RevocationBarrier1
   /**
-   * Every grant it revoked: the named one and its descendants.
+   * The grants it revoked, the named one and its descendants, in identity order, cut to what
+   * one answer carries. `revoked_grants_total` says how many there were.
    */
   revoked_grants: GrantId[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revoked_grants_total: string
 }
 /**
  * The per-worker completion status.
@@ -22705,9 +22729,17 @@ export interface RevocationBarrier1 {
    */
   authority_revision: string
   /**
-   * One entry per affected worker.
+   * One entry per affected worker, in session order, cut to what one answer carries.
+   *
+   * A cut keeps every worker whose barrier has not held before any that has, and at least one
+   * of them whenever there is one, so a reader finds the barrier held on the cut list exactly
+   * when it holds on the whole. `workers_total` says how many there were.
    */
   workers: WorkerBarrier[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workers_total: string
 }
 /**
  * The closed, versioned method table for rich actions.
