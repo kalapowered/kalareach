@@ -3984,6 +3984,15 @@ async fn kr_req_12_13_a_client_request_the_upstream_never_answers_is_bounded_and
         bound,
         "and the refusal added nothing"
     );
+    assert_eq!(
+        broker
+            .client_requests()
+            .expect("the records read")
+            .last()
+            .map(|intent| intent.outcome),
+        Some(kr_worker::broker::ClientRequestOutcome::Unsent),
+        "and the request it refused is recorded as one whose bytes never went"
+    );
     // The caller is told, and so is the terminal: a request this host refused is answered under
     // the identifier the terminal used, rather than left for a person to wait on.
     let refusal = read_available(&mut client).await;
@@ -5089,6 +5098,20 @@ fn kr_req_11_37_a_ledger_refusing_the_settlement_of_a_client_request_raises_the_
                 .expect("the gaps read")
                 .is_empty(),
             "{outcome:?}: the interval is on record"
+        );
+        // A restart reads the intent as it is stored: recorded and not settled, which is a request
+        // whose bytes may have gone, and nothing sends it again.
+        drop(broker);
+        let reopened = Broker::open(Some(&store.path), session(), JournalHealth::shared())
+            .expect("the broker opens again");
+        assert_eq!(
+            reopened
+                .client_requests()
+                .expect("the records read")
+                .first()
+                .map(|intent| intent.outcome),
+            Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+            "{outcome:?}: a restart reads an intent that may have gone"
         );
     }
 }
