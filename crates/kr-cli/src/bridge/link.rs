@@ -138,12 +138,13 @@ impl Link for LocalClient {
 }
 
 /// A connection to a control daemon or a worker in another environment, through a bridge helper.
-#[derive(Debug)]
 pub struct BridgedLink {
     stream: BridgeStream,
     /// The last request number this link used. They are this connection's own.
     last_request: u64,
 }
+
+kr_client::debug_as_name!(BridgedLink);
 
 impl BridgedLink {
     /// Takes an open bridge as a connection.
