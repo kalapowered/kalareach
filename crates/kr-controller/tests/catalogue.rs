@@ -4260,11 +4260,11 @@ mod native_bridges {
         assert_eq!(site.tree(), placed, "with no list it is back");
         assert!(bridge_facts(&host, &digest).is_some());
     }
-    /// KR-REQ-11.42: the index that says whether a release is revoked is read last and once, so a
-    /// package the owner disabled or the organisation's list excludes loses its registration with
-    /// the index unreadable, and where the index is what cannot be read nothing is known to stand
-    /// and the registration is not kept on its account. The control is the index repaired: the
-    /// registration comes back with the next change that follows bridges.
+    /// KR-REQ-11.42: the index that says whether a release is revoked is read last and once. Where
+    /// it cannot be read nothing is known to stand and the registration is not kept on its
+    /// account, and a package the organisation's list excludes loses its registration whatever
+    /// state the index is in. The control is the index repaired: the registration comes back with
+    /// the next change that follows bridges.
     ///
     /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
     /// platforms.
@@ -4302,7 +4302,27 @@ mod native_bridges {
             ]))
         };
 
-        // The list excludes the package while the index is damaged: the registration goes.
+        // A change that follows the bridge while the index cannot be read: nothing says the
+        // release is not revoked, so the registration is not kept on its account.
+        std::fs::write(&index, b"not an index").expect("damaged");
+        assert!(
+            host.module
+                .put_allowed_adapters(name("kalareach/claude-code"))
+                .await
+                .expect("put")
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "an unreadable index keeps no registration, though the list names the package"
+        );
+
+        // Control: repaired, the next change that follows bridges puts it back.
+        std::fs::write(&index, &intact).expect("repaired");
+        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
+        assert_eq!(site.tree(), placed, "the repaired index restores it");
+
+        // A package the list excludes loses its registration whatever state the index is in.
         std::fs::write(&index, b"not an index").expect("damaged");
         assert!(
             host.module
@@ -4313,26 +4333,8 @@ mod native_bridges {
         assert_eq!(
             site.tree(),
             before,
-            "a package the list excludes loses its registration whatever state the index is in"
+            "a package the list excludes loses its registration with the index unreadable"
         );
-
-        // The list lifted and the index still damaged: nothing says the release stands.
-        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
-        assert_eq!(
-            site.tree(),
-            before,
-            "a registration is not put back on an index that cannot be read"
-        );
-
-        // Control: repaired, the next change that follows bridges puts it back.
-        std::fs::write(&index, &intact).expect("repaired");
-        assert!(
-            host.module
-                .put_allowed_adapters(name("kalareach/claude-code"))
-                .await
-                .expect("put")
-        );
-        assert_eq!(site.tree(), placed, "the repaired index restores it");
     }
 
     /// KR-REQ-11.42: the organisation's list is in force when the catalogue opens, before any
