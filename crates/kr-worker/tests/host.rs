@@ -1093,6 +1093,72 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     daemon.stop().await;
 }
 
+/// KR-REQ-24.27: a worker created while privacy mode is on holds the generation before the daemon
+/// has recorded it as running, and so before the daemon could first tell it anything: the worker
+/// read the state from its launch specification and wrote it to its journal ahead of its shell.
+///
+/// The journal says when it recorded the state and the worker's descriptor says when the daemon
+/// published the worker, which is after the ready report. The control is a worker created with
+/// privacy mode off, whose journal says the initial generation, off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "on Windows the worker's rendezvous times out before the descriptor is published, so the worker does not report itself in time"
+)]
+async fn a_worker_created_while_privacy_mode_is_on_holds_the_generation_before_it_is_recorded() {
+    for private in [true, false] {
+        let host = Host::create();
+        let daemon = host.start().await;
+        let mut client = host.client().await;
+        if private {
+            let on = client
+                .mutate(
+                    Method::PrivacySet,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &kr_protocol::privacy::PrivacySetParams { enabled: true },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .unwrap_or_else(|error| panic!("privacy mode is turned on: {error}"));
+            let report: kr_protocol::privacy::PrivacyReport = on.to_typed().expect("decodes");
+            assert!(report.enabled);
+        }
+        let created = create(&mut client, &host).await;
+        let session_id = created.session.session_id;
+        let paths = host.paths();
+        let descriptor = kr_ipc::descriptor::read(&paths, session_id)
+            .expect("reads the runtime directory")
+            .expect("the descriptor is published");
+        let (generation, enabled, recorded_at_ms): (i64, i64, i64) =
+            rusqlite::Connection::open_with_flags(
+                paths.journal_database(session_id),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("opens the worker's journal")
+            .query_row(
+                "SELECT generation, enabled, recorded_at_ms FROM privacy WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the worker's privacy record");
+        if private {
+            assert_eq!((generation, enabled), (1, 1));
+            assert!(
+                u64::try_from(recorded_at_ms).expect("a time") <= descriptor.published_at_ms.get(),
+                "the worker held the generation ({recorded_at_ms}) before the daemon recorded it \
+                 as running ({})",
+                descriptor.published_at_ms.get()
+            );
+        } else {
+            assert_eq!((generation, enabled), (0, 0));
+        }
+        close(&mut client, &host, session_id).await;
+        drop(client);
+        daemon.stop().await;
+    }
+}
+
 /// KR-REQ-07.02: a create presented for attaching makes the session at the creating terminal's
 /// size, and that terminal then attaches to it.
 /// KR-REQ-07.03: the size of the terminal a session is created from travels in the create request

@@ -7,7 +7,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-24.27 | a worker launched while privacy mode is on is given the generation and that it is on, before its shell runs, and the state it is given is the one in force when its claim is accepted |
-//! | KR-REQ-24.28 | a session whose launch has handed out its specification when privacy mode is turned on owes its cleanup, and turning privacy mode off waits for it |
+//! | KR-REQ-24.28 | a session whose launch has handed out its specification when privacy mode is turned on owes its cleanup, across a daemon restart too, and turning privacy mode off waits for it; one launched while privacy mode is on owes it from before its worker runs |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +41,8 @@ fn build() -> BuildId {
 #[derive(Debug)]
 struct RendezvousSupervisor {
     launched: std::sync::Mutex<std::sync::mpsc::Sender<WorkerLaunch>>,
+    /// Set by a test that wants the next launch to start nothing.
+    refuse: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkerSupervisor for RendezvousSupervisor {
@@ -50,6 +52,11 @@ impl WorkerSupervisor for RendezvousSupervisor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .send(launch.clone());
+        if self.refuse.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return LaunchOutcome::NotStarted {
+                detail: "this test's supervisor starts nothing this time".to_owned(),
+            };
+        }
         LaunchOutcome::Started(
             kr_ipc::identity::current_process_start_identity().expect("a process identity"),
         )
@@ -62,64 +69,105 @@ impl WorkerSupervisor for RendezvousSupervisor {
 
 /// A daemon on a tree of its own, asked for workers through [`RendezvousSupervisor`].
 struct Daemon {
-    _temp: kr_ipc::testing::TempHost,
+    temp: kr_ipc::testing::TempHost,
     client_endpoint: kr_ipc::paths::Endpoint,
     rendezvous_endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     launches: std::sync::mpsc::Receiver<WorkerLaunch>,
-    _controller: Arc<Controller>,
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+    controller: Arc<Controller>,
+    serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
 }
 
 async fn daemon() -> Daemon {
-    let temp = kr_ipc::testing::TempHost::create();
+    start(kr_ipc::testing::TempHost::create()).await
+}
+
+/// Starts a daemon on `temp`, whose environment may already hold what an earlier daemon left.
+async fn start(temp: kr_ipc::testing::TempHost) -> Daemon {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     environment.create().expect("the environment's directories");
     let secrets = environment.secrets_dir();
     let (launched, launches) = std::sync::mpsc::channel();
-    let controller = Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        secret_store: StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(RendezvousSupervisor {
-            launched: std::sync::Mutex::new(launched),
-        }),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: build(),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let controller = kr_controller::testing::taken_over(|| {
+        let secrets = secrets.clone();
+        let launched = launched.clone();
+        let refuse = Arc::clone(&refuse);
+        Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RendezvousSupervisor {
+                launched: std::sync::Mutex::new(launched),
+                refuse,
+            }),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
     })
     .await
     .expect("the daemon starts");
     let client_endpoint = environment.controller_endpoint().expect("an endpoint");
-    tokio::spawn(
-        Arc::clone(&controller)
-            .serve_clients(Listener::bind(&client_endpoint).expect("binds the client endpoint")),
-    );
     let rendezvous_endpoint = environment.rendezvous_endpoint().expect("an endpoint");
-    tokio::spawn(Arc::clone(&controller).serve_rendezvous(
-        Listener::bind(&rendezvous_endpoint).expect("binds the rendezvous endpoint"),
-    ));
+    let serving =
+        vec![
+            tokio::spawn(Arc::clone(&controller).serve_clients(
+                Listener::bind(&client_endpoint).expect("binds the client endpoint"),
+            )),
+            tokio::spawn(Arc::clone(&controller).serve_rendezvous(
+                Listener::bind(&rendezvous_endpoint).expect("binds the rendezvous endpoint"),
+            )),
+        ];
     Daemon {
-        _temp: temp,
+        temp,
         client_endpoint,
         rendezvous_endpoint,
         environment_id,
         launches,
-        _controller: controller,
+        refuse,
+        controller,
+        serving,
     }
 }
 
 impl Daemon {
+    /// Stops this daemon the way its process exiting would, and keeps the environment's tree.
+    async fn stop(self) -> kr_ipc::testing::TempHost {
+        let Self {
+            temp,
+            controller,
+            serving,
+            ..
+        } = self;
+        for task in &serving {
+            task.abort();
+        }
+        for task in serving {
+            let _ = task.await;
+        }
+        drop(controller);
+        temp
+    }
+
+    /// Has the supervisor start nothing for the next launch it is asked for.
+    fn refuse_the_next_launch(&self) {
+        self.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
             .await
@@ -291,4 +339,143 @@ async fn kr_req_24_27_a_worker_is_given_the_state_in_force_when_its_claim_is_acc
     assert_eq!(off.generation.get(), 2);
     let (_launch, specification) = after.launched().await;
     assert_eq!(specification.privacy, state(2, false));
+}
+
+/// Where each session the report names stands, by session.
+fn owing(report: &PrivacyReport) -> Vec<kr_protocol::ids::SessionId> {
+    report.sessions.iter().map(|owed| owed.session_id).collect()
+}
+
+/// KR-REQ-24.28: a worker that was handed a specification saying privacy mode was off, and has not
+/// reported yet, owes its cleanup when privacy mode is turned on after: it has no journal and no
+/// worker row for a list to find, and is told the generation by the daemon's notice once it runs.
+/// Turning privacy mode off is refused, naming it, until it answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_28_a_launch_under_way_when_privacy_mode_is_turned_on_owes_its_cleanup() {
+    let daemon = daemon().await;
+    let (launch, specification) = daemon.launched().await;
+    assert_eq!(specification.privacy, state(0, false));
+    let before = daemon.status().await;
+    assert!(owing(&before).is_empty(), "nothing is owed while it is off");
+
+    let on = daemon.set(true).await.expect("privacy mode is turned on");
+    assert_eq!(owing(&on), vec![launch.session_id], "the launch owes it");
+    let refused = daemon
+        .set(false)
+        .await
+        .expect_err("a worker that may still start holds privacy mode on");
+    assert!(
+        refused.message.contains(&launch.session_id.to_string()),
+        "the refusal names the session: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.28: the same, across a restart of the daemon between the specification and the change.
+/// The new daemon holds no record in memory of the launch, and the worker has no journal or row yet,
+/// so the registry's reservation is what says a worker may be running there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_28_a_launch_under_way_across_a_restart_owes_its_cleanup() {
+    let first = daemon().await;
+    let (launch, specification) = first.launched().await;
+    assert_eq!(specification.privacy, state(0, false));
+    let temp = first.stop().await;
+
+    let second = start(temp).await;
+    let on = second.set(true).await.expect("privacy mode is turned on");
+    assert_eq!(
+        owing(&on),
+        vec![launch.session_id],
+        "the reservation says a worker may be running"
+    );
+    second
+        .set(false)
+        .await
+        .expect_err("and it holds privacy mode on");
+}
+
+/// KR-REQ-24.27: a worker launched while privacy mode is on owes its cleanup from before it runs:
+/// the obligation is on the disk when its specification is read, and turning privacy mode off is
+/// refused, naming it, whatever the daemon's tick has or has not seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_27_a_worker_launched_while_privacy_mode_is_on_owes_cleanup_before_it_runs() {
+    let daemon = daemon().await;
+    daemon.set(true).await.expect("privacy mode is turned on");
+    let (launch, specification) = daemon.launched().await;
+    assert_eq!(specification.privacy, state(1, true));
+
+    let recorded: i64 = rusqlite::Connection::open(
+        daemon
+            .temp
+            .environment()
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD),
+    )
+    .expect("a second connection to the record")
+    .query_row(
+        "SELECT COUNT(*) FROM privacy_obligations WHERE session_id = ?1",
+        [launch.session_id.to_string()],
+        |row| row.get(0),
+    )
+    .expect("a count");
+    assert_eq!(recorded, 1, "the obligation is on the disk");
+    assert_eq!(owing(&daemon.status().await), vec![launch.session_id]);
+    let refused = daemon
+        .set(false)
+        .await
+        .expect_err("a worker that may still start holds privacy mode on");
+    assert!(
+        refused.message.contains(&launch.session_id.to_string()),
+        "{refused:?}"
+    );
+}
+
+/// KR-REQ-24.28: a launch the supervisor could not start owes nothing and is not reported as ended
+/// with the archive named: no worker claimed it, so no shell ran, and the tick forgets it with its
+/// obligation. The control is the launch above, whose worker did claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_28_a_launch_that_started_nothing_is_forgotten_not_reported_as_ended() {
+    let daemon = daemon().await;
+    daemon.set(true).await.expect("privacy mode is turned on");
+    // The supervisor starts nothing this time: it reports the launch as not started.
+    daemon.refuse_the_next_launch();
+    let created = daemon
+        .client()
+        .await
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            daemon.target(),
+            &create(daemon.environment_id),
+        )
+        .await
+        .expect("the call reaches the daemon");
+    assert!(created.is_err(), "a launch that starts nothing fails");
+    let launch = daemon
+        .launches
+        .recv_timeout(PATIENCE)
+        .expect("the daemon asked for a worker");
+    // A few passes of the tick, and the session is neither owed nor ended.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let report = daemon.status().await;
+        if owing(&report).is_empty() {
+            assert!(
+                report.completion == kr_protocol::privacy::PrivacyCompletion::Complete,
+                "{:?}",
+                report.completion
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never forgot {}: {:?}",
+            launch.session_id,
+            report.sessions
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    daemon
+        .set(false)
+        .await
+        .expect("a launch that never started does not hold privacy mode on");
 }

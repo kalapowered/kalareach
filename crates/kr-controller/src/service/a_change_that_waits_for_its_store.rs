@@ -9,8 +9,12 @@
 //! while it waits, and read back that nothing was written: once because the action's deadline
 //! passed, on a clock the test moves, and once because its connection was withdrawn.
 //!
+//! A create that launches a worker while privacy mode is on waits for the record too, and has the
+//! session's obligation on the disk before it asks for the worker.
+//!
 //! The tick that decides which sessions have ended is tested here too: it takes a session for ended
-//! only when the registry shows its launch is over.
+//! only when the registry shows its launch is over, and forgets a launch that never produced a
+//! worker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +54,38 @@ impl WorkerSupervisor for NoWorkers {
 
     fn describe(&self) -> &'static str {
         "a supervisor that starts nothing"
+    }
+}
+
+/// A supervisor that records what the privacy record held on the disk when it was asked to start a
+/// worker, and starts nothing.
+#[derive(Debug)]
+struct Recording {
+    state_dir: std::path::PathBuf,
+    asked: Arc<std::sync::Mutex<Vec<(SessionId, i64)>>>,
+}
+
+impl WorkerSupervisor for Recording {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let owed: i64 = rusqlite::Connection::open(self.state_dir.join(PRIVACY_RECORD))
+            .expect("a second connection to the record")
+            .query_row(
+                "SELECT COUNT(*) FROM privacy_obligations WHERE session_id = ?1",
+                [launch.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("a count");
+        self.asked
+            .lock()
+            .expect("the record is not poisoned")
+            .push((launch.session_id, owed));
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that records the privacy record's obligations and starts nothing"
     }
 }
 
@@ -99,6 +135,14 @@ async fn arrival(arrived: std::sync::mpsc::Receiver<()>) {
 /// A daemon on a tree of its own, on a continuous clock the test moves, with a supervisor that
 /// starts nothing.
 async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
+    daemon_starting(|_| Box::new(NoWorkers)).await
+}
+
+/// A daemon as [`daemon`] starts one, whose supervisor `supervisor` makes from the environment's
+/// state directory.
+async fn daemon_starting(
+    supervisor: impl FnOnce(&std::path::Path) -> Box<dyn WorkerSupervisor>,
+) -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -117,7 +161,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
             }),
             secret_store: kr_crypto::store::StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(NoWorkers),
+            supervisor: supervisor(environment.state_dir()),
             worker_program: temp.root().join("kr-worker"),
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
@@ -423,6 +467,51 @@ async fn reserved(controller: &Controller, token: u8, phase: LaunchPhase) -> Ses
     reservation.session_id
 }
 
+/// Reserves a session and has a worker claim it, as a rendezvous does, so the reservation records
+/// the key that worker presented and is `claimed`. `then` says what became of the launch after.
+async fn claimed(controller: &Controller, token: u8, then: Option<LaunchPhase>) -> SessionId {
+    let session_id = reserved(controller, token, LaunchPhase::Spawned).await;
+    let mut registry = controller.registry.lock().await;
+    let reservation_id = registry
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    registry
+        .claim_rendezvous(
+            reservation_id,
+            kr_protocol::scalars::AuthorisationKey::from_bytes([token; 32]),
+        )
+        .expect("the claim is consumed");
+    match then {
+        Some(LaunchPhase::Fenced) => registry.fence(reservation_id).expect("fenced"),
+        Some(phase) => {
+            let _ = registry
+                .resolve_claim(reservation_id, phase)
+                .expect("resolved");
+        }
+        None => {}
+    }
+    session_id
+}
+
+/// Records that the launcher of a reserved session is the process `identity`.
+async fn launched_by(
+    controller: &Controller,
+    session_id: SessionId,
+    identity: &kr_protocol::identity::ProcessStartIdentity,
+) {
+    let mut registry = controller.registry.lock().await;
+    let reservation_id = registry
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    registry
+        .record_launch(reservation_id, identity)
+        .expect("the launcher is recorded");
+}
+
 /// Records that the launch of an already reserved session has reached `phase`.
 async fn recorded_as(controller: &Controller, session_id: SessionId, phase: LaunchPhase) {
     let mut registry = controller.registry.lock().await;
@@ -436,50 +525,92 @@ async fn recorded_as(controller: &Controller, session_id: SessionId, phase: Laun
         .expect("the phase is recorded");
 }
 
-/// KR-REQ-24.28: a reservation in any phase before its launch has failed or its session has
-/// closed is a worker that may be starting or running, so its session is not over; a session the
-/// registry holds no reservation for, one whose launch failed and one that closed are.
+/// KR-REQ-24.28: what the registry shows of a session's launch decides what became of it. A
+/// reservation that was claimed and then failed or closed, and a session the registry holds nothing
+/// for, are over: a worker ran, or may have, and what it retained is the archive's. A launch that
+/// failed or was fenced before any worker claimed it, or whose launcher has ended without claiming,
+/// never handed out a specification, so no shell ran: it is forgotten. Every other phase is a worker
+/// that may be starting or running, and its session is neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     let (_temp, controller, _clock) = daemon().await;
     let mut asked: Vec<SessionId> = Vec::new();
-    let mut expected: Vec<SessionId> = Vec::new();
-    for (token, (phase, over)) in [
+    let mut ended: Vec<SessionId> = Vec::new();
+    let mut never_started: Vec<SessionId> = Vec::new();
+    let mut token = 0_u8;
+    let mut next = || {
+        token += 1;
+        token
+    };
+    // A reservation in a phase no worker has claimed it in: only a launch that cannot be claimed
+    // any more never started.
+    for (phase, over) in [
         (LaunchPhase::Reserved, false),
         (LaunchPhase::Spawned, false),
         (LaunchPhase::Claimed, false),
         (LaunchPhase::Live, false),
-        (LaunchPhase::Fenced, false),
+        (LaunchPhase::Fenced, true),
         (LaunchPhase::Failed, true),
-        (LaunchPhase::Closed, true),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let session_id = reserved(
-            &controller,
-            u8::try_from(token).expect("a small token") + 1,
-            phase,
-        )
-        .await;
+        (LaunchPhase::Closed, false),
+    ] {
+        let session_id = reserved(&controller, next(), phase).await;
         asked.push(session_id);
         if over {
-            expected.push(session_id);
+            never_started.push(session_id);
+        }
+        if phase == LaunchPhase::Closed {
+            ended.push(session_id);
         }
     }
+    // A claim consumed: a worker was given its specification, so what happens after is the
+    // archive's, and a launch fenced after a claim may still have a worker.
+    let after_a_claim_failed = claimed(&controller, next(), Some(LaunchPhase::Failed)).await;
+    let after_a_claim_closed = claimed(&controller, next(), Some(LaunchPhase::Closed)).await;
+    let after_a_claim_fenced = claimed(&controller, next(), Some(LaunchPhase::Fenced)).await;
+    let after_a_claim = claimed(&controller, next(), None).await;
+    asked.extend([
+        after_a_claim_failed,
+        after_a_claim_closed,
+        after_a_claim_fenced,
+        after_a_claim,
+    ]);
+    ended.extend([after_a_claim_failed, after_a_claim_closed]);
+
+    // A launch whose launcher has ended without claiming can never be claimed: a claim comes from
+    // the launcher's own process. One whose launcher is running, or that nobody has recorded one
+    // for, still can.
+    let gone = reserved(&controller, next(), LaunchPhase::Spawned).await;
+    launched_by(
+        &controller,
+        gone,
+        &kr_ipc::identity::ended_process_identity(4_000_000),
+    )
+    .await;
+    let running = reserved(&controller, next(), LaunchPhase::Spawned).await;
+    launched_by(
+        &controller,
+        running,
+        &kr_ipc::identity::current_process_start_identity().expect("this process"),
+    )
+    .await;
+    asked.extend([gone, running]);
+    never_started.push(gone);
+
     // A session the registry holds nothing for is over too: no launch can come of it.
     let unknown = SessionId::new(kr_ipc::new_uuid());
     asked.push(unknown);
-    expected.push(unknown);
+    ended.push(unknown);
 
-    let mut over = super::start::launches_over(&controller, &asked).await;
-    over.sort_unstable();
-    expected.sort_unstable();
-    assert_eq!(over, expected);
+    let launches = super::start::launches_over(&controller, &asked).await;
+    let sorted = |mut sessions: Vec<SessionId>| {
+        sessions.sort_unstable();
+        sessions
+    };
+    assert_eq!(sorted(launches.ended), sorted(ended));
+    assert_eq!(sorted(launches.never_started), sorted(never_started));
+    let none = super::start::launches_over(&controller, &[]).await;
     assert!(
-        super::start::launches_over(&controller, &[])
-            .await
-            .is_empty(),
+        none.ended.is_empty() && none.never_started.is_empty(),
         "nothing asked, nothing over"
     );
 }
@@ -519,39 +650,62 @@ async fn ended(controller: &Controller, sessions: &[SessionId]) {
 
 /// KR-REQ-24.28: privacy mode's tick takes a session for ended only on the registry's evidence.
 /// Two sessions owe their cleanup and have no worker: one whose launch was claimed, one whose
-/// reservation was fenced. Through every pass of the tick each may still have a worker, so turning
-/// privacy mode off is refused; it stays refused while one of them is left, and once the registry
-/// records that both launches failed the next pass takes them for ended and privacy mode is turned
-/// off.
+/// reservation was fenced after a claim. Through every pass of the tick each may still have a
+/// worker, so turning privacy mode off is refused; it stays refused while one of them is left, and
+/// once the registry records that the first launch failed the next pass takes it for ended, and
+/// once it records the second as closed, privacy mode is turned off. A third, launched and failed
+/// before any worker claimed it, ran no shell: it is forgotten with its obligation, durably, and
+/// never reported as ended with the archive named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over() {
-    let (_temp, controller, _clock) = daemon().await;
-    let claimed = reserved(&controller, 1, LaunchPhase::Claimed).await;
-    let fenced = reserved(&controller, 2, LaunchPhase::Fenced).await;
+    let (temp, controller, _clock) = daemon().await;
+    let claim = claimed(&controller, 1, None).await;
+    let fenced = claimed(&controller, 2, Some(LaunchPhase::Fenced)).await;
+    let unstarted = reserved(&controller, 3, LaunchPhase::Spawned).await;
     let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
     controller
         .privacy
-        .enable(&[claimed, fenced], kr_ipc::now_ms(), &standing)
+        .enable(&[claim, fenced, unstarted], kr_ipc::now_ms(), &standing)
         .expect("privacy mode is turned on");
 
-    // The tick passes over both, more than once, and neither is taken for ended.
+    // The tick passes over all three, more than once; none that may still have a worker is taken
+    // for ended, so turning privacy mode off is refused.
     tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
     let refused = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
         .expect_err("a launch that may still produce a worker holds privacy mode on");
-    for session_id in [claimed, fenced] {
+    for session_id in [claim, fenced, unstarted] {
         assert!(
             refused.to_string().contains(&session_id.to_string()),
             "the refusal names the session: {refused}"
         );
     }
 
+    // The third launch fails before any worker claimed it. The pass that follows forgets it: it is
+    // not reported as ended, and no obligation of it is left on the disk.
+    recorded_as(&controller, unstarted, LaunchPhase::Failed).await;
+    forgotten(&controller, &[unstarted]).await;
+    assert!(!is_ended(&controller, unstarted));
+    assert_eq!(
+        obligations_on_disk(&temp),
+        2,
+        "the other two are still owed"
+    );
+    let refused = controller
+        .privacy
+        .disable(kr_ipc::now_ms(), &standing)
+        .expect_err("the other two still hold privacy mode on");
+    assert!(
+        !refused.to_string().contains(&unstarted.to_string()),
+        "{refused}"
+    );
+
     // One launch is over, and the other may still produce a worker. The pass that takes the first
     // for ended is a pass that has read the registry with the second fenced, so once it has been
     // seen the second is known to have been passed over, and it holds the change back.
-    recorded_as(&controller, claimed, LaunchPhase::Failed).await;
-    ended(&controller, &[claimed]).await;
+    recorded_as(&controller, claim, LaunchPhase::Failed).await;
+    ended(&controller, &[claim]).await;
     assert!(
         !is_ended(&controller, fenced),
         "the fenced launch may still produce a worker, so its session is not ended"
@@ -565,12 +719,320 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
         "{refused}"
     );
 
-    // Both are over: the next pass takes them for ended, and privacy mode is turned off.
-    recorded_as(&controller, fenced, LaunchPhase::Failed).await;
-    ended(&controller, &[claimed, fenced]).await;
+    // Both are over: the next pass takes them for ended, and privacy mode is turned off. What each
+    // had retained is the archive's, so their obligations stay.
+    recorded_as(&controller, fenced, LaunchPhase::Closed).await;
+    ended(&controller, &[claim, fenced]).await;
     let off = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
         .expect("sessions whose launches are over do not hold privacy mode on");
     assert!(!off.enabled);
+    assert_eq!(obligations_on_disk(&temp), 2);
+}
+
+/// How many obligations privacy mode's record holds on the disk.
+fn obligations_on_disk(temp: &kr_ipc::testing::TempHost) -> i64 {
+    rusqlite::Connection::open(temp.environment().state_dir().join(PRIVACY_RECORD))
+        .expect("a second connection to the record")
+        .query_row("SELECT COUNT(*) FROM privacy_obligations", [], |row| {
+            row.get(0)
+        })
+        .expect("a count")
+}
+
+/// Waits until privacy mode's tick has forgotten every session in `sessions`, and fails the test
+/// when it has not within thirty seconds.
+async fn forgotten(controller: &Controller, sessions: &[SessionId]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = controller.privacy.status(kr_ipc::now_ms());
+        if sessions.iter().all(|session_id| {
+            report
+                .sessions
+                .iter()
+                .all(|owed| owed.session_id != *session_id)
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never forgot the sessions: {:?}",
+            report.sessions
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A create request for an invisible session.
+fn create_request(environment_id: EnvironmentId) -> MutationRequest {
+    request(
+        Method::SessionCreate,
+        environment_id,
+        &kr_protocol::session::SessionCreateParams {
+            environment_id,
+            presentation: kr_protocol::session::Presentation::Invisible,
+            shell: Nullable::null(),
+            shell_mode: ShellMode::NativeCompat,
+            cwd: Nullable::some("/".to_owned()),
+            dimensions: Nullable::null(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
+        },
+    )
+}
+
+/// What a create that asked for its worker while privacy mode was `private` left: the sessions the
+/// supervisor was asked to start, each with how many obligations the record held for it on the
+/// disk at that moment.
+async fn asked_after_a_create(private: bool) -> Vec<(SessionId, i64)> {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (temp, controller, _clock) = daemon_starting(|state_dir| {
+        Box::new(Recording {
+            state_dir: state_dir.to_path_buf(),
+            asked: Arc::clone(&asked),
+        })
+    })
+    .await;
+    if private {
+        controller
+            .privacy
+            .enable(&[], kr_ipc::now_ms(), &|write| write())
+            .expect("privacy mode is turned on");
+    }
+    let (actor_id, carried) = admitted(&controller).await;
+    controller
+        .session_create(&actor_id, &create_request(temp.environment_id()), carried)
+        .await
+        .expect_err("this test starts no workers");
+    let asked = asked.lock().expect("the record is not poisoned").clone();
+    asked
+}
+
+/// KR-REQ-24.27: a session created while privacy mode is on has its obligation on the disk when its
+/// worker is asked for, so turning privacy mode off waits for it from before its shell runs. The
+/// control is the same create with privacy mode off, which has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_created_while_privacy_mode_is_on_owes_cleanup_when_its_worker_is_asked_for() {
+    let private = asked_after_a_create(true).await;
+    assert_eq!(private.len(), 1, "the worker was asked for: {private:?}");
+    assert_eq!(private[0].1, 1, "its obligation was on the disk");
+    let off = asked_after_a_create(false).await;
+    assert_eq!(off.len(), 1, "the worker was asked for: {off:?}");
+    assert_eq!(off[0].1, 0, "and owed nothing while privacy mode was off");
+}
+
+/// A create that waits for a change of privacy mode that holds the record, while its admission
+/// lapses, starts nothing and holds nothing: the registry stays free while it waits, its
+/// reservation is resolved as failed, and the obligation it wrote once the change had finished is
+/// forgotten by the tick, because no worker ever claimed it.
+async fn a_create_whose_admission_lapses_while_it_waits_for_the_record(lapse: Lapse) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (temp, controller, clock) = daemon_starting(|state_dir| {
+        Box::new(Recording {
+            state_dir: state_dir.to_path_buf(),
+            asked: Arc::clone(&asked),
+        })
+    })
+    .await;
+    let (actor_id, carried) = admitted(&controller).await;
+    let connection_id = carried.connection_id;
+    let mutation = create_request(temp.environment_id());
+
+    // An enabling holds the record's mutex, as it does while it waits for what it must.
+    let (arrived, release) = controller.privacy.before_change.arm();
+    let enabling = tokio::task::spawn_blocking({
+        let controller = Arc::clone(&controller);
+        move || {
+            controller
+                .privacy
+                .enable(&[], kr_ipc::now_ms(), &|write| write())
+        }
+    });
+    arrival(arrived).await;
+
+    let creating = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move {
+            controller
+                .session_create(&actor_id, &mutation, carried)
+                .await
+        }
+    });
+    tokio::time::sleep(SETTLING).await;
+    assert!(!creating.is_finished(), "the create waits for the record");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "and has asked for no worker"
+    );
+    // The registry is free while it waits: the create holds no guard of it.
+    tokio::time::timeout(Duration::from_secs(10), controller.registry.lock())
+        .await
+        .expect("the registry is not held by a create that is waiting");
+    lapse.happens(&controller, &clock, connection_id);
+    release.send(()).expect("the enabling goes on");
+    enabling
+        .await
+        .expect("the enabling finishes")
+        .expect("privacy mode is turned on");
+
+    let refused = creating
+        .await
+        .expect("the create finishes")
+        .expect_err("a create whose admission lapsed while it waited starts nothing");
+    assert!(lapse.is_refused_by(&refused), "{lapse:?}: {refused}");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "{lapse:?}: no worker was asked for"
+    );
+    let failed = controller
+        .registry
+        .lock()
+        .await
+        .reservations_in(LaunchPhase::Failed)
+        .expect("a read");
+    assert_eq!(failed.len(), 1, "{lapse:?}: the reservation is resolved");
+    // It wrote its obligation once the change had finished, and the tick forgets it: nothing ran.
+    forgotten(&controller, &[failed[0].session_id]).await;
+    assert_eq!(obligations_on_disk(&temp), 0);
+    controller
+        .privacy
+        .disable(
+            kr_ipc::now_ms(),
+            &|write: &mut dyn FnMut() -> crate::error::Result<()>| write(),
+        )
+        .expect("a launch that never started does not hold privacy mode on");
+}
+
+/// KR-REQ-24.27: a create's deadline passes while it waits for a change of privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_deadline_passes_while_it_waits_for_the_record_starts_nothing() {
+    a_create_whose_admission_lapses_while_it_waits_for_the_record(Lapse::Deadline).await;
+}
+
+/// KR-REQ-24.27: the connection a create arrived on is withdrawn while it waits for a change of
+/// privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_connection_is_withdrawn_while_it_waits_for_the_record_starts_nothing() {
+    a_create_whose_admission_lapses_while_it_waits_for_the_record(Lapse::Withdrawal).await;
+}
+
+/// KR-REQ-24.27: a create whose session's obligation cannot be written is refused with the store's
+/// reason, and starts nothing: its reservation is resolved as failed, and nothing is owed for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_obligation_cannot_be_written_starts_nothing() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (temp, controller, _clock) = daemon_starting(|state_dir| {
+        Box::new(Recording {
+            state_dir: state_dir.to_path_buf(),
+            asked: Arc::clone(&asked),
+        })
+    })
+    .await;
+    controller
+        .privacy
+        .enable(&[], kr_ipc::now_ms(), &|write| write())
+        .expect("privacy mode is turned on");
+    rusqlite::Connection::open(temp.environment().state_dir().join(PRIVACY_RECORD))
+        .expect("a second connection to the record")
+        .execute_batch(
+            "CREATE TRIGGER refuse_the_obligation BEFORE INSERT ON privacy_obligations
+             BEGIN SELECT RAISE(ABORT, 'this store refused the obligation'); END;",
+        )
+        .expect("the store will refuse the obligation");
+    let (actor_id, carried) = admitted(&controller).await;
+    let refused = controller
+        .session_create(&actor_id, &create_request(temp.environment_id()), carried)
+        .await
+        .expect_err("a create whose obligation cannot be recorded starts nothing");
+    assert!(
+        refused.to_string().contains("refused the obligation"),
+        "{refused}"
+    );
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "no worker was asked for"
+    );
+    let registry = controller.registry.lock().await;
+    assert_eq!(
+        registry
+            .reservations_in(LaunchPhase::Failed)
+            .expect("a read")
+            .len(),
+        1,
+        "the reservation is resolved rather than left occupying the environment"
+    );
+    assert_eq!(registry.occupancy().expect("counts"), 0);
+    drop(registry);
+    assert!(
+        controller
+            .privacy
+            .status(kr_ipc::now_ms())
+            .sessions
+            .is_empty(),
+        "nothing is owed for a launch that was refused"
+    );
+}
+
+/// KR-REQ-24.28: a claim that commits after the launcher was found to have ended makes the launch
+/// one a worker ran from, so the registry is read again before a launch is believed never to have
+/// started. The control is the same reservation, unclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_claimed_after_its_launcher_was_found_ended_is_not_taken_for_never_started() {
+    let (_temp, controller, _clock) = daemon().await;
+    let unclaimed = reserved(&controller, 1, LaunchPhase::Spawned).await;
+    let claim = claimed(&controller, 2, None).await;
+    let both = [unclaimed, claim];
+    assert_eq!(
+        super::start::still_unclaimed(&controller, &both).await,
+        vec![unclaimed],
+        "only the reservation nobody claimed"
+    );
+    // A reservation that moved on since, whatever it moved to, is not one of them either.
+    recorded_as(&controller, unclaimed, LaunchPhase::Fenced).await;
+    assert!(
+        super::start::still_unclaimed(&controller, &both)
+            .await
+            .is_empty()
+    );
+}
+
+/// KR-REQ-24.28: turning privacy mode on after a restart finds a launch whose worker was handed a
+/// specification before it, which this daemon's own record of launches no longer holds and whose
+/// worker has no journal or worker row yet: the registry says a worker may be running there, so
+/// the session owes its cleanup. A reservation no worker can come of, and one not yet launched,
+/// owe nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of() {
+    let (temp, controller, _clock) = daemon().await;
+    let environment_id = temp.environment_id();
+    let spawned = reserved(&controller, 1, LaunchPhase::Spawned).await;
+    let claim = claimed(&controller, 2, None).await;
+    let fenced = claimed(&controller, 3, Some(LaunchPhase::Fenced)).await;
+    let _reserved = reserved(&controller, 4, LaunchPhase::Reserved).await;
+    let _failed = reserved(&controller, 5, LaunchPhase::Failed).await;
+    let _closed = reserved(&controller, 6, LaunchPhase::Closed).await;
+
+    let (_actor, carried) = admitted(&controller).await;
+    let report = controller
+        .privacy_set(
+            &request(
+                Method::PrivacySet,
+                environment_id,
+                &PrivacySetParams { enabled: true },
+            ),
+            carried,
+        )
+        .await
+        .expect("privacy mode is turned on");
+    let report: kr_protocol::privacy::PrivacyReport = report.to_typed().expect("decodes");
+    let mut owing: Vec<SessionId> = report.sessions.iter().map(|owed| owed.session_id).collect();
+    owing.sort_unstable();
+    let mut expected = vec![spawned, claim, fenced];
+    expected.sort_unstable();
+    assert_eq!(owing, expected);
+    assert_eq!(obligations_on_disk(&temp), 3);
 }

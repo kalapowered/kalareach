@@ -30,6 +30,11 @@
 //!   worker says its cleanup is complete. A session whose worker has ended keeps its obligation,
 //!   reported as unavailable, because what it retained is the archive's and nothing here removes
 //!   it.
+//! * **A launch is recorded before its worker runs.** A session created while privacy mode is on
+//!   owes its cleanup from the moment its worker is asked for ([`EnvironmentPrivacy::note_session_launching`]),
+//!   and its worker is told the state in its launch specification and applies it before its shell
+//!   starts. A launch that never produced a worker, as the registry shows, has its obligation
+//!   discharged ([`EnvironmentPrivacy::discharge_unstarted`]): nothing ran, so nothing was kept.
 //! * **Disabling is two phases.** It is refused while a daemon step, or a session whose worker is
 //!   running or may still start, owes cleanup. Otherwise the new generation is recorded first and
 //!   then each fence is released; a release that is still pending, or that a store refused, is
@@ -338,6 +343,9 @@ enum Reach {
     /// Nothing has said yet, which is the state of every session after a daemon restart.
     #[default]
     Unknown,
+    /// A worker has been asked for and has not yet been found running: its launch is under way,
+    /// and what it owes is recorded, but there is nobody to tell yet.
+    Launching,
     /// Its worker is running.
     Live,
     /// Its worker has ended; what it retained is the archive's.
@@ -611,13 +619,14 @@ impl EnvironmentPrivacy {
         let mut mode = inner.mode;
         let generation = mode.open_generation(now_ms);
         // Every session this environment holds content for owes its cleanup, and so does every
-        // session whose worker is running now, whether or not the caller named it.
+        // session whose worker is running now or is on its way, whether or not the caller named
+        // it: a launch that has been asked for has no journal yet for the caller to find.
         let mut owing: Vec<SessionId> = sessions.to_vec();
         owing.extend(
             inner
                 .sessions
                 .iter()
-                .filter(|(_, progress)| progress.reach == Reach::Live)
+                .filter(|(_, progress)| matches!(progress.reach, Reach::Live | Reach::Launching))
                 .map(|(session_id, _)| *session_id),
         );
         owing.sort_unstable();
@@ -795,10 +804,11 @@ impl EnvironmentPrivacy {
     ///
     /// While privacy mode is on, a session that joins owes its cleanup like every other, durably,
     /// until its worker says the generation in force is applied and its cleanup complete: nothing
-    /// is known about what it retained before it was told.
+    /// is known about what it retained before it was told. A session created while privacy mode is
+    /// on already has its obligation by now ([`Self::note_session_launching`]); this finds it there,
+    /// and is what writes it for a worker this daemon meets without having launched it.
     ///
-    /// Success says the session owes nothing or its obligation is on the disk, so a session created
-    /// while privacy mode is on is launched only once this has succeeded.
+    /// Success says the session owes nothing or its obligation is on the disk.
     ///
     /// # Errors
     ///
@@ -830,6 +840,70 @@ impl EnvironmentPrivacy {
         Ok(())
     }
 
+    /// Records that a session's worker has been asked for, before it is launched.
+    ///
+    /// While privacy mode is on, the session owes its cleanup from this moment, durably, because
+    /// its worker is told the privacy state when it is launched and applies it before its shell
+    /// runs, and turning privacy mode off must wait for it from then. Privacy mode being off, the
+    /// session owes nothing yet, and a change that turns it on while the launch is under way finds
+    /// the session here and obliges it ([`Self::enable`]). Nothing is told to a worker that does not
+    /// exist: the session is told the generation once it is running ([`Self::note_session_live`]).
+    ///
+    /// The launch waits here for everything that holds the record, a change of privacy mode among
+    /// it, and records the state that change left. Success says the session owes nothing or its
+    /// obligation is on the disk, and a session created while privacy mode is on is launched only
+    /// once it has succeeded. A write that fails leaves nothing held: no worker will come of a
+    /// launch that is refused, so nothing is owed for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when its obligation cannot be written.
+    pub fn note_session_launching(&self, session_id: SessionId, now_ms: TimestampMs) -> Result<()> {
+        let mut inner = self.inner();
+        if inner.mode.is_enabled() && !inner.obligations.contains_key(&session_id) {
+            let generation = inner.mode.generation();
+            inner.record.oblige(session_id, generation, now_ms)?;
+            inner.obligations.insert(session_id, generation);
+        }
+        let progress = inner.sessions.entry(session_id).or_default();
+        // A session that is already running, or whose worker has ended, is not taken back.
+        if progress.reach == Reach::Unknown {
+            progress.reach = Reach::Launching;
+        }
+        Ok(())
+    }
+
+    /// Forgets the sessions whose launches the daemon's registry shows never produced a worker,
+    /// with their obligations.
+    ///
+    /// A launch that failed before its worker claimed its reservation was never given a launch
+    /// specification, so no shell ran and nothing was retained: what its obligation recorded is not
+    /// owed, and an obligation kept for it would be reported for good as the archive's. Each
+    /// obligation is deleted from the record first, and the session forgotten only once that has
+    /// landed; a delete the store refuses leaves the session owed, and the next pass tries it
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first delete the record refused; every session is still tried.
+    pub fn discharge_unstarted(&self, sessions: &[SessionId]) -> Result<()> {
+        let mut inner = self.inner();
+        let generation = inner.mode.generation();
+        let mut refused = None;
+        for session_id in sessions {
+            if inner.obligations.contains_key(session_id) {
+                if let Err(error) = inner.record.discharge(*session_id, generation) {
+                    refused.get_or_insert(error);
+                    continue;
+                }
+                inner.obligations.remove(session_id);
+            }
+            inner.unrecorded.remove(session_id);
+            inner.sessions.remove(session_id);
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
     /// Records that a session's worker has ended.
     ///
     /// Its obligation, when it has one, stays: an ended worker is not evidence that what it
@@ -848,9 +922,8 @@ impl EnvironmentPrivacy {
     /// news of: neither running nor recorded, and not yet taken for ended.
     ///
     /// The daemon asks its registry about each one ([`Self::sessions_seen`]), because a worker that
-    /// is not recorded may not have reported yet: a session whose launch is still in progress has a
-    /// journal on the disk and no worker the registry lists, and is one this host has not reached,
-    /// not one that has ended.
+    /// is not recorded may not have reported yet: a session whose launch is still in progress has no
+    /// worker the registry lists, and is one this host has not reached, not one that has ended.
     #[must_use]
     pub fn unreached(&self, live: &[SessionId], recorded: &[SessionId]) -> Vec<SessionId> {
         let inner = self.inner();
@@ -971,7 +1044,8 @@ impl EnvironmentPrivacy {
             inner.unrecorded.remove(&session_id);
         }
         let progress = inner.sessions.entry(session_id).or_default();
-        if progress.reach == Reach::Unknown {
+        // An answer says the worker is running, whatever this record had heard of it before.
+        if matches!(progress.reach, Reach::Unknown | Reach::Launching) {
             progress.reach = Reach::Live;
         }
         progress.answer = Some(answer);
@@ -1478,9 +1552,10 @@ fn write_obligation(
 impl crate::service::Controller {
     /// Performs `privacy.set` under the admission it carries, and answers the report.
     ///
-    /// The sessions the environment holds content for are every worker the registry records and
-    /// every session whose journal or spool is still on disk, and each owes its own cleanup when
-    /// privacy mode is turned on. The admission is asked again immediately before the change is
+    /// The sessions the environment holds content for are every worker the registry records, every
+    /// launch whose worker may be starting or running (a reservation that is spawned, claimed or
+    /// fenced) and every session whose journal or spool is still on disk, and each owes its own
+    /// cleanup when privacy mode is turned on. The admission is asked again immediately before the change is
     /// written, after every wait ([`EnvironmentPrivacy::set`]).
     ///
     /// # Errors
@@ -1503,14 +1578,31 @@ impl crate::service::Controller {
             .params
             .to_typed()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let mut sessions: Vec<SessionId> = self
-            .registry_handle()
-            .lock()
-            .await
-            .workers()?
-            .into_iter()
-            .map(|worker| worker.session_id)
-            .collect();
+        let mut sessions: Vec<SessionId> = {
+            let registry = self.registry_handle().lock().await;
+            let mut sessions: Vec<SessionId> = registry
+                .workers()?
+                .into_iter()
+                .map(|worker| worker.session_id)
+                .collect();
+            // A launch that handed its worker a specification, or may be about to, owes its
+            // cleanup too, whether or not its worker has opened a journal or reported yet: after a
+            // restart this daemon's own record of launches is gone, and the registry is the only
+            // place that says a worker may be running there.
+            for phase in [
+                crate::registry::LaunchPhase::Spawned,
+                crate::registry::LaunchPhase::Claimed,
+                crate::registry::LaunchPhase::Fenced,
+            ] {
+                sessions.extend(
+                    registry
+                        .reservations_in(phase)?
+                        .into_iter()
+                        .map(|reservation| reservation.session_id),
+                );
+            }
+            sessions
+        };
         sessions.extend(self.archive().sessions_on_disk()?);
         sessions.sort_unstable();
         sessions.dedup();
@@ -3617,6 +3709,239 @@ mod tests {
             .expect("nothing is owed now");
         assert!(!report.enabled);
         assert!(report.obligations.is_empty());
+    }
+
+    /// How many obligations the record holds on the disk, read through a connection of its own.
+    fn recorded_obligations(host: &Host) -> i64 {
+        Connection::open(host.root.path().join(PRIVACY_RECORD))
+            .expect("a second connection to the record")
+            .query_row("SELECT COUNT(*) FROM privacy_obligations", [], |row| {
+                row.get(0)
+            })
+            .expect("a count")
+    }
+
+    /// KR-REQ-24.27: a session launched while privacy mode is on owes its cleanup, durably, before
+    /// any worker is running, so turning privacy mode off waits for it from that moment. Its worker
+    /// does not exist yet, so nothing is told it: it is told, at once and not after a wait that
+    /// grew while there was nobody to tell, when the daemon first finds it running.
+    #[test]
+    fn a_session_launched_while_privacy_mode_is_on_owes_cleanup_before_its_worker_runs() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        host.privacy
+            .note_session_launching(session(7), at(10))
+            .expect("the launch is recorded");
+        assert_eq!(recorded_obligations(&host), 1, "it is on the disk");
+        let report = host.privacy.report_now(at(20));
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].session_id, session(7));
+        assert_eq!(report.obligations[0].generation, PrivacyGeneration::new(1));
+        assert_eq!(report.obligations[0].standing, Standing::AwaitingWorker);
+        assert!(!report.completion.is_complete());
+        let refused = host
+            .privacy
+            .disable(at(30), &standing)
+            .expect_err("a launch that will produce a worker holds privacy mode on");
+        assert!(
+            refused.to_string().contains(&session(7).to_string()),
+            "{refused}"
+        );
+        assert_eq!(
+            host.privacy.unreached(&[], &[]),
+            vec![session(7)],
+            "it is neither running nor over"
+        );
+
+        // Nobody is told anything while there is no worker, and no wait is spent on trying.
+        for offset in [2_000, 4_000, 8_000, 16_000] {
+            assert!(host.privacy.notices_due(at(offset)).is_empty());
+        }
+        host.privacy
+            .note_session_live(session(7), at(20_000))
+            .expect("the worker is running");
+        let notices = host.privacy.notices_due(at(20_010));
+        assert_eq!(notices.len(), 1, "told as soon as it is running");
+        assert_eq!(notices[0].session_id, session(7));
+        assert!(notices[0].enabled);
+        assert_eq!(recorded_obligations(&host), 1, "and still one obligation");
+
+        // Noting a launch again, as a repeated create would, does not take a running session back.
+        host.privacy
+            .note_session_launching(session(7), at(20_020))
+            .expect("noted again");
+        assert_eq!(host.privacy.notices_due(at(40_000)).len(), 1);
+    }
+
+    /// KR-REQ-24.27: a session launched while privacy mode is off owes nothing, and one that is
+    /// launched and has no worker yet when privacy mode is turned on owes its cleanup like every
+    /// session the environment holds, though no list names it and no journal of it exists.
+    #[test]
+    fn a_launch_under_way_when_privacy_mode_is_turned_on_owes_its_cleanup() {
+        let host = Host::open();
+        host.privacy
+            .note_session_launching(session(8), at(0))
+            .expect("the launch is recorded");
+        let report = host.privacy.report_now(at(5));
+        assert!(report.obligations.is_empty());
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
+        assert_eq!(recorded_obligations(&host), 0);
+
+        let report = host
+            .privacy
+            .enable(&[session(9)], at(10), &standing)
+            .expect("privacy mode is enabled");
+        let owing: Vec<SessionId> = report
+            .obligations
+            .iter()
+            .map(|obligation| obligation.session_id)
+            .collect();
+        assert_eq!(owing, vec![session(8), session(9)], "both owe it");
+        assert_eq!(recorded_obligations(&host), 2);
+        assert!(host.privacy.disable(at(20), &standing).is_err());
+    }
+
+    /// KR-REQ-24.27: a launch whose obligation cannot be written is refused, and nothing is owed
+    /// for it: no worker will come of it, so the report does not say one is awaited and privacy
+    /// mode can be turned off. The same launch is recorded once the store takes it.
+    #[test]
+    fn a_launch_whose_obligation_cannot_be_written_owes_nothing() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_obligation BEFORE INSERT ON privacy_obligations
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the obligation'); END;",
+            )
+            .expect("the store will refuse the obligation");
+        let refused = host
+            .privacy
+            .note_session_launching(session(5), at(10))
+            .expect_err("the obligation could not be written");
+        assert!(
+            refused.to_string().contains("refused the obligation"),
+            "{refused}"
+        );
+        let report = host.privacy.report_now(at(20));
+        assert!(report.obligations.is_empty(), "{:?}", report.obligations);
+        assert!(
+            unavailable(&report, "sessions").is_empty(),
+            "{:?}",
+            report.completion
+        );
+        assert!(host.privacy.unreached(&[], &[]).is_empty());
+        host.privacy
+            .disable(at(30), &standing)
+            .expect("nothing is owed for a launch that was refused");
+        host.privacy
+            .enable(&[], at(40), &standing)
+            .expect("privacy mode is turned on again");
+        record
+            .execute_batch("DROP TRIGGER refuse_the_obligation")
+            .expect("the store accepts the obligation");
+        host.privacy
+            .note_session_launching(session(5), at(50))
+            .expect("the same launch is recorded once the store takes it");
+        assert_eq!(recorded_obligations(&host), 1);
+    }
+
+    /// KR-REQ-24.27: a launch is recorded after a change that holds the record has finished, not
+    /// before it and not around it: it waits, and what it records is the state the change left.
+    #[test]
+    fn a_launch_waits_for_a_change_that_holds_the_record() {
+        let host = Host::open();
+        let (arrived, release) = host.privacy.before_change.arm();
+        std::thread::scope(|scope| {
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the enabling holds the record");
+            let launching = scope.spawn(|| host.privacy.note_session_launching(session(3), at(20)));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !launching.is_finished(),
+                "the launch waits for the change that holds the record"
+            );
+            release.send(()).expect("the enabling goes on");
+            enabling
+                .join()
+                .expect("the enabling finishes")
+                .expect("privacy mode is enabled");
+            launching
+                .join()
+                .expect("the launch finishes")
+                .expect("the launch is recorded");
+        });
+        let report = host.privacy.report_now(at(30));
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].session_id, session(3));
+        assert_eq!(
+            report.obligations[0].generation,
+            PrivacyGeneration::new(1),
+            "at the generation the change left"
+        );
+        assert_eq!(recorded_obligations(&host), 1);
+    }
+
+    /// KR-REQ-24.28: a launch the registry shows never produced a worker is forgotten with its
+    /// obligation, durably, and does not keep privacy mode on or the report from saying complete.
+    /// A refused delete keeps it owed, with nothing forgotten, until a later pass lands it.
+    #[test]
+    fn a_launch_that_never_started_is_discharged_once_the_store_takes_the_delete() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        host.privacy
+            .note_session_launching(session(5), at(10))
+            .expect("the launch is recorded");
+        host.privacy
+            .note_session_launching(session(6), at(10))
+            .expect("the launch is recorded");
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_delete BEFORE DELETE ON privacy_obligations
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the delete'); END;",
+            )
+            .expect("the store will refuse the delete");
+        let refused = host
+            .privacy
+            .discharge_unstarted(&[session(5)])
+            .expect_err("the delete was refused");
+        assert!(
+            refused.to_string().contains("refused the delete"),
+            "{refused}"
+        );
+        assert_eq!(recorded_obligations(&host), 2, "nothing was forgotten");
+        assert_eq!(host.privacy.report_now(at(20)).obligations.len(), 2);
+        assert!(host.privacy.disable(at(30), &standing).is_err());
+
+        record
+            .execute_batch("DROP TRIGGER refuse_the_delete")
+            .expect("the store takes the delete");
+        host.privacy
+            .discharge_unstarted(&[session(5)])
+            .expect("the delete lands");
+        assert_eq!(recorded_obligations(&host), 1);
+        let report = host.privacy.report_now(at(40));
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].session_id, session(6));
+        assert_eq!(host.privacy.unreached(&[], &[]), vec![session(6)]);
+
+        // The other launch ends the way a worker that ran does: its obligation stays.
+        host.privacy.note_session_ended(session(6));
+        let report = host
+            .privacy
+            .disable(at(50), &standing)
+            .expect("an ended session does not hold privacy mode on");
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].standing, Standing::WorkerEnded);
     }
 
     /// An environment that never turned privacy mode on owes its workers nothing: none is told

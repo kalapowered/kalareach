@@ -870,8 +870,9 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
     };
     let now_ms = kr_ipc::now_ms();
     // A session that is neither running nor recorded is not thereby one that has ended: its worker
-    // may not have reported yet. The registry says whether its launch is over.
-    let over = match &recorded {
+    // may not have reported yet. The registry says whether its launch is over, and whether a worker
+    // was ever given a launch specification.
+    let launches = match &recorded {
         Some(recorded) => {
             let unreached = {
                 let privacy = Arc::clone(&privacy);
@@ -883,14 +884,17 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
             let controller = daemon.upgrade()?;
             launches_over(&controller, &unreached).await
         }
-        None => Vec::new(),
+        None => Launches::default(),
     };
     let notices = {
         let privacy = Arc::clone(&privacy);
         tokio::task::spawn_blocking(move || {
             if let Some(recorded) = recorded {
                 // An obligation that could not be written is held and written again by the tick.
-                let _ = privacy.sessions_seen(&live, &recorded, &over, now_ms);
+                let _ = privacy.sessions_seen(&live, &recorded, &launches.ended, now_ms);
+                // A launch that never produced a worker owes nothing; a delete the record refuses
+                // leaves it owed, and the next pass tries it again.
+                let _ = privacy.discharge_unstarted(&launches.never_started);
             }
             let _ = privacy.tick(now_ms);
             privacy.notices_due(now_ms)
@@ -908,34 +912,106 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
     Some(())
 }
 
-/// The sessions among `unreached` whose launch the registry shows to be over: it records no
-/// reservation for them, or one whose launch produced no worker or whose session has closed.
+/// What the registry shows of the launches of the sessions privacy mode's record has no worker for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Launches {
+    /// The sessions whose launch is over after a worker had claimed its reservation, or which the
+    /// registry holds no reservation for: a worker ran, or may have, so what it retained is the
+    /// archive's.
+    pub(super) ended: Vec<SessionId>,
+    /// The sessions whose launch can never hand out a launch specification: no worker ever claimed
+    /// its reservation, and none can any more. No shell ran, so nothing was retained.
+    pub(super) never_started: Vec<SessionId>,
+}
+
+/// The sessions among `unreached` whose launch the registry shows to be over, and those whose
+/// launch never produced a worker.
 ///
-/// A reservation in any phase before that, reserved, spawned, claimed, live or fenced, is a worker
-/// that may be starting or running and that this host has not reached, so its session is not over.
-/// A registry that cannot be read says nothing about any of them, and none is.
-pub(super) async fn launches_over(
-    controller: &Controller,
-    unreached: &[SessionId],
-) -> Vec<SessionId> {
+/// A reservation in any phase before that, reserved, spawned, claimed, live or fenced after a
+/// claim, is a worker that may be starting or running and that this host has not reached, so its
+/// session is not over. Neither is a launch that is merely slow: one whose worker has not claimed
+/// its reservation yet.
+///
+/// A launch never started when its reservation records no claim and cannot get one. A claim, which
+/// is what hands a worker its launch specification, needs a reservation that is spawned and comes
+/// from the launcher's own process, so a reservation that failed or was fenced before a claim, or
+/// is spawned with a launcher that has since ended, never will. The registry is read once to find
+/// the launches that might qualify, the launchers are asked about, and the registry is read again
+/// under its guard before one is believed: a claim that committed in between is one a worker ran
+/// from. A registry that cannot be read says nothing about any of them, and none is over.
+pub(super) async fn launches_over(controller: &Controller, unreached: &[SessionId]) -> Launches {
     if unreached.is_empty() {
-        return Vec::new();
+        return Launches::default();
     }
-    let registry = controller.registry.lock().await;
-    let mut over = Vec::new();
-    for session_id in unreached {
-        match registry.reservation_for_session(*session_id) {
-            Ok(None) => over.push(*session_id),
-            Ok(Some(reservation))
-                if matches!(reservation.phase, LaunchPhase::Failed | LaunchPhase::Closed) =>
-            {
-                over.push(*session_id);
+    let mut launches = Launches::default();
+    // Launches whose launcher might have ended without ever claiming, with the launcher.
+    let mut launchers = Vec::new();
+    {
+        let registry = controller.registry.lock().await;
+        for session_id in unreached {
+            match registry.reservation_for_session(*session_id) {
+                Ok(None) => launches.ended.push(*session_id),
+                Ok(Some(reservation)) => match (reservation.phase, &reservation.claimed_key) {
+                    (LaunchPhase::Closed, _) => launches.ended.push(*session_id),
+                    (LaunchPhase::Failed, Some(_)) => launches.ended.push(*session_id),
+                    (LaunchPhase::Failed | LaunchPhase::Fenced, None) => {
+                        launches.never_started.push(*session_id);
+                    }
+                    (LaunchPhase::Spawned, None) => {
+                        if let Some(launcher) = reservation.launcher_identity {
+                            launchers.push((*session_id, launcher));
+                        }
+                    }
+                    _ => {}
+                },
+                Err(_) => return Launches::default(),
             }
-            Ok(Some(_)) => {}
-            Err(_) => return Vec::new(),
         }
     }
-    over
+    let mut ended_launchers = Vec::new();
+    for (session_id, launcher) in launchers {
+        let process = launcher.clone();
+        let state = tokio::task::spawn_blocking(move || kr_ipc::identity::process_state(&process))
+            .await
+            .unwrap_or(kr_ipc::identity::ProcessState::Unknown {
+                detail: "the question about the launcher did not finish".to_owned(),
+            });
+        if state == kr_ipc::identity::ProcessState::Ended {
+            ended_launchers.push(session_id);
+        }
+    }
+    if !ended_launchers.is_empty() {
+        launches
+            .never_started
+            .extend(still_unclaimed(controller, &ended_launchers).await);
+    }
+    launches
+}
+
+/// The sessions among `sessions` whose reservation is still spawned and unclaimed, read now under
+/// the registry's guard.
+///
+/// A claim takes the same guard and moves the reservation out of `spawned`, so a reservation found
+/// here cannot be claimed by the time the caller acts on the answer's being true of a launcher that
+/// has ended. A reservation claimed since the caller last looked, or one the registry cannot be
+/// read for, is not among them: a worker may have run.
+pub(super) async fn still_unclaimed(
+    controller: &Controller,
+    sessions: &[SessionId],
+) -> Vec<SessionId> {
+    let registry = controller.registry.lock().await;
+    sessions
+        .iter()
+        .copied()
+        .filter(|session_id| {
+            matches!(
+                registry.reservation_for_session(*session_id),
+                Ok(Some(reservation))
+                    if reservation.phase == LaunchPhase::Spawned
+                        && reservation.claimed_key.is_none()
+            )
+        })
+        .collect()
 }
 
 /// Tells one worker the environment's privacy generation, and returns its answer; `None` once the
