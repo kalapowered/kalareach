@@ -96,6 +96,10 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          column leaves a row one cell wider than the grid and sets the pending wrap, where xterm \
          blanks the last column and wraps the character. A projected renderer clips or safely \
          replaces the overhanging cell.",
+        "A wide character that ends exactly on the last column leaves the library's cursor on the \
+         character's first cell, one column short of the last, where xterm and the terminals \
+         measured against the grid report the last column. The grid reports the library's \
+         column, so the difference is recorded and not corrected.",
     ],
     qualified_additions: &[
         QualifiedAddition {

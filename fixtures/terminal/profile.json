@@ -29,7 +29,8 @@
   "grid_library": {
     "direct_mode_constraints": [
       "Cells follow the pinned legacy codepoint-width model, so a multi-scalar emoji sequence takes one cell per scalar that has a width of its own. A physical terminal that applies its own grapheme clustering to the same bytes draws fewer cells and every later column on the row disagrees, so it is not qualified for direct mode whatever it reports.",
-      "A wide cell may overhang the right margin. Writing a two-cell character in the last column leaves a row one cell wider than the grid and sets the pending wrap, where xterm blanks the last column and wraps the character. A projected renderer clips or safely replaces the overhanging cell."
+      "A wide cell may overhang the right margin. Writing a two-cell character in the last column leaves a row one cell wider than the grid and sets the pending wrap, where xterm blanks the last column and wraps the character. A projected renderer clips or safely replaces the overhanging cell.",
+      "A wide character that ends exactly on the last column leaves the library's cursor on the character's first cell, one column short of the last, where xterm and the terminals measured against the grid report the last column. The grid reports the library's column, so the difference is recorded and not corrected."
     ],
     "notes": [
       "The revision accepts already-parsed actions, so the engine parses once and the library never re-frames a byte. That is what makes a second parse unnecessary rather than merely discouraged.",
