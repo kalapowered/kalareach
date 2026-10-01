@@ -375,7 +375,7 @@ pub fn run<M: Model>(
                 deadline_ms,
             })) => {
                 let id = id.get();
-                let due = Instant::now() + Duration::from_millis(deadline_ms.get());
+                let due = due_in(deadline_ms.get());
                 let token = shared.token_for(id);
                 let load = Work::Load {
                     id,
@@ -405,7 +405,7 @@ pub fn run<M: Model>(
                 ceiling_bytes,
             })) => {
                 let id = id.get();
-                let due = Instant::now() + Duration::from_millis(deadline_ms.get());
+                let due = due_in(deadline_ms.get());
                 let token = shared.token_for(id);
                 let job = Work::Generate {
                     id,
@@ -436,7 +436,7 @@ pub fn run<M: Model>(
                 deadline_ms,
             })) => {
                 let id = id.get();
-                let due = Instant::now() + Duration::from_millis(deadline_ms.get());
+                let due = due_in(deadline_ms.get());
                 let token = shared.token_for(id);
                 let check = Work::Verify {
                     id,
@@ -462,11 +462,7 @@ pub fn run<M: Model>(
             // says this thread is reading, which is the condition the daemon waits for. It is
             // sent only for work still in hand, so a cancellation that crosses the work's answer
             // is not acknowledged after it.
-            Ok(Some(Request::Cancel { id })) => {
-                if shared.cancel(id.get()) {
-                    shared.answer(&Answer::Cancelling { id });
-                }
-            }
+            Ok(Some(Request::Cancel { id })) => shared.cancel_and_acknowledge(id),
             // The input ended, or failed, which on a pipe the daemon holds is the same thing: the
             // daemon is not going to send anything more.
             Ok(None) | Err(WireError::Io(_)) => return shared.end(Exit::Ended),
@@ -476,6 +472,15 @@ pub fn run<M: Model>(
             }
         }
     }
+}
+
+/// The longest deadline the process accepts, so that one the daemon sends cannot overflow the
+/// clock it is counted on.
+const LONGEST_DEADLINE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Returns when a piece of work given `deadline_ms` is due.
+fn due_in(deadline_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(deadline_ms).min(LONGEST_DEADLINE)
 }
 
 /// What the threads of one process share.
@@ -542,18 +547,17 @@ impl Shared {
             .remove(&id);
     }
 
-    /// Cancels the work with this identifier, and says whether there was any in hand.
-    fn cancel(&self, id: u64) -> bool {
-        if let Some(token) = self
-            .tokens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&id)
-        {
+    /// Acknowledges the cancellation of the work with this identifier and then cancels it, when
+    /// there is any in hand.
+    ///
+    /// Both happen under the lock the model thread takes to forget the work before it answers, so
+    /// the acknowledgement is written before the work's own answer: the work cannot be seen
+    /// cancelled, forgotten and answered in the gap between cancelling it and saying so.
+    fn cancel_and_acknowledge(&self, id: U64) {
+        let tokens = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(token) = tokens.get(&id.get()) {
+            self.answer(&Answer::Cancelling { id });
             token.cancel();
-            true
-        } else {
-            false
         }
     }
 

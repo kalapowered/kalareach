@@ -120,6 +120,8 @@ pub struct Script {
     pub verify_ms: u64,
     /// Whether checking a file waits until it is cancelled or passes its deadline.
     pub verify_until_cancelled: bool,
+    /// How long checking a file sleeps without looking at its token, in milliseconds.
+    pub verify_ignore_token_ms: u64,
     /// Whether the process leaves a file named [`LOADED_PREFIX`] and its identifier in its runtime
     /// directory when a load succeeds, holding the identifier of the profile it loaded.
     pub mark_loads: bool,
@@ -149,6 +151,10 @@ pub struct Script {
     pub wedge_output_from: Option<u64>,
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
+    /// Whether the model looks at its token without pausing between looks, so that it sees a
+    /// cancellation the moment it is made: what a test uses to expose an order that holds only
+    /// when the model is slow to look.
+    pub spin: bool,
     /// Whether the process leaves a file named [`STARTED_PREFIX`] and its identifier in its
     /// runtime directory as it starts, holding the daemon's start identity it was given as JSON, so
     /// a test can tell whether it was ever started and what it was told.
@@ -204,6 +210,7 @@ impl Script {
         number("load-ms", self.load_ms);
         number("load-ignore-token-ms", self.load_ignore_token_ms);
         number("verify-ms", self.verify_ms);
+        number("verify-ignore-token-ms", self.verify_ignore_token_ms);
         number("generate-ms", self.generate_ms);
         number("ignore-token-ms", self.ignore_token_ms);
         if let Some(bytes) = self.peak_rss_bytes {
@@ -229,6 +236,7 @@ impl Script {
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
         flag("mark-start", self.mark_start);
+        flag("spin", self.spin);
         match &self.output {
             Output::WellFormed => {}
             Output::Malformed => parts.push("output=malformed".to_owned()),
@@ -273,6 +281,7 @@ impl Script {
                 "load-ms" => script.load_ms = number()?,
                 "load-ignore-token-ms" => script.load_ignore_token_ms = number()?,
                 "verify-ms" => script.verify_ms = number()?,
+                "verify-ignore-token-ms" => script.verify_ignore_token_ms = number()?,
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
@@ -287,6 +296,7 @@ impl Script {
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
                 "mark-start" => script.mark_start = true,
+                "spin" => script.spin = true,
                 "output" => {
                     script.output = match value {
                         "malformed" => Output::Malformed,
@@ -365,7 +375,7 @@ enum Waited {
 
 /// Waits `duration`, or until the token is cancelled or the deadline passes, whichever is first;
 /// with no duration, until one of the other two.
-fn wait(duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> Waited {
+fn wait(spin: bool, duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> Waited {
     let started = Instant::now();
     loop {
         if token.is_cancelled() {
@@ -377,7 +387,11 @@ fn wait(duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> 
         if Instant::now() >= deadline {
             return Waited::PastDeadline;
         }
-        std::thread::sleep(LOOK);
+        if spin {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(LOOK);
+        }
     }
 }
 
@@ -389,7 +403,7 @@ impl Model for StubModel {
         }
         let duration =
             (!self.script.load_until_cancelled).then(|| Duration::from_millis(self.script.load_ms));
-        match wait(duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline) {
             Waited::Done => {
                 if self.script.mark_loads
                     && let Some(runtime_dir) = &self.runtime_dir
@@ -426,7 +440,7 @@ impl Model for StubModel {
         }
         let duration = (!self.script.generate_until_cancelled)
             .then(|| Duration::from_millis(self.script.generate_ms));
-        match wait(duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline) {
             Waited::Done => {}
             Waited::Cancelled => {
                 return Generating::Ended {
@@ -474,9 +488,12 @@ impl Model for StubModel {
         deadline: Instant,
     ) -> Verifying {
         self.began("check");
+        if self.script.verify_ignore_token_ms > 0 {
+            std::thread::sleep(Duration::from_millis(self.script.verify_ignore_token_ms));
+        }
         let duration = (!self.script.verify_until_cancelled)
             .then(|| Duration::from_millis(self.script.verify_ms));
-        match wait(duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline) {
             Waited::Done => check_file(asset, path),
             Waited::Cancelled => Verifying::Ended {
                 result: VerifyResult::Cancelled,
@@ -825,6 +842,12 @@ pub fn stub_main() -> i32 {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--daemon") {
         return run_daemon(&arguments);
+    }
+    // What a test starts a placed copy with once, so the operating system's check of a new
+    // executable is paid before the test times anything.
+    if arguments.first().map(String::as_str) == Some("--version") {
+        println!("kr-describe-stub {}", crate::wire::RELEASE);
+        return 0;
     }
     let script = match Script::parse(&std::env::var(SCRIPT_VARIABLE).unwrap_or_default()) {
         Ok(script) => script,

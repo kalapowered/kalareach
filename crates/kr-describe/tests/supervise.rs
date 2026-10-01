@@ -660,7 +660,9 @@ fn a_process_whose_control_thread_is_wedged_is_ended_when_a_cancel_goes_unanswer
 /// ended at the bound (the wedged control thread, above).
 #[test]
 fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_bound() {
-    // A model that does not look at its token for longer than this test lasts.
+    // A model that does not look at its token for longer than this test needs. The process's own
+    // watchdog ends it when the job's deadline has passed, which is the bound this test crosses
+    // by the reading it passes, not by waiting.
     let mut rig = Rig::new(&Script {
         ignore_token_ms: 120_000,
         mark_work: true,
@@ -681,7 +683,8 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert_eq!(rig.driver.pid(), pid);
-    // The job's own deadline, and its grace, end it, and the job ends cancelled.
+    // The job's own deadline, and its grace, end it. The process was ended for running past its
+    // deadline, so the job ends past its deadline, not cancelled.
     let reports = rig
         .driver
         .turn(&roomy(), at(3_000 + DEADLINE_MS + ANSWER_GRACE_MS))
@@ -702,9 +705,10 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
     assert_eq!(rig.driver.pid(), None);
 }
 
-/// A load that was told to stop and keeps going is held to the cancellation's bound for its own
-/// answer: the process is ended then, the load ends cancelled, and it is no failure of inference,
-/// so the next load is not delayed. Not a moment before the bound.
+/// A load that was told to stop, said it had read it and keeps going is held to the cancellation's
+/// bound for its own answer: the process is ended then, the load ends cancelled, and it is no
+/// failure of inference, though the next load waits a moment so a host near its reserve does not
+/// admit, cancel and end in a loop. Not a moment before the bound.
 #[test]
 fn a_load_that_does_not_stop_is_ended_at_the_cancel_bound_and_is_no_failure() {
     let mut rig = Rig::new(&Script {
@@ -740,7 +744,7 @@ fn a_load_that_does_not_stop_is_ended_at_the_cancel_bound_and_is_no_failure() {
     let ended = outcomes(&reports);
     assert!(
         ended.contains(&&Outcome::ProcessEnded {
-            why: ProcessEnd::CancelUnanswered
+            why: ProcessEnd::StopOverdue
         }),
         "{reports:?}"
     );
@@ -756,7 +760,11 @@ fn a_load_that_does_not_stop_is_ended_at_the_cancel_bound_and_is_no_failure() {
     );
     assert_eq!(rig.driver.pid(), None);
     assert_eq!(rig.driver.service().inference_restarts(), 0);
-    assert_eq!(rig.driver.service().restart_not_before_ms(), None);
+    assert_eq!(
+        rig.driver.service().restart_not_before_ms(),
+        Some(3_100 + CANCEL_MS + RESTART_FIRST_MS),
+        "the next load waits a moment"
+    );
 }
 
 /// A signed catalogue of one default profile with a one-file asset, and where its file is kept.
@@ -805,7 +813,13 @@ fn checks(reports: &[Report]) -> Vec<(u64, Checked)> {
 #[test]
 fn the_driver_has_a_file_checked_by_the_process() {
     let (signed, weights) = tiny();
-    let mut rig = Rig::signed(&Script::default(), &signed);
+    let mut rig = Rig::signed(
+        &Script {
+            mark_work: true,
+            ..Script::default()
+        },
+        &signed,
+    );
     let files = rig.placed.directory("files");
     std::fs::write(files.join("right"), &weights).expect("the right file");
     std::fs::write(files.join("wrong"), b"another file").expect("the wrong file");
@@ -835,10 +849,11 @@ fn the_driver_has_a_file_checked_by_the_process() {
         )]
     );
     assert_eq!(rig.driver.checking(), None);
-    assert_eq!(
-        rig.processes_started(),
-        0,
-        "no stub marks: it was told nothing to load"
+    let runtime = rig.placed.directory("runtime");
+    assert!(stub::began(&runtime, "check"), "the check began");
+    assert!(
+        !stub::began(&runtime, "load") && !stub::began(&runtime, "job"),
+        "nothing was loaded or run on the way"
     );
 
     let pid = rig.driver.pid();
@@ -857,8 +872,9 @@ fn the_driver_has_a_file_checked_by_the_process() {
     assert_eq!(rig.driver.ceiling(), Some("sampler"));
 }
 
-/// A check can be cancelled, and the process answers that it was; one that does not answer by its
-/// deadline ends the process, and the check is reported as ended with it.
+/// A check can be cancelled, and the process answers that it was, with no timer left behind; one
+/// that does not answer by its deadline ends the process, and the check is reported as ended with
+/// it. A check that ran too long says nothing of inference.
 #[test]
 fn a_check_is_cancelled_and_a_check_past_its_deadline_ends_the_process() {
     let (signed, weights) = tiny();
@@ -897,8 +913,20 @@ fn a_check_is_cancelled_and_a_check_past_its_deadline_ends_the_process() {
         pid,
         "the process was not ended to stop its check"
     );
+    // The answer cleared the cancellation's timer: long past its bound, the idle process is left
+    // alone and nothing is counted against it.
+    assert_eq!(rig.driver.cancelling(), None);
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(30 + 10 * CANCEL_MS))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.pid(), pid);
+    assert_eq!(rig.driver.service().inference_restarts(), 0);
 
     // A check the process does not answer: its deadline, and the grace after it, end the process.
+    // The deadline is far past anything the test waits for, so the process's own clock does not
+    // answer first, and the reading the test passes crosses the daemon's.
     let mut rig = Rig::signed(
         &Script {
             verify_ms: 120_000,
@@ -909,25 +937,218 @@ fn a_check_is_cancelled_and_a_check_past_its_deadline_ends_the_process() {
     let files = rig.placed.directory("files");
     std::fs::write(files.join("right"), &weights).expect("the right file");
     rig.driver
-        .verify(&check(2, files.join("right"), 5_000), at(0))
+        .verify(&check(2, files.join("right"), 600_000), at(0))
         .expect("a check");
+    rig.until(&roomy(), at(10), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
     let reports = rig
         .driver
-        .turn(&roomy(), at(5_000 + ANSWER_GRACE_MS - 1))
+        .turn(&roomy(), at(600_000 + ANSWER_GRACE_MS - 1))
         .expect("a turn");
     assert!(checks(&reports).is_empty(), "{reports:?}");
     let reports = rig
         .driver
-        .turn(&roomy(), at(5_000 + ANSWER_GRACE_MS))
+        .turn(&roomy(), at(600_000 + ANSWER_GRACE_MS))
         .expect("a turn");
     assert_eq!(
         checks(&reports),
         vec![(
             2,
             Checked::ProcessEnded {
-                why: ProcessEnd::PastDeadline
+                why: ProcessEnd::CheckOverdue
             }
         )]
+    );
+    assert_eq!(rig.driver.pid(), None);
+    assert_eq!(
+        rig.driver.service().inference_restarts(),
+        0,
+        "a check that took too long is no failure of inference"
+    );
+    assert_eq!(rig.driver.service().restart_not_before_ms(), None);
+}
+
+/// A check the process said it had read the cancellation of, and did not stop, is held to the
+/// bound for its own answer and ended without a failure of inference; one the process never said it
+/// had read the cancellation of is a process that is not listening, which is one. Asking again to
+/// stop a check being stopped moves neither bound.
+#[test]
+fn a_check_that_will_not_stop_is_ended_at_the_bound_and_one_nobody_hears_counts_as_a_failure() {
+    let (signed, weights) = tiny();
+
+    // Acknowledged, and not stopped: ended at the bound for its answer, no failure.
+    let mut rig = Rig::signed(
+        &Script {
+            verify_ignore_token_ms: 120_000,
+            mark_work: true,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(1, files.join("right"), 600_000), at(0))
+        .expect("a check");
+    stub::wait_until_began(&rig.placed.directory("runtime"), "check");
+    rig.until(&roomy(), at(10), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
+    rig.driver.cancel_check(at(100)).expect("a cancellation");
+    rig.until(&roomy(), at(110), "the acknowledgement", |_, driver| {
+        matches!(driver.cancelling(), Some((1, true)))
+    });
+    // Asking again, after the acknowledgement, sends nothing and moves nothing.
+    let reports = rig.driver.cancel_check(at(1_000)).expect("a cancellation");
+    assert!(reports.is_empty(), "{reports:?}");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(100 + CANCEL_MS - 1))
+        .expect("a turn");
+    assert!(checks(&reports).is_empty(), "{reports:?}");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(100 + CANCEL_MS))
+        .expect("a turn");
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            1,
+            Checked::ProcessEnded {
+                why: ProcessEnd::StopOverdue
+            }
+        )]
+    );
+    assert_eq!(rig.driver.service().inference_restarts(), 0);
+    assert_eq!(rig.driver.service().restart_not_before_ms(), None);
+
+    // The control: the process stopped reading after the check was sent, so the cancellation is
+    // never acknowledged. It is ended at the bound, which counts, and asking again at 1,020 ms
+    // does not move the bound that began at 20 ms.
+    let mut rig = Rig::signed(
+        &Script {
+            verify_ms: 120_000,
+            wedge_input_after: Some(2),
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(2, files.join("right"), 600_000), at(0))
+        .expect("a check");
+    rig.until(&roomy(), at(10), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
+    rig.driver.cancel_check(at(20)).expect("a cancellation");
+    rig.driver.cancel_check(at(1_020)).expect("a cancellation");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(20 + CANCEL_MS - 1))
+        .expect("a turn");
+    assert!(checks(&reports).is_empty(), "{reports:?}");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(20 + CANCEL_MS))
+        .expect("a turn");
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            2,
+            Checked::ProcessEnded {
+                why: ProcessEnd::CancelUnanswered
+            }
+        )]
+    );
+    assert_eq!(rig.driver.service().inference_restarts(), 1);
+}
+
+/// A check is not sent behind a load, a job or another check, and says so; and a check in a
+/// process the service ends is reported as ended with it. The control is a check with nothing in
+/// the process, which is sent.
+#[test]
+fn a_check_is_refused_behind_other_work_and_reported_when_its_process_is_unloaded() {
+    let (signed, weights) = tiny();
+
+    // Behind a job.
+    let mut rig = Rig::signed(
+        &Script {
+            generate_until_cancelled: true,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    let reports = rig
+        .driver
+        .verify(&check(7, files.join("right"), 60_000), at(3_100))
+        .expect("a check");
+    assert_eq!(checks(&reports), vec![(7, Checked::Refused)], "{reports:?}");
+    assert_eq!(rig.driver.checking(), None);
+    assert_eq!(rig.driver.service().in_flight(), 1, "the job is untouched");
+
+    // Behind another check.
+    let mut rig = Rig::signed(
+        &Script {
+            verify_until_cancelled: true,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(1, files.join("right"), 60_000), at(0))
+        .expect("a check");
+    let reports = rig
+        .driver
+        .verify(&check(2, files.join("right"), 60_000), at(10))
+        .expect("a check");
+    assert_eq!(checks(&reports), vec![(2, Checked::Refused)], "{reports:?}");
+    assert_eq!(
+        rig.driver.checking(),
+        Some(1),
+        "the first is still being made"
+    );
+
+    // A model resident, a check in the process, and the files stop being held: the service has the
+    // process ended, and the check is reported rather than lost.
+    let mut rig = Rig::signed(
+        &Script {
+            verify_until_cancelled: true,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the description", |reports, _| {
+        a_job_ended(reports)
+    });
+    let reports = rig
+        .driver
+        .verify(&check(3, files.join("right"), 60_000), at(3_100))
+        .expect("a check");
+    assert!(checks(&reports).is_empty(), "sent: {reports:?}");
+    assert_eq!(rig.driver.checking(), Some(3));
+    rig.service().set_assets_held(false);
+    let reports = rig.driver.turn(&roomy(), at(3_200)).expect("a turn");
+    assert_eq!(
+        checks(&reports),
+        vec![(3, Checked::Unloaded)],
+        "{reports:?}"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, Report::Unloaded { .. })),
+        "{reports:?}"
     );
     assert_eq!(rig.driver.pid(), None);
 }

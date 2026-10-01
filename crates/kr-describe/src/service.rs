@@ -302,8 +302,16 @@ pub enum ProcessEnd {
     SilentAtStart,
     /// A load or a job ran past its deadline and the process did not end it.
     PastDeadline,
-    /// A cancellation went unanswered.
+    /// A cancellation went unanswered: the process did not say it had read it, so it is not
+    /// listening.
     CancelUnanswered,
+    /// The process said it had read the cancellation of a load or of a check of a file, and the
+    /// work did not stop within the bound after it. The daemon ended the process for work it had
+    /// itself called off.
+    StopOverdue,
+    /// A check of a file ran past its deadline. The daemon ended the process for a check that
+    /// took too long, which says nothing of inference.
+    CheckOverdue,
     /// Its resident set passed the ceiling.
     MemoryCeiling,
     /// It stopped reading its requests.
@@ -322,9 +330,22 @@ impl ProcessEnd {
             Self::SilentAtStart => "silent_at_start",
             Self::PastDeadline => "past_deadline",
             Self::CancelUnanswered => "cancel_unanswered",
+            Self::StopOverdue => "stop_overdue",
+            Self::CheckOverdue => "check_overdue",
             Self::MemoryCeiling => "memory_ceiling",
             Self::NotReading => "not_reading",
         }
+    }
+
+    /// Returns whether this end counts as a failure of inference: toward the failures in a row
+    /// that pause it, and toward the delay before the next start.
+    ///
+    /// An end the daemon causes to stop work it called off, or a check of a file that took too
+    /// long, lost nothing and says nothing of the model. Every other end is the process failing
+    /// to do what it was asked, or failing to listen.
+    #[must_use]
+    pub const fn is_failure(self) -> bool {
+        !matches!(self, Self::StopOverdue | Self::CheckOverdue)
     }
 }
 
@@ -493,6 +514,19 @@ impl Restart {
         self.pause = pause.or_else(|| {
             (self.failures >= INFERENCE_FAILED_AFTER).then_some(PauseReason::InferenceFailed)
         });
+    }
+
+    /// Delays the next load without counting a failure, for work the daemon had to end that the
+    /// process did not stop in time.
+    fn paced(&mut self, now: Reading) {
+        self.not_before_ms = self
+            .not_before_ms
+            .max(now.monotonic_ms().saturating_add(RESTART_FIRST_MS));
+    }
+
+    /// Whether a delay was set, by a failure or by a pace.
+    const fn waiting(&self) -> bool {
+        self.not_before_ms != 0
     }
 
     fn succeeded(&mut self) {
@@ -757,9 +791,15 @@ impl DescriptionService {
     /// settle, on the continuous clock, when any are waiting.
     #[must_use]
     pub fn settle_due_ms(&self) -> Option<u64> {
+        // A session whose changes wait for its job settles when the job ends, and a fenced one
+        // records nothing: neither has a time to wake for, and a time already past would have the
+        // host wake at once, find nothing to do, and wake again for as long as the job runs.
         self.trackers
-            .values()
-            .filter_map(ContextTracker::settles_at_ms)
+            .iter()
+            .filter(|(session_id, _)| {
+                !self.waiting.contains_key(*session_id) && !self.fence.is_fenced(session_id)
+            })
+            .filter_map(|(_, tracker)| tracker.settles_at_ms())
             .min()
     }
 
@@ -849,10 +889,10 @@ impl DescriptionService {
     /// Returns the next load's earliest time after a failure, when one is waiting.
     #[must_use]
     pub const fn restart_not_before_ms(&self) -> Option<u64> {
-        if self.restart.failures == 0 {
-            None
-        } else {
+        if self.restart.waiting() {
             Some(self.restart.not_before_ms)
+        } else {
+            None
         }
     }
 
@@ -1290,7 +1330,7 @@ impl DescriptionService {
             if now.monotonic_ms() < self.restart.not_before_ms {
                 self.state = ResourceState::ResourcePaused {
                     reason,
-                    unloaded: true,
+                    unloaded: !resident,
                 };
                 return Ok(Instruction::Wait {
                     until_ms: Some(self.restart.not_before_ms),
@@ -1369,20 +1409,19 @@ impl DescriptionService {
             self.after_job(&session_id, outlived, superseded, requeued, now);
             outcomes.push(outcome);
         }
-        // A load that was told to stop and did not, ended by the daemon, lost nothing and is no
-        // failure of inference: the next load may happen at once.
-        let load_cancel_unanswered = why == ProcessEnd::CancelUnanswered
-            && matches!(
-                self.model,
-                Model::Loading {
-                    cancel_sent: true,
-                    ..
-                }
-            );
+        let load_called_off = matches!(
+            self.model,
+            Model::Loading {
+                cancel_sent: true,
+                ..
+            }
+        );
         if let Model::Loading { cancel_sent, .. } = &self.model {
             let load_why = match why {
                 ProcessEnd::PastDeadline => LoadEnd::DeadlineExceeded,
-                ProcessEnd::CancelUnanswered if *cancel_sent => LoadEnd::Cancelled,
+                ProcessEnd::CancelUnanswered | ProcessEnd::StopOverdue if *cancel_sent => {
+                    LoadEnd::Cancelled
+                }
                 _ => LoadEnd::Failed,
             };
             outcomes.push(Outcome::LoadEnded {
@@ -1391,12 +1430,16 @@ impl DescriptionService {
             });
         }
         self.release();
-        if !load_cancel_unanswered {
+        if why.is_failure() {
             self.inference_restarts = self.inference_restarts.saturating_add(1);
             self.restart.failed(
                 now,
                 (why == ProcessEnd::MemoryCeiling).then_some(PauseReason::MemoryPressure),
             );
+        } else if load_called_off {
+            // Not a failure of inference, but a host that is near the reserve would otherwise admit
+            // a load, call it off and end the process in a loop with nothing between.
+            self.restart.paced(now);
         }
         if why == ProcessEnd::MemoryCeiling {
             self.state = ResourceState::ResourcePaused {
@@ -1483,7 +1526,10 @@ impl DescriptionService {
         ) {
             return None;
         }
-        let stop = !enabled || self.paused_now(conditions, false) || self.scheduler.queued() == 0;
+        let stop = !enabled
+            || !self.assets_held
+            || self.paused_now(conditions, false)
+            || self.scheduler.queued() == 0;
         if !stop {
             return None;
         }
@@ -1522,7 +1568,7 @@ impl DescriptionService {
                 until_ms: self.scheduler.next_due_ms(now),
             };
         }
-        if self.restart.failures > 0 && now.monotonic_ms() < self.restart.not_before_ms {
+        if now.monotonic_ms() < self.restart.not_before_ms {
             return Instruction::Wait {
                 until_ms: Some(self.restart.not_before_ms),
             };
@@ -1818,11 +1864,9 @@ impl DescriptionService {
                 // Nothing admits a publication at the generation the job was produced under: privacy
                 // mode is on, or the generation moved on.
                 None => {
-                    let expected = self.privacy_generation(&session_id);
                     return Ok(rejected(
                         &mut self.counts,
-                        Rejection::LateGeneration {
-                            expected,
+                        Rejection::NotAdmitted {
                             found: produced_under.generation,
                         },
                     ));
@@ -1845,6 +1889,7 @@ impl DescriptionService {
             }
             PublishGate::DeadlineExceeded => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                self.restart.failed(now, None);
                 Outcome::DeadlineExceeded { session_id }
             }
             // A pin committed after validation read none. Nothing was recorded, so nothing is a
@@ -2037,6 +2082,17 @@ impl DescriptionService {
     const fn take_id(&mut self) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
+    }
+}
+
+impl Drop for DescriptionService {
+    /// A service that goes owes nothing: the job it had in the process and the load it had asked
+    /// for are no longer outstanding for whoever holds the records it shared.
+    fn drop(&mut self) {
+        if let Some(dispatched) = self.job.take() {
+            drop(InFlightRecords::of(self, dispatched.job.session_id));
+        }
+        self.loading.store(0, Ordering::Release);
     }
 }
 

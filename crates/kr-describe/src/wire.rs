@@ -38,7 +38,10 @@ use serde::{Deserialize, Serialize};
 use crate::priority::Applied;
 
 /// This wire's version. A daemon and a process that disagree about it do not talk.
-pub const WIRE_VERSION: u64 = 1;
+///
+/// The second version added `verify` and `verified`, `cancelling`, and the way `ready` says its
+/// memory ceiling is enforced.
+pub const WIRE_VERSION: u64 = 2;
 
 /// This build's release, which the daemon and the process it starts share.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
