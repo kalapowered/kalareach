@@ -2204,3 +2204,44 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_ca
     assert_eq!(script.forwarded().len(), 0, "nothing reached the worker");
     world.serving.abort();
 }
+
+/// KR-REQ-23.34: a retried close of a session this daemon recorded the closure of is answered from
+/// that record, which no worker gave and which therefore is not a worker's whole answer: it is the
+/// daemon's own, and a device that may read it is shown it, whichever contract the session's worker
+/// kept. It carries no description, because no worker is left to describe the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_34_a_close_answered_from_the_closure_record_is_the_daemons_own() {
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.built_before_results_were_held_to_scopes();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&scripted::closure_of(world.session_id))
+        .expect("the closure is recorded");
+    controller.directory.lock().await.remove(world.session_id);
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 67));
+
+    let closed = close_for_a_device(
+        &world,
+        &connection,
+        &fake::close_request(world.environment_id, world.session_id),
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    )
+    .await;
+    assert_eq!(closed.retained, crate::service::net::Retained::Record);
+    let answer: SessionCloseResult = closed.value.to_typed().expect("a close answer");
+    assert_eq!(answer.state, SessionState::Closed);
+    assert!(answer.session.is_none(), "no worker is left to describe it");
+    assert_eq!(script.forwarded().len(), 0, "no worker was asked");
+    world.serving.abort();
+}
