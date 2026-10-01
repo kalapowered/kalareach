@@ -158,3 +158,41 @@ fn every_difference_is_written_up() {
         }
     }
 }
+
+/// A record is kept in a repository: it names programs and application bundles, never a home
+/// directory, a user, a session or the directory of a program outside an application.
+#[test]
+fn no_record_names_a_home_directory_a_user_or_a_program_directory() {
+    fn strings<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
+        match value {
+            Value::String(text) => found.push(text),
+            Value::Array(items) => items.iter().for_each(|item| strings(item, found)),
+            Value::Object(fields) => fields.values().for_each(|field| strings(field, found)),
+            _ => {}
+        }
+    }
+    for (path, record) in records() {
+        let mut found = Vec::new();
+        strings(&record["launcher"], &mut found);
+        for text in found {
+            for private in ["/Users/", "/home/", "C:\\Users", "~/"] {
+                assert!(
+                    !text.contains(private),
+                    "{} writes {text:?}, which holds {private:?}",
+                    path.display()
+                );
+            }
+        }
+        for ancestor in record["launcher"]["ancestors"]
+            .as_array()
+            .expect("ancestors")
+        {
+            let name = ancestor.as_str().expect("a program name");
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "{}: {name:?} is a path, and a record keeps the program's name",
+                path.display()
+            );
+        }
+    }
+}

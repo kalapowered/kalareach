@@ -367,3 +367,52 @@ fn replies_are_found_among_bytes_nobody_asked_for() {
     );
     assert_eq!(replies::version_text(b"\x1b[?1;2c"), None);
 }
+
+/// A record is kept in a repository, so what identifies the account is taken out of the launcher's
+/// facts before it is written: the programs the window descends from keep their names and lose
+/// their directories, and the home directory, where one is written, becomes `~`.
+#[test]
+fn a_record_keeps_no_home_directory_and_no_user_name() {
+    let launcher = serde_json::json!({
+        "ancestors": [
+            "/bin/bash",
+            "-zsh",
+            "/usr/bin/login",
+            "/Users/jo/Library/Application Support/iTerm2/iTermServer-3.6.11",
+            "C:\\Users\\jo\\AppData\\Local\\Terminal\\wt.exe"
+        ],
+        "bundle": "/Applications/iTerm.app",
+        "environment": {
+            "TERMINFO_DIRS": "/Users/jo/.terminfo:/Applications/iTerm.app/Contents/Resources/terminfo",
+            "TERM": "xterm-256color"
+        },
+        "build": "3.7.1"
+    });
+    let kept = kr_term_probe::report::keep_private(launcher, Some("/Users/jo"));
+    assert_eq!(
+        kept["ancestors"],
+        serde_json::json!(["bash", "-zsh", "login", "iTermServer-3.6.11", "wt.exe"])
+    );
+    assert_eq!(
+        kept["environment"]["TERMINFO_DIRS"],
+        "~/.terminfo:/Applications/iTerm.app/Contents/Resources/terminfo"
+    );
+    assert_eq!(
+        kept["bundle"], "/Applications/iTerm.app",
+        "an application's directory stays"
+    );
+    assert_eq!(kept["build"], "3.7.1");
+    assert!(!kept.to_string().contains("jo"), "{kept}");
+
+    // A launcher with nothing to take out is written as it is, and a missing home takes out nothing
+    // beyond the programs' directories.
+    let plain = serde_json::json!({ "application": "a scripted terminal" });
+    assert_eq!(
+        kr_term_probe::report::keep_private(plain.clone(), None),
+        plain
+    );
+    assert_eq!(
+        kr_term_probe::report::keep_private(serde_json::Value::Null, Some("/Users/jo")),
+        serde_json::Value::Null
+    );
+}
