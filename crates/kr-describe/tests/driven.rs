@@ -1456,6 +1456,46 @@ fn a_pause_between_a_failure_and_its_retry_keeps_the_retry_used() {
     assert_eq!(service.scheduler().queued(), 0);
 }
 
+/// KR-REQ-22.16: a semantic event is a change of the context. One that arrives with nothing else
+/// moved starts the debounce, and a job follows it; the same event again is the event already
+/// held, and starts nothing.
+#[test]
+fn a_new_semantic_event_starts_the_debounce_and_the_same_one_again_does_not() {
+    let event = |cursor: u64| SemanticEvent {
+        cursor,
+        kind: SemanticEventKind::CommandAccepted,
+        summary: ProjectText::new("cargo").expect("a summary"),
+    };
+    let mut service = service();
+    service.session_opened(session(1), SessionEpoch::V1, binding());
+    change(&mut service, &session(1), "docs", at(0));
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(2_000))
+            .is_some()
+    );
+    assert_eq!(service.settle_due_ms(), None, "nothing waits");
+
+    assert!(service.note_event(&session(1), event(1), at(10_000)));
+    assert_eq!(
+        service.settle_due_ms(),
+        Some(10_000 + 2_000),
+        "the event waits out the debounce"
+    );
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(12_000))
+            .is_some()
+    );
+
+    assert!(service.note_event(&session(1), event(1), at(20_000)));
+    assert_eq!(
+        service.settle_due_ms(),
+        None,
+        "the control: an event already held"
+    );
+}
+
 /// KR-REQ-22.16: a session opened again starts with no semantic events of its earlier self. An
 /// event recorded before the session is opened again, without a close between, reaches no prompt
 /// of the session there now. The control is the same session left alone, whose next prompt
@@ -1472,7 +1512,8 @@ fn a_session_opened_again_carries_no_earlier_events() {
                 kind: SemanticEventKind::CommandAccepted,
                 summary:
                     ProjectText::new("cargo publish from the earlier session").expect("a summary"),
-            }
+            },
+            at(0),
         ));
         if reopened {
             service.session_opened(session(1), SessionEpoch::V1, binding());
@@ -2287,7 +2328,9 @@ fn inference_on_battery_follows_the_owners_setting_at_the_next_turn() {
     let mut service = service();
     queue(&mut service, &session(1), "kalareach", at(0));
     assert!(matches!(
-        service.next(&on_battery, at(3_000)).expect("an instruction"),
+        service
+            .next(&on_battery, at(3_000))
+            .expect("an instruction"),
         Instruction::Wait { .. }
     ));
     assert_eq!(
@@ -2298,7 +2341,9 @@ fn inference_on_battery_follows_the_owners_setting_at_the_next_turn() {
         }
     );
     service.set_on_battery(true);
-    let Instruction::Load { id, .. } = service.next(&on_battery, at(3_100)).expect("an instruction")
+    let Instruction::Load { id, .. } = service
+        .next(&on_battery, at(3_100))
+        .expect("an instruction")
     else {
         panic!("allowed on battery, the queue loads");
     };
@@ -2314,7 +2359,9 @@ fn inference_on_battery_follows_the_owners_setting_at_the_next_turn() {
         .expect("the load");
     service.set_on_battery(false);
     assert_eq!(
-        service.next(&on_battery, at(3_200)).expect("an instruction"),
+        service
+            .next(&on_battery, at(3_200))
+            .expect("an instruction"),
         Instruction::Unload {
             why: UnloadReason::Paused(PauseReason::Battery)
         },

@@ -765,6 +765,12 @@ impl DescriptionService {
         self.gate = Some(gate);
     }
 
+    /// Says whether publications are held under a gate.
+    #[must_use]
+    pub const fn publication_gated(&self) -> bool {
+        self.gate.is_some()
+    }
+
     /// Says whether the selected profile's files are here and verified.
     ///
     /// A service nobody has said otherwise to takes them to be: a host that fetches its files
@@ -1022,16 +1028,30 @@ impl DescriptionService {
     ///
     /// It is the only way an event reaches a description, and the bound is the context's:
     /// [`crate::context::MAX_RECENT_EVENTS`] of them, newest first. A session this host is not
-    /// tracking, or one that is fenced, takes none.
-    pub fn note_event(&mut self, session_id: &SessionId, event: SemanticEvent) -> bool {
+    /// tracking, or one that is fenced, takes none. An event at a cursor the session already holds
+    /// is the same event, and changes nothing; a new one is a change of the context, which starts
+    /// the debounce at `now`.
+    pub fn note_event(
+        &mut self,
+        session_id: &SessionId,
+        event: SemanticEvent,
+        now: Reading,
+    ) -> bool {
         if self.fence.is_fenced(session_id) || !self.live_sessions.contains(session_id) {
             return false;
         }
         let events = self.events.entry(*session_id).or_default();
+        if events.iter().any(|held| held.cursor == event.cursor) {
+            return true;
+        }
         events.push(event);
         events.sort_by_key(|event| event.cursor);
         while events.len() > crate::context::MAX_RECENT_EVENTS {
             events.remove(0);
+        }
+        // A new event is a change of the context, so a job follows it after the debounce.
+        if let Some(tracker) = self.trackers.get_mut(session_id) {
+            tracker.note_event(now);
         }
         true
     }

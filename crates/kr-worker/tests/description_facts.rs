@@ -400,11 +400,15 @@ async fn the_descriptions_connection_carries_facts_requests_only_and_a_newer_one
         .write_message(&ControlFrame::DescriptionFacts(request(3, 0, 0, None)))
         .await
         .ok();
-    let answer = tokio::time::timeout(Duration::from_secs(5), older.recv()).await;
+    // Fenced is an explicit refusal or a closed connection; a connection that says nothing at all
+    // is a stalled one, which fences nothing.
+    let answer = tokio::time::timeout(LIVENESS, older.recv())
+        .await
+        .expect("the older connection answers or closes, and does not stall");
     let fenced = match answer {
-        Err(_) | Ok(Err(_)) => true,
-        Ok(Ok(ControlFrame::Response(response))) => matches!(response.outcome, Outcome::Error(_)),
-        Ok(Ok(_)) => false,
+        Err(_) => true,
+        Ok(ControlFrame::Response(response)) => matches!(response.outcome, Outcome::Error(_)),
+        Ok(_) => false,
     };
     assert!(fenced, "the older connection is fenced");
 }
@@ -572,6 +576,41 @@ async fn the_repository_is_read_off_the_hook_path_and_follows_the_directory() {
     let facts = left.facts.0.expect("facts");
     assert_eq!(facts.directory.0.as_deref(), Some("elsewhere"));
     assert_eq!(facts.repository.0, None);
+}
+
+/// KR-REQ-01.14, KR-REQ-22.05: a command that ended in another directory than the block says it
+/// began in is followed to where the session's shell is now, so a `cd` is described at the prompt
+/// and nothing more has to be typed. The shell here really is in that directory: the page names
+/// it, and the directory the block carried is not the one that stays.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_command_that_ended_elsewhere_reports_where_the_shell_is_now() {
+    let root = tempfile::tempdir().expect("a directory");
+    let inside = root.path().join("moved-to");
+    std::fs::create_dir_all(&inside).expect("a directory to be in");
+    let host = host(&format!("cd '{}' && exec cat", inside.display())).await;
+    let mut link = daemon(&host, ControllerConnectionRole::Descriptions).await;
+    let base = ask(&mut link, 1, 0, 0, Some(0)).await;
+    assert_eq!(base.facts.0, None);
+
+    report(&host, block("cd moved-to", "/stale/begun-in", Some(0)));
+    let mut after = 0;
+    let mut id = 2;
+    loop {
+        let page = ask(&mut link, id, after, 30_000, Some(0)).await;
+        id += 1;
+        let facts = page.facts.0.expect("facts");
+        after = facts.revision.get();
+        if facts.directory.0.as_deref() == Some("moved-to") {
+            assert_eq!(facts.completion.0, Some(DescriptionCompletion::Succeeded));
+            break;
+        }
+        assert_eq!(
+            facts.directory.0.as_deref(),
+            Some("begun-in"),
+            "until the shell has been read, the block's own directory stands"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

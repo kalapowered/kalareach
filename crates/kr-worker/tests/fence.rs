@@ -2859,6 +2859,83 @@ fn installed_package() -> kr_shell_integration::host::package::ShellPackage {
         .clone()
 }
 
+/// KR-REQ-01.14, KR-REQ-22.05: a real managed shell that ran `cd` is described by the directory it
+/// is in at the next prompt, with nothing more typed. The block the shell's hooks report names the
+/// directory the command began in, so the worker reads the directory the shell is in once the
+/// command has ended; the first command's own block is the control, naming the directory it ran in.
+///
+/// It needs the built Zsh and Bash packages, which only a run that built them has, so an ordinary
+/// run leaves it out; see [`package_root`].
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt() {
+    let root = package_root();
+    let set =
+        kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = set
+            .select(Some(kind.as_str()))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
+            .clone();
+        let shell = RealShell::start(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        let target = shell.home().join("kr-moved-here");
+        std::fs::create_dir(&target).expect("a directory to move to");
+        let home_name = shell
+            .home()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a home with a name")
+            .to_owned();
+
+        let mut keys = shell.keys();
+        keys.type_line(&shell, "true");
+        shell
+            .directory_described_as(&home_name, "the command that ran where the shell began")
+            .await;
+        keys.type_line(&shell, &format!("cd {}", shell_quoted(&target)));
+        shell
+            .directory_described_as("kr-moved-here", "the prompt after `cd`, with nothing typed")
+            .await;
+        shell.close().await;
+    }
+}
+
+#[cfg(unix)]
+impl RealShell {
+    /// Waits until the session's description facts name `directory`, and says what they did name
+    /// when they never do.
+    async fn directory_described_as(&self, directory: &str, waited_for: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let facts = self
+                .runtime
+                .session()
+                .description_facts()
+                .read(0, None)
+                .facts;
+            if facts
+                .as_ref()
+                .is_some_and(|facts| facts.directory.0.as_deref() == Some(directory))
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited for the facts to name {directory:?} ({waited_for}); they are {facts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 // --------------------------------------------------------------------------------------------
 // KR-REQ-12.07, KR-REQ-25.05: the command hooks the private integration reports through.
 // --------------------------------------------------------------------------------------------

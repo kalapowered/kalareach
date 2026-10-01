@@ -349,6 +349,7 @@ struct Environment {
     workers: Vec<Worker>,
     placed: kr_controller::describe::hooks::Placed,
     runtime_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl Environment {
@@ -394,6 +395,7 @@ impl Environment {
             workers,
             placed,
             runtime_dir,
+            state_dir,
         };
         for worker in &environment.workers {
             environment.until_adopted(worker.session_id).await;
@@ -510,6 +512,7 @@ impl Environment {
             workers,
             placed,
             runtime_dir,
+            state_dir,
         } = self;
         let host = host.restart().await;
         let environment = Self {
@@ -517,6 +520,7 @@ impl Environment {
             workers,
             placed,
             runtime_dir,
+            state_dir,
         };
         for worker in &environment.workers {
             environment.until_adopted(worker.session_id).await;
@@ -524,13 +528,46 @@ impl Environment {
         environment
     }
 
+    /// Makes the store refuse to remove generated descriptions, as a store that cannot be written
+    /// would, by taking their table away under its name; and gives it back.
+    fn set_removal_refused(&self, refused: bool) {
+        let connection = rusqlite::Connection::open(self.state_dir.join("descriptions.sqlite3"))
+            .expect("the store's file opens");
+        let (from, to) = if refused {
+            ("describe_generated", "describe_generated_held")
+        } else {
+            ("describe_generated_held", "describe_generated")
+        };
+        connection
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .expect("the table is renamed");
+    }
+
     /// Whether a process is running, as the operating system says.
     fn alive(pid: u32) -> bool {
-        std::process::Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        matches!(
+            kr_ipc::identity::query_process(pid),
+            kr_ipc::identity::ProcessQuery::Present(_)
+        )
+    }
+
+    /// Ends a process by its identifier, as the platform does it.
+    fn end(pid: u32) {
+        #[cfg(unix)]
+        {
+            let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a pid in range"))
+                .expect("a process identifier");
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                .expect("the process is signalled");
+        }
+        #[cfg(windows)]
+        {
+            let ended = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .status()
+                .expect("the process is ended");
+            assert!(ended.success());
+        }
     }
 
     /// Whether a stub has begun a piece of work of this kind.
@@ -594,6 +631,21 @@ impl Environment {
             .await
             .expect("the call reaches the daemon")
             .expect("the settings are changed")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Reads privacy mode's report at the daemon's local socket.
+    async fn privacy_status(&self) -> PrivacyReport {
+        let mut client = self.host.client().await;
+        client
+            .request(
+                Method::PrivacyStatus,
+                &kr_protocol::privacy::PrivacyStatusParams {},
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("privacy mode's report")
             .to_typed()
             .expect("decodes")
     }
@@ -707,6 +759,10 @@ async fn a_directory_change_publishes_a_title_and_input_makes_no_page_and_no_job
     assert_eq!(described.state, DescriptionState::Resident);
     assert_eq!(described.paused.0, None);
     assert_eq!(environment.figures().jobs.published, 1);
+    assert!(
+        environment.figures().gated,
+        "every publication is held under privacy mode's admission"
+    );
 
     // Keystrokes, a resize and a bracketed paste: the terminal's own answers to its query went in
     // as the session started. None of them reaches the facts.
@@ -1050,9 +1106,14 @@ async fn a_host_with_no_sessions_unloads_its_model_after_fifteen_minutes() {
         environment.figures().sessions == 0
     })
     .await;
-    // Fourteen minutes on: nothing is unloaded yet.
+    // Fourteen minutes on: the host has taken a turn at that time, and has unloaded nothing.
+    let before = environment.figures().read_at_ms;
     environment.placed.advance(14 * 60 * 1_000);
     environment.controller().descriptions().wake();
+    until("a host turn at the clock fourteen minutes on", || {
+        environment.figures().read_at_ms >= before + 14 * 60 * 1_000
+    })
+    .await;
     assert!(
         environment.figures().pid.is_some(),
         "fourteen minutes is not fifteen: {:?}",
@@ -1182,11 +1243,12 @@ async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_ha
     assert_eq!(carried.source, LabelSource::Generated);
     assert_eq!(carried.freshness, DescriptionFreshness::Stale);
 
-    // The new daemon reads the worker's facts and asks for a load, and the load waits for the old
-    // process's lock: nothing is mapped twice while it lives.
-    until("the new process asked to load", || {
+    // The new daemon reads the worker's facts and asks for a load, and the new process finds the
+    // old one's lock held and waits for it: nothing is mapped twice while it lives. The old
+    // process took the lock without finding it held, so the mark is the new one's.
+    until("the new process finding the lock held", || {
         let figures = environment.figures();
-        figures.loading && figures.started == 1
+        figures.loading && figures.started == 1 && environment.began("lock-held")
     })
     .await;
     assert!(Environment::alive(old));
@@ -1207,11 +1269,7 @@ async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_ha
     );
 
     // The old process goes, and the new one loads and describes.
-    let ended = std::process::Command::new("/bin/kill")
-        .args(["-TERM", &old.to_string()])
-        .status()
-        .expect("the old process is signalled");
-    assert!(ended.success());
+    Environment::end(old);
     until("the new process describing", || {
         environment.figures().jobs.published >= 1
     })
@@ -1251,5 +1309,200 @@ async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
     environment.until_privacy_settled().await;
     until("the load cancelled", || !environment.figures().loading).await;
     assert_eq!(environment.figures().jobs.published, 0);
+    environment.stop().await;
+}
+
+/// KR-REQ-24.11: a refused removal of the stored descriptions does not keep the memory the service
+/// holds: the queue is forgotten and the load in flight is cancelled while the store still
+/// refuses, privacy mode's change is not complete while the removal is owed, and it completes once
+/// the store takes the removal. The control is the load before privacy mode, which goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_is_cancelled_by_privacy_mode_though_the_stored_rows_cannot_be_removed() {
+    let environment = Environment::start(Setup {
+        script: Script {
+            load_until_cancelled: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    until("a load in the process", || {
+        environment.began("load") && environment.figures().loading
+    })
+    .await;
+
+    environment.set_removal_refused(true);
+    let report = environment.privacy(true).await;
+    assert!(report.enabled);
+    until("the load cancelled while the store refuses", || {
+        !environment.figures().loading
+    })
+    .await;
+    assert_eq!(environment.figures().jobs.published, 0);
+    assert!(
+        !matches!(
+            environment.privacy_status().await.completion,
+            kr_protocol::privacy::PrivacyCompletion::Complete
+        ),
+        "the removal is owed while the store refuses it"
+    );
+
+    environment.set_removal_refused(false);
+    environment.until_privacy_settled().await;
+    environment.stop().await;
+}
+
+/// KR-REQ-24.11: a result that arrives after privacy mode was enabled is never published, though
+/// the process was in the middle of the job and did not look at its cancellation: privacy mode's
+/// change is not complete until the job has answered, nothing was published, and turning privacy
+/// mode off brings back nothing from before. The control is the same job left alone, which
+/// publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_that_arrives_after_privacy_mode_was_enabled_is_never_published() {
+    let script = Script {
+        ignore_token_ms: 2_000,
+        produce_when_cancelled: true,
+        ..Script::default()
+    };
+    let environment = Environment::start(Setup {
+        script: script.clone(),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    environment
+        .describe_until("the control's description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    environment.stop().await;
+
+    let environment = Environment::start(Setup {
+        script,
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    until("a job in the process", || environment.began("job")).await;
+    assert!(environment.privacy(true).await.enabled);
+    environment.until_privacy_settled().await;
+    assert_eq!(environment.figures().in_flight, 0, "the job has answered");
+    assert_eq!(
+        environment.figures().jobs.published,
+        0,
+        "and what it produced was refused"
+    );
+    let shown = environment.describe(session_id).await;
+    assert_eq!(shown.source, LabelSource::Metadata);
+
+    assert!(!environment.privacy(false).await.enabled);
+    let after = environment.describe(session_id).await;
+    assert_eq!(
+        after.source,
+        LabelSource::Metadata,
+        "nothing from before privacy mode comes back"
+    );
+    assert_eq!(after.freshness, DescriptionFreshness::None);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.14: what a client is shown of the queue and of the last success. The age of a waiting
+/// job grows with the clock; nothing has succeeded until something has; the last success is the
+/// time the last description was published and stays there while a newer job waits; and a
+/// description the session has moved on from is shown as stale, with the wait beside it and its
+/// own text kept. The control is the same host once the pressure goes: the job runs, the wait is
+/// gone, and the last success moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_display_shows_the_age_of_a_waiting_job_and_the_time_of_the_last_success() {
+    let on_battery = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Battery,
+        ThermalState::Nominal,
+    );
+    let environment = Environment::start(Setup {
+        conditions: on_battery,
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let waiting = environment
+        .describe_until("the job waiting", session_id, |described| {
+            described.queued_age_ms.0.is_some()
+        })
+        .await;
+    assert_eq!(waiting.last_success_ms.0, None, "nothing has succeeded yet");
+    let age = waiting.queued_age_ms.0.expect("a queued age").get();
+
+    // A minute on: the wait is that much longer.
+    environment.placed.advance(60_000);
+    environment.controller().descriptions().wake();
+    environment
+        .describe_until("the wait to follow the clock", session_id, |described| {
+            described
+                .queued_age_ms
+                .0
+                .is_some_and(|waited| waited.get() >= age + 60_000)
+        })
+        .await;
+
+    // The pressure goes and the job runs: nothing waits, and the last success is when it ended.
+    environment.placed.set_conditions(roomy());
+    environment.controller().descriptions().wake();
+    let first = environment
+        .describe_until("the first description", session_id, |described| {
+            described.source == LabelSource::Generated && described.queued_age_ms.0.is_none()
+        })
+        .await;
+    assert_eq!(first.freshness, DescriptionFreshness::Current);
+    let succeeded = first.last_success_ms.0.expect("a last success");
+    assert_eq!(
+        Some(succeeded),
+        first
+            .provenance
+            .0
+            .as_ref()
+            .map(|provenance| provenance.produced_at_ms),
+        "the last success is when the description was produced"
+    );
+
+    // The pressure comes back and the session moves on: the description is stale with a wait
+    // beside it, still its own text, and the last success has not moved.
+    environment.placed.set_conditions(on_battery);
+    environment.controller().descriptions().wake();
+    environment
+        .describe_until("the pause", session_id, |described| {
+            described.paused.0 == Some(DescriptionPause::Battery)
+        })
+        .await;
+    environment.workers[0].report("make", "/home/a/other", None);
+    let stale = environment
+        .describe_until("a stale description and a wait", session_id, |described| {
+            described.freshness == DescriptionFreshness::Stale
+                && described.queued_age_ms.0.is_some()
+        })
+        .await;
+    assert_eq!(stale.source, LabelSource::Generated);
+    assert_eq!(stale.activity_text, first.activity_text);
+    assert_eq!(stale.last_success_ms.0, Some(succeeded));
+
+    // The control: the pressure goes, the job runs, the wait is gone and the last success moved.
+    environment.placed.set_conditions(roomy());
+    environment.controller().descriptions().wake();
+    let second = environment
+        .describe_until("the second description", session_id, |described| {
+            described.freshness == DescriptionFreshness::Current
+                && described.queued_age_ms.0.is_none()
+                && described
+                    .last_success_ms
+                    .0
+                    .is_some_and(|moved| moved.get() > succeeded.get())
+        })
+        .await;
+    assert_eq!(second.source, LabelSource::Generated);
     environment.stop().await;
 }

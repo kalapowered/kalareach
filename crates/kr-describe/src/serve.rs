@@ -99,6 +99,10 @@ pub trait Model: Send + 'static {
         token: &Cancellation,
         deadline: Instant,
     ) -> Verifying;
+
+    /// Hears that another description process holds this environment's lock, so this one waits
+    /// for it before it loads. Said once per wait; a model has no need to act on it.
+    fn lock_held(&mut self) {}
 }
 
 /// What checking a file did.
@@ -660,8 +664,10 @@ fn model_thread<M: Model>(
                             let locked = if lock.is_some() {
                                 Ok(())
                             } else {
-                                ProcessLock::acquire_until(runtime_dir, &token, due)
-                                    .map(|held| lock = Some(held))
+                                ProcessLock::acquire_until(runtime_dir, &token, due, &mut || {
+                                    model.lock_held();
+                                })
+                                .map(|held| lock = Some(held))
                             };
                             match locked {
                                 Err(LockWait::Cancelled) => ended(LoadEnd::Cancelled, None),
@@ -916,7 +922,8 @@ pub enum LockWait {
 
 impl ProcessLock {
     /// Takes the lock in `directory` without blocking, trying again until it is taken, the token
-    /// is cancelled or the deadline passes.
+    /// is cancelled or the deadline passes. `held` is called once, the first time the lock is
+    /// found held by another process.
     ///
     /// # Errors
     ///
@@ -925,12 +932,18 @@ impl ProcessLock {
         directory: &Path,
         token: &Cancellation,
         deadline: Instant,
+        held: &mut dyn FnMut(),
     ) -> Result<Self, LockWait> {
         let path = directory.join(LOCK_FILE);
+        let mut told = false;
         loop {
             match try_lock(&path) {
                 Ok(Some(file)) => return Ok(Self { _file: file }),
-                Ok(None) => {}
+                Ok(None) => {
+                    if !std::mem::replace(&mut told, true) {
+                        held();
+                    }
+                }
                 Err(error) => return Err(LockWait::Failed(error)),
             }
             if token.is_cancelled() {
