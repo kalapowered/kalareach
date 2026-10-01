@@ -8,9 +8,11 @@
  * The draft is durable and the association is not. A draft is this device's own record with its
  * own identity and revision; the attachment that presents it in an editor is a binding that the
  * connection owns. Losing the connection removes the binding and leaves the draft exactly as it
- * was. Coming back offers a rebind, and only the same authorised device against an unchanged
- * target gets one: a changed application or binding revision is a conflict the person resolves,
- * and a session that has gone orphans the draft. Nothing here submits anything.
+ * was. Coming back offers a rebind to a detached draft. The same authorised device against an
+ * unchanged target gets one, and so does a draft that holds nothing or never learnt its
+ * conversation, which takes the one that is current; a changed application or binding revision is
+ * a conflict the person resolves, and a session that has gone orphans the draft. Nothing here
+ * submits anything.
  *
  * An action is the other way round. The connection coming back is not an outcome. A submission
  * that was in flight when contact was lost is unresolved until a receipt says otherwise, and the
