@@ -1265,16 +1265,25 @@ export const USER_ACTIONS: Readonly<Record<string, string>> = {
  * code into a direct action, and not show the code by default.
  */
 export function failureMessage(value: unknown): string {
-  const failure = isHostError(value) ? value : null
-  const own = failure !== null ? failure.message : value instanceof Error ? value.message : ''
-  const codeFirst = failure === null ? '' : `${failure.code}: `
-  const words = codeFirst !== '' && own.startsWith(codeFirst) ? own.slice(codeFirst.length) : own
-  const said = words.trim().length > 0 ? words : 'Something went wrong.'
-  const key = failure?.user_action
+  const said = failureWords(value)
+  const key = isHostError(value) ? value.user_action : undefined
   const action = typeof key === 'string' && Object.hasOwn(USER_ACTIONS, key) ? USER_ACTIONS[key] : undefined
   if (action === undefined) return said
   const sentence = said.trimEnd()
   return `${sentence}${/[.!?…]$/.test(sentence) ? '' : '.'} ${action}`
+}
+
+/**
+ * The words of a failure, without the code the client library puts before a host's and without
+ * the action, for a place that says what a person can do about it in its own words, or where
+ * nothing can be done.
+ */
+export function failureWords(value: unknown): string {
+  const failure = isHostError(value) ? value : null
+  const own = failure !== null ? failure.message : value instanceof Error ? value.message : ''
+  const codeFirst = failure === null ? '' : `${failure.code}: `
+  const words = codeFirst !== '' && own.startsWith(codeFirst) ? own.slice(codeFirst.length) : own
+  return words.trim().length > 0 ? words : 'Something went wrong.'
 }
 
 /** The protocol code of a failure, or null when it did not carry one. */
