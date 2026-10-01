@@ -268,6 +268,80 @@ fn confirmation_document(challenge: &kr_protocol::pairing::OwnerConfirmationRequ
         )
 }
 
+/// How long the host may take to answer the request for a challenge, or for what an owner device
+/// is shown, before the command gives up and says nothing was changed.
+const ASK_WITHIN: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// How long past the challenge's own deadline the host may take over a repeated request it began
+/// to perform: the answer may have been spent on the last poll, and an installation fetches what
+/// it installs.
+const PERFORM_WITHIN: tokio::time::Duration = tokio::time::Duration::from_secs(300);
+
+/// What is left of a challenge that ends at `expires_at_ms` when this clock reads `now_ms`.
+const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
+    tokio::time::Duration::from_millis(expires_at_ms.saturating_sub(now_ms))
+}
+
+/// Repeats `ask` every `poll` until the host spends an owner device's answer, the challenge's
+/// `deadline` passes, the host refuses for another reason, or a request is not answered within
+/// `grace` past the deadline.
+///
+/// The deadline is a point on this process's own monotonic clock, fixed when the challenge
+/// arrived, so nothing that happens to the wall clock afterwards moves it. A request is made
+/// once at least, because the host may hold an answer it has not spent, and never after the
+/// deadline: the host cannot spend an answer to a challenge that has ended. A request the host
+/// did not answer may have been performed, so its end says the outcome is not known and never that
+/// nothing was changed.
+async fn wait_for_an_owner_device<T>(
+    deadline: tokio::time::Instant,
+    grace: tokio::time::Duration,
+    poll: tokio::time::Duration,
+    mut ask: impl AsyncFnMut() -> Result<T>,
+) -> Result<T> {
+    loop {
+        let answered = tokio::time::timeout_at(deadline + grace, ask()).await;
+        match answered {
+            Err(_) => {
+                return Err(CliError::Refused(refusal(
+                    ErrorCode::OutcomeUnknown,
+                    Shown::said(
+                        "the host did not answer the request, so whether it was performed is not \
+                         known: look at what the host lists before asking again",
+                    ),
+                )));
+            }
+            Ok(Ok(answer)) => return Ok(answer),
+            Ok(Err(CliError::Refused(refused)))
+                if refused.code == ErrorCode::OwnerConfirmationRequired =>
+            {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(CliError::Refused(refusal(
+                        ErrorCode::OwnerConfirmationRequired,
+                        shown!(
+                            "no owner device confirmed this before the challenge ran out. Nothing \
+                             was changed ({})",
+                            Shown::protocol(&refused)
+                        ),
+                    )));
+                }
+                tokio::time::sleep(poll.min(deadline - now)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CliError::Refused(refusal(
+                        ErrorCode::OwnerConfirmationRequired,
+                        shown!(
+                            "no owner device confirmed this before the challenge ran out. Nothing \
+                             was changed ({})",
+                            Shown::protocol(&refused)
+                        ),
+                    )));
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+        }
+    }
+}
+
 /// Asks the host for the challenge that confirms the exact request `params` names, says that an
 /// owner device has to confirm it and what that device is shown, and repeats the request with no
 /// proof every [`OWNER_DEVICE_POLL`] until the host spends the owner device's answer to it or the
@@ -287,12 +361,15 @@ where
     P: serde::Serialize + ?Sized,
     T: kr_protocol::wire::WireMessage,
 {
-    let challenge: OwnerConfirmationRequestResult = daemon
-        .mutate(
+    let asked = tokio::time::timeout(
+        ASK_WITHIN,
+        daemon.mutate::<_, OwnerConfirmationRequestResult>(
             Method::OwnerConfirmationRequest,
             &OwnerConfirmationRequestParams { subject },
-        )
-        .await?;
+        ),
+    )
+    .await;
+    let challenge = asked.map_err(|_| host_did_not_answer())??;
     if challenge.initial_bootstrap {
         return Err(CliError::Refused(refusal(
             ErrorCode::OwnerConfirmationRequired,
@@ -302,14 +379,19 @@ where
             ),
         )));
     }
+    // The wait ends at the host's own expiry, measured once on this process's monotonic clock.
     let expires_at_ms = challenge.request.expires_at_ms.get();
+    let deadline = tokio::time::Instant::now() + time_left(expires_at_ms, kr_ipc::now_ms().get());
     if !json {
-        let pending: OwnerConfirmationPendingResult = daemon
-            .read(
+        let read = tokio::time::timeout(
+            ASK_WITHIN,
+            daemon.read::<_, OwnerConfirmationPendingResult>(
                 Method::OwnerConfirmationPending,
                 &OwnerConfirmationPendingParams {},
-            )
-            .await?;
+            ),
+        )
+        .await;
+        let pending = read.map_err(|_| host_did_not_answer())??;
         if let Some(listed) = pending
             .pending
             .iter()
@@ -322,27 +404,20 @@ where
             remaining(expires_at_ms, kr_ipc::now_ms().get())
         ));
     }
-    loop {
-        match daemon.mutate::<P, T>(method, params).await {
-            Ok(answer) => return Ok((answer, challenge.request)),
-            Err(CliError::Refused(refusal))
-                if refusal.code == ErrorCode::OwnerConfirmationRequired =>
-            {
-                if kr_ipc::now_ms().get() >= expires_at_ms {
-                    return Err(CliError::Refused(self::refusal(
-                        ErrorCode::OwnerConfirmationRequired,
-                        shown!(
-                            "no owner device confirmed this before the challenge ran out. Nothing \
-                             was changed ({})",
-                            Shown::protocol(&refusal)
-                        ),
-                    )));
-                }
-                tokio::time::sleep(OWNER_DEVICE_POLL).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let answer =
+        wait_for_an_owner_device(deadline, PERFORM_WITHIN, OWNER_DEVICE_POLL, async || {
+            daemon.mutate::<P, T>(method, params).await
+        })
+        .await?;
+    Ok((answer, challenge.request))
+}
+
+/// What the command says when the host does not answer a request that changes nothing.
+fn host_did_not_answer() -> CliError {
+    CliError::HostUnavailable(Shown::said(
+        "the host did not answer the request for an owner device's confirmation. Nothing was \
+         changed",
+    ))
 }
 
 /// How long a wait has left, in words.
@@ -536,8 +611,8 @@ async fn repo_list(paths: &HostPaths, arguments: &PluginListArguments, json: boo
 /// The root is read from the file the person names and travels with the request, because a host
 /// that fetched it from the location it is meant to verify would be trusting the thing it is
 /// checking. The repository is a directory on this machine when its metadata is addressed by a
-/// `file` location and a community repository otherwise, with the budgets and the ceiling this
-/// host starts a repository with; an owner device confirms exactly that enrolment.
+/// `file` location and a community repository otherwise, with the budgets this host's configuration
+/// allows and no capability beyond the default; an owner device confirms exactly that enrolment.
 async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: bool) -> Result<()> {
     use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
     let root = std::fs::read(&arguments.root).map_err(|error| {
@@ -547,7 +622,13 @@ async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: b
         ))
     })?;
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
-    let defaults = EnrolmentBudgets::default();
+    // What this host's own configuration allows a repository, which is the product's default
+    // unless its owner narrowed it: a request for more is refused by the host, and this command
+    // has no option to ask for less.
+    let defaults: EnrolmentBudgets =
+        crate::doctor::configuration::load(&paths.environment(daemon.environment_id()))
+            .ceilings()
+            .enrolment_budgets();
     let params = CatalogueAddParams {
         environment_id: daemon.environment_id(),
         catalogue_id: arguments.catalogue.clone(),
@@ -793,5 +874,151 @@ mod tests {
                 "kalareach/example-declarative 0.1.0 from development (enabled)"
             );
         }
+    }
+
+    /// What a wait that is asked to repeat a request reports, and when each request was made.
+    #[derive(Default)]
+    struct Asks {
+        at: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl Asks {
+        fn count(&self) -> usize {
+            self.at.lock().expect("the record").len()
+        }
+
+        fn note(&self) {
+            self.at
+                .lock()
+                .expect("the record")
+                .push(tokio::time::Instant::now());
+        }
+    }
+
+    fn needs_the_owner() -> CliError {
+        CliError::Refused(refusal(
+            ErrorCode::OwnerConfirmationRequired,
+            Shown::said("no owner device has answered this"),
+        ))
+    }
+
+    fn short() -> tokio::time::Duration {
+        tokio::time::Duration::from_millis(5)
+    }
+
+    /// KR-REQ-07.47: the request is repeated, with nothing added, until the host spends an owner
+    /// device's answer, and the result is the host's own.
+    #[tokio::test]
+    async fn a_request_is_repeated_until_the_host_spends_the_answer() {
+        let asks = Asks::default();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let done: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            asks.note();
+            if asks.count() < 3 {
+                Err(needs_the_owner())
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert!(matches!(done, Ok(7)));
+        assert_eq!(asks.count(), 3);
+    }
+
+    /// KR-REQ-07.47: when no owner device answers, the wait ends at the challenge's own deadline
+    /// with a refusal that says nothing was changed, and no request is made after it: the host
+    /// cannot spend an answer to a challenge that has ended.
+    #[tokio::test]
+    async fn a_wait_ends_at_the_deadline_and_asks_nothing_after_it() {
+        let asks = Asks::default();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
+        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            asks.note();
+            Err(needs_the_owner())
+        })
+        .await;
+        let Err(CliError::Refused(refused)) = ended else {
+            panic!("a refusal");
+        };
+        assert_eq!(refused.code, ErrorCode::OwnerConfirmationRequired);
+        let said = &refused.message;
+        assert!(said.contains("Nothing was changed"), "{said}");
+        let at = asks.at.lock().expect("the record");
+        assert!(at.len() >= 2, "it asked until the deadline: {}", at.len());
+        assert!(
+            at.iter().all(|moment| *moment < deadline),
+            "no request was made after the deadline"
+        );
+    }
+
+    /// KR-REQ-07.47: a challenge that has ended already is asked about once, because the host may
+    /// hold an answer it has not spent, and then ends the wait.
+    #[tokio::test]
+    async fn a_challenge_that_has_ended_is_asked_once() {
+        let asks = Asks::default();
+        let deadline = tokio::time::Instant::now();
+        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            asks.note();
+            Err(needs_the_owner())
+        })
+        .await;
+        assert!(matches!(ended, Err(CliError::Refused(_))));
+        assert_eq!(asks.count(), 1);
+    }
+
+    /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
+    /// deadline and a bound beyond it, and what it says is that the outcome is not known: the
+    /// request may have been performed, and "nothing was changed" would be a claim nobody can
+    /// make. The control is a refusal for another reason, which ends the wait at once as itself.
+    #[tokio::test]
+    async fn a_host_that_does_not_answer_leaves_the_outcome_unknown() {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(20);
+        let silent: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            tokio::time::Duration::from_millis(20),
+            short(),
+            || std::future::pending(),
+        )
+        .await;
+        let Err(CliError::Refused(refused)) = silent else {
+            panic!("a refusal");
+        };
+        assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
+        let said = &refused.message;
+        assert!(said.contains("not known"), "{said}");
+        assert!(!said.contains("Nothing was changed"), "{said}");
+
+        let asks = Asks::default();
+        let other: Result<u32> = wait_for_an_owner_device(
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(CliError::Refused(refusal(
+                    ErrorCode::QuotaExceeded,
+                    Shown::said("past a budget"),
+                )))
+            },
+        )
+        .await;
+        let Err(CliError::Refused(refused)) = other else {
+            panic!("a refusal");
+        };
+        assert_eq!(refused.code, ErrorCode::QuotaExceeded);
+        assert_eq!(asks.count(), 1);
+    }
+
+    /// The time a challenge has left is read once, from the host's own expiry and this clock's
+    /// reading when the challenge arrived, so a clock that moves afterwards cannot lengthen the
+    /// wait; an expiry that has passed leaves none.
+    #[test]
+    fn the_time_left_is_read_once_and_never_negative() {
+        assert_eq!(
+            time_left(1_000_500, 1_000_000),
+            tokio::time::Duration::from_millis(500)
+        );
+        assert_eq!(time_left(999_000, 1_000_000), tokio::time::Duration::ZERO);
+        assert_eq!(time_left(1_000_000, 1_000_000), tokio::time::Duration::ZERO);
     }
 }
