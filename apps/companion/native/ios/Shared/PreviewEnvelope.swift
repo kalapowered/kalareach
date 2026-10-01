@@ -43,11 +43,22 @@ let previewKeyIDLength = 32
 extension PreviewEnvelope {
     /// Reads a sealed preview out of the notification's own user info.
     ///
+    /// FCM carries nothing but strings in a message's data, so the gateway sends the sealed
+    /// envelope as the JSON text of an object under `preview`, and that text is what is read here.
+    /// Anything else under that key, an object included, is not what the gateway sent.
+    ///
     /// Every failure is a reason to show the generic alert, so the parse is strict: a field that is
     /// not what the protocol declares is a malformed payload rather than something to interpret.
     static func parse(userInfo: [AnyHashable: Any]) throws -> PreviewEnvelope {
-        guard let preview = userInfo["preview"] as? [String: Any] else {
+        guard let sent = userInfo["preview"] else {
             throw PreviewParseFailure.absent
+        }
+        guard
+            let text = sent as? String,
+            let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
+            let preview = object as? [String: Any]
+        else {
+            throw PreviewParseFailure.malformed("preview")
         }
         guard let routing = preview["routing"] as? [String: Any] else {
             throw PreviewParseFailure.malformed("routing")
