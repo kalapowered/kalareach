@@ -1278,10 +1278,11 @@ impl WorkerService {
                 // replaces stops between two frames: a frame it has begun is finished, because one
                 // cut part way would end the connection, and it begins no other, except the
                 // keepalive that completes a closure notice it has already written and the side
-                // effects still queued on its stream, each written whole, which a screen drawn
-                // afresh does not carry. The new one begins its first frame only once the old one
-                // has stopped, so the peer is sent the old stream's last frame whole and then the
-                // new stream.
+                // effects still queued on its stream, which a screen drawn afresh does not carry:
+                // each is written whole, or recorded as a host event when the client was never
+                // sent the beginning of its stream (see `settle_effects`). The new one begins its
+                // first frame only once the old one has stopped, so the peer is sent the old
+                // stream's last frame whole and then the new stream.
                 #[cfg(feature = "testing")]
                 let watched = if state.delivery.is_some() {
                     self.wait_before_replacing_delivery().await
@@ -1346,29 +1347,12 @@ impl WorkerService {
                     // owed to the terminal from the stream: see `settle_effects`.
                     'delivery: {
                         if let Some(joined) = restoration {
-                            if let Some(gap) = joined.gap.as_ref()
-                                && let Some(notification) =
-                                    notification(&stream_id, sequence, "session.gap", gap)
+                            match open_delivery(&mut outlet, &stream_id, &mut sequence, joined)
+                                .await
                             {
-                                sequence += 1;
-                                if !outlet.write(&notification).await {
-                                    break 'delivery;
-                                }
+                                Some(sent) => opened = sent,
+                                None => break 'delivery,
                             }
-                            if !send_screen(
-                                &mut outlet,
-                                &stream_id,
-                                &mut sequence,
-                                joined.cursor,
-                                &joined.bytes,
-                            )
-                            .await
-                            {
-                                break 'delivery;
-                            }
-                            // A projected join has no bytes of its own: its screen is the events
-                            // that follow.
-                            opened = !joined.bytes.is_empty();
                         }
                         loop {
                             // Waiting for the next delivery is between two frames too, and a replaced
@@ -6956,8 +6940,9 @@ impl Delivery {
     /// The word goes out under the connection's writer, which is where the task decides whether to
     /// begin its next frame: it either sees the replacement and begins nothing more, or had already
     /// begun and finishes that frame. A closure notice it has written is still followed by the
-    /// keepalive that completes it, and the side effects still queued on its stream are written
-    /// after it, each whole (see `settle_effects`).
+    /// keepalive that completes it, and the side effects still queued on its stream follow it, each
+    /// written whole or recorded as a host event when the client was never sent the beginning of its
+    /// stream (see `settle_effects`).
     fn replace(self, writer: &Mutex<kr_ipc::framed::FrameWriter>) -> Predecessor {
         {
             let _boundary = writer
@@ -7456,6 +7441,32 @@ async fn send_effect(
         }
     }
     true
+}
+
+/// Writes what a subscription opens with: the gap notice, when it has one, and then the screen it
+/// joins on.
+///
+/// Returns whether the client has now been sent the beginning of its stream, or `None` when a
+/// write stopped. Only the screen is that beginning: the gap notice is not, and a projected join,
+/// whose screen is the events that follow it, has been sent none of it yet.
+async fn open_delivery(
+    outlet: &mut Outlet,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    joined: JoinedScreen,
+) -> Option<bool> {
+    if let Some(gap) = joined.gap.as_ref()
+        && let Some(notification) = notification(stream_id, *sequence, "session.gap", gap)
+    {
+        *sequence += 1;
+        if !outlet.write(&notification).await {
+            return None;
+        }
+    }
+    if !send_screen(outlet, stream_id, sequence, joined.cursor, &joined.bytes).await {
+        return None;
+    }
+    Some(!joined.bytes.is_empty())
 }
 
 /// Writes one side effect the stream owed, and keeps it in `failed` when its write stopped.
@@ -8504,8 +8515,10 @@ mod tests {
         }
     }
 
-    /// A hub with one subscriber holding the effects at `cursors`, and the subscriber's stream.
-    fn queued_effects(cursors: &[u64]) -> crate::output::OutputStream {
+    /// A hub with one subscriber holding the effects at `cursors`, and the subscriber's stream. The
+    /// hub is returned too and the caller keeps it, as a session keeps its hub while a delivery ends:
+    /// only the stream's own `close` ends what the delivery reads.
+    fn queued_effects(cursors: &[u64]) -> (crate::output::OutputHub, crate::output::OutputStream) {
         let attachment =
             kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
         let mut hub = crate::output::OutputHub::new();
@@ -8516,8 +8529,25 @@ mod tests {
                 crate::output::EffectOutcome::Queued
             );
         }
-        // The hub goes out of scope with its senders, as a subscriber the session removed would.
-        stream
+        (hub, stream)
+    }
+
+    /// Settles a stream within a bound: a settlement that did not close its stream would wait for a
+    /// producer that is still alive, and never return.
+    async fn settled(
+        outlet: &mut Outlet,
+        stream_id: &StreamId,
+        sequence: &mut u64,
+        stream: &mut crate::output::OutputStream,
+        opened: bool,
+        failed: Option<Arc<kr_term::sideeffect::SideEffect>>,
+    ) -> Vec<Arc<kr_term::sideeffect::SideEffect>> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::settle(outlet, stream_id, sequence, stream, opened, failed),
+        )
+        .await
+        .expect("a settlement closes its stream, so it ends while the hub still holds the producer")
     }
 
     fn cursors(effects: &[Arc<kr_term::sideeffect::SideEffect>]) -> Vec<u64> {
@@ -8536,9 +8566,9 @@ mod tests {
             replaced,
         };
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        let mut stream = queued_effects(&[4, 9, 12]);
+        let (_hub, mut stream) = queued_effects(&[4, 9, 12]);
         let mut sequence = 5_u64;
-        let abandoned = super::settle(
+        let abandoned = settled(
             &mut outlet,
             &stream_id,
             &mut sequence,
@@ -8580,9 +8610,9 @@ mod tests {
             replaced,
         };
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        let mut stream = queued_effects(&[1, 2]);
+        let (_hub, mut stream) = queued_effects(&[1, 2]);
         let mut sequence = 1_u64;
-        let abandoned = super::settle(
+        let abandoned = settled(
             &mut outlet,
             &stream_id,
             &mut sequence,
@@ -8612,7 +8642,7 @@ mod tests {
             replaced,
         };
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        let mut stream = queued_effects(&[20, 30]);
+        let (_hub, mut stream) = queued_effects(&[20, 30]);
         let mut sequence = 3_u64;
         let mut failed = None;
         // The connection's authority has been withdrawn before the first frame of the effect.
@@ -8631,8 +8661,17 @@ mod tests {
             Some(10),
             "and the effect it was writing is the one it keeps"
         );
-        let abandoned = super::settle(
-            &mut outlet,
+        // Settlement writes through an outlet of its own that nothing has withdrawn, so a retry of
+        // the failed effect, or a write of the ones behind it, would reach the peer.
+        let (_subscription_again, replaced_again) = tokio::sync::oneshot::channel();
+        let mut settling = Outlet {
+            writable: outlet.writable.clone(),
+            writer: Arc::clone(&outlet.writer),
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced: replaced_again,
+        };
+        let abandoned = settled(
+            &mut settling,
             &stream_id,
             &mut sequence,
             &mut stream,
@@ -8684,6 +8723,129 @@ mod tests {
             .read_message::<kr_protocol::envelope::ControlFrame>()
             .await
             .expect("the peer received the effect");
+    }
+
+    fn a_gap() -> kr_protocol::recovery::HistoryGap {
+        kr_protocol::recovery::HistoryGap {
+            cause: None,
+            from_cursor: kr_protocol::scalars::U64::new(0),
+            to_cursor: kr_protocol::scalars::U64::new(5),
+        }
+    }
+
+    fn joined(bytes: &[u8], gap: Option<kr_protocol::recovery::HistoryGap>) -> super::JoinedScreen {
+        super::JoinedScreen {
+            cursor: 5,
+            bytes: bytes.to_vec(),
+            gap,
+        }
+    }
+
+    /// An outlet over a real connection and the peer's reader. The sender is returned too: a delivery
+    /// whose sender is dropped has been replaced, and begins no frame.
+    async fn an_outlet() -> (
+        kr_ipc::testing::TempHost,
+        tokio::sync::oneshot::Sender<()>,
+        Outlet,
+        kr_ipc::framed::FrameReader,
+    ) {
+        let (temp, writable, writer, reader) = connected().await;
+        let (subscription, replaced) = tokio::sync::oneshot::channel();
+        let outlet = Outlet {
+            writable,
+            writer,
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced,
+        };
+        (temp, subscription, outlet, reader)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gap_notice_alone_is_not_the_beginning_of_a_stream_and_a_whole_screen_is() {
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        for (bytes, gap, opened, frames) in [
+            (&b""[..], Some(a_gap()), false, 1_u64),
+            (&b"a screen"[..], None, true, 1),
+            (&b"a screen"[..], Some(a_gap()), true, 2),
+            (&b""[..], None, false, 0),
+        ] {
+            let (_temp, _subscription, mut outlet, _reader) = an_outlet().await;
+            let mut sequence = 0_u64;
+            let sent =
+                super::open_delivery(&mut outlet, &stream_id, &mut sequence, joined(bytes, gap))
+                    .await;
+            assert_eq!(
+                (sent, sequence),
+                (Some(opened), frames),
+                "a screen of {} bytes after {gap:?}",
+                bytes.len()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_stopped_while_it_opens_has_not_been_sent_the_beginning_of_its_stream() {
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
+        let mut sequence = 0_u64;
+        outlet.withdrawn.set();
+        assert_eq!(
+            super::open_delivery(
+                &mut outlet,
+                &stream_id,
+                &mut sequence,
+                joined(b"a screen", Some(a_gap())),
+            )
+            .await,
+            None,
+            "the first write stopped"
+        );
+        let nothing = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+        )
+        .await;
+        assert!(nothing.is_err(), "and nothing reached the peer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn effects_owed_to_a_delivery_that_opened_with_a_gap_alone_are_recorded_and_none_written()
+    {
+        // The two halves of one delivery, joined: what the opening reports is what settlement acts
+        // on, so a delivery that wrote only the gap notice before it was replaced writes no effect.
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
+        let (_hub, mut stream) = queued_effects(&[7, 8]);
+        let mut sequence = 0_u64;
+        let opened = super::open_delivery(
+            &mut outlet,
+            &stream_id,
+            &mut sequence,
+            joined(b"", Some(a_gap())),
+        )
+        .await
+        .expect("the gap notice was written");
+        let abandoned = settled(
+            &mut outlet,
+            &stream_id,
+            &mut sequence,
+            &mut stream,
+            opened,
+            None,
+        )
+        .await;
+        assert_eq!(cursors(&abandoned), vec![7, 8]);
+        assert_eq!(sequence, 1, "only the gap notice was written");
+        reader
+            .read_message::<kr_protocol::envelope::ControlFrame>()
+            .await
+            .expect("the gap notice arrives");
+        let nothing = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+        )
+        .await;
+        assert!(nothing.is_err(), "and no effect follows it");
     }
 
     #[tokio::test(flavor = "multi_thread")]

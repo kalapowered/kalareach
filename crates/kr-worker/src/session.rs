@@ -3200,8 +3200,9 @@ impl Session {
     /// Records the side effects a delivery was owed and could not write, as durable host events.
     ///
     /// A subscription that another replaces writes the effects queued on it first. The ones it
-    /// cannot write, because its connection has gone or because it never wrote anything the client
-    /// could tell it apart by, are what this takes: each is a host event rather than something lost.
+    /// cannot write are what this takes: a write that failed stops it, and so does a client that was
+    /// never sent the beginning of its stream, because only a gap notice reached it or its
+    /// restoration stopped part way. Each is a host event rather than something lost.
     pub fn record_abandoned_effects(&mut self, effects: &mut [Arc<SideEffect>]) {
         self.record_host_events(effects);
     }
