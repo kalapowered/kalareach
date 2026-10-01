@@ -132,7 +132,8 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
 /// A test run of this crate alone does not build the worker, so one an earlier build left in the
 /// target directory could be started, and every check below would be about another build. The
 /// version the worker reports is checked against this build's, which catches a worker of another
-/// release or protocol; a run of this crate alone builds the worker first.
+/// release or protocol and not a stale build of this one, so build the worker before a run of this
+/// crate alone.
 fn built_worker() -> PathBuf {
     let mut directory = std::env::current_exe().expect("this test's own path");
     directory.pop();

@@ -464,6 +464,21 @@ pub fn replay(trace: &Trace) -> Result<(), Stopped> {
 ///
 /// As [`replay`].
 pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
+    replay_between(trace, strategy, &mut |_, _| Ok(()))
+}
+
+/// What a control does after a step: it is given the step's index and the path of the kept journal
+/// the trace opened, when it opened one.
+type Between<'a> = dyn FnMut(usize, Option<&Path>) -> Result<(), String> + 'a;
+
+/// As [`replay_with`], and `between` is called after each step with that step's index and the path
+/// of the kept journal the trace opened, when it opened one: what a control does to the store behind
+/// the session's back, as another connection would.
+fn replay_between(
+    trace: &Trace,
+    strategy: Strategy,
+    between: &mut Between<'_>,
+) -> Result<(), Stopped> {
     let stopped = |step: Option<usize>, cause: Cause, what: String| Stopped {
         trace: trace.name.clone(),
         step,
@@ -507,6 +522,9 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         replay
             .run(step)
             .map_err(|(cause, what)| stopped(Some(index), cause, what))?;
+        let journal = replay.journal_home.as_ref().map(JournalHome::path);
+        between(index, journal.as_deref())
+            .map_err(|what| stopped(Some(index), Cause::Malformed, what))?;
     }
     Ok(())
 }
@@ -549,15 +567,18 @@ impl JournalHome {
     }
 }
 
-/// Whether the intervals a journal reads as written down, oldest first, are the ones a replay has
-/// had recorded: exactly `owed` of them, and when this step recorded one, the newest of its kind.
+/// Whether the intervals a journal reads as written down, oldest first, are the ones it should
+/// hold: exactly `owed` of them, which counts the intervals the journal held when the session
+/// opened it and the ones this replay has had it record since, and, when this step recorded one
+/// (`recorded` is its kind), the newest of them is of that kind.
 fn gaps_written_down(owed: usize, recorded: Option<&str>, stored: &[&str]) -> Result<(), String> {
     if stored.len() == owed && (recorded.is_none() || stored.last().copied() == recorded) {
         Ok(())
     } else {
         Err(format!(
-            "reads {} interval(s) written down, ending {:?}, and the trace has had {owed} \
-             recorded, the last {recorded:?}",
+            "reads {} interval(s) written down, the newest {:?}; {owed} are owed (the intervals \
+             the journal held when the session opened it and those this replay has had it \
+             record), and the newest must be of kind {recorded:?} when this step recorded one",
             stored.len(),
             stored.last()
         ))
@@ -1186,6 +1207,61 @@ mod tests {
         // A second recovery that found nothing to record leaves the count as it was.
         assert!(gaps_written_down(1, None, &["full", "full"]).is_err());
         assert!(gaps_written_down(1, None, &[]).is_err());
+    }
+
+    /// A control for the read-back of the intervals: a row another connection writes into the
+    /// journal between the two recoveries of a kept trace is one the second recovery never made,
+    /// and the second read-back finds more written down than the session owes.
+    #[test]
+    fn an_interval_another_connection_writes_between_two_recoveries_fails_the_second_read_back() {
+        let kept = Trace::load(&directory().join("full-journal-keeps-native-input.json"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let releases: Vec<usize> = kept
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| matches!(step, Step::ReleaseJournal { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let [first, second] = releases[..] else {
+            panic!("the kept trace recovers twice: {releases:?}");
+        };
+        let mut written = false;
+        let stopped = replay_between(&kept, Strategy::Product, &mut |step, journal| {
+            if step != first {
+                return Ok(());
+            }
+            let path = journal.ok_or_else(|| "the trace opened no kept journal".to_owned())?;
+            rusqlite::Connection::open(path)
+                .and_then(|connection| {
+                    connection.execute(
+                        "INSERT INTO journal_gaps (
+                             kind, detail, faulted_at_ms, recovered_at_ms, durable_through,
+                             resumed_at
+                         ) VALUES ('full', 'written by another connection', 1, 2, 3, 4)",
+                        [],
+                    )
+                })
+                .map_err(|error| format!("the other connection could not write: {error}"))?;
+            written = true;
+            Ok(())
+        })
+        .expect_err("the second read-back finds a row nobody recorded");
+        assert!(written, "the control wrote its row");
+        assert_eq!(
+            (stopped.step, stopped.cause),
+            (Some(second), Cause::Expectation),
+            "{stopped}"
+        );
+        assert!(
+            stopped.what.contains("interval(s) written down"),
+            "{stopped}"
+        );
+        let unchanged = replay(&kept);
+        assert!(
+            unchanged.is_ok(),
+            "the same trace replays without it: {unchanged:?}"
+        );
     }
 
     #[test]
