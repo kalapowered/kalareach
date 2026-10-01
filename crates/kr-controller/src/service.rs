@@ -316,6 +316,14 @@ pub struct Controller {
     /// its specification is made. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_claim: ReadPause,
+    /// How the loop that serves one local connection paces what it writes unasked. A shipped build
+    /// has the one pace the constants name; this host's own tests choose another.
+    #[cfg(feature = "testing")]
+    local_pace: std::sync::Mutex<local::LocalPace>,
+    /// How many writes of a local connection's loop have had to wait for their peer. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    local_writes_blocked: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a retry that has found its retained answer, before the
     /// admission it arrived under is asked again, so that a withdrawal can land in between.
     /// Compiled away in every shipped build.
@@ -749,6 +757,10 @@ mod a_change_that_waits_for_its_store;
 /// What the local door asks again where a retained answer goes back and where a mutation lands.
 #[cfg(test)]
 mod the_fence_at_every_effect;
+
+/// A local connection whose peer stops reading.
+#[cfg(test)]
+mod a_peer_that_stops_reading;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
