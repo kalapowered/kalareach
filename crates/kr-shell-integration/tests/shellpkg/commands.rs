@@ -1187,7 +1187,7 @@ struct Corpus {
 /// The reserved variables a managed shell may export to what it starts and an ordinary one does not,
 /// by name. Any other `KR_` variable an agent sees is one both shells were given, and is compared
 /// like every other.
-const DECLARED_RESERVED: &[&str] = &["KR_SESSION"];
+const DECLARED_RESERVED: &[&str] = &["KR_SESSION", "KR_DETACH_TOKEN"];
 
 /// What one shell left behind: the files its corpus wrote, and every start of each agent.
 struct Observed {
