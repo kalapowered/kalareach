@@ -171,6 +171,7 @@
 		A9011D4AFA5E6579D9C0375B /* transfers.rs */ = {isa = PBXFileReference; path = transfers.rs; sourceTree = "<group>"; };
 		B2DF4188C16A66634654971D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		B30A99D51E204CF08E48F0D7 /* ProbeSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeSupport.swift; sourceTree = "<group>"; };
+		B3FF429BEAA11EE3AF62D73B /* Build.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Build.xcconfig; sourceTree = "<group>"; };
 		B470404A82E630AA056C0BCA /* navigation.rs */ = {isa = PBXFileReference; path = navigation.rs; sourceTree = "<group>"; };
 		BC81452583E1A11378351821 /* SecureKeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeys.swift; sourceTree = "<group>"; };
 		BD790CB946E32C30357728DA /* PushStartup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushStartup.swift; sourceTree = "<group>"; };
@@ -324,6 +325,15 @@
 			path = audio;
 			sourceTree = "<group>";
 		};
+		5D232CEEA100058A3C044901 /* apple */ = {
+			isa = PBXGroup;
+			children = (
+				B3FF429BEAA11EE3AF62D73B /* Build.xcconfig */,
+			);
+			name = apple;
+			path = .;
+			sourceTree = "<group>";
+		};
 		759ED3EAF99DD6D22AC770CE /* KalaReachNative */ = {
 			isa = PBXGroup;
 			children = (
@@ -442,6 +452,7 @@
 				9763735ADB959CD6F7877892 /* assets */,
 				3CC3E46F612EC707E33F9F70 /* Assets.xcassets */,
 				2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */,
+				5D232CEEA100058A3C044901 /* apple */,
 				A8267576D0426DF97270ACD4 /* companion-tauri_iOS */,
 				8C72BD05AE26F57E26052278 /* Externals */,
 				3B506588AC88ABCEFBB10E36 /* KalaReachApp */,
@@ -489,6 +500,13 @@
 				B2DF4188C16A66634654971D /* WebKit.framework */,
 			);
 			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		"TEMP_DB9D2DA1-41C9-47A4-9AA1-CEECC7EB0B0C" /* x86_64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = x86_64;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -652,7 +670,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\ndestination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist\"\nrm -f \"${destination}\"\nif [ -n \"${KR_GOOGLE_SERVICE_INFO:-}\" ] && [ -f \"${KR_GOOGLE_SERVICE_INFO}\" ]; then\n  cp \"${KR_GOOGLE_SERVICE_INFO}\" \"${destination}\"\nelif [ \"${CONFIGURATION}\" = \"release\" ]; then\n  echo \"error: a release build needs KR_GOOGLE_SERVICE_INFO to name a GoogleService-Info.plist\" >&2\n  exit 1\nelse\n  echo \"note: no GoogleService-Info.plist named by KR_GOOGLE_SERVICE_INFO, so Firebase is left alone\"\nfi\n";
+			shellScript = "bash \"${SRCROOT}/../../../scripts/copy-firebase-configuration.sh\"";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -874,6 +892,7 @@
 		};
 		BBA8EAEA023702CDAB8A72B1 /* debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B3FF429BEAA11EE3AF62D73B /* Build.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -938,6 +957,7 @@
 		};
 		EC3F95ED40BA695150DC57F8 /* release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B3FF429BEAA11EE3AF62D73B /* Build.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
