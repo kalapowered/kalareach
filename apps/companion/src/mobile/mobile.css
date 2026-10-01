@@ -628,10 +628,12 @@
 /*
  * Above a software keyboard the composer is lifted by what the keyboard covers beyond the padding
  * and the tab bar under the session, which the session measures, and by nothing when it covers no
- * more. The tab bar keeps clear of the home indicator for both.
+ * more. The tab bar keeps clear of the home indicator for both. Where the session is taller than
+ * the room above the keyboard and scrolls, the session adds what scrolling could not bring the field
+ * up by, so the field rests on the keyboard's top edge.
  */
 .m-composer {
-  padding-block-end: max(0px, calc(var(--keyboard) - var(--under-session, 0px)));
+  padding-block-end: calc(max(0px, calc(var(--keyboard) - var(--under-session, 0px))) + var(--lift-more, 0px));
 }
 
 .m-composer-body {
