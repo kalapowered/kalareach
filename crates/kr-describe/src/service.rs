@@ -571,17 +571,14 @@ pub trait PublicationGate: Send {
     ) -> Option<Result<PublishGate>>;
 
     /// Runs `register`, which makes a job of a session at `generation` one that is in flight and
-    /// can be cancelled, while a send at that generation is admitted, and says whether it ran. It
-    /// does not run when none is: privacy mode is on, or the generation moved on. A change of
-    /// privacy mode then waits for the registration, and finds the job in flight to cancel, or the
-    /// registration comes after it and is refused: no job starts once privacy mode is published.
+    /// can be cancelled, while a send at that generation is admitted. It does not run when none
+    /// is: privacy mode is on, or the generation moved on. A change of privacy mode then waits for
+    /// the registration, and finds the job in flight to cancel, or the registration comes after it
+    /// and is refused: no job starts once privacy mode is published.
     ///
-    /// A gate that holds nothing runs it.
-    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut()) -> bool {
-        let _ = generation;
-        register();
-        true
-    }
+    /// The service sends the job only if `register` ran, so a gate cannot admit a job it has not
+    /// registered, nor refuse one it has.
+    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut());
 }
 
 /// The description service for one execution environment.
@@ -1736,14 +1733,11 @@ impl DescriptionService {
                 registered = Some(self.running.started(session_id));
                 self.in_flight.dispatched(session_id);
             };
-            let admitted = match &self.gate {
+            match &self.gate {
                 Some(gate) => gate.admit_dispatch(generation, &mut register),
-                None => {
-                    register();
-                    true
-                }
-            };
-            let Some(cancellation) = registered.filter(|_| admitted) else {
+                None => register(),
+            }
+            let Some(cancellation) = registered else {
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 continue;
             };

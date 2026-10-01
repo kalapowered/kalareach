@@ -25,7 +25,9 @@ use kr_protocol::ids::{
 };
 use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::privacy::PrivacyGenerationNotice;
-use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+use kr_protocol::root::{
+    CwdRevision, PromptGeneration, RootCommandBlockParams, RootCommandResolveParams,
+};
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_worker::fence::{CommandHook, Effects, Step};
@@ -258,11 +260,22 @@ async fn page(link: &mut LocalClient) -> DescriptionFactsPage {
     }
 }
 
-/// A command block the shell integration reports.
+/// A command block the shell integration reports, for the line accepted at the first prompt.
 fn block(command: &str, cwd: &str, status: Option<u64>) -> RootCommandBlockParams {
+    block_at(1, command, cwd, status)
+}
+
+/// A command block the shell integration reports, for the line accepted at prompt generation
+/// `generation`.
+fn block_at(
+    generation: u64,
+    command: &str,
+    cwd: &str,
+    status: Option<u64>,
+) -> RootCommandBlockParams {
     RootCommandBlockParams {
         session_id: SessionId::new(Uuid::from_bytes([1; 16])),
-        prompt_generation: PromptGeneration::new(1),
+        prompt_generation: PromptGeneration::new(generation),
         command: command.to_owned(),
         started_at_ms: TimestampMs::new(1),
         duration_ms: Nullable(status.map(|_| DurationMs::new(1))),
@@ -278,6 +291,28 @@ fn report(host: &Host, block: RootCommandBlockParams) {
         steps: vec![Step::CommandHook(
             RequestId::new(1),
             Box::new(CommandHook::Block(Box::new(block))),
+        )],
+        ..Effects::default()
+    });
+}
+
+/// Reports the shell's question in front of an interactive command of the line accepted at prompt
+/// generation `generation`, as the shell integration's hook does: the program is named from the
+/// file the shell's own search resolved the command to.
+fn resolved(host: &Host, generation: u64, argv: &[&str], executable: &str) {
+    let invocation = RootCommandResolveParams {
+        session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+        prompt_generation: PromptGeneration::new(generation),
+        argv: argv.iter().map(|word| (*word).to_owned()).collect(),
+        executable: executable.to_owned(),
+        interactive: true,
+        cwd: "/home/a/work".to_owned(),
+        cwd_revision: CwdRevision::new(0),
+    };
+    let _ = host.runtime.session().apply_fence_effects(Effects {
+        steps: vec![Step::CommandHook(
+            RequestId::new(1),
+            Box::new(CommandHook::Resolve(invocation)),
         )],
         ..Effects::default()
     });
@@ -464,6 +499,12 @@ async fn a_command_block_becomes_a_directory_a_program_and_a_completion() {
     assert_eq!(empty.facts.0, None, "nothing has happened yet");
     assert!(!empty.private);
 
+    resolved(
+        &host,
+        1,
+        &["cargo", "test", "--all", "--token", "hunter2"],
+        "/usr/bin/cargo",
+    );
     report(
         &host,
         block(
@@ -500,6 +541,32 @@ async fn a_command_block_becomes_a_directory_a_program_and_a_completion() {
     assert!(after.revision.get() > facts.revision.get());
 }
 
+/// KR-REQ-22.05: a token typed at the prompt as one plain word is recorded as no program: the
+/// shell found no file to run, so it asked nothing, and the page names the directory and no
+/// program, with no event. The control is a command the shell did resolve to a
+/// file, which is recorded under the line's own generation.
+#[tokio::test]
+async fn a_word_typed_at_the_prompt_is_no_program_and_a_resolved_command_still_is() {
+    let host = host("exec cat").await;
+    let mut link = daemon(&host, ControllerConnectionRole::Descriptions).await;
+
+    report(&host, block("kr-9f3a7c1e-token", "/home/a/work", None));
+    let pasted = ask(&mut link, 1, 0, 0, Some(0)).await;
+    let facts = pasted.facts.0.expect("facts");
+    assert_eq!(facts.directory.0.as_deref(), Some("work"));
+    assert_eq!(facts.application.0, None, "a pasted word is no program");
+    assert!(facts.events.is_empty(), "and no command is announced");
+    let encoded = serde_json::to_string(&facts).expect("facts encode");
+    assert!(!encoded.contains("9f3a7c1e"), "{encoded}");
+
+    resolved(&host, 2, &["make", "all"], "/usr/bin/make");
+    report(&host, block_at(2, "make all", "/home/a/work", None));
+    let made = ask(&mut link, 2, facts.revision.get(), 0, Some(0)).await;
+    let facts = made.facts.0.expect("facts");
+    assert_eq!(facts.application.0.as_deref(), Some("make"));
+    assert_eq!(facts.events.len(), 1);
+}
+
 /// A request the worker holds is answered by the change that moves the facts, and not before:
 /// the first frame back is the page of the change, never an earlier empty one. The control is a
 /// request that asks for no wait, which is answered at once with nothing.
@@ -519,6 +586,7 @@ async fn a_held_request_is_answered_by_the_change_that_moves_the_facts() {
     // says it is holding the request, so an answer that came before it would be the first frame.
     send(&mut link, request(3, 0, 300_000, current)).await;
     until_held(&host, 1).await;
+    resolved(&host, 1, &["make"], "/usr/bin/make");
     report(&host, block("make", "/home/a/work", None));
     let answered = page(&mut link).await;
     assert_eq!(answered.request_id, RequestId::new(3));
@@ -532,7 +600,7 @@ async fn a_held_request_is_answered_by_the_change_that_moves_the_facts() {
     send(&mut link, request(5, revision, 300_000, current)).await;
     // The first is let go and the second is held in its place.
     until_held(&host, 3).await;
-    report(&host, block("ls", "/home/a/work", None));
+    report(&host, block_at(2, "ls", "/home/a/work", None));
     let replaced = page(&mut link).await;
     assert_eq!(replaced.request_id, RequestId::new(5));
 }
@@ -698,12 +766,14 @@ async fn privacy_mode_stops_capture_clears_the_record_and_tells_the_daemon() {
 
     // Turned off: a record of its own, at the new generation, with nothing from before.
     tell_privacy(&host, &mut authority, 2, false).await;
+    resolved(&host, 1, &["make"], "/usr/bin/make");
     report(&host, block("make", "/home/a/after", None));
     let after = ask(&mut link, 4, 0, 0, Some(2)).await;
     assert!(!after.private);
     let facts = after.facts.0.expect("facts");
     assert_eq!(facts.generation.get(), 2);
     assert_eq!(facts.directory.0.as_deref(), Some("after"));
+    assert_eq!(facts.application.0.as_deref(), Some("make"));
     assert_eq!(
         facts.events.len(),
         1,

@@ -11,7 +11,8 @@
 //! record: its capture points are the places the worker already decides something happened (a
 //! command block the shell integration reported, a prompt the worker admitted, an observation an
 //! admitted bridge sent), and no input, resize or query path calls any of them. A command line is
-//! reduced to its program name before it is stored, because its arguments are what a person typed.
+//! never stored or read: the program's name is the one the shell itself resolved to a file, because
+//! what a person typed is its arguments, and a word the shell did not resolve names no program.
 //! Every text is clipped to [`MAX_DESCRIPTION_FACT_CODEPOINTS`] and stripped of control
 //! characters.
 //!
@@ -38,9 +39,8 @@ use kr_protocol::describe::{
     DescriptionCompletion, DescriptionEvent, DescriptionEventKind, DescriptionFacts as FactsRecord,
     DescriptionRepository, MAX_DESCRIPTION_FACT_CODEPOINTS, MAX_DESCRIPTION_FACT_EVENTS,
 };
-use kr_protocol::root::RootCommandBlockParams;
+use kr_protocol::root::{RootCommandBlockParams, RootCommandResolveParams};
 use kr_protocol::scalars::{Nullable, U64};
-use kr_shell_integration::contract::qualification::ShellKind;
 
 use crate::privacy::{
     Cancelled, Fenced, PrivacyGeneration, PrivacySubsystem, Removed, Unavailable,
@@ -100,6 +100,34 @@ struct State {
     blocks: u64,
     /// The directory read that is running, and the one waiting behind it.
     probe: Probe,
+    /// The command line the program is being named for.
+    line: Line,
+}
+
+/// The command line a program is named for. A line is accepted at one prompt generation, and the
+/// first command in it that the shell resolved to a file names the program for all of it: the
+/// shell's question comes before the command starts, and it may come before or after the line's
+/// block is reported, so each side waits for the other.
+#[derive(Debug, Default)]
+struct Line {
+    /// The prompt generation the line was accepted at, once either side has reported it.
+    generation: Option<u64>,
+    /// Whether the line's block has been reported: the record shows the line from then on.
+    started: bool,
+    /// The program the shell resolved, once it has.
+    program: Option<String>,
+    /// Whether the record's event for the command has been made.
+    announced: bool,
+}
+
+impl Line {
+    /// The line accepted at `generation`, which nothing has been said of yet.
+    fn at(generation: u64) -> Self {
+        Self {
+            generation: Some(generation),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -195,6 +223,7 @@ impl DescriptionFacts {
                     epoch: 0,
                     blocks: 0,
                     probe: Probe::Idle,
+                    line: Line::default(),
                 }),
                 changed: tokio::sync::Notify::new(),
             }),
@@ -227,19 +256,14 @@ impl DescriptionFacts {
         }
     }
 
-    /// Records a command block the shell integration reported: the directory it ran in, its
-    /// program name and, when it has ended, how.
+    /// Records a command block the shell integration reported: the directory it ran in, the
+    /// program the shell resolved for its line and, when it has ended, how.
     ///
-    /// A command starting is also an event, with its program name for a summary. The repository the
-    /// directory is in is read on a thread of its own.
-    pub fn note_command(
-        &self,
-        block: &RootCommandBlockParams,
-        shell: Option<u64>,
-        kind: Option<ShellKind>,
-    ) {
+    /// The block's command line is not read: the program is the one [`Self::note_resolved`] was
+    /// told of for the same line, and none until it is. The repository the directory is in is read
+    /// on a thread of its own.
+    pub fn note_command(&self, block: &RootCommandBlockParams, shell: Option<u64>) {
         let directory = last_component(&block.cwd);
-        let application = program_of(&block.command, kind);
         let finished = block.finished();
         let completion = block.exit_status.0.map(|status| {
             if status.get() == 0 {
@@ -255,6 +279,12 @@ impl DescriptionFacts {
         let mut read = None;
         self.change(|state| {
             state.blocks += 1;
+            let generation = block.prompt_generation.0.get();
+            if state.line.generation != Some(generation) {
+                state.line = Line::at(generation);
+            }
+            state.line.started = true;
+            let application = state.line.program.clone();
             let mut moved = false;
             let moved_directory = state.cwd.as_deref() != Some(block.cwd.as_str());
             if moved_directory {
@@ -287,21 +317,44 @@ impl DescriptionFacts {
                 moved = true;
             }
             if !finished {
-                let cursor = state.events_recorded;
-                state.events_recorded += 1;
-                push_event(
-                    &mut state.record,
-                    cursor,
-                    DescriptionEventKind::CommandAccepted,
-                    application.as_deref().unwrap_or_default(),
-                );
-                moved = true;
+                moved |= state.announce_command();
             }
             moved
         });
         if let Some(read) = read {
             self.read_directory(read);
         }
+    }
+
+    /// Records the program the shell resolved an invocation of the line it is running to.
+    ///
+    /// The first command of a line that the shell resolved to a file names the program; a later
+    /// one, one that is not interactive and one resolved to no absolute path name none. A shell
+    /// that never asks, and a word it did not resolve, leave the line with no program.
+    pub fn note_resolved(&self, invocation: &RootCommandResolveParams) {
+        let Some(program) = program_of(invocation) else {
+            return;
+        };
+        let generation = invocation.prompt_generation.0.get();
+        self.change(|state| {
+            match state.line.generation {
+                // A line already gone by: nothing about it is the record's any longer.
+                Some(current) if current > generation => return false,
+                Some(current) if current == generation => {}
+                _ => state.line = Line::at(generation),
+            }
+            if state.line.program.is_some() {
+                return false;
+            }
+            state.line.program = Some(program);
+            // Until the line's block is reported the record shows the command before it.
+            if !state.line.started {
+                return false;
+            }
+            state.record.application.clone_from(&state.line.program);
+            state.announce_command();
+            true
+        });
     }
 
     /// Records the prompt an agent in the session was last given.
@@ -451,11 +504,33 @@ impl DescriptionFacts {
 }
 
 impl State {
+    /// Makes the record's event for the command its line runs, once and only when the shell has
+    /// resolved a program for the line, and says whether it made one.
+    fn announce_command(&mut self) -> bool {
+        if self.line.announced {
+            return false;
+        }
+        let Some(program) = self.line.program.clone() else {
+            return false;
+        };
+        self.line.announced = true;
+        let cursor = self.events_recorded;
+        self.events_recorded += 1;
+        push_event(
+            &mut self.record,
+            cursor,
+            DescriptionEventKind::CommandAccepted,
+            &program,
+        );
+        true
+    }
+
     /// Begins a record of its own at a privacy transition: nothing from before comes with it, and
     /// no read that began before it applies to it.
     fn start_over(&mut self) {
         self.record = Record::default();
         self.cwd = None;
+        self.line = Line::default();
         self.revision += 1;
         self.epoch += 1;
         if let Probe::Running(waiting) = &mut self.probe {
@@ -543,165 +618,21 @@ fn last_component(path: &str) -> Option<String> {
         .or_else(|| path.to_str().and_then(clip))
 }
 
-/// The program a command line runs, and nothing else of it.
+/// The name of the program a shell resolved an invocation to, and nothing else of it.
 ///
-/// This reads a closed grammar and nothing more. A line is blanks, the variable assignments the
-/// shell it came from has (see [`Assignments`]), and then the program word; the program word's last
-/// component is the name. Every word is made of characters whose meaning is the same in every shell
-/// this product runs (letters, digits and `_ . / : + - = ~`) and quoted parts whose contents hold
-/// only letters, digits, spaces and ASCII punctuation that no shell reads specially inside the
-/// quote it is in; the words are separated by spaces and tabs alone. Anything else, wherever it is
-/// before the program word ends, means this reader does not know what the shell will run, and the
-/// line names no program: a redirection, an operator, a substitution, a group, a comment, a
-/// backslash, a comma, a quote of any other kind, an unterminated quote, a newline before the
-/// program, a name that is not a variable's, a line from a shell this reader has no assignment
-/// rule for. Nothing after the program word is read. A missing name is no harm, and a wrong one
-/// is a leak of what a person typed, so no syntax is ever modelled: it is refused.
-fn program_of(command: &str, kind: Option<ShellKind>) -> Option<String> {
-    let assignments = Assignments::of(kind);
-    let mut rest = command.trim_start_matches(is_blank);
-    loop {
-        let (word, after) = scan_word(rest)?;
-        if word.is_assignment(assignments) {
-            // What it is for follows after blanks. A newline or the end of the line makes the
-            // assignment a command of its own: the next word is then empty, and names nothing.
-            rest = after.trim_start_matches(is_blank);
-            continue;
-        }
-        // A word that holds an `=` and is not an assignment is not one this reader knows.
-        if word.raw.contains('=') {
-            return None;
-        }
-        // PowerShell reads a quoted word, a number and a word with a sign in it as an expression,
-        // not as the name of a command: its program word is a plain name, unquoted, that starts
-        // with a letter, an underscore or a path character.
-        if kind == Some(ShellKind::PowerShell) && !is_command_name(word.raw) {
-            return None;
-        }
-        let name = word.text.rsplit('/').next().unwrap_or(&word.text);
-        return clip(name);
+/// The name comes from the shell's own answer to which file a command runs: an interactive
+/// invocation whose command name the shell's search resolved to an absolute path names the program,
+/// and its name is the last component of the command name as it was typed. The command line is
+/// never read for it, so a word the shell did not resolve to a file, whether a token pasted at the
+/// prompt or the name of a function, a builtin or a command that does not exist, names no program,
+/// and neither does a shell that does not ask. A missing name is no harm, and a wrong one is a leak
+/// of what a person typed.
+fn program_of(invocation: &RootCommandResolveParams) -> Option<String> {
+    if !invocation.interactive || !Path::new(&invocation.executable).is_absolute() {
+        return None;
     }
-}
-
-/// Whether `word` can only be the name of a command in PowerShell: no quote, no sign and no
-/// number, an unbroken run of letters, digits and `_ . / : ~ -`, starting with a letter, an
-/// underscore, a dot, a slash or a tilde.
-fn is_command_name(word: &str) -> bool {
-    word.chars()
-        .next()
-        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | '.' | '/' | '~'))
-        && word.chars().all(|character| {
-            character.is_alphanumeric() || matches!(character, '_' | '.' | '/' | ':' | '~' | '-')
-        })
-}
-
-/// Which variable assignments may come before a program, by the shell the line came from. A line
-/// from a shell this reader has no rule for has none: its first word is the program, or the line
-/// names none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Assignments {
-    /// `NAME=value` and `NAME+=value`: Bash and Zsh.
-    Appending,
-    /// `NAME=value`: Fish.
-    Plain,
-    /// None: PowerShell has no prefix assignment, and a shell not known has no rule.
-    None,
-}
-
-impl Assignments {
-    const fn of(kind: Option<ShellKind>) -> Self {
-        match kind {
-            Some(ShellKind::Bash | ShellKind::Zsh) => Self::Appending,
-            Some(ShellKind::Fish) => Self::Plain,
-            Some(ShellKind::PowerShell) | None => Self::None,
-        }
-    }
-}
-
-/// One word of a command line: as it was typed, and with its quotes taken off.
-struct Word<'a> {
-    raw: &'a str,
-    text: String,
-}
-
-impl Word<'_> {
-    /// Whether the word sets a variable for the command after it: an unquoted name that starts
-    /// with a letter or an underscore, an `=` (after a `+` where the shell appends), and a value.
-    fn is_assignment(&self, assignments: Assignments) -> bool {
-        if assignments == Assignments::None {
-            return false;
-        }
-        let Some((name, _value)) = self.raw.split_once('=') else {
-            return false;
-        };
-        let name = match (assignments, name.strip_suffix('+')) {
-            (Assignments::Appending, Some(appended)) => appended,
-            _ => name,
-        };
-        name.chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-            && name.chars().all(is_variable_character)
-    }
-}
-
-/// A space or a tab: the only characters that separate the words of a line.
-const fn is_blank(character: char) -> bool {
-    matches!(character, ' ' | '\t')
-}
-
-/// A character that means the same in every shell, outside quotes.
-fn is_plain(character: char) -> bool {
-    character.is_alphanumeric()
-        || matches!(character, '_' | '.' | '/' | ':' | '+' | '~' | '-' | '=')
-}
-
-/// Whether a quoted part may hold `character`: a letter, a digit, a space or ASCII punctuation, and
-/// nothing a shell reads specially inside the quote it is in (a backslash, and in double quotes
-/// `$`, a backtick and `!`). The quote that closes the part is ruled out by the search for it. A
-/// quote of another script, such as the curved ones PowerShell closes a string at, is not ASCII
-/// punctuation, and is refused.
-fn is_quotable(character: char, quote: char) -> bool {
-    (character == ' ' || character.is_alphanumeric() || character.is_ascii_punctuation())
-        && character != '\\'
-        && (quote == '\'' || !matches!(character, '$' | '`' | '!'))
-}
-
-/// Reads the word at the start of `rest` and returns it with what follows it: the blank or newline
-/// that ended it, or nothing. None when the word holds anything outside the closed grammar.
-fn scan_word(rest: &str) -> Option<(Word<'_>, &str)> {
-    let mut text = String::new();
-    let mut at = 0;
-    while let Some(character) = rest[at..].chars().next() {
-        match character {
-            blank if is_blank(blank) || blank == '\n' => break,
-            quote @ ('\'' | '"') => {
-                let from = at + 1;
-                let close = from + rest[from..].find(quote)?;
-                let inside = &rest[from..close];
-                if !inside.chars().all(|inside| is_quotable(inside, quote)) {
-                    return None;
-                }
-                text.push_str(inside);
-                at = close + 1;
-                continue;
-            }
-            plain if is_plain(plain) => text.push(plain),
-            _ => return None,
-        }
-        at += character.len_utf8();
-    }
-    Some((
-        Word {
-            raw: &rest[..at],
-            text,
-        },
-        &rest[at..],
-    ))
-}
-
-const fn is_variable_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_'
+    let typed = invocation.argv.first()?;
+    clip(typed.rsplit('/').next().unwrap_or(typed))
 }
 
 /// Reads what the file system says of one read: the directory it names, and the repository above.
@@ -793,19 +724,23 @@ fn head_of(marker: &Path, owner: &Path) -> Option<String> {
 }
 
 /// Reads at most [`HEAD_BYTES`] of a regular file as text. Anything else a directory can hold under
-/// that name, a pipe or a device, is not read: opening one can wait for ever for a writer, and the
-/// read that waits is the only one this session would ever make. The file is opened without
-/// waiting and its type is read from the open handle, so a file swapped for a pipe between the
-/// two is no different.
+/// that name, a pipe or a device, is not read: opening one can wait for ever for a writer, a
+/// terminal device opened by a process with no terminal of its own becomes its terminal, and a
+/// serial line has its signals raised. The path's type is read before it is opened, the file is
+/// opened without waiting and without taking a terminal, and its type is read again from the open
+/// handle, so a file swapped for a pipe between the two is no different.
 fn read_bounded(path: &Path) -> Option<String> {
     use std::io::Read as _;
 
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(path)
             .ok()?
     };
@@ -879,9 +814,19 @@ mod tests {
     use kr_protocol::scalars::{DurationMs, TimestampMs, Uuid};
 
     fn block(command: &str, cwd: &str, status: Option<u64>) -> RootCommandBlockParams {
+        block_at(1, command, cwd, status)
+    }
+
+    /// A command block of the line accepted at prompt generation `generation`.
+    fn block_at(
+        generation: u64,
+        command: &str,
+        cwd: &str,
+        status: Option<u64>,
+    ) -> RootCommandBlockParams {
         RootCommandBlockParams {
             session_id: SessionId::new(Uuid::from_bytes([1; 16])),
-            prompt_generation: PromptGeneration::new(1),
+            prompt_generation: PromptGeneration::new(generation),
             command: command.to_owned(),
             started_at_ms: TimestampMs::new(1),
             duration_ms: Nullable(status.map(|_| DurationMs::new(1))),
@@ -899,289 +844,187 @@ mod tests {
         facts.read(0, Some(0)).facts.expect("facts are there")
     }
 
-    /// A command line is reduced to its program: variable assignments, arguments and the
-    /// directory it was named by never reach the record.
-    #[test]
-    fn a_command_line_is_reduced_to_its_program_name() {
-        for (line, program) in [
-            ("cargo test --all", Some("cargo")),
-            ("FOO=1 BAR=two /usr/bin/git status", Some("git")),
-            ("  \"/opt/tools/rg\" secret-needle", Some("rg")),
-            ("C:/tools/node.exe app.js", Some("node.exe")),
-            ("A=1", None),
-            ("", None),
-        ] {
-            assert_eq!(
-                program_in(line, ShellKind::Bash).as_deref(),
-                program,
-                "{line:?}"
-            );
+    /// The shell's question in front of an interactive command of the line accepted at prompt
+    /// generation `generation`: the vector it will run and the file its search resolved the
+    /// command name to.
+    fn resolve(generation: u64, argv: &[&str], executable: &str) -> RootCommandResolveParams {
+        RootCommandResolveParams {
+            session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+            prompt_generation: PromptGeneration::new(generation),
+            argv: argv.iter().map(|word| (*word).to_owned()).collect(),
+            executable: executable.to_owned(),
+            interactive: true,
+            cwd: "/home/a/work".to_owned(),
+            cwd_revision: CwdRevision::new(0),
         }
+    }
+
+    /// The program is the command name the shell resolved to a file, without its path, and no
+    /// argument of the invocation is in it. What the shell did not resolve to an absolute path, an
+    /// invocation that is not interactive and one with no command name name none.
+    #[test]
+    fn a_program_is_named_only_from_what_the_shell_resolved_to_a_file() {
+        let interactive =
+            |argv: &[&str], executable: &str| program_of(&resolve(1, argv, executable));
+        assert_eq!(
+            interactive(&["cargo", "test", "--token", "hunter2"], "/usr/bin/cargo").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(
+            interactive(&["/opt/tools/rg", "secret-needle"], "/opt/tools/rg").as_deref(),
+            Some("rg")
+        );
+        assert_eq!(
+            interactive(&["./run.sh"], "/home/a/work/run.sh").as_deref(),
+            Some("run.sh")
+        );
+        assert_eq!(
+            interactive(&["g++", "-O2"], "/usr/bin/g++").as_deref(),
+            Some("g++")
+        );
+        // The shell found no file, or named a relative one, or had no command name.
+        assert_eq!(interactive(&["hunter2token"], ""), None);
+        assert_eq!(interactive(&["cargo"], "cargo"), None);
+        assert_eq!(interactive(&["cargo"], "./cargo"), None);
+        assert_eq!(interactive(&[], "/usr/bin/cargo"), None);
+        let mut script = resolve(1, &["cargo"], "/usr/bin/cargo");
+        script.interactive = false;
+        assert_eq!(program_of(&script), None, "a line of a script is not typed");
+    }
+
+    /// KR-REQ-22.05: a token typed at the prompt as one plain word is recorded as no program,
+    /// whether or not the shell's search was asked about it, since the shell resolved it to no file;
+    /// the same line's command that the shell did resolve is the control, and is recorded, whether
+    /// the shell's question reaches the worker before the line's block or after it.
+    #[test]
+    fn a_word_the_shell_did_not_resolve_is_recorded_as_no_program_and_a_resolved_command_still_is()
+    {
         let facts = facts();
+        // The pasted token: a block, and no question, since the shell found no file to run.
         facts.note_command(
-            &block("TOKEN=hunter2 deploy --key abc", "/home/a/work", None),
+            &block_at(1, "kr-9f3a7c1e-token", "/home/a/work", None),
             None,
-            Some(ShellKind::Zsh),
         );
-        let record = read(&facts);
-        assert_eq!(record.application.0.as_deref(), Some("deploy"));
-        let encoded = serde_json::to_string(&record).expect("facts encode");
-        assert!(
-            !encoded.contains("hunter2") && !encoded.contains("abc"),
-            "{encoded}"
+        let started = read(&facts);
+        assert_eq!(started.directory.0.as_deref(), Some("work"));
+        assert_eq!(started.application.0, None, "a pasted word is no program");
+        assert!(started.events.is_empty(), "and no command is announced");
+        facts.note_command(
+            &block_at(1, "kr-9f3a7c1e-token", "/home/a/work", Some(127)),
+            None,
         );
+        let ended = read(&facts);
+        assert_eq!(ended.completion.0, Some(DescriptionCompletion::Failed));
+        assert_eq!(ended.application.0, None);
+        assert!(ended.events.is_empty());
+        let encoded = serde_json::to_string(&ended).expect("facts encode");
+        assert!(!encoded.contains("9f3a7c1e"), "{encoded}");
+
+        // The control, the shell's question after the line's block.
+        facts.note_command(&block_at(2, "cargo test", "/home/a/work", None), None);
+        assert_eq!(read(&facts).application.0, None, "not yet resolved");
+        facts.note_resolved(&resolve(2, &["cargo", "test"], "/usr/bin/cargo"));
+        let resolved = read(&facts);
+        assert_eq!(resolved.application.0.as_deref(), Some("cargo"));
+        assert_eq!(resolved.events.len(), 1);
+        assert_eq!(resolved.events[0].summary, "cargo");
+        assert_eq!(
+            resolved.events[0].kind,
+            DescriptionEventKind::CommandAccepted
+        );
+
+        // And before the line's block.
+        facts.note_resolved(&resolve(3, &["make"], "/usr/bin/make"));
+        assert_eq!(
+            read(&facts).application.0.as_deref(),
+            Some("cargo"),
+            "the record shows the line before until the line's block is reported"
+        );
+        facts.note_command(&block_at(3, "make", "/home/a/work", None), None);
+        let made = read(&facts);
+        assert_eq!(made.application.0.as_deref(), Some("make"));
+        assert_eq!(made.events[0].summary, "make");
+        assert_eq!(made.events.len(), 2, "one event for each command, not two");
     }
 
-    fn program_in(line: &str, kind: ShellKind) -> Option<String> {
-        program_of(line, Some(kind))
-    }
-
-    /// The program is read from a closed grammar: assignments, then the program word, in
-    /// characters that mean the same in every shell. Quoted values stay inside their assignment;
-    /// every other syntax, wherever it is before the program, names no program at all.
+    /// The first command of a line that the shell resolved names its program, for the whole line
+    /// and for its ending; a later one does not replace it, a new line starts with none, and a
+    /// question about a line already gone by changes nothing.
     #[test]
-    fn a_program_is_named_only_from_the_closed_grammar_and_every_other_syntax_names_none() {
-        for (line, program) in [
-            // Named: assignments of plain or quoted values, then the program word.
-            ("TOKEN='first secret' cargo test", Some("cargo")),
-            ("TOKEN=\"first secret\" cargo test", Some("cargo")),
-            ("A='x y' B=\"p q\" C=r /usr/bin/make all", Some("make")),
-            ("NAME='it'\"'\"'s a secret' deploy", Some("deploy")),
-            ("TOKEN+=s3cret deploy", Some("deploy")),
-            ("RUSTFLAGS+=\" -D warnings\" cargo build", Some("cargo")),
-            ("TOKEN=a=b\tcargo test", Some("cargo")),
-            ("\"/Applications/My App/run\" --flag", Some("run")),
-            ("'/opt/tools/rg' secret-needle", Some("rg")),
-            ("cargo\nrm -rf secret", Some("cargo")),
-            ("C:/tools/node.exe app.js", Some("node.exe")),
-            ("~/bin/tool --now", Some("tool")),
-            ("g++ -O2 main.cc", Some("g++")),
-            // Not named: a redirection, in any spelling, before the program.
-            ("> out.log cargo build", None),
-            (">out.log cargo build", None),
-            ("2>&1 cargo build", None),
-            ("2> err.log TOKEN='a b' cargo build", None),
-            (">| out.log cargo build", None),
-            ("<<- END cat", None),
-            ("<<<text cat", None),
-            (">&- cargo build", None),
-            (">! out.log cargo build", None),
-            ("<<EOF\nbody secret\nEOF", None),
-            // Not named: an operator or a separator inside or after an assignment.
-            ("TOKEN=x;deploy prod", None),
-            ("2>/dev/null&&deploy --key k1", None),
-            ("TOKEN=x|deploy prod", None),
-            ("TOKEN=x\ndeploy prod", None),
-            ("TOKEN=x\u{a0}secret cmd", None),
-            // Not named: a quote this reader would read differently from the shell.
-            ("MSG=$'it\\'s done' git commit -m 'fix it'", None),
-            ("MSG='it\\'s done' git commit -m 'fix it'", None),
-            ("echo\\\"hello secret\"", None),
-            ("TOKEN='first secret cargo test", None),
-            ("TOKEN=\"first secret cargo test", None),
-            ("TOKEN=\"$HOME secret\" cargo test", None),
-            // Not named: a substitution, an expansion, a group, a comment.
-            ("X=$(echo a b) cargo test", None),
-            ("X=$(echo a b cargo test", None),
-            ("$(pick-a-tool) --now", None),
-            ("`pick-a-tool` --now", None),
-            ("$TOOL --now", None),
-            ("(cd /x && run) --now", None),
-            ("#note secret text", None),
-            ("TOKEN=x #note", None),
-            // Not named: any backslash (an escape in one shell and a path separator in another), a
-            // comma, a name that is not a variable's, and a line with no program.
-            ("C:\\tools\\node.exe app.js", None),
-            ("foo\\bar arg", None),
-            ("deploy,SECRET", None),
-            ("@splat SECRET", None),
-            ("TOKEN=first\\ secret cargo test", None),
-            ("A=x\\\\ y cmd", None),
-            ("ls\\ secret", None),
-            ("1A=x cmd", None),
-            ("pasted=secret", None),
-            ("TOKEN+=s3cret", None),
-            ("TOKEN='only a secret'", None),
-            ("A=1", None),
-            ("", None),
-            ("   ", None),
-            // Not named: a backslash in a quote, which a shell may read as an escape, and so as
-            // a different word than this reader would.
-            ("\"C:\\Program Files\\x.exe\" arg", None),
-            ("'a\\b' secret", None),
-        ] {
-            assert_eq!(
-                program_in(line, ShellKind::Bash).as_deref(),
-                program,
-                "{line:?}"
-            );
-            assert_eq!(
-                program_in(line, ShellKind::Zsh).as_deref(),
-                program,
-                "{line:?}"
-            );
-        }
-        // PowerShell reads a quoted word, a number and a sum as expressions, not as a command.
-        for expression in [
-            "'SECRET'",
-            "'a'+'SECRET'",
-            "'foo''bar'",
-            "42",
-            "1+SECRET",
-            "+SECRET",
-        ] {
-            assert_eq!(
-                program_in(expression, ShellKind::PowerShell),
-                None,
-                "{expression}"
-            );
-        }
-        assert_eq!(
-            program_in("Get-ChildItem ./SECRET", ShellKind::PowerShell).as_deref(),
-            Some("Get-ChildItem")
-        );
-        assert_eq!(
-            program_in("./run.ps1 SECRET", ShellKind::PowerShell).as_deref(),
-            Some("run.ps1")
-        );
-        assert_eq!(
-            program_in("C:/tools/node.exe app.js", ShellKind::PowerShell).as_deref(),
-            Some("node.exe")
-        );
-        // A quote of another script, which PowerShell closes a string at, is refused in a quote.
-        let curved = "Write-Output\"\u{201d} SECRET \u{201c}\"";
-        assert_eq!(program_in(curved, ShellKind::Bash), None);
-        assert_eq!(program_in(curved, ShellKind::PowerShell), None);
+    fn the_first_command_resolved_in_a_line_names_its_program_until_the_next_line() {
         let facts = facts();
-        facts.note_command(
-            &block("TOKEN='first secret' cargo test", "/home/a/work", None),
-            None,
-            Some(ShellKind::Bash),
-        );
-        let record = read(&facts);
-        assert_eq!(record.application.0.as_deref(), Some("cargo"));
-        assert_eq!(record.events[0].summary, "cargo");
-        let encoded = serde_json::to_string(&record).expect("facts encode");
-        assert!(!encoded.contains("secret"), "{encoded}");
-    }
+        facts.note_command(&block_at(5, "cd x; make; ls", "/w/a", None), None);
+        facts.note_resolved(&resolve(5, &["make"], "/usr/bin/make"));
+        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        let running = read(&facts);
+        assert_eq!(running.application.0.as_deref(), Some("make"));
+        assert_eq!(running.events.len(), 1);
+        // The same line's start reported again is not a second command.
+        facts.note_command(&block_at(5, "cd x; make; ls", "/w/a", None), None);
+        assert_eq!(read(&facts).events.len(), 1, "one event for the line");
 
-    /// The assignments a line may start with are the ones its shell has: Bash and Zsh take `=` and
-    /// `+=`, Fish takes `=`, PowerShell has none, and a line from a shell that is not known has
-    /// none either. Where a shell has none, a word with an `=` is the program word, which is no
-    /// name, and what follows it is never named.
-    #[test]
-    fn a_line_may_start_with_the_assignments_its_shell_has_and_no_others() {
-        for (line, bash, fish, powershell, unknown) in [
-            ("A=x cmd", Some("cmd"), Some("cmd"), None, None),
-            ("A+=x cmd", Some("cmd"), None, None, None),
-            ("A=x SECRET", Some("SECRET"), Some("SECRET"), None, None),
-            (
-                "TOKEN=value SECRET",
-                Some("SECRET"),
-                Some("SECRET"),
-                None,
-                None,
-            ),
-            (
-                "cmd A=x",
-                Some("cmd"),
-                Some("cmd"),
-                Some("cmd"),
-                Some("cmd"),
-            ),
-        ] {
-            assert_eq!(
-                program_in(line, ShellKind::Bash).as_deref(),
-                bash,
-                "{line:?} in Bash"
-            );
-            assert_eq!(
-                program_in(line, ShellKind::Zsh).as_deref(),
-                bash,
-                "{line:?} in Zsh"
-            );
-            assert_eq!(
-                program_in(line, ShellKind::Fish).as_deref(),
-                fish,
-                "{line:?} in Fish"
-            );
-            assert_eq!(
-                program_in(line, ShellKind::PowerShell).as_deref(),
-                powershell,
-                "{line:?} in PowerShell"
-            );
-            assert_eq!(
-                program_of(line, None).as_deref(),
-                unknown,
-                "{line:?} in an unknown shell"
-            );
-        }
-    }
-
-    /// Whatever a line starts with, nothing past the point where one command ends and the next
-    /// begins is ever named: every line of up to four characters from a set of the characters
-    /// shells treat specially (and, with up to three, from a set that holds the characters the
-    /// grammar accepts), followed by each way of ending one command and starting the next, names
-    /// neither of the words that come after.
-    #[test]
-    fn nothing_after_a_command_boundary_is_ever_named() {
-        const SPECIAL: [char; 20] = [
-            '\'', '"', '\\', ' ', '$', ';', '=', '#', 'a', '<', '>', '\n', '\u{a0}', '&', '|', '(',
-            '`', '!', '{', '\t',
-        ];
-        const ACCEPTED: [char; 14] = [
-            'a', '1', '_', '.', '/', ':', '+', '~', '-', '=', ' ', '\t', '\'', '"',
-        ];
-        const BOUNDARIES: [&str; 4] =
-            ["\ncmd SECRET", ";cmd SECRET", "&&cmd SECRET", "|cmd SECRET"];
-        let lines = |alphabet: &[char], length: usize| {
-            let mut all = vec![String::new()];
-            let mut level = vec![String::new()];
-            for _ in 0..length {
-                let mut longer = Vec::new();
-                for prefix in &level {
-                    for character in alphabet {
-                        let mut next = prefix.clone();
-                        next.push(*character);
-                        longer.push(next);
-                    }
-                }
-                all.extend(longer.iter().cloned());
-                level = longer;
-            }
-            all
-        };
-        let mut checked = 0_u64;
-        for prefix in lines(&SPECIAL, 4).into_iter().chain(lines(&ACCEPTED, 3)) {
-            for boundary in BOUNDARIES {
-                let line = format!("{prefix}{boundary}");
-                for kind in [ShellKind::Bash, ShellKind::Fish, ShellKind::PowerShell] {
-                    if let Some(named) = program_in(&line, kind) {
-                        assert!(
-                            !named.contains("SECRET") && !named.contains("cmd"),
-                            "{line:?} named {named:?} in {kind:?}"
-                        );
-                    }
-                    checked += 1;
-                }
-            }
-        }
-        assert!(checked > 700_000, "the sets were enumerated: {checked}");
-        // The control: a boundary that is a blank does not end the command, so what follows an
-        // assignment is its program.
+        facts.note_command(&block_at(5, "cd x; make; ls", "/w/a", Some(0)), None);
+        let ended = read(&facts);
         assert_eq!(
-            program_in("A=b cmd SECRET", ShellKind::Bash).as_deref(),
-            Some("cmd")
+            ended.application.0.as_deref(),
+            Some("make"),
+            "kept to its end"
         );
+        assert_eq!(ended.events.len(), 1, "the end is not a second event");
+
+        facts.note_command(&block_at(6, "cd y", "/w/a", None), None);
+        let builtin = read(&facts);
+        assert_eq!(builtin.application.0, None, "a line of no resolved command");
+        assert_eq!(builtin.events.len(), 1);
+
+        let revision = builtin.revision;
+        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        assert_eq!(
+            read(&facts).revision,
+            revision,
+            "a line gone by is not recorded"
+        );
+        assert_eq!(read(&facts).application.0, None);
+
+        // Nor does it take the line that is running from it.
+        facts.note_resolved(&resolve(6, &["cargo"], "/usr/bin/cargo"));
+        assert_eq!(read(&facts).application.0.as_deref(), Some("cargo"));
+        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        facts.note_command(&block_at(6, "cd y; cargo", "/w/a", Some(0)), None);
+        assert_eq!(
+            read(&facts).application.0.as_deref(),
+            Some("cargo"),
+            "the running line keeps its program to its end"
+        );
+    }
+
+    /// Nothing is captured while privacy mode is on, the fence clears what a line had, and the end
+    /// of a line that began before the fence is described with no program: nothing a person ran
+    /// before the fence comes back.
+    #[test]
+    fn a_program_resolved_before_privacy_mode_is_not_brought_back_by_the_end_of_its_line() {
+        let facts = facts();
+        facts.note_command(&block_at(1, "make", "/w/a", None), None);
+        facts.note_resolved(&resolve(1, &["make"], "/usr/bin/make"));
+        assert_eq!(read(&facts).application.0.as_deref(), Some("make"));
+
+        facts.fence(PrivacyGeneration::new(1));
+        facts.note_resolved(&resolve(2, &["cargo"], "/usr/bin/cargo"));
+        facts.release(PrivacyGeneration::new(2));
+        facts.note_command(&block_at(1, "make", "/w/a", Some(0)), None);
+        let after = read_at(&facts, 2);
+        assert_eq!(after.application.0, None);
+        assert!(after.events.is_empty());
+        assert_eq!(after.completion.0, Some(DescriptionCompletion::Succeeded));
     }
 
     /// A root directory has a name of its own, so `cd /` replaces the directory the session left.
     #[test]
     fn the_root_directory_is_named_and_a_move_to_it_is_a_move() {
         let facts = facts();
-        facts.note_command(&block("ls", "/home/a/kalareach", None), None, None);
+        facts.note_command(&block("ls", "/home/a/kalareach", None), None);
         assert_eq!(read(&facts).directory.0.as_deref(), Some("kalareach"));
-        facts.note_command(&block("ls", "/", None), None, None);
+        facts.note_command(&block("ls", "/", None), None);
         assert_eq!(read(&facts).directory.0.as_deref(), Some("/"));
     }
 
@@ -1218,12 +1061,12 @@ mod tests {
         );
     }
 
-    /// A pipe where a repository's `.git` or `HEAD` should be is not read: the read returns at
-    /// once and finds no repository, where opening it would wait for a writer that never comes.
-    /// The control is a regular file in the same place, which is read.
+    /// A pipe or a device where a repository's `.git` or `HEAD` should be is not read: the read
+    /// returns at once and finds no repository, where opening a pipe would wait for a writer that
+    /// never comes. The control is a regular file in the same place, which is read.
     #[cfg(unix)]
     #[test]
-    fn a_pipe_named_git_or_head_is_not_opened() {
+    fn a_pipe_or_a_device_named_git_or_head_is_not_opened() {
         let root = tempfile::tempdir().expect("a directory");
         let fifo = |path: &std::path::Path| {
             let made = std::process::Command::new("mkfifo")
@@ -1252,6 +1095,12 @@ mod tests {
         fifo(&head.join(".git/HEAD"));
         assert_eq!(as_found(head), None, "a pipe named HEAD");
 
+        // A device where a repository's HEAD should be: a link to the null device is refused too.
+        let device = root.path().join("device");
+        std::fs::create_dir_all(device.join(".git")).expect("a git directory");
+        std::os::unix::fs::symlink("/dev/null", device.join(".git/HEAD")).expect("a link");
+        assert_eq!(as_found(device), None, "a device named HEAD");
+
         let control = root.path().join("control");
         std::fs::create_dir_all(control.join(".git")).expect("a git directory");
         std::fs::write(control.join(".git/HEAD"), "ref: refs/heads/main\n").expect("a HEAD");
@@ -1266,7 +1115,8 @@ mod tests {
     #[test]
     fn a_command_has_a_completion_only_once_it_has_ended_and_is_one_event() {
         let facts = facts();
-        facts.note_command(&block("cargo test", "/home/a/kalareach", None), None, None);
+        facts.note_resolved(&resolve(1, &["cargo", "test"], "/usr/bin/cargo"));
+        facts.note_command(&block("cargo test", "/home/a/kalareach", None), None);
         let started = read(&facts);
         assert_eq!(started.directory.0.as_deref(), Some("kalareach"));
         assert_eq!(started.completion.0, None);
@@ -1277,17 +1127,13 @@ mod tests {
         );
         assert_eq!(started.events[0].summary, "cargo");
 
-        facts.note_command(
-            &block("cargo test", "/home/a/kalareach", Some(1)),
-            None,
-            None,
-        );
+        facts.note_command(&block("cargo test", "/home/a/kalareach", Some(1)), None);
         let ended = read(&facts);
         assert_eq!(ended.completion.0, Some(DescriptionCompletion::Failed));
         assert_eq!(ended.events.len(), 1, "the end is not a second event");
         assert!(ended.revision.get() > started.revision.get());
 
-        facts.note_command(&block("make", "/home/a/kalareach", None), None, None);
+        facts.note_command(&block_at(2, "make", "/home/a/kalareach", None), None);
         assert_eq!(
             read(&facts).completion.0,
             None,
@@ -1341,7 +1187,7 @@ mod tests {
         );
         let revision = facts.state().revision;
         facts.note_intent("while private");
-        facts.note_command(&block("ls", "/home/a/x", None), None, None);
+        facts.note_command(&block("ls", "/home/a/x", None), None);
         facts.note_event(DescriptionEventKind::TaskStarted, "while private");
         facts.note_thread(Some("while private"));
         let held = facts.state();
@@ -1533,7 +1379,7 @@ mod tests {
         // Nothing is reported after the transition: only the transition says the read is old.
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("make", "/w/app", None), None, None);
+        facts.note_command(&block("make", "/w/app", None), None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
         facts.fence(PrivacyGeneration::new(1));
         facts.release(PrivacyGeneration::new(2));
@@ -1548,11 +1394,11 @@ mod tests {
         // The next command names the same directory: the first read is refused, the second applies.
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("make", "/w/app", None), None, None);
+        facts.note_command(&block("make", "/w/app", None), None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/app"));
         facts.fence(PrivacyGeneration::new(1));
         facts.release(PrivacyGeneration::new(2));
-        facts.note_command(&block("make", "/w/app", None), None, None);
+        facts.note_command(&block("make", "/w/app", None), None);
 
         // The first read answers now, from before the transition. The second begins only once the
         // first has been dealt with, so its beginning is the point to look from.
@@ -1580,9 +1426,9 @@ mod tests {
     fn a_read_for_an_older_block_is_refused_when_a_newer_block_has_arrived() {
         let step = Stepped::new();
         let facts = &step.facts;
-        facts.note_command(&block("ls", "/w/a", None), None, None);
+        facts.note_command(&block("ls", "/w/a", None), None);
         assert_eq!(step.next_read().directory, PathBuf::from("/w/a"));
-        facts.note_command(&block("ls", "/w/b", Some(0)), None, None);
+        facts.note_command(&block("ls", "/w/b", Some(0)), None);
 
         step.hand_over("/w/a", Some(("a", None)));
         assert_eq!(step.next_read().directory, PathBuf::from("/w/b"));
@@ -1619,7 +1465,7 @@ mod tests {
         });
         let facts = DescriptionFacts::reading_with(false, PrivacyGeneration::new(0), reader);
 
-        facts.note_command(&block("cd /w/new", "/w/old", None), Some(7), None);
+        facts.note_command(&block("cd /w/new", "/w/old", None), Some(7));
         let started = entered.recv_timeout(WAIT).expect("a read for the start");
         assert_eq!(
             started.shell, None,
@@ -1629,7 +1475,7 @@ mod tests {
             facts.state().record.directory.as_deref() == Some("old")
         });
 
-        facts.note_command(&block("cd /w/new", "/w/old", Some(0)), Some(7), None);
+        facts.note_command(&block("cd /w/new", "/w/old", Some(0)), Some(7));
         let ended = entered.recv_timeout(WAIT).expect("a read for the end");
         assert_eq!(
             ended.shell,
@@ -1653,8 +1499,8 @@ mod tests {
         let cwd = repo.display().to_string();
 
         let facts = facts();
-        facts.note_command(&block("git switch topic", &cwd, None), None, None);
-        facts.note_command(&block("git switch topic", &cwd, Some(0)), None, None);
+        facts.note_command(&block("git switch topic", &cwd, None), None);
+        facts.note_command(&block("git switch topic", &cwd, Some(0)), None);
         until("the repository to be read", || {
             read(&facts).repository.0.is_some()
         });
@@ -1664,8 +1510,8 @@ mod tests {
         );
 
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/topic\n").expect("a new HEAD");
-        facts.note_command(&block("git status", &cwd, None), None, None);
-        facts.note_command(&block("git status", &cwd, Some(0)), None, None);
+        facts.note_command(&block("git status", &cwd, None), None);
+        facts.note_command(&block("git status", &cwd, Some(0)), None);
         until("the branch the command left", || {
             read(&facts)
                 .repository
