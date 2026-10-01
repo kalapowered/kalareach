@@ -603,6 +603,23 @@ export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'termina
  */
 export type UpstreamMethod = string
 /**
+ * What a worker did with a session's last command, as it recorded it.
+ */
+export type DescriptionCompletion = 'succeeded' | 'failed'
+/**
+ * How fetching the selected profile's files is going.
+ */
+export type DescriptionDownload = 'not_started' | 'running' | 'verified' | 'cancelled' | 'failed'
+/**
+ * What `description.download` is asked to do.
+ */
+export type DescriptionDownloadAction = 'start' | 'cancel'
+/**
+ * The kinds of semantic event a description may be built from.
+ */
+export type DescriptionEventKind =
+  'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
+/**
  * The credential one external destination sends with.
  */
 export type DestinationSecret =
@@ -1805,6 +1822,8 @@ export type DescriptionPause =
   | 'signal_unqualified'
   | 'disabled'
   | 'no_model_here'
+  | 'not_downloaded'
+  | 'inference_failed'
 /**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
@@ -2002,6 +2021,18 @@ export interface KalaReachProtocol {
   decoding_trust?: DecodingTrust
   delivery_destination_secret_set_params?: DeliveryDestinationSecretSetParams
   delivery_destination_secret_set_result?: DeliveryDestinationSecretSetResult
+  description_completion?: DescriptionCompletion
+  description_configure_params?: DescriptionConfigureParams
+  description_download?: DescriptionDownload
+  description_download_action?: DescriptionDownloadAction
+  description_download_params?: DescriptionDownloadParams
+  description_event?: DescriptionEvent
+  description_event_kind?: DescriptionEventKind
+  description_facts?: DescriptionFacts
+  description_facts_page?: DescriptionFactsPage
+  description_facts_request?: DescriptionFactsRequest
+  description_repository?: DescriptionRepository
+  description_setup_params?: DescriptionSetupParams
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
   destination_secret?: DestinationSecret
@@ -10046,6 +10077,7 @@ export interface ConfigurationDocument {
    * The profile selected when a request and the allowlist name none.
    */
   default_profile?: string | null
+  descriptions?: DescriptionsSelection
   network?: NetworkSelection
   preferences?: PreferenceSet
   /**
@@ -10153,6 +10185,23 @@ export interface ConfiguredEnrolmentBudgets {
    * How many bytes one synchronisation may transfer.
    */
   transfer_bytes?: number | null
+}
+/**
+ * The two settings an owner has for session descriptions.
+ *
+ * Applied as soon as they are written: turning descriptions off stops the work in flight
+ * and ends the description process, and no restart is needed for either. No environment
+ * variable reaches them.
+ */
+export interface DescriptionsSelection {
+  /**
+   * Whether descriptions are on.
+   */
+  enabled?: boolean | null
+  /**
+   * Whether inference may run while the host is on battery.
+   */
+  on_battery?: boolean | null
 }
 /**
  * Whether this host joins the network, and every service it selects there.
@@ -10682,6 +10731,167 @@ export interface DeliveryDestinationSecretSetResult {
    */
   recipients_can_read: string
 }
+/**
+ * Parameters of `description.configure`: the two settings an owner has.
+ *
+ * A null leaves that setting as it is; a value sets it. Both apply at once, with no restart.
+ */
+export interface DescriptionConfigureParams {
+  /**
+   * Whether descriptions are on. Turning them off stops admission and dispatch, cancels the
+   * work in flight and ends the description process.
+   */
+  enabled: boolean | null
+  /**
+   * Whether inference may run while the host is on battery. Off unless an owner turns it on.
+   */
+  on_battery: boolean | null
+}
+/**
+ * Parameters of `description.download`.
+ */
+export interface DescriptionDownloadParams {
+  /**
+   * What to do.
+   */
+  action: 'start' | 'cancel'
+}
+/**
+ * One recent semantic event: its place in the session's stream, its kind and a clipped summary.
+ */
+export interface DescriptionEvent {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * What kind of event it is.
+   */
+  kind:
+    'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
+  /**
+   * A summary of at most [`MAX_DESCRIPTION_FACT_CODEPOINTS`] codepoints.
+   */
+  summary: string
+}
+/**
+ * What one session was doing, as its worker recorded it: the whole of what a description is built
+ * from, and nothing a person typed into the terminal.
+ *
+ * Each field is something the session did or was asked to do: the directory a command ran in, the
+ * program it ran, how it ended, the prompt an agent was given, the thread it selected and the
+ * last few semantic events. No keystroke, no output and no query's answer is in it.
+ */
+export interface DescriptionFacts {
+  /**
+   * The program name of the newest command, without its arguments.
+   */
+  application: string | null
+  /**
+   * How the newest command ended, when it has.
+   */
+  completion: DescriptionCompletion | null
+  /**
+   * The directory's last component.
+   */
+  directory: string | null
+  /**
+   * The most recent events, newest first, at most [`MAX_DESCRIPTION_FACT_EVENTS`].
+   */
+  events: DescriptionEvent[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * The last prompt an agent in the session was given.
+   */
+  intent: string | null
+  /**
+   * The repository the directory is inside, when it is inside one.
+   */
+  repository: DescriptionRepository | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The thread the session selected.
+   */
+  thread: string | null
+}
+/**
+ * The repository a session's directory is inside.
+ */
+export interface DescriptionRepository {
+  /**
+   * The branch checked out, when there is one.
+   */
+  branch: string | null
+  /**
+   * The repository's name.
+   */
+  name: string
+}
+/**
+ * The worker's answer to a [`DescriptionFactsRequest`].
+ */
+export interface DescriptionFactsPage {
+  /**
+   * The session's facts, when their revision is past the request's `after` and privacy mode is
+   * off; null otherwise.
+   */
+  facts: DescriptionFacts | null
+  /**
+   * The privacy generation the session holds, or null when it holds none.
+   */
+  privacy_generation: U64 | null
+  /**
+   * Whether privacy mode is on in the session. While it is, no facts are carried and none are
+   * captured.
+   */
+  private: boolean
+  /**
+   * The request this answers.
+   */
+  request_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The control daemon's request for one session's description facts, made over the connection it
+ * reads them on.
+ *
+ * The worker answers at once when the facts have moved past `after`, or when its privacy state is
+ * not the one `generation` names, and otherwise holds the request for up to `wait_ms`. A newer
+ * request on the connection replaces a held one.
+ */
+export interface DescriptionFactsRequest {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  after: string
+  /**
+   * The session's privacy generation the daemon has recorded, or null when it has recorded
+   * none. A worker whose privacy state is past it answers at once, so the daemon learns of a
+   * transition without waiting for the request's bound.
+   */
+  generation: U64 | null
+  /**
+   * Correlates the page with this request.
+   */
+  request_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  wait_ms: string
+}
+/**
+ * Parameters of `description.setup`. The environment is the one the connection reaches.
+ */
+export interface DescriptionSetupParams {}
 /**
  * Every capability record for one desktop, with the context they are about.
  */
@@ -15083,6 +15293,9 @@ export interface MethodEntry {
     | 'privacy.set'
     | 'privacy.status'
     | 'host.update.handover'
+    | 'description.setup'
+    | 'description.configure'
+    | 'description.download'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -23441,6 +23654,9 @@ export interface ServiceRequestPayload {
     | 'privacy.set'
     | 'privacy.status'
     | 'host.update.handover'
+    | 'description.setup'
+    | 'description.configure'
+    | 'description.download'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -24045,7 +24261,8 @@ export interface DescriptionProvenance {
   source_cursor_to: string
 }
 /**
- * The state description setup is in, for the host's own setup surface.
+ * The state description setup is in, for the host's own setup surface: the answer to
+ * `description.setup`, `description.configure` and `description.download`.
  *
  * Section 22 offers descriptions during host setup *with visible asset size, cancel/disable
  * controls and no hosted-account dependency*. These are those facts, so the surface that shows
@@ -24065,9 +24282,17 @@ export interface DescriptionSetup {
    */
   can_disable: boolean
   /**
+   * How the fetch is going.
+   */
+  download: 'not_started' | 'running' | 'verified' | 'cancelled' | 'failed'
+  /**
    * Whether an owner has enabled them.
    */
   enabled: boolean
+  /**
+   * What went wrong, when the fetch failed.
+   */
+  failure: string | null
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -24081,9 +24306,29 @@ export interface DescriptionSetup {
    */
   offered: boolean
   /**
+   * Whether inference may run while the host is on battery.
+   */
+  on_battery: boolean
+  /**
+   * Why inference is paused, when it is.
+   */
+  paused: DescriptionPause | null
+  /**
    * The profile that would be fetched.
    */
   profile_id: string | null
+  /**
+   * Where the fetch would reach: the hosts, and nothing else.
+   */
+  sources: string[]
+  /**
+   * What state inference is in on this host.
+   */
+  state: 'ready' | 'resident' | 'resource_paused'
+  /**
+   * Why this host offers nothing, when it offers nothing.
+   */
+  unavailable: string | null
 }
 /**
  * Parameters of `session.detach`.

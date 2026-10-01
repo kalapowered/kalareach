@@ -7678,6 +7678,14 @@
           "default": null,
           "description": "The profile selected when a request and the allowlist name none."
         },
+        "descriptions": {
+          "$ref": "#/$defs/DescriptionsSelection",
+          "default": {
+            "enabled": null,
+            "on_battery": null
+          },
+          "description": "The two settings an owner has for session descriptions.\n\nApplied as soon as they are written: turning descriptions off stops the work in flight\nand ends the description process, and no restart is needed for either. No environment\nvariable reaches them."
+        },
         "network": {
           "$ref": "#/$defs/NetworkSelection",
           "default": {
@@ -9310,6 +9318,350 @@
       ],
       "type": "object"
     },
+    "DescriptionCompletion": {
+      "description": "What a worker did with a session's last command, as it recorded it.",
+      "oneOf": [
+        {
+          "const": "succeeded",
+          "description": "It finished with a zero exit status.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "It finished with another status.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionConfigureParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `description.configure`: the two settings an owner has.\n\nA null leaves that setting as it is; a value sets it. Both apply at once, with no restart.",
+      "properties": {
+        "enabled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether descriptions are on. Turning them off stops admission and dispatch, cancels the\nwork in flight and ends the description process."
+        },
+        "on_battery": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether inference may run while the host is on battery. Off unless an owner turns it on."
+        }
+      },
+      "required": [
+        "enabled",
+        "on_battery"
+      ],
+      "type": "object"
+    },
+    "DescriptionDownload": {
+      "description": "How fetching the selected profile's files is going.",
+      "oneOf": [
+        {
+          "const": "not_started",
+          "description": "Nothing has been fetched, and nothing is being fetched.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A fetch is running.",
+          "type": "string"
+        },
+        {
+          "const": "verified",
+          "description": "Every file is here and its digest matched.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "An owner cancelled the fetch, and what it had written is gone.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The fetch failed; [`DescriptionSetup::failure`] says how.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionDownloadAction": {
+      "description": "What `description.download` is asked to do.",
+      "oneOf": [
+        {
+          "const": "start",
+          "description": "Fetch the selected profile's files, check them and keep them.",
+          "type": "string"
+        },
+        {
+          "const": "cancel",
+          "description": "Stop a running fetch and delete what it had written.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionDownloadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `description.download`.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/DescriptionDownloadAction",
+          "description": "What to do."
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "DescriptionEvent": {
+      "additionalProperties": false,
+      "description": "One recent semantic event: its place in the session's stream, its kind and a clipped summary.",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor the event sits at in the session's semantic stream."
+        },
+        "kind": {
+          "$ref": "#/$defs/DescriptionEventKind",
+          "description": "What kind of event it is."
+        },
+        "summary": {
+          "description": "A summary of at most [`MAX_DESCRIPTION_FACT_CODEPOINTS`] codepoints.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "kind",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "DescriptionEventKind": {
+      "description": "The kinds of semantic event a description may be built from.",
+      "oneOf": [
+        {
+          "const": "command_accepted",
+          "description": "A command was accepted.",
+          "type": "string"
+        },
+        {
+          "const": "task_started",
+          "description": "A task started.",
+          "type": "string"
+        },
+        {
+          "const": "task_completed",
+          "description": "A task finished.",
+          "type": "string"
+        },
+        {
+          "const": "approval_requested",
+          "description": "An approval was requested.",
+          "type": "string"
+        },
+        {
+          "const": "file_changed",
+          "description": "A file changed. The path is carried; the contents are not.",
+          "type": "string"
+        }
+      ]
+    },
+    "DescriptionFacts": {
+      "additionalProperties": false,
+      "description": "What one session was doing, as its worker recorded it: the whole of what a description is built\nfrom, and nothing a person typed into the terminal.\n\nEach field is something the session did or was asked to do: the directory a command ran in, the\nprogram it ran, how it ended, the prompt an agent was given, the thread it selected and the\nlast few semantic events. No keystroke, no output and no query's answer is in it.",
+      "properties": {
+        "application": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The program name of the newest command, without its arguments."
+        },
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionCompletion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the newest command ended, when it has."
+        },
+        "directory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The directory's last component."
+        },
+        "events": {
+          "description": "The most recent events, newest first, at most [`MAX_DESCRIPTION_FACT_EVENTS`].",
+          "items": {
+            "$ref": "#/$defs/DescriptionEvent"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The privacy generation the facts were captured under."
+        },
+        "intent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last prompt an agent in the session was given."
+        },
+        "repository": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionRepository"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The repository the directory is inside, when it is inside one."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The record's revision. It moves with every change to any fact, and with nothing else."
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The thread the session selected."
+        }
+      },
+      "required": [
+        "revision",
+        "generation",
+        "directory",
+        "repository",
+        "application",
+        "completion",
+        "intent",
+        "thread",
+        "events"
+      ],
+      "type": "object"
+    },
+    "DescriptionFactsPage": {
+      "additionalProperties": false,
+      "description": "The worker's answer to a [`DescriptionFactsRequest`].",
+      "properties": {
+        "facts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's facts, when their revision is past the request's `after` and privacy mode is\noff; null otherwise."
+        },
+        "privacy_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The privacy generation the session holds, or null when it holds none."
+        },
+        "private": {
+          "description": "Whether privacy mode is on in the session. While it is, no facts are carried and none are\ncaptured.",
+          "type": "boolean"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this answers."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "request_id",
+        "session_id",
+        "privacy_generation",
+        "private",
+        "facts"
+      ],
+      "type": "object"
+    },
+    "DescriptionFactsRequest": {
+      "additionalProperties": false,
+      "description": "The control daemon's request for one session's description facts, made over the connection it\nreads them on.\n\nThe worker answers at once when the facts have moved past `after`, or when its privacy state is\nnot the one `generation` names, and otherwise holds the request for up to `wait_ms`. A newer\nrequest on the connection replaces a held one.",
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/U64",
+          "description": "The last revision the daemon has read, or nought for none."
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's privacy generation the daemon has recorded, or null when it has recorded\nnone. A worker whose privacy state is past it answers at once, so the daemon learns of a\ntransition without waiting for the request's bound."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the page with this request."
+        },
+        "wait_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "How long the worker may hold the request while it has nothing newer, bounded by\n[`MAX_DESCRIPTION_FACTS_WAIT_MS`]. Nought answers at once."
+        }
+      },
+      "required": [
+        "request_id",
+        "after",
+        "wait_ms",
+        "generation"
+      ],
+      "type": "object"
+    },
     "DescriptionFreshness": {
       "description": "How current a generated description is.\n\nThere is no variant meaning \"probably current\". When demand exceeds capacity a client is shown\nthe delay or the staleness rather than text that implies the session is doing what it was doing\nfive minutes ago.",
       "oneOf": [
@@ -9372,6 +9724,16 @@
           "const": "no_model_here",
           "description": "This environment runs no model: a WSL distribution with no data-access choice, or a mobile\ndevice.",
           "type": "string"
+        },
+        {
+          "const": "not_downloaded",
+          "description": "The selected profile's files are not on this host, or are not the files the profile\nrecords. Nothing is fetched until an owner asks.",
+          "type": "string"
+        },
+        {
+          "const": "inference_failed",
+          "description": "The description process failed three times in a row, and the next start waits out its\ndelay.",
+          "type": "string"
         }
       ]
     },
@@ -9414,9 +9776,35 @@
       ],
       "type": "object"
     },
+    "DescriptionRepository": {
+      "additionalProperties": false,
+      "description": "The repository a session's directory is inside.",
+      "properties": {
+        "branch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The branch checked out, when there is one."
+        },
+        "name": {
+          "description": "The repository's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "branch"
+      ],
+      "type": "object"
+    },
     "DescriptionSetup": {
       "additionalProperties": false,
-      "description": "The state description setup is in, for the host's own setup surface.\n\nSection 22 offers descriptions during host setup *with visible asset size, cancel/disable\ncontrols and no hosted-account dependency*. These are those facts, so the surface that shows\nthem does not have to work them out.",
+      "description": "The state description setup is in, for the host's own setup surface: the answer to\n`description.setup`, `description.configure` and `description.download`.\n\nSection 22 offers descriptions during host setup *with visible asset size, cancel/disable\ncontrols and no hosted-account dependency*. These are those facts, so the surface that shows\nthem does not have to work them out.",
       "properties": {
         "asset_bytes": {
           "$ref": "#/$defs/U64",
@@ -9430,9 +9818,24 @@
           "description": "Whether the feature can be turned off now.",
           "type": "boolean"
         },
+        "download": {
+          "$ref": "#/$defs/DescriptionDownload",
+          "description": "How the fetch is going."
+        },
         "enabled": {
           "description": "Whether an owner has enabled them.",
           "type": "boolean"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What went wrong, when the fetch failed."
         },
         "fetched_bytes": {
           "$ref": "#/$defs/U64",
@@ -9446,6 +9849,21 @@
           "description": "Whether this host can offer descriptions at all.",
           "type": "boolean"
         },
+        "on_battery": {
+          "description": "Whether inference may run while the host is on battery.",
+          "type": "boolean"
+        },
+        "paused": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptionPause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why inference is paused, when it is."
+        },
         "profile_id": {
           "anyOf": [
             {
@@ -9456,18 +9874,52 @@
             }
           ],
           "description": "The profile that would be fetched."
+        },
+        "sources": {
+          "description": "Where the fetch would reach: the hosts, and nothing else.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/DescriptionState",
+          "description": "What state inference is in on this host."
+        },
+        "unavailable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why this host offers nothing, when it offers nothing."
         }
       },
       "required": [
         "offered",
         "enabled",
+        "on_battery",
         "profile_id",
         "asset_bytes",
+        "sources",
+        "download",
         "fetched_bytes",
+        "failure",
         "can_cancel",
         "can_disable",
-        "needs_hosted_account"
+        "needs_hosted_account",
+        "unavailable",
+        "state",
+        "paused"
       ],
+      "type": "object"
+    },
+    "DescriptionSetupParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `description.setup`. The environment is the one the connection reaches.",
       "type": "object"
     },
     "DescriptionState": {
@@ -9489,6 +9941,37 @@
           "type": "string"
         }
       ]
+    },
+    "DescriptionsSelection": {
+      "additionalProperties": false,
+      "description": "The two settings an owner has for session descriptions, each absent unless this document\nchooses it.\n\nSection 22 turns descriptions on by default and inference on battery off by default, so an\nabsent setting reads as that default and a document that says nothing changes nothing.",
+      "properties": {
+        "enabled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether descriptions are on."
+        },
+        "on_battery": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether inference may run while the host is on battery."
+        }
+      },
+      "type": "object"
     },
     "DesktopAvailability": {
       "description": "Whether the desktop is usable right now.\n\nThis is reported separately from process life on purpose. A locked screen or a switched-away\nuser makes a desktop temporarily unusable; it does not end the session or the processes it\nowns. Only [`DesktopAvailability::Ended`] does that.",
@@ -17529,6 +18012,21 @@
         {
           "const": "host.update.handover",
           "description": "Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops.",
+          "type": "string"
+        },
+        {
+          "const": "description.setup",
+          "description": "What session descriptions offer on this host: the profile, its exact size and where the fetch would reach before anything is fetched, how a fetch is going, the two settings, and what state inference is in.",
+          "type": "string"
+        },
+        {
+          "const": "description.configure",
+          "description": "Turn session descriptions on or off, or allow inference on battery, at the host itself. The setting is recorded in the host's configuration and applies at once: turning them off cancels the work in flight and ends the description process.",
+          "type": "string"
+        },
+        {
+          "const": "description.download",
+          "description": "Start or cancel the fetch of the selected profile's files, at the host itself. A fetch needs no account, checks every file against the profile before it keeps it, and a cancellation deletes what it had written.",
           "type": "string"
         },
         {
@@ -36742,6 +37240,42 @@
     },
     "delivery_destination_secret_set_result": {
       "$ref": "#/$defs/DeliveryDestinationSecretSetResult"
+    },
+    "description_completion": {
+      "$ref": "#/$defs/DescriptionCompletion"
+    },
+    "description_configure_params": {
+      "$ref": "#/$defs/DescriptionConfigureParams"
+    },
+    "description_download": {
+      "$ref": "#/$defs/DescriptionDownload"
+    },
+    "description_download_action": {
+      "$ref": "#/$defs/DescriptionDownloadAction"
+    },
+    "description_download_params": {
+      "$ref": "#/$defs/DescriptionDownloadParams"
+    },
+    "description_event": {
+      "$ref": "#/$defs/DescriptionEvent"
+    },
+    "description_event_kind": {
+      "$ref": "#/$defs/DescriptionEventKind"
+    },
+    "description_facts": {
+      "$ref": "#/$defs/DescriptionFacts"
+    },
+    "description_facts_page": {
+      "$ref": "#/$defs/DescriptionFactsPage"
+    },
+    "description_facts_request": {
+      "$ref": "#/$defs/DescriptionFactsRequest"
+    },
+    "description_repository": {
+      "$ref": "#/$defs/DescriptionRepository"
+    },
+    "description_setup_params": {
+      "$ref": "#/$defs/DescriptionSetupParams"
     },
     "desktop_capability_report": {
       "$ref": "#/$defs/DesktopCapabilityReport"
