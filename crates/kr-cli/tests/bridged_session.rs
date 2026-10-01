@@ -261,11 +261,7 @@ impl World {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
+        on_a_thread_of_its_own(async {
             tokio::time::timeout(
                 Duration::from_secs(10),
                 LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
@@ -276,7 +272,7 @@ impl World {
     }
 
     /// Asks the destination's daemon one question.
-    fn ask<T: kr_protocol::wire::WireMessage>(
+    fn ask<T: kr_protocol::wire::WireMessage + Send>(
         &self,
         method: Method,
         params: &impl serde::Serialize,
@@ -286,16 +282,13 @@ impl World {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
+        let params = kr_protocol::envelope::ParamsValue::from_typed(params).expect("parameters");
+        on_a_thread_of_its_own(async {
             let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
                 .await
                 .expect("reaches the destination's daemon");
             client
-                .request(method, params)
+                .request(method, &params)
                 .await
                 .expect("the call reaches the daemon")
                 .expect("the daemon answers")
@@ -328,11 +321,7 @@ impl World {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
+        on_a_thread_of_its_own(async {
             if let Ok(mut client) =
                 LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
             {
@@ -381,6 +370,25 @@ impl World {
         );
         serde_json::from_slice(&created.stdout).expect("kr printed JSON")
     }
+}
+
+/// Runs a future to its end on a thread of its own, where blocking is allowed.
+///
+/// A test is itself on a runtime, and a drop that has to ask a daemon something runs on it too:
+/// neither may start a second runtime on the thread it is running on.
+fn on_a_thread_of_its_own<T: Send>(future: impl std::future::Future<Output = T> + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime")
+                    .block_on(future)
+            })
+            .join()
+            .expect("the thread ran to its end")
+    })
 }
 
 /// The directory a path resolves to, so a comparison is of places and not of how they were named.
