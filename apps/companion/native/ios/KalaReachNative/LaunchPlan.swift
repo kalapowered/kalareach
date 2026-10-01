@@ -12,16 +12,6 @@
 
 import Foundation
 
-/// Where the person's answer to the notification permission stands.
-enum PushAuthorisation: Equatable {
-    /// The person has not been asked.
-    case notDetermined
-    /// The person said no, or took a yes back.
-    case denied
-    /// The person said yes.
-    case authorised
-}
-
 /// One thing a launch does.
 enum LaunchAction: Equatable {
     /// A device check's own mode, which a debug build was started with.
@@ -47,7 +37,7 @@ enum LaunchPlan {
     static func decide(
         debugMode: String?,
         hasFirebaseConfiguration: Bool,
-        authorisation: PushAuthorisation
+        permission: PushPermission
     ) -> [LaunchAction] {
         if let mode = debugMode, beforeAnythingWrites.contains(mode) {
             return [.runDebugMode(mode)]
@@ -58,7 +48,7 @@ enum LaunchPlan {
                 .configureFirebase,
                 .addTokenMethods,
                 .registerForRemoteNotifications,
-                .setAutoInit(authorisation == .authorised),
+                .setAutoInit(permission == .granted),
             ]
         } else {
             plan = [.skipFirebase]

@@ -10,14 +10,14 @@
 import XCTest
 
 final class LaunchPlanTests: XCTestCase {
-    private let everyAuthorisation: [PushAuthorisation] = [.notDetermined, .denied, .authorised]
+    private let everyPermission: [PushPermission] = [.unknown, .refused, .granted]
 
     func testALaunchWithConfigurationStartsPushWithoutAskingForAnything() {
-        for authorisation in everyAuthorisation {
+        for permission in everyPermission {
             let plan = LaunchPlan.decide(
                 debugMode: nil,
                 hasFirebaseConfiguration: true,
-                authorisation: authorisation
+                permission: permission
             )
             XCTAssertEqual(
                 plan,
@@ -25,57 +25,57 @@ final class LaunchPlanTests: XCTestCase {
                     .configureFirebase,
                     .addTokenMethods,
                     .registerForRemoteNotifications,
-                    .setAutoInit(authorisation == .authorised),
+                    .setAutoInit(permission == .granted),
                 ],
-                "authorisation \(authorisation)"
+                "permission \(permission)"
             )
         }
     }
 
     func testRegistrationForRemoteNotificationsNeedsNoPermission() {
         // Registering shows no prompt, so it happens at every launch whatever the person answered.
-        for authorisation in everyAuthorisation {
-            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, authorisation: authorisation)
-            XCTAssertTrue(plan.contains(.registerForRemoteNotifications), "authorisation \(authorisation)")
+        for permission in everyPermission {
+            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: permission)
+            XCTAssertTrue(plan.contains(.registerForRemoteNotifications), "permission \(permission)")
         }
     }
 
-    func testAutoInitFollowsTheCurrentAuthorisationEveryLaunch() {
+    func testAutoInitFollowsTheCurrentPermissionEveryLaunch() {
         // The setting persists across launches, so a launch that stays silent on it would keep an
         // answer the person has since taken back.
-        let granted = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, authorisation: .authorised)
-        let revoked = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, authorisation: .denied)
+        let granted = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: .granted)
+        let revoked = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: true, permission: .refused)
         XCTAssertTrue(granted.contains(.setAutoInit(true)))
         XCTAssertTrue(revoked.contains(.setAutoInit(false)))
     }
 
     func testABuildWithoutConfigurationLeavesFirebaseAlone() {
-        for authorisation in everyAuthorisation {
-            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: false, authorisation: authorisation)
-            XCTAssertEqual(plan, [.skipFirebase], "authorisation \(authorisation)")
+        for permission in everyPermission {
+            let plan = LaunchPlan.decide(debugMode: nil, hasFirebaseConfiguration: false, permission: permission)
+            XCTAssertEqual(plan, [.skipFirebase], "permission \(permission)")
         }
     }
 
     func testTheCountAndSweepModesRunBeforeAnythingCanWriteAndNothingElseRuns() {
         for mode in ["count", "sweep"] {
             for configured in [true, false] {
-                for authorisation in everyAuthorisation {
+                for permission in everyPermission {
                     let plan = LaunchPlan.decide(
                         debugMode: mode,
                         hasFirebaseConfiguration: configured,
-                        authorisation: authorisation
+                        permission: permission
                     )
-                    XCTAssertEqual(plan, [.runDebugMode(mode)], "\(mode) \(configured) \(authorisation)")
+                    XCTAssertEqual(plan, [.runDebugMode(mode)], "\(mode) \(configured) \(permission)")
                 }
             }
         }
     }
 
     func testAnotherModeRunsAfterPushHasStarted() {
-        let configured = LaunchPlan.decide(debugMode: "push", hasFirebaseConfiguration: true, authorisation: .denied)
+        let configured = LaunchPlan.decide(debugMode: "push", hasFirebaseConfiguration: true, permission: .refused)
         XCTAssertEqual(configured.last, .runDebugMode("push"))
         XCTAssertEqual(configured.first, .configureFirebase)
-        let bare = LaunchPlan.decide(debugMode: "keychain", hasFirebaseConfiguration: false, authorisation: .denied)
+        let bare = LaunchPlan.decide(debugMode: "keychain", hasFirebaseConfiguration: false, permission: .refused)
         XCTAssertEqual(bare, [.skipFirebase, .runDebugMode("keychain")])
     }
 
@@ -84,8 +84,8 @@ final class LaunchPlanTests: XCTestCase {
         let modes: [String?] = [nil, "count", "sweep", "keychain", "push", "push-read", "audio", "shots"]
         for mode in modes {
             for configured in [true, false] {
-                for authorisation in everyAuthorisation {
-                    let plan = LaunchPlan.decide(debugMode: mode, hasFirebaseConfiguration: configured, authorisation: authorisation)
+                for permission in everyPermission {
+                    let plan = LaunchPlan.decide(debugMode: mode, hasFirebaseConfiguration: configured, permission: permission)
                     for action in plan {
                         XCTAssertFalse("\(action)".lowercased().contains("authoris") && !"\(action)".contains("setAutoInit"), "\(action)")
                     }
