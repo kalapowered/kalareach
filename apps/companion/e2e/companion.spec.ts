@@ -3455,6 +3455,22 @@ test.describe("the phone's field above a keyboard the platform panned the page f
   ]
 
   /**
+   * Where the shell's scrolling area is once nothing moves it any more: the platform may scroll it a
+   * frame or two after a field takes the focus, and what the session does is measured from there.
+   */
+  async function settledScroll(page: Page): Promise<number> {
+    let last = -1
+    let steady = 0
+    for (let tries = 0; tries < 40 && steady < 3; tries += 1) {
+      await page.waitForTimeout(60)
+      const now = await page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
+      steady = now === last ? steady + 1 : 0
+      last = now
+    }
+    return last
+  }
+
+  /**
    * Replaces the visual viewport with one the test moves, as a platform does: a keyboard takes
    * `covered` pixels of the height and the page is panned `panned` pixels, and the page measures
    * both from it, as it does from a real one.
@@ -3560,7 +3576,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
           return box && shell ? Math.round(box.bottom - (shell.bottom - covered)) : null
         })
       const scrolled = () => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
-      const before = await scrolled()
+      const before = await settledScroll(page)
       // A keyboard first as tall as it is while it announces itself, with the page panned, and then
       // as tall as it stays, with the pan gone: the field is on its edge each time, never short of
       // it by what the first state needed.
@@ -3574,6 +3590,35 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       await expect.poll(scrolled, { message: 'the session is where it was before the keyboard' }).toBe(before)
     })
 
+    test(`keeps the field whole in view when the keyboard becomes shorter than the bar under the session, on ${surface}`, async ({
+      page
+    }) => {
+      const move = await withViewport(page)
+      await onPhone(page, surface, { width: 320, height: 658, scale: '200%' }, `&session=${SESSION}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      const field = page.locator('textarea[id^="composer-"]')
+      await field.focus()
+      // A tall keyboard scrolls the session to its field. Then only a suggestion bar is left, which
+      // is shorter than the tab bar under the session: the field is then above the keyboard where it
+      // lies, and is not scrolled back to a place below the room the session has.
+      await move(399, 297)
+      await expect.poll(() => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? 0)).toBeGreaterThan(0)
+      await move(48, 0)
+      await expect
+        .poll(() => hiddenPart(field), { message: 'no part of the field is clipped' })
+        .toBeLessThanOrEqual(1)
+      await expect
+        .poll(() =>
+          page.evaluate(() => {
+            const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
+            const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
+            return box && shell ? Math.round(box.bottom - (shell.bottom - 48)) : null
+          })
+        )
+        .toBeLessThanOrEqual(1)
+    })
+
     test(`leaves the shell's scrolling area where it was when the person leaves the session with the keyboard up, on ${surface}`, async ({
       page
     }) => {
@@ -3583,9 +3628,13 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
       await page.locator('textarea[id^="composer-"]').focus()
       const scrolled = () => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
-      const before = await scrolled()
+      // Where the platform left the area when the field took the focus: the session's own scrolling
+      // is measured from there.
+      const before = await settledScroll(page)
       await move(399, 297)
       await expect.poll(scrolled, { message: 'the session scrolled to its field' }).toBeGreaterThan(before)
+      // Let the session settle on its field, so what is put back is the whole of what it did.
+      await page.waitForTimeout(400)
       // Away from the session while the keyboard is still up: what the destination opens on is not
       // scrolled by what the session did. The tab bar is under the keyboard, so the tab is pressed
       // as a pointer would press it, not scrolled to.
