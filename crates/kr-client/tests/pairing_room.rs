@@ -5,15 +5,16 @@
 //! are verified TLS, bounded while the room answers the upgrade, and bounded in how much of the
 //! room's traffic can wait for them once they are open.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use kr_client::pairing::room::{
-    MAX_UNANSWERED_PINGS, OPEN_DEADLINE, RoomConnector, RoomError, RoomRole, RoomSocket,
+    MAX_UNANSWERED_PINGS, RoomConnector, RoomError, RoomRole, RoomSocket,
 };
 use kr_crypto::secret::SymmetricKey;
+use kr_ipc::testing::UNANSWERED;
 use kr_protocol::ids::{AttemptId, InvitationId};
 use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use kr_protocol::rendezvous::{
@@ -160,15 +161,6 @@ impl LoopbackRoom {
         let _ = tokio::time::timeout(WATCHDOG, stream.read_u8()).await;
     }
 }
-
-/// A loopback address that nothing answers at, whatever else is running beside a test.
-///
-/// A port a test frees is one another program can be given before the test connects to it. This
-/// one is not: the ports a program is given when it asks for any free port begin far above port 1
-/// unless the machine is set up to hand it out, so nothing listens there unless a program was put
-/// there on purpose, and a connection to it is refused. A machine where that does not hold fails
-/// `nothing_answers_at_the_unanswered_address`, which names the address.
-const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
 
 fn locator() -> Locator {
     Locator::new("abcd").expect("a locator")
@@ -418,21 +410,6 @@ async fn a_connection_that_reached_the_room_is_heard() {
     room_heard_nothing(&room).await;
 }
 
-/// The address the tests name as unanswered refuses a connection. A machine that answers there
-/// fails this test, which names the address, as well as the tests that rely on it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nothing_answers_at_the_unanswered_address() {
-    let refused = tokio::time::timeout(WATCHDOG, TcpStream::connect(UNANSWERED))
-        .await
-        .expect("the connection ends")
-        .expect_err("nothing listens");
-    assert_eq!(
-        refused.kind(),
-        std::io::ErrorKind::ConnectionRefused,
-        "{refused:?}"
-    );
-}
-
 /// KR-REQ-26.14: a host whose configuration selects a proxy opens its room through it. The proxy
 /// is asked for one `CONNECT` to the room's address, and the room's TLS and upgrade run inside the
 /// tunnel, so the path and the control token reach the room as they would directly.
@@ -647,25 +624,53 @@ async fn a_refused_upgrade_reports_its_status() {
     }
 }
 
-/// An answer to the upgrade whose head never ends is refused once it reaches its bound, well
-/// before the open deadline, rather than held for as long as it keeps arriving.
+/// An answer to the upgrade whose head never ends is refused once it reaches its bound, as an
+/// answer that is not an upgrade, rather than held for as long as it keeps arriving until the
+/// open deadline ends the attempt as one that did not open in time. The error says which.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_to_the_upgrade_that_never_ends_is_refused_at_its_bound() {
     let authority = Authority::new("rendezvous test authority");
     let room = LoopbackRoom::start(&authority).await;
     let mut answer = b"HTTP/1.1 101 Switching Protocols\r\nX-Padding: ".to_vec();
     answer.resize(answer.len() + 1024 * 1024, b'a');
-    let attempted = Instant::now();
     let refused = refusal_of(&authority.trusted_by(), &room, vec![answer]).await;
     assert!(
-        matches!(refused, RoomError::NotAnUpgrade { .. }),
+        matches!(
+            &refused,
+            RoomError::NotAnUpgrade { reason, .. } if reason.contains("longer than an answer may be")
+        ),
         "{refused:?}"
     );
-    let took = attempted.elapsed();
-    assert!(
-        took < OPEN_DEADLINE / 2,
-        "refused {took:?} after the attempt began, at the bound rather than the deadline"
+}
+
+/// What the bound refuses is told from what the deadline ends by the error alone, however long
+/// the room took. An answer that stops short of its bound and never finishes, and a room that
+/// answers nothing, are not refused as answers that are not upgrades: the open deadline ends each
+/// as an attempt that did not open in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_that_never_finishes_and_a_room_that_says_nothing_end_at_the_deadline() {
+    let authority = Authority::new("rendezvous test authority");
+    let unfinished = LoopbackRoom::start(&authority).await;
+    let silent = LoopbackRoom::start(&authority).await;
+    let connector = authority.trusted_by();
+    let (stopped_short, said_nothing) = tokio::join!(
+        refusal_of(
+            &connector,
+            &unfinished,
+            vec![b"HTTP/1.1 101 Switching Protocols\r\nX-Padding: a".to_vec()]
+        ),
+        refusal_of(&connector, &silent, Vec::new())
     );
+    for ended in [stopped_short, said_nothing] {
+        assert!(
+            matches!(
+                &ended,
+                RoomError::Unreachable { reason, .. }
+                    if reason.contains("did not open within its deadline")
+            ),
+            "{ended:?}"
+        );
+    }
 }
 
 /// An answer whose accept value is longer than a SHA-1 digest is refused as not an upgrade,
@@ -722,32 +727,51 @@ async fn blank_lines_in_front_of_an_answer_do_not_let_it_past() {
         vec![long_accept],
     ] {
         let room = LoopbackRoom::start(&authority).await;
-        let attempted = Instant::now();
         let refused = refusal_of(&authority.trusted_by(), &room, answer).await;
         assert!(
             matches!(refused, RoomError::NotAnUpgrade { .. }),
             "{refused:?}"
         );
-        let took = attempted.elapsed();
-        assert!(
-            took < OPEN_DEADLINE / 2,
-            "refused {took:?} after the attempt began"
-        );
     }
 }
 
 /// Sends frames until the socket takes no more, the room reading nothing.
-async fn fill(socket: &mut RoomSocket) {
+///
+/// A full queue in front of the socket says only that the socket has not taken a frame yet, and a
+/// slow machine can leave that true for as long as it likes. The pump reads what the room sent,
+/// offers the socket the caller's next frame, and hands what it read to the caller only in the
+/// pass after: so a frame of the room's that arrives after the queue filled shows the pump has
+/// made a pass since, and a queue still full then means the socket could not take a frame in it.
+/// A pass can be cut short when the runtime's budget for one poll of the pump is spent, though,
+/// and then one such frame can arrive before the pump has offered anything. A second cannot: the
+/// pump reads it only once the first is handed over, and handing it over draws on the same budget,
+/// so after a cut the first is handed over at the start of the next poll, with the budget whole,
+/// and that poll makes its offer before it hands the second over. So two frames are sent, both are
+/// waited for, and the socket is full when the queue is still full after them. The room reads
+/// nothing, so what stopped the pump has nothing that starts it again.
+async fn fill(socket: &mut RoomSocket, end: &mut RoomEnd) {
     let large = ClientFrame::Relay {
         attempt_id: AttemptId::new(Uuid::from_bytes([7; 16])),
         payload: Bytes::new(vec![0; MAX_FRAME_PAYLOAD_BYTES]),
     };
+    let probes = [8, 9].map(|byte| ServiceFrame::AttemptOpened {
+        attempt_id: AttemptId::new(Uuid::from_bytes([byte; 16])),
+    });
     tokio::time::timeout(WATCHDOG, async {
         loop {
             match socket.outgoing.try_send(large.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    for probe in &probes {
+                        send(end, probe).await;
+                    }
+                    for probe in &probes {
+                        assert_eq!(
+                            socket.incoming.recv().await.as_ref(),
+                            Some(probe),
+                            "the room's frame arrives while the queue is full"
+                        );
+                    }
                     if socket.outgoing.capacity() == 0 {
                         return;
                     }
@@ -768,7 +792,7 @@ async fn a_room_that_pings_without_reading_loses_its_socket() {
     let room = LoopbackRoom::start(&authority).await;
     let (mut socket, _, _, mut end) =
         open_while(&authority.trusted_by(), &room, RoomRole::Host(&token())).await;
-    fill(&mut socket).await;
+    fill(&mut socket, &mut end).await;
 
     tokio::time::timeout(WATCHDOG, async {
         for _ in 0..=MAX_UNANSWERED_PINGS {
@@ -794,11 +818,11 @@ async fn the_rooms_frames_arrive_while_the_socket_can_take_no_more() {
     let (mut socket, _, _, mut end) =
         open_while(&authority.trusted_by(), &room, RoomRole::Host(&token())).await;
     let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
-    fill(&mut socket).await;
+    fill(&mut socket, &mut end).await;
 
     let opened = ServiceFrame::AttemptOpened { attempt_id };
     send(&mut end, &opened).await;
-    let delivered = tokio::time::timeout(Duration::from_secs(5), socket.incoming.recv())
+    let delivered = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
         .await
         .expect("delivered while the caller's frames wait");
     assert_eq!(delivered, Some(opened));
@@ -848,7 +872,7 @@ async fn an_oversized_frame_ends_the_socket_at_its_header() {
         .await
         .expect("the header is written");
     stream.flush().await.expect("the header is sent");
-    let ended = tokio::time::timeout(Duration::from_secs(5), socket.incoming.recv())
+    let ended = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
         .await
         .expect("the socket ends at the header, without waiting for a body that never comes");
     assert_eq!(ended, None, "an oversized frame ends the socket");
