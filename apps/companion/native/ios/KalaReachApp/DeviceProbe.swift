@@ -204,75 +204,64 @@ enum DeviceProbe {
         var facts = fileFixtures(nonce: nonce)
         facts["nonce.digest"] = SHA256.hash(data: Data(nonce.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
 
+        // The file an earlier check filed names an earlier nonce and token, and the step that reads
+        // it must not find them.
+        let filed = container().appendingPathComponent("probe-push.json")
+        try? FileManager.default.removeItem(at: filed)
+        pushReport = PushCheckReport(
+            nonce: nonce,
+            group: PreviewKeyLocation.resolvedPrivateGroup() ?? "",
+            writeFile: { try? $0.write(to: filed) },
+            finish: { finish(.push, $0) }
+        )
+
         // The test asks for the permission here, which the product does not at launch.
         PushRegistration.shared.start()
-        waitForToken(tries: 0, nonce: nonce, facts: facts, fetching: false)
+        waitForToken(tries: 0, facts: facts, fetching: false)
     }
 
-    /// Lets the check report once, so that a late answer or a timeout cannot report after it.
-    private static var pushReport = OneReport()
+    /// How the check ends, which it does once. Nil until the check starts.
+    private static var pushReport: PushCheckReport?
 
-    /// Reports the check's result, once, running `before` first when this is the one report: what a
-    /// report leaves behind (a file a later step reads) is left only by the report that counts.
-    private static func reportPush(_ facts: [String: String], before: (() -> Void)? = nil) {
-        guard pushReport.claim() else { return }
-        before?()
-        finish(.push, facts)
-    }
-
-    private static func waitForToken(tries: Int, nonce: String, facts: [String: String], fetching: Bool) {
-        guard !pushReport.claimed else { return }
-        var facts = facts
+    private static func waitForToken(tries: Int, facts: [String: String], fetching: Bool) {
+        guard var report = pushReport, !report.reported else { return }
         var fetching = fetching
         let registration = PushRegistration.shared
         if registration.permission == .refused || registration.state == .refused {
-            facts["permission"] = "refused"
-            reportPush(facts)
+            report.refused(facts: facts)
+            pushReport = report
             return
         }
         // Only once Firebase has the APNs token, which is once the person has agreed: the launch has
         // registered for a token already, and that says nothing about the permission.
         if registration.tokenHandedToFirebase, !fetching {
             fetching = true
-            facts["permission"] = "granted"
             // Agreed, so Firebase may make a registration token on its own from now on. The one this
             // check sends to is asked for after the APNs token has gone to Firebase, and arrives once
             // Firebase has the mapping.
             Messaging.messaging().isAutoInitEnabled = true
-            let known = facts
+            var known = facts
+            known["permission"] = "granted"
             Messaging.messaging().token { token, error in
                 DispatchQueue.main.async {
-                    var facts = known
-                    guard let token, error == nil else {
+                    guard var report = pushReport else { return }
+                    if let token, error == nil {
+                        report.token(token, facts: known)
+                    } else {
                         let failure = error as NSError?
-                        facts["token"] = "error"
-                        facts["token.error"] = failure.map { "\($0.domain)/\($0.code)" } ?? "none"
-                        reportPush(facts)
-                        return
+                        report.failed(facts: known, domain: failure?.domain ?? "none", code: failure?.code ?? 0)
                     }
-                    let file: [String: String] = [
-                        "nonce": nonce,
-                        "group": PreviewKeyLocation.resolvedPrivateGroup() ?? "",
-                        "fcm_token": token,
-                    ]
-                    facts["token"] = "ready"
-                    reportPush(facts) {
-                        if let data = try? JSONSerialization.data(withJSONObject: file) {
-                            try? data.write(to: container().appendingPathComponent("probe-push.json"))
-                        }
-                    }
+                    pushReport = report
                 }
             }
         }
         guard tries < 240 else {
-            facts["token"] = "timeout"
-            facts["state"] = "\(registration.state)"
-            facts["permission"] = "\(registration.permission)"
-            reportPush(facts)
+            report.timedOut(facts: facts, state: registration.state.name, permission: "\(registration.permission)")
+            pushReport = report
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            waitForToken(tries: tries + 1, nonce: nonce, facts: facts, fetching: fetching)
+            waitForToken(tries: tries + 1, facts: facts, fetching: fetching)
         }
     }
 

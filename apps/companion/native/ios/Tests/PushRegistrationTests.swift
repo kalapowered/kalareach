@@ -3,16 +3,23 @@
 //
 //  The system gives this device an APNs token, and Firebase makes a registration token from it. A
 //  registration token is for one APNs token: it can be asked for only once Firebase has been given
-//  the current one, so none made earlier is ever used. And Firebase makes an installation and a
-//  registration token of its own from the APNs token it is given, which is for a person who has
-//  agreed to notifications: registering for a token needs no agreement, so the token can arrive
-//  first, and waits.
+//  the current one, so none made for an earlier APNs token is ever used. And Firebase makes an
+//  installation and a registration token of its own from the APNs token it is given, which is for
+//  a person who has agreed to notifications: registering for a token needs no agreement, so the
+//  token can arrive first, and waits.
 //
 
 import XCTest
 
 final class PushRegistrationTests: XCTestCase {
     private let apnsToken = Data([0x0a, 0x1b, 0x2c, 0x3d])
+
+    func testAStateIsNamedWithoutItsTokenOrReason() {
+        XCTAssertEqual(PushRegistrationState.registered(token: "0a1b2c3d").name, "registered")
+        XCTAssertEqual(PushRegistrationState.failed(reason: "no network").name, "failed")
+        XCTAssertEqual(PushRegistrationState.awaitingPermission.name, "awaitingPermission")
+        XCTAssertFalse(PushRegistrationState.registered(token: "0a1b2c3d").name.contains("0a1b"))
+    }
 
     private func registration(collecting given: Box<[Data]>) -> PushRegistration {
         let registration = PushRegistration()
