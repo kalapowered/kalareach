@@ -314,15 +314,16 @@ fn a_value_is_read_as_a_shell_word() {
     );
 }
 
-/// KR-REQ-29.04: where a quote could surround a credential's value, the field is withheld: one
-/// before the value that opens and one at or after it that closes. A quote is a quote or a
-/// character of a name (`Tom's`, `Rock 'n Roll`) and the text cannot say which, so no reading of
-/// it is trusted to end the value. Every input here is one that a reading of the quotes left a
-/// marker in the text for: the quoted-argument forms of `docker -e`, `env` and `sh -c`,
-/// apostrophes in a path before a credential, quotes of the other kind, an escaped quote and the
-/// quote at a boundary.
+/// KR-REQ-29.04: a field with a quote before a credential's value is withheld. A quote is a quote
+/// or a character of a name (`Tom's`, `Rock 'n Roll`) and the text cannot say which; a quote before
+/// the value can surround it up to a later quote, or up to the end of the text when nothing closes
+/// it, so no reading of the quotes is trusted to end the value. Every input here is one that a
+/// reading of the quotes left a marker in the text for: the quoted-argument forms of `docker -e`,
+/// `env` and `sh -c`, apostrophes in a path before a credential, quotes of the other kind, an
+/// escaped quote, the quote at a boundary, a quote that is never closed and a value that starts
+/// with whitespace.
 #[test]
-fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
+fn a_quote_before_a_credential_value_withholds_the_field() {
     for text in [
         // The whole assignment is a quoted argument.
         format!("docker run -e \"PASSWORD=two {MARKER}\" img"),
@@ -342,8 +343,7 @@ fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
         format!("sh -c \"env 'TOKEN=a {MARKER}' cmd\" tail"),
         format!("sh -c \"tool --password \\\"a {MARKER}\\\"\" tail"),
         format!("sh -c \"tool --password {MARKER}\""),
-        // An apostrophe in a path before the credential, with a later quote that closes it, or
-        // that is the value's own.
+        // An apostrophe in a path before the credential, with a later quote or none.
         format!("/Users/Tom's Tools/o'neil/run TOKEN='abc {MARKER} def'"),
         format!("/Users/Tom's Tools/o'neil/run --password 'abc {MARKER}'"),
         format!("/Users/Tom's Tools/run TOKEN='abc {MARKER} def'"),
@@ -355,6 +355,8 @@ fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
         format!("/Users/Tom's x TOKEN=' {MARKER} y/o"),
         format!("/Users/Tom's x --password abc' {MARKER} y/o"),
         format!("/Users/Tom's x TOKEN=abc {MARKER} y/o'neil"),
+        format!("/Users/o'neil/x's TOKEN=a{MARKER}"),
+        format!("/Users/o'neil/x's --password {MARKER}"),
         // The apostrophe that a later quote closes is the opening quote of the argument.
         format!("/Users/Tom's x 'TOKEN=abc {MARKER}' z/o'neil"),
         format!("/Users/Tom's x 'tool --password abc {MARKER}' z/o'neil"),
@@ -367,6 +369,15 @@ fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
         format!("/tmp/Rock 'n Roll/run --password 'abc {MARKER}' y/o'neil"),
         format!("/tmp/Rock 'n Roll/run TOKEN=abc' {MARKER}/y"),
         format!("/tmp/Rock 'n Roll/run TOKEN=' {MARKER}/y"),
+        // A quote before the value that nothing closes: a truncated command.
+        format!("/Users/Tom's/run 'TOKEN=abc {MARKER}"),
+        format!("/tmp/Rock 'n Roll/run 'TOKEN=abc {MARKER}"),
+        format!("/Users/Tom's/o'neil/run TOKEN=abc {MARKER}"),
+        format!("FOO=\"a b\" TOKEN=x {MARKER} cmd"),
+        // A value that starts with whitespace, in a quote that never closes.
+        format!("sh -c \"TOKEN= {MARKER}"),
+        format!("docker run -e \"PASSWORD= {MARKER}"),
+        format!("env 'TOKEN= {MARKER}"),
         // An escaped quote before the value and the value's own quotes.
         format!("\\\"TOKEN=\"abc {MARKER}\""),
     ] {
@@ -386,29 +397,13 @@ fn a_quote_that_could_surround_a_credential_value_withholds_the_field() {
     );
 }
 
-/// KR-REQ-29.04: the controls of the rule above. Where there is no quote before a value, or none at
-/// or after it, no quote can surround it and it is read as a word, and the text around it is as it
-/// was: quotes before it that nothing could close, a value's own quotes, a quote after it, quotes
-/// of values before it.
+/// KR-REQ-29.04: the controls of the rule above. With no quote before a value, nothing can
+/// surround it and it is read as a word, and the text around it is as it was: the value's own
+/// quotes, a quote after it, a name that holds no credential, a quote with no credential in the
+/// field.
 #[test]
-fn a_value_no_quote_can_surround_is_replaced_and_its_neighbours_stay() {
+fn a_value_with_no_quote_before_it_is_replaced_and_its_neighbours_stay() {
     for (text, expected) in [
-        (
-            format!("FOO=\"a b\" TOKEN={MARKER} cmd"),
-            "FOO=\"a b\" TOKEN=[redacted] cmd".to_owned(),
-        ),
-        (
-            format!("git commit -m \"x y\" --password {MARKER}"),
-            "git commit -m \"x y\" --password [redacted]".to_owned(),
-        ),
-        (
-            format!("/Users/o'neil/x's TOKEN=a{MARKER}"),
-            "/Users/o'neil/x's TOKEN=[redacted]".to_owned(),
-        ),
-        (
-            format!("/Users/o'neil/x's --password {MARKER}"),
-            "/Users/o'neil/x's --password [redacted]".to_owned(),
-        ),
         (
             format!("TOKEN='a b {MARKER}' next \"x\""),
             "TOKEN=[redacted] next \"x\"".to_owned(),
@@ -421,30 +416,64 @@ fn a_value_no_quote_can_surround_is_replaced_and_its_neighbours_stay() {
             format!("run TOKEN={MARKER} 'next arg'"),
             "run TOKEN=[redacted] 'next arg'".to_owned(),
         ),
+        (
+            format!("git commit --password {MARKER} -m \"x y\""),
+            "git commit --password [redacted] -m \"x y\"".to_owned(),
+        ),
+        (
+            format!("TOKEN={MARKER} /Users/Tom's x/o'neil"),
+            "TOKEN=[redacted] /Users/Tom's x/o'neil".to_owned(),
+        ),
     ] {
         let said = redacted(&text);
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
     // An apostrophe nothing closes, with a credential in the text, withholds the field whether or
-    // not a quote surrounds the value; without a credential the text is untouched.
+    // not a quote comes before the value; without a credential the text is untouched.
     let open = format!("/Users/Tom's Tools/run TOKEN={MARKER}");
     assert_eq!(
         redacted(&open),
         format!("[withheld: {} characters]", open.chars().count())
     );
     assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
+    assert_eq!(redacted("echo 'a' \"b\""), "echo 'a' \"b\"");
+}
+
+/// KR-REQ-29.04: a quote in the home directory is a quote before the credential that follows it,
+/// even though the home is replaced: the credentials are read in the text as it was written.
+#[test]
+fn a_quote_in_the_home_directory_is_a_quote_before_the_credential() {
+    for text in [
+        format!("'/home/o'neil' TOKEN=abc {MARKER}"),
+        format!("/home/o'neil/run TOKEN=abc {MARKER}\\' next"),
+        format!("/home/o'neil/run --password abc {MARKER} tail'"),
+    ] {
+        let said = field(&text, Some("/home/o'neil"), UNIX);
+        assert_eq!(
+            said,
+            format!("[withheld: {} characters]", text.chars().count()),
+            "{text}"
+        );
+    }
+    // With no credential the home is replaced as before, apostrophe and all.
+    assert_eq!(
+        field("/home/o'neil/work", Some("/home/o'neil"), UNIX),
+        "[home]/work"
+    );
 }
 
 /// Where the word that holds the value starting at `start` ends when each quote character before
 /// `start` is a quote (`structural`) or an ordinary character, as a shell reads the quotes that are
 /// quotes: at the first whitespace outside a quote, with a backslash escaping the next character
-/// outside single quotes. Every quote character at or after `start` is a quote. `None` when a quote
-/// that is a quote never closes.
-fn word_end_when(text: &str, start: usize, structural: &[bool]) -> Option<usize> {
+/// outside single quotes; a quote that is open at the end of the text runs the word to the end of
+/// it. Every quote character at or after `start` is a quote. With it, the offset of the quote that
+/// closes the argument the value is in, when one does.
+fn word_end_when(text: &str, start: usize, structural: &[bool]) -> (usize, Option<usize>) {
     let characters: Vec<(usize, char)> = text.char_indices().collect();
     let mut ordinal = 0;
-    let mut open: Option<char> = None;
+    let mut open: Option<(char, usize)> = None;
+    let mut closing = None;
     let mut index = 0;
     let quote_character = |ordinal: &mut usize, offset: usize, character: char| {
         let is_quote = matches!(character, '\'' | '"');
@@ -458,9 +487,12 @@ fn word_end_when(text: &str, start: usize, structural: &[bool]) -> Option<usize>
         let (offset, character) = characters[index];
         let quote_here = quote_character(&mut ordinal, offset, character);
         match open {
-            Some(quote) => {
+            Some((quote, opened)) => {
                 if quote_here && character == quote {
                     open = None;
+                    if offset >= start && opened < start {
+                        closing = Some(offset);
+                    }
                 } else if quote == '"' && character == '\\' {
                     index += 1;
                     if let Some(&(next_offset, next)) = characters.get(index) {
@@ -470,32 +502,33 @@ fn word_end_when(text: &str, start: usize, structural: &[bool]) -> Option<usize>
             }
             None => {
                 if quote_here {
-                    open = Some(character);
+                    open = Some((character, offset));
                 } else if character == '\\' {
                     index += 1;
                     if let Some(&(next_offset, next)) = characters.get(index) {
                         quote_character(&mut ordinal, next_offset, next);
                     }
                 } else if matches!(character, ' ' | '\t' | '\n') && offset >= start {
-                    return Some(offset);
+                    return (offset, closing);
                 }
             }
         }
         index += 1;
     }
-    open.is_none().then_some(text.len())
+    (text.len(), closing)
 }
 
-/// KR-REQ-29.04: no reading of the quotes before a value leaves part of the value in the text. A
-/// quote before a credential is a quote or a character of a path (`Tom's`, `Rock 'n Roll`), and the
-/// text cannot say which. So for every text built from quotes, backslashes, spaces and letters with
-/// one credential in it, and for every way of reading each quote character before the credential
-/// as a quote or as an ordinary character, the value that reading gives is replaced whole, or the
-/// field is withheld. The check tries every reading; it does not name the inputs a reviewer found.
-/// Quotes in the value itself are read as a shell reads them.
+/// KR-REQ-29.04: no reading of the quotes before a value leaves it in the text. A quote before a
+/// credential is a quote or a character of a path (`Tom's`, `Rock 'n Roll`), and the text cannot
+/// say which. So for every text built from quotes, backslashes, spaces and letters with one
+/// credential in it, and for every way of reading each quote character before the credential as a
+/// quote or as an ordinary character, the value that reading gives is replaced whole, or the field
+/// is withheld. A reading that leaves a quote open runs the value to the end of the text. The check
+/// tries every reading; it does not name the inputs a reviewer found. Quotes in the value itself
+/// are read as a shell reads them.
 #[test]
 fn no_reading_of_the_quotes_before_a_value_leaves_it_in_the_text() {
-    const PIECES: [&str; 6] = ["a", "b", " ", "'", "\"", "\\"];
+    const PIECES: [&str; 7] = ["a", "b", " ", "'", "\"", "\\", "  "];
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = move |bound: usize| {
         seed = seed
@@ -505,7 +538,7 @@ fn no_reading_of_the_quotes_before_a_value_leaves_it_in_the_text() {
     };
     let mut readings = 0_u64;
     let mut leaks = Vec::new();
-    for _ in 0..200_000 {
+    for _ in 0..400_000 {
         let length = 4 + next(9);
         let mut pieces: Vec<&str> = (0..length).map(|_| PIECES[next(PIECES.len())]).collect();
         let credential = if next(2) == 0 {
@@ -525,38 +558,49 @@ fn no_reading_of_the_quotes_before_a_value_leaves_it_in_the_text() {
         {
             continue;
         }
-        let start = at + credential.len();
         let said = redacted(&text);
         if said.starts_with("[withheld: ") {
             continue;
         }
-        let kept = said.find(REDACTED).map_or(start, |position| {
-            text.len() - said[position + REDACTED.len()..].len()
-        });
-        let before = text[..start]
-            .chars()
-            .filter(|c| matches!(c, '\'' | '"'))
-            .count();
-        for mask in 0..(1_u32 << before) {
-            let structural: Vec<bool> = (0..before).map(|bit| mask >> bit & 1 == 1).collect();
-            let Some(end) = word_end_when(&text, start, &structural) else {
-                continue;
-            };
-            readings += 1;
-            // The quote that closes the argument the credential is in is not part of the value.
-            let closes_it = end > start
-                && matches!(text[..end].chars().next_back(), Some('\'' | '"'))
-                && word_end_when(&text[..end - 1], start, &structural).is_none();
-            let required = if closes_it { end - 1 } else { end };
-            if kept < required {
-                leaks.push(format!(
-                    "{text:?} -> {said:?} (reading {mask:b}: value to {required})"
-                ));
-                break;
+        let replaced_to = said
+            .find(REDACTED)
+            .map(|position| text.len() - said[position + REDACTED.len()..].len());
+        // The value of an option starts after the whitespace that follows its name, and a reading
+        // may take that whitespace into the value. An assignment's value starts at the `=`: with
+        // whitespace right after it the value is empty.
+        let after = at + credential.len();
+        let skipped = after + text[after..].len() - text[after..].trim_start().len();
+        let starts = if credential == "TOKEN=" {
+            vec![after]
+        } else {
+            vec![after, skipped]
+        };
+        for start in starts {
+            // Nothing replaced means nothing taken as a value: it ends where it starts.
+            let kept = replaced_to.unwrap_or(start);
+            let before = text[..start]
+                .chars()
+                .filter(|c| matches!(c, '\'' | '"'))
+                .count();
+            for mask in 0..(1_u32 << before) {
+                let structural: Vec<bool> = (0..before).map(|bit| mask >> bit & 1 == 1).collect();
+                let (end, closing) = word_end_when(&text, start, &structural);
+                readings += 1;
+                // The quote that closes the argument the credential is in is not part of the value.
+                let required = match closing {
+                    Some(offset) if offset + 1 == end => offset,
+                    _ => end,
+                };
+                // Whitespace left after the value is not a secret.
+                if kept < required && !text[kept..required].trim().is_empty() {
+                    leaks.push(format!(
+                        "{text:?} -> {said:?} (reading {mask:b} from {start}: value to {required})"
+                    ));
+                }
             }
         }
     }
-    assert!(readings > 80_000, "the check made {readings} readings");
+    assert!(readings > 150_000, "the check made {readings} readings");
     assert!(
         leaks.is_empty(),
         "{} leaks, first: {:?}",
