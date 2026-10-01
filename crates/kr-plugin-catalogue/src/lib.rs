@@ -76,7 +76,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry, QualifiedBuild};
+use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::package::MANIFEST_FILE;
@@ -871,14 +871,6 @@ impl Catalogue {
         })
     }
 
-    /// Returns whether the organisation's allowlist, where there is one, names the package.
-    #[must_use]
-    pub fn allows(&self, plugin_id: &PluginId) -> bool {
-        self.allowed_adapters
-            .as_ref()
-            .is_none_or(|allowed| allowed.contains(plugin_id))
-    }
-
     /// Says why an installation does not stand, before anything about its package is read, or
     /// `None` where it does: it is disabled, the current generation of its origin revoked its exact
     /// package hash (`entry`, from [`Self::release_entry`]; `None` says nothing is known to be
@@ -897,34 +889,6 @@ impl Catalogue {
             entry.and_then(|entry| entry.revocation.0.clone()),
             self.allowed_adapters.as_ref(),
         )
-    }
-
-    /// Returns the builds the current generation of an installation's origin names for its exact
-    /// release on `host`'s platform: the signed records that say which version an executable is.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the record or the index cannot be read.
-    pub fn builds(
-        &self,
-        installation: &Installation,
-        host: &HostPlatform,
-    ) -> CatalogueResult<Vec<QualifiedBuild>> {
-        let (Some(os), Some(architecture)) = (host.os, host.architecture) else {
-            return Ok(Vec::new());
-        };
-        let entry = self.read_kept(|records| {
-            admission::current_entry(
-                &self.root,
-                records,
-                &installation.enrolment,
-                &installation.plugin_id,
-                installation.package_digest,
-            )
-        })?;
-        Ok(entry
-            .map(|entry| entry.builds_for(os, architecture).cloned().collect())
-            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2116,7 +2080,15 @@ impl Catalogue {
         }
         let subject = format!("{} {}", entry.plugin_id, entry.version);
         let length = entry.manifest_size_bytes.get();
-        let bytes = match store.read_payload(entry.manifest_digest, length) {
+        // A release that is installed has its manifest where it is installed, whole and verified
+        // against this hash; a host that cannot reach its repository, or has dropped the cached
+        // copy, still describes what it asks an owner to confirm.
+        let installed = store
+            .installed_manifest(entry.manifest_digest)?
+            .filter(|bytes| bytes.len() as u64 == length);
+        let bytes = match installed
+            .map_or_else(|| store.read_payload(entry.manifest_digest, length), Ok)
+        {
             Ok(bytes) => bytes,
             Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {
                 let prefix = format!(

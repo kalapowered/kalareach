@@ -4608,6 +4608,73 @@ mod native_bridges {
         assert!(bridge_facts(&host, &digest).is_none());
     }
 
+    /// KR-REQ-11.42: the statement an owner is asked to confirm for an installation of a release
+    /// that is installed already is read from the installed package, which the host holds whole
+    /// and verified, so a host that cannot reach its repository and has dropped the cached copy
+    /// still describes the confirmation it asks for. The control is the same host with the
+    /// installed package gone too: the manifest is then neither held nor reachable, and nothing
+    /// is described for a statement that cannot be read.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_the_statement_of_an_installed_release_is_read_where_it_is_installed() {
+        use kr_protocol::confirmation::{ConfirmationDisplay, ConfirmationSubject};
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let params = wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: GRANT.iter().map(|name| (*name).to_owned()).collect(),
+            owner_confirmation: Nullable::null(),
+        };
+        let subject = ConfirmationSubject::PluginInstall(Box::new(params));
+
+        // The cached copy is dropped and the repository no longer serves the manifest.
+        let cached = {
+            let catalogue = host.module.catalogue().lock().await;
+            let installation = catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .expect("installed");
+            catalogue
+                .store_of(&installation)
+                .payload_path(installation.package_digest)
+        };
+        let _ = std::fs::remove_file(&cached);
+        std::fs::remove_file(
+            host.working
+                .join("targets/packages/kalareach/claude-code/0.3.0/plugin.json"),
+        )
+        .expect("the repository's copy");
+
+        let resolved = host
+            .module
+            .resolve_confirmation(&subject)
+            .await
+            .expect("the installed package says what its bridge does");
+        match resolved.display {
+            ConfirmationDisplay::PluginInstall {
+                grant_statement, ..
+            } => assert_eq!(grant_statement.0, Some(release_statement())),
+            other => panic!("an installation is shown as one, not {other:?}"),
+        }
+
+        // Control: with the installed package gone as well, the statement can be read from
+        // nowhere.
+        std::fs::remove_dir_all(package_directory(&host, &digest).await).expect("a package");
+        assert!(
+            host.module.resolve_confirmation(&subject).await.is_err(),
+            "nothing is described for a statement that cannot be read"
+        );
+    }
+
     /// KR-REQ-11.42: the organisation's list is in force when the catalogue opens, before any
     /// bridge is brought to what its installation wants, so a restart puts back no registration
     /// the list excludes. The control is a restart with no list, which puts it back.
