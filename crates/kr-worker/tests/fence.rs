@@ -3332,6 +3332,7 @@ fn package_root() -> std::ffi::OsString {
 }
 
 /// Returns the qualified package of one shell this run named.
+#[cfg(unix)]
 fn installed_package_of(kind: ShellKind) -> kr_shell_integration::host::package::ShellPackage {
     let root = package_root();
     let set =
