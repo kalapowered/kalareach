@@ -786,6 +786,8 @@ impl FenceDriver {
 
     /// Reports that the session has begun closing.
     pub fn session_closing(&mut self) -> Effects {
+        // Whatever arrives from here on is about a session that is going: nothing qualifies it.
+        self.closing = true;
         self.apply(&Stimulus::SessionClosing, Context::Other)
     }
 
@@ -1597,6 +1599,19 @@ mod tests {
         assert!(
             !closing.phase().reports_ready(),
             "a session that is being closed is not qualified by a report that follows its loss"
+        );
+    }
+
+    /// A session that has begun closing for any reason is not promoted by a report that follows.
+    #[test]
+    fn a_report_after_the_session_began_closing_does_not_qualify_it() {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()));
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+        let _ = driver.session_closing();
+        let _ = driver.bridge_event(RequestId::new(1), &activation(Vec::new()));
+        assert!(
+            !driver.phase().reports_ready(),
+            "a session that is being closed was qualified by a report that follows"
         );
     }
 

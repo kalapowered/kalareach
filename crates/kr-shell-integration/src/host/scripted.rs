@@ -127,6 +127,25 @@ impl ScriptedBridge {
         Ok((bridge, outcome))
     }
 
+    /// Presents a hello and closes the connection without waiting for the answer: a shell that has
+    /// gone by the time the worker replies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Ipc`] when the endpoint cannot be reached or the hello cannot be
+    /// written.
+    pub async fn hello_and_hang_up(address: &BridgeEndpoint, hello: &BridgeHello) -> Result<()> {
+        let endpoint = client_endpoint(address)?;
+        let connection = Connection::connect(&endpoint).await?;
+        let (reader, mut writer) = split(connection, BRIDGE_STREAM_KIND);
+        writer
+            .write_message(&BridgeFrame::Hello(hello.clone()))
+            .await?;
+        drop(reader);
+        drop(writer);
+        Ok(())
+    }
+
     /// Reports something the reader did, and returns the identifier the answer will carry.
     ///
     /// # Errors

@@ -1321,17 +1321,30 @@ impl SessionRuntime {
         loop {
             {
                 let session = self.session();
+                // The refusal first, which survives the session's closure and is the answer a
+                // create gets whatever became of the session; then whether the session is still
+                // there, since a session that has begun to close is no answer to a create; and only
+                // then whether the integration is ready.
+                if let Some(refusal) = session
+                    .fence()
+                    .and_then(|driver| driver.qualification_refusal())
+                {
+                    eprintln!(
+                        "kr-worker: session {}: the root integration was refused ({}): {}; {}",
+                        session.id(),
+                        refusal.refused.reason.as_str(),
+                        refusal.refused.error.message,
+                        refusal.diagnostic
+                    );
+                    return Err(qualification_answer(&refusal.refused));
+                }
+                if session.state() != SessionState::Live {
+                    return Err(ProtocolError::new(
+                        ErrorCode::ShellIntegrationUnsupported,
+                        "the session ended before its root integration qualified",
+                    ));
+                }
                 if let Some(driver) = session.fence() {
-                    if let Some(refusal) = driver.qualification_refusal() {
-                        eprintln!(
-                            "kr-worker: session {}: the root integration was refused ({}): {}; {}",
-                            session.id(),
-                            refusal.refused.reason.as_str(),
-                            refusal.refused.error.message,
-                            refusal.diagnostic
-                        );
-                        return Err(qualification_answer(&refusal.refused));
-                    }
                     if driver.phase().reports_ready() {
                         return Ok(());
                     }
@@ -1342,12 +1355,6 @@ impl SessionRuntime {
                              so this session claims none of the managed contract",
                         ));
                     }
-                }
-                if session.state() != SessionState::Live {
-                    return Err(ProtocolError::new(
-                        ErrorCode::ShellIntegrationUnsupported,
-                        "the session ended before its root integration qualified",
-                    ));
                 }
             }
             if tokio::time::Instant::now() >= deadline {
