@@ -572,9 +572,27 @@ fn program_of(command: &str, kind: Option<ShellKind>) -> Option<String> {
         if word.raw.contains('=') {
             return None;
         }
+        // PowerShell reads a quoted word, a number and a word with a sign in it as an expression,
+        // not as the name of a command: its program word is a plain name, unquoted, that starts
+        // with a letter, an underscore or a path character.
+        if kind == Some(ShellKind::PowerShell) && !is_command_name(word.raw) {
+            return None;
+        }
         let name = word.text.rsplit('/').next().unwrap_or(&word.text);
         return clip(name);
     }
+}
+
+/// Whether `word` can only be the name of a command in PowerShell: no quote, no sign and no
+/// number, an unbroken run of letters, digits and `_ . / : ~ -`, starting with a letter, an
+/// underscore, a dot, a slash or a tilde.
+fn is_command_name(word: &str) -> bool {
+    word.chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | '.' | '/' | '~'))
+        && word.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '.' | '/' | ':' | '~' | '-')
+        })
 }
 
 /// Which variable assignments may come before a program, by the shell the line came from. A line
@@ -1003,6 +1021,33 @@ mod tests {
                 "{line:?}"
             );
         }
+        // PowerShell reads a quoted word, a number and a sum as expressions, not as a command.
+        for expression in [
+            "'SECRET'",
+            "'a'+'SECRET'",
+            "'foo''bar'",
+            "42",
+            "1+SECRET",
+            "+SECRET",
+        ] {
+            assert_eq!(
+                program_in(expression, ShellKind::PowerShell),
+                None,
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            program_in("Get-ChildItem ./SECRET", ShellKind::PowerShell).as_deref(),
+            Some("Get-ChildItem")
+        );
+        assert_eq!(
+            program_in("./run.ps1 SECRET", ShellKind::PowerShell).as_deref(),
+            Some("run.ps1")
+        );
+        assert_eq!(
+            program_in("C:/tools/node.exe app.js", ShellKind::PowerShell).as_deref(),
+            Some("node.exe")
+        );
         // A quote of another script, which PowerShell closes a string at, is refused in a quote.
         let curved = "Write-Output\"\u{201d} SECRET \u{201c}\"";
         assert_eq!(program_in(curved, ShellKind::Bash), None);

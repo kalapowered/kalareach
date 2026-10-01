@@ -1841,10 +1841,20 @@ fn an_end_the_daemon_causes_to_stop_called_off_work_is_no_failure_of_inference()
 /// ran inside it.
 struct Gate {
     admits: bool,
+    /// Whether it admits a job's registration; a test of publications leaves it on.
+    dispatches: bool,
     ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl kr_describe::service::PublicationGate for Gate {
+    fn admit_dispatch(
+        &self,
+        _generation: kr_worker::privacy::PrivacyGeneration,
+        register: &mut dyn FnMut(),
+    ) -> bool {
+        self.dispatches.then(register).is_some()
+    }
+
     fn hold(
         &self,
         _generation: kr_worker::privacy::PrivacyGeneration,
@@ -1854,6 +1864,42 @@ impl kr_describe::service::PublicationGate for Gate {
             self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
             publish()
         })
+    }
+}
+
+/// KR-REQ-24.11: a job is registered as in flight inside the gate, and not at all when the gate
+/// admits none: the job is dropped from the queue and counted as cancelled, nothing is sent and
+/// nothing is in flight, so no job starts once privacy mode is published. The control is a
+/// service with no gate, and one whose gate admits, which send the job.
+#[test]
+fn a_job_is_registered_inside_its_gate_and_never_sent_when_none_admits_it() {
+    for case in ["no gate", "admitting", "refusing"] {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service = service();
+        if case != "no gate" {
+            service.set_publication_gate(Box::new(Gate {
+                admits: true,
+                dispatches: case == "admitting",
+                ran: ran.clone(),
+            }));
+        }
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let next = loaded(&mut service, at(3_000));
+        if case == "refusing" {
+            assert!(
+                matches!(next, Instruction::Wait { .. }),
+                "nothing is sent: {next:?}"
+            );
+            assert_eq!(service.in_flight(), 0, "{case}");
+            assert_eq!(service.counts().cancelled, 1, "{case}");
+        } else {
+            assert!(
+                matches!(next, Instruction::Generate { .. }),
+                "{case}: {next:?}"
+            );
+            assert_eq!(service.in_flight(), 1, "{case}");
+            assert_eq!(service.counts().cancelled, 0, "{case}");
+        }
     }
 }
 
@@ -1868,6 +1914,7 @@ fn a_publication_is_written_inside_its_gate_and_refused_when_none_admits_it() {
         match case {
             "admitting" | "refusing" => service.set_publication_gate(Box::new(Gate {
                 admits: case == "admitting",
+                dispatches: true,
                 ran: ran.clone(),
             })),
             _ => {}

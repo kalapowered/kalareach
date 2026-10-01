@@ -1660,14 +1660,22 @@ mod tests {
         assert_eq!(vouched(&broker, id).as_deref(), Some("b"));
         assert_eq!(thread().as_deref(), Some("b"), "settled by a later tick");
 
-        // A late report of another thread going on advances the binding without a selection of
-        // its own, and the facts follow the binding.
+        // A late report of another thread going on, after a newer report of the selected one: it
+        // started after the report that began the binding's revision, so it advances the binding
+        // to a new revision that still selects what the newest report says, and the facts still
+        // name that thread.
+        assert_eq!(
+            apply(&broker, id, 300, &continued("b")),
+            ThreadChange::Unchanged
+        );
         let before = revision(&broker, id);
-        let late = apply(&broker, id, 150, &continued("c"));
-        if matches!(late, ThreadChange::Overtaken(_)) {
-            assert!(revision(&broker, id) > before);
-        }
-        assert_eq!(thread(), vouched(&broker, id));
+        assert!(matches!(
+            apply(&broker, id, 250, &continued("c")),
+            ThreadChange::Overtaken(_)
+        ));
+        assert!(revision(&broker, id) > before, "the binding advanced");
+        assert_eq!(vouched(&broker, id).as_deref(), Some("b"));
+        assert_eq!(thread().as_deref(), Some("b"));
     }
 
     fn suspension(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {
