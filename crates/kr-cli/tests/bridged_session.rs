@@ -88,20 +88,35 @@ fn installation() -> &'static Path {
     })
 }
 
+/// What a login in the destination gives the helper as its `HOME`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Login {
+    /// The destination user's home, as `wsl.exe --user` and a container runtime's exec set it.
+    Home,
+    /// None at all.
+    NoHome,
+    /// A value that is not an absolute path.
+    RelativeHome,
+}
+
 /// What the stand-in for `wsl.exe` does: record how it was run, and run what follows `--exec` in the
 /// destination's own environment, with what a login there would give it and nothing of the caller's.
-fn stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
+fn stand_in(tools: &Path, destination: &Path, home: &Path, login: Login) -> String {
     let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
+    let home_variable = match login {
+        Login::Home => format!("HOME='{}'", home.display()),
+        Login::NoHome => String::new(),
+        Login::RelativeHome => "HOME=relative/home".to_owned(),
+    };
     format!(
         r##"#!/bin/sh
 printf '%s\n' "$*" >>'{tools}/invocations'
 while [ "$#" -gt 0 ] && [ "$1" != "--exec" ]; do shift; done
 shift
-exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
+exec /usr/bin/env -i PATH=/usr/bin:/bin {home_variable} TMPDIR='{temporary}' \
   KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' "$@"
 "##,
         tools = tools.display(),
-        home = home.display(),
         runtime = destination.join("r").display(),
         state = destination.join("s").display(),
     )
@@ -151,6 +166,10 @@ impl Drop for World {
 
 impl World {
     async fn start() -> Self {
+        Self::start_with(Login::Home).await
+    }
+
+    async fn start_with(login: Login) -> Self {
         let source = teardown::Tree::create();
         let destination = teardown::Tree::create();
         let home = destination.root().join("home");
@@ -158,7 +177,8 @@ impl World {
         let tools = source.root().join("tools");
         std::fs::create_dir_all(&tools).expect("a directory for the stand-in");
         let text = tools.join("wsl.exe.text");
-        std::fs::write(&text, stand_in(&tools, destination.root(), &home)).expect("the stand-in");
+        std::fs::write(&text, stand_in(&tools, destination.root(), &home, login))
+            .expect("the stand-in");
         kr_ipc::testing::place_program(&text, &tools.join("wsl.exe"));
         let ssh_text = tools.join("ssh.text");
         std::fs::write(&ssh_text, ssh_stand_in(destination.root(), &home))
@@ -682,6 +702,39 @@ impl Terminal {
         writer.write_all(text.as_bytes()).expect("types");
         writer.flush().expect("flushes");
     }
+
+    /// Waits for the shell to print `marker` followed by `count` values, each ended by `|`, and
+    /// returns them.
+    ///
+    /// The command typed to print them names its values as `%s`, which is what tells its echo from
+    /// its output: only output has a value where the echo has a placeholder.
+    fn reported_within(&self, marker: &str, count: usize, what: &str) -> Vec<String> {
+        let started = Instant::now();
+        loop {
+            let text = self.text();
+            let printed = text.match_indices(marker).find_map(|(at, _)| {
+                let line = text[at + marker.len()..].lines().next()?;
+                if line.starts_with('%') {
+                    return None;
+                }
+                let values: Vec<&str> = line.split('|').collect();
+                // The last part is what follows the final separator, and a line still being
+                // written has not reached it.
+                (values.len() == count + 1)
+                    .then(|| values[..count].iter().map(|value| (*value).to_owned()).collect())
+            });
+            if let Some(printed) = printed {
+                return printed;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "{what}: waited {:?} for the shell to print {marker:?}: {}",
+                started.elapsed(),
+                text.escape_debug()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 impl World {
@@ -761,7 +814,7 @@ async fn a_terminal_attached_through_a_bridge_reaches_the_shell_in_the_destinati
     let display = created["display_number"].to_string();
 
     let terminal = world.attach_on_a_terminal(&display);
-    terminal.types("printf 'in-%s %s %s\\n' destination \"$PWD\" \"${HOME:+home-set}\"\r");
+    terminal.types("printf 'in-%s %s\\n' destination \"$PWD\"\r");
     terminal.expect_within(
         "in-destination",
         "what was typed reached the shell and its output came back",
@@ -773,16 +826,64 @@ async fn a_terminal_attached_through_a_bridge_reaches_the_shell_in_the_destinati
         "the shell started in the destination's home: {}",
         text.escape_debug()
     );
-    assert!(
-        text.contains("home-set"),
-        "and has a home of its own, which is the destination's: {}",
-        text.escape_debug()
-    );
     // Ending the session from where it lives ends the attachment, and the command says it did.
     terminal.types("exit\r");
     terminal.expect_within("attach-finished-", "the attachment ended with the session");
     let mut shell = terminal.shell;
     let _ = shell.wait();
+}
+
+/// What a shell created through a bridge has as `HOME` and starts in, for a destination whose login
+/// gave the helper this `HOME`.
+async fn a_shell_has_a_home_and_starts_in_it(login: Login) {
+    let world = World::start_with(login).await;
+    world.enrol_destination();
+    let created = world.create_in_destination();
+    let display = created["display_number"].to_string();
+
+    let terminal = world.attach_on_a_terminal(&display);
+    terminal.types("printf 'reports|%s|%s|\\n' \"$HOME\" \"$PWD\"\r");
+    let printed = terminal.reported_within("reports|", 2, "the shell reported its home");
+    let (home, directory) = (&printed[0], &printed[1]);
+    assert!(
+        home.starts_with('/'),
+        "the shell's HOME is an absolute path: {home:?}"
+    );
+    assert_eq!(
+        resolved(Path::new(home)),
+        resolved(Path::new(directory)),
+        "the shell starts in the directory its HOME names"
+    );
+    if login == Login::Home {
+        assert_eq!(
+            resolved(Path::new(home)),
+            resolved(&world.home),
+            "and it is the destination user's own"
+        );
+    }
+    terminal.types("exit\r");
+    terminal.expect_within("attach-finished-", "the attachment ended with the session");
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+}
+
+/// KR-REQ-03.14, 03.15: the destination user's `HOME`, as the login gave it, is the shell's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_created_through_a_bridge_has_the_destination_users_home() {
+    a_shell_has_a_home_and_starts_in_it(Login::Home).await;
+}
+
+/// KR-REQ-03.14, 03.15: a login that gave the helper no `HOME` still leaves the shell with one,
+/// and it is the directory the shell starts in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_created_through_a_bridge_has_a_home_when_the_login_gave_none() {
+    a_shell_has_a_home_and_starts_in_it(Login::NoHome).await;
+}
+
+/// KR-REQ-03.14, 03.15: a `HOME` that is not an absolute path is not carried into the shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_created_through_a_bridge_has_no_relative_home() {
+    a_shell_has_a_home_and_starts_in_it(Login::RelativeHome).await;
 }
 
 /// KR-REQ-25.26: `kr bridge enrol --access ssh --probe` learns the destination's identity from its
