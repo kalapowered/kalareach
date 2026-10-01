@@ -694,26 +694,20 @@ fn a_registration_for_another_packages_application_is_refused() {
     assert_eq!(settled, Settled::Applied);
 }
 
-/// A registration a recipe writes as a configuration value is read as a registration too: files
-/// that start the forwarder for the package's own application beside a settings key that starts
-/// it for another's are refused, and nothing is written.
+/// What the refusal of a configuration key this host does not permit a bridge to add says.
 #[cfg(unix)]
-#[test]
-fn a_configuration_value_that_registers_another_application_is_refused() {
-    let site = Site::new();
-    let before = site.tree();
+const UNPERMITTED_KEY: &str = "does not permit a native bridge";
+
+/// The recipe of release 0.3.0 with one more configuration key added, and its removal.
+#[cfg(unix)]
+fn recipe_adding_key(key: &str, value: &str) -> NativeBridge {
     let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
-    let hooks = serde_json::json!({
-        "SessionStart": [{"hooks": [{"type": "command", "command": "kr-hook",
-                                      "args": ["another-agent", "hook"]}]}]
-    })
-    .to_string();
     recipe["install"]
         .as_array_mut()
         .expect("the install steps")
         .push(
             serde_json::json!({"type": "add_configuration_key", "file": "settings.json",
-                                  "key": "hooks", "value": hooks}),
+                                  "key": key, "value": value}),
         );
     recipe["remove"]
         .as_array_mut()
@@ -721,8 +715,86 @@ fn a_configuration_value_that_registers_another_application_is_refused() {
         .insert(
             0,
             serde_json::json!({"type": "remove_configuration_key", "file": "settings.json",
-                               "key": "hooks"}),
+                               "key": key}),
         );
+    serde_json::from_value(recipe).expect("a recipe")
+}
+
+/// A native bridge may add the configuration keys this host names for its application, each with
+/// the one value that enables what the bridge installed, and no other: a key that makes the
+/// application run a program (a status line, an API key helper, a credential refresh, a hook, an
+/// MCP server), a plugin key with another value, a key nested beyond the plugin's name, and a key
+/// in another document are refused before anything is written. This closes the class by
+/// construction, because no configuration value a bridge adds can hold a command. The control is
+/// another plugin's own enabling key, which is applied.
+#[cfg(unix)]
+#[test]
+fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
+    let hooks = serde_json::json!({
+        "SessionStart": [{"hooks": [{"type": "command", "command": "kr-hook",
+                                      "args": ["another-agent", "hook"]}]}]
+    })
+    .to_string();
+    for (key, value) in [
+        ("hooks", hooks.as_str()),
+        ("statusLine.command", r#""other-command""#),
+        (
+            "statusLine",
+            r#"{"type": "command", "command": "other-command"}"#,
+        ),
+        (
+            "apiKeyHelper",
+            r#""sh ~/.claude/skills/kalareach-channels/helper.sh""#,
+        ),
+        ("awsAuthRefresh", r#""other-command""#),
+        ("awsCredentialExport", r#""other-command""#),
+        ("otelHeadersHelper", r#""other-command""#),
+        ("mcpServers.channels.command", r#""other-command""#),
+        ("env.LD_PRELOAD", r#""/tmp/x""#),
+        ("enabledPlugins", r#"{"a@skills-dir": true}"#),
+        ("enabledPlugins.other@skills-dir", "false"),
+        ("enabledPlugins.other@skills-dir", r#""yes""#),
+        (
+            "enabledPlugins.other@skills-dir",
+            r#"{"command": "other-command"}"#,
+        ),
+        ("enabledPlugins.a.b", "true"),
+        ("enabledPlugins.", "true"),
+        ("enabledPlugins.bad name", "true"),
+        ("permissions.allow", r#"["Bash(*)"]"#),
+    ] {
+        let site = Site::new();
+        let before = site.tree();
+        let target = BridgeTarget {
+            recipe: recipe_adding_key(key, value),
+            ..site.release()
+        };
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(
+            reason.contains(UNPERMITTED_KEY) && reason.contains(key),
+            "{key} = {value}: refused as a key this host does not permit: {reason}"
+        );
+        assert_eq!(site.tree(), before, "{key} = {value}: nothing was written");
+    }
+    // The same key in another document is not the one this host names.
+    let site = Site::new();
+    let before = site.tree();
+    let mut recipe = serde_json::to_value(recipe_adding_key(
+        "enabledPlugins.another-plugin@skills-dir",
+        "true",
+    ))
+    .expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            if step["key"] == "enabledPlugins.another-plugin@skills-dir" {
+                step["file"] = serde_json::json!("settings.local.json");
+            }
+        }
+    }
     let target = BridgeTarget {
         recipe: serde_json::from_value(recipe).expect("a recipe"),
         ..site.release()
@@ -731,96 +803,42 @@ fn a_configuration_value_that_registers_another_application_is_refused() {
         .bridges()
         .reconcile(&plugin(), Some(&target))
         .expect("reconciles");
-    let reason = refused(&settled);
-    assert!(reason.contains("another-agent"), "{reason}");
+    assert!(
+        refused(&settled).contains(UNPERMITTED_KEY)
+            && refused(&settled).contains("settings.local.json"),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
-}
-
-/// A recipe's configuration key is read where it will stand. A key whose last member is `command`
-/// makes a `command` member in the document, so what it holds is a command the application runs,
-/// and a value that is not the forwarder in a form the host reads is refused: alone and beside the
-/// package's own registration, for a key at any depth. The control is the forwarder itself at such
-/// a key, which is applied.
-#[cfg(unix)]
-#[test]
-fn a_configuration_key_that_makes_a_command_member_is_read_as_a_command() {
-    let with_key = |site: &Site, key: &str, value: &str| {
-        let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
-        recipe["install"]
-            .as_array_mut()
-            .expect("the install steps")
-            .push(
-                serde_json::json!({"type": "add_configuration_key", "file": "settings.json",
-                                      "key": key, "value": value}),
-            );
-        recipe["remove"]
-            .as_array_mut()
-            .expect("the removal steps")
-            .insert(
-                0,
-                serde_json::json!({"type": "remove_configuration_key", "file": "settings.json",
-                                   "key": key}),
-            );
-        BridgeTarget {
-            recipe: serde_json::from_value(recipe).expect("a recipe"),
-            ..site.release()
-        }
-    };
-    for (key, value) in [
-        ("statusLine.command", r#""other-command""#),
-        ("mcpServers.channels.command", r#""other-command""#),
-        (
-            "a.b.c.command",
-            r#""kr-hook claude-code hook; other-command""#,
-        ),
-        ("statusLine.command", r#""'kr-hook' claude-code hook""#),
-        ("statusLine.command", "5"),
-        ("statusLine.command", "null"),
-        (
-            "statusLine",
-            r#"{"type": "command", "command": "other-command"}"#,
-        ),
-    ] {
-        let site = Site::new();
-        let before = site.tree();
-        let settled = site
-            .bridges()
-            .reconcile(&plugin(), Some(&with_key(&site, key, value)))
-            .expect("reconciles");
-        let reason = refused(&settled);
-        assert!(
-            reason.contains(UNREAD_COMMAND),
-            "{key} = {value}: refused as a command the host does not read: {reason}"
-        );
-        assert_eq!(site.tree(), before, "{key} = {value}: nothing was written");
-    }
-    // The control: the forwarder, for the package's own application, at such a key.
     let site = Site::new();
+    let target = BridgeTarget {
+        recipe: recipe_adding_key("enabledPlugins.another-plugin@skills-dir", "true"),
+        ..site.release()
+    };
     let settled = site
         .bridges()
-        .reconcile(
-            &plugin(),
-            Some(&with_key(
-                &site,
-                "statusLine.command",
-                r#""kr-hook claude-code hook""#,
-            )),
-        )
+        .reconcile(&plugin(), Some(&target))
         .expect("reconciles");
     assert_eq!(settled, Settled::Applied, "{settled:?}");
 }
 
-/// A file the recipe installs whose name says it is JSON, and that does not parse as JSON, is
-/// refused: an application that reads it more leniently than this host would read commands this
-/// host never saw. The control is the same file with its content as JSON.
+/// A file a recipe installs is JSON this host can read, whatever its name says, or the recipe is
+/// refused: an application that reads it more leniently, or runs it as a script, would act on
+/// bytes this host never checked. A script, a name in other case, a comment, a trailing comma, text
+/// that is not JSON, a document nested deeper than this host reads and an empty file are each
+/// refused, and nothing is written. The control is the same file as JSON.
 #[cfg(unix)]
 #[test]
-fn an_installed_json_file_this_host_cannot_read_is_refused() {
-    for bytes in [
-        &b"{ // a comment\n \"hooks\": {} }"[..],
-        &b"{\"hooks\": {},}"[..],
-        &b"not json at all"[..],
-    ] {
+fn a_file_a_recipe_installs_that_is_not_json_this_host_can_read_is_refused() {
+    let deep = format!("{}0{}", "[".repeat(300), "]".repeat(300));
+    let cases: [&[u8]; 6] = [
+        b"{ // a comment\n \"hooks\": {} }",
+        b"{\"hooks\": {},}",
+        b"not json at all",
+        b"#!/bin/sh\nother-command\n",
+        deep.as_bytes(),
+        b"",
+    ];
+    for bytes in cases {
         let site = Site::new();
         std::fs::write(site.package("a").join("bridge/hooks.json"), bytes).expect("changes it");
         let before = site.tree();
@@ -837,20 +855,47 @@ fn an_installed_json_file_this_host_cannot_read_is_refused() {
 
         let reason = refused(&settled);
         assert!(
-            reason.contains("hooks.json") && reason.contains("cannot be read as JSON"),
-            "{reason}"
+            reason.contains("cannot be read as JSON"),
+            "{:?}: {reason}",
+            String::from_utf8_lossy(bytes)
         );
         assert_eq!(site.tree(), before, "nothing was written");
     }
+    // A name in other case is no way round it: the content decides.
     let site = Site::new();
-    std::fs::write(
-        site.package("a").join("bridge/hooks.json"),
-        b"{\"hooks\": {}}",
-    )
-    .expect("changes it");
-    let digest = PayloadDigest::of(b"{\"hooks\": {}}").to_string();
+    let script: &[u8] = b"#!/bin/sh\nother-command\n";
+    std::fs::write(site.package("a").join("bridge/hooks.json"), script).expect("changes it");
+    let mut recipe =
+        serde_json::to_value(recipe_with_hooks(&PayloadDigest::of(script).to_string()))
+            .expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            if step["destination"] == HOOKS_PATH {
+                step["destination"] =
+                    serde_json::json!("skills/kalareach-channels/hooks/HOOKS.JSON");
+            }
+        }
+    }
+    let before = site.tree();
     let target = BridgeTarget {
-        recipe: recipe_with_hooks(&digest),
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("cannot be read as JSON"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = Site::new();
+    let json: &[u8] = b"{\"hooks\": {}}";
+    std::fs::write(site.package("a").join("bridge/hooks.json"), json).expect("changes it");
+    let target = BridgeTarget {
+        recipe: recipe_with_hooks(&PayloadDigest::of(json).to_string()),
         ..site.release()
     };
     let settled = site
@@ -2480,21 +2525,23 @@ fn an_object_at_a_former_temporary_name_does_not_hide_what_was_published() {
 }
 
 /// A settings document the key would create is held to the size this host reads back, as one it
-/// edits is: a recipe value that would make it larger is refused before anything is written.
+/// edits is: a recipe key that would make it larger is refused before anything is written. The
+/// value a bridge adds is `true`, so the size is the key's.
 #[cfg(unix)]
 #[test]
 fn a_settings_document_the_key_would_create_past_the_limit_is_refused() {
     let site = Site::with_settings(None);
     let before = site.tree();
-    let value = format!("[{}]", vec!["0"; 200_000].join(","));
-    assert!(
-        value.len() < 1 << 20,
-        "the value itself is within the limit"
-    );
+    let long = format!("enabledPlugins.{}", "a".repeat(1 << 20));
     let mut target = site.release();
     for step in &mut target.recipe.install {
-        if let kr_plugin_sdk::plugin::BridgeStep::AddConfigurationKey { value: set, .. } = step {
-            set.clone_from(&value);
+        if let kr_plugin_sdk::plugin::BridgeStep::AddConfigurationKey { key, .. } = step {
+            key.clone_from(&long);
+        }
+    }
+    for removal in &mut target.recipe.remove {
+        if let kr_plugin_sdk::plugin::BridgeRemoval::RemoveConfigurationKey { key, .. } = removal {
+            key.clone_from(&long);
         }
     }
 
@@ -3700,7 +3747,8 @@ const UNREAD_COMMAND: &str = "starts the forwarder with arguments it does not ac
 /// KR-REQ-11.42: a command that is not a string, and the forwarder's name with an argument list
 /// that is not exactly the application and the surface as two words, are commands the host does
 /// not read, wherever they stand: a list with a third member of any kind, one that is not a word,
-/// a command member that is not text, and a one-line command with an argument list beside it. Each is refused before anything is written, alone and
+/// a command member that is not text, a one-line command with an argument list beside it, and a
+/// member beside the command that a forwarder registration does not use. Each is refused before anything is written, alone and
 /// beside a good command.
 #[cfg(unix)]
 #[test]
@@ -3724,6 +3772,16 @@ fn kr_req_11_42_a_command_in_a_shape_the_host_does_not_read_is_refused_wherever_
                            "command": "kr-hook gemini-cli hook", "args": ["extra"]}),
         serde_json::json!({"type": "command", "name": "kalareach",
                            "command": "kr-hook gemini-cli hook", "args": []}),
+        // A member a forwarder registration does not use can make the program run in another
+        // environment or place: it is refused whatever its value.
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", "hook"], "env": {"LD_PRELOAD": "/tmp/x"}}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", "hook"], "cwd": "/tmp"}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", "hook"], "shell": "bash"}),
+        serde_json::json!({"type": "command", "name": "kalareach",
+                           "command": "kr-hook gemini-cli hook", "env": {}}),
     ];
     for shape in shapes {
         for hooks in [
@@ -3938,6 +3996,36 @@ fn kr_req_11_42_the_doctor_reports_an_applied_bridge_and_its_files_by_digest() {
     );
 }
 
+/// KR-REQ-11.42: a journal the listing names and that is gone by the time it is read, as a
+/// removal finishing beside the doctor's read leaves, is not a bridge to report and not a failure
+/// to read: the other bridges are reported and the check is the check of those. A dangling name in
+/// the journals' directory is that case, made without a race. The control is a journal that is
+/// there, which is reported.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_journal_that_goes_before_it_is_read_is_no_failure_to_read() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let site = GeminiSite::new();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("applies");
+    let journals = site.root.join("state/native-bridges");
+    std::os::unix::fs::symlink(
+        site.root.join("nothing-here"),
+        journals.join("0123456789abcdef.json"),
+    )
+    .expect("a name that leads nowhere");
+
+    let reports = bridges
+        .reports()
+        .expect("the journal that is gone is skipped");
+
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].state, "applied");
+    assert_eq!(doctor_check(&bridges).status, DoctorStatus::Ok);
+}
+
 /// KR-REQ-11.42: the doctor warns for a bridge whose recipe is half applied, wherever an
 /// installation stopped, and for one half removed; before anything is recorded there is nothing to
 /// warn of, a bridge that stopped before a removal's first change is still applied, one finished is
@@ -4055,6 +4143,39 @@ fn kr_req_11_42_the_doctor_warns_for_an_applied_bridge_that_no_longer_matches() 
 
     let drifted = doctor_check(&bridges);
     assert_eq!(drifted.status, DoctorStatus::Warning, "{drifted:?}");
+}
+
+/// KR-REQ-11.42: the doctor warns for a bridge that was removed with something left in place,
+/// because a file somebody changed since it was installed is not taken out: the row says it was
+/// removed, as a warning. The control is a removal that left nothing, which leaves no row (the
+/// half-applied case's removals).
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_doctor_warns_for_a_removal_that_left_something_in_place() {
+    use kr_protocol::hostinfo::DoctorStatus;
+    let site = GeminiSite::new();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("applies");
+    std::fs::write(
+        site.application().join(GEMINI_HOOKS_PATH),
+        b"{\"somebody\": 1}",
+    )
+    .expect("changed");
+
+    let settled = bridges.reconcile(&gemini(), None).expect("removes");
+
+    assert_eq!(settled, Settled::Removed, "{settled:?}");
+    let reports = bridges.reports().expect("reads");
+    let [report] = reports.as_slice() else {
+        panic!("one bridge: {reports:?}");
+    };
+    assert_eq!(report.state, "removed", "{report:?}");
+    assert!(!report.notes.is_empty(), "something was left: {report:?}");
+    let check = doctor_check(&bridges);
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+    assert!(check.detail().contains("removed"), "{}", check.detail());
 }
 
 /// KR-REQ-11.42: a recipe the host refuses is reported as refused, and is not a warning: nothing

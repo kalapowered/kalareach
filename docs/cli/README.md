@@ -1251,9 +1251,11 @@ location has the `file:` scheme, the repository is added as a local repository, 
 community repository. In both cases it asks for the budgets the host says it allows, as
 `catalogue.list` reports them, and for no capability beyond the default. If no owner device answers
 before the challenge ends, the command exits with `OWNER_CONFIRMATION_REQUIRED` and says that
-nothing was changed. A host that does not answer a request the command sent, or a connection that
-ends after it, leaves the outcome unknown: the command says so, with `OUTCOME_UNKNOWN`, and exits
-1, because the host refused nothing. If the host has no owner device
+nothing was changed. A host that does not answer the repeated request, or a connection that ends
+after it was sent, leaves the outcome unknown: the command says so, with `OUTCOME_UNKNOWN`, and
+exits 1, because the host refused nothing. A host that does not answer one of the two requests
+before it, for the budgets and for the challenge, within thirty seconds changed nothing, and the
+command exits 3. If the host has no owner device
 yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
 owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
 

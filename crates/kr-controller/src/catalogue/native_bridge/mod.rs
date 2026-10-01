@@ -814,22 +814,26 @@ impl NativeBridges {
                 sources.push((destination.to_string(), bytes));
             }
         }
-        // A configuration value is as much a part of the registration as a file is: a settings
-        // key can start the forwarder too, so its invocations are read with the files'. It is read
-        // where it will stand, inside the members its key names, so that a key whose last member
-        // is `command` is a command the application runs.
-        let mut registered = sources.clone();
+        // A configuration key is added only where this host names it for the application, with
+        // the one value that enables what the release installed: no key a bridge adds can hold a
+        // command, so none is left unread. Everything a file installs is read below.
         for step in &recipe.install {
-            if let BridgeStep::AddConfigurationKey { file, key, value } = step {
-                let value: serde_json::Value = serde_json::from_str(value)
-                    .map_err(|error| format!("the recipe's value {value} is not JSON: {error}"))?;
-                let placed = key
-                    .split('.')
-                    .rev()
-                    .fold(value, |inner, member| serde_json::json!({ member: inner }));
-                registered.push((format!("{file} {key}"), placed.to_string().into_bytes()));
+            if let BridgeStep::AddConfigurationKey { file, key, value } = step
+                && !configuration_key_permitted(
+                    recipe.application.as_str(),
+                    file.as_str(),
+                    key,
+                    value,
+                )
+            {
+                return Err(format!(
+                    "the recipe adds the key {key} to {file}, which this host does not permit a \
+                     native bridge for {} to add",
+                    recipe.application
+                ));
             }
         }
+        let registered = sources.clone();
         let facts = registration(&registered, &forwarder)?;
         // The forwarder a registration starts reports for the application it names, and a
         // launch of this package admits only its own: a registration for another package's
@@ -2265,15 +2269,13 @@ fn registration(
     let mut applications = BTreeSet::new();
     let mut surfaces = BTreeSet::new();
     for (destination, bytes) in sources {
+        // Every file a recipe installs is JSON this host reads, whatever its name says: an
+        // application may read a file more leniently than this host does, or run it as a script,
+        // and what is not read is not checked.
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            // A file named for JSON that this host cannot read as JSON is one an application may
-            // read more leniently, with commands this host never saw.
-            if destination.ends_with(".json") {
-                return Err(format!(
-                    "{destination} cannot be read as JSON, so what it registers cannot be checked"
-                ));
-            }
-            continue;
+            return Err(format!(
+                "{destination} cannot be read as JSON, so what it registers cannot be checked"
+            ));
         };
         invocations(&value, destination, &mut applications, &mut surfaces)?;
     }
@@ -2316,6 +2318,14 @@ fn invocations(
                     )
                 };
                 let command = command.as_str().ok_or_else(unaccepted)?;
+                // The members a forwarder registration uses, and no others: one beside the
+                // command can run it in another environment or place.
+                if members
+                    .keys()
+                    .any(|member| !COMMAND_MEMBERS.contains(&member.as_str()))
+                {
+                    return Err(unaccepted());
+                }
                 let surface = if command == "kr-hook" {
                     let arguments = members.get("args").and_then(serde_json::Value::as_array);
                     let words: Vec<&str> = arguments
@@ -2365,6 +2375,34 @@ fn invocations(
         _ => {}
     }
     Ok(())
+}
+
+/// The members of an object that holds a command, which a forwarder registration uses: what kind
+/// of entry it is, its name, the command, its arguments and its time limit.
+const COMMAND_MEMBERS: [&str; 5] = ["type", "name", "command", "args", "timeout"];
+
+/// Whether a native bridge for `application` may add `key` to `file` with `value`: a closed table.
+///
+/// Claude Code's `enabledPlugins.<name>` in `settings.json`, set to `true`, which enables the
+/// registration files the release installed. Any other key, in any other document or with any
+/// other value, is not on the list, and an application that is not on it may add none. A key that
+/// makes an application run a program (a status line, an API key helper, a credential refresh, a
+/// hook, an MCP server) is therefore never added, whatever the recipe says.
+fn configuration_key_permitted(application: &str, file: &str, key: &str, value: &str) -> bool {
+    match application {
+        "Claude Code" => {
+            file == "settings.json"
+                && serde_json::from_str::<serde_json::Value>(value)
+                    .is_ok_and(|value| value == serde_json::Value::Bool(true))
+                && key.strip_prefix("enabledPlugins.").is_some_and(|name| {
+                    !name.is_empty()
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'@')
+                        })
+                })
+        }
+        _ => false,
+    }
 }
 
 /// True for a word of lower-case letters, digits and hyphens, which a shell reads as itself.

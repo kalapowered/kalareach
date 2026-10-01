@@ -978,19 +978,23 @@ mod tests {
     }
 
     /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
-    /// deadline and a bound beyond it, and what it says is that the outcome is not known: the
+    /// deadline and the bound beyond it, and what it says is that the outcome is not known: the
     /// request may have been performed, and "nothing was changed" would be a claim nobody can
-    /// make. The control is a refusal for another reason, which ends the wait at once as itself.
+    /// make. An answer that comes inside the bound beyond the deadline is the host's own, and one
+    /// that comes after it is not waited for. The control is a refusal for another reason, which
+    /// ends the wait at once as itself.
     #[tokio::test(start_paused = true)]
     async fn a_host_that_does_not_answer_leaves_the_outcome_unknown() {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(20);
-        let silent: Result<u32> = wait_for_an_owner_device(
-            deadline,
-            tokio::time::Duration::from_millis(20),
-            short(),
-            std::future::pending,
+        let started = tokio::time::Instant::now();
+        let deadline = started + tokio::time::Duration::from_millis(20);
+        let grace = tokio::time::Duration::from_millis(20);
+        // The outer bound is the test's own: a request that is never given up never ends.
+        let silent = tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            wait_for_an_owner_device::<u32>(deadline, grace, short(), std::future::pending),
         )
-        .await;
+        .await
+        .expect("the wait ended at its own bound");
         let Err(unknown @ CliError::Unfinished { .. }) = silent else {
             panic!("an unfinished request, which the host did not refuse");
         };
@@ -999,6 +1003,26 @@ mod tests {
         let said = unknown.to_string();
         assert!(said.contains("not known"), "{said}");
         assert!(!said.contains("Nothing was changed"), "{said}");
+        assert_eq!(
+            started.elapsed(),
+            tokio::time::Duration::from_millis(40),
+            "the wait ended at the deadline and the bound beyond it, on the paused clock"
+        );
+
+        // An answer inside the bound beyond the deadline is taken; one past it is not.
+        for (after, taken) in [(30, true), (50, false)] {
+            let slow: Result<u32> = wait_for_an_owner_device(
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(20),
+                grace,
+                short(),
+                async || {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(after)).await;
+                    Ok(7)
+                },
+            )
+            .await;
+            assert_eq!(slow.is_ok(), taken, "an answer after {after} ms");
+        }
 
         let asks = Asks::default();
         let other: Result<u32> = wait_for_an_owner_device(
