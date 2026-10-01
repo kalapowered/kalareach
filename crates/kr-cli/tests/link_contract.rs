@@ -233,7 +233,7 @@ fn bridge_helper() -> (tempfile::TempDir, Opening) {
                 // The answer's frames follow the acknowledgement at once, which a peer that
                 // answered a moment after the question would do no differently to a reader that
                 // is not waiting for them. Then it ends.
-                "cat \"$1\"; cat \"$2\"; sleep 0.5".to_owned(),
+                "head -c 4 >/dev/null; cat \"$1\"; cat \"$2\"; sleep 0.5".to_owned(),
                 "sh".to_owned(),
                 first.to_str().expect("text").to_owned(),
                 rest.to_str().expect("text").to_owned(),
@@ -270,7 +270,7 @@ async fn a_bridged_connection_keeps_the_same_contract() {
 async fn a_bridged_request_to_a_helper_that_has_gone_fails_instead_of_waiting() {
     let (_directory, mut opening) = bridge_helper();
     // The same helper, without the frames that would answer: it writes its acknowledgement and goes.
-    opening.command.arguments[1] = "cat \"$1\"; exit 0".to_owned();
+    opening.command.arguments[1] = "head -c 4 >/dev/null; cat \"$1\"; exit 0".to_owned();
     let invocation = opening.launch().await.expect("the helper answered");
     let mut link = BridgedLink::new(invocation.into_stream());
     let outcome =

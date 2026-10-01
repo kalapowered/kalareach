@@ -1359,8 +1359,6 @@ async fn new_in_enrolled(
     shell_mode: ShellMode,
     json: bool,
 ) -> Result<Completion> {
-    use kr_cli::bridge::session as bridged;
-
     // A terminal application opens where the session runs, and an enrolled environment has no
     // screen of this host's to open one on.
     if presentation == Presentation::Terminal {
@@ -1384,9 +1382,9 @@ async fn new_in_enrolled(
     let launch_profile = arguments.launch_profile()?;
     let fenced_launch = launch_profile.fenced_launch;
     let chosen_profile = arguments.execution.chosen();
-    let created = bridged::create(
+    let created = kr_cli::bridge::session::create(
         &enrolment,
-        &bridged::NewSession {
+        &kr_cli::bridge::session::NewSession {
             presentation,
             shell: arguments.shell,
             shell_mode,
@@ -1410,7 +1408,7 @@ async fn new_in_enrolled(
     let presented = match presentation {
         Presentation::Attach => {
             let session = &created.result.session;
-            bridged::attach(
+            kr_cli::bridge::session::attach(
                 &enrolment,
                 kr_cli::attach::Attaching {
                     session_id: session.session_id,
@@ -1447,17 +1445,15 @@ async fn attach_in_enrolled(
     arguments: &kr_cli::cli::AttachArguments,
     json: bool,
 ) -> Result<Completion> {
-    use kr_cli::bridge::session as bridged;
-
     // What the destination retains is read before this terminal is touched, so a closed session is
     // refused with how it ended rather than after a probe of the terminal.
-    let attaching = match bridged::locate(enrolment, selector).await? {
-        bridged::Found::Closed { session_id, record } => {
+    let attaching = match kr_cli::bridge::session::locate(enrolment, selector).await? {
+        kr_cli::bridge::session::Found::Closed { session_id, record } => {
             return Ok(closed_refusal(session_id, record, json));
         }
-        bridged::Found::Live(attaching) => attaching,
+        kr_cli::bridge::session::Found::Live(attaching) => attaching,
     };
-    let (outcome, session_id) = bridged::attach(
+    let (outcome, session_id) = kr_cli::bridge::session::attach(
         enrolment,
         attaching,
         AttachOptions {

@@ -270,13 +270,14 @@ pub fn origin_environment_id() -> EnvironmentId {
 }
 
 /// The environment a command that creates or attaches acts in.
-#[derive(Debug)]
 pub enum Selected {
     /// An environment of this installation, on this host.
     Local(crate::resolve::KnownEnvironment),
     /// An enrolled environment this host reaches through a process bridge.
     Enrolled(Box<EnvironmentEnrolment>),
 }
+
+kr_client::debug_as_name!(Selected);
 
 /// Resolves what `--environment` named: one of this host's own environments, else an enrolled one.
 ///
