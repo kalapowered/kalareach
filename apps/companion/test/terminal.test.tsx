@@ -386,6 +386,53 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.queryByTestId('terminal-ended')).toBeNull()
   })
 
+  it('opens again when the host connection comes back as the refusal of an open is published', async () => {
+    const { port, controls } = fakeHost()
+    controls.setConnected(false)
+    // The connection returns in the turn that publishes the refusal, before the page has drawn it.
+    const returning: HostPort = {
+      ...port,
+      openTerminalView: (sessionId, grid, listener) =>
+        port.openTerminalView(sessionId, grid, (state) => {
+          listener(state)
+          if (state.state === 'ended') controls.setConnected(true)
+        })
+    }
+    open(returning)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    expect(await screen.findByTestId('palette-provenance')).toBeInTheDocument()
+    expect(screen.queryByTestId('terminal-ended')).toBeNull()
+  })
+
+  it('opens again when the host connection comes back after the open call itself failed', async () => {
+    const { port, controls } = fakeHost()
+    // The first open is refused by the call, not by a state on the view's channel.
+    let refused = false
+    const failing: HostPort = {
+      ...port,
+      openTerminalView: (sessionId, grid, listener) => {
+        if (refused) return port.openTerminalView(sessionId, grid, listener)
+        refused = true
+        return Promise.reject(new Error('This session could not be reached'))
+      }
+    }
+    open(failing)
+    expect(await screen.findByTestId('terminal-ended')).toHaveTextContent(
+      'This session could not be reached'
+    )
+    expect(controls.terminalViews).toHaveLength(0)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    expect(await screen.findByTestId('palette-provenance')).toBeInTheDocument()
+    expect(screen.queryByTestId('terminal-ended')).toBeNull()
+  })
+
   it('leaves a live view alone when the host connection comes back', async () => {
     const { port, controls } = fakeHost()
     open(port)
