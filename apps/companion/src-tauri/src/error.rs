@@ -184,6 +184,15 @@ mod tests {
             "{}",
             error.message
         );
+        // Both platforms' words, whichever this test runs on.
+        assert_eq!(
+            crate::transfers::too_large_to_hand(true),
+            "a pasted or picked file is at most 64 MiB"
+        );
+        assert_eq!(
+            crate::transfers::too_large_to_hand(false),
+            "a pasted or picked file is at most 64 MiB; drop a larger one on the window"
+        );
     }
 
     /// A dropped folder is not a file, and the words say so: an update would not change it.
