@@ -373,10 +373,22 @@ impl DescribeModule {
             title: shown.title.as_str().to_owned(),
             source: protocol_source(shown.source),
             activity_text: Nullable(generated.map(|record| record.activity.as_str().to_owned())),
-            freshness: match (generated.is_some(), standing) {
-                (true, Some(standing)) => standing.freshness,
-                (true, None) => DescriptionFreshness::Stale,
-                (false, _) => DescriptionFreshness::None,
+            // A row from before this host started is from an earlier daemon, whose context
+            // revisions say nothing about this one's: it is shown as stale until a newer
+            // description replaces it.
+            freshness: match (generated, standing) {
+                (Some(record), Some(standing)) => {
+                    let earlier = published
+                        .as_ref()
+                        .is_some_and(|snapshot| record.produced_at_ms < snapshot.started_wall_ms);
+                    if earlier {
+                        DescriptionFreshness::Stale
+                    } else {
+                        standing.freshness
+                    }
+                }
+                (Some(_), None) => DescriptionFreshness::Stale,
+                (None, _) => DescriptionFreshness::None,
             },
             provenance: Nullable(generated.map(|record| DescriptionProvenance {
                 profile_id: record.profile_id.clone(),
@@ -726,6 +738,7 @@ pub(crate) struct Placement {
     pub(crate) catalogue: kr_describe::profile::catalogue::Catalogue,
     pub(crate) clock: host::Clock,
     pub(crate) conditions: Option<Arc<Mutex<kr_describe::resource::HostConditions>>>,
+    pub(crate) abandon: bool,
 }
 
 /// Maps where a title came from onto the protocol's word for it.
