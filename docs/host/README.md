@@ -2939,9 +2939,11 @@ particular, a reservation that never made it to the `spawned` state (because wri
 failed) will stay owed until the next time the daemon starts and fails it.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
-about an earlier one, is admitted under the privacy state the record publishes: only while privacy
-mode is off, and only at the generation the notification was admitted under. The admission is held
-until the answer is recorded. Turning privacy mode on waits for exchanges already admitted, and a
+about an earlier one, is admitted under the privacy state the record publishes, and only at the
+generation the notification was admitted under. The admission is held until the answer is recorded.
+Privacy mode ends the generation every notification that carries content was admitted under, so
+while it is on nothing is admitted but the alerts it lets through, and those only at the generation
+the fence stands at. Turning privacy mode on waits for exchanges already admitted, and a
 notification claimed before the change and presented after it, once a credential renewal that waits
 on the gateway has finished, is taken back rather than presented: nothing of it left this host, and
 it is settled as cancelled. Anything the outbox has on the wire when privacy mode is turned on stays
@@ -3991,8 +3993,10 @@ admits; a daemon thread held off the processor for longer than that between the 
 suspended in that instant, is the one case a lease cannot order. A delivery consumer releases the
 same way: each transport write of session text is made through the daemon's release, which refuses
 it once the check fails, and a consumer whose transport would send held bytes later on its own
-cannot carry session text. Text read from a finished session's journal needs no lease, because no
-transition can follow a closure the host confirmed.
+cannot carry session text. No sender of this host meets that contract, so none carries any, and a
+request already handed to a transport can still leave within that sender's own deadline. Text read
+from a finished session's journal needs no lease, because no transition can follow a closure the
+host confirmed.
 
 Privacy mode reports complete only once the daemon has recorded the new generation, which a request
 on the current attention connection says when it names that generation. Until then the worker's
@@ -4022,15 +4026,34 @@ same transaction as the work they describe, and the source is acknowledged only 
 host that dies in between is offered the same page again and the event keys absorb it. Both
 consumers register before they rely on collection keeping anything for them.
 
+The attention store is one of the journal's sources, and the daemon takes from it on every pass. The
+take is made with the store held, in the producer's order: the announcements are read, the events
+and the cursor are committed to the journal, and only then is the store told. An announcement about
+a session the daemon is closing is not offered until the store has read the session's journal to its
+end. The take is made only while the journal stands where the privacy state the daemon publishes
+says: a fence the journal has not reached, or has not yet lifted, takes nothing, and the store
+offers the same announcements again. Notifications are then built from the notices the journal
+holds, one for each destination whose recipient's grant reaches what the notice is about.
+
 What travels to a device is an opaque identifier, a preview sealed to that device's own
 notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a
 locked screen shows is one of six fixed sentences. There is no field for text a producer supplies.
 
+A paired device registers or rotates its notification-preview key under the admission its request
+was served under. Both stores are written with the registry held, and the admission is asked again
+there, after every wait: its deadline on the continuous clock, the authority it was admitted under,
+and the device's own grant on both clocks. The delivery journal is written first, because it can
+refuse a rotation the device directory knows nothing about, and once it has taken the registration
+the directory is completed without asking again, since refusing the second half would answer a
+registration that took effect as one that did not.
+
 The daemon sends on its own. Its start path recovers what an earlier daemon left on the wire and
-takes back what is no longer authorised, then a pass runs every second. Every HTTP exchange goes
-through the managed transport of the origin it is for: the gateway a delivery credential names, the
-address a webhook's owner configured, or Slack's, Discord's or Telegram's own. Mail goes to the
-submission server the owner's account names, over TLS the operating system's verifier checks.
+takes back what is no longer authorised, then a pass runs every second: it takes what the attention
+store has announced, produces from what the journal holds, and claims and sends what is due. Every
+HTTP exchange goes through the managed transport of the origin it is for: the gateway a delivery
+credential names, the address a webhook's owner configured, or Slack's, Discord's or Telegram's own.
+Mail goes to the submission server the owner's account names, over TLS the operating system's
+verifier checks.
 
 External destinations are different in the way that matters: their recipients can read what
 arrives, every message says so, and nothing in this host claims otherwise. A destination needs a
@@ -4047,10 +4070,12 @@ so a credential replaced under a configured destination never carries a notifica
 under the old one, and removing the destination deletes the credential with it.
 
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
-queued content, and does not report complete while a send is still on the wire. Notifications that
-already reached a provider are shown as retained artifacts, each saying that this host holds no way
-to recall it: there is no deletion action for a copy that is on somebody else's device or in
-somebody else's service, and the listing says so rather than offering one that would do nothing.
+queued content, and does not report complete while a send is still on the wire. A pending question
+or approval still alerts a paired device, with no preview and none of its words, and nothing else
+decided while privacy mode is on is ever sent. Notifications that already reached a provider are
+shown as retained artifacts, each saying that this host holds no way to recall it: there is no
+deletion action for a copy that is on somebody else's device or in somebody else's service, and the
+listing says so rather than offering one that would do nothing.
 
 `docs/delivery/README.md` is the whole of it.
 
