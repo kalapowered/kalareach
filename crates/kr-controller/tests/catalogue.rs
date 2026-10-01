@@ -4441,11 +4441,12 @@ mod native_bridges {
         assert_eq!(site.tree(), placed, "with no list it is back");
         assert!(bridge_facts(&host, &digest).is_some());
     }
-    /// KR-REQ-11.42: the index that says whether a release is revoked is read last and once. Where
-    /// it cannot be read nothing is known to stand and the registration is not kept on its
-    /// account, and a package the organisation's list excludes loses its registration whatever
-    /// state the index is in. The control is the index repaired: the registration comes back with
-    /// the next change that follows bridges.
+
+    /// KR-REQ-11.42: the index that says whether a release is revoked is read once, after what
+    /// needs no index and before the package. Where it cannot be read nothing is known to stand
+    /// and the registration is not kept on its account, and a package the organisation's list
+    /// excludes loses its registration whatever state the index is in. The control is the index
+    /// repaired: the registration comes back with the next change that follows bridges.
     ///
     /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
     /// platforms.
@@ -4516,6 +4517,119 @@ mod native_bridges {
             before,
             "a package the list excludes loses its registration with the index unreadable"
         );
+    }
+
+    /// The extracted package of the installed release, where a test can damage it.
+    #[cfg(unix)]
+    async fn package_directory(host: &Host, digest: &str) -> std::path::PathBuf {
+        let catalogue = host.module.catalogue().lock().await;
+        let installation = catalogue
+            .installation(host.environment_id, &claude_code())
+            .expect("readable")
+            .expect("installed");
+        assert_eq!(installation.package_digest.to_string(), digest);
+        catalogue
+            .store_of(&installation)
+            .package_dir(installation.package_digest)
+    }
+
+    /// The path of the active generation's index in the catalogue's store.
+    #[cfg(unix)]
+    async fn index_file(host: &Host) -> std::path::PathBuf {
+        let catalogue = host.module.catalogue().lock().await;
+        let id = RepositoryId::new("development").expect("a valid identifier");
+        let active = catalogue
+            .repository_views()
+            .expect("readable")
+            .into_iter()
+            .find(|view| view.enrolment.id == id)
+            .and_then(|view| view.active)
+            .expect("an activated generation");
+        catalogue
+            .store(&id)
+            .expect("enrolled")
+            .index_path(active.index_digest)
+    }
+
+    /// KR-REQ-11.42, KR-REQ-25.22: what the signed index says about a release decides its
+    /// registration whatever state the extracted package is in. A package that is not whole here
+    /// is not read, and its registration is left as it is, but a release its repository revokes,
+    /// or one whose revocation cannot be read, keeps no registration on that account. The
+    /// controls are the same damaged package under a generation that revokes nothing, which keeps
+    /// the registration, and the package restored, which brings it back.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_damaged_package_keeps_a_registration_only_while_nothing_says_it_must_go()
+     {
+        let site = Site::new();
+        let host = host(&site);
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let keys = signed_again(&host, home.path(), None, 1, None).await;
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &generation());
+        assert_eq!(site.tree(), placed, "applied");
+
+        // The extracted package loses a payload: it is not whole, so what it wants is not read.
+        let package = package_directory(&host, &digest).await;
+        let payload = package.join("README.md");
+        let kept = std::fs::read(&payload).expect("a payload of the package");
+        std::fs::remove_file(&payload).expect("a damaged package");
+        let name = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+
+        // Control: a generation that revokes nothing leaves the registration of a package that is
+        // not whole where it is.
+        signed_again(&host, home.path(), Some(keys.clone()), 2, None).await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            placed,
+            "a damaged package with nothing against it keeps its registration"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+
+        // The index that says whether the release is revoked cannot be read: nothing says it
+        // stands, so the registration goes although the package cannot be read either.
+        let index = index_file(&host).await;
+        let intact = std::fs::read(&index).expect("the index");
+        std::fs::write(&index, b"not an index").expect("damaged");
+        assert!(
+            host.module
+                .put_allowed_adapters(name("kalareach/claude-code"))
+                .await
+                .expect("put")
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "an unreadable index keeps no registration, whatever state the package is in"
+        );
+
+        // Control: the index repaired, the registration of the damaged package stays as it was
+        // found, which is out; restoring the package puts it back.
+        std::fs::write(&index, &intact).expect("repaired");
+        std::fs::write(&payload, &kept).expect("restored");
+        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
+        assert_eq!(site.tree(), placed, "the package restored, it is back");
+
+        // A release its repository revokes keeps no registration with the package damaged.
+        std::fs::remove_file(&payload).expect("a damaged package");
+        signed_again(&host, home.path(), Some(keys), 3, Some(revoked)).await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            before,
+            "a revoked release's registration is out with the package damaged"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
     }
 
     /// KR-REQ-11.42: the organisation's list is in force when the catalogue opens, before any
