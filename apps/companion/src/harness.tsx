@@ -16,7 +16,7 @@ import { fakeHost, type FakeHostControls } from './host/fake'
 // The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
 // the phone's one without pretending to be a phone.
 import { Shell, surfaceOf } from './mobile/entry'
-import { HarnessStrip } from './harness-strip'
+import { HarnessStrip, applyPendingReset } from './harness-strip'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -31,6 +31,9 @@ declare global {
 
 const root = document.getElementById('root')
 if (!root) throw new Error('The application has no root element.')
+
+// Before the shell reads what the page kept: a reset the strip asked for is done here.
+applyPendingReset(window.localStorage, window.sessionStorage)
 
 const { port, controls } = fakeHost()
 window.krTestHost = controls
