@@ -7,10 +7,14 @@
 //! and in the preview a person sees before anything is written.
 //!
 //! One scanner reads a field's text and replaces spans of it; every other character is left as it
-//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. The home
-//! directory is replaced first, over the whole field, and a quote in it counts as a quote in the
-//! field. Then:
+//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. The text is read
+//! once, as it was written, and every rule below finds spans in it, the home directory too: where
+//! a home directory and a credential overlap, the region they cover together is replaced whole, so
+//! a credential's value that starts inside a home with a space in it does not cut the home in two,
+//! and a quote in the home directory is a quote in the field.
 //!
+//! * **Home directory.** Each place the CLI's own home directory is a path's start becomes
+//!   `[home]`.
 //! * **Assignments.** A name, then `=`, then a value: when the name says credential, the value
 //!   becomes `[redacted]`. The name is the run of letters, digits, `_`, `.` and `-` before the
 //!   `=`, wherever the `=` is: `TOKEN=x`, `--password=x`, `?token=x` and `/tmp/TOKEN=x` all
@@ -52,9 +56,10 @@
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
 //! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
 //! or `#` in a URL, a quote character that is part of a secret, a value in `$'...'` quoting, a
-//! value with a command substitution, backticks or `${...}` in it, or a name nobody listed stays in
-//! the text. So does a user name anywhere in a path but the home directory's. The preview shows
-//! everything that will be written, and a person can leave a session out.
+//! value with a command substitution, backticks, `${...}` or a parenthesised array in it, or a
+//! name nobody listed stays in the text. So does a user name anywhere in a path but the home
+//! directory's. The preview shows everything that will be written, and a person can leave a session
+//! out.
 
 /// The name of these rules, recorded in the file and in the bundle's manifest.
 pub const RULES: &str = "session-content-1";
@@ -98,39 +103,36 @@ impl Paths {
     }
 }
 
-/// Redacts one field's text: its home directory, and each credential its text spells.
-///
-/// Whether the field can be redacted at all is decided in the text as it was written: a quote in
-/// the home directory (`/home/o'neil`) is a quote before the credential that follows it, and
-/// replacing the home first would hide it. Which spans are replaced is read in the text with the
-/// home directory replaced, so that a credential's value that starts inside a home with a space in
-/// it does not cut the home in two and leave part of it in the text.
+/// Redacts one field's text: its home directory, and each credential its text spells, found in the
+/// text as it was written.
 #[must_use]
 pub fn field(text: &str, home: Option<&str>, paths: Paths) -> String {
-    let withheld = || format!("[withheld: {} characters]", text.chars().count());
-    if credentials(text).is_none() {
-        return withheld();
-    }
-    let homed = home.map_or_else(|| text.to_owned(), |home| replace_home(text, home, paths));
-    credentials(&homed).unwrap_or_else(withheld)
+    let homes = home.map_or_else(Vec::new, |home| home_spans(text, home, paths));
+    credentials(text, homes)
+        .unwrap_or_else(|| format!("[withheld: {} characters]", text.chars().count()))
 }
 
-/// Replaces each place `home` is a path's start with [`HOME`].
+/// Each place `home` is a path's start, as a span that [`HOME`] replaces.
 ///
 /// A home is skipped when it is empty, a root, or not an absolute path: replacing `/` would turn
 /// every path of the machine into `[home]` followed by itself.
-fn replace_home(text: &str, home: &str, paths: Paths) -> String {
+fn home_spans(text: &str, home: &str, paths: Paths) -> Vec<Span> {
     let home = home.trim_end_matches(|character| paths.separates(character));
     // A drive's own root (`C:`) is a root like `/`, so a drive needs a directory after it.
     let drive = home.chars().nth(1) == Some(':') && home.chars().count() > 2;
     let absolute =
         home.starts_with('/') || (paths.backslash_separates && (home.starts_with('\\') || drive));
     if home.is_empty() || !absolute || !home.chars().any(char::is_alphanumeric) {
-        return text.to_owned();
+        return Vec::new();
     }
     let home: Vec<char> = home.chars().collect();
     let characters: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+    let offsets: Vec<usize> = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut spans = Vec::new();
     let mut at = 0;
     while at < characters.len() {
         // A path starts at the field's start, after whitespace, a quote or a separator of values
@@ -156,14 +158,17 @@ fn replace_home(text: &str, home: &str, paths: Paths) -> String {
                     || matches!(after, ':' | ';' | '"' | '\'')
             });
         if matches {
-            out.push_str(HOME);
+            spans.push(Span {
+                start: offsets[at],
+                end: offsets[end],
+                with: HOME,
+            });
             at = end;
         } else {
-            out.push(characters[at]);
             at += 1;
         }
     }
-    out
+    spans
 }
 
 /// One span of the text and what replaces it.
@@ -173,9 +178,9 @@ struct Span {
     with: &'static str,
 }
 
-/// Replaces each credential `text` spells, or says it cannot: `None` when a credential's value
-/// starts with a quote that never closes.
-fn credentials(text: &str) -> Option<String> {
+/// Replaces each credential `text` spells and each of `homes`, or says it cannot: `None` when a
+/// credential's value starts with a quote that never closes.
+fn credentials(text: &str, homes: Vec<Span>) -> Option<String> {
     let mut named = Vec::new();
     assignments(text, &mut named)?;
     options(text, &mut named)?;
@@ -186,6 +191,7 @@ fn credentials(text: &str) -> Option<String> {
         return None;
     }
     let mut spans = named;
+    spans.extend(homes);
     userinfo(text, &mut spans);
     Some(replace_spans(text, spans))
 }
@@ -193,7 +199,8 @@ fn credentials(text: &str) -> Option<String> {
 /// Replaces each of `spans` in `text`, earliest first. A span that starts inside one already taken
 /// is part of it: the region the first one replaces grows to the end of the later one, so a value
 /// that holds another credential, and a span that runs past the end of the one an earlier rule
-/// stopped at, are replaced whole and nothing of either is left behind.
+/// stopped at, are replaced whole and nothing of either is left behind. A region that a credential
+/// is part of is replaced as a credential: a home directory is the label only of a region of homes.
 fn replace_spans(text: &str, mut spans: Vec<Span>) -> String {
     spans.sort_by_key(|span| (span.start, span.end));
     let mut out = String::with_capacity(text.len());
@@ -201,7 +208,12 @@ fn replace_spans(text: &str, mut spans: Vec<Span>) -> String {
     let mut pending: Option<Span> = None;
     for span in spans {
         match pending.as_mut() {
-            Some(region) if span.start < region.end => region.end = region.end.max(span.end),
+            Some(region) if span.start < region.end => {
+                region.end = region.end.max(span.end);
+                if region.with == HOME {
+                    region.with = span.with;
+                }
+            }
             _ => {
                 if let Some(region) = pending.take() {
                     out.push_str(&text[taken..region.start]);
