@@ -3,46 +3,77 @@
 //
 // Usage: node scripts/debug-code.mjs <KalaReach.app>
 //
-// Exit 0 when the application and its extension hold none of it, 1 when they hold some, and 2 when
-// it could not be read. A debug build holds all of it by design, so this is run on a release.
+// Reads every executable in the bundle: the application's, its extension's, each framework's and a
+// debug build's separate library. Exit 0 when none holds any of it, 1 when some does, and 2 when it
+// could not be read. A debug build holds all of it by design, so this is run on a release.
 import { Buffer } from 'node:buffer'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-/** The names the debug-only code is made of, and what no release may link. */
+/**
+ * The names the debug-only code is made of, and what no release may link.
+ *
+ * A string literal of fifteen bytes or fewer can be compiled into instructions rather than kept as
+ * bytes, so the probe's flags and keys may not show in a release that wrongly holds the probe. Its
+ * type names are kept in the binary's metadata whatever the optimiser does with its strings, so they
+ * are named too.
+ */
 export const DEBUG_CODE_NAMES = [
-  'KRDeviceProbe',
+  // The probe's type name, which is also inside its launch flag, `-KRDeviceProbe`.
+  'DeviceProbe',
   'KRColourMode',
   'kr_probe_nonce',
   'kr_probe_group',
   'kr_ext_',
   'kr.probe.',
-  'probe-keychain',
+  'probe-presented',
   'to.kala.reach.probe.shot',
+  'ProbeSurface',
+  'ExtensionProbe',
+  'ProbeFixture',
+  'NotificationRecorder',
+  'KeychainSweepPlan',
   // Firebase's analytics library writes an installation of its own, whatever else is switched off.
-  'FIRAnalytics'
+  // These are names only that library holds: the core and messaging libraries, which are linked,
+  // look up and refer to `FIRAnalytics` and its interop by name, so that name proves nothing.
+  'APMAnalytics',
+  'GoogleAppMeasurement'
 ]
 
-/** The files of a bundle that are executables: the application's and each extension's. */
-function executables(app) {
-  const found = []
-  const name = 'KalaReach'
-  found.push(join(app, name))
-  const plugins = join(app, 'PlugIns')
-  let entries = []
+/** The first four bytes of a Mach-O file, thin or universal, in either byte order. */
+const MACH_O_MAGICS = [
+  [0xfe, 0xed, 0xfa, 0xce],
+  [0xfe, 0xed, 0xfa, 0xcf],
+  [0xce, 0xfa, 0xed, 0xfe],
+  [0xcf, 0xfa, 0xed, 0xfe],
+  [0xca, 0xfe, 0xba, 0xbe],
+  [0xbe, 0xba, 0xfe, 0xca]
+]
+
+function isMachO(path) {
+  const head = Buffer.alloc(4)
+  const file = openSync(path, 'r')
   try {
-    entries = readdirSync(plugins)
-  } catch {
-    // No extension is a bundle with fewer files to read.
+    if (readSync(file, head, 0, 4, 0) < 4) return false
+  } finally {
+    closeSync(file)
   }
-  for (const entry of entries) {
-    if (!entry.endsWith('.appex')) continue
-    const extension = join(plugins, entry)
-    for (const file of readdirSync(extension)) {
-      const path = join(extension, file)
-      if (statSync(path).isFile() && !file.includes('.')) found.push(path)
-    }
+  return MACH_O_MAGICS.some((magic) => magic.every((byte, at) => head[at] === byte))
+}
+
+/**
+ * Every executable in a bundle: the application's, each extension's and each framework's, and the
+ * separate library a debug build keeps its code in. A bundle's own executables are found by what
+ * they are rather than by where they are or what they are called, so none is left out.
+ */
+function executables(root) {
+  const found = []
+  for (const entry of readdirSync(root)) {
+    const path = join(root, entry)
+    const kind = statSync(path)
+    if (kind.isDirectory()) found.push(...executables(path))
+    else if (kind.isFile() && isMachO(path)) found.push(path)
   }
   return found
 }
@@ -50,7 +81,9 @@ function executables(app) {
 /** The problems found in a built application: each is one executable holding one name. */
 export function debugCodeIn(app) {
   const problems = []
-  for (const path of executables(app)) {
+  const found = executables(app).sort()
+  if (found.length === 0) throw new Error('the bundle holds no executable')
+  for (const path of found) {
     const bytes = readFileSync(path)
     for (const name of DEBUG_CODE_NAMES) {
       if (bytes.includes(Buffer.from(name))) problems.push(`${relative(app, path)} holds ${name}`)
