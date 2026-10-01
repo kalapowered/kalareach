@@ -568,6 +568,9 @@ fn digest_prefix(digest: &kr_protocol::scalars::Digest256) -> String {
 ///
 /// Returns [`CannotCheck::CannotShow`] when no line can say it all.
 pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String, CannotCheck> {
+    if !is_showable(subject) {
+        return Err(CannotCheck::CannotShow);
+    }
     for names in [40, 24, 16] {
         let host = shown(host_name, names);
         let text = match subject {
@@ -703,6 +706,12 @@ const fn platform(platform: DevicePlatform) -> &'static str {
     }
 }
 
+/// The longest address, name or identifier an enrolment or an installation shows whole.
+pub const FIELD_CHARS: usize = 2048;
+
+/// The longest statement a publisher's manifest may carry, and so the longest shown whole.
+pub const STATEMENT_CHARS: usize = 1000;
+
 /// True when `text` is one line a person reads as it is written: no control character, no
 /// character that reorders or hides text, and no white space but the space.
 ///
@@ -718,16 +727,45 @@ pub fn is_plain_text(text: &str) -> bool {
             .any(|character| character.is_whitespace() && character != ' ')
 }
 
-/// True for a character that reorders or hides text, which a dialog's line leaves out.
-const fn invisible(character: char) -> bool {
-    matches!(
-        character,
-        '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-    )
+/// True when every word an enrolment or an installation shows can be shown exactly as written:
+/// each is one plain line within its bound. A request with a word that cannot be is not offered
+/// to anybody to confirm, because what it shows would not be what its digest covers.
+fn is_showable(subject: &Subject) -> bool {
+    let line =
+        |text: &str| !text.is_empty() && text.chars().count() <= FIELD_CHARS && is_plain_text(text);
+    match subject {
+        Subject::CatalogueAdd(plan) => {
+            line(&plan.catalogue_id)
+                && line(&plan.metadata_url)
+                && line(&plan.targets_url)
+                && line(&plan.root_digest)
+                && plan.root_key_ids.iter().all(|key| line(key))
+                && plan.ceiling.iter().all(|capability| line(capability))
+        }
+        Subject::PluginInstall(plan) => {
+            line(plan.plugin_id.as_str())
+                && line(&plan.version)
+                && line(&plan.catalogue_id)
+                && line(&plan.package_digest)
+                && plan.ceiling.iter().all(|capability| line(capability))
+                && plan.grant.iter().all(|capability| line(capability))
+                && plan.grant_statement.as_ref().is_none_or(|statement| {
+                    !statement.is_empty()
+                        && statement.chars().count() <= STATEMENT_CHARS
+                        && is_plain_text(statement)
+                })
+        }
+        _ => true,
+    }
+}
+
+/// True for a character that reorders or hides text, which a dialog's line leaves out: the
+/// characters every package's own text is held to, apart from the control characters, which a
+/// line turns into spaces.
+fn invisible(character: char) -> bool {
+    kr_plugin_sdk::text::is_forbidden_text_char(character)
+        && !character.is_control()
+        && !character.is_whitespace()
 }
 
 /// Display text as a dialog may show it: on one line, with the characters that reorder or hide
@@ -1301,7 +1339,27 @@ mod tests {
                 }),
             ),
             (
-                "a budget",
+                "the metadata budget",
+                Box::new(|plan| plan.budgets.metadata_bytes = kr_protocol::scalars::U64::new(1)),
+            ),
+            (
+                "the entry budget",
+                Box::new(|plan| plan.budgets.metadata_entries = kr_protocol::scalars::U64::new(1)),
+            ),
+            (
+                "the generations kept",
+                Box::new(|plan| {
+                    plan.budgets.retained_generations = kr_protocol::scalars::U64::new(9)
+                }),
+            ),
+            (
+                "the metadata kept",
+                Box::new(|plan| {
+                    plan.budgets.retained_metadata_bytes = kr_protocol::scalars::U64::new(1)
+                }),
+            ),
+            (
+                "the package cache",
                 Box::new(|plan| {
                     plan.budgets.payload_cache_bytes = kr_protocol::scalars::U64::new(1)
                 }),
@@ -1500,18 +1558,34 @@ mod tests {
              beyond what the repository allows; package starts e5f6 0718"
         );
 
-        let hostile = Subject::PluginInstall(PluginInstallPlan {
-            catalogue_id: "com\u{2028}mu\u{202E}nity\n".repeat(20),
+        let long = Subject::PluginInstall(PluginInstallPlan {
+            catalogue_id: "community".repeat(30),
             ..install_plan()
         });
-        let line = reason(&hostile, &"h\u{2029}".repeat(60), NOW).expect("a line");
+        let line = reason(&long, &"h".repeat(120), NOW).expect("a line");
         assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
         assert!(
             line.contains("runs outside the plugin sandbox"),
             "authority is never shortened away: {line}"
         );
-        for hidden_character in ['\n', '\u{2028}', '\u{2029}', '\u{202E}'] {
-            assert!(!line.contains(hidden_character), "{line:?}");
+
+        // Words that cannot be shown as written are not cleaned into words the host did not
+        // write: there is no line.
+        for hidden in [
+            "com\u{2028}munity",
+            "com\u{202E}munity",
+            "com\nmunity",
+            "com\u{00AD}munity",
+        ] {
+            let hostile = Subject::PluginInstall(PluginInstallPlan {
+                catalogue_id: hidden.to_owned(),
+                ..install_plan()
+            });
+            assert_eq!(
+                reason(&hostile, "studio", NOW),
+                Err(CannotCheck::CannotShow),
+                "{hidden:?}"
+            );
         }
 
         for broken in ["", "not a hash", &"G".repeat(64), &"a".repeat(63)] {
@@ -1525,6 +1599,137 @@ mod tests {
                 "{broken:?}"
             );
         }
+    }
+
+    /// KR-REQ-11.42: a character that hides or reorders text is never shown: U+00AD and U+061C are
+    /// not control characters or white space and are in the policy every package's own text is held
+    /// to. A host's name, an address with one in its path or a publisher's statement that carries
+    /// one is a line no dialog is given, so the confirmation is not offered to the ceremony.
+    #[test]
+    fn text_that_hides_or_reorders_characters_is_never_shown() {
+        for hidden in [
+            '\u{00AD}', '\u{061C}', '\u{200B}', '\u{202E}', '\u{FFF9}', '\u{FEFF}',
+        ] {
+            assert!(
+                !is_plain_text(&format!("a{hidden}b")),
+                "U+{:04X}",
+                hidden as u32
+            );
+        }
+        assert!(is_plain_text(
+            "an ordinary line, with spaces and https://repo.example/a-b_c/"
+        ));
+        assert!(!is_plain_text("two\nlines"));
+        assert!(!is_plain_text("tab\there"));
+
+        let mut subjects = Vec::new();
+        for text in [
+            "https://repo.example/me\u{00AD}tadata/",
+            "https://repo.example/me\u{061C}tadata/",
+        ] {
+            subjects.push(Subject::CatalogueAdd(CatalogueTrustPlan {
+                metadata_url: text.to_owned(),
+                ..trust_plan()
+            }));
+            subjects.push(Subject::CatalogueAdd(CatalogueTrustPlan {
+                targets_url: text.to_owned(),
+                ..trust_plan()
+            }));
+        }
+        subjects.push(Subject::CatalogueAdd(CatalogueTrustPlan {
+            targets_url: format!("https://repo.example/{}", "a".repeat(5000)),
+            ..trust_plan()
+        }));
+        subjects.push(Subject::PluginInstall(PluginInstallPlan {
+            grant_statement: Some("it\u{00AD}s fine".to_owned()),
+            ..install_plan()
+        }));
+        subjects.push(Subject::PluginInstall(PluginInstallPlan {
+            grant_statement: Some("x".repeat(kr_plugin_sdk::text::Summary::LIMIT + 1)),
+            ..install_plan()
+        }));
+        subjects.push(Subject::PluginInstall(PluginInstallPlan {
+            version: "0.3\u{061C}.0".to_owned(),
+            ..install_plan()
+        }));
+        for subject in &subjects {
+            assert_eq!(
+                reason(subject, "studio", NOW),
+                Err(CannotCheck::CannotShow),
+                "{subject:?}"
+            );
+        }
+        // The control: the same plans with the text as written.
+        assert!(reason(&Subject::CatalogueAdd(trust_plan()), "studio", NOW).is_ok());
+        assert!(reason(&Subject::PluginInstall(install_plan()), "studio", NOW).is_ok());
+    }
+
+    /// A review of one listed challenge on a listing of its own, and what the person was asked and
+    /// what was sent.
+    async fn reviewed(
+        host: &PairedHost,
+        pending: PendingConfirmation,
+    ) -> (ReviewOutcome, usize, usize) {
+        let listing = Arc::new(Listing {
+            pending: Mutex::new(vec![pending]),
+            completions: AtomicUsize::new(0),
+            takes: std::sync::atomic::AtomicBool::new(true),
+            reply: Mutex::new(Reply::Took),
+        });
+        let confirmations = OwnerConfirmations::new(
+            host.clone(),
+            DeviceKeys::generate().expect("keys").authorisation,
+            listing.clone(),
+            Arc::new(Fixed(NOW)),
+        );
+        let listed = confirmations.pending().await.expect("the listing");
+        assert!(listed[0].subject.is_ok(), "the challenge itself checks");
+        let asked = Asked(Mutex::new(Vec::new()));
+        let outcome = confirmations.review(&listed[0], &asked).await;
+        let asked = asked.0.lock().expect("the record").len();
+        (outcome, asked, listing.completions.load(Ordering::SeqCst))
+    }
+
+    /// KR-REQ-11.42: a request whose text cannot be shown as written never reaches the ceremony,
+    /// whoever asks for the review: the review runs the same check before it asks the person, so
+    /// a signature is never given for facts a page withheld. Nothing is signed or sent. The
+    /// control is the same challenge with its text as written, which the person is asked about.
+    #[tokio::test]
+    async fn a_request_whose_text_cannot_be_shown_is_not_offered_to_the_ceremony() {
+        let host = paired_host();
+        for unshowable in [
+            CatalogueTrustPlan {
+                targets_url: format!("https://repo.example/{}", "a".repeat(5000)),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                metadata_url: "https://repo.example/me\u{00AD}tadata/".to_owned(),
+                ..trust_plan()
+            },
+        ] {
+            let pending = pending_for(
+                &host,
+                SensitiveAction::TrustRepositoryRoot,
+                unshowable.action_digest().expect("a digest"),
+                unshowable.display(),
+            );
+            assert_eq!(
+                reviewed(&host, pending).await,
+                (ReviewOutcome::CannotCheck, 0, 0),
+                "{unshowable:?}"
+            );
+        }
+        let trust = trust_plan();
+        let pending = pending_for(
+            &host,
+            SensitiveAction::TrustRepositoryRoot,
+            trust.action_digest().expect("a digest"),
+            trust.display(),
+        );
+        assert_eq!(
+            reviewed(&host, pending).await,
+            (ReviewOutcome::Confirmed, 1, 1)
+        );
     }
 
     /// An owner channel over a listing a test writes, which counts what is sent.
