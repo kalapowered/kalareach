@@ -1364,7 +1364,7 @@ export class ScriptedRecords {
         synced_at_ms: null
       }
     ]
-    return { catalogues }
+    return { catalogues, enrolment_budgets: budgets }
   }
 
   /* ---- What a test changes -------------------------------------------------------------------- */
