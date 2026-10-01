@@ -170,19 +170,60 @@ enum DeliveredMarks {
     }
 }
 
-/// A report that can be made once.
+/// How the push check ends, which it does once.
 ///
-/// A check that waits on something with a timeout can hear from it after the timeout has reported.
-/// Whichever comes first claims the report, and what the second would have left behind is never
-/// left.
-struct OneReport {
-    private(set) var claimed = false
+/// The check waits on Firebase with a timeout and on the person's answer, and can hear from either
+/// after the other has ended it. Whichever comes first reports; what a second would have reported
+/// or left behind is never reported or left. The one thing the check leaves behind is the file the
+/// next step reads to find the token it sends to, and it is left by the report that counts, before
+/// that report is made, so a reader that waits for the report finds the file whole.
+struct PushCheckReport {
+    private(set) var reported = false
+    let nonce: String
+    let group: String
+    let writeFile: (Data) -> Void
+    let finish: ([String: String]) -> Void
 
-    /// True for the first call and false after.
-    mutating func claim() -> Bool {
-        if claimed { return false }
-        claimed = true
-        return true
+    /// The person refused.
+    mutating func refused(facts: [String: String]) {
+        var facts = facts
+        facts["permission"] = "refused"
+        end(facts, leaving: nil)
+    }
+
+    /// Nothing came in time.
+    mutating func timedOut(facts: [String: String], state: String, permission: String) {
+        var facts = facts
+        facts["token"] = "timeout"
+        facts["state"] = state
+        facts["permission"] = permission
+        end(facts, leaving: nil)
+    }
+
+    /// Firebase answered with an error: only its domain and code are kept.
+    mutating func failed(facts: [String: String], domain: String, code: Int) {
+        var facts = facts
+        facts["token"] = "error"
+        facts["token.error"] = "\(domain)/\(code)"
+        end(facts, leaving: nil)
+    }
+
+    /// Firebase answered with a token, which is filed for the next step.
+    mutating func token(_ token: String, facts: [String: String]) {
+        var facts = facts
+        facts["token"] = "ready"
+        let file = ["nonce": nonce, "group": group, "fcm_token": token]
+        let write = writeFile
+        end(facts, leaving: {
+            if let data = try? JSONSerialization.data(withJSONObject: file) { write(data) }
+        })
+    }
+
+    private mutating func end(_ facts: [String: String], leaving: (() -> Void)?) {
+        guard !reported else { return }
+        reported = true
+        leaving?()
+        finish(facts)
     }
 }
 #endif
