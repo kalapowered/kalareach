@@ -477,11 +477,15 @@ A bridge places only what this host names for its application. For Claude Code t
 and the one key that enables them, `enabledPlugins.<name>@skills-dir` in `settings.json`, set to
 `true`, for the same name. For Gemini CLI it is three files in `extensions/<name>/` and no key. A
 recipe installs every one of the files, once. A destination or a key that is not on that list is
-refused, and so is a name in another case. A bridge therefore never installs a settings document of
-its own, never enables a plugin it did not install, and no value it adds can hold a command.
+refused, and so is a name in another case. The directory is one the host makes: one that is already
+there with anything in it besides this registration, or another folder beside it whose manifest has
+the same name, is refused, because the application would enable it with the registration. A bridge
+therefore never installs a settings document of its own, enables only the plugin its files make, and
+no value it adds can hold a command.
 
-What the forwarder does once the application starts it is the publisher's own, and the owner's
-confirmation of the publisher's statement is the only control on that.
+What the publisher chooses is which of the forwarder's events and which surface the registration
+starts it for, and what the package does with what the forwarder carries. The owner's confirmation
+of the publisher's statement is the only control on that.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key

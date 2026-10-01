@@ -1038,6 +1038,18 @@ fn a_registration_file_outside_the_shape_this_host_names_is_refused() {
             "bridge/hooks.json",
             r#"{"hooks": {"SessionStart": {"hooks": []}}}"#.to_owned(),
         ),
+        // The kinds of the members a handler and a manifest may hold.
+        (
+            "bridge/hooks.json",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": 5, "command": "kr-hook", "args": ["claude-code", "hook"]}]}]}}"#.to_owned(),
+        ),
+        (
+            "bridge/hooks.json",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "kr-hook", "args": ["claude-code", "hook"], "timeout": "5"}]}]}}"#.to_owned(),
+        ),
+        ("bridge/plugin-manifest.json", manifest("").replace(r#""version": "0.2.0""#, r#""version": 2"#)),
+        ("bridge/plugin-manifest.json", manifest(r#", "description": 5"#)),
+        ("bridge/plugin-manifest.json", manifest(r#", "displayName": ["x"]"#)),
         // A handler of another kind with only members a command has, a server of another kind
         // with only members a stdio server has, a matcher that is not text.
         (
@@ -1095,6 +1107,146 @@ fn a_registration_file_outside_the_shape_this_host_names_is_refused() {
     assert_eq!(settled, Settled::Applied, "the shipped files: {settled:?}");
 }
 
+/// A bridge installs into a directory it makes, and a name an application keeps once is not one
+/// the person's other plugin already holds. A `skills/<name>/` already there that this host did not
+/// make (the application would enable everything in it, such as a monitor's command, with the
+/// registration) and another folder whose manifest has the same name (the application keeps the
+/// first it reads, so the key could enable that one instead) are each refused before anything is
+/// written. The controls are a folder of another name beside it, which is applied, and the
+/// directory this host made, which a later run finishes and takes out (the boundary cases).
+#[cfg(unix)]
+#[test]
+fn a_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
+    let manifest_of = |name: &str| format!("{{\"name\": \"{name}\", \"version\": \"1\"}}");
+    let claim = |site: &Site, folder: &str, name: &str| {
+        let manifest = site
+            .application()
+            .join("skills")
+            .join(folder)
+            .join(".claude-plugin/plugin.json");
+        std::fs::create_dir_all(manifest.parent().expect("a parent")).expect("a folder");
+        std::fs::write(manifest, manifest_of(name)).expect("a manifest");
+    };
+    // A directory of the same name that holds a monitor and none of the registration's files.
+    let site = Site::new();
+    let monitors = site
+        .application()
+        .join("skills/kalareach-channels/monitors");
+    std::fs::create_dir_all(&monitors).expect("a folder");
+    std::fs::write(monitors.join("monitors.json"), b"[]").expect("a monitor file");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("did not make"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
+    // Another folder that names the same plugin.
+    let site = Site::new();
+    claim(&site, "a", "kalareach-channels");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("keeps one of two"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+    // The control: a folder of the person's own with another name beside it.
+    let site = Site::new();
+    claim(&site, "a", "theirs-too");
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+}
+
+/// The Gemini CLI registration's shapes are as closed as Claude Code's: a manifest holding
+/// another member or another name than its directory, and an install record that is not a local
+/// one with the source `/dev/null/<directory>` (a source another allowed-extensions pattern
+/// matches, a relative one an update would read, an `autoUpdate`, another type), are each refused
+/// before anything is written. The control is the shipped record.
+#[cfg(unix)]
+#[test]
+fn a_gemini_cli_registration_outside_its_shape_is_refused() {
+    let manifest = |extra: &str, name: &str| {
+        format!(r#"{{"name": "{name}", "version": "0.3.0", "description": "d"{extra}}}"#)
+    };
+    let cases = [
+        (
+            "gemini-extension.json",
+            manifest(r#", "mcpServers": {}"#, "kalareach"),
+        ),
+        (
+            "gemini-extension.json",
+            manifest(r#", "contextFileName": "x""#, "kalareach"),
+        ),
+        ("gemini-extension.json", manifest("", "theirs")),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": "/dev/null/kalareach", "type": "local", "autoUpdate": true}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": "/dev/null/kalareach", "type": "git"}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": "kalareach", "type": "local"}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": "/tmp/kalareach", "type": "local"}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": "/dev/null/other", "type": "local"}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"type": "local"}"#.to_owned(),
+        ),
+        (
+            "gemini-extension-install.json",
+            r#"{"source": 5, "type": "local"}"#.to_owned(),
+        ),
+    ];
+    for (source, bytes) in cases {
+        let site = GeminiSite::new();
+        let before = site.tree();
+        std::fs::write(site.package().join("bridge").join(source), &bytes).expect("a package file");
+        let digest = PayloadDigest::of(bytes.as_bytes()).to_string();
+        let mut recipe = serde_json::to_value(gemini_recipe()).expect("the recipe encodes");
+        for list in ["install", "remove"] {
+            for step in recipe[list].as_array_mut().expect("steps") {
+                let destination = step["destination"].as_str().unwrap_or_default();
+                let named = source.replace("gemini-extension-install", ".gemini-extension-install");
+                if destination.ends_with(&named) {
+                    step["digest"] = serde_json::json!(digest);
+                }
+            }
+        }
+        let target = BridgeTarget {
+            recipe: serde_json::from_value(recipe).expect("a recipe"),
+            ..site.release()
+        };
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(reason.contains(UNSHAPED), "{source}: {bytes}: {reason}");
+        assert_eq!(
+            site.tree(),
+            before,
+            "{source}: {bytes}: nothing was written"
+        );
+    }
+}
+
 /// A bridge installs every file of its registration, each once: a directory an application reads
 /// that holds a manifest or a server file this host has not checked is not one it may enable. A
 /// registration that leaves one out is refused, whichever, and a directory named with a character
@@ -1127,6 +1279,29 @@ fn a_bridge_that_installs_less_than_its_whole_registration_is_refused() {
         );
         assert_eq!(site.tree(), before, "{omitted}: nothing was written");
     }
+    // A file named twice is not installed exactly once.
+    let site = Site::new();
+    let before = site.tree();
+    let mut twice = serde_json::to_value(recipe()).expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        let steps = twice[list].as_array_mut().expect("steps");
+        let again = steps
+            .iter()
+            .find(|step| step["destination"] == HOOKS_PATH)
+            .cloned()
+            .expect("the hooks step");
+        steps.push(again);
+    }
+    let target = BridgeTarget {
+        recipe: serde_json::from_value(twice).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("exactly once"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
     for with_key in [true, false] {
         let site = Site::new();
         let before = site.tree();
