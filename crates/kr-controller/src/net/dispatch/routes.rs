@@ -553,6 +553,8 @@ impl RemoteConnection {
                 });
         }
         if let Some(retained) = held {
+            #[cfg(feature = "testing")]
+            self.controller.after_the_retained_lookup.wait().await;
             if let Err(error) = self.admitted_to_answer(validated) {
                 return failure(mutation.request_id, error);
             }
@@ -573,6 +575,8 @@ impl RemoteConnection {
         match self.retained_remotely(mutation, validated, &decided).await {
             Ok(Some((answered, read))) => {
                 *asked = Some(read);
+                #[cfg(feature = "testing")]
+                self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
                     Ok(()) => answered,
                     Err(error) => failure(mutation.request_id, error),
