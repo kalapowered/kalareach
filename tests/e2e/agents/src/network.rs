@@ -221,6 +221,22 @@ impl Proxy {
             .clone()
     }
 
+    /// Waits up to `wait` for every tunnel to end, as they do once the agent's processes have: a
+    /// tunnel that has not ended after that is reported as open.
+    pub fn settle(&self, wait: Duration) {
+        let end = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < end
+            && self
+                .tunnels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|tunnel| tunnel.carried.is_none())
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// The authorities it refused, one entry each, for the part's private log only.
     #[must_use]
     pub fn refused_authorities(&self) -> Vec<String> {
@@ -255,6 +271,31 @@ fn connect_authority(head: &str) -> Option<&str> {
     let (method, authority, version) = (words.next()?, words.next()?, words.next()?);
     (method == "CONNECT" && version.starts_with("HTTP/1.") && words.next().is_none())
         .then_some(authority)
+}
+
+/// A request line as the private log may keep it: its method and the authority it names, with no path,
+/// query, user or version, so no URL a plain request carried is kept beyond its host.
+fn request_target(line: &str) -> String {
+    let mut words = line.split(' ');
+    let method: String = words
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .take(16)
+        .collect();
+    let target = words.next().unwrap_or_default();
+    let authority = target
+        .split_once("://")
+        .map_or(target, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let authority: String = authority.chars().take(255).collect();
+    format!("{method} {authority}")
 }
 
 /// What the policy says of a request head. The name is resolved here, once.
@@ -326,8 +367,9 @@ fn serve(
         }
     }
     let head = String::from_utf8_lossy(&head).into_owned();
-    // Only the request line is kept, never a header.
-    let line = head.lines().next().unwrap_or_default().to_owned();
+    // Only the request line's method and where it points are kept, never a header, and of a URL
+    // neither its path nor its query.
+    let line = request_target(head.lines().next().unwrap_or_default());
     let candidates = match judge(&head, policy) {
         Verdict::Allow(addresses) => addresses,
         Verdict::Refuse(why) => {
@@ -384,12 +426,12 @@ fn serve(
         return;
     };
     let forward = std::thread::spawn(move || {
-        let sent = std::io::copy(&mut client_read, &mut upstream_write).unwrap_or(0);
+        let sent = relay(&mut client_read, &mut upstream_write);
         let _ = upstream_write.shutdown(Shutdown::Write);
         sent
     });
     let (mut upstream_read, mut client_write) = (upstream, client);
-    let received = std::io::copy(&mut upstream_read, &mut client_write).unwrap_or(0);
+    let received = relay(&mut upstream_read, &mut client_write);
     let _ = client_write.shutdown(Shutdown::Write);
     let sent = forward.join().unwrap_or(0);
     if let Some(tunnel) = tunnels
@@ -398,6 +440,23 @@ fn serve(
         .get_mut(index)
     {
         tunnel.carried = Some((sent, received));
+    }
+}
+
+/// Copies `from` to `to` until either ends or fails, and returns the bytes that were written: an
+/// error after some bytes went through leaves the count of those, where a plain copy would lose it.
+fn relay(from: &mut impl Read, to: &mut impl Write) -> u64 {
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut written = 0_u64;
+    loop {
+        let read = match from.read(&mut buffer) {
+            Ok(0) | Err(_) => return written,
+            Ok(read) => read,
+        };
+        if to.write_all(&buffer[..read]).is_err() {
+            return written;
+        }
+        written += read as u64;
     }
 }
 
@@ -525,6 +584,48 @@ mod tests {
             judge("CONNECT api.example:443 HTTP/1.1\r\n\r\n", &none),
             Verdict::Refuse(Refusal::Unresolved)
         );
+    }
+
+    #[test]
+    fn a_refused_request_is_kept_as_its_method_and_host_and_no_path_query_or_user() {
+        assert_eq!(
+            request_target("GET http://user:pw@api.example/some/path?token=abc#x HTTP/1.1"),
+            "GET api.example"
+        );
+        assert_eq!(
+            request_target("CONNECT other.example:443 HTTP/1.1"),
+            "CONNECT other.example:443"
+        );
+        assert_eq!(request_target("GET /relative?q=1 HTTP/1.1"), "GET ");
+        assert_eq!(request_target(""), " ");
+    }
+
+    /// A reader that gives its bytes and then fails, and a writer that takes only so many.
+    struct Failing(&'static [u8], bool);
+
+    impl Read for Failing {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return if self.1 {
+                    Err(std::io::Error::new(ErrorKind::ConnectionReset, "reset"))
+                } else {
+                    Ok(0)
+                };
+            }
+            let count = self.0.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.0[..count]);
+            self.0 = &self.0[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_reset_after_some_bytes_went_through_still_counts_them() {
+        let mut taken = Vec::new();
+        assert_eq!(relay(&mut Failing(b"hello", true), &mut taken), 5);
+        assert_eq!(taken, b"hello");
+        assert_eq!(relay(&mut Failing(b"", true), &mut Vec::new()), 0);
+        assert_eq!(relay(&mut Failing(b"abc", false), &mut Vec::new()), 3);
     }
 
     #[test]

@@ -88,17 +88,19 @@ pub fn answers(
     Ok(counted.len())
 }
 
-/// Whether the agent's own record of its latest request for approval after line `after` of `text` is
-/// one of the tool the part asked it to use, is still pending, and names `command` and the folder
-/// `cwd` it runs in. The last line holding `request.line` must be JSON with `kind` `approval`, an
-/// `id` and a `toolCallId` that its `request` repeats, `request.toolName` the tool named,
-/// `request.agentId` the main agent, `request.display.command` the command and
-/// `request.display.cwd` the folder; and no later line holding `request.resolved_line` may name its
-/// `id`, since an answered request is not the dialog on the screen.
+/// Whether the agent's own record, after line `after` of `text`, holds exactly one request for
+/// approval still pending, and it is one of the tool the part asked it to use, naming `command` and
+/// the folder `cwd` it runs in. A request is a line holding `request.line` that is JSON with `kind`
+/// `approval`, an `id` and a `toolCallId` that its `request` repeats, `request.toolName` the tool
+/// named, `request.agentId` the main agent, `request.display.command` the command and
+/// `request.display.cwd` the folder; it is pending while no later line holding
+/// `request.resolved_line` names its `id`. The dialog on the screen shows the command alone, so
+/// with two requests pending it could be either, and neither is answered.
 ///
 /// # Errors
 ///
-/// Returns what the record names in their place, or that there is none.
+/// Returns what the record names in their place, that there is none pending, or that there are
+/// several.
 pub fn request_names(
     text: &str,
     after: Option<usize>,
@@ -106,34 +108,58 @@ pub fn request_names(
     command: &str,
     cwd: &str,
 ) -> Result<(), String> {
-    let (at, line) = text
-        .lines()
-        .enumerate()
-        .filter(|(index, line)| {
-            after.is_none_or(|from| *index > from) && line.contains(request.line.as_str())
-        })
-        .last()
-        .ok_or_else(|| "the conversation holds no record of a request for approval".to_owned())?;
-    let record: serde_json::Value = serde_json::from_str(line)
-        .map_err(|error| format!("the request's record is not JSON: {error}"))?;
     let words =
         |holder: &serde_json::Value, key: &str| holder[key].as_str().unwrap_or_default().to_owned();
-    if words(&record, "kind") != "approval" {
+    let lines: Vec<&str> = text.lines().collect();
+    let answered = |from: usize, id: &str| {
+        lines.iter().skip(from + 1).any(|later| {
+            later.contains(request.resolved_line.as_str())
+                && serde_json::from_str::<serde_json::Value>(later)
+                    .is_ok_and(|answer| words(&answer, "id") == id)
+        })
+    };
+    let mut pending: Vec<serde_json::Value> = Vec::new();
+    let mut requests = 0;
+    for (at, line) in lines.iter().enumerate() {
+        if after.is_some_and(|from| at <= from) || !line.contains(request.line.as_str()) {
+            continue;
+        }
+        requests += 1;
+        let record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("a request's record is not JSON: {error}"))?;
+        if !answered(at, &words(&record, "id")) {
+            pending.push(record);
+        }
+    }
+    let record = match pending.as_slice() {
+        [] if requests == 0 => {
+            return Err("the conversation holds no record of a request for approval".to_owned());
+        }
+        [] => return Err("every request for approval in the record has been answered".to_owned()),
+        [one] => one,
+        several => {
+            return Err(format!(
+                "{} requests for approval are pending, and the dialog could be any of them",
+                several.len()
+            ));
+        }
+    };
+    if words(record, "kind") != "approval" {
         return Err("the record is not a request for approval".to_owned());
     }
-    let id = words(&record, "id");
+    let id = words(record, "id");
     let details = &record["request"];
     if id.is_empty() || words(details, "id") != id {
         return Err("the request's record has no identifier, or two".to_owned());
     }
-    let call = words(&record, "toolCallId");
+    let call = words(record, "toolCallId");
     if call.is_empty() || words(details, "toolCallId") != call {
         return Err("the request's record names no tool call, or two".to_owned());
     }
     if words(details, "toolName") != request.tool {
         return Err("the request's record is for another tool".to_owned());
     }
-    if words(&record, "agentId") != "main" || words(details, "agentId") != "main" {
+    if words(record, "agentId") != "main" || words(details, "agentId") != "main" {
         return Err("the request's record is not the main agent's".to_owned());
     }
     let display = &details["display"];
@@ -142,14 +168,6 @@ pub fn request_names(
     }
     if words(display, "cwd") != cwd {
         return Err("the request's record names another folder to run it in".to_owned());
-    }
-    let answered = text.lines().skip(at + 1).any(|later| {
-        later.contains(request.resolved_line.as_str())
-            && serde_json::from_str::<serde_json::Value>(later)
-                .is_ok_and(|answer| words(&answer, "id") == id)
-    });
-    if answered {
-        return Err("the request's record has been answered already".to_owned());
     }
     Ok(())
 }
@@ -251,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_approval_is_the_pending_one_for_the_tool_with_the_command_and_the_folder() {
+    fn a_request_for_approval_is_the_one_pending_for_the_tool_with_the_command_and_the_folder() {
         let request = |id: &str, tool: &str, command: &str, cwd: &str| {
             format!(
                 "{{\"type\":\"interaction.request\",\"agentId\":\"main\",\"id\":\"{id}\",\"kind\":\"approval\",\"toolCallId\":\"call-{id}\",\"request\":{{\"id\":\"{id}\",\"agentId\":\"main\",\"toolCallId\":\"call-{id}\",\"toolName\":\"{tool}\",\"display\":{{\"kind\":\"command\",\"command\":\"{command}\",\"cwd\":\"{cwd}\"}}}}}}\n"
@@ -267,43 +285,51 @@ mod tests {
             resolved_line: r#""type":"interaction.resolved""#.to_owned(),
             tool: "Bash".to_owned(),
         };
+        let names = |text: &str, command: &str, cwd: &str| {
+            request_names(text, Some(0), &record, command, cwd)
+        };
+        let prompt = "{\"type\":\"turn.prompt\"}\n";
+        // An earlier request answered, and the one pending.
         let text = format!(
-            "{{\"type\":\"turn.prompt\"}}\n{}{}",
+            "{prompt}{}{}{}",
             request("a", "Bash", "echo a >> a", "/r/w"),
+            resolved("a"),
             request("b", "Bash", "echo kr1 >> a", "/r/w")
         );
-        assert_eq!(
-            request_names(&text, Some(0), &record, "echo kr1 >> a", "/r/w"),
-            Ok(())
-        );
+        assert_eq!(names(&text, "echo kr1 >> a", "/r/w"), Ok(()));
         assert!(
-            request_names(&text, Some(0), &record, "echo a >> a", "/r/w").is_err(),
-            "the latest request is the one read"
+            names(&text, "echo a >> a", "/r/w").is_err(),
+            "the pending one is the one read"
         );
-        assert!(request_names(&text, Some(0), &record, "echo kr1 >> a", "/elsewhere").is_err());
+        assert!(names(&text, "echo kr1 >> a", "/elsewhere").is_err());
         assert!(
             request_names(&text, Some(3), &record, "echo kr1 >> a", "/r/w").is_err(),
             "nothing after that line"
         );
-        // Another tool's request, an answered one, another request answered and a record that
-        // contradicts itself.
-        let other_tool = format!(
-            "{{\"type\":\"turn.prompt\"}}\n{}",
-            request("c", "Write", "echo kr1 >> a", "/r/w")
+        // Two pending: the dialog could be either, and the same command in another folder is not told
+        // apart on the screen.
+        let two = format!(
+            "{prompt}{}{}",
+            request("a", "Bash", "echo kr1 >> a", "/other"),
+            request("b", "Bash", "echo kr1 >> a", "/r/w")
         );
-        assert!(request_names(&other_tool, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
+        assert!(names(&two, "echo kr1 >> a", "/r/w").is_err());
+        // Another tool's request, an answered one, and the answer to another request.
+        let other_tool = format!("{prompt}{}", request("c", "Write", "echo kr1 >> a", "/r/w"));
+        assert!(names(&other_tool, "echo kr1 >> a", "/r/w").is_err());
         let answered = format!("{text}{}", resolved("b"));
-        assert!(request_names(&answered, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
-        let another_answered = format!("{text}{}", resolved("a"));
+        assert!(names(&answered, "echo kr1 >> a", "/r/w").is_err());
+        let another_answered = format!("{text}{}", resolved("c"));
         assert_eq!(
-            request_names(&another_answered, Some(0), &record, "echo kr1 >> a", "/r/w"),
+            names(&another_answered, "echo kr1 >> a", "/r/w"),
             Ok(()),
             "the answer to another request does not answer this one"
         );
+        // A record that contradicts itself, a subagent's, and one that is no JSON.
         let torn = text.replace("call-b\",\"request", "call-x\",\"request");
-        assert!(request_names(&torn, Some(0), &record, "echo kr1 >> a", "/r/w").is_err());
+        assert!(names(&torn, "echo kr1 >> a", "/r/w").is_err());
         let subagent = text.replace("\"agentId\":\"main\"", "\"agentId\":\"agent-0\"");
-        assert!(request_names(&subagent, Some(0), &record, "echo a >> a", "/r/w").is_err());
+        assert!(names(&subagent, "echo kr1 >> a", "/r/w").is_err());
         assert!(
             request_names(
                 "not json with the mark \"type\":\"interaction.request\"\n",
@@ -314,6 +340,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(names(prompt, "c", "d").is_err(), "none at all");
     }
 
     #[test]
