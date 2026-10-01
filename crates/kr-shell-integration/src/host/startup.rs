@@ -871,18 +871,11 @@ impl FileLock {
     ///
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     fn take_for_startup_file(path: &Path, locks: &Path) -> std::io::Result<Self> {
-        use sha2::{Digest as _, Sha256};
-
-        let target = resolved(path)?;
+        let name = lock_name(path)?;
         // The installation's state directory is the root, made this user's own like everything
         // under it, and the lock directory is inside it.
         kr_ipc::paths::create_private_tree(locks.parent().unwrap_or(locks), locks)
             .map_err(std::io::Error::other)?;
-        let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
-        let name = digest.iter().fold(String::new(), |mut name, byte| {
-            name.push_str(&format!("{byte:02x}"));
-            name
-        });
         Self::acquire(locks.join(format!("{name}.lock")), path)
     }
 
@@ -1118,6 +1111,48 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     prepared
+}
+
+/// Returns the name of the lock that holds one startup file, a digest of where the file is.
+///
+/// Every way of reaching the file gives one name: a link at the file, a link at any directory above
+/// it, and a path that spells a directory another way all resolve to the same place. A directory
+/// that is not there yet is resolved as far as it exists, so a first-time setup that creates it
+/// names the lock of the file it is about to write.
+fn lock_name(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let target = resolved(path)?;
+    let mut existing = target.parent().map(Path::to_path_buf);
+    let mut below = Vec::new();
+    // The nearest directory above the file that exists, and what lies between it and the file.
+    while let Some(directory) = existing.take() {
+        match std::fs::canonicalize(&directory) {
+            Ok(real) => {
+                existing = Some(real);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(name) = directory.file_name() {
+                    below.push(name.to_os_string());
+                }
+                existing = directory.parent().map(Path::to_path_buf);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut key = existing.unwrap_or_default();
+    for name in below.iter().rev() {
+        key.push(name);
+    }
+    if let Some(name) = target.file_name() {
+        key.push(name);
+    }
+    let digest = Sha256::digest(key.as_os_str().as_encoded_bytes());
+    Ok(digest.iter().fold(String::new(), |mut name, byte| {
+        name.push_str(&format!("{byte:02x}"));
+        name
+    }))
 }
 
 /// Returns the file a startup path resolves to, following a link the user made.
@@ -1701,6 +1736,51 @@ mod tests {
                 .starts_with("export EDITOR=vim"),
             "the user's own line is still first"
         );
+    }
+
+    /// KR-REQ-26.05: two ways of reaching one startup file are one lock, so two installs through
+    /// them cannot write the file at once and lose an entry.
+    #[cfg(unix)]
+    #[test]
+    fn every_way_of_reaching_a_startup_file_names_one_lock() {
+        let root = tempfile::tempdir().expect("a directory");
+        let real = root.path().join("dotfiles");
+        std::fs::create_dir(&real).expect("a directory");
+        std::fs::write(real.join(".zshrc"), "export EDITOR=vim\n").expect("writes");
+        // The home's own directory is a link to the checkout.
+        let linked = root.path().join("home");
+        std::os::unix::fs::symlink(&real, &linked).expect("links the directory");
+        // And the file is a link of its own, in a directory that is a link to another.
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).expect("a directory");
+        std::os::unix::fs::symlink(real.join(".zshrc"), other.join(".zshrc")).expect("links");
+        let through_other = root.path().join("alias");
+        std::os::unix::fs::symlink(&other, &through_other).expect("links the directory");
+
+        let by_real = lock_name(&real.join(".zshrc")).expect("a name");
+        for alias in [
+            linked.join(".zshrc"),
+            other.join(".zshrc"),
+            through_other.join(".zshrc"),
+            real.join("../dotfiles/.zshrc"),
+        ] {
+            assert_eq!(
+                lock_name(&alias).expect("a name"),
+                by_real,
+                "{} is the same file and takes another lock",
+                alias.display()
+            );
+        }
+        // A directory that is not there yet is resolved as far as it exists.
+        let before = lock_name(&linked.join("config/profile.ps1")).expect("a name");
+        std::fs::create_dir(real.join("config")).expect("a directory");
+        assert_eq!(
+            lock_name(&real.join("config/profile.ps1")).expect("a name"),
+            before,
+            "the lock of a file in a directory that was not there changes when it is made"
+        );
+        // And a different file is a different lock.
+        assert_ne!(lock_name(&real.join(".bashrc")).expect("a name"), by_real);
     }
 
     /// KR-REQ-07.29: a first-time setup creates the directory and still takes a lock in it.
