@@ -296,6 +296,15 @@ fn report(host: &Host, block: RootCommandBlockParams) {
     });
 }
 
+/// A file that can be run, which is all a resolution has to name for the program to be named: this
+/// test's own executable.
+fn executable() -> String {
+    std::env::current_exe()
+        .expect("this test's own executable")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Reports the shell's question in front of an interactive command of the line accepted at prompt
 /// generation `generation`, as the shell integration's hook does: the program is named from the
 /// file the shell's own search resolved the command to.
@@ -503,7 +512,7 @@ async fn a_command_block_becomes_a_directory_a_program_and_a_completion() {
         &host,
         1,
         &["cargo", "test", "--all", "--token", "hunter2"],
-        "/usr/bin/cargo",
+        &executable(),
     );
     report(
         &host,
@@ -559,9 +568,33 @@ async fn a_word_typed_at_the_prompt_is_no_program_and_a_resolved_command_still_i
     let encoded = serde_json::to_string(&facts).expect("facts encode");
     assert!(!encoded.contains("9f3a7c1e"), "{encoded}");
 
-    resolved(&host, 2, &["make", "all"], "/usr/bin/make");
-    report(&host, block_at(2, "make all", "/home/a/work", None));
-    let made = ask(&mut link, 2, facts.revision.get(), 0, Some(0)).await;
+    // A shell that asks about a word with slashes in it, found or not, is not believed: the path
+    // it names is no file.
+    resolved(
+        &host,
+        2,
+        &["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+        "/home/a/work/wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    );
+    report(
+        &host,
+        block_at(
+            2,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "/home/a/work",
+            None,
+        ),
+    );
+    let slashed = ask(&mut link, 2, 0, 0, Some(0)).await;
+    let facts = slashed.facts.0.expect("facts");
+    assert_eq!(facts.application.0, None, "a pasted token with slashes");
+    assert!(facts.events.is_empty());
+    let encoded = serde_json::to_string(&facts).expect("facts encode");
+    assert!(!encoded.contains("bPxRfiCY"), "{encoded}");
+
+    resolved(&host, 3, &["make", "all"], &executable());
+    report(&host, block_at(3, "make all", "/home/a/work", None));
+    let made = ask(&mut link, 3, facts.revision.get(), 0, Some(0)).await;
     let facts = made.facts.0.expect("facts");
     assert_eq!(facts.application.0.as_deref(), Some("make"));
     assert_eq!(facts.events.len(), 1);
@@ -586,7 +619,7 @@ async fn a_held_request_is_answered_by_the_change_that_moves_the_facts() {
     // says it is holding the request, so an answer that came before it would be the first frame.
     send(&mut link, request(3, 0, 300_000, current)).await;
     until_held(&host, 1).await;
-    resolved(&host, 1, &["make"], "/usr/bin/make");
+    resolved(&host, 1, &["make"], &executable());
     report(&host, block("make", "/home/a/work", None));
     let answered = page(&mut link).await;
     assert_eq!(answered.request_id, RequestId::new(3));
@@ -766,7 +799,7 @@ async fn privacy_mode_stops_capture_clears_the_record_and_tells_the_daemon() {
 
     // Turned off: a record of its own, at the new generation, with nothing from before.
     tell_privacy(&host, &mut authority, 2, false).await;
-    resolved(&host, 1, &["make"], "/usr/bin/make");
+    resolved(&host, 1, &["make"], &executable());
     report(&host, block("make", "/home/a/after", None));
     let after = ask(&mut link, 4, 0, 0, Some(2)).await;
     assert!(!after.private);

@@ -621,18 +621,43 @@ fn last_component(path: &str) -> Option<String> {
 /// The name of the program a shell resolved an invocation to, and nothing else of it.
 ///
 /// The name comes from the shell's own answer to which file a command runs: an interactive
-/// invocation whose command name the shell's search resolved to an absolute path names the program,
-/// and its name is the last component of the command name as it was typed. The command line is
-/// never read for it, so a word the shell did not resolve to a file, whether a token pasted at the
-/// prompt or the name of a function, a builtin or a command that does not exist, names no program,
-/// and neither does a shell that does not ask. A missing name is no harm, and a wrong one is a leak
-/// of what a person typed.
+/// invocation whose command name the shell's search resolved to an executable file names the
+/// program, and its name is the last component of the command name as it was typed. The command
+/// line is never read for it. A shell that does not ask names none, and neither does a word that
+/// did not resolve to a file: a token pasted at the prompt, the name of a function or a builtin, or
+/// a command that does not exist. A shell that asks before it has found a file (a word with a
+/// slash in it is the word itself to a shell's search, found or not) is not believed: the file the
+/// answer names has to be there, a regular file this user can run. A missing name is no harm, and a
+/// wrong one is a leak of what a person typed.
 fn program_of(invocation: &RootCommandResolveParams) -> Option<String> {
-    if !invocation.interactive || !Path::new(&invocation.executable).is_absolute() {
+    if !invocation.interactive || !is_executable_file(Path::new(&invocation.executable)) {
         return None;
     }
     let typed = invocation.argv.first()?;
     clip(typed.rsplit('/').next().unwrap_or(typed))
+}
+
+/// Whether `path` is an absolute path to an existing regular file that can be run: on a platform
+/// with permission bits, one with an execute bit set.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Reads what the file system says of one read: the directory it names, and the repository above.
@@ -859,37 +884,100 @@ mod tests {
         }
     }
 
+    /// A file that can be run, which is all a resolution has to name for the program to be named:
+    /// this test's own executable.
+    fn executable() -> String {
+        std::env::current_exe()
+            .expect("this test's own executable")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// The program is the command name the shell resolved to a file, without its path, and no
-    /// argument of the invocation is in it. What the shell did not resolve to an absolute path, an
-    /// invocation that is not interactive and one with no command name name none.
+    /// argument of the invocation is in it. What the shell did not resolve to a file that can be
+    /// run, an invocation that is not interactive and one with no command name name none. This
+    /// includes the answer of a shell that asks about a word with a slash in it whether or not a
+    /// file is there (a token with slashes in it, or an address, pasted at the prompt), which
+    /// carries an absolute path made of the shell's directory and the word.
     #[test]
-    fn a_program_is_named_only_from_what_the_shell_resolved_to_a_file() {
+    fn a_program_is_named_only_from_what_the_shell_resolved_to_a_file_that_can_be_run() {
         let interactive =
             |argv: &[&str], executable: &str| program_of(&resolve(1, argv, executable));
+        let own = executable();
         assert_eq!(
-            interactive(&["cargo", "test", "--token", "hunter2"], "/usr/bin/cargo").as_deref(),
+            interactive(&["cargo", "test", "--token", "hunter2"], &own).as_deref(),
             Some("cargo")
         );
+        // A command typed with a path names the program by the last part, as long as it is a file.
         assert_eq!(
-            interactive(&["/opt/tools/rg", "secret-needle"], "/opt/tools/rg").as_deref(),
+            interactive(&["/opt/tools/rg", "secret-needle"], &own).as_deref(),
             Some("rg")
         );
-        assert_eq!(
-            interactive(&["./run.sh"], "/home/a/work/run.sh").as_deref(),
-            Some("run.sh")
-        );
-        assert_eq!(
-            interactive(&["g++", "-O2"], "/usr/bin/g++").as_deref(),
-            Some("g++")
-        );
+        assert_eq!(interactive(&["./run.sh"], &own).as_deref(), Some("run.sh"));
+        assert_eq!(interactive(&["g++", "-O2"], &own).as_deref(), Some("g++"));
+
         // The shell found no file, or named a relative one, or had no command name.
         assert_eq!(interactive(&["hunter2token"], ""), None);
         assert_eq!(interactive(&["cargo"], "cargo"), None);
         assert_eq!(interactive(&["cargo"], "./cargo"), None);
-        assert_eq!(interactive(&[], "/usr/bin/cargo"), None);
-        let mut script = resolve(1, &["cargo"], "/usr/bin/cargo");
+        assert_eq!(interactive(&[], &own), None);
+        let mut script = resolve(1, &["cargo"], &own);
         script.interactive = false;
         assert_eq!(program_of(&script), None, "a line of a script is not typed");
+
+        // The shell named a path that is no file that can be run: the word a person pasted with
+        // slashes in it, joined to the shell's directory, a directory, a file with no execute
+        // bit. The control for each is the file that can be run, above.
+        let root = tempfile::tempdir().expect("a directory");
+        let pasted = root
+            .path()
+            .join("wJalrXUtnFEMI")
+            .join("K7MDENG")
+            .join("bPxRfiCYEXAMPLEKEY");
+        assert_eq!(
+            interactive(
+                &["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+                &pasted.to_string_lossy()
+            ),
+            None,
+            "a token with slashes in it that is no file"
+        );
+        assert_eq!(
+            interactive(
+                &["https://hooks.example.test/services/T0/B0/the-token"],
+                &root
+                    .path()
+                    .join("https:/hooks.example.test/services/T0/B0/the-token")
+                    .to_string_lossy()
+            ),
+            None,
+            "an address pasted at the prompt"
+        );
+        assert_eq!(
+            interactive(&["subdirectory"], &root.path().to_string_lossy()),
+            None,
+            "a directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let plain = root.path().join("notes.txt");
+            std::fs::write(&plain, b"not a program").expect("a file");
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644))
+                .expect("permissions");
+            assert_eq!(
+                interactive(&["notes.txt"], &plain.to_string_lossy()),
+                None,
+                "a file with no execute bit"
+            );
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755))
+                .expect("permissions");
+            assert_eq!(
+                interactive(&["notes.txt"], &plain.to_string_lossy()).as_deref(),
+                Some("notes.txt"),
+                "the same file once it can be run"
+            );
+        }
     }
 
     /// KR-REQ-22.05: a token typed at the prompt as one plain word is recorded as no program,
@@ -923,7 +1011,7 @@ mod tests {
         // The control, the shell's question after the line's block.
         facts.note_command(&block_at(2, "cargo test", "/home/a/work", None), None);
         assert_eq!(read(&facts).application.0, None, "not yet resolved");
-        facts.note_resolved(&resolve(2, &["cargo", "test"], "/usr/bin/cargo"));
+        facts.note_resolved(&resolve(2, &["cargo", "test"], &executable()));
         let resolved = read(&facts);
         assert_eq!(resolved.application.0.as_deref(), Some("cargo"));
         assert_eq!(resolved.events.len(), 1);
@@ -934,7 +1022,7 @@ mod tests {
         );
 
         // And before the line's block.
-        facts.note_resolved(&resolve(3, &["make"], "/usr/bin/make"));
+        facts.note_resolved(&resolve(3, &["make"], &executable()));
         assert_eq!(
             read(&facts).application.0.as_deref(),
             Some("cargo"),
@@ -954,8 +1042,8 @@ mod tests {
     fn the_first_command_resolved_in_a_line_names_its_program_until_the_next_line() {
         let facts = facts();
         facts.note_command(&block_at(5, "cd x; make; ls", "/w/a", None), None);
-        facts.note_resolved(&resolve(5, &["make"], "/usr/bin/make"));
-        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        facts.note_resolved(&resolve(5, &["make"], &executable()));
+        facts.note_resolved(&resolve(5, &["ls"], &executable()));
         let running = read(&facts);
         assert_eq!(running.application.0.as_deref(), Some("make"));
         assert_eq!(running.events.len(), 1);
@@ -978,7 +1066,7 @@ mod tests {
         assert_eq!(builtin.events.len(), 1);
 
         let revision = builtin.revision;
-        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        facts.note_resolved(&resolve(5, &["ls"], &executable()));
         assert_eq!(
             read(&facts).revision,
             revision,
@@ -987,9 +1075,9 @@ mod tests {
         assert_eq!(read(&facts).application.0, None);
 
         // Nor does it take the line that is running from it.
-        facts.note_resolved(&resolve(6, &["cargo"], "/usr/bin/cargo"));
+        facts.note_resolved(&resolve(6, &["cargo"], &executable()));
         assert_eq!(read(&facts).application.0.as_deref(), Some("cargo"));
-        facts.note_resolved(&resolve(5, &["ls"], "/bin/ls"));
+        facts.note_resolved(&resolve(5, &["ls"], &executable()));
         facts.note_command(&block_at(6, "cd y; cargo", "/w/a", Some(0)), None);
         assert_eq!(
             read(&facts).application.0.as_deref(),
@@ -1005,11 +1093,11 @@ mod tests {
     fn a_program_resolved_before_privacy_mode_is_not_brought_back_by_the_end_of_its_line() {
         let facts = facts();
         facts.note_command(&block_at(1, "make", "/w/a", None), None);
-        facts.note_resolved(&resolve(1, &["make"], "/usr/bin/make"));
+        facts.note_resolved(&resolve(1, &["make"], &executable()));
         assert_eq!(read(&facts).application.0.as_deref(), Some("make"));
 
         facts.fence(PrivacyGeneration::new(1));
-        facts.note_resolved(&resolve(2, &["cargo"], "/usr/bin/cargo"));
+        facts.note_resolved(&resolve(2, &["cargo"], &executable()));
         facts.release(PrivacyGeneration::new(2));
         facts.note_command(&block_at(1, "make", "/w/a", Some(0)), None);
         let after = read_at(&facts, 2);
@@ -1115,7 +1203,7 @@ mod tests {
     #[test]
     fn a_command_has_a_completion_only_once_it_has_ended_and_is_one_event() {
         let facts = facts();
-        facts.note_resolved(&resolve(1, &["cargo", "test"], "/usr/bin/cargo"));
+        facts.note_resolved(&resolve(1, &["cargo", "test"], &executable()));
         facts.note_command(&block("cargo test", "/home/a/kalareach", None), None);
         let started = read(&facts);
         assert_eq!(started.directory.0.as_deref(), Some("kalareach"));

@@ -2391,10 +2391,20 @@ fn a_load_refused_for_its_files_is_no_failure_and_nothing_loads_until_they_are_h
         assert_eq!(service.inference_restarts(), 0, "round {round}");
         assert_eq!(service.restart_not_before_ms(), None, "round {round}");
         assert!(!inference_failed(&service), "round {round}");
-        // Nothing is asked for while the files are not held.
+        // The process holds no model and has nothing to do, so it is ended; then nothing is asked
+        // for while the files are not held.
         assert!(
             matches!(
-                service.next(&roomy(), now.after_ms(10)).expect("a wait"),
+                service.next(&roomy(), now.after_ms(10)).expect("an unload"),
+                Instruction::Unload {
+                    why: UnloadReason::Assets
+                }
+            ),
+            "round {round}"
+        );
+        assert!(
+            matches!(
+                service.next(&roomy(), now.after_ms(20)).expect("a wait"),
                 Instruction::Wait { .. }
             ),
             "round {round}"

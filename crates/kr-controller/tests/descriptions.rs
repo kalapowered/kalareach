@@ -434,6 +434,8 @@ enum Reply {
     Chunked(Vec<u8>),
     /// The whole length declared, half of the body sent, and then nothing until the client leaves.
     HalfThenHold(Vec<u8>),
+    /// The request read and no answer, until the client leaves.
+    Silent,
 }
 
 /// A local HTTP server that answers each path the way a test says, and records what was asked.
@@ -550,6 +552,11 @@ impl Fixture {
                     stream.write_all(b"\r\n").await.ok();
                 }
                 stream.write_all(b"0\r\n\r\n").await
+            }
+            Some(Reply::Silent) => {
+                // Held until the client leaves: reading answers nothing but its end.
+                let _ = stream.read(&mut chunk).await;
+                return;
             }
             Some(Reply::HalfThenHold(body)) => {
                 stream
@@ -2415,6 +2422,15 @@ async fn a_changed_catalogue_is_fetched_afresh_and_loads_only_once_the_old_proce
         !environment.marker(),
         "the old revision's files are not this one's"
     );
+    let old_revision = environment
+        .files()
+        .parent()
+        .expect("the profile's directory")
+        .join("1");
+    assert!(
+        old_revision.exists(),
+        "the old revision's files are still there"
+    );
     let carried = environment.describe(session_id).await;
     assert_eq!(carried.source, LabelSource::Generated);
     assert_eq!(carried.freshness, DescriptionFreshness::Stale);
@@ -2426,6 +2442,10 @@ async fn a_changed_catalogue_is_fetched_afresh_and_loads_only_once_the_old_proce
             shown.download == DescriptionDownload::Verified
         })
         .await;
+    assert!(
+        !old_revision.exists(),
+        "the files of the profile's other revisions go once the new ones are kept"
+    );
     environment.workers[0].report("make", "/home/a/other", None);
     until("the new process finding the lock held", || {
         environment.began("lock-held")
@@ -2587,5 +2607,200 @@ async fn the_real_process_describes_a_session_from_the_real_weights() {
     assert_eq!(described.paused.0, None);
     assert_eq!(environment.figures().mapped, 1, "one mapping");
     assert_eq!(environment.figures().started, 1, "one process");
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a server that takes the connection and never answers, and one that sends half a
+/// body and stops, each fail the fetch at the bound the fetch waits for the server, and say which
+/// it was; no partial or marker is left. The bound is shortened for the test, and the control is a
+/// server that answers, which the same fetch completes against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_goes_silent_fails_the_fetch_at_the_bound_and_keeps_nothing() {
+    let fixture = Fixture::start().await;
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment
+        .placed
+        .set_fetch_stall(Some(Duration::from_secs(1)));
+
+    for (case, reply, said) in [
+        (
+            "no answer",
+            Reply::Silent,
+            "did not answer within 1 seconds",
+        ),
+        (
+            "a body that stops",
+            Reply::HalfThenHold(WEIGHTS.to_vec()),
+            "sent nothing for 1 seconds",
+        ),
+    ] {
+        fixture.reply("/tiny.gguf", reply);
+        environment.download(DescriptionDownloadAction::Start).await;
+        let failed = environment
+            .setup_until(case, |shown| shown.download == DescriptionDownload::Failed)
+            .await;
+        let why = failed.failure.0.expect("it says how it failed");
+        assert!(why.contains(said), "{case}: {why}");
+        assert!(environment.partials().is_empty(), "{case}");
+        assert!(!environment.files().join(WEIGHTS_FILE).exists(), "{case}");
+        assert!(!environment.marker(), "{case}");
+    }
+
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the fetch from a server that answers", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a cancellation that comes while the process is checking the last file wins over
+/// the check, even when the process answers that the file passed before it read the cancellation:
+/// no file is kept and no marker is written. The stub reads the check's cancellation only after it
+/// has answered, as a process that was already past the last block does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_during_the_last_check_wins_over_a_check_that_passed() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        script: Script {
+            verify_ignore_token_ms: 800,
+            verify_finishes_after_cancel: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    environment.download(DescriptionDownloadAction::Start).await;
+    until("the check", || environment.began("check")).await;
+    environment
+        .download(DescriptionDownloadAction::Cancel)
+        .await;
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(!environment.files().join(WEIGHTS_FILE).exists(), "no file");
+    assert!(environment.partials().is_empty());
+    assert!(!environment.marker(), "no marker");
+    assert!(!environment.figures().assets_held);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: descriptions turned off by a change to the configuration that did not come
+/// through `description.configure` (a document the owner edited by hand reaches the daemon the same
+/// way) stop a running fetch as well, and what it had written is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn descriptions_turned_off_in_the_configuration_stop_a_running_fetch() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.download(DescriptionDownloadAction::Start).await;
+    fixture.until_half_sent().await;
+    until("the partial file", || !environment.partials().is_empty()).await;
+
+    environment
+        .controller()
+        .apply_configuration(
+            &kr_protocol::hostinfo::configuration::Change::Descriptions {
+                enabled: Some(false),
+                on_battery: None,
+            },
+        )
+        .await
+        .expect("the document is changed");
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
+    assert!(environment.partials().is_empty());
+    assert!(!environment.files().join(WEIGHTS_FILE).exists());
+    assert!(!environment.marker());
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: the model's files may be fetched while descriptions are off, so that they are
+/// here when the owner turns descriptions on. The process that checks them goes with the check,
+/// nothing is loaded while descriptions are off, and turning them on then describes a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_files_may_be_fetched_while_descriptions_are_off_and_nothing_loads_until_they_are_on() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        script: Script {
+            mark_loads: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.configure(Some(false), None).await;
+
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert!(environment.marker());
+    until("no process left behind", || {
+        environment.figures().pid.is_none()
+    })
+    .await;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let titled = environment.describe(session_id).await;
+    assert_eq!(titled.source, LabelSource::Metadata);
+    assert_eq!(environment.loaded(), 0, "nothing loads while they are off");
+
+    environment.configure(Some(true), None).await;
+    environment
+        .describe_until("the generated description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(environment.loaded(), 1);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01: a partial file a daemon left when it went in the middle of a fetch is removed
+/// when the next daemon starts, and the files the marker holds are left alone: the kept file beside
+/// the partial stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_left_by_a_daemon_that_went_mid_fetch_is_removed_at_the_next_start() {
+    let environment = Environment::start(Setup::new()).await;
+    let partial = environment.files().join(format!("{WEIGHTS_FILE}.partial"));
+    std::fs::write(&partial, b"half a body").expect("a partial file");
+    assert_eq!(environment.partials().len(), 1);
+
+    let environment = environment.restart().await;
+    assert!(environment.partials().is_empty(), "the partial is gone");
+    assert!(
+        environment.files().join(WEIGHTS_FILE).exists(),
+        "the kept file stays"
+    );
+    assert!(environment.marker());
+    assert_eq!(
+        environment.setup().await.download,
+        DescriptionDownload::Verified
+    );
     environment.stop().await;
 }
