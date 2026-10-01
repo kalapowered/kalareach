@@ -90,6 +90,7 @@ import { AttachmentPicker } from '../components/picker'
 import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
+import { liftAbove } from '../model/keyboard'
 import { admit, describeBytes, type Picked } from '../model/media'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
@@ -446,17 +447,50 @@ export function MobileSession({
     const element = sessionRef.current
     if (element === null) return
     const root = document.documentElement
+    // The keyboard's height the composer's extra lift was worked out for.
+    let liftedFor = 0
+    let settling = 0
+    let settleFrame = 0
     const cover = () => {
       const style = getComputedStyle(root)
       const covered = parseFloat(style.getPropertyValue('--keyboard')) || 0
       // What lies under the session is measured in the shell's own terms, from where the session
-      // ends to where the shell does: the shell follows the visual viewport when the page is
-      // panned, so a distance to the window's edge would count the pan.
+      // ends to where the shell does, as the page lies unscrolled: the shell follows the visual
+      // viewport when the page is panned, so a distance to the window's edge would count the pan,
+      // and the session moves up by whatever its scrolling area has scrolled.
       const shell = element.closest<HTMLElement>('.m-shell')
       const edge = shell === null ? window.innerHeight : shell.getBoundingClientRect().bottom
-      const under = Math.max(0, edge - element.getBoundingClientRect().bottom)
+      const scrolled = element.closest<HTMLElement>('.m-main')?.scrollTop ?? 0
+      const under = Math.max(0, edge - (element.getBoundingClientRect().bottom + scrolled))
       element.style.setProperty('--under-session', `${under}px`)
       setKeyboardUp(covered > under)
+      // A session too tall for the room above the keyboard scrolls, and the field being typed into
+      // is scrolled to, since the platform's own scroll to it is undone with the shell's pan. What
+      // the areas that hold it cannot scroll by is room the composer lacks under the field: it is
+      // added to the composer's lift, and kept for as long as this keyboard stays the height it is.
+      const typing = document.activeElement
+      if (covered !== liftedFor) {
+        liftedFor = covered
+        element.style.removeProperty('--lift-more')
+      }
+      let acted = false
+      if (covered > 0 && shell !== null && typing instanceof HTMLElement && typing.closest('.m-composer') !== null) {
+        let more = parseFloat(element.style.getPropertyValue('--lift-more')) || 0
+        for (let pass = 0; pass < 3; pass += 1) {
+          const short = liftAbove(typing, edge - covered, shell)
+          if (short === 0) break
+          acted = true
+          more += short
+          element.style.setProperty('--lift-more', `${more}px`)
+        }
+      }
+      // The layout and the scroll position settle a frame after a change of this kind, so what was
+      // done is looked at once more then, a few times at most.
+      if (!acted) settling = 0
+      else if (settling < 4) {
+        settling += 1
+        settleFrame = requestAnimationFrame(cover)
+      }
       const rem = parseFloat(style.fontSize)
       setShort(element.clientHeight > 0 && rem > 0 && element.clientHeight < ROOMY_SESSION_REM * rem)
     }
@@ -467,10 +501,14 @@ export function MobileSession({
     const written = new MutationObserver(cover)
     written.observe(root, { attributes: true, attributeFilter: ['style'] })
     window.addEventListener('resize', cover)
+    // A field that takes the focus while a keyboard is up is lifted as one that was there before it.
+    document.addEventListener('focusin', cover)
     return () => {
+      cancelAnimationFrame(settleFrame)
       resized?.disconnect()
       written.disconnect()
       window.removeEventListener('resize', cover)
+      document.removeEventListener('focusin', cover)
     }
   }, [])
 

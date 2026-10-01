@@ -368,7 +368,10 @@ Where the platform pans the phone's page to keep a focused field in sight, the s
 visual viewport by as much as it was panned, so nothing of it is above the screen, and what the
 keyboard takes of the height is at its foot, the composer above it. This holds where the platform
 shrinks the layout viewport to what is visible while it pans, as iOS does the first time a field
-takes the focus.
+takes the focus. Where the session is taller than the room above the keyboard (larger text, a phone
+on its side), the session scrolls and the field being typed into is scrolled to, rather than asked
+to scroll itself into view, which would pan the page again: the field rests on the keyboard's top
+edge and the rows above it go out of view first.
 
 At larger text sizes the phone's inbox breaks a long word, such as a path or a command, where its
 row ends instead of running past the screen, and the count on the Attention tab is a circle that
