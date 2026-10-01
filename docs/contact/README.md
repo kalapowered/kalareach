@@ -211,6 +211,10 @@ the operating-system owner the worker's socket authenticates. The revision the c
 revision it submits, so an answer to a question that moved underneath it is refused rather than
 applied to something else.
 
+## What an answer returns
+
+Calling `question.answer` or `question.cancel` will always provide the question identity, revision, state, and resolution time to the caller that performed the action. However, the question itself will only be provided if it is reachable in the present authority of the caller, and `question` is `null` where the host held it back. For example, if a device has `question.respond` but not `session.view`, `question` will be `null`; it is also `null` for a device whose history begins after the question was asked. A retried answer and `action.read` follow the same rule at the moment they are read. The local owner will always see the question. A device may only answer a question its history reaches, or one its grant names while it is open.
+
 ## Installing the skill
 
 `kr skill install --agent <agent> --scope <user|project> [--project-dir <path>]` writes the skill
