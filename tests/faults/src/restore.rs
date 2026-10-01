@@ -518,7 +518,7 @@ pub(crate) struct Stage {
 /// A pair of clients arrives at every point of the corpus. A session holds a bounded number of
 /// attachments, so the points are shared among passes: each pass is a session of its own that is
 /// fed the whole corpus and takes every `stride`-th point, the stride being the smallest that keeps
-/// each pass's clients within [`PAIRS_AT_ONCE`] at any moment.
+/// each pass's clients within the pairs one session holds at once (`PAIRS_AT_ONCE`) at any moment.
 ///
 /// # Errors
 ///
