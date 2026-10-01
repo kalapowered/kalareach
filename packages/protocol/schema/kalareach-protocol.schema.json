@@ -5419,10 +5419,15 @@
             "$ref": "#/$defs/CatalogueSummary"
           },
           "type": "array"
+        },
+        "enrolment_budgets": {
+          "$ref": "#/$defs/CatalogueBudgets",
+          "description": "The budgets a repository enrolled now may ask for: what this host's configuration allows,\nwhich is the product's defaults unless its owner narrowed or raised them. A request for\nmore is refused, so a client that adds a repository asks for these."
         }
       },
       "required": [
-        "catalogues"
+        "catalogues",
+        "enrolment_budgets"
       ],
       "type": "object"
     },
