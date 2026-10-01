@@ -86,6 +86,7 @@ jobs:
         kr-cli/kr-attach-guard
         kr-worker/kr-worker
         kr-controller/kr-controller
+        kr-describe-model/kr-describe-inference
         kr-hook/kr-hook
         kr-plugin-host/kr-plugin-host
     steps:
