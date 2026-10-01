@@ -1,0 +1,150 @@
+name: wsl-probe
+
+# Asks whether a GitHub-hosted Windows runner can run a WSL2 distribution, and writes the answer
+# down whichever way it falls.
+#
+# Release acceptance for WSL2 (`scripts/e2e-wsl.sh`) needs a Windows host that runs WSL2. A hosted
+# runner is a virtual machine, and WSL2 is a virtual machine of its own, so whether one can be
+# started inside the other is a fact about the runner image and its host, not about this
+# repository, and it can change when the image does. This workflow measures it on demand: it
+# installs the WSL platform, imports a small root file system as a WSL2 distribution and runs one
+# command in it. Each step's exit status and what it printed go into the run's summary and into an
+# artefact, and the job itself passes when the probe ran to its end, so a runner that cannot do it
+# produces a recorded "no" rather than a red run.
+#
+# It is not part of the landing workflow. `docs/releases/platforms.md` says what it found and when.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: The hosted Windows runner image to ask.
+        required: false
+        default: windows-2025
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # A root file system small enough to download in a second, pinned by its digest so the probe asks
+  # about the runner and never about what a mirror served.
+  ROOTFS_URL: https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.10-x86_64.tar.gz
+  ROOTFS_SHA256: 0d44a414245f043ae56872a23762e6c9bee585da2cbe4aa81cbd0331eaf53223
+
+jobs:
+  probe:
+    name: wsl2 on ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    # Installing the platform on a machine that cannot virtualise can wait for a long time before it
+    # says so. The bound turns that into a recorded step that did not finish.
+    timeout-minutes: 30
+    steps:
+      - name: Ask the runner
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $report = New-Object System.Collections.Generic.List[object]
+          $log = Join-Path $env:RUNNER_TEMP 'wsl-probe.txt'
+
+          # wsl.exe writes UTF-16, which is read here as text. Whatever a step printed is kept to
+          # its last twenty lines, which is where a refusal says what it refused.
+          function Probe([string] $name, [scriptblock] $action) {
+            Write-Host "::group::$name"
+            $text = ''
+            $finished = $true
+            try {
+              $job = Start-Job -ScriptBlock $action
+              if (-not (Wait-Job $job -Timeout 600)) {
+                $finished = $false
+                Stop-Job $job
+              }
+              $text = (Receive-Job $job 2>&1 | Out-String)
+              Remove-Job $job -Force
+            } catch {
+              $text = "$_"
+            }
+            $text = ($text -replace "`0", '')
+            Write-Host $text
+            Write-Host '::endgroup::'
+            $tail = (($text -split "`r?`n") | Select-Object -Last 20) -join "`n"
+            $script:report.Add([pscustomobject]@{ Step = $name; Finished = $finished; Output = $tail })
+            Add-Content -Path $log -Value "== $name (finished: $finished)`n$text`n"
+            return @{ Finished = $finished; Text = $text }
+          }
+
+          $summary = $env:GITHUB_STEP_SUMMARY
+          Add-Content $summary "## WSL2 on $env:ImageOS ($env:ImageVersion)"
+          Add-Content $summary ''
+
+          Probe 'the host the runner reports' {
+            Get-CimInstance Win32_ComputerSystem | Format-List Manufacturer, Model, HypervisorPresent
+            (Get-CimInstance Win32_Processor | Select-Object -First 1 | Format-List Name, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions, VMMonitorModeExtensions | Out-String)
+            systeminfo | Select-String -Pattern 'Hyper-V|Virtualization|Hypervisor'
+          } | Out-Null
+
+          Probe 'wsl.exe --version before an install' { wsl.exe --version; "exit $LASTEXITCODE" } | Out-Null
+
+          $installed = Probe 'wsl.exe --install --no-distribution' {
+            wsl.exe --install --no-distribution
+            "exit $LASTEXITCODE"
+          }
+
+          Probe 'wsl.exe --status' { wsl.exe --status; "exit $LASTEXITCODE" } | Out-Null
+          Probe 'wsl.exe --set-default-version 2' { wsl.exe --set-default-version 2; "exit $LASTEXITCODE" } | Out-Null
+
+          $rootfs = Join-Path $env:RUNNER_TEMP 'rootfs.tar.gz'
+          $downloaded = Probe 'download and check the root file system' {
+            Invoke-WebRequest -Uri $env:ROOTFS_URL -OutFile $using:rootfs
+            $digest = (Get-FileHash -Algorithm SHA256 $using:rootfs).Hash.ToLowerInvariant()
+            if ($digest -ne $env:ROOTFS_SHA256) { throw "the digest is $digest" }
+            "sha256 $digest"
+          }
+
+          $location = Join-Path $env:RUNNER_TEMP 'probe-distro'
+          $imported = Probe 'wsl.exe --import as WSL 2' {
+            New-Item -ItemType Directory -Force $using:location | Out-Null
+            wsl.exe --import kr-probe $using:location $using:rootfs --version 2
+            "exit $LASTEXITCODE"
+          }
+
+          $ran = Probe 'wsl.exe --distribution kr-probe --exec /bin/true' {
+            wsl.exe --distribution kr-probe --exec /bin/true
+            "exit $LASTEXITCODE"
+          }
+          $version = Probe 'wsl.exe --list --verbose' { wsl.exe --list --verbose; "exit $LASTEXITCODE" }
+
+          # The answer is read from what the last two steps printed, never from the job's own
+          # status: a step that printed "exit 0" ran, and one that did not is a "no" with its reason
+          # in the table above.
+          $runs = $ran.Finished -and ($ran.Text -match '(?m)^exit 0\s*$')
+          $isTwo = $version.Text -match 'kr-probe\s+\S+\s+2'
+          $verdict = if ($runs -and $isTwo) { 'available' } else { 'unavailable' }
+
+          Add-Content $summary "**WSL2 can run a command in a distribution on this runner: $verdict.**"
+          Add-Content $summary ''
+          Add-Content $summary '| Step | Finished | Last lines |'
+          Add-Content $summary '| --- | --- | --- |'
+          foreach ($row in $report) {
+            $cell = ($row.Output -replace '\|', '\|' -replace "`n", '<br>')
+            Add-Content $summary "| $($row.Step) | $($row.Finished) | ``$cell`` |"
+          }
+          "verdict=$verdict" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "WSL2 on this runner: $verdict"
+
+          # The unregister is the probe's own clean-up of what it made, by the name it gave it.
+          wsl.exe --unregister kr-probe 2>&1 | Out-Null
+
+      - name: Keep the probe's own record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wsl-probe-${{ inputs.runner }}
+          path: ${{ runner.temp }}/wsl-probe.txt
+          if-no-files-found: warn
