@@ -3002,7 +3002,7 @@ mod tests {
 
         fn producer(&self) -> Producer {
             Producer::new(
-                DeliveryJournal::open(self.journal()).expect("a journal"),
+                DeliveryJournal::open(&self.journal()).expect("a journal"),
                 NotificationPreviewKeyPair::generate().expect("a keypair"),
                 kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
             )
