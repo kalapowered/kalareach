@@ -32,6 +32,8 @@ $script:Hooks = @{
     GestureBefore      = $null
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
+    InnerIsEditors     = $true
+    EditorText         = $null
     Wrapper            = $null
     ReadLineInstalled  = $false
 }
@@ -404,8 +406,22 @@ function Initialize-KalaReachBridge {
 
 # The host's own read-line entry point, with the reader's boundaries around it.
 function Install-KrReadLineWrapper {
+    # The editor's own function as it is when this module loads, which is the first thing in the
+    # first profile and so before any text of the person's own has run. What it says is kept once:
+    # the function a person's profile later makes of it is compared with this, never with itself.
+    if ($null -eq $script:Hooks.EditorText) {
+        $editor = Get-KrEditorsReadLine
+        if ($null -ne $editor) { $script:Hooks.EditorText = $editor.ToString() }
+    }
     $existing = Get-Command -Name 'PSConsoleHostReadLine' -CommandType Function -ErrorAction SilentlyContinue
-    if ($null -ne $existing) { $script:Hooks.InnerReadLine = $existing.ScriptBlock }
+    if ($null -ne $existing) {
+        $script:Hooks.InnerReadLine = $existing.ScriptBlock
+        # Decided here, when the function is the one that was there before this module went in front
+        # of it, and kept. The editor imported again later exports another object and leaves this
+        # one as it was, so asking again would call a reader that is still the editor's somebody
+        # else's.
+        $script:Hooks.InnerIsEditors = Test-KrEditorsReadLine $existing.ScriptBlock
+    }
     # `$?` is the status of the command the person just ran, and this editor shows it. It is read
     # here, as the host's own entry point does, because anything else run first would replace it.
     $wrapper = {
@@ -416,20 +432,31 @@ function Install-KrReadLineWrapper {
     $script:Hooks.ReadLineInstalled = $true
 }
 
-# Whether a script block is the editor's own read-line function, by identity.
+# The function the editor's module exports as the host's read-line entry point.
+function Get-KrEditorsReadLine {
+    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
+    if ($null -eq $module) { return $null }
+    $editor = $module.ExportedFunctions['PSConsoleHostReadLine']
+    if ($null -eq $editor) { return $null }
+    $editor.ScriptBlock
+}
+
+# Whether a script block is the editor's own read-line function.
 #
-# A function's text decides nothing, and neither does the name of the module it lives in: a wrapper
-# that calls the editor directly has the editor's call in its text, and a function made inside the
-# editor's own module scope reports the editor as its module. The editor's function is the one
-# its module exports, so a script block is that function only when it is that very object. The
-# editor imported again exports a new one, and it is that one that is compared with.
+# A function's text alone decides nothing, and neither does the name of the module it lives in: a
+# wrapper that calls the editor directly has the editor's call in its text, and a function made
+# inside the editor's own module scope reports the editor as its module. So it is two things at
+# once. It is the very object the editor's module exports, which an alias, a proxy and a function
+# of the person's own are not. And its text is the text the editor's function had when this module
+# loaded, which a function put in the place of the editor's own inside its module scope has not,
+# though the module exports it. The editor imported again exports a new object with the same text,
+# and it is that one that is accepted.
 function Test-KrEditorsReadLine {
     param($ScriptBlock)
-    if ($null -eq $ScriptBlock) { return $false }
-    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
-    if ($null -eq $module) { return $false }
-    $editor = $module.ExportedFunctions['PSConsoleHostReadLine']
-    $null -ne $editor -and [object]::ReferenceEquals($ScriptBlock, $editor.ScriptBlock)
+    if ($null -eq $ScriptBlock -or $null -eq $script:Hooks.EditorText) { return $false }
+    $editor = Get-KrEditorsReadLine
+    if ($null -eq $editor -or -not [object]::ReferenceEquals($ScriptBlock, $editor)) { return $false }
+    $ScriptBlock.ToString() -ceq $script:Hooks.EditorText
 }
 
 # The command the host runs under the read-line entry point's name, which an alias takes before a
@@ -441,11 +468,12 @@ function Get-KrReadLineCommand {
 # True when the read-line entry point this module went in front of is this editor's own.
 #
 # A reader of somebody else's is a root-shell replacement rather than the editor this package was
-# qualified against, and it is reported by name instead of being bypassed.
+# qualified against, and it is reported by name instead of being bypassed. What was there is judged
+# when this module went in front of it, so a profile that imports the editor again afterwards
+# cannot turn a reader that was the editor's into somebody else's.
 function Test-KrInnerReadLine {
-    $inner = $script:Hooks.InnerReadLine
-    if ($null -eq $inner) { return $true }
-    Test-KrEditorsReadLine $inner
+    if ($null -eq $script:Hooks.InnerReadLine) { return $true }
+    [bool]$script:Hooks.InnerIsEditors
 }
 
 # ---- the user-facing hooks, after the profile has run -----------------------------------------------

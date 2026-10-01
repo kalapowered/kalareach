@@ -2558,6 +2558,13 @@ pub enum ReadLineChange {
     /// A function defined inside the editor's own module scope, which reports the editor as the
     /// module it belongs to and is not the editor's function.
     InsideTheEditorsModule,
+    /// The editor's own function replaced where it lives, inside its module scope, and the module
+    /// imported again so that the replacement is what it exports. It is the very object the editor
+    /// exports and it is not the editor's function.
+    ReplacedInsideTheEditorsModule,
+    /// The editor imported again so that it brings in no function of the host's entry point and
+    /// takes none of the module's, which leaves the module in front of the editor's own function.
+    ImportedAgainBesideTheModule,
 }
 
 impl ReadLineChange {
@@ -2577,6 +2584,11 @@ impl ReadLineChange {
             Self::InsideTheEditorsModule => {
                 "& (Get-Module PSReadLine) { function global:PSConsoleHostReadLine { [Console]::ReadLine() } }\n"
             }
+            Self::ReplacedInsideTheEditorsModule => {
+                "& (Get-Module PSReadLine) { Set-Item function:script:PSConsoleHostReadLine -Value { [Console]::ReadLine() } }\n\
+                 Import-Module PSReadLine\n"
+            }
+            Self::ImportedAgainBesideTheModule => "Import-Module PSReadLine -Force -NoClobber\n",
         }
     }
 
@@ -2587,7 +2599,10 @@ impl ReadLineChange {
 
     /// Whether the reader is still the qualified editor's after this, so the session carries on.
     fn leaves_the_qualified_reader(self) -> bool {
-        matches!(self, Self::None | Self::EditorImportedAgain)
+        matches!(
+            self,
+            Self::None | Self::EditorImportedAgain | Self::ImportedAgainBesideTheModule
+        )
     }
 }
 
@@ -2605,18 +2620,23 @@ impl ReadLineChange {
 /// editor the package was qualified against, and each is refused by the name the integration loss
 /// carries. The session that was being created closes with it, and is never reported to have its
 /// hooks live afterwards. The editor imported again puts its own function back, which is the
-/// qualified reader, so the module goes back in front of it and the session carries on.
+/// qualified reader, so the module goes back in front of it and the session carries on. So does the
+/// editor imported again beside the module, which brings in nothing the module's function stands in
+/// front of. The editor's own function replaced where it lives, in its module scope, and imported
+/// again is the very object the editor exports and is not the editor's function, so it is refused.
 pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kind: ShellKind) {
     let package = Package::built(kind);
 
     for change in [
         ReadLineChange::None,
         ReadLineChange::EditorImportedAgain,
+        ReadLineChange::ImportedAgainBesideTheModule,
         ReadLineChange::Replaced,
         ReadLineChange::Wrapped,
         ReadLineChange::CallsTheEditor,
         ReadLineChange::Aliased,
         ReadLineChange::InsideTheEditorsModule,
+        ReadLineChange::ReplacedInsideTheEditorsModule,
     ] {
         let mut session = Session::start_with_profile(
             &package,
