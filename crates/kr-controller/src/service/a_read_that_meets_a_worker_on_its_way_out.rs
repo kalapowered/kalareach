@@ -76,6 +76,10 @@ pub(super) struct Scripted {
     holds_results_to_scopes: AtomicBool,
     /// Every mutation a daemon forwarded to it, in the order they came.
     forwarded: std::sync::Mutex<Vec<kr_protocol::local::ForwardedMutation>>,
+    /// Whether each of those frames carried a `history` member on the wire, read from the bytes
+    /// as they arrived and not from the type they decode into, which reads an absent member and a
+    /// null one alike.
+    forwarded_with_history: std::sync::Mutex<Vec<bool>>,
     /// The receipts it keeps with no result, by the action they belong to: the method, and the
     /// failure the receipt records.
     receipts_only: std::sync::Mutex<BTreeMap<ActionId, (Method, ProtocolError)>>,
@@ -108,6 +112,7 @@ impl Scripted {
             connections: AtomicUsize::new(0),
             holds_results_to_scopes: AtomicBool::new(true),
             forwarded: std::sync::Mutex::new(Vec::new()),
+            forwarded_with_history: std::sync::Mutex::new(Vec::new()),
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
@@ -139,6 +144,15 @@ impl Scripted {
     /// Every mutation a daemon forwarded to this worker, in the order they came.
     pub(super) fn forwarded(&self) -> Vec<kr_protocol::local::ForwardedMutation> {
         self.forwarded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether each mutation a daemon forwarded to this worker carried a `history` member on the
+    /// wire, in the order they came.
+    pub(super) fn forwarded_with_history(&self) -> Vec<bool> {
+        self.forwarded_with_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -440,7 +454,19 @@ fn serve_scripted(
                 let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                 // Whether this connection declared itself a proxy for somebody else's actions.
                 let mut proxy = false;
-                while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                while let Ok(payload) = reader.read_payload().await {
+                    let limits = StreamKind::Control.cbor_limits();
+                    let Ok(frame) = kr_protocol::wire::decode::<ControlFrame>(&payload, &limits)
+                    else {
+                        break;
+                    };
+                    if matches!(frame, ControlFrame::Forwarded(_)) {
+                        script
+                            .forwarded_with_history
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(carries_history(&payload));
+                    }
                     if let ControlFrame::ControllerRole(role) = &frame {
                         proxy = *role == kr_protocol::local::ControllerConnectionRole::Proxy;
                     }
@@ -588,6 +614,24 @@ fn serve_scripted(
         drop(listener);
         script.gone.notify_one();
     })
+}
+
+/// Whether a forwarded frame's bytes have a `history` member at the frame's own level.
+fn carries_history(payload: &[u8]) -> bool {
+    use kr_cbor::CanonicalValue;
+
+    let Ok(CanonicalValue::Map(frame)) =
+        kr_cbor::decode(payload, &StreamKind::Control.cbor_limits())
+    else {
+        return false;
+    };
+    // The frame is a map holding the forwarded mutation under its name, and the mutation's own
+    // members (`mutation`, `actor`, the rights, the deadline and the scope) are one level in.
+    frame.get("history").is_some()
+        || frame.entries().iter().any(|(_, held)| {
+            matches!(held, CanonicalValue::Map(inner)
+                if inner.get("mutation").is_some() && inner.get("history").is_some())
+        })
 }
 
 /// A daemon with a scripted worker in its directory, and the registry's own row for that
