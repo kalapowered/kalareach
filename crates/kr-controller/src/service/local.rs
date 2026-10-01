@@ -462,7 +462,7 @@ impl Controller {
         // surviving registration stamped with the new one, so a door that read the revision after
         // a retained lookup, a lock or a task being scheduled would admit a mutation under an
         // authority the other door refuses the same mutation under. A retained answer is checked
-        // against it.
+        // against it, and so is every effect this door performs.
         let admitted = self.admitted_revision(connection_id).ok();
         let mut retained = self
             .retained(actor_id, &mutation, method, connection_id, admitted)

@@ -609,15 +609,19 @@ impl Controller {
         // The admission the mutation carries into its transaction: the deadline this daemon
         // accepted, the authority revision it was admitted under, and the connection it arrived
         // on. Every service re-checks all three inside its own transaction.
-        let admitted_revision = match self.admitted_revision(connection_id) {
-            Ok(revision) => revision,
-            Err(error) => {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
-            }
+        //
+        // The revision is the one `perform` read beside the registration check, before anything
+        // waited, and never one read here. A revocation of another device stamps every surviving
+        // registration with the revision it advanced to, so a change admitted before it and
+        // checked against a revision read afterwards would be checked against the authority that
+        // replaced the one it was admitted under.
+        let Some(admitted_revision) = admitted else {
+            return error_reply(
+                mutation.request_id,
+                ErrorCode::PermissionDenied,
+                "the authority this connection was admitted under has been withdrawn; open a new \
+                 connection",
+            );
         };
         let carried = crate::authority::AdmittedMutation {
             connection_id,
@@ -648,30 +652,10 @@ impl Controller {
                 self.review_power_soon();
                 closed
             }
-            // The revision `perform` read beside the registration check, before anything waited,
-            // rather than the one read above. A revocation of another device stamps every
-            // surviving registration with the revision it advanced to, so a change admitted before
-            // it and checked against a revision read afterwards would be checked against the
-            // authority that replaced the one it was admitted under.
-            Method::AgentToolsInstall | Method::AgentToolsRemove => match admitted {
-                Some(admitted_revision) => {
-                    self.agent_tools_change(
-                        actor_id,
-                        mutation,
-                        method,
-                        crate::authority::AdmittedMutation {
-                            admitted_revision,
-                            ..carried
-                        },
-                    )
+            Method::AgentToolsInstall | Method::AgentToolsRemove => {
+                self.agent_tools_change(actor_id, mutation, method, carried)
                     .await
-                }
-                None => Err(ControllerError::PermissionDenied {
-                    detail: "the authority this connection was admitted under has been \
-                             withdrawn; open a new connection"
-                        .to_owned(),
-                }),
-            },
+            }
             Method::GrantCreate
             | Method::GrantRevoke
             | Method::DeviceRevoke
