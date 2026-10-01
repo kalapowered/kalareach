@@ -427,9 +427,7 @@ Every ordinary preference resolves through one function, so the order cannot dri
 sites. A profile a request names and this host does not have contributes nothing and the value
 falls through to the document.
 
-The creator's shell environment is recorded as an execution snapshot: it is what the session's own
-processes run with, and nothing this host decides is taken from it. Only the variables below
-participate in configuration, and they are read from the host's own environment.
+The creator's shell environment is what the session's own processes run with, and nothing this host decides is taken from it. The daemon holds it in memory from the reservation until the worker claims it. Because it is never written anywhere, environmental variables containing security credentials are never written to the registry, to a WAL, or to any log. Only the variables below participate in configuration, and they are read from the host's own environment.
 
 | Variable | Supplies | Acts at | Why there |
 | --- | --- | --- | --- |
@@ -890,8 +888,8 @@ qualification may not do.
 ## Creating a session
 
 1. The daemon records the reservation durably: the actor, the create token, the immutable payload
-   digest, the allocated session identifier and display number, and the launch phase. Display
-   numbers increase and are never reused.
+   digest, the create request without its environment variables, the allocated session identifier
+   and display number, and the launch phase. Display numbers increase and are never reused.
 2. The reservation moves to `spawned` **before** anything starts, because a worker can reach the
    rendezvous socket the instant the service manager starts it.
 3. The service manager starts the worker. Its job definition carries only non-secret facts: the
@@ -901,8 +899,8 @@ qualification may not do.
    the signature, matches the reservation, and compares the connecting process — both its
    identifier and the kernel's record of its start — with what the launcher reported. Exactly one
    rendezvous per reservation succeeds; a second is refused, recorded, and fences the reservation.
-5. The daemon sends the launch specification over that private channel: the create request, its own
-   public key and its generation.
+5. The daemon sends the launch specification over that private channel: the create request with the
+   creator's environment variables, taken from memory, its own public key and its generation.
 6. The worker creates the pseudo-terminal, launches the root shell, binds its endpoint and reports
    itself ready. The daemon records the worker's public key inside the same transaction that marks
    the session live, then publishes the descriptor.
@@ -910,6 +908,10 @@ qualification may not do.
 The create token is the request's action identifier. A retry with the same payload resolves to the
 same reservation; the same token with a different payload is refused rather than becoming a second
 session. A lost reply never causes a second launch.
+
+A reservation records the create request without the environment variables its creator sent. The list in a recorded request is always empty and says nothing about what the creator sent. The environment is kept in memory in the daemon in the entry corresponding to a create request waiting for a worker to claim it. When a worker claims the create request, the environment is "moved" (once) from the waiting create request to the specification of what needs to be launched by the worker. A create that stops waiting takes back whatever the claim has not taken, whether its launch could not start or the 30 seconds it waits for its worker ran out, so a claim that arrives afterwards finds none.
+
+When a worker claims a create request, if there is no more environment, the claim is refused. A reservation that is still `spawned` becomes `failed` without any key, and nothing is launched with an environment its creator did not send. Another case where this can happen is when the daemon is restarted in between a reservation and the claim of a worker created by the previous daemon. A second claim on a reservation that was already claimed still fences it. A repeat under the same token is answered from the record: with the session once it exists, or with an error that names the reservation's phase. A `claimed` reservation can still become a session. A `spawned` one can only while its create is waiting or a claim has already taken the variables; otherwise it becomes `failed` when its worker's claim is refused or, once its worker has ended, at a later start. A `failed` one cannot. Note that if a worker claimed the create request in time but is not answering anymore, the answer to the create request will be `OUTCOME_UNKNOWN`. In that case, the create request can be sent again under the same token, but a new session should only be created if the answer is `failed`.
 
 ### Which shell, and what the session claims
 
@@ -2429,6 +2431,8 @@ version and every object against the statement one of those builds ran to make i
 as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
 it was; a failure after it has begun changing the journal goes back with its transaction. Code reads
 one current schema after migration or import, and there is no branch anywhere that reads two.
+
+Similarly, the registry will take its own set of steps to move through schema versions one-by-one. In this case, version 7 will rewrite all create request records to remove environment variables that the creator had sent (and which earlier versions of the registry recorded as part of the reservation). After it has done this, the registry will `VACUUM` and perform a truncating checkpoint to remove the old bytes (which are still in free pages and in the WAL). Only then will it move to the next version. A run that stops before then is made again from the start. If `VACUUM` cannot finish, the daemon does not start. The error says why, and when the disk is full it asks for free space in the registry's directory and in SQLite's temporary directory, then a new start. Any record that is not in the expected format for either version will be cleared as it cannot be proven that the record does not contain environment variables.
 
 ## Retained output, and what eviction leaves behind
 
