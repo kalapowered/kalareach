@@ -2490,3 +2490,69 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_as_unrecorded() {
         .execute_batch("DROP TRIGGER refuse_expiry;")
         .expect("the fault is cleared");
 }
+
+/// KR-REQ-09.12: a device's retry that the worker answers from the receipt it kept goes back only
+/// under the admission asked after that lookup, which the worker's own answer waits for. A fence
+/// this host comes to owe while the lookup is under way stops the answer.
+///
+/// The retry is stopped at the place its answer has been found and has not been given, so the
+/// fence lands there and not before: the admission the retry arrived under stood when the lookup
+/// began, which is what a check made before the lookup would have asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands_during_the_lookup()
+{
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    script.refuse_reads(true);
+    let world = scripted::restarted(world).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 24));
+    let close = fake::close_request(world.environment_id, world.session_id);
+    assert!(
+        connection
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    let accepted = script.acceptance(world.session_id);
+    script.kept(
+        close.action_id,
+        ParamsValue::from_typed(&accepted).expect("encodes"),
+    );
+
+    let (arrived, release) = controller.pause_retained_lookup();
+    let (answered, ()) = tokio::join!(
+        connection.answer(ControlFrame::Mutation(Box::new(close))),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                .await
+                .expect("the retry reaches the place it is stopped at")
+                .expect("the pause is armed");
+            controller.hold_fence(true);
+            release.send(()).expect("the retry goes on");
+        }
+    );
+    let answered = answered.expect("the retry is answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(refused),
+        ..
+    }) = answered.frame()
+    else {
+        panic!(
+            "a fence owed while the receipt was found stops the answer: {:?}",
+            answered.frame()
+        );
+    };
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(refused.message.contains("fence"), "{refused:?}");
+    world.serving.abort();
+}

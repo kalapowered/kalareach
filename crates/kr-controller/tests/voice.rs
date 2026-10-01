@@ -1343,6 +1343,63 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
     host.stop().await;
 }
 
+/// KR-REQ-09.12 and 26.16: the admission is asked after the record is found and not only before it
+/// is looked for. The retry is stopped at the place its answer has been found and has not been
+/// given, and this host comes to owe a fence there: the answer is refused. A check made before the
+/// lookup would have asked while the fence was not yet owed, and the answer would go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+    let params = VoiceGrantParams {
+        device_id: record.device_id,
+        session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+        actions: Nullable::null(),
+    };
+    raw.mutate(Method::VoiceGrant, action_id, target.clone(), &params)
+        .await
+        .expect("the voice grant is written");
+
+    let (arrived, release) = host.controller().pause_retained_lookup();
+    let (retried, registry) = tokio::join!(
+        raw.mutate(Method::VoiceGrant, action_id, target, &params),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                .await
+                .expect("the retry reaches the place it is stopped at")
+                .expect("the pause is armed");
+            let registry = owe_a_fence(host.controller(), &host.tree().environment()).await;
+            release.send(()).expect("the retry goes on");
+            registry
+        }
+    );
+    let refused = retried.expect_err("a fence owed while its record was found stops the answer");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("could not be raised"),
+        "{refused:?}"
+    );
+    clear_the_fault(&registry);
+    raw.close();
+    host.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // One action, one call: the claim a voice start is performed under
 // ---------------------------------------------------------------------------------------------
