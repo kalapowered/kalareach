@@ -2871,15 +2871,15 @@ untrue.
 
 The same boundary applies when exporting session content as part of a support bundle:
 
-When the user runs `kr doctor --bundle support.tar --include-content` while privacy mode is enabled,
-all sessions will be excluded from the bundle. The same is true for sessions that are pending
-privacy mode cleanup for any reason, including sessions where the worker terminated before cleanup
-could complete. The command will inform the user how many sessions were excluded from the bundle and
-the reason. Privacy mode state will be checked both before and after the session list is read; if
-privacy mode changed in the meantime, all sessions will be excluded. Once the file is written to
-disk, it is the person's own, and enabling privacy mode afterwards cannot recall it, just like it
-cannot recall what had already left this host. See the command-line reference for more details on
-how to preview and redact session content.
+If `kr doctor --bundle support.tar --include-content` is invoked while privacy mode is enabled, all
+sessions will be excluded from the bundle. The same is true for any sessions still awaiting to be
+cleaned up by privacy mode, for whatever reason (e.g. the worker was terminated before the cleanup
+could complete). In these cases the command will inform the user how many sessions have been
+excluded from the bundle, and why. The privacy mode state is checked both prior to reading the list
+of sessions, and after. If the privacy mode has been changed in the meantime, all sessions will be
+excluded from the bundle. Once the file has been written to disk, it’s yours, and enabling privacy
+mode afterwards cannot recall it, just like it cannot recall anything that had already left this
+host. See the command-line reference for how to preview and redact the session content.
 
 The text the environment's attention inbox shows is fenced at the control daemon rather than in a
 queue of the session's own. A session serves no text from before a transition, and text it answered
