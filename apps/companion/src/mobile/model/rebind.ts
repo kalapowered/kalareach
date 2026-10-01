@@ -57,15 +57,19 @@ export async function observeTargets(
 }
 
 /**
- * Where one session stands: its conversation now, null when the host does not know it, 'unchanged'
- * when it is there with no agent to compare, and undefined when the read failed.
+ * Where one session stands: its conversation now, null when the host does not know it or holds it
+ * only as closed, 'unchanged' when it is there with no agent to compare, and undefined when the read
+ * failed.
  */
 async function standing(
   port: HostPort,
   sessionId: string
 ): Promise<DraftTarget | null | 'unchanged' | undefined> {
   try {
-    await port.sessionRead({ session_id: sessionId })
+    const read = await port.sessionRead({ session_id: sessionId })
+    // A host keeps the record of a session that closed and answers a read of it with that record.
+    // Its worker has stopped, so nothing is left to ask about the agents: the session has gone.
+    if (read.session.state === 'closed') return null
   } catch (failure) {
     return failureCode(failure) === UNKNOWN_SESSION ? null : undefined
   }

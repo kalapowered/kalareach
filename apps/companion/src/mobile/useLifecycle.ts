@@ -11,7 +11,7 @@
  * a resume by a marker written at the first render of a run.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { Draft } from '../model/drafts'
 import type { Submission } from '../model/receipts'
@@ -47,6 +47,12 @@ export interface Lifecycle {
    * of resumption, so what it was cannot say that one happened; this can.
    */
   readonly resumed: number
+  /**
+   * The same count, read at the moment it is asked. The number above is the page's rendering of the
+   * count, which trails a resumption by a render; this does not, so an answer to a question asked
+   * before a resumption can tell that one has happened since.
+   */
+  readonly resumedNow: () => number
   /** The banner to show, or null. */
   readonly banner: RecoveryBanner | null
   readonly setDrafts: (change: (drafts: readonly Draft[]) => readonly Draft[]) => void
@@ -88,6 +94,8 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
       : restored
   })
   const [resumed, setResumed] = useState(0)
+  const resumptions = useRef(0)
+  const resumedNow = useCallback(() => resumptions.current, [])
   const [dismissed, setDismissed] = useState(false)
   const [durable, setDurable] = useState(true)
 
@@ -116,6 +124,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
 
   const resume = useCallback(
     (next: Resumption) => {
+      resumptions.current += 1
       setResumption(next)
       setResumed((count) => count + 1)
       setDismissed(false)
@@ -171,6 +180,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
     state,
     resumption,
     resumed,
+    resumedNow,
     banner,
     setDrafts,
     setSubmissions,
