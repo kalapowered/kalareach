@@ -1026,7 +1026,11 @@ mod tests {
     /// that comes in time is the host's own.
     #[tokio::test(start_paused = true)]
     async fn a_request_that_changes_nothing_is_given_up_when_the_host_does_not_answer() {
-        let silent: Result<u32> = ask_within(std::future::pending()).await;
+        // The outer bound is the test's own: a request that is never given up never ends.
+        let silent =
+            tokio::time::timeout(ASK_WITHIN * 2, ask_within::<u32>(std::future::pending()))
+                .await
+                .expect("the request was given up at its own bound");
         let Err(unavailable @ CliError::HostUnavailable(_)) = silent else {
             panic!("the host did not answer");
         };
