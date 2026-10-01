@@ -136,12 +136,12 @@ Each number is the median of ten sessions, measured with a timer around the whol
 
 | The shell holds | Apple M4 Pro, macOS 26 | AMD EPYC 7502P, Linux (glibc 2.43) |
 | --- | --- | --- |
-| only the modules it loaded itself (two on macOS, one on Linux) | 0.22 ms (0.32) | 0.14 ms (0.17) |
+| only the modules it loaded itself (two on macOS, one on Linux) | 0.22 ms (0.32) | 0.12 ms (0.15) |
 | and 1 small module of the person's own | 0.22 ms (0.50) | 0.12 ms (0.15) |
-| and 3 | 0.24 ms (0.51) | 0.13 ms (0.18) |
-| and 8 | 0.29 ms (0.59) | 0.12 ms (0.16) |
-| and 10 of the package's modules, read from another directory | 1.2 ms (1.3) | 0.39 ms (0.48) |
-| and about 35 of the package's modules, read from another directory | 1.9 ms (3.2) | 0.58 ms (0.79) |
+| and 3 | 0.24 ms (0.51) | 0.12 ms (0.18) |
+| and 8 | 0.29 ms (0.59) | 0.14 ms (0.17) |
+| and 10 of the package's modules, read from another directory | 1.2 ms (1.3) | 0.29 ms (0.36) |
+| and about 35 of the package's modules, read from another directory | 1.9 ms (3.2) | 0.49 ms (0.83) |
 
 A `.zshrc` that loads a few modules of its own pays about a quarter of a millisecond on the Mac, at most 0.6 ms in the slowest run measured, and about a tenth of a millisecond on Linux. The last row loads the whole module tree of the package, which amounts to dozens of modules, and stays under four milliseconds.
 
