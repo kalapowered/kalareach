@@ -238,29 +238,56 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
     );
 }
 
-/// The controls for what the diagnosis must not refuse: a module that imports from a package module
-/// that is not loaded yet binds (the shell loads it on demand), and so does one that imports a name
-/// it is content to lose.
+/// A module that imports from a package module is judged by whether that module is loaded when the
+/// hooks go live: the shell does not load a module because another imports a name from it, so a
+/// call into a module that is not there ends the shell, and the session is refused by name. Loaded
+/// first, as a startup file that needs it loads it, the same module binds.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
-fn a_module_that_imports_from_an_unloaded_package_module_or_only_weakly_binds() {
+fn a_module_that_imports_from_a_package_module_is_judged_by_whether_that_module_is_loaded() {
     let package = Package::built(ShellKind::Zsh);
     let modules = built_modules(&package);
-    let setup = home_with_modules(&package, &["kr_user_lazy", "kr_user_weak"]);
-    for name in ["kr_user_lazy", "kr_user_weak"] {
-        std::fs::copy(
-            modules.join(format!("{name}.so")),
-            setup.home.join("modules").join(format!("{name}.so")),
-        )
-        .expect("the module goes where the shell searches");
-    }
 
+    let setup = home_loading(&package, &modules, "kr_user_lazy");
     let mut session = Session::start_for(&package, &case(), &setup);
     let listed = activation_report(&mut session);
     assert_eq!(
         module(&listed, "kr_user_lazy").imports,
-        ModuleImports::Bound
+        ModuleImports::Missing("asklist".to_owned()),
+        "the provider is not loaded, and the module would end the shell at its first call"
     );
+    let refused = decide_activated_modules("zle-5.9", &listed)
+        .expect_err("a module that imports what is not there is not qualified");
+    assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
+    drop(session);
+
+    let setup = home_with_modules(&package, &["zsh/complist", "kr_user_lazy"]);
+    std::fs::copy(
+        modules.join("kr_user_lazy.so"),
+        setup.home.join("modules/kr_user_lazy.so"),
+    )
+    .expect("the module goes where the shell searches");
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
+    assert_eq!(
+        module(&listed, "kr_user_lazy").imports,
+        ModuleImports::Bound,
+        "the provider is loaded: {}",
+        refusals(&setup)
+    );
+    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+}
+
+/// A name a module imports weakly is one it is content to lose, and is not judged.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
+fn a_module_that_only_weakly_imports_a_missing_name_binds() {
+    let package = Package::built(ShellKind::Zsh);
+    let modules = built_modules(&package);
+    let setup = home_loading(&package, &modules, "kr_user_weak");
+
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
     assert_eq!(
         module(&listed, "kr_user_weak").imports,
         ModuleImports::Bound
@@ -354,6 +381,44 @@ fn a_module_is_judged_as_the_shell_loaded_it_and_not_as_its_file_is_now() {
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     drop(session);
 
+    // Replaced by a link into the package's own tree, which is where the package's modules are: the
+    // name now finds a module of the package, and the module that loaded is still the one judged.
+    let package_tree = PathBuf::from(
+        package.record["shell"]["modules"][0]["search_path"]
+            .as_str()
+            .expect("the record names the package's module directory"),
+    );
+    let mut setup = home_loading(&package, &modules, "kr_user_newer");
+    setup.environment.push((
+        "KR_TEST_LINK_AFTER_LOAD".to_owned(),
+        "kr_user_newer".to_owned(),
+    ));
+    setup.environment.push((
+        "KR_TEST_LINK_TARGET".to_owned(),
+        package_tree
+            .join("zsh/complist.so")
+            .to_str()
+            .expect("a path that is text")
+            .to_owned(),
+    ));
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
+    assert!(
+        std::fs::symlink_metadata(setup.home.join("modules/kr_user_newer.so"))
+            .is_ok_and(|about| about.file_type().is_symlink()),
+        "the startup file put a link where the module was: {}",
+        refusals(&setup)
+    );
+    assert_eq!(
+        module(&listed, "kr_user_newer").imports,
+        ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
+        "a link into the package's tree made the module the package's"
+    );
+    let refused = decide_activated_modules("zle-5.9", &listed)
+        .expect_err("the shell holds a module that cannot bind");
+    assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
+    drop(session);
+
     // The other way, the control: a module that binds is not refused for what replaces its file.
     let mut setup = home_loading(&package, &modules, "kr_user_compatible");
     std::fs::copy(
@@ -372,6 +437,87 @@ fn a_module_is_judged_as_the_shell_loaded_it_and_not_as_its_file_is_now() {
         ModuleImports::Bound
     );
     assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+}
+
+/// A copy of the editor that a person puts first on their module path is not the package's: where
+/// the shell sets the editor up only when a startup file asks, that copy is the editor, and a module
+/// beside it is not the package's for being there.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
+fn a_copy_of_the_editor_does_not_make_the_modules_beside_it_the_packages() {
+    let package = Package::built(ShellKind::Zsh);
+    let modules = built_modules(&package);
+    let package_tree = PathBuf::from(
+        package.record["shell"]["modules"][0]["search_path"]
+            .as_str()
+            .expect("the record names the package's module directory"),
+    );
+    let setup = home_loading(&package, &modules, "kr_user_newer");
+    std::fs::create_dir_all(setup.home.join("modules/zsh")).expect("a directory");
+    std::fs::copy(
+        package_tree.join("zsh/zle.so"),
+        setup.home.join("modules/zsh/zle.so"),
+    )
+    .expect("the editor is copied beside the module");
+
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
+    assert_eq!(
+        module(&listed, "kr_user_newer").imports,
+        ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
+        "a module beside a copy of the editor was taken for the package's"
+    );
+    assert_eq!(
+        decide_activated_modules("zle-5.9", &listed)
+            .expect_err("the shell holds a module that cannot bind")
+            .reason,
+        QualificationReason::ModuleTreeUnsupported
+    );
+}
+
+/// Every module of the package's own tree binds when it is the only one loaded. A module that
+/// imported a name from one that was not loaded would be refused with the session, since every
+/// module the shell holds is judged: the package's own are not exempt, and this holds them to it.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
+fn each_of_the_packages_own_modules_binds_when_it_is_the_only_one_loaded() {
+    let package = Package::built(ShellKind::Zsh);
+    let tree = PathBuf::from(
+        package.record["shell"]["modules"][0]["search_path"]
+            .as_str()
+            .expect("the record names the package's module directory"),
+    );
+    let mut names = Vec::new();
+    collect_modules(&tree, &tree, &mut names);
+    names.retain(|name| name != "zsh/zle");
+    assert!(
+        names.len() >= 20,
+        "the package's module tree holds {names:?}"
+    );
+    for name in &names {
+        let setup = home_with_modules(&package, &[name.as_str()]);
+        let mut session = Session::start_for(&package, &case(), &setup);
+        let listed = activation_report(&mut session);
+        assert_eq!(
+            setup.recorded_order(),
+            ["user-top", "kr-module-loaded", "user-bottom"],
+            "{name} did not load: {}",
+            refusals(&setup)
+        );
+        for held in &listed {
+            assert_eq!(
+                held.imports,
+                ModuleImports::Bound,
+                "with {name} loaded, {} was not judged to bind",
+                held.name
+            );
+        }
+        assert_eq!(
+            decide_activated_modules("zle-5.9", &listed),
+            Ok(()),
+            "{name}"
+        );
+    }
 }
 
 /// Every module of the package's own tree, loaded from a directory the person's module path puts
@@ -401,7 +547,8 @@ fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
     copy_tree(&tree, &setup.home.join("modules"));
     // The editor the shell runs is the one its module path finds first. Where the shell sets it up
     // only when a startup file asks, after that file has put the home's directory first, a copy of
-    // it here would be the editor, and the package's own directory would be this one.
+    // it here would be the editor the shell runs; a copy of the editor has a test of its own, and
+    // this one keeps the package's.
     std::fs::remove_file(setup.home.join("modules/zsh/zle.so"))
         .expect("the copy of the editor goes, so the package's own is loaded");
     warm(&package, &setup, &names);
