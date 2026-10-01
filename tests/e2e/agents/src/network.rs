@@ -451,12 +451,14 @@ fn relay(from: &mut impl Read, to: &mut impl Write) -> u64 {
     let mut written = 0_u64;
     loop {
         let read = match from.read(&mut buffer) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return written,
             Ok(read) => read,
         };
         let mut sent = 0;
         while sent < read {
             match to.write(&buffer[sent..read]) {
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Ok(0) | Err(_) => return written,
                 Ok(count) => {
                     sent += count;
@@ -643,6 +645,31 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A writer that is interrupted once before each byte it takes.
+    struct Interrupting(bool, Vec<u8>);
+
+    impl Write for Interrupting {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 = !self.0;
+            if self.0 {
+                return Err(std::io::Error::new(ErrorKind::Interrupted, "signal"));
+            }
+            self.1.push(buffer[0]);
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_write_is_tried_again_and_not_taken_for_a_closed_stream() {
+        let mut writer = Interrupting(false, Vec::new());
+        assert_eq!(relay(&mut Failing(b"hello", false), &mut writer), 5);
+        assert_eq!(writer.1, b"hello");
     }
 
     #[test]

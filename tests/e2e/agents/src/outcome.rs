@@ -162,6 +162,32 @@ impl Outcome {
         }
     }
 
+    /// Whether the line this outcome would write holds any of `values`, the strings of a login's
+    /// files, which no record may hold.
+    #[must_use]
+    pub fn mentions(&self, values: &[String]) -> bool {
+        let line = serde_json::to_string(self).unwrap_or_default();
+        values
+            .iter()
+            .any(|value| !value.is_empty() && line.contains(value.as_str()))
+    }
+
+    /// This outcome, or, where it holds one of `values`, a failure that says so and holds nothing
+    /// of the part's: a text that quotes a screen or a message can quote what a tool printed.
+    #[must_use]
+    pub fn without(self, values: &[String]) -> Self {
+        if !self.mentions(values) {
+            return self;
+        }
+        Self::failed(
+            &self.part,
+            &self.test,
+            "the part's result held a string of the login's files, so it is not kept",
+            json!({ "stop_agent": true }),
+        )
+        .with_failures(&[Failure::AgentStops("secret_found")])
+    }
+
     /// Appends the line, and says so.
     ///
     /// # Panics
@@ -222,6 +248,40 @@ mod tests {
             !outcome.evidence.to_string().contains("anything"),
             "no text of the failure goes to the evidence"
         );
+    }
+
+    #[test]
+    fn a_result_that_holds_a_logins_string_is_replaced_by_a_failure_that_holds_none() {
+        let secret = "sk-0123456789abcdefghij".to_owned();
+        let quoting = Outcome::failed(
+            "3",
+            "a test",
+            &format!("the screen showed {secret} and more"),
+            json!({ "login_held": true, "stop_agent": false }),
+        );
+        assert!(quoting.mentions(std::slice::from_ref(&secret)));
+        assert!(!quoting.mentions(&["something else long".to_owned()]));
+        let kept = quoting.without(std::slice::from_ref(&secret));
+        assert!(!kept.mentions(std::slice::from_ref(&secret)));
+        assert_eq!(kept.outcome, "failed");
+        assert_eq!(kept.evidence["stop_agent"], true);
+        assert_eq!(
+            kept.evidence["failure_codes"],
+            json!([{ "code": "agent_stops", "class": "secret_found" }])
+        );
+        // In the evidence too, where nothing but a count is meant to be.
+        let in_evidence = Outcome::passed("1", "a test", json!({ "note": secret.clone() }));
+        assert_eq!(
+            in_evidence.without(std::slice::from_ref(&secret)).outcome,
+            "failed"
+        );
+        // A part that holds none is returned as it was.
+        let clean = Outcome::passed("1", "a test", json!({ "a": 1 }));
+        assert_eq!(
+            clean.clone().without(std::slice::from_ref(&secret)).outcome,
+            "passed"
+        );
+        assert_eq!(clean.without(&[]).evidence, json!({ "a": 1 }));
     }
 
     #[test]
