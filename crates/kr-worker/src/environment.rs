@@ -150,11 +150,20 @@ impl TerminfoSelection {
     }
 }
 
-/// `text` with every control character written as its escape, so it stays on one line.
+/// `text` with every control character written as its escape, so it stays on one line and a
+/// viewer cannot be made to break it or to reorder what follows.
+///
+/// That is every control character, the line and paragraph separators (U+2028, U+2029) and the
+/// direction marks and overrides (U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
 fn one_line(text: &str) -> String {
     text.chars()
         .flat_map(|character| {
-            if character.is_control() {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
+            {
                 character.escape_default().collect::<Vec<_>>()
             } else {
                 vec![character]
@@ -786,6 +795,22 @@ mod tests {
         assert!(
             !line.chars().any(char::is_control),
             "the line holds a control character: {line:?}"
+        );
+        let separators = built_with(
+            &[("TERMINFO", "/a\u{2028}b\u{2029}c\u{202e}d\u{200f}e")],
+            &with_private_database("/state/terminfo/ab"),
+        );
+        let marked = separators.sources.terminfo.describe();
+        assert!(
+            !marked.chars().any(|character| matches!(
+                character,
+                '\u{2028}' | '\u{2029}' | '\u{202e}' | '\u{200f}'
+            )),
+            "the line holds a separator or a direction mark: {marked:?}"
+        );
+        assert!(
+            marked.contains(r"/a\u{2028}b\u{2029}c\u{202e}d\u{200f}e"),
+            "{marked}"
         );
         assert!(
             line.contains(r"TERMINFO=/x\nkr-worker: session s:"),
