@@ -536,12 +536,10 @@ impl PublicationGate for Admission {
         Some(publish())
     }
 
-    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut()) -> bool {
-        let Some(_admission) = self.privacy.admit_send(generation) else {
-            return false;
-        };
-        register();
-        true
+    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut()) {
+        if let Some(_admission) = self.privacy.admit_send(generation) {
+            register();
+        }
     }
 }
 
@@ -1363,22 +1361,14 @@ mod tests {
                 privacy: PrivacyState::at(state),
             };
             let mut ran = false;
-            let admitted = gate.admit_dispatch(PrivacyGeneration::new(generation), &mut || {
+            gate.admit_dispatch(PrivacyGeneration::new(generation), &mut || {
                 ran = true;
             });
-            (ran, admitted)
+            ran
         };
-        assert_eq!(registered(state(3, false), 3), (true, true));
-        assert_eq!(
-            registered(state(3, true), 3),
-            (false, false),
-            "privacy mode is on"
-        );
-        assert_eq!(
-            registered(state(4, false), 3),
-            (false, false),
-            "another generation"
-        );
+        assert!(registered(state(3, false), 3));
+        assert!(!registered(state(3, true), 3), "privacy mode is on");
+        assert!(!registered(state(4, false), 3), "another generation");
     }
 
     /// A reading of the host's conditions serves while it is under a minute old and says nothing

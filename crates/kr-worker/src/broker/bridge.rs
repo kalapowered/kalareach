@@ -820,6 +820,20 @@ impl crate::broker::Broker {
         let Some(facts) = self.description_facts.get() else {
             return;
         };
+        // Only a report that decided something about a thread says anything about the thread. One
+        // that changed nothing, a stale or indirect one and a tool's or a notification's come from
+        // an instance that may hold no thread at all while another instance of the session holds
+        // one, and must not clear it.
+        if !matches!(
+            change,
+            ThreadChange::Selected(_)
+                | ThreadChange::Ended(_)
+                | ThreadChange::Overtaken(_)
+                | ThreadChange::Unordered
+                | ThreadChange::Refused(_)
+        ) {
+            return;
+        }
         let vouched = state
             .instances
             .get(&application_instance_id)
@@ -1676,6 +1690,55 @@ mod tests {
         assert!(revision(&broker, id) > before, "the binding advanced");
         assert_eq!(vouched(&broker, id).as_deref(), Some("b"));
         assert_eq!(thread().as_deref(), Some("b"));
+    }
+
+    /// With two instances in one session, a report that decided nothing about a thread, from an
+    /// instance that holds none, leaves the thread the other holds in the facts and moves no
+    /// revision. The control is the same instance's own selection, which is recorded.
+    #[test]
+    fn a_report_that_decided_no_thread_leaves_the_thread_another_instance_holds() {
+        let (first, second) = (instance(21), instance(22));
+        let broker = broker_with(&[first, second]);
+        let facts = crate::description_facts::DescriptionFacts::new(
+            false,
+            crate::privacy::PrivacyGeneration::new(0),
+        );
+        broker.set_description_facts(facts.clone());
+        let read = || facts.read(0, Some(0)).facts.expect("facts");
+
+        assert!(matches!(
+            apply(&broker, first, 10, &start("a")),
+            ThreadChange::Selected(_)
+        ));
+        let held = read();
+        assert_eq!(held.thread.0.as_deref(), Some("a"));
+        for event in [
+            ObservedEvent::ToolFinished,
+            ObservedEvent::ToolFailed,
+            ObservedEvent::Notification,
+        ] {
+            assert_eq!(
+                apply(&broker, second, 11, &observed(event, "b")),
+                ThreadChange::Unchanged
+            );
+        }
+        let after = read();
+        assert_eq!(
+            after.thread.0.as_deref(),
+            Some("a"),
+            "the other's thread stays"
+        );
+        assert_eq!(after.revision, held.revision, "and nothing moved");
+
+        assert!(matches!(
+            apply(&broker, second, 12, &start("b")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(
+            read().thread.0.as_deref(),
+            Some("b"),
+            "its own selection is recorded"
+        );
     }
 
     fn suspension(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {
