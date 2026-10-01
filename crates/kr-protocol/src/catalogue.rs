@@ -128,6 +128,10 @@ pub struct CatalogueListParams {
 pub struct CatalogueListResult {
     /// The enrolled repositories, ordered by identifier.
     pub catalogues: Vec<CatalogueSummary>,
+    /// The budgets a repository enrolled now may ask for: what this host's configuration allows,
+    /// which is the product's defaults unless its owner narrowed or raised them. A request for
+    /// more is refused, so a client that adds a repository asks for these.
+    pub enrolment_budgets: CatalogueBudgets,
 }
 
 /// Parameters of `catalogue.add`.

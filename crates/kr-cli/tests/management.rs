@@ -634,6 +634,15 @@ async fn every_plugin_operation_reaches_its_method() {
         Value::Array(Vec::new()),
         "{repositories}"
     );
+    assert_eq!(
+        repositories["enrolment_budgets"]["metadata_bytes"],
+        Value::String(
+            kr_protocol::hostinfo::configuration::EnrolmentBudgets::default()
+                .metadata_bytes
+                .to_string()
+        ),
+        "the budgets a repository may ask for: {repositories}"
+    );
 
     let root = host.work().join("root.json");
     std::fs::write(&root, "{}").expect("a root file");
@@ -841,6 +850,8 @@ struct OwnerDevice {
     expires_at_ms: u64,
     /// Whether this host has no owner yet.
     initial_bootstrap: bool,
+    /// The budgets this host allows a new enrolment, which `catalogue.list` reports.
+    budgets: kr_protocol::catalogue::CatalogueBudgets,
     /// What the effect answers once an owner device has answered.
     answer: ParamsValue,
 }
@@ -928,6 +939,13 @@ impl OwnerDevice {
                     .push(asked.subject);
                 Ok(ParamsValue::from_typed(&challenge).expect("a challenge"))
             }
+            "catalogue.list" => Ok(ParamsValue::from_typed(
+                &kr_protocol::catalogue::CatalogueListResult {
+                    catalogues: Vec::new(),
+                    enrolment_budgets: self.budgets,
+                },
+            )
+            .expect("a list")),
             "owner.confirmation.pending" => {
                 let subject: ConfirmationSubject = seen
                     .lock()
@@ -961,6 +979,20 @@ impl OwnerDevice {
                 format!("{other} was not expected"),
             )),
         })
+    }
+}
+
+/// The budgets a host allows a new enrolment when its owner has narrowed none: the product's own.
+fn allowed() -> kr_protocol::catalogue::CatalogueBudgets {
+    use kr_protocol::scalars::U64;
+    let defaults = kr_protocol::hostinfo::configuration::EnrolmentBudgets::default();
+    kr_protocol::catalogue::CatalogueBudgets {
+        metadata_bytes: U64::new(defaults.metadata_bytes),
+        metadata_entries: U64::new(defaults.metadata_entries),
+        retained_generations: U64::new(defaults.retained_generations),
+        retained_metadata_bytes: U64::new(defaults.retained_metadata_bytes),
+        payload_cache_bytes: U64::new(defaults.cached_payload_bytes),
+        full_offline_mirror: defaults.full_offline_mirror,
     }
 }
 
@@ -1055,6 +1087,7 @@ async fn a_repository_added_from_a_terminal_is_confirmed_on_an_owner_device_and_
                 refusals: Some(2),
                 expires_at_ms: kr_ipc::now_ms().get() + 600_000,
                 initial_bootstrap: false,
+                budgets: allowed(),
                 answer: added(kind),
             }
             .script(&temp, Arc::clone(&seen)),
@@ -1119,7 +1152,10 @@ async fn a_repository_added_from_a_terminal_is_confirmed_on_an_owner_device_and_
         assert!(
             methods.iter().all(|name| matches!(
                 name.as_str(),
-                "owner.confirmation.request" | "owner.confirmation.pending" | "catalogue.add"
+                "catalogue.list"
+                    | "owner.confirmation.request"
+                    | "owner.confirmation.pending"
+                    | "catalogue.add"
             )),
             "{methods:?}"
         );
@@ -1145,34 +1181,38 @@ async fn a_repository_added_from_a_terminal_is_confirmed_on_an_owner_device_and_
     }
 }
 
-/// KR-REQ-07.47: a repository added from a terminal asks for the budgets this host's own
-/// configuration allows, which are the product's defaults unless its owner narrowed them, and the
-/// request repeated until an owner device answers is the one the challenge was asked for. A host
-/// that allows less metadata than the product's default would refuse a request for the default, and
-/// the command has no option to change it. The control is a host with no configured budgets.
+/// KR-REQ-07.47: a repository added from a terminal asks for the budgets the host says it allows,
+/// as `catalogue.list` reports them, and the request repeated until an owner device answers is the
+/// one the challenge was asked for. What the host enforces is what it accepted, which a document on
+/// disk may no longer say, so the command reads it from the host and not from a file: here the file
+/// names other numbers, and the host's are the ones asked for. A host that allows less metadata
+/// than the product's default would refuse a request for the default, and the command has no
+/// option to change it. The control is a host that allows the product's defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allows() {
-    use kr_protocol::catalogue::{CatalogueAddParams, CatalogueKind};
+    use kr_protocol::catalogue::{CatalogueAddParams, CatalogueBudgets, CatalogueKind};
     use kr_protocol::confirmation::ConfirmationSubject;
-    use kr_protocol::hostinfo::configuration::{
-        Change, ConfiguredEnrolmentBudgets, EnrolmentBudgets,
-    };
+    use kr_protocol::hostinfo::configuration::{Change, ConfiguredEnrolmentBudgets};
     use kr_protocol::scalars::U64;
-    for configured in [false, true] {
+    let narrowed = CatalogueBudgets {
+        metadata_bytes: U64::new(32 * 1024 * 1024),
+        metadata_entries: U64::new(50_000),
+        retained_generations: U64::new(1),
+        retained_metadata_bytes: U64::new(32 * 1024 * 1024),
+        payload_cache_bytes: U64::new(512 * 1024 * 1024),
+        full_offline_mirror: false,
+    };
+    for (what, allows) in [("the defaults", allowed()), ("less than them", narrowed)] {
         let temp = kr_ipc::testing::TempHost::create();
-        let narrowed = ConfiguredEnrolmentBudgets {
-            metadata_bytes: Nullable::some(32 * 1024 * 1024),
-            cached_payload_bytes: Nullable::some(1024 * 1024 * 1024),
-            full_offline_mirror: Nullable::some(false),
-            ..ConfiguredEnrolmentBudgets::default()
-        };
-        let in_force = if configured {
-            kr_cli::doctor::configuration::apply(&temp.environment(), &Change::Enrolment(narrowed))
-                .expect("a configuration document");
-            narrowed.resolve()
-        } else {
-            EnrolmentBudgets::default()
-        };
+        // A document that names other budgets than the host enforces, which the command ignores.
+        kr_cli::doctor::configuration::apply(
+            &temp.environment(),
+            &Change::Enrolment(ConfiguredEnrolmentBudgets {
+                metadata_bytes: Nullable::some(7 * 1024 * 1024),
+                ..ConfiguredEnrolmentBudgets::default()
+            }),
+        )
+        .expect("a configuration document");
         let root = temp.root().join("root.json");
         std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
         let root = root.display().to_string();
@@ -1184,6 +1224,7 @@ async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allow
                 refusals: Some(1),
                 expires_at_ms: kr_ipc::now_ms().get() + 600_000,
                 initial_bootstrap: false,
+                budgets: allows,
                 answer: added(CatalogueKind::Community),
             }
             .script(&temp, Arc::clone(&seen)),
@@ -1195,7 +1236,7 @@ async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allow
         assert_eq!(
             output.status.code(),
             Some(0),
-            "{}{}",
+            "{what}: {}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1203,31 +1244,16 @@ async fn a_repository_added_from_a_terminal_asks_for_the_budgets_this_host_allow
         let [ConfirmationSubject::CatalogueAdd(subject)] = seen.subjects.as_slice() else {
             panic!("one challenge, for a repository: {:?}", seen.subjects);
         };
-        let wanted = kr_protocol::catalogue::CatalogueBudgets {
-            metadata_bytes: U64::new(in_force.metadata_bytes),
-            metadata_entries: U64::new(in_force.metadata_entries),
-            retained_generations: U64::new(in_force.retained_generations),
-            retained_metadata_bytes: U64::new(in_force.retained_metadata_bytes),
-            payload_cache_bytes: U64::new(in_force.cached_payload_bytes),
-            full_offline_mirror: in_force.full_offline_mirror,
-        };
         assert_eq!(
-            subject.budgets, wanted,
-            "configured {configured}: the budgets this host allows"
+            subject.budgets, allows,
+            "{what}: the budgets the host says it allows"
         );
-        if configured {
-            assert_ne!(
-                subject.budgets.metadata_bytes,
-                U64::new(EnrolmentBudgets::default().metadata_bytes),
-                "the narrowed budget is not the default"
-            );
-        }
         for effect in &seen.effects {
             let sent: CatalogueAddParams = effect.to_typed().expect("the request");
             assert_eq!(
                 &sent,
                 subject.as_ref(),
-                "every request sent is the one the challenge was asked for"
+                "{what}: every request sent is the one the challenge was asked for"
             );
         }
         serving.abort();
@@ -1252,6 +1278,7 @@ async fn an_installation_confirmed_on_an_owner_device_is_installed_with_the_publ
             refusals: Some(3),
             expires_at_ms: kr_ipc::now_ms().get() + 600_000,
             initial_bootstrap: false,
+            budgets: allowed(),
             answer: installed(&temp),
         }
         .script(&temp, Arc::clone(&seen)),
@@ -1337,6 +1364,7 @@ async fn an_owner_device_that_never_answers_ends_at_the_challenges_deadline_and_
                 refusals: None,
                 expires_at_ms,
                 initial_bootstrap: false,
+                budgets: allowed(),
                 answer: added(CatalogueKind::Community),
             }
             .script(&temp, Arc::clone(&seen)),
@@ -1391,6 +1419,7 @@ async fn a_host_with_no_owner_device_is_told_how_to_pair_one_and_nothing_waits()
                 refusals: None,
                 expires_at_ms: kr_ipc::now_ms().get() + 600_000,
                 initial_bootstrap: true,
+                budgets: allowed(),
                 answer: added(CatalogueKind::Community),
             }
             .script(&temp, Arc::clone(&seen)),
@@ -1410,7 +1439,7 @@ async fn a_host_with_no_owner_device_is_told_how_to_pair_one_and_nothing_waits()
         let expected: &[&str] = if effect == "plugin.install" {
             &["plugin.install", "owner.confirmation.request"]
         } else {
-            &["owner.confirmation.request"]
+            &["catalogue.list", "owner.confirmation.request"]
         };
         assert_eq!(
             methods, expected,
