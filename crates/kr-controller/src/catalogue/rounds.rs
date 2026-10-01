@@ -401,6 +401,8 @@ impl Controller {
 
     /// Asks the cadence for a pass now.
     pub(crate) fn admissions_due(&self) {
+        #[cfg(feature = "testing")]
+        self.plugin_bridge.pass_asked();
         self.admissions_due.notify_one();
     }
 
@@ -467,6 +469,14 @@ impl Controller {
     #[must_use]
     pub fn reported_releases(&self) -> Vec<(LiveRelease, bool)> {
         self.plugin_bridge.live().into_values().collect()
+    }
+
+    /// Returns how many times a pass of the cadence was asked for ahead of its tick. For this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn passes_asked(&self) -> u64 {
+        self.plugin_bridge.passes_asked()
     }
 
     /// Asks the cadence for a pass now, as a change does. For this host's own tests.

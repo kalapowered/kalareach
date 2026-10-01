@@ -1507,9 +1507,14 @@ async fn a_worker_that_outlives_a_restart_is_first_sent_the_policy_the_configura
     );
 }
 
-/// KR-REQ-25.22: a policy that moves sends every worker a round at once, as a package limit does,
-/// without waiting for the cadence. The worker cannot answer here, so the round stays out, and
-/// that is what shows it was sent.
+/// KR-REQ-25.22: a policy that moves asks the admissions cadence for a pass at once, as a package
+/// limit does, and the pass sends a worker that has not answered at the new revision a round: no
+/// worker waits for the cadence's next tick to be told.
+///
+/// What decides the case is a count of the passes asked for ahead of a tick, which a change makes
+/// and a tick does not, so no wait stands in for it: the count moves when the policy moves,
+/// stays where it is when the same document is accepted again, and the pass it asked for sends the
+/// stopped worker its round. The wait for that round only ends a case whose pass never came.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_policy_that_moves_sends_every_worker_a_round_at_once() {
     use kr_protocol::admission::RevocationPolicy;
@@ -1525,23 +1530,32 @@ async fn a_policy_that_moves_sends_every_worker_a_round_at_once() {
     assert!(hosted.pending().await.is_empty());
 
     let stopped = Stopped::stop(&worker);
+    let asked = hosted.controller().passes_asked();
     name_the_policy(&hosted, RevocationPolicy::DisableAtNextAdmission);
     drop(hosted.controller().effective_configuration().await);
+    assert!(
+        hosted.controller().passes_asked() > asked,
+        "the policy moving asked the cadence for a pass"
+    );
     assert_eq!(
         hosted.pending().await,
         vec![format!("session {session_id}")],
         "the worker is pending at the revision the policy moved"
     );
-    // The cadence's own pass is thirty seconds away from any point in this test's first seconds,
-    // so a round out before it is the one the change asked for.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
     while !hosted.controller().admission_round_out(session_id) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no round was sent when the policy moved"
+            "the pass the policy asked for sent no round"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    // The same document accepted again moves nothing and asks for nothing.
+    let asked = hosted.controller().passes_asked();
+    drop(hosted.controller().effective_configuration().await);
+    assert_eq!(hosted.controller().passes_asked(), asked);
+
     drop(stopped);
     assert_eq!(
         hosted.counted_once_known().await,
