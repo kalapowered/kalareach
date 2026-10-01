@@ -1133,12 +1133,15 @@ rather than being shown to whoever happens to be watching.
 A side effect with a destination is delivered whole, never trimmed as if it were a span of the
 stream, and ahead of any request to begin again that the same output makes of that attachment,
 because the byte that ends a clipboard write can also be the byte that lets a held terminal take the
-stream. If a side effect with a destination cannot be delivered for any reason (its lease has moved,
-its attachment has no subscription, its stream has been told to begin again, or its queue has no
-room), it is recorded as a host event as though it had no destination. When a subscription is
-replaced by another, the original subscription will attempt to deliver all side effects queued on
-its stream before it stops. These side effects will be delivered in full, and any that cannot be
-delivered will be recorded as host events.
+stream. A side effect which cannot be delivered is recorded as a host event, as if it had no
+destination. Reasons for not delivering a side effect include: the lease has moved to another
+attachment; the attachment has no subscription; its stream has been told to begin again; its queue
+has no room; or a write to it failed. When a subscription is replaced by another, the former
+subscription writes the effects still queued on its stream, each whole, before it stops, and records
+the ones it cannot write. When a subscription that has written no frame but a gap is replaced by
+another, it writes no side effects and records them all, because the first frame of a stream is the
+one a client takes for its beginning. A connection that ends, or an authority that is withdrawn,
+stops a delivery where it stands, and the effects still queued on its stream go with it.
 
 The host's own replies to the application's questions are measured on the session's continuous
 clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. Each
