@@ -12,12 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use kr_controller::sharing::CatalogueTrustPlan;
 use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
 use kr_protocol::catalogue as wire;
+use kr_protocol::confirmation::CatalogueTrustPlan;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::SensitiveAction;
-use kr_protocol::scalars::CanonicalSet;
 
 use crate::device::Remote;
 
@@ -102,8 +101,8 @@ pub fn pinned_root(lock: &BundledLock) -> Vec<u8> {
 }
 
 /// Enrols a repository on the host through `remote`, with the owner device's confirmation of that
-/// exact enrolment: this identifier, this root, its key identifiers, and no ceiling beyond the
-/// default.
+/// exact enrolment: this identifier, its kind and locations, this root, its key identifiers, its
+/// budgets, and no ceiling beyond the default.
 ///
 /// # Errors
 ///
@@ -137,41 +136,38 @@ pub async fn enrol(
     .map_err(|error| format!("the root's key identifiers: {error}"))?
     .into_iter()
     .collect();
-    let digest = CatalogueTrustPlan {
+    let defaults = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
+    let mut params = wire::CatalogueAddParams {
         environment_id: remote.environment_id(),
         catalogue_id: catalogue_id.to_owned(),
-        root_digest: kr_plugin_sdk::digest::PayloadDigest::of(root).to_string(),
+        kind,
+        metadata_url: metadata_url.to_owned(),
+        targets_url: targets_url.to_owned(),
+        root: base64::engine::general_purpose::STANDARD.encode(root),
+        budgets: wire::CatalogueBudgets {
+            metadata_bytes: defaults.metadata_bytes,
+            metadata_entries: defaults.metadata_entries,
+            retained_generations: defaults.retained_generations,
+            retained_metadata_bytes: defaults.retained_metadata_bytes,
+            payload_cache_bytes: defaults.payload_cache_bytes,
+            full_offline_mirror: false,
+        },
+        ceiling: Vec::new(),
+        owner_confirmation: kr_protocol::scalars::Nullable::null(),
+    };
+    let digest = CatalogueTrustPlan::of_request(
+        &params,
+        kr_plugin_sdk::digest::PayloadDigest::of(root).to_string(),
         root_key_ids,
-        ceiling: CanonicalSet::new(),
-    }
+    )
     .action_digest()
     .map_err(|error| format!("the enrolment's digest: {error}"))?;
     let proof = remote
         .confirm_described(SensitiveAction::TrustRepositoryRoot, digest)
         .await?;
-    let defaults = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
+    params.owner_confirmation = kr_protocol::scalars::Nullable::some(proof);
     remote
-        .mutate_environment(
-            Method::CatalogueAdd,
-            &wire::CatalogueAddParams {
-                environment_id: remote.environment_id(),
-                catalogue_id: catalogue_id.to_owned(),
-                kind,
-                metadata_url: metadata_url.to_owned(),
-                targets_url: targets_url.to_owned(),
-                root: base64::engine::general_purpose::STANDARD.encode(root),
-                budgets: wire::CatalogueBudgets {
-                    metadata_bytes: defaults.metadata_bytes,
-                    metadata_entries: defaults.metadata_entries,
-                    retained_generations: defaults.retained_generations,
-                    retained_metadata_bytes: defaults.retained_metadata_bytes,
-                    payload_cache_bytes: defaults.payload_cache_bytes,
-                    full_offline_mirror: false,
-                },
-                ceiling: Vec::new(),
-                owner_confirmation: kr_protocol::scalars::Nullable::some(proof),
-            },
-        )
+        .mutate_environment(Method::CatalogueAdd, &params)
         .await
         .map_err(|error| format!("catalogue.add: {error}"))
 }
