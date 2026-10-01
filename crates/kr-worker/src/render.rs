@@ -811,6 +811,10 @@ impl Writer {
         // Into the other buffer. Switching resets the pen on the terminals this profile is written
         // against, so this writer's idea of what the terminal is in goes with it, in both
         // directions.
+        if active == ActiveBuffer::Primary {
+            // What the switch saves for the buffer that is showing: the default cursor shape.
+            self.csi(b"0 q");
+        }
         self.csi(match active {
             ActiveBuffer::Primary => b"?1049h",
             ActiveBuffer::Alternate => b"?1049l",
@@ -836,13 +840,16 @@ impl Writer {
             self.paint(row);
         }
         self.viewport = window;
+        // A link the last row left open is closed before the switch, which would otherwise carry it
+        // into the state the switch saves or restores.
+        if self.link.is_some() {
+            self.close_link();
+        }
         if active == ActiveBuffer::Alternate {
-            // The switch back into the alternate buffer saves the cursor: the plain pen, no link
-            // open, and the cursor at home.
-            if self.link.is_some() {
-                self.close_link();
-            }
+            // The switch back into the alternate buffer saves the cursor: the plain pen, the
+            // default shape, and the cursor at home.
             self.rendition(Rendition::default());
+            self.csi(b"0 q");
             self.csi(b"H");
         }
         // And back, before anything of the active buffer is drawn.
@@ -1694,9 +1701,9 @@ mod tests {
             .expect("the switch back into the alternate buffer");
         let before = &rendered.bytes[..enter];
         assert!(
-            before.ends_with(b"\x1b[0m\x1b[H"),
-            "plain pen and home before it saves the cursor: {:?}",
-            String::from_utf8_lossy(&rendered.bytes[enter.saturating_sub(20)..enter + 8])
+            before.ends_with(b"\x1b[0m\x1b[0 q\x1b[H"),
+            "plain pen, default shape and home before it saves the cursor: {:?}",
+            String::from_utf8_lossy(&rendered.bytes[enter.saturating_sub(24)..enter + 8])
         );
     }
 
@@ -1739,6 +1746,59 @@ mod tests {
             text.find("showing").expect("painted") > last_reset,
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn what_a_switch_saves_is_the_default_shape_and_no_open_link_in_either_buffer_order() {
+        // The last row of the other buffer ends inside a link. Leaving the buffer must not carry it
+        // into what the switch saves, and the switch that saves the cursor for the buffer that is
+        // showing is preceded by the default shape.
+        for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
+            let mut linked = row(0, 0, "link");
+            linked.runs[0].hyperlink = Some("https://example.invalid/".to_owned());
+            let operations = vec![
+                RestoreOp::SelectBuffer { buffer: active },
+                RestoreOp::PaintInactiveRow { row: linked },
+                RestoreOp::PaintRow {
+                    row: row(0, 0, "showing"),
+                },
+            ];
+            let rendered = render(
+                &operations,
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+            let link = text
+                .find("\x1b]8;;https")
+                .expect("the row's link is opened");
+            let closed = text[link..]
+                .find("\x1b]8;;\x1b\\")
+                .map(|at| at + link)
+                .expect("and closed");
+            let switches = dec_switches(&rendered.bytes);
+            let leave = switches
+                .iter()
+                .map(|(at, _, _)| *at)
+                .find(|at| *at > link)
+                .expect("the buffer is left after its row is painted");
+            assert!(closed < leave, "{active:?}: {text:?}");
+            let entering = switches
+                .iter()
+                .filter(|(_, mode, set)| *mode == 1049 && *set)
+                .map(|(at, _, _)| *at)
+                .max()
+                .expect("a switch into a buffer");
+            assert!(
+                text[..entering].ends_with("\x1b[0 q") || text[..entering].ends_with("\x1b[H"),
+                "{active:?}: the cursor is plain before it is saved: {text:?}"
+            );
+            assert!(
+                text[..entering].contains("\x1b[0 q"),
+                "{active:?}: and has the default shape: {text:?}"
+            );
+        }
     }
 
     #[test]
