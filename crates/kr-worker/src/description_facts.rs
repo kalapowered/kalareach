@@ -530,196 +530,125 @@ fn last_component(path: &str) -> Option<String> {
         .or_else(|| path.to_str().and_then(clip))
 }
 
-/// The program a command line runs: its first word that is neither a variable assignment nor a
-/// redirection, without the directory it was named by, and nothing of its arguments.
+/// The program a command line runs, and nothing else of it.
 ///
-/// The line is split with the shell's own quoting, so a quoted or escaped value in an assignment
-/// stays inside that assignment and is never read as the program. A line that cannot be read with
-/// certainty up to its program (a quote or a substitution that does not close, a program word that
-/// is itself an expansion or a group) names no program at all: a wrong name is a leak, a missing
-/// one is not. Nothing after the program is read.
+/// This reads a closed grammar and nothing more. A line is blanks, any number of variable
+/// assignments (`NAME=value`, `NAME+=value`), and then the program word; the program word's last
+/// component is the name. Every word is made of characters whose meaning is the same in every
+/// shell this product runs (letters, digits and `_ . / : + , @ % ~ - =`, a backslash in front of
+/// one of them, and quoted parts whose contents hold no character a shell treats specially inside
+/// quotes), and the words are separated by spaces and tabs alone. Anything else, wherever it is
+/// before the program word ends, means this reader does not know what the shell will run, and
+/// the line names no program: a redirection, an operator, a substitution, a group, a comment, an
+/// escaped blank or quote, an unterminated quote, a newline before the program, a name that is not
+/// a variable's. Nothing after the program word is read. A missing name is no harm, and a wrong
+/// one is a leak of what a person typed, so no syntax is ever modelled: it is refused.
 fn program_of(command: &str) -> Option<String> {
-    let mut skip_target = false;
-    for word in Words::of(command) {
-        let word = word?;
-        if skip_target {
-            skip_target = false;
+    let mut rest = command.trim_start_matches(is_blank);
+    loop {
+        let (word, after) = scan_word(rest)?;
+        if word.is_assignment() {
+            // What it is for follows after blanks. A newline or the end of the line makes the
+            // assignment a command of its own: the next word is then empty, and names nothing.
+            rest = after.trim_start_matches(is_blank);
             continue;
         }
-        // A word that starts with `#` starts a comment: there is no command in what follows.
-        if word.raw.starts_with('#') {
-            return None;
-        }
-        if let Some(operator_only) = word.redirection() {
-            // `> file` names its target in the word after it.
-            skip_target = operator_only;
-            continue;
-        }
-        if word.assignment() {
-            continue;
-        }
-        // A program word is a name: syntax in it, or a `=` the shell did not take for an
-        // assignment, means this reader does not know what the shell will run.
-        if word.raw.contains(is_shell_syntax) || word.raw.contains('=') {
+        // A word that holds an `=` and is not an assignment is not one this reader knows.
+        if word.raw.contains('=') {
             return None;
         }
         let name = word.text.rsplit(['/', '\\']).next().unwrap_or(&word.text);
         return clip(name);
     }
-    None
 }
 
-/// One word of a command line: as it was typed, and as the shell reads it with its quotes removed.
-struct Word {
-    raw: String,
+/// One word of a command line: as it was typed, and with its quotes taken off.
+struct Word<'a> {
+    raw: &'a str,
     text: String,
 }
 
-impl Word {
-    /// Whether the word sets a variable for the command after it: `NAME=value` or `NAME+=value`,
-    /// where a name starts with a letter or an underscore.
-    fn assignment(&self) -> bool {
-        self.raw.split_once('=').is_some_and(|(name, _)| {
-            let name = name.strip_suffix('+').unwrap_or(name);
-            name.chars()
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-                && name.chars().all(is_variable_character)
-        })
-    }
-
-    /// Whether the word is a redirection, and when it is, whether it is only the operator, so that
-    /// its target is the next word. An operator is one of the shell's own, so a word this does not
-    /// know is not taken for one, and is not skipped as one.
-    fn redirection(&self) -> Option<bool> {
-        let rest = self
-            .raw
-            .trim_start_matches(|character: char| character.is_ascii_digit());
-        // Longest first, so `>>` is not read as `>` with a target of `>`.
-        const OPERATORS: [&str; 12] = [
-            "<<<", "<<-", "&>>", ">>", "<<", ">|", "<>", "<&", ">&", "&>", "<", ">",
-        ];
-        let operator = OPERATORS
-            .into_iter()
-            .find(|operator| rest.starts_with(operator))?;
-        Some(rest.len() == operator.len())
-    }
-}
-
-/// The words of a command line, split as a shell does: single quotes keep everything, double
-/// quotes keep everything but a backslash before `"`, `\`, `$` or a backtick, and a backslash
-/// before whitespace or a quote keeps it in the word. A backslash before anything else stays,
-/// being a Windows path's separator. A word that cannot be read with certainty ends the sequence
-/// with `None`: a quote that does not close, or a substitution or group that could hide words.
-struct Words<'a> {
-    characters: std::iter::Peekable<std::str::Chars<'a>>,
-}
-
-impl<'a> Words<'a> {
-    fn of(command: &'a str) -> Self {
-        Self {
-            characters: command.chars().peekable(),
-        }
-    }
-
-    /// Reads up to the closing quote of a quoted part, adding what is inside to the word.
-    fn quoted(&mut self, quote: char, word: &mut Word) -> Option<()> {
-        word.raw.push(quote);
-        loop {
-            let inside = self.characters.next()?;
-            word.raw.push(inside);
-            if inside == quote {
-                return Some(());
-            }
-            if quote == '"' {
-                match inside {
-                    '`' => return None,
-                    '$' if matches!(self.characters.peek(), Some('(' | '{')) => return None,
-                    '\\' if matches!(self.characters.peek(), Some('"' | '\\' | '$' | '`')) => {
-                        let escaped = self.characters.next()?;
-                        word.raw.push(escaped);
-                        word.text.push(escaped);
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            word.text.push(inside);
-        }
-    }
-}
-
-impl Iterator for Words<'_> {
-    type Item = Option<Word>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut word = Word {
-            raw: String::new(),
-            text: String::new(),
+impl Word<'_> {
+    /// Whether the word sets a variable for the command after it: an unquoted name that starts
+    /// with a letter or an underscore, an optional `+`, an `=`, and a value with no backslash.
+    fn is_assignment(&self) -> bool {
+        let Some((name, _value)) = self.raw.split_once('=') else {
+            return false;
         };
-        let mut open = false;
-        while let Some(character) = self.characters.peek().copied() {
-            if character.is_whitespace() {
-                if open {
-                    break;
+        let name = name.strip_suffix('+').unwrap_or(name);
+        name.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && name.chars().all(is_variable_character)
+            && !self.raw.contains('\\')
+    }
+}
+
+/// A space or a tab: the only characters that separate the words of a line.
+const fn is_blank(character: char) -> bool {
+    matches!(character, ' ' | '\t')
+}
+
+/// A character that means the same in every shell, outside quotes.
+fn is_plain(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            '_' | '.' | '/' | ':' | '+' | ',' | '@' | '%' | '~' | '-' | '='
+        )
+}
+
+/// Whether a quoted part may hold `character`: nothing a shell reads specially inside the quote
+/// it is in (a backslash, and in double quotes `$`, a backtick and `!`), no control character, and
+/// no quote of the kind that closes it, which the search for the closing quote has already ruled
+/// out.
+fn is_quotable(character: char, quote: char) -> bool {
+    !character.is_control()
+        && character != '\\'
+        && (quote == '\'' || !matches!(character, '$' | '`' | '!'))
+}
+
+/// Reads the word at the start of `rest` and returns it with what follows it: the blank or newline
+/// that ended it, or nothing. None when the word holds anything outside the closed grammar.
+fn scan_word(rest: &str) -> Option<(Word<'_>, &str)> {
+    let mut text = String::new();
+    let mut at = 0;
+    while let Some(character) = rest[at..].chars().next() {
+        match character {
+            blank if is_blank(blank) || blank == '\n' => break,
+            quote @ ('\'' | '"') => {
+                let from = at + 1;
+                let close = from + rest[from..].find(quote)?;
+                let inside = &rest[from..close];
+                if !inside.chars().all(|inside| is_quotable(inside, quote)) {
+                    return None;
                 }
-                self.characters.next();
+                text.push_str(inside);
+                at = close + 1;
                 continue;
             }
-            self.characters.next();
-            open = true;
-            match character {
-                '\'' | '"' => {
-                    if self.quoted(character, &mut word).is_none() {
-                        return Some(None);
-                    }
+            // A backslash is a Windows path's separator or a shell's escape of the next character,
+            // and which it is depends on the shell: only before a character of the closed set does
+            // it say the same thing in both, a word that goes on.
+            '\\' => {
+                let next = rest[at + 1..].chars().next()?;
+                if !(is_plain(next) || next == '\\') {
+                    return None;
                 }
-                '\\' => {
-                    word.raw.push(character);
-                    match self.characters.peek().copied() {
-                        // An escaped backslash, or the separator of a Windows network path: this
-                        // reader does not know which, and so does not say where a word ends.
-                        Some('\\') => return Some(None),
-                        Some(next) if next.is_whitespace() || matches!(next, '\'' | '"') => {
-                            self.characters.next();
-                            word.raw.push(next);
-                            word.text.push(next);
-                        }
-                        _ => word.text.push(character),
-                    }
-                }
-                '`' | '(' | ')' => return Some(None),
-                '$' if matches!(self.characters.peek(), Some('(' | '{')) => return Some(None),
-                _ => {
-                    word.raw.push(character);
-                    word.text.push(character);
-                }
+                text.push(character);
             }
+            plain if is_plain(plain) => text.push(plain),
+            _ => return None,
         }
-        open.then_some(Some(word))
+        at += character.len_utf8();
     }
-}
-
-/// A character that makes a word more than the name of a program.
-const fn is_shell_syntax(character: char) -> bool {
-    matches!(
-        character,
-        '$' | '`'
-            | '('
-            | ')'
-            | '{'
-            | '}'
-            | '<'
-            | '>'
-            | '|'
-            | '&'
-            | ';'
-            | '*'
-            | '?'
-            | '['
-            | ']'
-            | '!'
-    )
+    Some((
+        Word {
+            raw: &rest[..at],
+            text,
+        },
+        &rest[at..],
+    ))
 }
 
 const fn is_variable_character(character: char) -> bool {
@@ -814,10 +743,15 @@ fn head_of(marker: &Path, owner: &Path) -> Option<String> {
     read_bounded(&git_directory.join("HEAD"))
 }
 
-/// Reads at most [`HEAD_BYTES`] of a file as text.
+/// Reads at most [`HEAD_BYTES`] of a regular file as text. Anything else a directory can hold under
+/// that name, a pipe or a device, is not read: opening one can wait for ever for a writer, and the
+/// read that waits is the only one this session would ever make.
 fn read_bounded(path: &Path) -> Option<String> {
     use std::io::Read as _;
 
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     let mut text = String::new();
     file.take(HEAD_BYTES).read_to_string(&mut text).ok()?;
@@ -932,49 +866,74 @@ mod tests {
         );
     }
 
-    /// A quoted or escaped assignment, a redirection and an operator never put a secret or an
-    /// argument where the program name belongs: the program is the first word that is neither an
-    /// assignment nor a redirection, found with the shell's own quoting, and is left out when the
-    /// line cannot be read with certainty.
+    /// The program is read from a closed grammar: assignments, then the program word, in
+    /// characters that mean the same in every shell. Quoted values stay inside their assignment;
+    /// every other syntax, wherever it is before the program, names no program at all.
     #[test]
-    fn a_quoted_assignment_or_a_redirection_never_becomes_the_program() {
+    fn a_program_is_named_only_from_the_closed_grammar_and_every_other_syntax_names_none() {
         for (line, program) in [
+            // Named: assignments of plain or quoted values, then the program word.
             ("TOKEN='first secret' cargo test", Some("cargo")),
             ("TOKEN=\"first secret\" cargo test", Some("cargo")),
-            ("TOKEN=first\\ secret cargo test", Some("cargo")),
             ("A='x y' B=\"p q\" C=r /usr/bin/make all", Some("make")),
             ("NAME='it'\"'\"'s a secret' deploy", Some("deploy")),
-            ("> out.log cargo build", Some("cargo")),
-            (">out.log cargo build", Some("cargo")),
-            ("2>&1 cargo build", Some("cargo")),
-            ("2> err.log TOKEN='a b' cargo build", Some("cargo")),
+            ("TOKEN+=s3cret deploy", Some("deploy")),
+            ("RUSTFLAGS+=\" -D warnings\" cargo build", Some("cargo")),
+            ("TOKEN=a=b\tcargo test", Some("cargo")),
             ("\"/Applications/My App/run\" --flag", Some("run")),
-            // Uncertain: an unterminated quote, a substitution or a group that never closes, and a
-            // word that is itself an expansion say nothing certain about the program.
+            ("'/opt/tools/rg' secret-needle", Some("rg")),
+            ("cargo\nrm -rf secret", Some("cargo")),
+            ("C:\\tools\\node.exe app.js", Some("node.exe")),
+            ("~/bin/tool --now", Some("tool")),
+            // Not named: a redirection, in any spelling, before the program.
+            ("> out.log cargo build", None),
+            (">out.log cargo build", None),
+            ("2>&1 cargo build", None),
+            ("2> err.log TOKEN='a b' cargo build", None),
+            (">| out.log cargo build", None),
+            ("<<- END cat", None),
+            ("<<<text cat", None),
+            (">&- cargo build", None),
+            (">! out.log cargo build", None),
+            ("<<EOF\nbody secret\nEOF", None),
+            // Not named: an operator or a separator inside or after an assignment.
+            ("TOKEN=x;deploy prod", None),
+            ("2>/dev/null&&deploy --key k1", None),
+            ("TOKEN=x|deploy prod", None),
+            ("TOKEN=x\ndeploy prod", None),
+            ("TOKEN=x\u{a0}secret cmd", None),
+            // Not named: a quote this reader would read differently from the shell.
+            ("MSG=$'it\\'s done' git commit -m 'fix it'", None),
+            ("MSG='it\\'s done' git commit -m 'fix it'", None),
+            ("echo\\\"hello secret\"", None),
             ("TOKEN='first secret cargo test", None),
             ("TOKEN=\"first secret cargo test", None),
+            ("TOKEN=\"$HOME secret\" cargo test", None),
+            // Not named: a substitution, an expansion, a group, a comment.
             ("X=$(echo a b) cargo test", None),
             ("X=$(echo a b cargo test", None),
             ("$(pick-a-tool) --now", None),
             ("`pick-a-tool` --now", None),
             ("$TOOL --now", None),
             ("(cd /x && run) --now", None),
-            ("TOKEN='only a secret'", None),
-            // Appended assignments, `>|` and `<<-`, comments, an escaped backslash and a name the
-            // shell does not take for a variable.
-            ("TOKEN+=s3cret deploy", Some("deploy")),
-            ("TOKEN+=s3cret", None),
-            ("RUSTFLAGS+=\" -D warnings\" cargo build", Some("cargo")),
-            (">| out.log cargo build", Some("cargo")),
-            ("<<- END cat", Some("cat")),
-            ("<<<text cat", Some("cat")),
-            (">&- cargo build", Some("cargo")),
-            ("2>&1 >> log make", Some("make")),
             ("#note secret text", None),
             ("TOKEN=x #note", None),
+            // Not named: an escaped blank or backslash, a name that is not a variable's, and a
+            // line with no program.
+            ("TOKEN=first\\ secret cargo test", None),
             ("A=x\\\\ y cmd", None),
+            ("ls\\ secret", None),
             ("1A=x cmd", None),
             ("pasted=secret", None),
+            ("TOKEN+=s3cret", None),
+            ("TOKEN='only a secret'", None),
+            ("A=1", None),
+            ("", None),
+            ("   ", None),
+            // Not named: a backslash in a quote, which a shell may read as an escape, and so as
+            // a different word than this reader would.
+            ("\"C:\\Program Files\\x.exe\" arg", None),
+            ("'a\\b' secret", None),
         ] {
             assert_eq!(program_of(line).as_deref(), program, "{line:?}");
         }
@@ -988,6 +947,47 @@ mod tests {
         assert_eq!(record.events[0].summary, "cargo");
         let encoded = serde_json::to_string(&record).expect("facts encode");
         assert!(!encoded.contains("secret"), "{encoded}");
+    }
+
+    /// Whatever a line starts with, nothing past the point where one command ends and the next
+    /// begins is ever named: every line of up to four characters from a set of the characters
+    /// shells treat specially, followed by each way of ending one command and starting the next,
+    /// never names the word that comes after.
+    #[test]
+    fn nothing_after_what_a_line_starts_with_is_ever_named() {
+        const CHARACTERS: [char; 20] = [
+            '\'', '"', '\\', ' ', '$', ';', '=', '#', 'a', '<', '>', '\n', '\u{a0}', '&', '|', '(',
+            '`', '!', '{', '\t',
+        ];
+        const TAILS: [&str; 5] = [
+            " cmd SECRET",
+            "\ncmd SECRET",
+            ";cmd SECRET",
+            "&&cmd SECRET",
+            "|cmd SECRET",
+        ];
+        let mut prefixes = vec![String::new()];
+        let mut all = vec![String::new()];
+        for _ in 0..4 {
+            let mut longer = Vec::new();
+            for prefix in &prefixes {
+                for character in CHARACTERS {
+                    let mut next = prefix.clone();
+                    next.push(character);
+                    longer.push(next);
+                }
+            }
+            all.extend(longer.iter().cloned());
+            prefixes = longer;
+        }
+        for prefix in &all {
+            for tail in TAILS {
+                let line = format!("{prefix}{tail}");
+                if let Some(named) = program_of(&line) {
+                    assert!(!named.contains("SECRET"), "{line:?} named {named:?}");
+                }
+            }
+        }
     }
 
     /// A root directory has a name of its own, so `cd /` replaces the directory the session left.
@@ -1030,6 +1030,49 @@ mod tests {
             found.directory.canonicalize().expect("it exists"),
             here.canonicalize().expect("it exists"),
             "a directory the shell is not in is replaced by where it is"
+        );
+    }
+
+    /// A pipe where a repository's `.git` or `HEAD` should be is not read: the read returns at
+    /// once and finds no repository, where opening it would wait for a writer that never comes.
+    /// The control is a regular file in the same place, which is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_named_git_or_head_is_not_opened() {
+        let root = tempfile::tempdir().expect("a directory");
+        let fifo = |path: &std::path::Path| {
+            let made = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "a pipe");
+        };
+        let as_found = |directory: std::path::PathBuf| {
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(repository_above(&directory));
+            });
+            returned
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the read returned: it did not wait on a pipe")
+        };
+
+        let marker = root.path().join("marker");
+        std::fs::create_dir_all(&marker).expect("a directory");
+        fifo(&marker.join(".git"));
+        assert_eq!(as_found(marker), None, "a pipe named .git");
+
+        let head = root.path().join("head");
+        std::fs::create_dir_all(head.join(".git")).expect("a git directory");
+        fifo(&head.join(".git/HEAD"));
+        assert_eq!(as_found(head), None, "a pipe named HEAD");
+
+        let control = root.path().join("control");
+        std::fs::create_dir_all(control.join(".git")).expect("a git directory");
+        std::fs::write(control.join(".git/HEAD"), "ref: refs/heads/main\n").expect("a HEAD");
+        assert_eq!(
+            as_found(control).map(|repository| repository.name),
+            Some("control".to_owned())
         );
     }
 
