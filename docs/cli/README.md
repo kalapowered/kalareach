@@ -20,6 +20,7 @@ worker directly for what a session owns.
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
+| `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
 | `kr host install` | — | Put a first release into this user's store of releases and make it current |
 | `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
@@ -550,6 +551,22 @@ does not have is `TERMINAL_UNAVAILABLE` and changes nothing.
 The preference is the middle step of the order a `terminal` presentation uses: `kr new
 --terminal-app` wins over it, and detection decides when neither says anything. A preference that
 names something no longer installed is not an error, because nobody asked for it just now.
+
+## `kr host descriptions`
+
+`kr host descriptions` shows what session descriptions offer on this host and changes the two settings that govern them. With no option it only reads. It prints the settings, the model's name, its exact size in bytes, the addresses a fetch would reach and that no account is needed, whether anything has been fetched, and what state inference is in. The cost is shown before anything is fetched, and nothing is fetched until the `--download` option is given.
+
+| Option | What it does |
+| --- | --- |
+| `--on`, `--off` | Turn descriptions on or off. Off stops a fetch that is running and ends the description process |
+| `--battery on`, `--battery off` | Allow or forbid inference while the host is on battery |
+| `--download` | Fetch the model's files, check each against the profile and keep them |
+| `--cancel` | Stop the fetch that is running and remove what it wrote |
+| `--environment <id>` | Act in another environment than this installation's own |
+
+The options `--on` and `--off` are mutually exclusive, and `--download` cannot be combined with `--off` or `--cancel`. One action regarding the settings and one regarding the download can be given at the same time. The settings are recorded in the host's configuration and a fetch is started in the daemon, and the command prints what setup shows afterwards, so the output of `--download` is the fetch running. A battery setting that is neither `on` nor `off` is a usage failure and changes nothing.
+
+With `--json` the same answer is printed as a document with the fields `offered`, `enabled`, `on_battery`, `profile_id`, `asset_bytes`, `sources`, `download`, `fetched_bytes`, `failure`, `can_cancel`, `can_disable`, `needs_hosted_account`, `unavailable`, `state` and `paused`. The daemon of the environment must be running when this command is run.
 
 ## `kr detach`
 

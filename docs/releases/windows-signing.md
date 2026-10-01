@@ -49,8 +49,8 @@ certificate chain root-first and the timestamp certificate subject from the rele
 ## What a release carries
 
 `.github/workflows/release-windows.yml` builds on a GitHub-hosted `windows-2025` runner and signs
-every executable and PowerShell payload it staged: `kr.exe`, `kr-attach-guard.exe`, `kr-worker.exe`
-and `kr-controller.exe`, the PowerShell module scripts (`KalaReach.ShellBridge.psd1`,
+every executable and PowerShell payload it staged: `kr.exe`, `kr-attach-guard.exe`, `kr-worker.exe`,
+`kr-controller.exe` and `kr-describe-inference.exe`, the PowerShell module scripts (`KalaReach.ShellBridge.psd1`,
 `KalaReach.ShellBridge.psm1`, `KrBridge.ps1`, `KrCbor.ps1`, `KrReader.ps1`), and the startup script
 `shells/psreadline/startup/kr-profile.ps1`. PowerShell will not load any of those under an all-signed
 execution policy unless every one of them carries a signature, so they are signed together or not at
