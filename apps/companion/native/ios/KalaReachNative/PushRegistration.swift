@@ -35,6 +35,19 @@ final class PushRegistration: NSObject {
 
     private(set) var state: PushRegistrationState = .idle
 
+    /// The registration token Firebase most recently offered, counted or not.
+    private var offeredToken: String?
+
+    /// The registration token this device can be reached at.
+    ///
+    /// Firebase can offer one before the system's APNs token has been mapped to it, and a message
+    /// sent to that token cannot be delivered. So it is held until the APNs token is here, and
+    /// takes the token away again if the system then refuses to register.
+    var fcmToken: String? {
+        if case .registered = state { return offeredToken }
+        return nil
+    }
+
     /// Asks for permission and, if it is given, for a token.
     ///
     /// Called at launch rather than from the page: a launch into the background has no page.
@@ -55,6 +68,11 @@ final class PushRegistration: NSObject {
     /// Records the token the system produced.
     func registered(deviceToken: Data) {
         state = .registered(token: deviceToken.map { String(format: "%02x", $0) }.joined())
+    }
+
+    /// Records the registration token Firebase offered, or that it has none.
+    func fcmTokenReceived(_ token: String?) {
+        offeredToken = token
     }
 
     /// Records why the system would not register this device.

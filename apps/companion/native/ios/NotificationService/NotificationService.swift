@@ -39,16 +39,39 @@ final class NotificationService: UNNotificationServiceExtension {
         switch decision {
         case let .reveal(text):
             guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
-                contentHandler(request.content)
+                handBack(request.content, for: request, decision: decision, through: contentHandler)
                 return
             }
             content.body = text
-            contentHandler(content)
+            handBack(content, for: request, decision: decision, through: contentHandler)
         case .generic:
             // The alert the host chose is already in the content. It is handed back unchanged
             // rather than rewritten, so nothing this extension knows leaks into a generic alert.
-            contentHandler(request.content)
+            handBack(request.content, for: request, decision: decision, through: contentHandler)
         }
+    }
+
+    /// Hands the content to the system. A debug build answers a device check first, inside the
+    /// notification it hands back; every other build hands back exactly what was decided.
+    private func handBack(
+        _ content: UNNotificationContent,
+        for request: UNNotificationRequest,
+        decision: PreviewDecision,
+        through contentHandler: (UNNotificationContent) -> Void
+    ) {
+        #if DEBUG
+        let probe = ExtensionProbe(keys: KeychainPreviewKeyStore(), private: KeychainProbeReader())
+        if let added = probe.additions(for: request.content.userInfo, reason: decision.reasonName),
+            let answered = content.mutableCopy() as? UNMutableNotificationContent
+        {
+            var info = answered.userInfo
+            for (key, value) in added { info[key] = value }
+            answered.userInfo = info
+            contentHandler(answered)
+            return
+        }
+        #endif
+        contentHandler(content)
     }
 
     override func serviceExtensionTimeWillExpire() {
