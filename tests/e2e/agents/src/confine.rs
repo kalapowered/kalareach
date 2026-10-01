@@ -254,7 +254,7 @@ fn line_starts_a_subagent(line: &str) -> bool {
 
 /// Whether a subagent has started in any conversation of `bucket`, the run's directory of
 /// sessions: a directory under a session's `agents` other than the main agent's, or a line of the
-/// main agent's wire file that calls one of [`SUBAGENT_TOOLS`] or records a subagent. A bucket that
+/// main agent's wire file that calls one of the subagent tools or records a subagent. A bucket that
 /// is not there yet holds none. It names what it saw by kind, never a path or a line.
 #[must_use]
 pub fn subagent_started(bucket: &Path) -> Option<String> {
@@ -899,18 +899,43 @@ impl Setup {
     }
 }
 
-/// The MD5 digest of `text` in lower-case hexadecimal, by the system's own `md5`: the name the agent
-/// gives the file of a folder's prompt history is that of the folder's path.
+/// The MD5 digest of `text` in lower-case hexadecimal, by the system's own program: `md5` where the
+/// system has one (macOS), else `md5sum` (Linux), which reads the text from its input. The name the
+/// agent gives the file of a folder's prompt history is that of the folder's path.
 ///
 /// # Errors
 ///
 /// Returns why the program could not be run or did not print a digest.
 pub fn md5_hex(text: &str) -> Result<String, String> {
-    let output = std::process::Command::new("/sbin/md5")
-        .args(["-q", "-s", text])
-        .output()
-        .map_err(|error| format!("md5 did not run: {error}"))?;
-    let digest = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let output = if Path::new("/sbin/md5").exists() {
+        Command::new("/sbin/md5")
+            .args(["-q", "-s", text])
+            .output()
+            .map_err(|error| format!("md5 did not run: {error}"))?
+    } else {
+        let mut child = Command::new("md5sum")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("md5sum did not run: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "md5sum has no input".to_owned())?
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("md5sum took no input: {error}"))?;
+        child
+            .wait_with_output()
+            .map_err(|error| format!("md5sum did not finish: {error}"))?
+    };
+    let digest = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned();
     if output.status.success()
         && digest.len() == 32
         && digest.bytes().all(|b| b.is_ascii_hexdigit())

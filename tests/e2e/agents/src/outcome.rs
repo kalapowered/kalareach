@@ -47,6 +47,10 @@ pub enum Failure {
     /// The reply reached the device before the agent recorded the prompt, or whether it had could
     /// not be told, so no moment between them was shown.
     ReplyBeforeRecord,
+    /// The second prompt of a queued-prompt part was entered when the agent was not shown to be
+    /// running its turn (a fast model can finish it first, and a screen can fail to show one that
+    /// goes on), so the prompt was not shown to wait for a turn that was still running.
+    QueuedPromptNotDuringTurn,
     /// The session ran something other than the pinned build.
     NotPinned,
     /// The session's environment held a variable the build list clears.
@@ -80,6 +84,7 @@ impl Failure {
             }
             Self::ResumeForks => json!({ "code": "resume_forks" }),
             Self::ReplyBeforeRecord => json!({ "code": "reply_before_record" }),
+            Self::QueuedPromptNotDuringTurn => json!({ "code": "queued_prompt_not_during_turn" }),
             Self::NotPinned => json!({ "code": "not_pinned" }),
             Self::EnvironmentNotClear => json!({ "code": "environment_not_clear" }),
             Self::EnvironmentNotRead => json!({ "code": "environment_not_read" }),
@@ -598,6 +603,20 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(longest < crate::confine::SECRET_LENGTH, "{last}");
+    }
+
+    #[test]
+    fn a_queued_prompt_entered_with_no_turn_shown_running_is_a_code_of_its_own() {
+        assert_eq!(
+            Failure::QueuedPromptNotDuringTurn.evidence(),
+            json!({ "code": "queued_prompt_not_during_turn" })
+        );
+        let outcome = Outcome::failed("2a", "a test", "why", json!({ "login_held": true }))
+            .with_failures(&[Failure::QueuedPromptNotDuringTurn]);
+        assert_eq!(
+            outcome.evidence["failure_codes"],
+            json!([{ "code": "queued_prompt_not_during_turn" }])
+        );
     }
 
     #[test]

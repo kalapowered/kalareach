@@ -6455,6 +6455,40 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 account.turn_line.as_deref(),
             ),
         };
+        // A fast model can finish the turn before the second prompt is entered, and a screen can fail
+        // to show a turn that goes on: either way the turn was not shown to be running when the
+        // prompt was entered, which is a cause of its own that the record says by its code.
+        if !queue.busy_at_submission {
+            let why = check_queued(&queue).err().unwrap_or_default();
+            eprintln!(
+                "the prompt waited for the turn: {why}; the conversation from the first prompt: {}",
+                outline(
+                    &conversation,
+                    first_prompt,
+                    &[
+                        ("q", &format!("{mark}-q")),
+                        ("r", &format!("{mark}-r")),
+                        ("done", &queued_done),
+                        ("sum", &queued_sum),
+                        ("queued", account.queued_line.as_deref().unwrap_or("\u{0}")),
+                        ("turn", account.turn_line.as_deref().unwrap_or("\u{0}"))
+                    ]
+                )
+            );
+            return Ending::new(
+                Outcome::failed(
+                    "2a",
+                    TEST,
+                    "the agent was not shown to be running its turn when the second prompt was entered",
+                    json!({
+                        "account": account_evidence(stage, logged.turns),
+                        "queued": { "answer": queued_sum, "order": queue },
+                    }),
+                )
+                .with_failures(&[Failure::QueuedPromptNotDuringTurn]),
+                logged.agent.sessions(),
+            );
+        }
         check_queued(&queue).unwrap_or_else(|why| {
             panic!(
                 "the prompt waited for the turn: {why}; the conversation from the first prompt: {}",
