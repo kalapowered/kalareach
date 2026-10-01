@@ -795,35 +795,46 @@ impl crate::broker::Broker {
             now,
             under,
         )?;
+        // Said to the description facts while the decision is still held, so an older report can
+        // never overwrite what a newer one decided: the facts name the thread the broker vouches
+        // for, and none when it vouches for none.
+        self.note_thread_change(&mut state, application_instance_id, &thread, observation);
         drop(state);
-        self.note_thread_change(&thread, observation);
         Ok((thread, cursor))
     }
 
-    /// Records a selection or an ending an observation made in the session's description facts. A
-    /// report that changed nothing, a stale or indirect one, a tool and a notification record
-    /// nothing: only the thread the application itself selected, and the end of it, are facts.
-    fn note_thread_change(&self, change: &ThreadChange, observation: &Observation) {
+    /// Records in the session's description facts the thread the broker now vouches for, which no
+    /// thread is while a report could not be placed or a selection was refused, and the start or
+    /// the end of a thread an observation made. A report that changed nothing, a stale or indirect
+    /// one, a tool and a notification record no event: only the thread the application itself
+    /// selected, and the end of it, are events.
+    fn note_thread_change(
+        &self,
+        state: &mut crate::broker::BrokerState,
+        application_instance_id: ApplicationInstanceId,
+        change: &ThreadChange,
+        observation: &Observation,
+    ) {
         use kr_protocol::describe::DescriptionEventKind;
 
         let Some(facts) = self.description_facts.get() else {
             return;
         };
+        let vouched = state
+            .instances
+            .get(&application_instance_id)
+            .filter(|instance| !instance.bridge.unsettled)
+            .and_then(|instance| instance.thread_id.as_ref());
+        facts.note_thread(vouched.map(AgentThreadId::as_str));
         match change {
-            ThreadChange::Selected(_) => {
-                facts.note_thread(Some(observation.thread.as_str()));
-                facts.note_event(
-                    DescriptionEventKind::TaskStarted,
-                    observation.detail.as_deref().unwrap_or("a thread started"),
-                );
-            }
-            ThreadChange::Ended(_) => {
-                facts.note_thread(None);
-                facts.note_event(
-                    DescriptionEventKind::TaskCompleted,
-                    observation.detail.as_deref().unwrap_or("a thread ended"),
-                );
-            }
+            ThreadChange::Selected(_) => facts.note_event(
+                DescriptionEventKind::TaskStarted,
+                observation.detail.as_deref().unwrap_or("a thread started"),
+            ),
+            ThreadChange::Ended(_) => facts.note_event(
+                DescriptionEventKind::TaskCompleted,
+                observation.detail.as_deref().unwrap_or("a thread ended"),
+            ),
             _ => {}
         }
     }
@@ -1606,6 +1617,57 @@ mod tests {
         facts.fence(crate::privacy::PrivacyGeneration::new(1));
         apply(&broker, id, 30, &start("t2"));
         assert_eq!(facts.read(0, Some(1)).facts, None);
+    }
+
+    /// The facts name the thread the broker vouches for and none when it vouches for none: two
+    /// reports of one tick of the kernel's clock cannot be placed against each other, the broker
+    /// leaves no thread selected, and the facts drop the thread it had; the first report of a later
+    /// tick settles it, and the facts name that one.
+    #[test]
+    fn the_facts_name_the_thread_the_broker_vouches_for_and_none_when_it_vouches_for_none() {
+        let id = instance(11);
+        let broker = broker_with(&[id]);
+        let facts = crate::description_facts::DescriptionFacts::new(
+            false,
+            crate::privacy::PrivacyGeneration::new(0),
+        );
+        broker.set_description_facts(facts.clone());
+        let thread = || {
+            facts
+                .read(0, Some(0))
+                .facts
+                .and_then(|facts| facts.thread.0)
+        };
+
+        assert!(matches!(
+            apply(&broker, id, 200, &start("a")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(thread().as_deref(), Some("a"));
+        assert_eq!(apply(&broker, id, 200, &end("a")), ThreadChange::Unordered);
+        assert_eq!(vouched(&broker, id), None);
+        assert_eq!(thread(), None, "the broker vouches for no thread");
+        assert_eq!(
+            apply(&broker, id, 200, &start("b")),
+            ThreadChange::Unordered
+        );
+        assert_eq!(thread(), None, "and still does not");
+
+        assert!(matches!(
+            apply(&broker, id, 201, &start("b")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(vouched(&broker, id).as_deref(), Some("b"));
+        assert_eq!(thread().as_deref(), Some("b"), "settled by a later tick");
+
+        // A late report of another thread going on advances the binding without a selection of
+        // its own, and the facts follow the binding.
+        let before = revision(&broker, id);
+        let late = apply(&broker, id, 150, &continued("c"));
+        if matches!(late, ThreadChange::Overtaken(_)) {
+            assert!(revision(&broker, id) > before);
+        }
+        assert_eq!(thread(), vouched(&broker, id));
     }
 
     fn suspension(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {
