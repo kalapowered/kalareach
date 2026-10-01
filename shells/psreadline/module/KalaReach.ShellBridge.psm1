@@ -33,7 +33,6 @@ $script:Hooks = @{
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
     InnerIsEditors     = $true
-    EditorText         = $null
     Wrapper            = $null
     ReadLineInstalled  = $false
 }
@@ -325,6 +324,15 @@ function Test-KrQualifiedEditor {
             }
         }
     }
+    if ($null -eq (Get-KrEditorsReadLineText)) {
+        # The reader is judged against what the editor's own file says it is, and a build whose file
+        # does not say so cannot be judged.
+        return @{
+            Ok     = $false
+            Reason = 'psreadline_reader_unreadable'
+            Detail = "PSReadLine $version defines no read-line function this package can read from its own file"
+        }
+    }
     @{ Ok = $true; Reason = ''; Detail = '' }
 }
 
@@ -406,13 +414,6 @@ function Initialize-KalaReachBridge {
 
 # The host's own read-line entry point, with the reader's boundaries around it.
 function Install-KrReadLineWrapper {
-    # The editor's own function as it is when this module loads, which is the first thing in the
-    # first profile and so before any text of the person's own has run. What it says is kept once:
-    # the function a person's profile later makes of it is compared with this, never with itself.
-    if ($null -eq $script:Hooks.EditorText) {
-        $editor = Get-KrEditorsReadLine
-        if ($null -ne $editor) { $script:Hooks.EditorText = $editor.ToString() }
-    }
     $existing = Get-Command -Name 'PSConsoleHostReadLine' -CommandType Function -ErrorAction SilentlyContinue
     if ($null -ne $existing) {
         $script:Hooks.InnerReadLine = $existing.ScriptBlock
@@ -441,22 +442,60 @@ function Get-KrEditorsReadLine {
     $editor.ScriptBlock
 }
 
+# The text of the editor's own read-line function, as the editor's own file defines it.
+#
+# Read from the file the loaded editor came from, and from nothing a profile can change: a profile
+# that ran before this module can replace the function inside the editor's module scope and export
+# the replacement, and what this module would then find first is that replacement. The editor is
+# the one the qualification names, so its file is the baseline. It is null when the file does not
+# define the function once, which a qualified editor does.
+function Get-KrEditorsReadLineText {
+    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
+    if ($null -eq $module -or [string]::IsNullOrEmpty($module.Path)) { return $null }
+    try {
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($module.Path, [ref]$tokens, [ref]$errors)
+        $definitions = @($ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'PSConsoleHostReadLine'
+        }, $true))
+        if ($definitions.Count -ne 1) { return $null }
+        $body = $definitions[0].Body.Extent.Text
+        # What a function's script block says of itself is the text inside its braces.
+        if ($body.Length -lt 2 -or -not $body.StartsWith('{') -or -not $body.EndsWith('}')) { return $null }
+        $body.Substring(1, $body.Length - 2)
+    } catch { $null }
+}
+
+# The function the editor's module exports as the host's read-line entry point.
+function Get-KrEditorsReadLine {
+    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
+    if ($null -eq $module) { return $null }
+    $editor = $module.ExportedFunctions['PSConsoleHostReadLine']
+    if ($null -eq $editor) { return $null }
+    $editor.ScriptBlock
+}
+
 # Whether a script block is the editor's own read-line function.
 #
 # A function's text alone decides nothing, and neither does the name of the module it lives in: a
 # wrapper that calls the editor directly has the editor's call in its text, and a function made
 # inside the editor's own module scope reports the editor as its module. So it is two things at
 # once. It is the very object the editor's module exports, which an alias, a proxy and a function
-# of the person's own are not. And its text is the text the editor's function had when this module
-# loaded, which a function put in the place of the editor's own inside its module scope has not,
-# though the module exports it. The editor imported again exports a new object with the same text,
-# and it is that one that is accepted.
+# of the person's own are not. And its text is the text the editor's own file gives the function,
+# compared character for character, which a function put in the place of the editor's own inside
+# its module scope is not, though the module exports it. The editor imported again exports a new
+# object with the same text, and it is that one that is accepted.
 function Test-KrEditorsReadLine {
     param($ScriptBlock)
-    if ($null -eq $ScriptBlock -or $null -eq $script:Hooks.EditorText) { return $false }
+    if ($null -eq $ScriptBlock) { return $false }
     $editor = Get-KrEditorsReadLine
     if ($null -eq $editor -or -not [object]::ReferenceEquals($ScriptBlock, $editor)) { return $false }
-    $ScriptBlock.ToString() -ceq $script:Hooks.EditorText
+    $baseline = Get-KrEditorsReadLineText
+    if ($null -eq $baseline) { return $false }
+    # Ordinal: a culture-aware comparison takes a soft hyphen or a zero-width character for nothing.
+    [string]::Equals($ScriptBlock.ToString(), $baseline, [System.StringComparison]::Ordinal)
 }
 
 # The command the host runs under the read-line entry point's name, which an alias takes before a

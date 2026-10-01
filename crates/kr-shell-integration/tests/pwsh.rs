@@ -224,6 +224,113 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
     }
 }
 
+/// KR-REQ-07.85: what the module takes for the editor's own read-line function is decided against
+/// the editor's own file, never against anything a profile that ran first could have changed.
+///
+/// Each case is a host of its own. The first function is the editor's as the module finds it, and
+/// whether it is the editor's is asked of the text the editor's file defines it with. A person's
+/// function put in its place inside the editor's module scope and exported before the module loads
+/// is not the editor's, and is not made one by being what was there first; the editor imported
+/// again puts the real one back, and that is. A function whose text differs from the editor's by a
+/// character that is not seen, a soft hyphen, is not the editor's either: the comparison is
+/// ordinal, where a culture-aware one passes it. The control is the editor itself.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
+    let replace = r#"& (Get-Module PSReadLine) { Set-Item function:script:PSConsoleHostReadLine -Value { 'person' } };
+           Import-Module PSReadLine;"#;
+    let soft_hyphen = r#"$text = (Get-Module PSReadLine).ExportedFunctions['PSConsoleHostReadLine'].ScriptBlock.ToString();
+           $at = $text.IndexOf('$lastRunStatus');
+           if ($at -lt 0) { throw 'the editor keeps no $lastRunStatus to put a character before' };
+           $text = $text.Insert($at, [string][char]0x00AD);
+           & (Get-Module PSReadLine) { param($text) Set-Item function:script:PSConsoleHostReadLine -Value ([scriptblock]::Create($text)) } $text;
+           Import-Module PSReadLine;"#;
+    let package = shellpkg::Package::built(PWSH);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory");
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let asked = |before: &str, after: &str| -> String {
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; Import-Module PSReadLine; {before} \
+             Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
+             {after}"
+        );
+        let output = std::process::Command::new(&package.executable)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .env_remove("KR_SHELL_BRIDGE")
+            .env_remove("KR_SHELL_BRIDGE_SECRET")
+            .env_remove("KR_SESSION")
+            .output()
+            .expect("the package's host runs");
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "the host ended with {:?}:\n{said}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        said
+    };
+    // Put in front of what is there, the way the module does when it loads, and ask whether what
+    // it went in front of is the editor's.
+    let inner = "& $module { Install-KrReadLineWrapper; Write-Output \"kr-key[inner]=[$(Test-KrInnerReadLine)]\" };";
+    let current = "$f = (Get-Command PSConsoleHostReadLine -CommandType Function).ScriptBlock; \
+         Write-Output \"kr-key[now]=[$(& $module { param($f) Test-KrEditorsReadLine $f } $f)]\"";
+
+    let control = asked("", inner);
+    assert_eq!(
+        said(&control, "inner"),
+        "True",
+        "the editor itself is the editor's: {control}"
+    );
+
+    // Replaced before the module loads: what the module finds first is somebody else's.
+    let replaced = asked(replace, inner);
+    assert_eq!(
+        said(&replaced, "inner"),
+        "False",
+        "a function put in the editor's place before the module loaded was taken for the editor's: {replaced}"
+    );
+    // The editor imported again puts the real function back, and the module goes in front of that.
+    let restored = asked(
+        replace,
+        &format!(
+            "{inner} Import-Module PSReadLine -Force; & $module {{ Install-KrReadLineWrapper; \
+             Write-Output \"kr-key[again]=[$(Test-KrInnerReadLine)]\" }};"
+        ),
+    );
+    assert_eq!(
+        said(&restored, "again"),
+        "True",
+        "the editor's own function, put back, was refused: {restored}"
+    );
+
+    // A character nobody sees: the function the module went in front of was the editor's, and what
+    // a profile puts in its place afterwards is not, whatever a culture-aware comparison says.
+    let hyphen = asked("", &format!("{inner} {soft_hyphen} {current}"));
+    assert_eq!(
+        said(&hyphen, "now"),
+        "False",
+        "a function that differs from the editor's by a soft hyphen was taken for the editor's: {hyphen}"
+    );
+    // The control for it: the editor's own function, imported again, is still the editor's.
+    let again = asked(
+        "",
+        &format!("{inner} Import-Module PSReadLine -Force; {current}"),
+    );
+    assert_eq!(
+        said(&again, "now"),
+        "True",
+        "the editor imported again was refused: {again}"
+    );
+}
+
 /// Runs a script in a host of its own with the package's module imported, and returns what it
 /// printed.
 ///
