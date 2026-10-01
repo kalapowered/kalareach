@@ -22,10 +22,13 @@ for module in ${=KR_TEST_USER_MODULES}; do
   fi
 done
 
-# A configuration that loads a module and then removes its file: the shell still holds the module,
-# and there is no file left to read its imports from.
+# A configuration that loads a module and then removes its file, or puts another file in its place
+# as an update does: the shell still runs the module it loaded, whatever the name now finds.
 if [[ -n "$KR_TEST_REMOVE_AFTER_LOAD" ]]; then
   zmodload -F zsh/files b:rm && rm -f -- "$HOME/modules/$KR_TEST_REMOVE_AFTER_LOAD.so"
+fi
+if [[ -n "$KR_TEST_REPLACE_AFTER_LOAD" ]]; then
+  zmodload -F zsh/files b:mv && mv -f -- "$HOME/replacement.so" "$HOME/modules/$KR_TEST_REPLACE_AFTER_LOAD.so"
 fi
 
 print -r -- user-bottom >> "$KR_TEST_ORDER"
