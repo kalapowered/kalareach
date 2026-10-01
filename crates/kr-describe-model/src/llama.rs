@@ -50,9 +50,9 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use kr_describe::priority::Cancellation;
-use kr_describe::profile::ModelProfile;
-use kr_describe::serve::{Generating, Job, LoadWork, Loading, Model, own_rss_bytes};
-use kr_describe::wire::{JobEnd, LoadEnd, Phases};
+use kr_describe::profile::{Asset, ModelProfile};
+use kr_describe::serve::{Generating, Job, LoadWork, Loading, Model, Verifying, own_rss_bytes};
+use kr_describe::wire::{JobEnd, LoadEnd, Phases, VerifyResult};
 use kr_protocol::scalars::U64;
 
 /// How many tokens one decode batch carries.
@@ -178,6 +178,37 @@ impl Model for Llama {
             None => Generating::Ended {
                 why: JobEnd::NotLoaded,
                 detail: None,
+            },
+        }
+    }
+
+    fn verify(
+        &mut self,
+        asset: &Asset,
+        path: &Path,
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> Verifying {
+        // The same check a load makes, stopping between blocks of the file: a gigabyte hashed
+        // under the process's background class, and a cancellation heard within one block.
+        let stop = || token.is_cancelled() || Instant::now() >= deadline;
+        match crate::assets::verify_file_unless(asset, path, stop) {
+            Ok(true) => Verifying::Verified,
+            Ok(false) if token.is_cancelled() => Verifying::Ended {
+                result: VerifyResult::Cancelled,
+                detail: None,
+            },
+            Ok(false) => Verifying::Ended {
+                result: VerifyResult::DeadlineExceeded,
+                detail: None,
+            },
+            Err(error @ kr_describe::DescribeError::AssetUnreadable { .. }) => Verifying::Ended {
+                result: VerifyResult::Unreadable,
+                detail: Some(error.to_string()),
+            },
+            Err(error) => Verifying::Ended {
+                result: VerifyResult::Mismatch,
+                detail: Some(error.to_string()),
             },
         }
     }
