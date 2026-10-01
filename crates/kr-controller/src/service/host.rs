@@ -239,6 +239,7 @@ impl Controller {
     pub(super) async fn environment_record(
         &self,
         actor: &kr_protocol::actor::ActorEnvelope,
+        bridged: bool,
         mutation: &MutationRequest,
         method: Method,
     ) -> Result<ParamsValue> {
@@ -273,6 +274,17 @@ impl Controller {
                 encode(&EnvironmentForgetResult { forgotten })
             }
             Method::EnvironmentRefresh => {
+                // Before anything is asked of the platform, and before the record is touched: a
+                // refresh may start the environment it selects, and a request that has crossed a
+                // bridge is not one that may open another. Starting something and then refusing to
+                // look at it would be the wrong way round.
+                if bridged {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "a request crosses at most one process bridge, and this one has \
+                                 already crossed one to reach this environment"
+                            .to_owned(),
+                    });
+                }
                 let params: EnvironmentRefreshParams = parse(&mutation.params)?;
                 let environment_id = params.environment_id;
 
@@ -342,6 +354,7 @@ impl Controller {
                     let opened_for = row.enrolment.clone();
                     match crate::bridge::verify::through_bridge(
                         actor,
+                        bridged,
                         &opened_for,
                         self.paths.environment_id(),
                         self.build_id.clone(),

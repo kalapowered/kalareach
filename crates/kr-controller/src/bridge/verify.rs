@@ -38,13 +38,14 @@ use crate::bridge::invoke::{self, Refusal};
 /// that could not be ended once it had answered.
 pub async fn through_bridge(
     actor: &ActorEnvelope,
+    already_bridged: bool,
     enrolment: &EnvironmentEnrolment,
     origin_environment_id: EnvironmentId,
     build_id: BuildId,
 ) -> Result<BridgeVerification, Refusal> {
     let opening = invoke::open(
         actor,
-        false,
+        already_bridged,
         enrolment,
         origin_environment_id,
         build_id,
@@ -121,6 +122,7 @@ mod tests {
         // started: the refusal comes from the envelope this host built for the request.
         let refusal = through_bridge(
             &actor(ActorIngress::PairedDevice),
+            false,
             &enrolment(EnvironmentAccess::WslDistribution, "Ubuntu-24.04"),
             EnvironmentId::new(Uuid::from_bytes([1; 16])),
             BuildId::new("kr/0.1.0").expect("a build"),
@@ -139,6 +141,7 @@ mod tests {
     async fn an_ssh_environment_is_not_reached_by_a_bridge_at_all() {
         let refusal = through_bridge(
             &actor(ActorIngress::LocalIpc),
+            false,
             &enrolment(EnvironmentAccess::SshHost, "build.example"),
             EnvironmentId::new(Uuid::from_bytes([1; 16])),
             BuildId::new("kr/0.1.0").expect("a build"),
@@ -154,6 +157,7 @@ mod tests {
         // a refusal about authority that would send a person looking in the wrong place.
         let refusal = through_bridge(
             &actor(ActorIngress::LocalIpc),
+            false,
             &enrolment(
                 EnvironmentAccess::Container,
                 &"9f".repeat(kr_protocol::identity::CONTAINER_IDENTIFIER_LEN / 2),

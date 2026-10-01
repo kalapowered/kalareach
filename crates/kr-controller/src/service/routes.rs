@@ -266,6 +266,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
         accepted: Option<AcceptedDeadline>,
         admitted: Option<AuthorityRevision>,
     ) -> ControlFrame {
@@ -688,12 +689,15 @@ impl Controller {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 // Each is performed once per actor's action: claimed first, and what it came to is
                 // kept under the claim before it is answered, so a retry is answered from that
-                // record rather than enrolling, forgetting or observing again.
+                // record rather than enrolling, forgetting or observing again. A connection that
+                // came over a process bridge has already crossed its one: the helper that made it
+                // refuses to carry a request that would open another, and this is the rule kept
+                // where only the destination can keep it.
                 return self
                     .claimed_action(
                         actor_id,
                         mutation,
-                        self.environment_record(&actor, mutation, method),
+                        self.environment_record(&actor, origin.is_some(), mutation, method),
                     )
                     .await;
             }

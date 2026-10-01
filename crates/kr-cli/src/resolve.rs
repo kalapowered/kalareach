@@ -15,7 +15,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionId};
-use kr_protocol::local::LocalClientKind;
+use kr_protocol::local::{BridgeOrigin, LocalClientKind};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
@@ -188,8 +188,25 @@ pub fn find(
 ///
 /// Returns an error when the endpoint cannot be reached or the challenge fails.
 pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Result<LocalClient> {
+    open_worker_for(descriptor, build_id, None).await
+}
+
+/// Connects to a worker on behalf of an invoker in another environment, when `origin` says there
+/// is one, and proves it is the one the descriptor names.
+///
+/// This is the bridge helper's connection to the worker of the session it attaches to: the hello
+/// says where the invocation began, and the challenge is as for any other client.
+///
+/// # Errors
+///
+/// As [`open_worker`].
+pub async fn open_worker_for(
+    descriptor: &WorkerDescriptor,
+    build_id: BuildId,
+    origin: Option<BridgeOrigin>,
+) -> Result<LocalClient> {
     let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)?;
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
+    let mut client = connect(&endpoint, build_id, origin)
         .await
         .map_err(|error| {
             CliError::HostUnavailable(shown!(
@@ -229,22 +246,44 @@ pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it"
 /// to be guessed. Returns [`CliError::Unfinished`] with `ENVIRONMENT_UNAVAILABLE` when a daemon
 /// took the connection and did not answer within the bound.
 pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Result<LocalClient> {
-    open_controller_within(paths, build_id, crate::startup::ANSWER_BOUND).await
+    open_controller_for(paths, build_id, None).await
+}
+
+/// Connects to the control daemon on behalf of an invoker in another environment, when `origin`
+/// says there is one.
+///
+/// # Errors
+///
+/// As [`open_controller`].
+pub async fn open_controller_for(
+    paths: &EnvironmentPaths,
+    build_id: BuildId,
+    origin: Option<BridgeOrigin>,
+) -> Result<LocalClient> {
+    open_controller_within(paths, build_id, origin, crate::startup::ANSWER_BOUND).await
+}
+
+/// Connects as a plain command-line client, or as a bridge's helper where there is an origin.
+async fn connect(
+    endpoint: &kr_ipc::paths::Endpoint,
+    build_id: BuildId,
+    origin: Option<BridgeOrigin>,
+) -> kr_ipc::Result<LocalClient> {
+    match origin {
+        Some(origin) => LocalClient::connect_for_bridge(endpoint, build_id, origin).await,
+        None => LocalClient::connect(endpoint, LocalClientKind::Cli, build_id).await,
+    }
 }
 
 /// Connects to the control daemon, the connection and its hello together bounded by `bound`.
 async fn open_controller_within(
     paths: &EnvironmentPaths,
     build_id: BuildId,
+    origin: Option<BridgeOrigin>,
     bound: std::time::Duration,
 ) -> Result<LocalClient> {
     let endpoint = paths.controller_endpoint()?;
-    match tokio::time::timeout(
-        bound,
-        LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id),
-    )
-    .await
-    {
+    match tokio::time::timeout(bound, connect(&endpoint, build_id, origin)).await {
         Ok(connected) => connected.map_err(|error| not_running(&error, Shown::said(SETUP_ACTION))),
         Err(_) => Err(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -520,7 +559,7 @@ mod tests {
         let patience = std::time::Duration::from_secs(30);
         let Ok(opened) = tokio::time::timeout(
             patience,
-            open_controller_within(&environment, crate::build_id(), bound),
+            open_controller_within(&environment, crate::build_id(), None, bound),
         )
         .await
         else {

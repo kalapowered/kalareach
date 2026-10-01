@@ -1192,6 +1192,7 @@ async fn a_connection_that_admits_no_mutation_is_refused_by_the_daemon() {
                 max_outstanding_mutations: kr_protocol::scalars::U64::new(0),
                 ..kr_protocol::hello::ReceiveLimits::default()
             },
+            origin: None,
         }))
         .await
         .expect("writes the hello");
@@ -1829,6 +1830,7 @@ async fn hosted_worker() -> Hosted {
             client: LocalClientKind::Worker,
             capabilities: kr_protocol::scalars::CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: None,
         }))
         .await
         .expect("writes the hello");
@@ -2499,6 +2501,7 @@ async fn present_claim(
             client: LocalClientKind::Worker,
             capabilities: kr_protocol::scalars::CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            origin: None,
         }))
         .await
         .expect("writes the hello");
