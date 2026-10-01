@@ -162,13 +162,14 @@ the application comes to the front, the shell asks the host where each detached 
 stands, even if the draft is in a different session than the one currently displayed. Each draft is
 then offered its rebind. Two rules keep the rest honest.
 
-**A draft is durable; the association is not.** A draft is this device's own record with its own
-identity and revision. The attachment that presents it in an editor belongs to the connection, so
-losing the connection removes the binding and leaves the draft exactly as it was. Coming back
-offers a rebind. An unchanged target gets one. A draft that holds nothing, or was written before
-the device knew which conversation the agent was in, goes with the current conversation instead. A
-changed application or binding revision is a conflict the person resolves, and a session that has
-gone orphans the draft. Nothing is ever submitted automatically.
+**A draft is durable; the association is not.** The draft has its own identity and revision, and is
+stored on the device. The attachment of the draft to this editor is associated with the connection.
+When the connection is lost, the draft is unbound, but is not changed. When the connection is
+recovered, the draft may be rebound. If the target of the binding has not changed, the draft will be
+rebound. If the draft is empty, or was created before the association with an agent conversation was
+known, it will be associated with the current conversation. If the application or binding revision
+has changed, this is considered a conflict and will require resolution by the person. If the session
+has gone away, the draft is orphaned. In no case is a draft automatically submitted.
 
 Note that contact starting here means that contact has started with a host, and not merely that the
 connection has changed. Any time the application comes to the front, even if it never lost
