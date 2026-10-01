@@ -13,9 +13,25 @@
  * three together is what a fence rests on.
  */
 
-/* The lookup of a loaded module's file is behind this on glibc. */
+/* The lookup of a loaded module's image is behind this on glibc. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
+#endif
+
+/* The loader's own headers come before the shell's, whose names they would otherwise meet. */
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef __APPLE__
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#endif
+
+#if defined(__linux__) && defined(__GLIBC__)
+#include <elf.h>
+#include <link.h>
 #endif
 
 #include "zle.mdh"
@@ -23,9 +39,7 @@
 #include "kr_bridge.h"
 #include "kr_bridge_zle.h"
 
-#include <dlfcn.h>
 #include <stdio.h>
-#include <string.h>
 #include <termios.h>
 
 /*
@@ -422,22 +436,543 @@ kr_setup_symbol(const char *module_name)
     return symbol;
 }
 
+/* ---- the verdict on each module the shell holds -------------------------------------------- */
+
+/*
+ * A module is a shared object that binds to the reader by name, so a module built against another
+ * editor is one whose imports this reader does not provide: a function it has never had or has
+ * since renamed. The shell loads modules lazily, so such a module loads without complaint and fails
+ * at the first call that needs the missing name, which is a shell that ends in the middle of a
+ * command. The handshake is made when the editor is set up, which can be before a startup file has
+ * run, so it may not see a module a startup file loads. When the user-facing hooks are reported
+ * live, which is after the person's startup files, this reads the imports of every dynamic module
+ * the shell holds, and the report says for each whether every name it imports is provided.
+ *
+ * What is judged is the image the loader mapped, never a file opened again by its name: the name
+ * can be replaced or removed after the module loaded, and the file then found is not the code the
+ * shell runs. The module's undefined symbols are read from the tables the loader itself bound it
+ * with, which are in memory already, so nothing is opened, read or waited for. What is asked is
+ * whether the running shell, the modules already loaded or the module's own libraries provide each
+ * name; a name that carries a symbol version is asked for under that version, in the module's own
+ * libraries. Every module is judged, the package's own among them: where a module sits says
+ * nothing about what it is, and the package's own bind like any other.
+ *
+ * What this does not see: a module built against another layout of the same names, one that binds
+ * every symbol it imports; a name a library the module loads for itself imports in its turn; a
+ * name provided by a package module that is not loaded when the hooks go live; and a module the
+ * shell loads afterwards. A module image that does not read as one is reported as such and never as
+ * a module that binds. The reader is made for the shared objects a linker makes: a table that is
+ * not where the loader's own bookkeeping puts it is not read.
+ */
+
+typedef struct {
+    void *handle;
+    kr_imports_state state;
+    char detail[256];
+} kr_scan;
+
 static void
-kr_zle_free_partial(kr_loaded_module *modules, size_t count)
+kr_scan_not_read(kr_scan *scan, const char *why)
+{
+    if (scan->state != KR_IMPORTS_NOT_READ) {
+        scan->state = KR_IMPORTS_NOT_READ;
+        snprintf(scan->detail, sizeof(scan->detail), "%s", why);
+    }
+}
+
+/* The text a wire string carries: whatever is not well-formed UTF-8 becomes `?`. */
+static void
+kr_utf8_clean(char *text)
+{
+    unsigned char *p = (unsigned char *)text;
+
+    while (*p != '\0') {
+        size_t need = 0;
+
+        if (*p < 0x80) {
+            p++;
+            continue;
+        }
+        if (*p >= 0xC2 && *p <= 0xDF) {
+            need = 1;
+        } else if (*p >= 0xE0 && *p <= 0xEF) {
+            need = 2;
+        } else if (*p >= 0xF0 && *p <= 0xF4) {
+            need = 3;
+        }
+        if (need > 0) {
+            size_t i;
+
+            for (i = 1; i <= need && (p[i] & 0xC0) == 0x80; i++) {
+            }
+            if (i == need + 1) {
+                p += need + 1;
+                continue;
+            }
+        }
+        *p++ = '?';
+    }
+}
+
+/* Whether `handle`'s lookup finds `name`: a symbol whose value is zero is still one that exists. */
+static int
+kr_provides(void *handle, const char *name)
+{
+    (void)dlerror();
+    return dlsym(handle, name) != NULL || dlerror() == NULL;
+}
+
+/* Records `name` when nothing that can provide it does. */
+static void
+kr_check_import(const char *name, kr_scan *scan)
+{
+    if (scan->state != KR_IMPORTS_BOUND || name[0] == '\0') {
+        return;
+    }
+    /* The shell and what it has loaded, then the module's own dependencies. */
+    if (kr_provides(RTLD_DEFAULT, name) || kr_provides(scan->handle, name)) {
+        return;
+    }
+    scan->state = KR_IMPORTS_MISSING;
+    snprintf(scan->detail, sizeof(scan->detail), "%s", name);
+    kr_utf8_clean(scan->detail);
+}
+
+#ifdef __APPLE__
+
+/*
+ * The undefined names of the Mach-O image the loader mapped at `header`. The symbol and string
+ * tables are in the image's __LINKEDIT segment, which is mapped with it: a file offset in the load
+ * commands is an address there, relative to where the segment's file offset puts it.
+ */
+static void
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
+{
+    const struct mach_header_64 *image = header;
+    const unsigned char *cursor;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct segment_command_64 *text = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const unsigned char *base;
+    uint32_t command;
+    uint32_t used = 0;
+    uint32_t index;
+
+    (void)handle;
+    if (image == NULL) {
+        kr_scan_not_read(scan, "the loader does not say where it mapped it");
+        return;
+    }
+    if (image->magic != MH_MAGIC_64 || (image->filetype != MH_BUNDLE && image->filetype != MH_DYLIB)) {
+        kr_scan_not_read(scan, "its format is not one this reads");
+        return;
+    }
+    cursor = (const unsigned char *)(image + 1);
+    for (command = 0; command < image->ncmds; command++) {
+        const struct load_command *load = (const struct load_command *)cursor;
+
+        if (image->sizeofcmds < sizeof(*load) || used > image->sizeofcmds - sizeof(*load) ||
+            load->cmdsize < sizeof(*load) || load->cmdsize > image->sizeofcmds - used) {
+            kr_scan_not_read(scan, "its load commands run past their size");
+            return;
+        }
+        if (load->cmd == LC_SEGMENT_64 && load->cmdsize >= sizeof(*text)) {
+            const struct segment_command_64 *segment = (const struct segment_command_64 *)cursor;
+
+            if (strncmp(segment->segname, "__TEXT", sizeof(segment->segname)) == 0) {
+                text = segment;
+            } else if (strncmp(segment->segname, "__LINKEDIT", sizeof(segment->segname)) == 0) {
+                linkedit = segment;
+            }
+        } else if (load->cmd == LC_SYMTAB && load->cmdsize >= sizeof(*symtab)) {
+            symtab = (const struct symtab_command *)cursor;
+        } else if (load->cmd == LC_DYSYMTAB && load->cmdsize >= sizeof(*dysymtab)) {
+            dysymtab = (const struct dysymtab_command *)cursor;
+        }
+        used += load->cmdsize;
+        cursor += load->cmdsize;
+    }
+    if (text == NULL || linkedit == NULL || symtab == NULL || dysymtab == NULL ||
+        linkedit->filesize > linkedit->vmsize) {
+        kr_scan_not_read(scan, "its load commands name no symbol table this reads");
+        return;
+    }
+    /* Where the loader put the segment that holds the tables, and what of it is theirs. */
+    base = (const unsigned char *)((uintptr_t)image - (uintptr_t)text->vmaddr +
+                                   (uintptr_t)linkedit->vmaddr) -
+           (size_t)linkedit->fileoff;
+    if (symtab->symoff < linkedit->fileoff ||
+        symtab->symoff - linkedit->fileoff > linkedit->filesize ||
+        symtab->nsyms > (linkedit->filesize - (symtab->symoff - linkedit->fileoff)) /
+                            sizeof(struct nlist_64) ||
+        symtab->stroff < linkedit->fileoff ||
+        symtab->stroff - linkedit->fileoff > linkedit->filesize ||
+        symtab->strsize > linkedit->filesize - (symtab->stroff - linkedit->fileoff) ||
+        dysymtab->iundefsym > symtab->nsyms ||
+        dysymtab->nundefsym > symtab->nsyms - dysymtab->iundefsym) {
+        kr_scan_not_read(scan, "its symbol table is not one this reads");
+        return;
+    }
+    for (index = dysymtab->iundefsym; index < dysymtab->iundefsym + dysymtab->nundefsym; index++) {
+        const struct nlist_64 *symbol = (const struct nlist_64 *)(base + symtab->symoff) + index;
+        const char *name;
+
+        /* A weak reference is one the module is content to lose. */
+        if ((symbol->n_type & N_TYPE) != N_UNDF || !(symbol->n_type & N_EXT) ||
+            (symbol->n_desc & N_WEAK_REF)) {
+            continue;
+        }
+        if (symbol->n_un.n_strx >= symtab->strsize) {
+            kr_scan_not_read(scan, "its string table is not one this reads");
+            return;
+        }
+        name = (const char *)(base + symtab->stroff) + symbol->n_un.n_strx;
+        if (memchr(name, '\0', symtab->strsize - symbol->n_un.n_strx) == NULL) {
+            kr_scan_not_read(scan, "its string table is not one this reads");
+            return;
+        }
+        /* Every lazily bound image names the loader's binding routine, which the loader supplies
+         * and which is the one name that carries no prefix. */
+        if (strcmp(name, "dyld_stub_binder") == 0) {
+            continue;
+        }
+        /* The loader's own lookup is made without the prefix the C compiler put on, and a name
+         * that has none is one this does not know how to ask for. */
+        if (name[0] != '_') {
+            kr_scan_not_read(scan, "a name it imports is not one this knows how to ask for");
+            return;
+        }
+        kr_check_import(name + 1, scan);
+    }
+}
+
+#elif defined(__linux__) && defined(__GLIBC__)
+
+/* The most entries a dynamic section is read to: a section that runs on is not one this reads. */
+#define KR_DYNAMIC_MAX 4096u
+/* The most symbols a module's symbol table is taken to hold. */
+#define KR_SYMBOLS_MAX (1u << 24)
+/* The most loadable segments of one object this keeps. */
+#define KR_SEGMENTS_MAX 32
+
+/* The memory the loader mapped for one object: where its loadable segments are. */
+typedef struct {
+    uintptr_t bias;
+    size_t count;
+    uintptr_t start[KR_SEGMENTS_MAX];
+    uintptr_t end[KR_SEGMENTS_MAX];
+} kr_object;
+
+static int
+kr_collect_segments(struct dl_phdr_info *info, size_t size, void *data)
+{
+    kr_object *object = data;
+    size_t i;
+
+    (void)size;
+    if ((uintptr_t)info->dlpi_addr != object->bias || object->count != 0) {
+        return 0;
+    }
+    for (i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *segment = &info->dlpi_phdr[i];
+
+        if (segment->p_type != PT_LOAD) {
+            continue;
+        }
+        if (object->count == KR_SEGMENTS_MAX) {
+            return 1;
+        }
+        object->start[object->count] = (uintptr_t)info->dlpi_addr + (uintptr_t)segment->p_vaddr;
+        object->end[object->count] = object->start[object->count] + (uintptr_t)segment->p_memsz;
+        object->count++;
+    }
+    return 1;
+}
+
+/* Whether the `size` bytes at `at` are inside one loadable segment of the object. */
+static int
+kr_mapped(const kr_object *object, const void *at, size_t size)
+{
+    uintptr_t from = (uintptr_t)at;
+    size_t i;
+
+    for (i = 0; i < object->count; i++) {
+        if (from >= object->start[i] && from <= object->end[i] &&
+            size <= object->end[i] - from) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* An address the dynamic section holds: the loader may have added the load bias to it already. */
+static uintptr_t
+kr_dynamic_address(uintptr_t value, uintptr_t bias)
+{
+    return value < bias ? value + bias : value;
+}
+
+/* The name of the version the module's version table calls `index`, or NULL when it lists none. */
+static const char *
+kr_needed_version(const kr_object *object, const ElfW(Verneed) *needs, size_t count,
+                  uint16_t index, const char *strings, size_t string_size)
+{
+    const unsigned char *at = (const unsigned char *)needs;
+    size_t file;
+
+    if (needs == NULL) {
+        return NULL;
+    }
+    for (file = 0; file < count && file < KR_DYNAMIC_MAX; file++) {
+        const ElfW(Verneed) *need;
+        const unsigned char *aux_at;
+        size_t aux;
+
+        if (!kr_mapped(object, at, sizeof(*need))) {
+            return NULL;
+        }
+        need = (const ElfW(Verneed) *)at;
+        aux_at = at + need->vn_aux;
+        for (aux = 0; aux < need->vn_cnt && aux < KR_DYNAMIC_MAX; aux++) {
+            const ElfW(Vernaux) *aux_entry;
+
+            if (!kr_mapped(object, aux_at, sizeof(*aux_entry))) {
+                return NULL;
+            }
+            aux_entry = (const ElfW(Vernaux) *)aux_at;
+            if (aux_entry->vna_other == index) {
+                if (aux_entry->vna_name >= string_size ||
+                    memchr(strings + aux_entry->vna_name, '\0',
+                           string_size - aux_entry->vna_name) == NULL) {
+                    return NULL;
+                }
+                return strings + aux_entry->vna_name;
+            }
+            if (aux_entry->vna_next == 0) {
+                break;
+            }
+            aux_at += aux_entry->vna_next;
+        }
+        if (need->vn_next == 0) {
+            break;
+        }
+        at += need->vn_next;
+    }
+    return NULL;
+}
+
+/*
+ * How many symbols the object's symbol table holds, from the hash table the loader looks names up
+ * in, or 0 when that table is not one this reads.
+ */
+static size_t
+kr_symbol_count(const kr_object *object, const uint32_t *gnu, const uint32_t *sysv)
+{
+    if (gnu != NULL) {
+        uint32_t buckets;
+        uint32_t first_hashed;
+        uint32_t bloom;
+        const uint32_t *table;
+        const uint32_t *chains;
+        uint32_t last = 0;
+        uint32_t i;
+
+        if (!kr_mapped(object, gnu, 4 * sizeof(uint32_t))) {
+            return 0;
+        }
+        buckets = gnu[0];
+        first_hashed = gnu[1];
+        bloom = gnu[2];
+        table = (const uint32_t *)((const ElfW(Addr) *)(gnu + 4) + bloom);
+        chains = table + buckets;
+        if (!kr_mapped(object, gnu + 4, (size_t)bloom * sizeof(ElfW(Addr)) +
+                                            (size_t)buckets * sizeof(uint32_t))) {
+            return 0;
+        }
+        for (i = 0; i < buckets; i++) {
+            if (table[i] > last) {
+                last = table[i];
+            }
+        }
+        if (last < first_hashed) {
+            return first_hashed;
+        }
+        while (last - first_hashed < KR_SYMBOLS_MAX) {
+            if (!kr_mapped(object, &chains[last - first_hashed], sizeof(uint32_t))) {
+                return 0;
+            }
+            if (chains[last - first_hashed] & 1u) {
+                return (size_t)last + 1;
+            }
+            last++;
+        }
+        return 0;
+    }
+    if (sysv != NULL && kr_mapped(object, sysv, 2 * sizeof(uint32_t))) {
+        return sysv[1];
+    }
+    return 0;
+}
+
+/*
+ * The undefined names of the ELF object the loader mapped for `handle`. The dynamic section, and the
+ * symbol, string, version and hash tables it points to, are what the loader bound the module with,
+ * and they are in memory: each is read only where the object's own loadable segments say memory is.
+ */
+static void
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
+{
+    struct link_map *map = NULL;
+    kr_object object;
+    const ElfW(Dyn) *entry;
+    const ElfW(Sym) *symbols = NULL;
+    const char *strings = NULL;
+    size_t string_size = 0;
+    const uint16_t *versions = NULL;
+    const ElfW(Verneed) *needs = NULL;
+    size_t need_count = 0;
+    const uint32_t *sysv = NULL;
+    const uint32_t *gnu = NULL;
+    size_t symbol_size = sizeof(ElfW(Sym));
+    size_t count;
+    size_t seen = 0;
+    size_t n;
+
+    if (header == NULL || handle == NULL || dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 ||
+        map == NULL || map->l_ld == NULL) {
+        kr_scan_not_read(scan, "the loader does not say where it mapped it");
+        return;
+    }
+    memset(&object, 0, sizeof(object));
+    object.bias = (uintptr_t)map->l_addr;
+    dl_iterate_phdr(kr_collect_segments, &object);
+    if (object.count == 0) {
+        kr_scan_not_read(scan, "the loader does not say which memory it mapped");
+        return;
+    }
+    for (entry = map->l_ld;; entry++) {
+        if (++seen > KR_DYNAMIC_MAX || !kr_mapped(&object, entry, sizeof(*entry))) {
+            kr_scan_not_read(scan, "its dynamic section does not end where it is mapped");
+            return;
+        }
+        if (entry->d_tag == DT_NULL) {
+            break;
+        }
+        switch (entry->d_tag) {
+        case DT_SYMTAB:
+            symbols = (const ElfW(Sym) *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        case DT_STRTAB:
+            strings = (const char *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        case DT_STRSZ:
+            string_size = (size_t)entry->d_un.d_val;
+            break;
+        case DT_SYMENT:
+            symbol_size = (size_t)entry->d_un.d_val;
+            break;
+        case DT_VERSYM:
+            versions = (const uint16_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        case DT_VERNEED:
+            needs = (const ElfW(Verneed) *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        case DT_VERNEEDNUM:
+            need_count = (size_t)entry->d_un.d_val;
+            break;
+        case DT_HASH:
+            sysv = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        case DT_GNU_HASH:
+            gnu = (const uint32_t *)kr_dynamic_address(entry->d_un.d_ptr, object.bias);
+            break;
+        default:
+            break;
+        }
+    }
+    if (symbols == NULL || strings == NULL || string_size == 0 || symbol_size != sizeof(*symbols)) {
+        kr_scan_not_read(scan, "its dynamic section names no symbol table this reads");
+        return;
+    }
+    count = kr_symbol_count(&object, gnu, sysv);
+    if (count == 0 || count > KR_SYMBOLS_MAX) {
+        kr_scan_not_read(scan, "its hash table is not one this reads");
+        return;
+    }
+    if (!kr_mapped(&object, symbols, count * sizeof(*symbols)) ||
+        !kr_mapped(&object, strings, string_size) ||
+        (versions != NULL && !kr_mapped(&object, versions, count * sizeof(*versions)))) {
+        kr_scan_not_read(scan, "its symbol tables are not where it is mapped");
+        return;
+    }
+    for (n = 1; n < count; n++) {
+        const char *name;
+
+        if (symbols[n].st_shndx != SHN_UNDEF || ELF64_ST_BIND(symbols[n].st_info) == STB_WEAK ||
+            ELF64_ST_TYPE(symbols[n].st_info) == STT_TLS) {
+            continue;
+        }
+        if (symbols[n].st_name >= string_size) {
+            kr_scan_not_read(scan, "its string table is not one this reads");
+            return;
+        }
+        name = strings + symbols[n].st_name;
+        if (memchr(name, '\0', string_size - symbols[n].st_name) == NULL) {
+            kr_scan_not_read(scan, "its string table is not one this reads");
+            return;
+        }
+        /* A name a version is required for comes from a library that defines versions, never from
+         * the shell: it is asked for under that version, in the module's own libraries. */
+        if (versions != NULL && (versions[n] & 0x7fff) >= 2) {
+            const char *version = kr_needed_version(&object, needs, need_count, versions[n] & 0x7fff,
+                                                    strings, string_size);
+
+            if (version == NULL) {
+                kr_scan_not_read(scan, "a name it imports is bound to a version it does not list");
+                return;
+            }
+            (void)dlerror();
+            if (dlvsym(handle, name, version) == NULL && dlerror() != NULL &&
+                scan->state == KR_IMPORTS_BOUND) {
+                scan->state = KR_IMPORTS_MISSING;
+                snprintf(scan->detail, sizeof(scan->detail), "%s@%s", name, version);
+                kr_utf8_clean(scan->detail);
+            }
+            continue;
+        }
+        kr_check_import(name, scan);
+    }
+}
+
+#else
+
+static void
+kr_module_imports(const void *header, void *handle, kr_scan *scan)
+{
+    (void)header;
+    (void)handle;
+    kr_scan_not_read(scan, "this platform's module format is not one this reads");
+}
+
+#endif
+
+static void
+kr_zle_free_partial(kr_module_report *reports, size_t count)
 {
     size_t i;
 
     for (i = 0; i < count; i++) {
-        free(modules[i].name);
-        free(modules[i].path);
+        free(reports[i].name);
+        free(reports[i].path);
     }
-    free(modules);
+    free(reports);
 }
 
 static int
-kr_zle_loaded_modules(kr_loaded_module **out, size_t *count)
+kr_zle_module_reports(kr_module_report **out, size_t *count)
 {
-    kr_loaded_module *list;
+    kr_module_report *list;
     size_t capacity = 0;
     size_t made = 0;
     int slot;
@@ -464,9 +999,12 @@ kr_zle_loaded_modules(kr_loaded_module **out, size_t *count)
 
         for (module = (Module)modulestab->nodes[slot]; module != NULL;
              module = (Module)module->node.next) {
+            kr_module_report *report = &list[made];
+            kr_scan scan;
             char *symbol;
             void *setup;
             Dl_info where;
+            const void *header = NULL;
 
             /* An alias and a module linked into the shell have no file. */
             if ((module->node.flags & (MOD_ALIAS | MOD_LINKED)) || module->u.handle == NULL) {
@@ -475,22 +1013,29 @@ kr_zle_loaded_modules(kr_loaded_module **out, size_t *count)
             symbol = kr_setup_symbol(module->node.nam);
             setup = symbol != NULL ? dlsym(module->u.handle, symbol) : NULL;
             free(symbol);
-            list[made].handle = module->u.handle;
-            list[made].name = strdup(unmeta(module->node.nam));
-            if (list[made].name == NULL) {
-                kr_zle_free_partial(list, made);
+            report->name = strdup(unmeta(module->node.nam));
+            report->path = strdup("");
+            if (report->name == NULL || report->path == NULL) {
+                kr_zle_free_partial(list, made + 1);
                 return 0;
             }
-            /* The address of that function says which file the loader took the module from. */
+            /* The address of that function says which image the loader mapped the module in. */
             if (setup != NULL && dladdr(setup, &where) && where.dli_fname != NULL) {
-                list[made].path = strdup(where.dli_fname);
-                list[made].header = where.dli_fbase;
-                if (list[made].path == NULL) {
-                    free(list[made].name);
-                    kr_zle_free_partial(list, made);
+                free(report->path);
+                report->path = strdup(where.dli_fname);
+                header = where.dli_fbase;
+                if (report->path == NULL) {
+                    kr_zle_free_partial(list, made + 1);
                     return 0;
                 }
             }
+            memset(&scan, 0, sizeof(scan));
+            scan.handle = module->u.handle;
+            kr_module_imports(header, module->u.handle, &scan);
+            kr_utf8_clean(report->name);
+            kr_utf8_clean(report->path);
+            report->state = scan.state;
+            memcpy(report->detail, scan.detail, sizeof(report->detail));
             made++;
         }
     }
@@ -628,7 +1173,7 @@ void
 kr_zle_setup(void)
 {
     /* This shell loads native modules of its own, so its bridge lists them when the hooks go live. */
-    kr_loaded_modules_hook = kr_zle_loaded_modules;
+    kr_module_reports_hook = kr_zle_module_reports;
     kr_bridge_activate();
     /* Only the registered root shell asks; any other shell of this package pays nothing. */
     if (kr_bridge_registered()) {
@@ -639,7 +1184,7 @@ kr_zle_setup(void)
 void
 kr_zle_finish(void)
 {
-    kr_loaded_modules_hook = NULL;
+    kr_module_reports_hook = NULL;
     kr_resolve_hook = NULL;
     kr_bridge_resolution_free(&kr_resolution_now);
 }

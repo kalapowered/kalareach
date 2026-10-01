@@ -30,6 +30,10 @@ fi
 if [[ -n "$KR_TEST_REPLACE_AFTER_LOAD" ]]; then
   zmodload -F zsh/files b:mv && mv -f -- "$HOME/replacement.so" "$HOME/modules/$KR_TEST_REPLACE_AFTER_LOAD.so"
 fi
+if [[ -n "$KR_TEST_LINK_AFTER_LOAD" ]]; then
+  zmodload -F zsh/files b:rm b:ln && rm -f -- "$HOME/modules/$KR_TEST_LINK_AFTER_LOAD.so" &&
+    ln -s -- "$KR_TEST_LINK_TARGET" "$HOME/modules/$KR_TEST_LINK_AFTER_LOAD.so"
+fi
 
 print -r -- user-bottom >> "$KR_TEST_ORDER"
 # {kalareach-entry}
