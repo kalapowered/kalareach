@@ -1341,7 +1341,7 @@ impl SessionRuntime {
                 if session.state() != SessionState::Live {
                     return Err(ProtocolError::new(
                         ErrorCode::ShellIntegrationUnsupported,
-                        "the session ended before its root integration qualified",
+                        "the session ended before the create was answered",
                     ));
                 }
                 if let Some(driver) = session.fence() {
@@ -1391,8 +1391,9 @@ fn qualification_answer(
 
     let choices = match refused.reason {
         QualificationReason::ModuleTreeUnsupported => {
-            "rebuild the module for this reader, stop loading it in KalaReach sessions, or \
-             create the session with --shell-mode native_compat"
+            "rebuild the module for this reader, load the module that provides the name before \
+             it, stop loading it in KalaReach sessions, or create the session with \
+             --shell-mode native_compat"
         }
         _ => {
             "use a shell package this build qualifies, or create the session with --shell-mode native_compat"
