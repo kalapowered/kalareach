@@ -253,33 +253,6 @@ fn text_files(home: &Snapshot, package: &Path) -> Vec<(String, String)> {
     found
 }
 
-/// The lock file the installer keeps beside a startup file it has written to: `.<name>.kalareach-lock`
-/// in the file's own directory. It stays after the install and after the removal, empty, so that
-/// two writers cannot end up holding two different locks. It is not part of what the section lets
-/// the installer leave, and it is set apart here so that everything else is still held to it.
-fn is_lock_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.starts_with('.') && name.ends_with(".kalareach-lock"))
-}
-
-/// The snapshot without the lock files, and the lock files it had.
-fn without_locks(found: &Snapshot) -> (Snapshot, Vec<PathBuf>) {
-    let locks = found
-        .keys()
-        .filter(|path| is_lock_file(path))
-        .cloned()
-        .collect();
-    (
-        found
-            .iter()
-            .filter(|(path, _)| !is_lock_file(path))
-            .map(|(path, node)| (path.clone(), node.clone()))
-            .collect(),
-        locks,
-    )
-}
-
 /// The startup files the section names for a shell, relative to the home.
 fn startup_files(kind: ShellKind, home: &Snapshot) -> Vec<PathBuf> {
     match kind {
@@ -362,6 +335,27 @@ fn the_checks_refuse_an_installer_that_does_more_than_the_marked_entry() {
         only_marked_entries(
             &before,
             &with(&[(".zshrc", &format!("export EDITOR=nano\n{block}"))]),
+            &startup
+        )
+        .is_err()
+    );
+    // One that leaves a lock file beside the startup file it wrote, which is a file it does not own
+    // whatever it is for, and one that leaves it behind after the removal.
+    assert!(
+        only_marked_entries(
+            &before,
+            &with(&[
+                (".zshrc", &format!("{theirs}{block}")),
+                (".zshrc.kalareach-lock", "")
+            ]),
+            &startup
+        )
+        .is_err()
+    );
+    assert!(
+        only_marked_entries(
+            &before,
+            &with(&[(".zshrc", theirs), (".zshrc.kalareach-lock", "")]),
             &startup
         )
         .is_err()
@@ -512,10 +506,6 @@ struct Home {
 fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
     let powershell = (home.kind == ShellKind::PowerShell).then_some(package.executable.as_path());
     let before = snapshot(&home.path);
-    assert!(
-        without_locks(&before).1.is_empty(),
-        "{label}: the home starts with a lock file in it"
-    );
     let shell = home.kind.as_str();
 
     kr.run(
@@ -530,24 +520,9 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
         powershell,
         &["host", "startup", "--set", "standalone"],
     );
-    let (installed, locks) = without_locks(&snapshot(&home.path));
+    let installed = snapshot(&home.path);
 
     let startup = startup_files(home.kind, &before);
-    // The one thing the installer leaves besides its entry is the lock beside each file it wrote.
-    for lock in &locks {
-        let file = lock.parent().unwrap_or(Path::new("")).join(
-            lock.file_name()
-                .and_then(OsStr::to_str)
-                .and_then(|name| name.strip_prefix('.'))
-                .and_then(|name| name.strip_suffix(".kalareach-lock"))
-                .expect("a lock file's name"),
-        );
-        assert!(
-            startup.contains(&file),
-            "{label}: a lock file is beside {}, which is not a startup file the section names",
-            file.display()
-        );
-    }
     if let Err(fault) = only_marked_entries(&before, &installed, &startup) {
         panic!("{label}: the install changed more than its marked entry: {fault}");
     }
@@ -580,11 +555,7 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
         powershell,
         &["shell", "remove", "--shell", shell],
     );
-    let (removed, left) = without_locks(&snapshot(&home.path));
-    assert_eq!(
-        left, locks,
-        "{label}: the removal changed which lock files are left"
-    );
+    let removed = snapshot(&home.path);
     assert_eq!(
         removed,
         before,

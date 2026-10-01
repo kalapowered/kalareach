@@ -1115,44 +1115,56 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
 
 /// Returns the name of the lock that holds one startup file, a digest of where the file is.
 ///
-/// Every way of reaching the file gives one name: a link at the file, a link at any directory above
-/// it, and a path that spells a directory another way all resolve to the same place. A directory
-/// that is not there yet is resolved as far as it exists, so a first-time setup that creates it
-/// names the lock of the file it is about to write.
+/// Every way of reaching the file through links gives one name: a link at the file, a link at any
+/// directory above it, and a path that spells a directory another way (`..`, `.`) all resolve to the
+/// same place. A directory that is not there yet is resolved as far as it exists, so a first-time
+/// setup that creates it names the lock of the file it is about to write. A name that differs only
+/// in letter case on a filesystem that ignores it, and two mounts of one directory, are not unified;
+/// the record every install and removal holds beforehand is what keeps those apart.
 fn lock_name(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
 
-    let target = resolved(path)?;
-    let mut existing = target.parent().map(Path::to_path_buf);
-    let mut below = Vec::new();
-    // The nearest directory above the file that exists, and what lies between it and the file.
-    while let Some(directory) = existing.take() {
-        match std::fs::canonicalize(&directory) {
-            Ok(real) => {
-                existing = Some(real);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(name) = directory.file_name() {
-                    below.push(name.to_os_string());
-                }
-                existing = directory.parent().map(Path::to_path_buf);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let mut key = existing.unwrap_or_default();
-    for name in below.iter().rev() {
-        key.push(name);
-    }
-    if let Some(name) = target.file_name() {
-        key.push(name);
-    }
+    let key = resolved_as_far_as_it_exists(&resolved(path)?)?;
     let digest = Sha256::digest(key.as_os_str().as_encoded_bytes());
     Ok(digest.iter().fold(String::new(), |mut name, byte| {
         name.push_str(&format!("{byte:02x}"));
         name
     }))
+}
+
+/// Returns `path` made absolute with every link in the part that exists followed and every `.` and
+/// `..` resolved, and the rest, which is not there, spelled as it was given.
+fn resolved_as_far_as_it_exists(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut found = PathBuf::new();
+    // Whether the walk has gone below what exists: from there on a component is only a name.
+    let mut missing = false;
+    let given;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        given = std::env::current_dir()?.join(path);
+        &given
+    };
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                found.pop();
+            }
+            Component::Normal(name) if !missing => {
+                found.push(name);
+                match std::fs::canonicalize(&found) {
+                    Ok(real) => found = real,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(error) => return Err(error),
+                }
+            }
+            other => found.push(other.as_os_str()),
+        }
+    }
+    Ok(found)
 }
 
 /// Returns the file a startup path resolves to, following a link the user made.
@@ -1779,6 +1791,17 @@ mod tests {
             before,
             "the lock of a file in a directory that was not there changes when it is made"
         );
+        // A `..` after a directory that is not there is still a step back out of it.
+        assert_eq!(
+            lock_name(&linked.join("config/../config/profile.ps1")).expect("a name"),
+            before,
+            "a `..` below a missing directory was dropped"
+        );
+        assert_eq!(
+            lock_name(&linked.join("not-there/../.zshrc")).expect("a name"),
+            by_real,
+            "a missing directory and its `..` changed the file's lock"
+        );
         // And a different file is a different lock.
         assert_ne!(lock_name(&real.join(".bashrc")).expect("a name"), by_real);
     }
@@ -1884,7 +1907,7 @@ mod tests {
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\nHOME='{home}'\n\
+                "#!/bin/sh\n[ \"${{1:-}}\" = --version ] && exit 0\nHOME='{home}'\n\
                  cache=\"${{XDG_CACHE_HOME:-$HOME/.cache}}/powershell\"\n\
                  data=\"${{XDG_DATA_HOME:-$HOME/.local/share}}/powershell/Modules\"\n\
                  mkdir -p \"$cache\" \"$data\" && : > \"$cache/StartupProfileData-NonInteractive\"\n\
@@ -1896,7 +1919,7 @@ mod tests {
             ),
         )
         .expect("writes the program's text");
-        kr_ipc::testing::place_program(&text, &program);
+        kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
         std::fs::remove_file(&text).expect("the program's text goes once it is in place");
 
         let asking = HomeLayout {
@@ -1932,7 +1955,10 @@ mod tests {
         let text = root.join(format!("pwsh-{}.text", says.len()));
         std::fs::write(&text, format!("#!/bin/sh\nprintf '%s\\n' '{says}'\n"))
             .expect("writes the program's text");
-        kr_ipc::testing::place_program(&text, &path);
+        // Started once here, where nothing is timed: the first start of a program just written can
+        // take seconds on a machine that checks what it runs, and the question this host asks has a
+        // deadline of its own.
+        kr_ipc::testing::place_and_start_once(&text, &path, &["--version"]);
         std::fs::remove_file(&text).expect("the program's text goes once it is in place");
         path
     }
@@ -2186,14 +2212,13 @@ mod tests {
             .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
             .filter(|name| {
                 let name = name.to_string_lossy();
-                // The lock file is not a leftover: it is the name a waiter holds open, and on
-                // Unix it stays so that two writers cannot end up holding two different locks.
-                name.contains("kalareach-")
-                    && name != ".zshrc.kalareach-new"
-                    && !name.ends_with("kalareach-lock")
+                name.contains("kalareach-") && name != ".zshrc.kalareach-new"
             })
             .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "the install left something beside the startup file: {leftovers:?}"
+        );
     }
 
     #[test]
