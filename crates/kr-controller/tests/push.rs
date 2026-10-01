@@ -6535,6 +6535,7 @@ fn pair_phone(
     let device_id = DeviceId::new(uuid(byte));
     let grant = Grant {
         grant_id: GrantId::new(uuid(byte.wrapping_add(100))),
+        authority_revision: controller.policy().authority_revision(),
         actions: [kr_protocol::rights::ActionRight::SessionView]
             .into_iter()
             .collect(),
