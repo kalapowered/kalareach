@@ -3838,6 +3838,38 @@ fn key_registration(
     }
 }
 
+/// An admission that stands, on a connection this daemon holds a registration for, which the
+/// returned client keeps for as long as it is held.
+async fn standing_admission(
+    temp: &kr_ipc::testing::TempHost,
+    controller: &Arc<Controller>,
+) -> (
+    kr_ipc::client::LocalClient,
+    kr_controller::authority::AdmittedMutation,
+) {
+    let endpoint = temp
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    tokio::spawn(Arc::clone(controller).serve_clients(listener));
+    let client = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        BuildId::new("kr-test/0").expect("a build identifier"),
+    )
+    .await
+    .expect("connects");
+    let admission = kr_controller::authority::AdmittedMutation {
+        connection_id: client.acknowledgement().connection_id,
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: controller
+            .continuous_now()
+            .checked_add(Duration::from_secs(120)),
+    };
+    (client, admission)
+}
+
 /// KR-REQ-09.08: a key registration whose attempt ended unrecorded is not answered with what
 /// another action did. The first action's attempt claimed it and ended with nothing written, as an
 /// attempt refused by the delivery journal does when the daemon stops before it records the
@@ -3847,6 +3879,7 @@ fn key_registration(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfinished_key_registration_is_not_answered_with_another_actions_registration() {
     let (temp, controller) = daemon().await;
+    let (_client, admission) = standing_admission(&temp, &controller).await;
     let environment_id = temp.environment_id();
     let device = device_id(0xd1);
     let actor = kr_transport::listener::device_principal(&device);
@@ -3891,12 +3924,12 @@ async fn an_unfinished_key_registration_is_not_answered_with_another_actions_reg
     // Another action registers the same key at the same revision.
     let second = key_registration(environment_id, 0x72, device, *rotated.public(), 2);
     controller
-        .preview_key_update_action(&actor, &second)
+        .preview_key_update_action(&actor, &second, admission)
         .await
         .expect("the second action registers the key");
 
     let refusal = controller
-        .preview_key_update_action(&actor, &first)
+        .preview_key_update_action(&actor, &first, admission)
         .await
         .expect_err("the first action is not answered with the second one's registration");
     assert_eq!(

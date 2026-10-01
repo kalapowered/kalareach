@@ -53,7 +53,7 @@ use kr_delivery::journal::{
     Claim, DeliveryRecord, DeliveryState, EventKey, EventSource, TakenEvent, Transition,
 };
 use kr_delivery::producer::{
-    DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority, RecipientScope,
+    Audience, DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority, RecipientScope,
 };
 use kr_delivery::push::{DeliveryStatus, PushSender, SendOutcome, SenderCredentials, StatusAnswer};
 use kr_describe::context::{ContextBinding, ContextRevision, CursorInterval};
@@ -2197,6 +2197,10 @@ impl Subsystems {
             observed_at_ms: TimestampMs::new(NOW),
             collapse_group: "a-session/attention.pending_approval".to_owned(),
             expires_at_ms: TimestampMs::new(NOW + DEFAULT_NOTIFICATION_LIFETIME_MS),
+            audience: Audience::Sessions {
+                sessions: vec![session()],
+                at_ms: NOW,
+            },
         };
         self.delivery
             .with(|producer| {
@@ -2258,14 +2262,30 @@ fn session() -> SessionId {
 #[derive(Debug)]
 struct Granted;
 
-impl RecipientAuthority for Granted {
-    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
-        Some(RecipientScope {
+impl Granted {
+    fn scope() -> RecipientScope {
+        RecipientScope {
             viewer: ViewerScope::owner(),
             sessions: SessionSelector::These {
                 session_ids: [session()].into_iter().collect(),
             },
-        })
+            rights: [kr_protocol::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([9; 16])),
+            recipient: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([10; 16])),
+            history_from_ms: 0,
+        }
+    }
+}
+
+impl RecipientAuthority for Granted {
+    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+        Some(Self::scope())
+    }
+
+    fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+        Some(Self::scope())
     }
 }
 

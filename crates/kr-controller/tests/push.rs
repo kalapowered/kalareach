@@ -25,7 +25,7 @@ use kr_delivery::destination::{
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_delivery::journal::{DeliveryState, EventSource};
 use kr_delivery::producer::{
-    DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority, RecipientScope,
+    Audience, DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority, RecipientScope,
 };
 use kr_delivery::push::{DeliveryStatus, PushSender, SendOutcome, SenderCredentials, StatusAnswer};
 use kr_ipc::verify::ControllerIdentity;
@@ -420,14 +420,40 @@ impl SenderCredentials for FlakyRenewal {
 #[derive(Debug)]
 struct Granted(BTreeSet<SessionId>);
 
+impl Granted {
+    /// The scope these tests ask about: the owner's, over the sessions named, or over every session
+    /// when none is.
+    fn scope(&self) -> RecipientScope {
+        RecipientScope {
+            viewer: ViewerScope::owner(),
+            sessions: if self.0.is_empty() {
+                SessionSelector::Any
+            } else {
+                SessionSelector::These {
+                    session_ids: self.0.iter().copied().collect(),
+                }
+            },
+            rights: [
+                kr_protocol::rights::ActionRight::SessionView,
+                kr_protocol::rights::ActionRight::AutomationManage,
+                kr_protocol::rights::ActionRight::HostManage,
+            ]
+            .into_iter()
+            .collect(),
+            grant_id: GrantId::new(uuid(9)),
+            recipient: DeviceId::new(uuid(10)),
+            history_from_ms: 0,
+        }
+    }
+}
+
 impl RecipientAuthority for Granted {
     fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
-        Some(RecipientScope {
-            viewer: ViewerScope::owner(),
-            sessions: SessionSelector::These {
-                session_ids: self.0.iter().copied().collect(),
-            },
-        })
+        Some(self.scope())
+    }
+
+    fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+        Some(self.scope())
     }
 }
 
@@ -545,6 +571,10 @@ fn notice(number: u64, summary: &str) -> Notice {
         observed_at_ms: TimestampMs::new(NOW),
         collapse_group: "a-session/attention.pending_approval".to_owned(),
         expires_at_ms: TimestampMs::new(NOW + DEFAULT_NOTIFICATION_LIFETIME_MS),
+        audience: Audience::Sessions {
+            sessions: vec![session()],
+            at_ms: NOW,
+        },
     }
 }
 
@@ -2261,6 +2291,7 @@ fn a_rotation_the_delivery_journal_refuses_leaves_the_directory_alone() {
             second,
             2,
             NOW,
+            &|| Ok(()),
         )
         .expect("the first rotation");
     let third = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
@@ -2273,6 +2304,7 @@ fn a_rotation_the_delivery_journal_refuses_leaves_the_directory_alone() {
             third,
             3,
             NOW,
+            &|| Ok(()),
         )
         .expect_err("an overlapping rotation is refused");
     assert!(refusal.to_string().contains("overlapping rotation"));
@@ -2316,11 +2348,13 @@ fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
         fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
             self.0.store(true, std::sync::atomic::Ordering::Relaxed);
             // The same authority the message was admitted under: only the time has moved.
-            Some(RecipientScope {
-                viewer: ViewerScope::owner(),
-                sessions: SessionSelector::These {
-                    session_ids: CanonicalSet::new(),
-                },
+            Some(Granted(BTreeSet::new()).scope())
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            self.scope_for(&DeliveryRule {
+                name: String::new(),
+                grant_id: None,
             })
         }
     }
@@ -2396,6 +2430,7 @@ fn disabling_a_rejected_token_keeps_the_configuration_written_while_it_was_asked
                     self.rotated,
                     2,
                     NOW,
+                    &|| Ok(()),
                 )
                 .expect("the device registers a key while this call is out");
             SendOutcome::Decided(Box::new(PushDeliveryAck {
@@ -2541,6 +2576,7 @@ fn a_rotated_preview_key_keeps_the_old_one_only_while_notifications_are_outstand
             *replacement.public(),
             2,
             NOW,
+            &|| Ok(()),
         )
         .expect("a rotation");
     environment
@@ -2616,6 +2652,7 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
             *key2.public(),
             2,
             NOW,
+            &|| Ok(()),
         )
         .expect("first rotation succeeds");
 
@@ -2626,6 +2663,7 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
         *key3.public(),
         3,
         NOW + 1,
+        &|| Ok(()),
     );
     assert!(
         err.is_err(),
@@ -2640,6 +2678,7 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
             *key3.public(),
             3,
             NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1,
+            &|| Ok(()),
         )
         .expect("rotation succeeds after earlier notifications expire");
 }
@@ -2661,7 +2700,8 @@ fn a_preview_key_revision_only_moves_forward() {
                 &DestinationId::new("phone").expect("an identifier"),
                 *replacement.public(),
                 1,
-                NOW
+                NOW,
+                &|| Ok(())
             )
             .is_err(),
         "a revision that does not follow is a replay"
@@ -2844,6 +2884,41 @@ async fn start_controller_in(temp: &kr_ipc::testing::TempHost) -> Arc<Controller
     })
     .await
     .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
+}
+
+/// A connection this daemon holds a registration for, and an admission on it that stands for
+/// `lifetime` on the daemon's continuous clock, at the authority revision in force.
+struct Standing {
+    carried: kr_controller::authority::AdmittedMutation,
+    _client: kr_ipc::client::LocalClient,
+}
+
+async fn standing_admission(
+    temp: &kr_ipc::testing::TempHost,
+    controller: &Arc<Controller>,
+    lifetime: std::time::Duration,
+) -> Standing {
+    let endpoint = temp
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    tokio::spawn(Arc::clone(controller).serve_clients(listener));
+    let client = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        BuildId::new("kr-test/0").expect("a build identifier"),
+    )
+    .await
+    .expect("connects");
+    Standing {
+        carried: kr_controller::authority::AdmittedMutation {
+            connection_id: client.acknowledgement().connection_id,
+            admitted_revision: controller.policy().authority_revision(),
+            deadline: controller.continuous_now().checked_add(lifetime),
+        },
+        _client: client,
+    }
 }
 
 fn dummy_grant(device_id: DeviceId) -> Grant {
@@ -3250,7 +3325,9 @@ async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence(
 
 #[tokio::test]
 async fn device_preview_key_update_via_controller() {
-    let (_temp, controller) = start_controller().await;
+    let (temp, controller) = start_controller().await;
+    let admission =
+        standing_admission(&temp, &controller, std::time::Duration::from_secs(120)).await;
     let device_id = DeviceId::new(uuid(10));
     let actor_id = kr_transport::listener::device_principal(&device_id);
 
@@ -3317,7 +3394,7 @@ async fn device_preview_key_update_via_controller() {
     };
 
     let result_val = controller
-        .device_preview_key_update(&actor_id, &mutation)
+        .device_preview_key_update(&actor_id, &mutation, admission.carried)
         .await
         .expect("update succeeds");
     let result: kr_protocol::sharing::DevicePreviewKeyUpdateResult = result_val.to_typed().unwrap();
@@ -3365,7 +3442,7 @@ async fn device_preview_key_update_via_controller() {
         params: ParamsValue::from_typed(&params).unwrap(),
     };
     let repeated: kr_protocol::sharing::DevicePreviewKeyUpdateResult = controller
-        .device_preview_key_update(&actor_id, &repeat_mutation)
+        .device_preview_key_update(&actor_id, &repeat_mutation, admission.carried)
         .await
         .expect("a resubmission is answered rather than refused")
         .to_typed()
@@ -3395,7 +3472,7 @@ async fn device_preview_key_update_via_controller() {
         };
         assert!(
             controller
-                .device_preview_key_update(&actor_id, &stale_mutation)
+                .device_preview_key_update(&actor_id, &stale_mutation, admission.carried)
                 .await
                 .is_err(),
             "revision {behind} does not follow 2"
@@ -3433,7 +3510,7 @@ async fn device_preview_key_update_via_controller() {
     };
     assert!(
         controller
-            .device_preview_key_update(&actor_id, &forbidden_mutation)
+            .device_preview_key_update(&actor_id, &forbidden_mutation, admission.carried)
             .await
             .is_err()
     );
@@ -3462,7 +3539,7 @@ async fn device_preview_key_update_via_controller() {
     };
     assert!(
         controller
-            .device_preview_key_update(&unresolved, &stolen_mutation)
+            .device_preview_key_update(&unresolved, &stolen_mutation, admission.carried)
             .await
             .is_err(),
         "an unresolved actor may not register a key for a device it does not hold"
@@ -4623,7 +4700,9 @@ fn key_update(
 /// while a new action carrying the old revision is still refused and neither store moves back.
 #[tokio::test]
 async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
-    let (_temp, controller) = start_controller().await;
+    let (temp, controller) = start_controller().await;
+    let admission =
+        standing_admission(&temp, &controller, std::time::Duration::from_secs(120)).await;
     let device_id = DeviceId::new(uuid(10));
     let actor_id = kr_transport::listener::device_principal(&device_id);
     let (destination_id, _) = paired_with_preview_key(&controller, device_id);
@@ -4638,6 +4717,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
             .preview_key_update_action(
                 &actor_id,
                 &key_update(&controller, 99, device_id, *second.public(), 2),
+                admission.carried,
             )
             .await
             .expect("revision 2 is recorded"),
@@ -4647,6 +4727,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
         .preview_key_update_action(
             &actor_id,
             &key_update(&controller, 100, device_id, *third.public(), 3),
+            admission.carried,
         )
         .await
         .expect("revision 3 is recorded");
@@ -4657,6 +4738,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
             .preview_key_update_action(
                 &actor_id,
                 &key_update(&controller, 99, device_id, *second.public(), 2),
+                admission.carried,
             )
             .await
             .expect("a repeat is answered from its retained result, not refused as stale"),
@@ -4667,6 +4749,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
             .preview_key_update_action(
                 &actor_id,
                 &key_update(&controller, 101, device_id, *second.public(), 2),
+                admission.carried,
             )
             .await
             .is_err(),
@@ -4708,7 +4791,7 @@ async fn a_key_update_that_stopped_between_its_stores_is_finished_at_the_next_st
     // The journal's half of the update, and then the host stops.
     controller
         .delivery()
-        .update_preview_key(&destination_id, *rotated.public(), 2, NOW)
+        .update_preview_key(&destination_id, *rotated.public(), 2, NOW, &|| Ok(()))
         .expect("the journal takes it");
     let stored = controller
         .devices()
@@ -4744,7 +4827,7 @@ async fn a_preview_key_recovery_that_cannot_write_the_directory_says_so_and_can_
     let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
     controller
         .delivery()
-        .update_preview_key(&destination_id, *rotated.public(), 2, NOW)
+        .update_preview_key(&destination_id, *rotated.public(), 2, NOW, &|| Ok(()))
         .expect("the journal takes it");
 
     // Another writer holds the registry, which is where the device directory lives.

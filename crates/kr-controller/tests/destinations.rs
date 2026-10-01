@@ -1969,7 +1969,24 @@ impl kr_delivery::producer::RecipientAuthority for SessionGrant {
             sessions: kr_protocol::grant::SessionSelector::These {
                 session_ids: [session()].into_iter().collect(),
             },
+            rights: [kr_protocol::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            grant_id: kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [9; 16],
+            )),
+            recipient: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [10; 16],
+            )),
+            history_from_ms: 0,
         })
+    }
+
+    fn device_scope(
+        &self,
+        _destination: &DestinationRecord,
+    ) -> Option<kr_delivery::producer::RecipientScope> {
+        None
     }
 }
 
@@ -2046,6 +2063,10 @@ impl Deliveries {
             observed_at_ms: TimestampMs::new(now),
             collapse_group: "a-session/attention.pending_approval".to_owned(),
             expires_at_ms: TimestampMs::new(now + 60 * 60 * 1000),
+            audience: kr_delivery::producer::Audience::Sessions {
+                sessions: vec![session()],
+                at_ms: now,
+            },
         };
         self.module
             .with(|producer| {
