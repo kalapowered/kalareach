@@ -1184,6 +1184,11 @@ struct Corpus {
     root: PathBuf,
 }
 
+/// The reserved variables a managed shell may export to what it starts and an ordinary one does not,
+/// by name. Any other `KR_` variable an agent sees is one both shells were given, and is compared
+/// like every other.
+const DECLARED_RESERVED: &[&str] = &["KR_SESSION"];
+
 /// What one shell left behind: the files its corpus wrote, and every start of each agent.
 struct Observed {
     files: BTreeMap<String, String>,
@@ -1553,7 +1558,7 @@ fn observe(arena: &Path, replacing: &[(String, &'static str)]) -> Observed {
                 environment: run
                     .environment
                     .into_iter()
-                    .filter(|(name, _)| !name.starts_with("KR_"))
+                    .filter(|(name, _)| !DECLARED_RESERVED.contains(&name.as_str()))
                     .map(|(name, value)| (name, normalise(&value)))
                     .collect(),
             })
@@ -1730,14 +1735,20 @@ pub fn ordinary_commands_and_agent_names_run_as_in_an_unmanaged_shell(kind: Shel
         );
     }
     // The bridge's own variables leave the environment once the handshake is done, so no agent is
-    // started with the endpoint or the secret, whatever else a session exports.
-    for name in ["KR_SHELL_BRIDGE", "KR_SHELL_BRIDGE_SECRET"] {
-        assert!(
-            !managed.reserved.contains(name),
-            "{name} reached an agent's environment: {:?}",
-            managed.reserved
-        );
-    }
+    // started with the endpoint or the secret, whatever else a session exports. What a managed
+    // shell may export to an agent is the declared set and nothing else: a name outside it is a
+    // difference the comparison would otherwise have filtered away.
+    let undeclared: Vec<_> = managed
+        .reserved
+        .iter()
+        .filter(|name| {
+            !DECLARED_RESERVED.contains(&name.as_str()) && !ordinary.reserved.contains(*name)
+        })
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "an agent was started with reserved variables a managed shell does not declare: {undeclared:?}"
+    );
     let differences = differences(&managed, &ordinary);
     assert!(
         differences.is_empty(),
