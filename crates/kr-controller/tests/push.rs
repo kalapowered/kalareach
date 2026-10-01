@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+mod net_support;
 mod organisation_support;
 
 use kr_controller::push::DeliveryModule;
@@ -3140,33 +3141,32 @@ async fn until_state(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_delivers_a_notification_without_anything_calling_a_pass() {
     let (_temp, controller) = start_controller().await;
-    let now = kr_ipc::now_ms().get();
-    let preview_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
-    let destination = DestinationRecord {
-        id: DestinationId::new(DeviceId::new(uuid(10)).to_string()).expect("an identifier"),
-        destination: Destination::Push(Box::new(PushDestination {
-            installation_id: InstallationId::new(uuid(2)),
-            sender_record_id: PushSenderRecordId::new(uuid(3)),
-            preview_keys: PreviewKeys::only(*preview_key.public(), 1),
-            previews_enabled: true,
-            mailbox_key: None,
-        })),
-        rule: Some(DeliveryRule {
-            name: "anything that wants a person".to_owned(),
-            grant_id: None,
-        }),
-        enabled: true,
-        configured_at_ms: TimestampMs::new(now),
+    let session_id = SessionId::new(uuid(60));
+    // A paired device whose grant reaches the session, and the approval the environment raises.
+    pair_phone(&controller, 10, SessionSelector::Any);
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, "req-write-hosts")])
+        .expect("the store records the approval");
+    let notification_id = {
+        let delivery = Arc::clone(controller.delivery());
+        let mut found = None;
+        until_holds("the daemon producing a notification of its own", || {
+            found = delivery
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .deliveries()
+                        .expect("a read")
+                        .first()
+                        .map(|record| record.notification_id))
+                })
+                .expect("a read");
+            found.is_some()
+        })
+        .await;
+        found.expect("a notification")
     };
-    controller
-        .delivery()
-        .configure(&destination)
-        .expect("a destination");
-    controller
-        .delivery_runtime()
-        .credentials()
-        .hold(current_credential(now));
-    let notification_id = produce_now(controller.delivery(), &destination, 1, now);
 
     // A pass runs every second. With no transport attached, none of them claims anything.
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
@@ -6592,12 +6592,50 @@ fn pair_phone(
 }
 
 /// Waits, on a condition and nothing else, until `holds`.
-async fn until_holds(what: &str, mut holds: impl FnMut() -> bool) {
+async fn until_holds(what: &str, holds: impl FnMut() -> bool) {
+    until_holds_saying(what, holds, String::new).await;
+}
+
+/// Waits as [`until_holds`] does, and says what the daemon holds when the patience runs out.
+async fn until_holds_saying(
+    what: &str,
+    mut holds: impl FnMut() -> bool,
+    describe: impl Fn() -> String,
+) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !holds() {
-        assert!(std::time::Instant::now() < deadline, "{what} never held");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never held: {}",
+            describe()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// What the delivery journal holds, one line for each notification.
+fn journal_of(controller: &Controller) -> String {
+    controller
+        .delivery()
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .deliveries()
+                .expect("a read")
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} {} {} {:?}",
+                        record.destination_id,
+                        record.event.stored(),
+                        record.state,
+                        record.detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "))
+        })
+        .expect("a read")
 }
 
 /// The authorisations the gateway was asked to deliver for, once each notification it took.
@@ -6648,9 +6686,17 @@ async fn an_item_raised_in_the_attention_store_is_delivered_to_each_device_its_g
         .attention()
         .observe(&[pending_approval_in(session_id, "req-write-hosts")])
         .expect("the store records the approval");
-    until_holds("both devices being told", || {
-        delivered_to(&gateway).len() >= 2
-    })
+    until_holds_saying(
+        "both devices being told",
+        || delivered_to(&gateway).len() >= 2,
+        || {
+            format!(
+                "journal [{}], waiting {:?}",
+                journal_of(&controller),
+                announcements_waiting(&controller)
+            )
+        },
+    )
     .await;
     // The item is settled with the store once the journal holds it, and is never offered again.
     until_holds("the store being settled with", || {
@@ -6697,4 +6743,242 @@ async fn an_item_raised_in_the_attention_store_is_delivered_to_each_device_its_g
             );
         }
     }
+}
+
+// ----- Privacy mode and the attention feed ------------------------------------------------------
+
+/// Turns privacy mode on or off at the daemon's local socket, and returns where it stands.
+async fn set_privacy(
+    host: &net_support::Host,
+    enabled: bool,
+) -> kr_protocol::privacy::PrivacyReport {
+    let mut client = host.client().await;
+    client
+        .mutate(
+            kr_protocol::method::Method::PrivacySet,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::privacy::PrivacySetParams { enabled },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("privacy mode changes")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// Where privacy mode stands at the daemon's local socket.
+async fn privacy_report(host: &net_support::Host) -> kr_protocol::privacy::PrivacyReport {
+    let mut client = host.client().await;
+    client
+        .request(
+            kr_protocol::method::Method::PrivacyStatus,
+            &kr_protocol::privacy::PrivacyStatusParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("privacy mode's report")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// A command that failed in session `session`, recorded in the environment's own source.
+fn failed_command_in(session_id: SessionId, sequence: u64) -> kr_attention::SourceEvent {
+    kr_attention::SourceEvent::new(
+        kr_attention::EventCursor::new(kr_protocol::attention::AttentionSource::Receipts, sequence),
+        TimestampMs::new(kr_ipc::now_ms().get()),
+        kr_attention::EventKind::CommandCompleted {
+            session_id,
+            command: "cargo test".to_owned(),
+            exit_code: 101,
+        },
+    )
+}
+
+/// The requests the gateway was asked to deliver, in the order they came.
+fn requests_to(gateway: &DeliveringGateway) -> Vec<PushDeliveryRequest> {
+    gateway
+        .asked()
+        .into_iter()
+        .filter(|asked| asked.url.ends_with("/api/push/deliver"))
+        .map(|asked| serde_json::from_slice(&asked.body).expect("a delivery request"))
+        .collect()
+}
+
+/// Whether the attention store still holds an announcement nothing has taken.
+fn announcements_waiting(controller: &Controller) -> Option<usize> {
+    controller
+        .attention()
+        .take_for_delivery(|store, _| store.awaiting_delivery().ok())
+        .ok()
+        .flatten()
+}
+
+/// KR-REQ-24.27, KR-REQ-24.28, KR-REQ-16.13, KR-REQ-24.29: privacy mode fences content-bearing
+/// outboxes and no late result of an earlier generation is published, while a pending approval
+/// still alerts, with no body and no preview. A command that failed while privacy mode was on is
+/// never sent after it ends, and is settled with the store rather than held. The approval's alert
+/// is the one copy that left, and `privacy.status` lists it with its reference and says no removal
+/// is held for it. The control: a command that fails after privacy mode ends is delivered, with its
+/// preview.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_private_is_never_sent()
+{
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(60));
+    let (device_id, _) = pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[
+            pending_approval_in(session_id, "req-write-hosts"),
+            failed_command_in(session_id, 2),
+        ])
+        .expect("the store records both");
+    until_holds("the approval's alert reaching the gateway", || {
+        !requests_to(&gateway).is_empty()
+    })
+    .await;
+    until_holds("both announcements being settled with", || {
+        announcements_waiting(controller) == Some(0)
+    })
+    .await;
+    let alerts = requests_to(&gateway);
+    assert_eq!(
+        alerts.len(),
+        1,
+        "the approval alerts and the failed command does not"
+    );
+    assert_eq!(alerts[0].hints.alert, PushAlert::ApprovalWaiting);
+    assert!(
+        alerts[0].preview.as_ref().is_none(),
+        "the alert carries no preview"
+    );
+
+    // The one copy that left is listed with its reference, and no removal is held for it.
+    let report = privacy_report(&host).await;
+    assert_eq!(report.exported.len(), 1, "{:?}", report.exported);
+    assert_eq!(report.exported[0].kind, "notification");
+    assert!(
+        report.exported[0]
+            .reference
+            .contains(&device_id.to_string())
+    );
+    assert!(!report.exported[0].deletable);
+    assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
+
+    set_privacy(&host, false).await;
+    // The control, once the clock has moved past the moment privacy mode ended: a command that
+    // fails after it is decided after it, and is delivered with its preview.
+    let lifted = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().lifted_at_ms().expect("a read")))
+        .expect("a read");
+    until_holds("the clock moving past the end of privacy mode", || {
+        kr_ipc::now_ms().get() > lifted + 1
+    })
+    .await;
+    controller
+        .attention()
+        .observe(&[failed_command_in(session_id, 3)])
+        .expect("the store records the failure");
+    until_holds("the control being delivered", || {
+        requests_to(&gateway).len() >= 2
+    })
+    .await;
+    until_holds("the store being settled with", || {
+        announcements_waiting(controller) == Some(0)
+    })
+    .await;
+    let sent = requests_to(&gateway);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the alert and the control, and nothing decided in private: {sent:?}"
+    );
+    assert!(
+        sent[1].preview.as_ref().is_some(),
+        "after privacy mode, with its preview"
+    );
+    let rows = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
+        .expect("a read");
+    assert_eq!(rows, 2);
+    host.stop().await;
+}
+
+/// KR-REQ-24.29: a journal that cannot list what has left says so, under `unlisted` with its
+/// reason, and never by an empty list. The control: the same daemon, with its journal whole, lists
+/// the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_that_cannot_list_what_left_says_so_rather_than_listing_nothing() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(60));
+    pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, "req-write-hosts")])
+        .expect("the store records the approval");
+    until_holds("the notification being accepted", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::Accepted))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+
+    let report = privacy_report(&host).await;
+    assert_eq!(report.exported.len(), 1, "{:?}", report.exported);
+    assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
+
+    // The journal loses the table the list is read from, as a store that has gone wrong does.
+    let path = host
+        .tree()
+        .environment()
+        .state_dir()
+        .join("delivery.sqlite3");
+    let second = rusqlite::Connection::open(&path).expect("a second connection");
+    second
+        .execute_batch("ALTER TABLE delivery_notifications RENAME TO delivery_notifications_gone")
+        .expect("the table goes");
+    let report = privacy_report(&host).await;
+    second
+        .execute_batch("ALTER TABLE delivery_notifications_gone RENAME TO delivery_notifications")
+        .expect("the table comes back");
+    assert!(
+        report
+            .unlisted
+            .iter()
+            .any(|gap| gap.subsystem == "delivery"),
+        "the gap is reported: {:?}",
+        report.unlisted
+    );
+    assert!(
+        report
+            .exported
+            .iter()
+            .all(|copy| !copy.kind.contains("notification")),
+        "and nothing is listed in its place: {:?}",
+        report.exported
+    );
+    host.stop().await;
 }
