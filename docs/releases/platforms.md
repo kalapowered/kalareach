@@ -38,8 +38,8 @@ natively and then started on the machine that built it. None is only cross-built
 | `x86_64-pc-windows-msvc` | `windows-2025` |
 | `aarch64-pc-windows-msvc` | `windows-11-arm` |
 
-The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-hook` and
-`kr-plugin-host`. Each one is built by a Cargo command of its own, as the Windows release builds
+The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
+`kr-hook` and `kr-plugin-host`. Each one is built by a Cargo command of its own, as the Windows release builds
 them, so its dependencies resolve exactly as they do for the release.
 
 ## How each floor is read
