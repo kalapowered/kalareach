@@ -796,6 +796,18 @@ fn check(id: u64, path: PathBuf, deadline_ms: u64) -> Check {
     }
 }
 
+/// Returns whether a process was ended, in some reports, because it had held only a check.
+fn ended_with_its_check(reports: &[Report]) -> bool {
+    reports.iter().any(|report| {
+        matches!(
+            report,
+            Report::Unloaded {
+                why: UnloadReason::CheckDone
+            }
+        )
+    })
+}
+
 /// Returns the checks among some reports.
 fn checks(reports: &[Report]) -> Vec<(u64, Checked)> {
     reports
@@ -809,12 +821,15 @@ fn checks(reports: &[Report]) -> Vec<(u64, Checked)> {
 
 /// The driver has a file checked by the process: it starts the process when there is none, the
 /// right file passes, a file that is not the recorded one does not, and nothing is loaded or run on
-/// the way. The control is a service that never asks, whose process is never started.
+/// the way. A process that held only a check ends with it, so each check has a process of its own,
+/// and none is left behind. The control is a service that never asks, whose process is never
+/// started.
 #[test]
 fn the_driver_has_a_file_checked_by_the_process() {
     let (signed, weights) = tiny();
     let mut rig = Rig::signed(
         &Script {
+            mark_start: true,
             mark_work: true,
             ..Script::default()
         },
@@ -855,8 +870,17 @@ fn the_driver_has_a_file_checked_by_the_process() {
         !stub::began(&runtime, "load") && !stub::began(&runtime, "job"),
         "nothing was loaded or run on the way"
     );
+    // The process held only that check, so it went with it.
+    if !ended_with_its_check(&reports) {
+        reports.extend(
+            rig.until(&roomy(), at(11), "the process to go", |reports, _| {
+                ended_with_its_check(reports)
+            }),
+        );
+    }
+    assert_eq!(rig.driver.pid(), None, "no process is left behind");
+    assert_eq!(rig.driver.service().inference_restarts(), 0);
 
-    let pid = rig.driver.pid();
     rig.driver
         .verify(&check(2, files.join("wrong"), 60_000), at(20))
         .expect("a check");
@@ -868,7 +892,12 @@ fn the_driver_has_a_file_checked_by_the_process() {
     };
     assert_eq!(*result, VerifyResult::Mismatch);
     assert!(detail.is_some());
-    assert_eq!(rig.driver.pid(), pid, "the same process checked both");
+    assert_eq!(
+        rig.driver.started(),
+        2,
+        "the second check had a process of its own"
+    );
+    assert_eq!(rig.processes_started(), 2);
     assert_eq!(rig.driver.ceiling(), Some("sampler"));
 }
 
@@ -908,20 +937,23 @@ fn a_check_is_cancelled_and_a_check_past_its_deadline_ends_the_process() {
             }
         )]
     );
-    assert_eq!(
-        rig.driver.pid(),
-        pid,
-        "the process was not ended to stop its check"
+    // The check was stopped and the process was not ended to stop it: it answered, and then went
+    // with the check it had held, which is no failure of inference.
+    assert!(
+        ended_with_its_check(&reports),
+        "the process goes once its check is done: {reports:?}"
     );
-    // The answer cleared the cancellation's timer: long past its bound, the idle process is left
-    // alone and nothing is counted against it.
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_ne!(pid, None);
+    assert_eq!(rig.driver.pid(), None);
+    // The answer cleared the cancellation's timer: long past its bound, nothing is counted against
+    // the process.
     assert_eq!(rig.driver.cancelling(), None);
     let reports = rig
         .driver
         .turn(&roomy(), at(30 + 10 * CANCEL_MS))
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
-    assert_eq!(rig.driver.pid(), pid);
     assert_eq!(rig.driver.service().inference_restarts(), 0);
 
     // A check the process does not answer: its deadline, and the grace after it, end the process.
@@ -1151,6 +1183,139 @@ fn a_check_is_refused_behind_other_work_and_reported_when_its_process_is_unloade
         "{reports:?}"
     );
     assert_eq!(rig.driver.pid(), None);
+}
+
+/// A process that holds a model is not ended by a check that is made in it: the check passes, the
+/// model stays resident, and the next job is described by the same process. The control is the
+/// process that held only the check, which goes with it.
+#[test]
+fn a_check_made_in_a_process_that_holds_a_model_leaves_the_process_running() {
+    let (signed, weights) = tiny();
+    let mut rig = Rig::signed(&Script::default(), &signed);
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the description", |reports, _| {
+        a_job_ended(reports)
+    });
+    let pid = rig.driver.pid();
+    assert!(pid.is_some(), "the model is resident");
+
+    rig.driver
+        .verify(&check(1, files.join("right"), 60_000), at(3_100))
+        .expect("a check");
+    let reports = rig.until(&roomy(), at(3_200), "the check", |reports, _| {
+        !checks(reports).is_empty()
+    });
+    assert!(
+        matches!(
+            &checks(&reports)[..],
+            [(
+                1,
+                Checked::Answered {
+                    result: VerifyResult::Verified,
+                    ..
+                }
+            )]
+        ),
+        "{reports:?}"
+    );
+    assert!(!ended_with_its_check(&reports), "{reports:?}");
+    assert_eq!(
+        rig.driver.pid(),
+        pid,
+        "the process that holds a model stays"
+    );
+    assert_eq!(rig.driver.started(), 1);
+
+    // The control: a process that held only a check goes with it.
+    let mut rig = Rig::signed(&Script::default(), &signed);
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(1, files.join("right"), 60_000), at(0))
+        .expect("a check");
+    let reports = rig.until(&roomy(), at(10), "the process to go", |reports, _| {
+        ended_with_its_check(reports)
+    });
+    assert_eq!(checks(&reports).len(), 1, "{reports:?}");
+    assert_eq!(rig.driver.pid(), None);
+}
+
+/// A load whose file is not the one the profile records is refused by the process as its own kind
+/// of ending: the service holds nothing as downloaded, shows the fetch as not started and counts no
+/// failure of inference, so no restart delay follows and nothing is loaded until the files are
+/// fetched again. The control is the right file at the same place, which loads and describes.
+#[test]
+fn a_load_whose_file_is_not_the_profiles_ends_as_assets_and_is_no_failure() {
+    use kr_describe::service::DownloadProgress;
+
+    let (signed, weights) = tiny();
+    for case in ["right", "wrong", "missing"] {
+        let mut rig = Rig::signed(
+            &Script {
+                verify_on_load: true,
+                ..Script::default()
+            },
+            &signed,
+        );
+        let here = rig
+            .placed
+            .directory("models")
+            .join("tiny-default")
+            .join("1");
+        std::fs::create_dir_all(&here).expect("the model directory");
+        match case {
+            "right" => std::fs::write(here.join("tiny.gguf"), &weights).expect("the file"),
+            "wrong" => std::fs::write(here.join("tiny.gguf"), b"the weights of a tiny molde")
+                .expect("a file"),
+            _ => {}
+        }
+        queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+        let reports = rig.until(&roomy(), at(3_000), "the load's end", |reports, _| {
+            outcomes(reports).iter().any(|outcome| {
+                matches!(outcome, Outcome::Loaded { .. } | Outcome::LoadEnded { .. })
+            })
+        });
+        let refused = outcomes(&reports).iter().any(|outcome| {
+            matches!(
+                outcome,
+                Outcome::LoadEnded {
+                    why: LoadEnd::Assets,
+                    ..
+                }
+            )
+        });
+        assert_eq!(refused, case != "right", "{case}: {reports:?}");
+        assert_eq!(
+            rig.driver.service().inference_restarts(),
+            0,
+            "{case}: a file that is not the profile's is no failure of inference"
+        );
+        assert_eq!(rig.driver.service().restart_not_before_ms(), None, "{case}");
+        assert_eq!(
+            rig.driver.service().assets_held(),
+            case == "right",
+            "{case}"
+        );
+        if case != "right" {
+            assert_eq!(
+                rig.driver.service().setup_state().progress,
+                DownloadProgress::NotStarted,
+                "{case}"
+            );
+            // Nothing is asked of the process again until the files are held.
+            let reports = rig.driver.turn(&roomy(), at(60_000)).expect("a turn");
+            assert!(
+                !outcomes(&reports)
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::LoadEnded { .. })),
+                "{case}: {reports:?}"
+            );
+            assert!(!rig.driver.service().is_loading(), "{case}");
+        }
+    }
 }
 
 /// A cancellation reaches the process during a load and during a decode, and each ends at once

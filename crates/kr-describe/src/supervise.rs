@@ -24,6 +24,11 @@
 //! Nothing here reads a clock for a decision: every turn takes the host's reading, as the service
 //! does, so a timer is tested by the reading a test passes rather than by waiting for it.
 //!
+//! A process started to check a file holds no model: when the check is done, and it has been given
+//! no load and no job, the driver ends it ([`UnloadReason::CheckDone`]), so nothing is left running
+//! for a file that has been checked. A load or a job asked for while a check is in the process is
+//! the host's to avoid, as a host that holds nothing without its files does.
+//!
 //! The process is started with no environment but what the launch names, in the working directory
 //! the launch names, and it is the daemon's own child. Nothing in it outlives the daemon: its input
 //! ends when the daemon does, and its watchdog looks for the daemon by the start identity it is
@@ -218,6 +223,9 @@ struct Running {
     cancel: Option<Cancel>,
     /// The check of a file in the process, when one is.
     check: Option<Due>,
+    /// Whether the process has been given a load or a job. One that has only ever checked a file
+    /// holds no model, and goes when the check is done.
+    worked: bool,
     next_sample_ms: u64,
 }
 
@@ -604,6 +612,19 @@ impl Driver {
                 }
             }
         }
+        // A process that was started only to check a file holds no model, and has nothing to do
+        // once the check is done: it goes, and a load that follows starts another.
+        if self.process.as_ref().is_some_and(|running| {
+            !running.worked
+                && running.work.is_none()
+                && running.check.is_none()
+                && running.cancel.is_none()
+        }) {
+            self.leave(&mut reports);
+            reports.push(Report::Unloaded {
+                why: UnloadReason::CheckDone,
+            });
+        }
         Ok(reports)
     }
 
@@ -721,6 +742,7 @@ impl Driver {
             work: None,
             cancel: None,
             check: None,
+            worked: false,
             next_sample_ms: u64::MAX,
         });
         let hello = Request::Hello {
@@ -779,6 +801,7 @@ impl Driver {
                     .saturating_add(ANSWER_GRACE_MS),
             });
             running.next_sample_ms = now.monotonic_ms().saturating_add(SAMPLE_MS);
+            running.worked = true;
         }
     }
 

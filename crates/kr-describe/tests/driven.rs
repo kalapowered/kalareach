@@ -17,8 +17,8 @@ use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
 };
 use kr_describe::service::{
-    Answered, DescriptionService, Handles, HostPlacement, Instruction, Outcome, ProcessEnd,
-    RESTART_FIRST_MS, RESTART_MOST_MS, UnloadReason, Work,
+    Answered, DescriptionService, DownloadProgress, Handles, HostPlacement, Instruction, Outcome,
+    ProcessEnd, RESTART_FIRST_MS, RESTART_MOST_MS, UnloadReason, Work,
 };
 use kr_describe::store::DescriptionStore;
 use kr_describe::testing::{Output, answer_of, at_next_decision};
@@ -2349,6 +2349,83 @@ fn a_failed_load_a_crash_and_a_failed_job_are_three_failures_in_a_row() {
     service.next(&roomy(), sent).expect("the unload");
     service.next(&roomy(), sent).expect("the wait");
     assert!(inference_failed(&service), "three");
+}
+
+/// A load the process refused because a file is not the profile's counts for nothing against
+/// inference however often it happens: no restart delay and no pause for failures. The service
+/// holds nothing as downloaded afterwards and asks for no load until it is told the files are held
+/// again, and the same answer for any other ending of a load is the control that counts.
+#[test]
+fn a_load_refused_for_its_files_is_no_failure_and_nothing_loads_until_they_are_held_again() {
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let mut now = at(3_000);
+    for round in 1..=4_u64 {
+        let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("an instruction")
+        else {
+            panic!("round {round}: a load comes first");
+        };
+        let outcome = service
+            .finished(
+                id,
+                Answered::LoadEnded {
+                    why: LoadEnd::Assets,
+                    detail: Some("tiny.gguf is not the file the profile records".to_owned()),
+                },
+                now,
+            )
+            .expect("the answer");
+        assert!(matches!(
+            outcome,
+            Outcome::LoadEnded {
+                why: LoadEnd::Assets,
+                ..
+            }
+        ));
+        assert!(!service.assets_held(), "round {round}");
+        assert_eq!(
+            service.setup_state().progress,
+            DownloadProgress::NotStarted,
+            "round {round}"
+        );
+        assert_eq!(service.inference_restarts(), 0, "round {round}");
+        assert_eq!(service.restart_not_before_ms(), None, "round {round}");
+        assert!(!inference_failed(&service), "round {round}");
+        // Nothing is asked for while the files are not held.
+        assert!(
+            matches!(
+                service.next(&roomy(), now.after_ms(10)).expect("a wait"),
+                Instruction::Wait { .. }
+            ),
+            "round {round}"
+        );
+        service.set_assets_held(true);
+        now = now.after_ms(1_000);
+    }
+
+    // The control: the same ending for another reason is a failure, and three are a pause.
+    let mut service = self::service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let mut now = at(3_000);
+    for _ in 0..3 {
+        let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("an instruction")
+        else {
+            panic!("a load comes first");
+        };
+        service
+            .finished(
+                id,
+                Answered::LoadEnded {
+                    why: LoadEnd::Refused,
+                    detail: None,
+                },
+                now,
+            )
+            .expect("the answer");
+        service.next(&roomy(), now.after_ms(10)).expect("a wait");
+        now = now.after_ms(10 * 60 * 1_000);
+    }
+    assert!(inference_failed(&service));
 }
 
 /// Whether the service is paused for repeated failures.

@@ -144,7 +144,7 @@ impl Model for Llama {
                 }
                 Err(error) => {
                     return Loading::Ended {
-                        why: LoadEnd::Refused,
+                        why: LoadEnd::Assets,
                         detail: Some(error.to_string()),
                     };
                 }

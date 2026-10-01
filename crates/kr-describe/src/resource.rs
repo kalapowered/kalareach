@@ -588,6 +588,20 @@ pub mod platform {
             .ok()
     }
 
+    /// The bytes free on the disk that holds `path`, when this host can say: the disk whose mount
+    /// point is the longest prefix of the path as the operating system names it.
+    #[must_use]
+    pub fn free_space(path: &std::path::Path) -> Option<u64> {
+        let path = path.canonicalize().ok()?;
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        disks
+            .list()
+            .iter()
+            .filter(|disk| path.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map(sysinfo::Disk::available_space)
+    }
+
     /// The longest a platform program may take to say what it knows.
     #[cfg(target_os = "macos")]
     const PLATFORM_PROGRAM_BOUND: std::time::Duration = std::time::Duration::from_secs(5);

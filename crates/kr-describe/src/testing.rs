@@ -122,6 +122,9 @@ pub struct Script {
     pub verify_until_cancelled: bool,
     /// How long checking a file sleeps without looking at its token, in milliseconds.
     pub verify_ignore_token_ms: u64,
+    /// Whether a load checks each file of the profile against its recorded size and digest first,
+    /// as the real process does, and ends as [`crate::wire::LoadEnd::Assets`] when one is not it.
+    pub verify_on_load: bool,
     /// Whether the process leaves a file named [`LOADED_PREFIX`] and its identifier in its runtime
     /// directory when a load succeeds, holding the identifier of the profile it loaded.
     pub mark_loads: bool,
@@ -233,6 +236,7 @@ impl Script {
         };
         flag("load-until-cancelled", self.load_until_cancelled);
         flag("verify-until-cancelled", self.verify_until_cancelled);
+        flag("verify-on-load", self.verify_on_load);
         flag("mark-loads", self.mark_loads);
         flag("mark-work", self.mark_work);
         flag("generate-until-cancelled", self.generate_until_cancelled);
@@ -294,6 +298,7 @@ impl Script {
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
                 "verify-until-cancelled" => script.verify_until_cancelled = true,
+                "verify-on-load" => script.verify_on_load = true,
                 "mark-loads" => script.mark_loads = true,
                 "mark-work" => script.mark_work = true,
                 "generate-until-cancelled" => script.generate_until_cancelled = true,
@@ -408,6 +413,16 @@ impl Model for StubModel {
 
     fn load(&mut self, work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
         self.began("load");
+        if self.script.verify_on_load {
+            for placed in work.assets {
+                if let Verifying::Ended { detail, .. } = check_file(&placed.asset, &placed.path) {
+                    return Loading::Ended {
+                        why: crate::wire::LoadEnd::Assets,
+                        detail,
+                    };
+                }
+            }
+        }
         if self.script.load_ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.load_ignore_token_ms));
         }

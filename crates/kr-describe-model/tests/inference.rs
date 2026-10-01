@@ -24,7 +24,8 @@ use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{Driver, Launch, Report};
 use kr_describe::time::Reading;
 use kr_describe::wire::{
-    Answer, AssetFile, JobEnd, JobLimits, Request, WIRE_VERSION, frame_of, read_message,
+    Answer, AssetFile, JobEnd, JobLimits, LoadEnd, Request, VerifyResult, WIRE_VERSION, frame_of,
+    read_message,
 };
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::{U64, Uuid};
@@ -115,6 +116,33 @@ impl Placed {
             );
             return None;
         }
+        Some(Self::with_weights(|placed| {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&cached, placed).expect("the weights");
+            #[cfg(not(unix))]
+            std::fs::hard_link(&cached, placed).expect("the weights");
+        }))
+    }
+
+    /// Places the process with a file at the weights' path that is not the profile's, small enough
+    /// to need no weights on this host.
+    fn wrong_weights() -> Self {
+        Self::with_weights(|placed| {
+            std::fs::write(placed, b"not the weights the profile records").expect("a file");
+        })
+    }
+
+    /// Places the process and the model directory, and has `put` make the file at the weights'
+    /// path.
+    fn with_weights(put: impl FnOnce(&Path)) -> Self {
+        let catalogue = Catalogue::builtin().expect("this build's profiles");
+        let profile = catalogue.default_profile().clone();
+        let weights = profile
+            .assets()
+            .iter()
+            .find(|asset| asset.role == "weights")
+            .expect("the profile names its weights")
+            .clone();
         let directory = tempfile::tempdir().expect("a directory on the internal disk");
         let program = directory.path().join(format!(
             "kr-describe-inference{}",
@@ -132,19 +160,16 @@ impl Placed {
             .join(profile.profile_id())
             .join(profile.revision().get().to_string());
         std::fs::create_dir_all(&placed).expect("the model directory");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&cached, placed.join(&weights.file_name)).expect("the weights");
-        #[cfg(not(unix))]
-        std::fs::hard_link(&cached, placed.join(&weights.file_name)).expect("the weights");
+        put(&placed.join(&weights.file_name));
         let runtime = directory.path().join("runtime");
         std::fs::create_dir_all(&runtime).expect("the runtime directory");
-        Some(Self {
+        Self {
             _directory: directory,
             program,
             models,
             runtime,
             profile,
-        })
+        }
     }
 }
 
@@ -383,6 +408,154 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     );
 
     // Its input ends, and so does it.
+    drop(input);
+    let give_up = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("its status") {
+            break status;
+        }
+        assert!(Instant::now() < give_up, "the process outlived its input");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+}
+
+/// The real process, with no weights on this host at all, says what background class and memory
+/// ceiling it runs under, and refuses a file that is not the profile's as its own kind of answer:
+/// a check of it comes back as a mismatch and a load of it ends as a refusal of its files, which
+/// is no failure of the runtime. A check of a file that is not there is unreadable. The control is
+/// the same process answering a request for a profile its catalogue does not hold, which is a
+/// refusal of another kind. Spoken to over its own pipes, as the daemon's driver speaks to it.
+#[test]
+fn the_real_process_names_its_class_and_refuses_a_file_that_is_not_the_profiles() {
+    let placed = Placed::wrong_weights();
+    let mut child = Command::new(&placed.program)
+        .arg("--runtime-dir")
+        .arg(&placed.runtime)
+        .current_dir(&placed.runtime)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("the description process starts");
+    let mut input = child.stdin.take().expect("its input");
+    let mut output = child.stdout.take().expect("its output");
+    let (tell, answers) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(Some(answer)) = read_message::<Answer>(&mut output) {
+            if tell.send(answer).is_err() {
+                return;
+            }
+        }
+    });
+    let mut send = |request: &Request| {
+        let frame = frame_of(request).expect("a request frames");
+        input
+            .write_all(&frame)
+            .and_then(|()| input.flush())
+            .expect("the request is written");
+    };
+
+    send(&Request::Hello {
+        build: "kr-describe-tests/0".to_owned(),
+        wire: U64::new(WIRE_VERSION),
+    });
+    let ready = answers.recv_timeout(Duration::from_secs(120));
+    let Ok(Answer::Ready {
+        background,
+        ceiling,
+        target,
+        ..
+    }) = ready
+    else {
+        panic!("waited 120 s for ready after hello, and saw {ready:?}");
+    };
+    assert_eq!(target, build_target());
+    assert!(!background.mechanism.is_empty(), "{background:?}");
+    assert!(!ceiling.is_empty());
+
+    let profile = &placed.profile;
+    let weights = profile
+        .assets()
+        .iter()
+        .find(|asset| asset.role == "weights")
+        .expect("the profile names its weights");
+    let directory = placed
+        .models
+        .join(profile.profile_id())
+        .join(profile.revision().get().to_string());
+    let path = directory.join(&weights.file_name);
+
+    send(&Request::Verify {
+        id: U64::new(1),
+        profile_id: profile.profile_id().to_owned(),
+        revision: U64::new(profile.revision().get()),
+        file_name: weights.file_name.clone(),
+        path: path.to_string_lossy().into_owned(),
+        deadline_ms: U64::new(60_000),
+    });
+    let checked = answers.recv_timeout(Duration::from_secs(60));
+    assert!(
+        matches!(
+            &checked,
+            Ok(Answer::Verified { id, result: VerifyResult::Mismatch, .. }) if id.get() == 1
+        ),
+        "a file that is not the profile's is a mismatch: {checked:?}"
+    );
+    send(&Request::Verify {
+        id: U64::new(2),
+        profile_id: profile.profile_id().to_owned(),
+        revision: U64::new(profile.revision().get()),
+        file_name: weights.file_name.clone(),
+        path: directory.join("absent.gguf").to_string_lossy().into_owned(),
+        deadline_ms: U64::new(60_000),
+    });
+    let absent = answers.recv_timeout(Duration::from_secs(60));
+    assert!(
+        matches!(
+            &absent,
+            Ok(Answer::Verified { id, result: VerifyResult::Unreadable, .. }) if id.get() == 2
+        ),
+        "a file that is not there cannot be read: {absent:?}"
+    );
+
+    let load = |id: u64, profile_id: &str| Request::Load {
+        id: U64::new(id),
+        profile_id: profile_id.to_owned(),
+        revision: U64::new(profile.revision().get()),
+        assets: profile
+            .assets()
+            .iter()
+            .map(|asset| AssetFile {
+                file_name: asset.file_name.clone(),
+                path: directory
+                    .join(&asset.file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect(),
+        deadline_ms: U64::new(60_000),
+    };
+    send(&load(3, profile.profile_id()));
+    let loaded = answers.recv_timeout(Duration::from_secs(60));
+    assert!(
+        matches!(
+            &loaded,
+            Ok(Answer::LoadEnded { id, why: LoadEnd::Assets, .. }) if id.get() == 3
+        ),
+        "a load of a file that is not the profile's is refused for its files: {loaded:?}"
+    );
+    send(&load(4, "a-profile-this-catalogue-does-not-hold"));
+    let unknown = answers.recv_timeout(Duration::from_secs(60));
+    assert!(
+        matches!(
+            &unknown,
+            Ok(Answer::LoadEnded { id, why: LoadEnd::Refused, .. }) if id.get() == 4
+        ),
+        "a profile it does not hold is another kind of refusal: {unknown:?}"
+    );
+
     drop(input);
     let give_up = Instant::now() + Duration::from_secs(10);
     let status = loop {
