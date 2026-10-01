@@ -90,7 +90,7 @@ import { AttachmentPicker } from '../components/picker'
 import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
-import { putBack, restOn, type Positions } from '../model/keyboard'
+import { putBack, restOn, type Position } from '../model/keyboard'
 import { admit, describeBytes, type Picked } from '../model/media'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
@@ -453,7 +453,7 @@ export function MobileSession({
     // The keyboard's height the composer's extra lift was worked out for.
     let liftedFor = 0
     let settleTimer = 0
-    const moved: Positions = new Map()
+    const moved: Position = { area: null, top: 0 }
     const cover = (again = true) => {
       const style = getComputedStyle(root)
       const covered = parseFloat(style.getPropertyValue('--keyboard')) || 0
@@ -478,10 +478,17 @@ export function MobileSession({
         if (covered === 0) putBack(moved)
       }
       const typing = document.activeElement
-      if (covered > 0 && shell !== null && typing instanceof HTMLElement && typing.closest('.m-composer') !== null) {
+      const scroller = element.closest<HTMLElement>('.m-main')
+      if (
+        covered > 0 &&
+        shell !== null &&
+        scroller !== null &&
+        typing instanceof HTMLElement &&
+        typing.closest('.m-composer') !== null
+      ) {
         let more = parseFloat(element.style.getPropertyValue('--lift-more')) || 0
         for (let pass = 0; pass < 4; pass += 1) {
-          const off = restOn(typing, edge - covered, shell, moved)
+          const off = restOn(typing, edge - covered, scroller, moved)
           if (Math.abs(off) <= 0.5 || (off < 0 && more === 0)) break
           more = Math.max(0, more + off)
           element.style.setProperty('--lift-more', `${more}px`)
@@ -507,6 +514,8 @@ export function MobileSession({
     document.addEventListener('focusin', onResize)
     return () => {
       window.clearTimeout(settleTimer)
+      // The shell's scrolling area outlives the session: it is left where the destination expects it.
+      putBack(moved)
       resized?.disconnect()
       written.disconnect()
       window.removeEventListener('resize', onResize)
