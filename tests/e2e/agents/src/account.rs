@@ -37,6 +37,8 @@ pub struct Ledger {
     path: PathBuf,
     budget: String,
     limit: u64,
+    /// How many turns this process has charged, however many clones of the ledger charged them.
+    charged: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Ledger {
@@ -58,7 +60,42 @@ impl Ledger {
             path,
             budget: budget.to_owned(),
             limit,
+            charged: std::sync::Arc::default(),
         }
+    }
+
+    /// How many turns this run has charged so far.
+    #[must_use]
+    pub fn charged_here(&self) -> u64 {
+        self.charged.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Charges `count` turns that were found to have been spent without a charge, beyond the limit
+    /// where need be: the ledger then says what was spent.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the ledger could not be written.
+    pub fn charge_found(&self, part: &str, what: &str, count: u64) -> Result<u64, String> {
+        let _lock = LedgerLock::take(&self.path)?;
+        let mut ledger = read_ledger(&self.path)?;
+        let mut entries = ledger["budgets"][&self.budget]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for _ in 0..count {
+            entries.push(json!({ "at_ms": now_ms(), "part": part, "what": what }));
+        }
+        let total = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        ledger["budgets"][&self.budget] = Value::Array(entries);
+        let next = self.path.with_extension("next");
+        std::fs::write(
+            &next,
+            serde_json::to_vec_pretty(&ledger).expect("the ledger is JSON"),
+        )
+        .and_then(|()| std::fs::rename(&next, &self.path))
+        .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
+        Ok(total)
     }
 
     /// The turns charged to the budget so far.
@@ -112,6 +149,8 @@ impl Ledger {
         )
         .and_then(|()| std::fs::rename(&next, &self.path))
         .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
+        self.charged
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(spent + 1)
     }
 }
@@ -1337,12 +1376,14 @@ mod tests {
             path: path.clone(),
             budget: "agent".to_owned(),
             limit: 2,
+            charged: std::sync::Arc::default(),
         };
         assert_eq!(ledger.charge("1", "first"), Ok(1));
         let again = Ledger {
             path,
             budget: "agent".to_owned(),
             limit: 2,
+            charged: std::sync::Arc::default(),
         };
         assert_eq!(again.charge("1", "second"), Ok(2));
         assert!(
@@ -1358,6 +1399,38 @@ mod tests {
     }
 
     #[test]
+    fn the_turns_a_run_charged_are_counted_and_those_found_spent_are_charged_beyond_the_limit() {
+        let scratch = Scratch::new("found");
+        let ledger = Ledger {
+            path: scratch.0.join("turns.json"),
+            budget: "agent".to_owned(),
+            limit: 2,
+            charged: std::sync::Arc::default(),
+        };
+        let clone = ledger.clone();
+        assert_eq!(ledger.charged_here(), 0);
+        assert_eq!(clone.charge("1", "first"), Ok(1));
+        assert!(ledger.charge("1", "second").is_ok());
+        assert!(ledger.charge("1", "third").is_err());
+        assert_eq!(
+            ledger.charged_here(),
+            2,
+            "clones share one count; a refusal is none"
+        );
+        assert_eq!(ledger.charge_found("1", "found in the record", 2), Ok(4));
+        assert_eq!(
+            ledger.spent(),
+            Ok(4),
+            "the ledger says what was spent, over the limit"
+        );
+        assert_eq!(
+            ledger.charged_here(),
+            2,
+            "what was found was not charged by the run"
+        );
+    }
+
+    #[test]
     fn an_unreadable_ledger_is_neither_charged_nor_counted_as_empty() {
         let scratch = Scratch::new("unreadable");
         let path = scratch.0.join("turns.json");
@@ -1366,6 +1439,7 @@ mod tests {
             path: path.clone(),
             budget: "agent".to_owned(),
             limit: 2,
+            charged: std::sync::Arc::default(),
         };
         assert!(ledger.spent().is_err(), "a broken ledger has no count");
         assert!(

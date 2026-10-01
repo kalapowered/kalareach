@@ -287,6 +287,8 @@ struct Seen {
     /// with its command line, whatever became of reading its image: the run's close requires each
     /// ended.
     identified: BTreeMap<ProcessStartIdentity, String>,
+    /// The first process found whose command line names a word the part forbids.
+    forbidden: Option<String>,
 }
 
 /// The processes a look has published, and whether the part has been halted.
@@ -311,6 +313,9 @@ pub struct Provenance {
     cleared_required: AtomicBool,
     seen_path: Mutex<Option<String>>,
     seen: Mutex<Seen>,
+    /// The words no command line beneath the sessions may name, each a whole word of it, compared
+    /// without regard to case: the names of the servers a confined agent must start none of.
+    forbidden_words: Mutex<Vec<String>>,
     roots: Mutex<Vec<ProcessStartIdentity>>,
     /// Every process a look found beneath the sessions, published the moment the look takes it as
     /// theirs, under a lock of its own that is held only to read or extend it: what a stop reads
@@ -393,6 +398,7 @@ impl Provenance {
             cleared_required: AtomicBool::new(false),
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
+            forbidden_words: Mutex::new(Vec::new()),
             roots: Mutex::new(Vec::new()),
             published: Mutex::new(Published::default()),
             stopped: AtomicBool::new(false),
@@ -728,6 +734,27 @@ impl Provenance {
         }
     }
 
+    /// Sets the words no command line beneath the sessions may name: a process whose command line
+    /// holds one as a whole word is found by the next look, and [`Provenance::forbidden_found`]
+    /// says so.
+    pub fn forbid_words(&self, words: Vec<String>) {
+        *self
+            .forbidden_words
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = words;
+    }
+
+    /// What the looks found of the forbidden words: the first process whose command line named one,
+    /// by its number and the word's place in the list, never the word.
+    #[must_use]
+    pub fn forbidden_found(&self) -> Option<String> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forbidden
+            .clone()
+    }
+
     /// Every process a look found beneath the sessions and took as theirs, with its command line,
     /// for the run's closing check to find ended.
     #[must_use]
@@ -962,6 +989,22 @@ impl Provenance {
                 return;
             }
         };
+        let words = self
+            .forbidden_words
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for (identity, command) in &found {
+            if seen.forbidden.is_none()
+                && let Some(place) = names_a_word(command, &words)
+            {
+                seen.forbidden = Some(format!(
+                    "process {} runs a command line that names forbidden word {place} of {}",
+                    identity.pid.get(),
+                    words.len()
+                ));
+            }
+        }
         for (identity, command) in found {
             let mapping = mapping_of(&mappings, &identity);
             match self.inspect(&mut seen, &identity, &command, mapping) {
@@ -1054,6 +1097,23 @@ impl Drop for StopSampling<'_> {
 }
 
 /// Keeps the first problem.
+/// The place in `words` of the first that `command` holds as a whole word, compared without regard
+/// to case: with no letter or digit on either side of it, so `dtt-mcp` and `dtt/mcp` hold `dtt`
+/// and `dttx` does not.
+fn names_a_word(command: &str, words: &[String]) -> Option<usize> {
+    let command = command.to_lowercase();
+    words.iter().position(|word| {
+        let word = word.to_lowercase();
+        !word.is_empty()
+            && command.match_indices(word.as_str()).any(|(at, found)| {
+                let before = command[..at].chars().next_back();
+                let after = command[at + found.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
+            })
+    })
+}
+
 fn problem(seen: &mut Seen, why: String) {
     if seen.problem.is_none() {
         seen.problem = Some(why);
@@ -1299,6 +1359,26 @@ mod tests {
 
     /// A process's first file is its executable even when `lsof` gives it no name: a later
     /// mapping never takes its place, so what the process runs is not established.
+    #[test]
+    fn a_command_line_names_a_forbidden_word_only_as_a_whole_word() {
+        let words = vec!["pushary".to_owned(), "dtt".to_owned()];
+        assert_eq!(
+            names_a_word("/usr/bin/node /x/dtt-mcp serve", &words),
+            Some(1)
+        );
+        assert_eq!(names_a_word("node /x/dttx/mcp serve", &words), None);
+        assert_eq!(names_a_word("node /x/dtt/mcp serve", &words), Some(1));
+        assert_eq!(
+            names_a_word("run my-server now", &["my-server".to_owned()]),
+            Some(0)
+        );
+        assert_eq!(names_a_word("npx -y Pushary --stdio", &words), Some(0));
+        assert_eq!(names_a_word("kimi-code", &words), None);
+        assert_eq!(names_a_word("echo hi > /tmp/work/a", &words), None);
+        assert_eq!(names_a_word("echo dtt", &[]), None);
+        assert_eq!(names_a_word("echo dtt", &[String::new()]), None);
+    }
+
     #[test]
     fn a_first_file_without_a_name_is_kept_as_the_unnamed_executable() {
         let text = "p42\nftxt\nD0x1000012\ni7\nftxt\nD0x1000012\ni8\nn/usr/lib/dyld\n";

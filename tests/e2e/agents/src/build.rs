@@ -442,6 +442,10 @@ pub struct Confinement {
     /// Where the person's servers are named and where the project's file that switches them off
     /// goes.
     pub servers: ProjectServers,
+    /// The names the agent's processes go by in the process table, in either of its columns (the
+    /// program's own name, and the title the agent gives itself): a process of the person's with
+    /// one of them is another writer of the data directory.
+    pub process_names: Vec<String>,
     /// The tools the agent's own default policy approves without asking, recorded with the run.
     pub unasked_tools: Vec<String>,
     /// Paths in the data directory whose rewrite is only reported, relative to it: the agent's
@@ -990,7 +994,7 @@ mod tests {
                 "hosts": ["api.example"], "proxy_variables": ["HTTPS_PROXY"],
                 "provider": "providers.x",
                 "servers": {"source": "mcp.json", "member": "servers", "file": ".agent/mcp.json", "entry": {}},
-                "unasked_tools": [], "reported": reported,
+                "process_names": ["agent"], "unasked_tools": [], "reported": reported,
             }))
             .expect("a confinement")
         };

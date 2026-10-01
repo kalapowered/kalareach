@@ -100,10 +100,23 @@ const GUARD_CHANGED: &str = "the part's guards found what stops it:";
 /// What a guard says of a subagent's start, which the part's turn ledger cannot count.
 const SUBAGENT_STARTED: &str = "a subagent started:";
 
+/// What a guard says of a process beneath the agent that the isolation was to prevent.
+const TREE_BROKEN: &str = "a process beneath the agent broke its isolation:";
+
+/// Why the part stops, where a look at the processes beneath the agent found one whose command line
+/// names a server of the person's.
+fn tree_broken(provenance: &Provenance) -> Option<String> {
+    provenance
+        .forbidden_found()
+        .map(|why| format!("{TREE_BROKEN} {why}"))
+}
+
 /// The class a guard's text stops the agent for.
 fn guard_class(what: &str) -> &'static str {
     if what.contains(SUBAGENT_STARTED) {
         "subagent_started"
+    } else if what.contains(TREE_BROKEN) {
+        "isolation_not_established"
     } else {
         "guarded_file_changed"
     }
@@ -188,6 +201,15 @@ struct Guards {
     /// The run's directory of sessions in the person's data directory, where a subagent's start
     /// stops the part: its requests to the model are not turns the ledger counts.
     subagents: Option<PathBuf>,
+    /// The names the agent's processes go by in the process table, and whether a process of one of
+    /// them that is not the part's own was seen while it ran: whatever it wrote to the person's
+    /// data directory is not the part's, so nothing is put back over it.
+    agent_names: Vec<String>,
+    other_writer: std::sync::atomic::AtomicBool,
+    /// The person's data directory, where the login's files are read again at each look, and every
+    /// string they held at any look: the agent may refresh its token more than once while it runs.
+    login_data: Option<PathBuf>,
+    login_seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// When the files were last read.
     read_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// What changed, once a look found a change: the part stops on it.
@@ -228,6 +250,8 @@ impl Guards {
     /// part's mark or the run's directory), a line that was there in a file only appended to, or
     /// a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
+        self.note_login_strings();
+        self.note_other_writers();
         let now = match guarded_files(&self.home, &self.files, needles) {
             Ok(now) => now,
             Err(why) => return Some(why),
@@ -305,6 +329,39 @@ impl Guards {
                 None
             }
         })
+    }
+
+    /// Keeps every string the login's files hold now, for the search after the part.
+    fn note_login_strings(&self) {
+        let Some(data) = &self.login_data else {
+            return;
+        };
+        if let Ok(strings) = confine::login_strings(data)
+            && let Ok(mut seen) = self.login_seen.lock()
+        {
+            seen.extend(strings);
+        }
+    }
+
+    /// Notes a process of the agent's name that is not one of the part's own: any process of that
+    /// name when the process table cannot be read, since none can then be ruled out.
+    fn note_other_writers(&self) {
+        if self.agent_names.is_empty() {
+            return;
+        }
+        let own: Vec<u64> = self
+            .agents
+            .lock()
+            .map(|agents| agents.iter().map(|identity| identity.pid.get()).collect())
+            .unwrap_or_default();
+        let other = match agent_processes(&self.agent_names) {
+            Ok(pids) => pids.into_iter().any(|pid| !own.contains(&u64::from(pid))),
+            Err(_) => true,
+        };
+        if other {
+            self.other_writer
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// What a look has found changed, once one has.
@@ -411,7 +468,7 @@ const GUARD_WATCH: Duration = Duration::from_millis(250);
 /// and its outcome says so.
 fn watch_guards(guards: &Guards, run: &Run, provenance: &Provenance, needles: &[&str]) {
     while guards.watching.load(std::sync::atomic::Ordering::SeqCst) {
-        if let Some(what) = guards.change(needles) {
+        if let Some(what) = guards.change(needles).or_else(|| tree_broken(provenance)) {
             guards.trip(what, run, provenance);
             return;
         }
@@ -614,7 +671,10 @@ fn guards_hold(stage: &Stage<'_, '_>) {
         panic!("{GUARD_CHANGED} {what}");
     }
     let root = stage.run.root().display().to_string();
-    if let Some(what) = guards.change(&[stage.mark, root.as_str()]) {
+    if let Some(what) = guards
+        .change(&[stage.mark, root.as_str()])
+        .or_else(|| tree_broken(stage.provenance))
+    {
         // Whichever look sees a change first ends what the part started, before the part stops.
         guards.trip(what.clone(), stage.run, stage.provenance);
         panic!("{GUARD_CHANGED} {what}");
@@ -664,16 +724,16 @@ impl Ending {
     }
 }
 
-/// The name of a process of the person's that runs the agent's own program, where the agent is
-/// confined and shares its data directory with them: the guards would take its writes for the
-/// agent's, and the workspace list could not be restored without losing them.
+/// The numbers of the processes whose name, in either column of the process table (the program's own
+/// name and the title it gave itself), is one of `names`. The agent renames itself, so the program's
+/// name alone would miss it.
 ///
 /// # Errors
 ///
 /// Returns why the process list could not be read: the answer is then not "none".
-fn other_agent_running(command: &str) -> Result<Option<String>, String> {
+fn agent_processes(names: &[String]) -> Result<Vec<u32>, String> {
     let listing = std::process::Command::new("/bin/ps")
-        .args(["-axo", "comm="])
+        .args(["-axo", "pid=,ucomm=,comm="])
         .output()
         .map_err(|error| format!("the process list cannot be read: {error}"))?;
     if !listing.status.success() {
@@ -682,11 +742,28 @@ fn other_agent_running(command: &str) -> Result<Option<String>, String> {
             listing.status
         ));
     }
-    Ok(String::from_utf8_lossy(&listing.stdout)
+    Ok(agent_pids_in(
+        &String::from_utf8_lossy(&listing.stdout),
+        names,
+    ))
+}
+
+/// The numbers `agent_processes` takes from `listing`, the lines of `ps -axo pid=,ucomm=,comm=`.
+fn agent_pids_in(listing: &str, names: &[String]) -> Vec<u32> {
+    listing
         .lines()
-        .map(str::trim)
-        .find(|line| line.rsplit('/').next() == Some(command))
-        .map(str::to_owned))
+        .filter_map(|line| {
+            let (pid, rest) = line.trim().split_once(' ')?;
+            let pid = pid.parse::<u32>().ok()?;
+            rest.split_whitespace()
+                .any(|word| {
+                    names
+                        .iter()
+                        .any(|name| word == name || word.rsplit('/').next() == Some(name.as_str()))
+                })
+                .then_some(pid)
+        })
+        .collect()
 }
 
 /// The run's folder as the agent sees it: its resolved path.
@@ -720,7 +797,18 @@ fn layout_of(stage: &Stage<'_, '_>) -> Layout {
         bucket: resolved(login.person_home.join(&confinement.data))
             .join("sessions")
             .join(confine::workdir_key(&folder_of(stage.run))),
-        person: resolved(login.person_home.clone()),
+        history: resolved(login.person_home.join(&confinement.data))
+            .join("user-history")
+            .join(
+                confine::md5_hex(&folder_of(stage.run).display().to_string()).unwrap_or_else(
+                    |why| {
+                        panic!("{ISOLATION_UNPROVEN} the name of the run's prompt history: {why}")
+                    },
+                ),
+            ),
+        file_history: resolved(login.person_home.join(&confinement.data))
+            .join("file-history")
+            .join(confine::workdir_key(&folder_of(stage.run))),
         slot: setup.slot.clone(),
         proxy_port: login.proxy.as_ref().expect("the run's proxy").port(),
     }
@@ -839,6 +927,8 @@ struct Searched {
     login_unread: Option<String>,
     /// What shows that the agent started a subagent, where anything does.
     subagent: Option<String>,
+    /// The prompts the agent's own record holds, by who made them, or why they could not be counted.
+    wire: Result<confine::WirePrompts, String>,
 }
 
 /// Before a confined part's cleanup, once what it started has ended where it has: the strings of the
@@ -847,7 +937,7 @@ struct Searched {
 /// data directory the agent writes the run's work to: the run's sessions (the wire files), the
 /// run's history and the logs and indexes and every path the build list reports. The run's
 /// sessions are also searched for a subagent's start. Nothing of a string is printed.
-fn confine_scan(login: &Login, root: &Path) -> Option<Searched> {
+fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<Searched> {
     let (Some(confinement), Some(setup)) = (&login.account.confinement, &login.setup) else {
         return None;
     };
@@ -855,9 +945,14 @@ fn confine_scan(login: &Login, root: &Path) -> Option<Searched> {
     let folder = root.join("w");
     let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
     let bucket = data.join("sessions").join(confine::workdir_key(&folder));
+    // The strings read before the part, every string the login's files held at any look while it
+    // ran, and those they hold now.
     let mut values = setup.secrets.clone();
     let mut login_unread = None;
-    match confine::current_secrets(&data, &setup.slot) {
+    if let Some(seen) = guards.and_then(|guards| guards.login_seen.lock().ok()) {
+        values.extend(seen.iter().cloned());
+    }
+    match confine::login_strings(&data) {
         Ok(now) => values.extend(now),
         Err(why) => login_unread = Some(why),
     }
@@ -867,6 +962,8 @@ fn confine_scan(login: &Login, root: &Path) -> Option<Searched> {
     let mut places: Vec<PathBuf> = vec![
         bucket.clone(),
         data.join("user-history"),
+        data.join("file-history"),
+        data.join("logs"),
         data.join("workspaces.json"),
     ];
     places.extend(
@@ -907,6 +1004,7 @@ fn confine_scan(login: &Login, root: &Path) -> Option<Searched> {
         complete,
         login_unread,
         subagent: confine::subagent_started(&bucket),
+        wire: confine::wire_prompts(&bucket),
     })
 }
 
@@ -919,8 +1017,8 @@ fn confine_scan(login: &Login, root: &Path) -> Option<Searched> {
 fn confine_close(
     login: &Login,
     guards: Option<&Guards>,
-    root: &Path,
-    (command, ended): (&str, bool),
+    (part, root): (&str, &Path),
+    ended: bool,
     searched: Option<&Searched>,
 ) -> (serde_json::Value, Vec<(&'static str, String)>) {
     let (Some(confinement), Some(setup), Some(proxy), Some(searched)) = (
@@ -966,13 +1064,23 @@ fn confine_close(
                 confine::workspaces_verdict(&workspaces.before, &now, &workspaces.folder)
             });
             // The copy is put back only where nothing else could have written the list: the run's
-            // processes ended, and no process of the agent runs at all, since the change that is
-            // not the run's folder may be that one's, and the copy would erase it.
+            // processes ended, no process of the agent's name other than the run's was seen while
+            // it ran, and none runs now, since a change that is not the run's folder may be that
+            // one's, and the copy would erase it.
             let mut restored = false;
             let mut kept = "it could not be put back";
             if verdict.is_err() {
-                match (ended, other_agent_running(command)) {
-                    (true, Ok(None)) => {
+                let other_seen = guards.is_some_and(|guards| {
+                    guards
+                        .other_writer
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                });
+                match (
+                    ended,
+                    other_seen,
+                    agent_processes(&confinement.process_names),
+                ) {
+                    (true, false, Ok(pids)) if pids.is_empty() => {
                         let temporary = path.with_extension("json.kr-restore");
                         restored = write_private_file(&temporary, workspaces.before.as_bytes())
                             .and_then(|()| std::fs::rename(&temporary, &path))
@@ -984,15 +1092,15 @@ fn confine_close(
                             kept = "the copy taken before the part was put back";
                         }
                     }
-                    (true, Ok(Some(_))) => {
-                        kept = "it was not put back, since a process of the agent runs that may \
-                                have written it";
+                    (true, true, _) | (true, false, Ok(_)) => {
+                        kept = "it was not put back, since a process of the agent that is not \
+                                the run's ran, or may have, and may have written it";
                     }
-                    (true, Err(_)) => {
+                    (true, false, Err(_)) => {
                         kept = "it was not put back, since whether a process of the agent runs \
                                 could not be told";
                     }
-                    (false, _) => {
+                    (false, _, _) => {
                         kept = "it was not put back, since something the part started still runs";
                     }
                 }
@@ -1030,6 +1138,45 @@ fn confine_close(
             ),
         ));
     }
+    // Every prompt the agent's own record holds is a request to its model: those the part submitted
+    // were charged before they were typed, so the record holds no more, and none of another origin.
+    let charged = login.ledger.charged_here();
+    let turns = match &searched.wire {
+        Ok(wire) => {
+            let found = wire.user + wire.steers + wire.other;
+            if wire.other > 0 || found > charged {
+                let surplus = found.saturating_sub(charged);
+                let ledger_says = login
+                    .ledger
+                    .charge_found(
+                        part,
+                        "a prompt in the agent's record that the part did not charge",
+                        surplus,
+                    )
+                    .map_or_else(
+                        |why| format!("the ledger could not be written: {why}"),
+                        |total| format!("the ledger now says {total} spent"),
+                    );
+                stop.push((
+                    "uncharged_turns",
+                    format!(
+                        "the agent's record holds {} prompt(s) the part typed, {} steering, and {} of \
+                         another origin, against {charged} turn(s) charged; {surplus} charged now \
+                         ({ledger_says})",
+                        wire.user, wire.steers, wire.other
+                    ),
+                ));
+            }
+            json!({ "charged": charged, "prompts": wire.user, "steers": wire.steers, "others": wire.other })
+        }
+        Err(why) => {
+            stop.push((
+                "uncharged_turns",
+                format!("the prompts in the agent's record could not be counted: {why}"),
+            ));
+            json!({ "charged": charged })
+        }
+    };
     if let Some(why) = &searched.subagent {
         stop.push((
             "subagent_started",
@@ -1040,6 +1187,7 @@ fn confine_close(
     if !names.is_empty() {
         eprintln!("the proxy refused, in order: {}", names.join("; "));
     }
+    proxy.settle(Duration::from_secs(3));
     let tunnels = proxy.tunnels();
     for tunnel in &tunnels {
         eprintln!(
@@ -1100,6 +1248,7 @@ fn confine_close(
             "workspaces": workspaces.map(|(additive, restored)| json!({ "additive": additive, "restored": restored })),
             "secrets": { "strings": searched.strings, "found_in_run": searched.in_run, "found_in_data": searched.in_data, "places_in_data": searched.places, "complete": searched.complete },
             "subagent_started": searched.subagent.is_some(),
+            "turns": turns,
             "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
         }),
         stop,
@@ -1282,7 +1431,9 @@ fn confine_checks(stage: &Stage<'_, '_>, logged: &mut Logged) {
             8,
             &format!("'{}' --version >/dev/null 2>&1", person_copy.display()),
         );
-        Some(status == 126 || status == 1)
+        // The shell's own status for a program the kernel refused to run; a program that ran and
+        // failed would give another.
+        Some(status == 126)
     } else {
         None
     };
@@ -1484,11 +1635,12 @@ fn staged(
         // use, what its configuration sets, and which servers it names. Its other logins join the
         // files that may not change, and the one in use those whose change is only recorded.
         let setup = account.confinement.clone().map(|confinement| {
-            match other_agent_running(&inputs.build.command) {
-                Ok(None) => {}
-                Ok(Some(name)) => panic!(
-                    "part {part} does not start: a process of the person's own runs {name}, which \
-                     shares the data directory the part guards"
+            match agent_processes(&confinement.process_names) {
+                Ok(pids) if pids.is_empty() => {}
+                Ok(pids) => panic!(
+                    "part {part} does not start: {} process(es) of the person's own run the agent, \
+                     which shares the data directory the part guards",
+                    pids.len()
                 ),
                 Err(why) => panic!(
                     "{ISOLATION_UNPROVEN} {why}, so whether a process of the person's own runs the \
@@ -1620,6 +1772,19 @@ fn staged(
             shared: login.account.shared.clone(),
             append_only: lines.clone(),
             workspaces,
+            agent_names: login
+                .account
+                .confinement
+                .as_ref()
+                .map(|confinement| confinement.process_names.clone())
+                .unwrap_or_default(),
+            other_writer: std::sync::atomic::AtomicBool::new(false),
+            login_data: login
+                .account
+                .confinement
+                .as_ref()
+                .map(|confinement| login.person_home.join(&confinement.data)),
+            login_seen: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             subagents: login.account.confinement.as_ref().map(|confinement| {
                 let folder = std::fs::canonicalize(run.work()).unwrap_or_else(|error| {
                     panic!("the run's folder as the system names it: {error}")
@@ -1638,6 +1803,11 @@ fn staged(
             stopped: std::sync::Mutex::new(None),
         });
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
+    // A process beneath a confined agent whose command line names one of the person's servers is
+    // one the part's isolation was to prevent.
+    if let Some(setup) = login.as_ref().and_then(|login| login.setup.as_ref()) {
+        provenance.forbid_words(setup.servers.clone());
+    }
     if needs_login {
         provenance.require_cleared();
     }
@@ -1697,7 +1867,9 @@ fn staged(
     };
     // The search for the login's strings and for a subagent's start comes before anything is
     // cleaned up, so what the cleanup removes was searched.
-    let searched = login.as_ref().and_then(|login| confine_scan(login, &root));
+    let searched = login
+        .as_ref()
+        .and_then(|login| confine_scan(login, guards.as_ref(), &root));
     let removable: Vec<PathBuf> = login
         .as_ref()
         .map(|login| {
@@ -1740,8 +1912,8 @@ fn staged(
                 confine_close(
                     login,
                     guards.as_ref(),
-                    &root,
-                    (&inputs.build.command, writers.is_ok()),
+                    (part, &root),
+                    writers.is_ok(),
                     searched.as_ref(),
                 )
             });
@@ -3056,6 +3228,22 @@ impl Logged {
         // Keys that arrive together can be read as one paste, whose line end is text and not a
         // submission, so the submission follows on its own.
         std::thread::sleep(Duration::from_millis(300));
+        // The key that submits also answers a dialog: on one the agent raised meanwhile it picks the
+        // choice shown first, which may approve a command or change the agent's mode. So the screen
+        // is read once more, and a dialog on it is refused and fails the part before the key goes.
+        self.screen.pump(stage, Duration::from_millis(50));
+        let rows = self.screen.view.rows();
+        let account = login.account();
+        if let Some(shown) = Self::dialogs(account)
+            .into_iter()
+            .find(|needle| rows.iter().any(|row| row.contains(needle)))
+        {
+            self.refuse(stage, shown, "a dialog where the part was about to submit");
+            panic!(
+                "a dialog showing {shown:?} was on the screen where the part was about to submit, \
+                 so the key that submits was not sent"
+            );
+        }
         self.type_text(stage, key);
     }
 
@@ -6313,20 +6501,29 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
                 &account.prompt_line,
                 stage.conversations_before,
             );
+            // The agent's record can come a moment after its dialog does: it is read again, up to
+            // three seconds, before the request is taken as not the part's.
             let named = found
                 .ok_or_else(|| "the part's conversation is not found".to_owned())
                 .and_then(|conversation| {
-                    let text = std::fs::read_to_string(&conversation)
-                        .map_err(|error| format!("the conversation cannot be read: {error}"))?;
-                    let prompt_at =
-                        first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
-                    kr_e2e_agents::conversation::request_names(
-                        &text,
-                        prompt_at,
-                        request,
-                        &command,
-                        &folder_of(stage.run).display().to_string(),
-                    )
+                    let started = std::time::Instant::now();
+                    loop {
+                        let text = std::fs::read_to_string(&conversation)
+                            .map_err(|error| format!("the conversation cannot be read: {error}"))?;
+                        let prompt_at =
+                            first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
+                        let named = kr_e2e_agents::conversation::request_names(
+                            &text,
+                            prompt_at,
+                            request,
+                            &command,
+                            &folder_of(stage.run).display().to_string(),
+                        );
+                        if named.is_ok() || started.elapsed() >= Duration::from_secs(3) {
+                            return named;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 });
             if let Err(why) = named {
                 // The dialog is still open: refused, and the part fails on why.
@@ -7267,6 +7464,23 @@ fn a_conversation_search_skips_only_files_unchanged_since_before_the_agent_start
 
 /// A default keychain is said by its kind, compared as a path: a name that only begins like the
 /// login keychain's is another keychain, and no name is said.
+/// The agent renames itself: the program is `kimi` and the table's other column shows the title it
+/// gave itself, `kimi-code`. A process of either name is the agent's, wherever its file is.
+#[test]
+fn a_process_of_the_agent_is_found_by_the_program_s_name_or_the_title_it_gave_itself() {
+    let names = ["kimi".to_owned(), "kimi-code".to_owned()];
+    // The shape of the rows of a real listing (`ps -axo pid=,ucomm=,comm=`) while the agent ran: the
+    // agent's own row, the system's, and one with a path.
+    let listing = " 4907 kimi             kimi-code\n 4829 zsh              /bin/zsh\n\
+                    \u{20}  77 kimi             /Users/someone/.kimi-code/bin/kimi\n\
+                    \u{20} 880 kimi-code-helper  kimi-code-helper\n\
+                    \u{20} 901 bash             /bin/bash\n";
+    assert_eq!(agent_pids_in(listing, &names), vec![4907, 77]);
+    assert_eq!(agent_pids_in("", &names), Vec::<u32>::new());
+    assert_eq!(agent_pids_in("not a listing\n", &names), Vec::<u32>::new());
+    assert!(agent_processes(&["no-such-program-kr".to_owned()]).is_ok_and(|pids| pids.is_empty()));
+}
+
 #[test]
 fn a_default_keychain_is_said_by_its_kind_compared_as_a_path() {
     let home = Path::new("/Users/someone");

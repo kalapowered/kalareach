@@ -301,6 +301,75 @@ pub fn subagent_started(bucket: &Path) -> Option<String> {
     None
 }
 
+/// How many prompts the agent's own record of a run's conversations holds, by who made them: what
+/// the run's charges for turns are compared with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WirePrompts {
+    /// Prompts a person typed, which start a turn: the part's own submissions.
+    pub user: u64,
+    /// Prompts joined to a running turn: steering.
+    pub steers: u64,
+    /// Prompts of any other origin, which no submission of the part made: a subagent's, a goal's
+    /// continuation, a trigger of the agent's own. Each is a request to the model nothing charged.
+    pub other: u64,
+}
+
+/// Counts the prompts in every wire file of `bucket`, the run's directory of sessions: the main
+/// agent's and any other's. A bucket that is not there yet holds none; a line cut off where the
+/// agent was stopped is not counted.
+///
+/// # Errors
+///
+/// Returns why a directory or a file could not be read: the count is then not known.
+pub fn wire_prompts(bucket: &Path) -> Result<WirePrompts, String> {
+    let mut counts = WirePrompts::default();
+    let sessions = match std::fs::read_dir(bucket) {
+        Ok(sessions) => sessions,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(counts),
+        Err(error) => return Err(format!("the run's sessions cannot be listed: {error}")),
+    };
+    for session in sessions.flatten() {
+        let agents = match std::fs::read_dir(session.path().join("agents")) {
+            Ok(agents) => agents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("a conversation's agents cannot be listed: {error}")),
+        };
+        for agent in agents.flatten() {
+            let text = match std::fs::read(agent.path().join("wire.jsonl")) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("a wire file cannot be read: {error}")),
+            };
+            for line in text.lines() {
+                if !line.contains("turn.prompt") && !line.contains("turn.steer") {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                match value.get("type").and_then(Value::as_str) {
+                    Some("turn.prompt") => {
+                        if value["origin"]["kind"].as_str() == Some("user") {
+                            counts.user += 1;
+                        } else {
+                            counts.other += 1;
+                        }
+                    }
+                    Some("turn.steer") => {
+                        if value["origin"]["kind"].as_str() == Some("user") {
+                            counts.steers += 1;
+                        } else {
+                            counts.other += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
 /// The strings of at least sixteen characters a JSON document holds, at any depth: what a login
 /// file keeps of its tokens. They are searched for, never printed.
 #[must_use]
@@ -323,20 +392,93 @@ pub fn secret_values(text: &str) -> Vec<String> {
     found
 }
 
-/// The strings the login in use keeps now, which differ from those read before a part where the
-/// agent refreshed its token while it ran: both are searched for. Read again from `data` (the
-/// person's data directory), never printed.
+/// The strings of every key a TOML configuration holds, at any depth: each string of 16 characters
+/// or more under a key named `api_key`, `token` or `secret`, or ending in `_key`, `_token` or
+/// `_secret`, such as the key a third party's provider is given. They are searched for, never
+/// printed; a configuration that is not TOML has none.
+#[must_use]
+pub fn config_secrets(text: &str) -> Vec<String> {
+    fn walk(item: &Item, key: &str, found: &mut Vec<String>) {
+        let named = ["api_key", "token", "secret"].contains(&key)
+            || ["_key", "_token", "_secret"]
+                .iter()
+                .any(|end| key.ends_with(end));
+        match item {
+            Item::Value(toml_edit::Value::String(string)) => {
+                if named && string.value().chars().count() >= 16 {
+                    found.push(string.value().clone());
+                }
+            }
+            Item::Value(toml_edit::Value::Array(array)) => {
+                for value in array {
+                    walk(&Item::Value(value.clone()), key, found);
+                }
+            }
+            Item::Value(toml_edit::Value::InlineTable(table)) => {
+                for (name, value) in table {
+                    walk(&Item::Value(value.clone()), name, found);
+                }
+            }
+            Item::Table(table) => {
+                for (name, inner) in table {
+                    walk(inner, name, found);
+                }
+            }
+            Item::ArrayOfTables(array) => {
+                for table in array {
+                    for (name, inner) in table {
+                        walk(inner, name, found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(document) = text.parse::<DocumentMut>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (name, item) in document.iter() {
+        walk(item, name, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The strings the person's data directory keeps for logins: those of every credentials file, the
+/// login in use and the others, and of the configuration's keys. The login in use may be refreshed
+/// by the agent while it runs, so this is read again after a part and what was read before is
+/// searched for as well. Read from `data` (the person's data directory), never printed.
 ///
 /// # Errors
 ///
-/// Returns why the credentials file cannot be read or holds no string.
-pub fn current_secrets(data: &Path, slot: &str) -> Result<Vec<String>, String> {
-    let path = data.join("credentials").join(format!("{slot}.json"));
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("the login's file cannot be read again: {error}"))?;
-    let values = secret_values(&text);
+/// Returns why a credentials file or the configuration cannot be read, or that none holds a string.
+pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    let credentials = data.join("credentials");
+    for entry in std::fs::read_dir(&credentials)
+        .map_err(|error| format!("the credentials cannot be listed: {error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("the credentials cannot be listed: {error}"))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("a credentials file cannot be read: {error}"))?;
+            values.extend(secret_values(&text));
+        }
+    }
+    let config = std::fs::read_to_string(data.join("config.toml"))
+        .map_err(|error| format!("the configuration cannot be read: {error}"))?;
+    values.extend(config_secrets(&config));
+    values.sort();
+    values.dedup();
     if values.is_empty() {
-        return Err("the login's file holds no token now".to_owned());
+        return Err("no login file or configuration of the person's holds a string".to_owned());
     }
     Ok(values)
 }
@@ -482,11 +624,17 @@ pub fn settings_of(text: &str) -> Result<Settings, String> {
                         .iter()
                         .map(|table| table as &dyn toml_edit::TableLike)
                         .collect(),
-                    Item::Value(toml_edit::Value::Array(array)) => array
-                        .iter()
-                        .filter_map(|value| value.as_inline_table())
-                        .map(|table| table as &dyn toml_edit::TableLike)
-                        .collect(),
+                    Item::Value(toml_edit::Value::Array(array)) => {
+                        settings.unlisted += array
+                            .iter()
+                            .filter(|value| value.as_inline_table().is_none())
+                            .count();
+                        array
+                            .iter()
+                            .filter_map(|value| value.as_inline_table())
+                            .map(|table| table as &dyn toml_edit::TableLike)
+                            .collect()
+                    }
                     _ => {
                         settings.unlisted += 1;
                         Vec::new()
@@ -554,11 +702,14 @@ impl Setup {
         let slot = active_slot(&config, provider).ok_or_else(|| {
             "the configuration names no login for the agent's provider".to_owned()
         })?;
-        let credentials = format!("credentials/{slot}.json");
-        let secrets = secret_values(&read(&credentials)?);
-        if secrets.is_empty() {
-            return Err("the login's file holds no token".to_owned());
+        if !directory
+            .join("credentials")
+            .join(format!("{slot}.json"))
+            .is_file()
+        {
+            return Err(format!("{data}/credentials/{slot}.json is not there"));
         }
+        let secrets = login_strings(&directory)?;
         let names = server_names(&read(&servers.source)?, &servers.member)?;
         let mut other_logins = Vec::new();
         for (subdirectory, keep) in [
@@ -586,6 +737,28 @@ impl Setup {
     }
 }
 
+/// The MD5 digest of `text` in lower-case hexadecimal, by the system's own `md5`: the name the agent
+/// gives the file of a folder's prompt history is that of the folder's path.
+///
+/// # Errors
+///
+/// Returns why the program could not be run or did not print a digest.
+pub fn md5_hex(text: &str) -> Result<String, String> {
+    let output = std::process::Command::new("/sbin/md5")
+        .args(["-q", "-s", text])
+        .output()
+        .map_err(|error| format!("md5 did not run: {error}"))?;
+    let digest = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success()
+        && digest.len() == 32
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        Ok(digest)
+    } else {
+        Err(format!("md5 printed no digest (status {})", output.status))
+    }
+}
+
 /// The paths the sandbox profile's parameters name, each as the system resolves it.
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -608,8 +781,10 @@ pub struct Layout {
     /// The directory of sessions the agent files the run's folder under: the only one of its
     /// sessions it may write.
     pub bucket: PathBuf,
-    /// The person's home, of which the profile denies the rest.
-    pub person: PathBuf,
+    /// The file the agent keeps the run's prompt history in, in the data directory.
+    pub history: PathBuf,
+    /// The record the agent keeps for the run's folder in the data directory's file history.
+    pub file_history: PathBuf,
     /// The credentials file of the login in use, by name: the one file of the credentials
     /// directory the agent may write.
     pub slot: String,
@@ -632,7 +807,8 @@ impl Layout {
             ("SHELLS", text(&self.shells)),
             ("DATA", text(&self.data)),
             ("BUCKET", text(&self.bucket)),
-            ("PERSON", text(&self.person)),
+            ("HISTORY", text(&self.history)),
+            ("FILEHISTORY", text(&self.file_history)),
             ("SLOT", format!("{}.json", self.slot)),
             ("PROXY_PORT", self.proxy_port.to_string()),
         ]
@@ -878,7 +1054,8 @@ mod tests {
             shells: "/s".into(),
             data: "/p/.kimi-code".into(),
             bucket: "/p/.kimi-code/sessions/wd_w_0123456789ab".into(),
-            person: "/p".into(),
+            history: "/p/.kimi-code/user-history/0123456789abcdef0123456789abcdef".into(),
+            file_history: "/p/.kimi-code/file-history/wd_w_0123456789ab".into(),
             slot: "kimi-code-env-0123".into(),
             proxy_port: 4242,
         };
@@ -923,6 +1100,56 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("a .git");
         assert_eq!(git_above(&folder), Some(root.clone()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_prompts_of_a_run_are_counted_by_who_made_them() {
+        let bucket = std::env::temp_dir().join(format!("kr-confine-wire-{}", kr_ipc::new_uuid()));
+        assert_eq!(
+            wire_prompts(&bucket),
+            Ok(WirePrompts::default()),
+            "no bucket"
+        );
+        let main = bucket.join("session_a/agents/main");
+        let sub = bucket.join("session_a/agents/agent-0");
+        std::fs::create_dir_all(&main).expect("directories");
+        std::fs::create_dir_all(&sub).expect("directories");
+        // The shapes of a real wire file: a prompt, a steering prompt, the lines that merely hold the
+        // words, a line cut off, and a subagent's prompt.
+        std::fs::write(
+            main.join("wire.jsonl"),
+            concat!(
+                r#"{"type":"turn.prompt","agentId":"main","input":[],"origin":{"kind":"user"},"turnId":0}"#,
+                "\n",
+                r#"{"type":"turn.prompt","agentId":"main","input":[],"origin":{"kind":"user"},"turnId":1}"#,
+                "\n",
+                r#"{"type":"turn.steer","agentId":"main","origin":{"kind":"user","inTurn":true},"turnId":1}"#,
+                "\n",
+                r#"{"type":"prompt.steered","content":[{"type":"text","text":"turn.steer turn.prompt"}]}"#,
+                "\n",
+                r#"{"type":"turn.prompt","agentId":"main","origin":{"kind":"system_trigger","name":"goal"}}"#,
+                "\n",
+                r#"{"type":"turn.pro"#,
+            ),
+        )
+        .expect("write");
+        std::fs::write(
+            sub.join("wire.jsonl"),
+            concat!(
+                r#"{"type":"turn.prompt","agentId":"agent-0","origin":{"kind":"system_trigger","name":"subagent"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write");
+        assert_eq!(
+            wire_prompts(&bucket),
+            Ok(WirePrompts {
+                user: 2,
+                steers: 1,
+                other: 2
+            })
+        );
+        let _ = std::fs::remove_dir_all(&bucket);
     }
 
     #[test]
@@ -972,27 +1199,68 @@ mod tests {
     }
 
     #[test]
-    fn the_login_in_use_is_read_again_for_the_strings_a_refresh_changed() {
+    fn every_login_file_and_the_configurations_keys_are_read_again_for_the_strings_a_refresh_changed()
+     {
         let data = std::env::temp_dir().join(format!("kr-confine-login-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(data.join("credentials")).expect("directories");
-        assert!(
-            current_secrets(&data, "slot-a").is_err(),
-            "a file that is not there"
-        );
+        assert!(login_strings(&data).is_err(), "no configuration");
+        std::fs::write(data.join("config.toml"), "default_model = \"x\"\n").expect("write");
+        assert!(login_strings(&data).is_err(), "no string at all");
         std::fs::write(
             data.join("credentials/slot-a.json"),
             r#"{"access":"abcdefghijklmnopqrstuvwxyz"}"#,
         )
         .expect("write");
+        std::fs::write(
+            data.join("credentials/slot-b.json"),
+            r#"{"access":"zyxwvutsrqponmlkjihgfedcba"}"#,
+        )
+        .expect("write");
+        std::fs::write(
+            data.join("credentials/not-a-login.txt"),
+            "0123456789abcdef0123",
+        )
+        .expect("write");
+        std::fs::write(
+            data.join("config.toml"),
+            "[providers.third]\napi_key = 'sk-0123456789abcdef0123'\nbase_url = 'https://example.test/some/long/url/path'\n[providers.second]\ntoken = \"short\"\n[providers.other]\nrefresh_token = \"refresh-0123456789abcdef\"\n",
+        )
+        .expect("write");
         assert_eq!(
-            current_secrets(&data, "slot-a"),
-            Ok(vec!["abcdefghijklmnopqrstuvwxyz".to_owned()])
+            login_strings(&data),
+            Ok(vec![
+                "abcdefghijklmnopqrstuvwxyz".to_owned(),
+                "refresh-0123456789abcdef".to_owned(),
+                "sk-0123456789abcdef0123".to_owned(),
+                "zyxwvutsrqponmlkjihgfedcba".to_owned(),
+            ]),
+            "every slot, the keys of the configuration, and no other string or file"
         );
-        std::fs::write(data.join("credentials/slot-a.json"), r#"{"n":1}"#).expect("write");
+        // The login in use is refreshed: the strings it now holds are read.
+        std::fs::write(
+            data.join("credentials/slot-a.json"),
+            r#"{"access":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}"#,
+        )
+        .expect("write");
         assert!(
-            current_secrets(&data, "slot-a").is_err(),
-            "no string at all"
+            login_strings(&data)
+                .expect("read again")
+                .contains(&"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned())
         );
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_name_of_a_prompt_history_is_the_md5_of_the_folders_path() {
+        assert_eq!(
+            md5_hex("abc").as_deref(),
+            Ok("900150983cd24fb0d6963f7d28e17f72")
+        );
+        // The path of a run's folder and the name the agent gave its history in a recorded run.
+        assert_eq!(
+            md5_hex("/private/var/folders/55/mtcsh3xj5nd2qnl5_c7d5yk00000gn/T/krm-cee79ed3/w")
+                .as_deref(),
+            Ok("7e7911301a20868dc6e6f405026f0793")
+        );
     }
 }
