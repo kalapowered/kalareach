@@ -31,7 +31,9 @@ enum PushStartup {
                 FirebaseApp.configure()
                 Messaging.messaging().delegate = TokenListener.shared
             case .addTokenMethods:
-                if !installTokenMethods() {
+                if installTokenMethods() {
+                    NSLog("KalaReach: the application delegate now receives APNs tokens")
+                } else {
                     NSLog("KalaReach: the application delegate already answers for APNs tokens, so none reaches Firebase")
                 }
             case .registerForRemoteNotifications:
