@@ -433,15 +433,6 @@ function Install-KrReadLineWrapper {
     $script:Hooks.ReadLineInstalled = $true
 }
 
-# The function the editor's module exports as the host's read-line entry point.
-function Get-KrEditorsReadLine {
-    $module = Get-Module -Name 'PSReadLine' | Select-Object -First 1
-    if ($null -eq $module) { return $null }
-    $editor = $module.ExportedFunctions['PSConsoleHostReadLine']
-    if ($null -eq $editor) { return $null }
-    $editor.ScriptBlock
-}
-
 # The text of the editor's own read-line function, as the editor's own file defines it.
 #
 # Read from the file the loaded editor came from, and from nothing a profile can change: a profile
