@@ -24,7 +24,7 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureMessage as portFailureMessage, follow, watch } from '../host/port'
+import { failureMessage as portFailureMessage, failureWords, follow, watch } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
@@ -390,7 +390,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
             if (closure.closed_locally) setCall(null)
             setNotice(
               closure.host_failure
-                ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureMessage(closure.host_failure)}`
+                ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
                 : null
             )
           })
