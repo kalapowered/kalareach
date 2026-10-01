@@ -1337,8 +1337,8 @@ impl WorkerService {
                     // bytes written whole or, for a projected join that has none, the first frame
                     // the loop below wrote. While this is false every effect owed is recorded rather
                     // than written, because an effect is never the first frame of a stream and must
-                    // not follow part of a screen. The gap notice does not count, and a restoration
-                    // that stopped part way leaves this false.
+                    // not follow part of a restoration's bytes. The gap notice does not count, and a
+                    // restoration that stopped part way leaves this false.
                     let mut opened = false;
                     // The effect being written when a write failed, which is owed like the rest.
                     let mut failed: Option<Arc<kr_term::sideeffect::SideEffect>> = None;
@@ -7501,8 +7501,9 @@ async fn deliver_effect(
 /// Nothing is written when `opened` is false, that is when the client has not been sent the
 /// beginning of its stream, whether because only the gap notice reached it or because its
 /// restoration stopped part way: an effect is never the first frame of a stream and must not follow
-/// part of a screen, so every effect is recorded instead. A delivery that is aborted where it
-/// stands, because its connection has ended or its registration was withdrawn, does not run this.
+/// part of a restoration's bytes, so every effect is recorded instead. A projected join counts as
+/// begun after its first frame. A delivery that is aborted where it stands, because its connection
+/// has ended or its registration was withdrawn, does not run this.
 async fn settle_effects(
     outlet: &mut Outlet,
     stream_id: &StreamId,
@@ -8826,6 +8827,14 @@ mod tests {
         }
     }
 
+    /// Runs a delivery and the peer reading it within a bound, so that a frame lost or a withdrawal
+    /// ignored fails the test rather than hanging it.
+    async fn bounded<T>(both: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("the delivery and the peer finish within the bound")
+    }
+
     /// A screen of `chunks` frames, each byte telling which frame it belongs to.
     fn a_large_screen(chunks: usize) -> Vec<u8> {
         (0..chunks)
@@ -8856,30 +8865,33 @@ mod tests {
         let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
         let screen = a_large_screen(3);
         let mut sequence = 0_u64;
-        let (sent, read) = tokio::join!(
-            super::open_delivery(
-                &mut outlet,
-                &stream_id,
-                &mut sequence,
-                joined(&screen, Some(a_gap())),
-            ),
-            async {
-                let gap = reader
-                    .read_message::<kr_protocol::envelope::ControlFrame>()
-                    .await
-                    .expect("the gap notice arrives");
-                assert!(matches!(
-                    gap,
-                    kr_protocol::envelope::ControlFrame::Notification(ref notification)
-                        if notification.event_type.as_str() == "session.gap"
-                ));
-                let mut read = Vec::new();
-                for _ in 0..3 {
-                    read.push(read_output(&mut reader).await);
+        let (sent, read) = bounded(async {
+            tokio::join!(
+                super::open_delivery(
+                    &mut outlet,
+                    &stream_id,
+                    &mut sequence,
+                    joined(&screen, Some(a_gap())),
+                ),
+                async {
+                    let gap = reader
+                        .read_message::<kr_protocol::envelope::ControlFrame>()
+                        .await
+                        .expect("the gap notice arrives");
+                    assert!(matches!(
+                        gap,
+                        kr_protocol::envelope::ControlFrame::Notification(ref notification)
+                            if notification.event_type.as_str() == "session.gap"
+                    ));
+                    let mut read = Vec::new();
+                    for _ in 0..3 {
+                        read.push(read_output(&mut reader).await);
+                    }
+                    read
                 }
-                read
-            }
-        );
+            )
+        })
+        .await;
         assert_eq!(sent, Some(true), "every frame of the screen was written");
         assert_eq!(sequence, 4);
         for (position, (frame_sequence, output)) in read.iter().enumerate() {
@@ -8906,19 +8918,22 @@ mod tests {
         let screen = a_large_screen(4);
         let withdrawn = Arc::clone(&outlet.withdrawn);
         let mut sequence = 0_u64;
-        let (sent, first) = tokio::join!(
-            super::open_delivery(
-                &mut outlet,
-                &stream_id,
-                &mut sequence,
-                joined(&screen, None)
-            ),
-            async {
-                let first = read_output(&mut reader).await;
-                withdrawn.set();
-                first
-            }
-        );
+        let (sent, first) = bounded(async {
+            tokio::join!(
+                super::open_delivery(
+                    &mut outlet,
+                    &stream_id,
+                    &mut sequence,
+                    joined(&screen, None)
+                ),
+                async {
+                    let first = read_output(&mut reader).await;
+                    withdrawn.set();
+                    first
+                }
+            )
+        })
+        .await;
         assert_eq!(first.0, 0);
         assert_eq!(
             first.1.bytes.as_slice(),
