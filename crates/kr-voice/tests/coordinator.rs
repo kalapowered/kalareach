@@ -517,6 +517,8 @@ struct ManagedFake {
     versions: Mutex<Vec<Option<String>>>,
     /// Whether the terms read fails, as it does when the service cannot be reached.
     terms_unreachable: Mutex<bool>,
+    /// Whether closing a call fails, as it does when the service cannot be reached.
+    close_unreachable: Mutex<bool>,
     /// Held creations, for a test that needs one start to still be waiting while another arrives.
     ///
     /// A real creation takes as long as a network round trip, and the window this opens is that
@@ -533,9 +535,15 @@ impl ManagedFake {
             offers: Mutex::new(Vec::new()),
             versions: Mutex::new(Vec::new()),
             terms_unreachable: Mutex::new(false),
+            close_unreachable: Mutex::new(false),
             holding: tokio::sync::Semaphore::new(0),
             held: Mutex::new(false),
         }
+    }
+
+    /// Makes every close fail, as one does when the service cannot be reached.
+    fn cannot_close(&self) {
+        *self.close_unreachable.lock().expect("the switch") = true;
     }
 
     /// Makes every creation wait until [`ManagedFake::release`] lets one through.
@@ -698,7 +706,16 @@ impl ManagedVoiceService for ManagedFake {
             .expect("what was closed")
             .push(call_id.to_owned());
         let call_id = call_id.to_owned();
+        let unreachable = *self.close_unreachable.lock().expect("the switch");
         Box::pin(async move {
+            if unreachable {
+                return Err(kr_client::error::ClientError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                        "the managed service did not answer".to_owned(),
+                    ),
+                ));
+            }
             Ok(VoiceClosure {
                 call_id,
                 state: "finalised".to_owned(),
@@ -1513,6 +1530,74 @@ async fn replacing_a_standing_grant_closes_the_calls_it_withdrew() {
         vec!["call-managed".to_owned()],
         "and the broker was told to finalise them"
     );
+}
+
+/// Where the coordinator reports a call it could not end, and what it was told.
+fn reported_to(fixture: &Fixture) -> Arc<Mutex<Vec<kr_voice::UnclosedCall>>> {
+    let told: Arc<Mutex<Vec<kr_voice::UnclosedCall>>> = Arc::default();
+    let sink = Arc::clone(&told);
+    fixture
+        .coordinator
+        .report_unclosed_calls_to(Arc::new(move |call| {
+            sink.lock().expect("the report").push(call.clone());
+        }));
+    told
+}
+
+/// KR-REQ-15.14: a call the broker cannot be told to end is reported, and the change that withdrew
+/// the grant it ran under still succeeds. Replacing a standing grant ends the calls under it; the
+/// broker that cannot be reached leaves the call to its own deadline, and the person is told which
+/// call is still running.
+#[tokio::test]
+async fn a_call_the_broker_cannot_end_is_reported_and_the_replacement_still_stands() {
+    let fixture = fixture();
+    let told = reported_to(&fixture);
+    started(&fixture, None).await;
+    fixture.broker.cannot_close();
+
+    let second = fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_200,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("the replacement is written whether or not the broker can be told");
+
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.authority.standing_grants(device(PHONE)).len(), 1);
+    assert!(!fixture.authority.is_revoked(second.grant_id));
+    assert_eq!(
+        *told.lock().expect("the report"),
+        vec![kr_voice::UnclosedCall {
+            call_id: "call-managed".to_owned(),
+            provider: "the managed broker".to_owned(),
+            error: "UPSTREAM_UNAVAILABLE: the managed service did not answer".to_owned(),
+        }],
+        "the call that is still running is named, with the provider that holds it"
+    );
+}
+
+/// KR-REQ-15.14: a call the broker is told to end and ends is reported as nothing.
+#[tokio::test]
+async fn a_call_the_broker_ends_is_not_reported() {
+    let fixture = fixture();
+    let told = reported_to(&fixture);
+    started(&fixture, None).await;
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_200,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a narrower standing voice grant");
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+    assert!(told.lock().expect("the report").is_empty());
 }
 
 /// KR-REQ-15.21: replacing a standing voice grant withdraws the one it replaces, so two scopes
