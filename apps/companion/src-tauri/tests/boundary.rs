@@ -746,6 +746,109 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
     );
 }
 
+/// Push on iOS is wired the way the project's owner decided, and a build that cannot reach Firebase
+/// still launches.
+///
+/// Firebase's own hook into the application delegate is off, because the delegate belongs to the
+/// windowing library and the hook would wrap methods of it that have nothing to do with push;
+/// registration tokens are not made until the person agrees to notifications; only the messaging
+/// library is linked, so no analytics installation is written; the library is pinned by revision,
+/// and the application's deployment target is the one the library and the bundle configuration
+/// name. The configuration file is the build owner's, never the repository's.
+#[test]
+fn push_on_ios_is_wired_without_borrowing_the_delegate_or_the_account_configuration() {
+    let root = crate_root();
+    let text = |relative: &str| {
+        std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("{relative} could not be read: {error}"))
+    };
+    let project = text("gen/apple/project.yml");
+    for expected in [
+        "        FirebaseAppDelegateProxyEnabled: false\n",
+        "        FirebaseMessagingAutoInitEnabled: false\n",
+        "      - package: Firebase\n        product: FirebaseMessaging\n",
+        "    iOS: 17.0\n",
+    ] {
+        assert!(project.contains(expected), "project.yml lacks {expected:?}");
+    }
+    assert!(
+        !project.contains("FirebaseAnalytics") && !project.contains("product: FirebaseCore"),
+        "only the messaging library is linked"
+    );
+    let revision = project
+        .split("  Firebase:\n")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("revision: "))
+        })
+        .expect("the Firebase package is pinned by revision");
+    assert!(
+        revision.len() == 40 && revision.chars().all(|each| each.is_ascii_hexdigit()),
+        "the Firebase revision is a full commit: {revision}"
+    );
+    assert_eq!(
+        configuration()["bundle"]["iOS"]["minimumSystemVersion"],
+        serde_json::json!("17.0"),
+        "the bundle and the project agree on the deployment target"
+    );
+
+    // The launch code is the application's alone: the native tests build the decisions without the
+    // Firebase library and without a launch.
+    let target = |name: &str| {
+        let after = project
+            .split(&format!("  {name}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("project.yml describes {name}"));
+        // The target ends at the next line indented by exactly one level.
+        let mut block = String::new();
+        for line in after.lines() {
+            let one_level = line.starts_with("  ") && !line.starts_with("   ");
+            if one_level && !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+                break;
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+        block
+    };
+    assert!(
+        project.contains("native/ios/KalaReachApp"),
+        "the application compiles the launch code"
+    );
+    for other in ["KalaReachNativeTests", "KalaReachNotificationService"] {
+        assert!(
+            !target(other).contains("KalaReachApp"),
+            "{other} must not compile the application's launch code"
+        );
+    }
+
+    // The configuration is the account's, so the repository holds none and ignores the local file
+    // that names where it is.
+    let ignored = text("gen/apple/.gitignore");
+    assert!(
+        ignored.lines().any(|line| line == "Local.xcconfig"),
+        "the machine-local build settings are ignored"
+    );
+    let tracked = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["ls-files", "--", "."])
+            .current_dir(&root)
+            .output()
+            .expect("git runs")
+            .stdout,
+    )
+    .expect("git lists paths as text");
+    assert!(
+        !tracked
+            .lines()
+            .any(|line| line.ends_with("GoogleService-Info.plist")
+                || line.ends_with("Local.xcconfig")),
+        "the repository holds an account's Firebase configuration or a machine's settings"
+    );
+}
+
 /// Every file of the application that the repository holds, as a path relative to it.
 ///
 /// What a build leaves beside them (generated projects, caches, symbolic links to libraries) is
