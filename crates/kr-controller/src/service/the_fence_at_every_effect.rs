@@ -501,3 +501,230 @@ async fn an_authority_change_admitted_before_a_revocation_changes_nothing_after_
         "a change under the revision in force is performed: {answered:?}"
     );
 }
+
+/// A worker the lease issuer has bound and holds the acknowledgement of the revision in force from,
+/// the way a worker that answered an announcement is, and the envelope a paired device's mutation
+/// to it carries over a connection registered at that revision.
+fn acknowledged_worker_and_a_paired_device(
+    controller: &Controller,
+) -> (
+    kr_protocol::ids::SessionId,
+    kr_protocol::actor::ActorEnvelope,
+) {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+
+    let revision = controller.leases.authority_revision();
+    let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    let binding = controller.leases.bind(session_id);
+    assert!(
+        controller
+            .leases
+            .acknowledge(session_id, binding, revision, None)
+    );
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let actor_id = ActorId::new("device:test").expect("a principal");
+    controller.admitted_table().insert(
+        connection_id,
+        super::AdmittedConnection::new(actor_id.clone(), revision),
+    );
+    let actor = ActorEnvelope {
+        actor_id,
+        ingress: ActorIngress::PairedDevice,
+        device_id: Nullable::null(),
+        grant_id: Nullable::null(),
+        grant_revision: Nullable::some(revision),
+        controller_generation: controller.generation,
+        connection_id,
+    };
+    (session_id, actor)
+}
+
+/// KR-REQ-09.12: a lease is refused while this host owes a fence it could not raise. A debt is
+/// published without the revision moving, so the lease issuer still holds the worker's
+/// acknowledgement of the revision in force and would renew on it; the refusal is the fence's own,
+/// and it is not the one an announcement to the worker could change. The control: with no debt the
+/// same worker is given its lease, and is again once the fence is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_is_refused_while_this_host_owes_a_fence() {
+    let (_temp, controller, _clock) = daemon().await;
+    let (session_id, actor) = acknowledged_worker_and_a_paired_device(&controller);
+
+    let lease = controller
+        .dispatch_lease(session_id, &actor)
+        .await
+        .expect("with no fence owed the worker is given its lease");
+    assert!(lease.is_some());
+
+    controller.hold_fence(true);
+    let refused = controller
+        .dispatch_lease(session_id, &actor)
+        .await
+        .expect_err("a fence owed refuses the lease");
+    let super::LeaseDenied::Stopped(error) = refused else {
+        panic!("a fence is not what an announcement to the worker changes: {refused:?}");
+    };
+    assert!(error.to_string().contains("fence"), "{error}");
+
+    controller.hold_fence(false);
+    controller
+        .dispatch_lease(session_id, &actor)
+        .await
+        .expect("once the fence is gone the lease is given again");
+}
+
+/// KR-REQ-09.12: the lease issuer adopts a barrier's revision before the debts the barrier
+/// captured are let go. Stopped where the registrations have been withdrawn and the issuer has not
+/// yet adopted the revision, the debts are still published, so a lease asked for there is refused;
+/// at the base they were already let go, and the issuer, still at the revision it was
+/// acknowledged at, issued one. After the barrier the worker, which has acknowledged only the
+/// revision it replaced, is asked to acknowledge the new one, which no fence is owed for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_lease_is_issued_between_a_barriers_withdrawal_and_the_issuers_adoption_of_its_revision()
+{
+    let (_temp, controller, _clock) = daemon().await;
+    let (session_id, actor) = acknowledged_worker_and_a_paired_device(&controller);
+    let before = controller.leases.authority_revision();
+    let debt = controller
+        .owe_debt("a withdrawal", super::Reach::Host)
+        .expect("the debt is written");
+
+    let (arrived, release) = controller.before_the_leases_adopt.arm();
+    let raising = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move {
+            let own = controller.publish_debts(&[(debt, super::Reach::Host)]);
+            controller.barrier(own).await
+        }
+    });
+    arrival(arrived).await;
+
+    let asked = controller.dispatch_lease(session_id, &actor).await;
+    let refused = asked.expect_err("no lease is issued while the withdrawal is owed");
+    let super::LeaseDenied::Stopped(error) = refused else {
+        panic!("it is the fence that refuses: {refused:?}");
+    };
+    assert!(error.to_string().contains("fence"), "{error}");
+    assert_eq!(
+        controller.leases.authority_revision(),
+        before,
+        "the issuer has not adopted the revision yet"
+    );
+
+    release.send(()).expect("the barrier goes on");
+    raising
+        .await
+        .expect("the barrier ends")
+        .expect("the barrier is raised");
+    assert!(controller.leases.authority_revision() > before);
+    let refused = controller
+        .dispatch_lease(session_id, &actor)
+        .await
+        .expect_err("a worker that has not acknowledged the new revision holds no lease");
+    assert!(
+        matches!(refused, super::LeaseDenied::NotAcknowledged(_)),
+        "{refused:?}"
+    );
+}
+
+/// Waits until a change says it has reached the place it is stopped at, and fails the test when it
+/// does not within thirty seconds.
+async fn arrival(arrived: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the change reaches the place it is stopped at");
+}
+
+/// KR-REQ-09.12: a forwarded mutation whose lease is refused for the fence this host owes is
+/// refused with that fence, and no announcement is made to the worker for it. This daemon has no
+/// directory entry for the worker, so an announcement would end the forward with the unknown
+/// session instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forward_stopped_by_the_fence_starts_no_announcement() {
+    let (_temp, controller, _clock) = daemon().await;
+    let (session_id, actor) = acknowledged_worker_and_a_paired_device(&controller);
+    let accepted = accepted(&controller);
+
+    let (arrived, release) = controller.before_the_lease.arm();
+    let (forwarded, ()) = tokio::join!(
+        controller.forwarded_deadline(session_id, &actor, accepted),
+        async {
+            tokio::time::timeout(Duration::from_secs(30), arrived)
+                .await
+                .expect("the forward reaches the place it is stopped at")
+                .expect("the pause is armed");
+            controller.hold_fence(true);
+            release.send(()).expect("the forward goes on");
+        }
+    );
+    let refused = forwarded.expect_err("a fence owed stops the forward");
+    assert!(
+        matches!(
+            refused,
+            crate::error::ControllerError::PermissionDenied { .. }
+        ),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("fence"), "{refused}");
+}
+
+/// KR-REQ-09.12: a lease taken just before a debt was published still bounds the action that holds
+/// it, to the five seconds section 9 gives a lease, and nothing renews it: once the clock is past
+/// its deadline the action's deadline has passed, a forward asked for after it is refused for the
+/// fence and renews nothing, and the worker, which acknowledged nothing of the withdrawal, is
+/// pending. The control: with no debt a forward after the lapse is given a new lease and runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
+    let (_temp, controller, clock) = daemon().await;
+    let (session_id, actor) = acknowledged_worker_and_a_paired_device(&controller);
+    let accepted = accepted(&controller);
+
+    let forwarded = controller
+        .forwarded_deadline(session_id, &actor, accepted)
+        .await
+        .expect("the forward is given its lease");
+    let lease = controller
+        .leases
+        .current_lease(session_id)
+        .expect("the forward took a lease");
+    assert!(
+        forwarded.get() > 0
+            && lease.remaining(controller.clock.now()) <= kr_transport::lease::MAX_LEASE,
+        "the deadline the worker is given is bounded by the lease: {forwarded:?}"
+    );
+
+    controller.hold_fence(true);
+    clock.advance(kr_transport::lease::MAX_LEASE + Duration::from_secs(1));
+    assert_eq!(
+        crate::service::remaining_deadline(
+            &*controller.shared_clock,
+            &*controller.clock,
+            accepted.deadline,
+            Some(lease.deadline),
+        ),
+        None,
+        "the action that held the lease has run out of deadline"
+    );
+    let refused = controller
+        .forwarded_deadline(session_id, &actor, accepted)
+        .await
+        .expect_err("a forward after the lapse is refused for the fence");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    assert_eq!(
+        controller.leases.current_lease(session_id),
+        Some(lease),
+        "nothing renewed the lease"
+    );
+    let report = controller
+        .leases
+        .report(controller.leases.authority_revision(), [session_id]);
+    assert!(!report.holds(), "the worker is pending: {report:?}");
+
+    // The control: with no debt, a forward after the lapse renews.
+    controller.hold_fence(false);
+    controller
+        .forwarded_deadline(session_id, &actor, accepted)
+        .await
+        .expect("with no fence owed the forward runs");
+    assert_ne!(controller.leases.current_lease(session_id), Some(lease));
+}
