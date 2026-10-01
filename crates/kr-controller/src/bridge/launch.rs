@@ -137,6 +137,82 @@ pub fn helper_command(
     }
 }
 
+/// The options an SSH identity probe runs with, each of which closes a way for the probe to do
+/// more than ask one question of the helper on the other side.
+///
+/// * `BatchMode` and `StrictHostKeyChecking`: no prompt a person must answer, and a host this
+///   login has not seen is refused rather than trusted, so an identity is bound to a verified host.
+/// * `ClearAllForwardings`: no socket is forwarded from here, which a configured `RemoteForward`
+///   would otherwise turn into the helper reaching this host's own daemon.
+/// * `ControlMaster` and `ControlPath`: no connection is shared with, or left behind for, another
+///   command.
+/// * `ForwardAgent`, `ForwardX11` and `PermitLocalCommand`: nothing of this login's reaches the
+///   other side, and no local command runs.
+const SSH_PROBE_OPTIONS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+];
+
+/// Builds the command that asks a destination which environment it is, where that can be asked.
+///
+/// A WSL distribution and a container are asked through their process bridge. An SSH host is not
+/// a process bridge, and no request ever crosses ssh; but the helper installed there can say which
+/// environment and which user it is, once, and that answer is what registers the host's identity
+/// and the channel the helper holds there. The remote login's shell reads what follows the host,
+/// joined with spaces, so enrolment refuses every value a shell would read and the command here
+/// needs no quoting.
+///
+/// # Errors
+///
+/// As [`command`], and [`LaunchError::NotAProcessBridge`] for a paired host, which has no helper
+/// to ask.
+pub fn identity_command(
+    access: EnvironmentAccess,
+    target: &str,
+    os_user: &str,
+    helper_path: &str,
+) -> Result<BridgeCommand, LaunchError> {
+    match access {
+        EnvironmentAccess::SshHost => {
+            kr_protocol::identity::validate_destination(access, target, os_user, helper_path)
+                .map_err(LaunchError::Incomplete)?;
+            let mut arguments = vec!["-T".to_owned()];
+            arguments.extend(SSH_PROBE_OPTIONS.iter().map(|option| (*option).to_owned()));
+            arguments.extend([
+                "-l".to_owned(),
+                os_user.to_owned(),
+                "--".to_owned(),
+                target.to_owned(),
+                helper_path.to_owned(),
+                HELPER_ARGUMENTS[0].to_owned(),
+                HELPER_ARGUMENTS[1].to_owned(),
+            ]);
+            Ok(BridgeCommand {
+                program: "ssh".to_owned(),
+                arguments,
+            })
+        }
+        EnvironmentAccess::PairedHost => Err(LaunchError::NotAProcessBridge { access }),
+        EnvironmentAccess::WslDistribution | EnvironmentAccess::Container => {
+            helper_command(access, target, os_user, helper_path)
+        }
+    }
+}
+
 /// Builds the command that asks the platform whether one enrolled environment is running.
 ///
 /// Observing is not starting. Each of these reports state and changes none: `wsl.exe --list

@@ -151,6 +151,16 @@ pub enum Refusal {
         /// How long it was given.
         waited: std::time::Duration,
     },
+    /// The helper ran as another user than the record names.
+    UserMismatch {
+        /// The user the enrolment records.
+        enrolled: String,
+        /// The user the helper said it ran as.
+        answered: String,
+    },
+    /// The destination answered as one of this host's own environments, which a socket forwarded
+    /// from here would, so it registers nothing about the host that was asked.
+    OwnEnvironment,
     /// The destination's build does not share this host's compatibility level, so the frames that
     /// follow could not be read by one side.
     Level {
@@ -228,6 +238,14 @@ impl core::fmt::Display for Refusal {
                 "the destination said nothing for {} seconds",
                 waited.as_secs()
             ),
+            Self::UserMismatch { enrolled, answered } => write!(
+                formatter,
+                "the enrolment names user {enrolled} and the helper ran as {answered}"
+            ),
+            Self::OwnEnvironment => formatter.write_str(
+                "the destination answered as this host's own environment, so it is not another \
+                 one: a socket forwarded from here does not register an environment",
+            ),
             Self::Level { destination } => match destination {
                 Some(build) => write!(
                     formatter,
@@ -283,6 +301,8 @@ impl From<Refusal> for crate::error::ControllerError {
             Refusal::NetworkActor { .. }
             | Refusal::AlreadyBridged
             | Refusal::Destination(_)
+            | Refusal::UserMismatch { .. }
+            | Refusal::OwnEnvironment
             | Refusal::IdentityMismatch { .. } => Self::PermissionDenied {
                 detail: refusal.to_string(),
             },
@@ -417,6 +437,68 @@ impl Opening {
             diagnostics,
         })
     }
+}
+
+/// Asks the helper an enrolled environment names, once, who it is, and checks the answer against
+/// the record.
+///
+/// This is how a host reached by SSH registers its identity and the channel its helper holds, and
+/// it is the only thing ssh is used for: the helper answers the opening and is ended, and no
+/// request ever crosses. The answer has to be the environment the record names, run as the user it
+/// names, and not one of this host's own environments, which a socket forwarded from here is.
+///
+/// # Errors
+///
+/// As [`open`] for the gate, as [`discover`] for the helper, and [`Refusal::IdentityMismatch`],
+/// [`Refusal::UserMismatch`] or [`Refusal::OwnEnvironment`] for an answer that is not the record's.
+pub async fn identify(
+    actor: &ActorEnvelope,
+    already_bridged: bool,
+    enrolment: &EnvironmentEnrolment,
+    origin_environment_id: EnvironmentId,
+    build_id: BuildId,
+) -> Result<BridgeHelloAck, Refusal> {
+    if !actor.ingress.may_cross_process_bridge() {
+        return Err(Refusal::NetworkActor {
+            ingress: actor.ingress,
+        });
+    }
+    if already_bridged {
+        return Err(Refusal::AlreadyBridged);
+    }
+    let command = launch::identity_command(
+        enrolment.access,
+        &enrolment.target,
+        &enrolment.os_user,
+        &enrolment.helper_path,
+    )
+    .map_err(Refusal::Launch)?;
+    let hello = BridgeHello {
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        build_id,
+        origin_environment_id,
+        origin_ingress: ActorIngress::LocalIpc,
+        already_bridged: false,
+        start: false,
+        target: BridgeTarget::Controller,
+    };
+    let acknowledgement = discover(&command, &hello).await?;
+    if acknowledgement.environment_id == origin_environment_id {
+        return Err(Refusal::OwnEnvironment);
+    }
+    if acknowledgement.environment_id != enrolment.environment_id {
+        return Err(Refusal::IdentityMismatch {
+            enrolled: enrolment.environment_id,
+            answered: acknowledgement.environment_id,
+        });
+    }
+    if acknowledgement.os_user != enrolment.os_user {
+        return Err(Refusal::UserMismatch {
+            enrolled: enrolment.os_user.clone(),
+            answered: acknowledgement.os_user,
+        });
+    }
+    Ok(acknowledgement)
 }
 
 /// Asks a destination which environment it is, before there is a record naming it.
@@ -1633,6 +1715,13 @@ mod tests {
             Refusal::Silent {
                 waited: SILENCE_LIMIT,
             },
+            Refusal::UserMismatch {
+                enrolled: "kala".to_owned(),
+                answered: "root".to_owned(),
+            },
+            Refusal::OwnEnvironment,
+            Refusal::Level { destination: None },
+            Refusal::Backlog { limit: 1 },
             Refusal::Unkillable {
                 program: "wsl.exe".to_owned(),
                 pid: Some(4242),
