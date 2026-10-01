@@ -2272,3 +2272,52 @@ fn forgetting_content_clears_the_queue_and_the_contexts_and_leaves_the_store_alo
     );
     assert_eq!(service.scheduler().queued(), 1);
 }
+
+/// Inference on battery is the owner's setting, off until it is turned on, and it applies at the
+/// next turn: a host on battery pauses with the battery's reason and loads nothing, turning the
+/// setting on lets the same queue load, and turning it off again lets a model that is loaded go.
+#[test]
+fn inference_on_battery_follows_the_owners_setting_at_the_next_turn() {
+    let on_battery = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Battery,
+        ThermalState::Nominal,
+    );
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        service.next(&on_battery, at(3_000)).expect("an instruction"),
+        Instruction::Wait { .. }
+    ));
+    assert_eq!(
+        service.resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::Battery,
+            unloaded: false
+        }
+    );
+    service.set_on_battery(true);
+    let Instruction::Load { id, .. } = service.next(&on_battery, at(3_100)).expect("an instruction")
+    else {
+        panic!("allowed on battery, the queue loads");
+    };
+    service
+        .finished(
+            id,
+            Answered::Loaded {
+                load_ms: 0,
+                rss_bytes: 0,
+            },
+            at(3_100),
+        )
+        .expect("the load");
+    service.set_on_battery(false);
+    assert_eq!(
+        service.next(&on_battery, at(3_200)).expect("an instruction"),
+        Instruction::Unload {
+            why: UnloadReason::Paused(PauseReason::Battery)
+        },
+        "a model that was allowed is let go when the setting goes"
+    );
+}

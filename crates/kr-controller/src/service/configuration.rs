@@ -90,6 +90,12 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             crate::config::InForce::of(&resolver);
+        // The owner's settings for descriptions apply at once, with no fence to raise: the host
+        // takes them at its next turn, and a reading that changed nothing changes nothing there.
+        if let Some(host) = self.descriptions.host() {
+            let settings = self.description_settings();
+            host.settings(Some(settings.enabled), Some(settings.on_battery));
+        }
         // The enrolment budgets the catalogue acts on, by the session number's rule: this reading
         // decides them when it loaded a document, and leaves them as they are when it did not.
         let mut budget_failure = None;

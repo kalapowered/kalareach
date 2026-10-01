@@ -597,6 +597,8 @@ impl Controller {
                 module.session_closed(reach.as_ref(), session_id).await;
             });
         }
+        // The descriptions stop tracking it, and its facts are no longer read.
+        self.describe_session_closed(record.session_id);
         // A closed session has no window to report on, and a create token that replays one is
         // answered from the closure record.
         self.presentations.lock().await.remove(&record.session_id);

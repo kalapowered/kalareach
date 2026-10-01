@@ -127,7 +127,8 @@ impl DeviceRead {
             | Method::EnvironmentCapabilities
             | Method::HostDoctor
             | Method::DeviceList
-            | Method::PrivacyStatus => Self::Daemon,
+            | Method::PrivacyStatus
+            | Method::DescriptionSetup => Self::Daemon,
             Method::ProjectList
             | Method::ProjectRead
             | Method::WorkspaceList

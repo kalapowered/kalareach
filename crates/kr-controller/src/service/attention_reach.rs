@@ -14,6 +14,56 @@ use super::Controller;
 use super::workers::UNACCOUNTED_WORKER;
 
 impl Controller {
+    /// Opens a connection to a worker for one of the daemon's readers of it: verified, declared
+    /// for `role`, and speaking for this daemon's generation.
+    ///
+    /// The daemon is held only to read what the connection presents and to sign its token, never
+    /// across a wait for the worker, so a connection being made keeps nothing of a daemon that is
+    /// stopping.
+    pub(crate) async fn connect_role(
+        me: &std::sync::Weak<Self>,
+        worker: &KnownWorker,
+        role: kr_protocol::local::ControllerConnectionRole,
+    ) -> Result<LocalClient> {
+        let stopping = || ControllerError::supervision("the daemon is stopping");
+        let build_id = me
+            .upgrade()
+            .map(|controller| controller.build_id.clone())
+            .ok_or_else(stopping)?;
+        let mut client =
+            LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build_id).await?;
+        client.verify_worker(&worker.descriptor).await?;
+        client
+            .writer()
+            .write_message(&ControlFrame::ControllerRole(role))
+            .await?;
+        match client.recv().await? {
+            ControlFrame::ControllerRole(declared) if declared == role => {}
+            _ => {
+                return Err(ControllerError::supervision(format!(
+                    "the worker did not accept this connection for {}",
+                    role.as_str()
+                )));
+            }
+        }
+        let me = me.clone();
+        client
+            .present_generation(move |nonce| {
+                let controller = me.upgrade().ok_or_else(|| {
+                    kr_ipc::IpcError::socket(
+                        "present",
+                        std::io::Error::other("the daemon is stopping"),
+                    )
+                })?;
+                controller
+                    .identity
+                    .generation_token(controller.generation, &controller.boot_identity, nonce)
+                    .map_err(kr_ipc::IpcError::from)
+            })
+            .await?;
+        Ok(client)
+    }
+
     /// Returns how the attention store reaches this daemon's workers and closed sessions.
     #[must_use]
     pub fn attention_reach(&self) -> Arc<dyn crate::attention::Reach> {
@@ -70,50 +120,11 @@ impl crate::attention::Reach for AttentionReach {
         &'a self,
         worker: &'a KnownWorker,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>> {
-        Box::pin(async move {
-            let stopping = || ControllerError::supervision("the daemon is stopping");
-            let build_id = self
-                .0
-                .upgrade()
-                .map(|controller| controller.build_id.clone())
-                .ok_or_else(stopping)?;
-            let mut client =
-                LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build_id)
-                    .await?;
-            client.verify_worker(&worker.descriptor).await?;
-            client
-                .writer()
-                .write_message(&ControlFrame::ControllerRole(
-                    kr_protocol::local::ControllerConnectionRole::Attention,
-                ))
-                .await?;
-            match client.recv().await? {
-                ControlFrame::ControllerRole(
-                    kr_protocol::local::ControllerConnectionRole::Attention,
-                ) => {}
-                _ => {
-                    return Err(ControllerError::supervision(
-                        "the worker did not accept this connection for attention",
-                    ));
-                }
-            }
-            let me = self.0.clone();
-            client
-                .present_generation(move |nonce| {
-                    let controller = me.upgrade().ok_or_else(|| {
-                        kr_ipc::IpcError::socket(
-                            "present",
-                            std::io::Error::other("the daemon is stopping"),
-                        )
-                    })?;
-                    controller
-                        .identity
-                        .generation_token(controller.generation, &controller.boot_identity, nonce)
-                        .map_err(kr_ipc::IpcError::from)
-                })
-                .await?;
-            Ok(client)
-        })
+        Box::pin(Controller::connect_role(
+            &self.0,
+            worker,
+            kr_protocol::local::ControllerConnectionRole::Attention,
+        ))
     }
 
     fn unaccounted<'a>(

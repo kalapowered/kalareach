@@ -980,6 +980,17 @@ impl DescriptionService {
         self.policy = ResourcePolicy::new(self.settings, Budgets::DEFAULTS);
     }
 
+    /// Allows or forbids inference while the host is on battery.
+    ///
+    /// Section 22 keeps it off unless an owner turns it on. Like [`Self::set_enabled`] it is the
+    /// policy's own setting, so it applies at the next turn: a model that was unloaded for battery
+    /// is loaded again when work is due, and one that was allowed is let go when the host goes onto
+    /// battery.
+    pub fn set_on_battery(&mut self, allowed: bool) {
+        self.settings.on_battery = allowed;
+        self.policy = ResourcePolicy::new(self.settings, Budgets::DEFAULTS);
+    }
+
     /// Records that a session exists, with the epoch it was addressed in.
     pub fn session_opened(
         &mut self,
