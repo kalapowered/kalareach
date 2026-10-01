@@ -12,11 +12,57 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { minimumTarget, showsBackControl, type Surface } from '../platform'
 
 /**
- * The room a label keeps on either side in the one-row bar, in multiples of the root text size: a
- * tab's own inline padding in that form. The tabs take two rows once a label with this room either
- * side is wider than a quarter of the bar.
+ * The forms the bar takes, from the one that asks the most room to the one that asks the least. In
+ * the first the tabs sit side by side, each glyph over its label. With text or letters too wide for
+ * that they sit two to a row, each glyph beside its label, and where even that cuts a label, each
+ * has a row of its own. The tab order is the same in all three.
  */
-const LABEL_ROOM_REM = 0.25
+const FORMS = ['row', 'pairs', 'column'] as const
+type Form = (typeof FORMS)[number]
+
+/** Lays the bar out in `form`: the first is the bar's own, and the others are named on it. */
+function layOut(bar: HTMLElement, form: Form): void {
+  if (form === 'row') bar.removeAttribute('data-form')
+  else bar.setAttribute('data-form', form)
+}
+
+/**
+ * Whether the bar, as it is laid out now, holds its tabs within its width and every label shows its
+ * whole word. A label that is a fraction of a pixel short ends in an ellipsis as one that is far
+ * short does, so the word as typeset is held to its box to the fraction.
+ */
+function showsEveryLabel(bar: HTMLElement): boolean {
+  if (bar.scrollWidth > bar.clientWidth) return false
+  for (const label of bar.querySelectorAll<HTMLElement>('.m-tab-label')) {
+    if (label.scrollWidth > label.clientWidth) return false
+    const word = document.createRange()
+    word.selectNodeContents(label)
+    // A width in layout units is 1/64 of a pixel: anything over that is a cut. A range has no
+    // measure in a test environment that lays nothing out.
+    const typeset = typeof word.getBoundingClientRect === 'function' ? word.getBoundingClientRect().width : 0
+    if (typeset > label.getBoundingClientRect().width + 0.02) return false
+  }
+  return true
+}
+
+/**
+ * The first form in which the bar shows every label as the text is set, or the last, where a label
+ * can only end in an ellipsis. Each form is tried in turn and the bar is left as it was found, so
+ * the answer never depends on the form the bar is in, and nothing is drawn in between.
+ */
+function formThatFits(bar: HTMLElement): Form {
+  const found = bar.getAttribute('data-form')
+  try {
+    for (const form of FORMS) {
+      layOut(bar, form)
+      if (showsEveryLabel(bar)) return form
+    }
+    return 'column'
+  } finally {
+    if (found === null) bar.removeAttribute('data-form')
+    else bar.setAttribute('data-form', found)
+  }
+}
 
 /** One destination in the tab bar. */
 export interface Destination {
@@ -41,26 +87,14 @@ export function TabBar({
 }): ReactNode {
   const target = minimumTarget(surface)
   const bar = useRef<HTMLElement | null>(null)
-  // Whether a label, with its room either side, is wider than its share of one row, as the text it is
-  // set in measures it. Each label is one word, so its width is the same whatever form the bar takes,
-  // and nothing the bar's form changes decides it.
-  const [crowded, setCrowded] = useState(false)
+  // The form the labels need as the text and the screen are now. A label's width does not depend on
+  // the form, but what fits does, so each measure starts from the first form.
+  const [form, setForm] = useState<Form>('row')
   useLayoutEffect(() => {
     const element = bar.current
     if (element === null) return
     const measure = () => {
-      const tabs = Array.from(element.querySelectorAll<HTMLElement>('.m-tab'))
-      const style = getComputedStyle(element)
-      const share =
-        (element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) /
-        Math.max(1, tabs.length)
-      const room = 2 * LABEL_ROOM_REM * (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16)
-      setCrowded(
-        tabs.some((tab) => {
-          const label = tab.querySelector<HTMLElement>('.m-tab-label')
-          return label !== null && label.scrollWidth > 0 && label.scrollWidth + room > share + 0.5
-        })
-      )
+      setForm(formThatFits(element))
     }
     measure()
     if (typeof ResizeObserver === 'undefined') return
@@ -73,7 +107,7 @@ export function TabBar({
     }
   }, [destinations])
   return (
-    <nav className="m-tabbar" aria-label="Sections" ref={bar} data-crowded={crowded ? '' : undefined}>
+    <nav className="m-tabbar" aria-label="Sections" ref={bar} data-form={form === 'row' ? undefined : form}>
       {destinations.map((destination) => (
         <button
           key={destination.id}
