@@ -771,9 +771,10 @@ enum Signature {
 
 /// Where PowerShell reads the signature block of a profile, when it reads one.
 ///
-/// Asked of PowerShell's parser, which reads a comment that begins the block, of any case, the
-/// first one when there are two, and nothing inside a string, a here-string or a block comment.
-/// This asks nothing of PowerShell for a profile whose text holds nothing that could be one.
+/// Asked of PowerShell's parser, which decides what is a signature: the first comment it reads as
+/// the start of the block, and nothing inside a string, a here-string or a block comment, nor a
+/// comment that only starts with the words. This asks nothing of PowerShell for a profile whose
+/// text holds nothing that could be one.
 fn signature_in(shell: &Path, existing: &str, theirs: &str) -> std::io::Result<Signature> {
     let without_mark = |text: &str| text.strip_prefix('\u{feff}').unwrap_or(text).to_owned();
     let holds = |text: &str| text.to_ascii_lowercase().contains(SIGNATURE_BEGIN_LOWER);
@@ -790,12 +791,26 @@ fn signature_in(shell: &Path, existing: &str, theirs: &str) -> std::io::Result<S
 }
 
 /// The script that says where PowerShell reads a profile's signature block.
+///
+/// Whether a comment begins a signature is not a question about its text: PowerShell reads some
+/// comments that start with the words as the block and some not, by a rule of its own. So the
+/// comment is put to the parser. Every comment that starts with the words is tried by cutting the
+/// profile after it and putting a statement there: where PowerShell reads a signature it reports
+/// that text follows the end of the script (`TokenAfterEndOfValidScriptText`), and where the
+/// comment is only a comment the statement is one.
 const SIGNATURE_SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
      $text = [System.IO.File]::ReadAllText($env:KR_PROFILE_TEXT, (New-Object System.Text.UTF8Encoding $false)); \
      $tokens = $null; $errors = $null; \
      [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors); \
-     $block = @($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text.StartsWith('# SIG # Begin signature block', [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1; \
-     if ($null -eq $block) { [Console]::Out.Write('kr-unsigned') } else { [Console]::Out.Write('kr-signature ' + $block.Extent.StartOffset) }";
+     foreach ($token in $tokens) { \
+         if ($token.Kind -ne 'Comment' -or -not $token.Text.StartsWith('# SIG # Begin signature block', [System.StringComparison]::OrdinalIgnoreCase)) { continue }; \
+         $cut = $text.Substring(0, $token.Extent.EndOffset) + \"`n`$kr_probe = 1`n\"; \
+         $cutTokens = $null; $cutErrors = $null; \
+         [void][System.Management.Automation.Language.Parser]::ParseInput($cut, [ref]$cutTokens, [ref]$cutErrors); \
+         if (@($cutErrors | Where-Object { $_.ErrorId -eq 'TokenAfterEndOfValidScriptText' }).Count -gt 0) { \
+             [Console]::Out.Write('kr-signature ' + $token.Extent.StartOffset); return } \
+     }; \
+     [Console]::Out.Write('kr-unsigned')";
 
 /// Asks PowerShell where it reads a signature block in a profile's text, as a byte offset.
 fn signature_block(shell: &Path, text: &str) -> std::io::Result<Option<usize>> {
@@ -3312,6 +3327,26 @@ mod tests {
         assert_eq!(
             install(&path, &check, &last).expect("in place"),
             Change::Unchanged
+        );
+
+        // A comment that starts with the words and that PowerShell does not read as the block is a
+        // comment: a profile that holds one is not signed, and an entry before it is not where an
+        // install puts it. The parser decides, not the text.
+        let path = root.path().join("explained.ps1");
+        let theirs = format!(
+            "class KrDerived : KrBase {{}}\n{check}\r\n# SIG # Begin signature block # explanation\nfunction global:PSConsoleHostReadLine {{ 'mine' }}\n"
+        );
+        std::fs::write(&path, &theirs).expect("writes");
+        assert_eq!(
+            install(&path, &check, &last).expect("an ordinary comment"),
+            Change::Replaced,
+            "a comment that is not a signature was taken for one"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("reads")
+                .ends_with(&check),
+            "the check is the last thing in the profile"
         );
 
         // The block in another case is read as one: the profile is signed, so it is refused.
