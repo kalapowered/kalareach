@@ -160,9 +160,9 @@ fn every_difference_is_written_up() {
 }
 
 /// A record is kept in a repository: it names programs and application bundles, never a home
-/// directory, a user, a session or the directory of a program outside an application.
+/// directory, a session or the directory of a program outside an application.
 #[test]
-fn no_record_names_a_home_directory_a_user_or_a_program_directory() {
+fn no_record_names_a_home_directory_a_session_or_a_program_directory() {
     fn strings<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
         match value {
             Value::String(text) => found.push(text),
@@ -175,7 +175,7 @@ fn no_record_names_a_home_directory_a_user_or_a_program_directory() {
         let mut found = Vec::new();
         strings(&record["launcher"], &mut found);
         for text in found {
-            for private in ["/Users/", "/home/", "C:\\Users", "~/"] {
+            for private in ["/Users/", "/home/", "C:\\Users"] {
                 assert!(
                     !text.contains(private),
                     "{} writes {text:?}, which holds {private:?}",
@@ -191,6 +191,14 @@ fn no_record_names_a_home_directory_a_user_or_a_program_directory() {
             assert!(
                 !name.contains('/') && !name.contains('\\'),
                 "{}: {name:?} is a path, and a record keeps the program's name",
+                path.display()
+            );
+        }
+        for variable in ["STY", "TMUX", "TMUX_PANE"] {
+            let value = &record["launcher"]["environment"][variable];
+            assert!(
+                value.is_null() || value == "set",
+                "{}: {variable} is {value}, and a record keeps only whether it was set",
                 path.display()
             );
         }
