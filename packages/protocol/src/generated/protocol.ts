@@ -6077,6 +6077,16 @@ export interface BridgeHello {
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
   protocol_version: ProtocolVersion
   /**
+   * Whether this invocation may start what it needs inside the destination.
+   *
+   * Section 3 leaves starting an environment to refresh, create and attach, and a listing, an
+   * enrolment or a verification starts nothing. A create or an attach says `true`, and the
+   * helper then reaches the destination's control daemon through that environment's own
+   * configured startup when none is running. Everything else says `false`, and a destination
+   * with no daemon answers that it has none.
+   */
+  start: boolean
+  /**
    * What to reach inside the destination environment.
    */
   target:
@@ -6108,7 +6118,19 @@ export interface ProtocolVersion {
  */
 export interface BridgeHelloAck {
   action_window: ActionWindow1
+  base: DestinationBase
   boot_identity: BootIdentity
+  /**
+   * The build of the process the helper reached, stated as that process stated it.
+   *
+   * An invoker refuses a destination whose protocol version does not share its compatibility
+   * level before it sends a request, because the frames that follow are closed schemas. A
+   * process of a build before this member states none, and is refused the same way.
+   *
+   * Remove the default and the omission once no process of a build before this member can
+   * still be running.
+   */
+  build?: LocalBuild | null
   /**
    * The connection identity that host assigned the helper.
    */
@@ -6157,6 +6179,32 @@ export interface ActionWindow1 {
   valid_for_ms: string
 }
 /**
+ * The destination's own starting point for a session created through this bridge.
+ */
+export interface DestinationBase {
+  /**
+   * The destination user's home directory, where a session starts unless it is told otherwise.
+   */
+  home: string
+  /**
+   * The helper's own values of [`DESTINATION_BASE_VARIABLES`], in that order, where it has them.
+   */
+  variables: EnvironmentVariable[]
+}
+/**
+ * One environment variable in a create request's snapshot.
+ */
+export interface EnvironmentVariable {
+  /**
+   * The name.
+   */
+  name: string
+  /**
+   * The value.
+   */
+  value: string
+}
+/**
  * The boot the destination is running.
  */
 export interface BootIdentity {
@@ -6168,6 +6216,33 @@ export interface BootIdentity {
    * The opaque value. Compared for equality, never interpreted.
    */
   value: string
+}
+/**
+ * The build of a local host process, as it states it in its answer to a hello.
+ */
+export interface LocalBuild {
+  /**
+   * The process's build identifier: its program name and its release.
+   */
+  build_id: string
+  protocol_version: PackageVersion
+}
+/**
+ * The version of the protocol package the process was built from.
+ */
+export interface PackageVersion {
+  /**
+   * The major number.
+   */
+  major: number
+  /**
+   * The minor number, which is the compatibility level below 1.0.0.
+   */
+  minor: number
+  /**
+   * The patch number, which never changes a type.
+   */
+  patch: number
 }
 /**
  * The protocol version both sides will use.
@@ -6325,33 +6400,6 @@ export interface BootIdentity1 {
    * The opaque value. Compared for equality, never interpreted.
    */
   value: string
-}
-/**
- * The build of a local host process, as it states it in its answer to a hello.
- */
-export interface LocalBuild {
-  /**
-   * The process's build identifier: its program name and its release.
-   */
-  build_id: string
-  protocol_version: PackageVersion
-}
-/**
- * The version of the protocol package the process was built from.
- */
-export interface PackageVersion {
-  /**
-   * The major number.
-   */
-  major: number
-  /**
-   * The minor number, which is the compatibility level below 1.0.0.
-   */
-  minor: number
-  /**
-   * The patch number, which never changes a type.
-   */
-  patch: number
 }
 /**
  * The limits both sides will use.
@@ -6785,19 +6833,6 @@ export interface SessionCreateParams {
    * How long the worker's execution context should last.
    */
   worker_profile: 'desktop_bound' | 'headless_user'
-}
-/**
- * One environment variable in a create request's snapshot.
- */
-export interface EnvironmentVariable {
-  /**
-   * The name.
-   */
-  name: string
-  /**
-   * The value.
-   */
-  value: string
 }
 /**
  * How this session starts its root shell and what may be launched inside it.
