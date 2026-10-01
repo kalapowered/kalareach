@@ -625,6 +625,22 @@ fn lock(file: &File, path: &Path, operation: rustix::fs::FlockOperation) -> Resu
     }
 }
 
+/// Whether nothing holds the release whose manifest is `file`: the exclusive lock is taken to find
+/// out, and let go of by unlocking it. A lock goes with its last descriptor, and a program started
+/// meanwhile has a copy of this one until its own program takes over, so closing the file would
+/// leave the lock to that program and the question would hold what it asked about.
+#[cfg(unix)]
+fn probe_is_free(file: &File) -> std::io::Result<bool> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock)?;
+            Ok(true)
+        }
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
+}
+
 /// A host's store of installed releases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Store {
@@ -911,11 +927,9 @@ impl Store {
         let path = self.manifest(release);
         let file =
             open_regular_file(&path).map_err(|error| InstallError::io("open", &path, error))?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(false),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(true),
-            Err(error) => Err(InstallError::io("lock", &path, std::io::Error::from(error))),
-        }
+        probe_is_free(&file)
+            .map(|free| !free)
+            .map_err(|error| InstallError::io("lock", &path, error))
     }
 
     /// Removes a release no running process holds, and says whether it did. Whatever else is at
@@ -1289,7 +1303,18 @@ mod tests {
             .output()
         {
             Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).replace('\n', " ")
+                let listing = String::from_utf8_lossy(&output.stdout);
+                let mut holders = Vec::new();
+                for line in listing.lines() {
+                    if let Some(number) = line.strip_prefix('p') {
+                        holders.push(format!("process {number}"));
+                    } else if let (Some(name), Some(last)) =
+                        (line.strip_prefix('c'), holders.last_mut())
+                    {
+                        last.push_str(&format!(" ({name})"));
+                    }
+                }
+                holders.join(", ")
             }
             Ok(_) => "no process that can be seen".to_owned(),
             Err(error) => format!("lsof did not run: {error}"),
@@ -1418,19 +1443,21 @@ mod tests {
         );
     }
 
-    /// A program a test starts, ended and reaped when the test ends, however it ends.
-    struct Sleeper(std::process::Child);
+    /// A program a test starts, ended and reaped when the test ends. It reads from a pipe this test
+    /// holds the other end of, so it also ends when the test's process does, however that ends.
+    struct Started(std::process::Child);
 
-    impl Drop for Sleeper {
+    impl Drop for Started {
         fn drop(&mut self) {
+            drop(self.0.stdin.take());
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
     }
 
     /// A program started while a hold is open has a copy of its descriptor, and the release stays
-    /// held for as long as that program keeps the copy, however the holder lets go; once the program
-    /// has, the release goes.
+    /// held for as long as that program keeps the copy, whether the holder drops the hold or its
+    /// process ends; once the program has let go, the release goes.
     #[test]
     fn a_release_stays_held_while_a_program_started_with_its_hold_keeps_a_copy() {
         use std::process::Stdio;
@@ -1451,10 +1478,11 @@ mod tests {
             ._hold
             .try_clone()
             .expect("the descriptor is copied");
-        let program = Sleeper(
-            std::process::Command::new("sleep")
-                .arg("3600")
-                .stdin(Stdio::from(copy))
+        let program = Started(
+            std::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(copy))
+                .stderr(Stdio::null())
                 .spawn()
                 .expect("the program starts"),
         );
@@ -1474,7 +1502,14 @@ mod tests {
             test.store.retire(&one, &update).expect("asks")
         })
         .expect_err("the copy is still there");
-        assert!(still.contains(&program.0.id().to_string()), "{still}");
+        let (_, holders) = still.split_once("held by: ").expect("it names the holders");
+        let number = program.0.id().to_string();
+        assert!(
+            holders
+                .split(|character: char| !character.is_ascii_digit())
+                .any(|word| word == number),
+            "{still}"
+        );
         assert!(manifest.is_file(), "nothing of the release was removed");
 
         drop(program);
@@ -1484,6 +1519,36 @@ mod tests {
             || test.store.retire(&one, &update).expect("removes"),
         );
         assert!(!test.store.release_directory(&one).exists());
+    }
+
+    /// Asking whether a release is held takes a lock to find out, and lets go of it at once: a
+    /// program started at that moment keeps a copy of the descriptor, and the lock must not go with
+    /// the copy, or a question would hold the release it asked about.
+    #[test]
+    fn asking_whether_a_release_is_held_leaves_nothing_held_though_the_descriptor_is_copied() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let path = test.store.manifest(&one);
+        let asked = File::open(&path).expect("the question opens the manifest");
+        let copy = asked.try_clone().expect("a program started now has a copy");
+
+        assert!(probe_is_free(&asked).expect("asks"), "nothing holds it");
+        drop(asked);
+        let program = File::open(&path).expect("a program opens its manifest");
+        assert!(
+            rustix::fs::flock(&program, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok(),
+            "the copy keeps no lock: a program takes its hold at once"
+        );
+        drop(program);
+
+        // The control: a hold makes the same question answer that it is held.
+        let hold = File::open(&path).expect("a program opens its manifest");
+        rustix::fs::flock(&hold, rustix::fs::FlockOperation::NonBlockingLockShared)
+            .expect("the hold");
+        let again = File::open(&path).expect("the question opens the manifest");
+        assert!(!probe_is_free(&again).expect("asks"), "a hold is seen");
+        drop(copy);
     }
 
     /// Removing a release follows no link: a name that is a link is taken away and what it pointed
@@ -1627,7 +1692,9 @@ mod tests {
         );
         drop(removal);
         let opened = File::open(&path).expect("a program opens its manifest");
-        assert!(hold_opened_within(opened, path, &one, Duration::from_millis(200)).is_ok());
+        // A program another test starts while the removal's lock is held keeps a copy of it until
+        // its own program takes over, so the start waits for the lock rather than for a time.
+        assert!(hold_opened_within(opened, path, &one, RELEASE_WAIT).is_ok());
     }
 
     /// A program that opened its manifest while its release was being removed does not run: once
