@@ -1065,6 +1065,28 @@ impl DescriptionService {
         }
     }
 
+    /// Forgets every piece of content this service holds in memory, for every session: the queued
+    /// jobs, the retained contexts and events, and whatever waits behind a job. Returns how many
+    /// queued jobs and sessions with changes pending went. The store's rows are not touched:
+    /// removing them is the store's own step.
+    ///
+    /// This is what privacy mode owes the part of the service that holds no row: a change captured
+    /// before it could otherwise reach a job after privacy mode ended.
+    pub fn forget_content(&mut self) -> u64 {
+        let mut forgotten = self.scheduler.cancel_all();
+        for tracker in self.trackers.values_mut() {
+            if tracker.settles_at_ms().is_some() {
+                forgotten += 1;
+            }
+            tracker.forget();
+        }
+        self.events.clear();
+        self.retried.clear();
+        self.superseded.clear();
+        self.waiting.clear();
+        forgotten
+    }
+
     /// Returns how many sessions this environment is tracking.
     #[must_use]
     pub fn live_sessions(&self) -> usize {
