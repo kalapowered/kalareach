@@ -7,8 +7,9 @@
 //! and in the preview a person sees before anything is written.
 //!
 //! One scanner reads a field's text and replaces spans of it; every other character is left as it
-//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. The home
-//! directory is replaced first, over the whole field. Then:
+//! was, so a path with spaces, an apostrophe or a backslash comes back unchanged. Credentials are
+//! read in the field as it was written, and the home directory is replaced in what is left, so a
+//! quote in the home directory is a quote in the text the rules read. Then:
 //!
 //! * **Assignments.** A name, then `=`, then a value: when the name says credential, the value
 //!   becomes `[redacted]`. The name is the run of letters, digits, `_`, `.` and `-` before the
@@ -28,12 +29,12 @@
 //!
 //! A quote in a field also decides where a value ends, and a quote can be a character of a path as
 //! well as a quote: the apostrophe of `/Users/Tom's x`, the apostrophe of `Rock 'n Roll`. Reading
-//! the text from its start as a shell does cannot tell the two apart, and each reading puts the
-//! end of a value in a different place. So a value is read as a word, from where it starts, and
-//! only where no reading can put a quote around it: the quote that would have to open before it and
-//! the quote that would have to close after it are both needed, so a field with a quote before a
-//! credential's value and a quote at or after it is withheld. A quoted argument that holds a
-//! credential (`-e "PASSWORD=two words"`, the script of `sh -c`) is such a field.
+//! the text from its start as a shell does cannot tell the two apart, each reading puts the end of
+//! a value in a different place, and a quote before a credential that nothing closes (a truncated
+//! command) surrounds the value to the end of the text. So a value is read as a word, from where it
+//! starts, and only where no quote comes before it: a field with a quote before a credential's
+//! value is withheld. A quoted argument that holds a credential (`-e "PASSWORD=two words"`, the
+//! script of `sh -c`) is such a field.
 //!
 //! # What a name says
 //!
@@ -50,12 +51,10 @@
 //! It does not find a credential by its value. A secret that is a positional word, a plain path
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
 //! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
-//! or `#` in a URL, a quote character inside a quoted value (`TOKEN='it's'`), a value in `$'...'`
+//! or `#` in a URL, a quote character that is part of a secret (`TOKEN='it's a secret'`), a value in `$'...'`
 //! quoting, or a name nobody listed stays in the text. So does a user name anywhere in a
 //! path but the home directory's. The preview shows everything that will be written, and a person
 //! can leave a session out.
-
-use std::borrow::Cow;
 
 /// The name of these rules, recorded in the file and in the bundle's manifest.
 pub const RULES: &str = "session-content-1";
@@ -99,14 +98,20 @@ impl Paths {
     }
 }
 
-/// Redacts one field's text: its home directory, and each credential its text spells.
+/// Redacts one field's text: each credential its text spells, then its home directory.
+///
+/// The credentials are read in the text as it was written: a quote in the home directory
+/// (`/home/o'neil`) is a quote before the credential that follows it, and replacing the home first
+/// would hide it.
 #[must_use]
 pub fn field(text: &str, home: Option<&str>, paths: Paths) -> String {
-    let homed = home.map_or(Cow::Borrowed(text), |home| {
-        Cow::Owned(replace_home(text, home, paths))
-    });
-    credentials(&homed)
-        .unwrap_or_else(|| format!("[withheld: {} characters]", text.chars().count()))
+    match credentials(text) {
+        Some(redacted) => match home {
+            Some(home) => replace_home(&redacted, home, paths),
+            None => redacted,
+        },
+        None => format!("[withheld: {} characters]", text.chars().count()),
+    }
 }
 
 /// Replaces each place `home` is a path's start with [`HOME`].
@@ -351,11 +356,12 @@ fn has_quote(text: &str) -> bool {
 }
 
 /// Where the value that starts at `start` ends: as a word read from `start` ([`value_end`]), or
-/// `None`, which withholds the field, when a quote could surround the value: one before `start`
-/// that opens, and one at or after it that closes. Where either is missing no quote can enclose the
-/// value, and the word is the whole of it.
+/// `None`, which withholds the field, when a quote comes before `start`. A quote there can open a
+/// quote around the value that a later quote closes, or that nothing closes and that runs to the
+/// end of the text, or it can be a character of a name; nothing reads the text well enough to say.
+/// With no quote before it, nothing can open one, and the word is the whole of the value.
 fn value_end_from(text: &str, start: usize) -> Option<usize> {
-    if has_quote(&text[..start]) && has_quote(&text[start..]) {
+    if has_quote(&text[..start]) {
         return None;
     }
     value_end(text, start)
