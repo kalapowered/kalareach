@@ -1882,8 +1882,24 @@ impl WorkerService {
                 ),
             );
         }
+        // An origin is something only a bridge's helper has, and only for an invocation that was
+        // locally authenticated where it began. This worker refuses any other, whatever the helper
+        // checked before it connected.
+        if let Some(declared) = hello.origin.as_ref()
+            && (hello.client != LocalClientKind::Cli || !declared.is_admissible())
+        {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "a process bridge carries locally authenticated invocations only, and only a \
+                     command-line client may declare where one began",
+                ),
+            );
+        }
         state.negotiated = true;
         state.client_kind = hello.client;
+        state.origin = hello.origin;
         // The peer's offered limits bound what this worker sends it, and never raise this host's
         // own: a client that offers more than this host will accept does not get more.
         state.peer_limits = kr_protocol::hello::ReceiveLimits {
@@ -6667,6 +6683,9 @@ pub struct ConnectionState {
     pub controller: bool,
     /// Which kind of client opened this connection, as it declared in its hello.
     pub client_kind: LocalClientKind,
+    /// Where this connection's requests originally entered, when it is a process bridge's helper
+    /// and said so in its hello. Kept for the life of the connection: a connection says hello once.
+    pub origin: Option<kr_protocol::local::BridgeOrigin>,
     /// What the peer said it can receive. Nothing this worker sends exceeds it.
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
     /// The generation this connection proved, when it is a controller.
@@ -6762,6 +6781,7 @@ impl ConnectionState {
             negotiated: false,
             controller: false,
             client_kind: LocalClientKind::Cli,
+            origin: None,
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             generation: None,
             controller_role: ControllerConnectionRole::Authority,

@@ -2517,6 +2517,7 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
             &mutation,
             Method::AgentToolsInstall,
             connection_id,
+            None,
             Some(accepted),
             Some(admitted_at),
         )

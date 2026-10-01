@@ -6278,6 +6278,16 @@ export interface LocalHello {
    * Every protocol version the client offers.
    */
   offered_versions: ProtocolVersion2[]
+  /**
+   * Where this connection's requests originally entered, when it is a process bridge's helper
+   * connecting on an invoker's behalf.
+   *
+   * Absent for every other client, and then omitted from the frame, so a hello that declares no
+   * origin is the frame it always was and a process that outlived an upgrade still reads it. A
+   * host or worker of a build before this member refuses a hello that carries one, which fails
+   * closed. Absence is not a shape to be read two ways: it means the connection is not bridged.
+   */
+  origin?: BridgeOrigin | null
 }
 /**
  * The client's own receive limits.
@@ -6316,6 +6326,33 @@ export interface ProtocolVersion2 {
    * The minor version. A peer selects the highest minor both sides support.
    */
   minor: number
+}
+/**
+ * Where a request that crossed a process bridge first entered, as the invoker declares it.
+ *
+ * Section 3 has a request record the ingress it *originally* arrived on, `local_peer` or
+ * `network_device`, and not merely the local IPC hop the bridge's helper makes at the destination.
+ * A process bridge carries locally authenticated command-line invocations only, so the one
+ * ingress a destination admits here is [`ActorIngress::LocalIpc`] (`local_peer`); a declaration of
+ * any other is refused at the hello.
+ *
+ * This is a record and a restriction, never authority. The destination authenticates the helper by
+ * its own operating-system credentials and issues its own action window and generation, and
+ * nothing in a declared origin widens what that connection may do. What it does is let the
+ * destination know that the connection arrived over a bridge, so that a rule only a destination
+ * can keep, such as a request crossing at most one bridge, is kept there and not left to the
+ * helper alone.
+ */
+export interface BridgeOrigin {
+  /**
+   * The environment the invoker ran in.
+   */
+  environment_id: string
+  /**
+   * The ingress the request originally arrived on.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
 }
 /**
  * The first frame the host sends back.

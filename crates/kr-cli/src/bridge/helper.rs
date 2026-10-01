@@ -330,9 +330,15 @@ async fn reach(
 ) -> std::result::Result<(kr_ipc::client::LocalClient, kr_protocol::local::LocalRole), Unreached> {
     let paths = HostPaths::discover().map_err(CliError::from)?;
     let known = resolve::select(&paths, environment)?;
+    // What the destination is told of where this invocation began: the invoker's own declaration,
+    // which the destination checks again for itself and never takes for authority.
+    let origin = kr_protocol::local::BridgeOrigin {
+        environment_id: hello.origin_environment_id,
+        ingress: hello.origin_ingress,
+    };
     let (client, role) = match hello.target {
         BridgeTarget::Controller => (
-            controller(&paths, &known, hello.start).await?,
+            controller(&paths, &known, hello.start, origin).await?,
             kr_protocol::local::LocalRole::Controller,
         ),
         BridgeTarget::Session { session_id } => {
@@ -342,14 +348,21 @@ async fn reach(
                 Some(known.environment_id),
             ) {
                 Ok((_, descriptor)) => (
-                    resolve::open_worker(&descriptor, crate::build_id()).await?,
+                    resolve::open_worker_for(&descriptor, crate::build_id(), Some(origin)).await?,
                     kr_protocol::local::LocalRole::Worker,
                 ),
                 Err(CliError::UnknownSession(_)) => {
                     // No worker publishes a descriptor for it, so the daemon's retained record is
                     // what says whether it closed. After a stop of the whole environment that
                     // daemon has to be started to be asked, which an attach is allowed to do.
-                    if is_destination_session_closed(&paths, &known, session_id, hello.start).await
+                    if is_destination_session_closed(
+                        &paths,
+                        &known,
+                        session_id,
+                        hello.start,
+                        origin,
+                    )
+                    .await
                     {
                         return Err(Unreached::Refusal(Refusal::SessionClosed));
                     }
@@ -383,16 +396,21 @@ async fn controller(
     paths: &HostPaths,
     known: &resolve::KnownEnvironment,
     start: bool,
+    origin: kr_protocol::local::BridgeOrigin,
 ) -> Result<kr_ipc::client::LocalClient> {
-    if !start {
-        return resolve::open_controller(&known.paths, crate::build_id()).await;
+    if start {
+        // The daemon is reached the way `kr new` reaches it, starting it where this environment
+        // has chosen to. That connection is a plain one, made only to be sure a daemon is there;
+        // the one this bridge carries is made after it, and says where the invocation began.
+        let (reached, started) = crate::startup::open_or_start(paths, known).await?;
+        drop(reached);
+        if let Some(started) = started {
+            // Diagnostic output, which is where a person reading the log looks for what a helper
+            // did.
+            crate::report::say(&shown!("kr: {}", started.describe(known.environment_id)));
+        }
     }
-    let (client, started) = crate::startup::open_or_start(paths, known).await?;
-    if let Some(started) = started {
-        // Diagnostic output, which is where a person reading the log looks for what a helper did.
-        crate::report::say(&shown!("kr: {}", started.describe(known.environment_id)));
-    }
-    Ok(client)
+    resolve::open_controller_for(&known.paths, crate::build_id(), Some(origin)).await
 }
 
 /// What this helper's user is called, and where its home is, as the destination's account records
@@ -575,8 +593,9 @@ async fn is_destination_session_closed(
     known: &resolve::KnownEnvironment,
     session_id: kr_protocol::ids::SessionId,
     start: bool,
+    origin: kr_protocol::local::BridgeOrigin,
 ) -> bool {
-    let Ok(mut client) = controller(paths, known, start).await else {
+    let Ok(mut client) = controller(paths, known, start, origin).await else {
         return false;
     };
     let params = kr_protocol::session::SessionReadParams { session_id };
