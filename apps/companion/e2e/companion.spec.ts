@@ -3488,14 +3488,60 @@ test.describe("the phone's field above a keyboard the platform panned the page f
           await expect
             .poll(async () => {
               const at = await where()
-              return at === null ? 'no field' : at.bottom <= at.visibleBottom + 1 ? 'above the keyboard' : `${Math.round(at.bottom - at.visibleBottom)} px under the keyboard`
+              if (at === null) return 'no field'
+              const off = Math.round(at.bottom - at.visibleBottom)
+              // Under the terminal the field is the foot of the session and rests on the keyboard's
+              // edge. Under the conversation, in a session that fits whole, the pickers lie under the
+              // field and it is above the keyboard by their height, as it always was.
+              const rests = pane === 'terminal' || !each.fits ? Math.abs(off) <= 1 : off <= 1
+              return rests ? 'where it rests' : off > 0 ? `${off} px under the keyboard` : `${-off} px above the keyboard`
             })
-            .toBe('above the keyboard')
+            .toBe('where it rests')
           const at = await where()
           expect(at?.bottom, 'the field is not above the top of what the person sees').toBeGreaterThan(at?.shellTop ?? 0)
         })
       }
     }
+  }
+
+  for (const surface of ['ios', 'android'] as const) {
+    test(`follows a keyboard that changes its height and goes, on ${surface}, and leaves the session where it was`, async ({
+      page
+    }) => {
+      await onPhone(page, surface, { width: 320, height: 658, scale: '200%' }, `&session=${SESSION}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      const field = page.locator('textarea[id^="composer-"]')
+      await field.focus()
+      const cover = (covered: number, panned: number) =>
+        page.evaluate(
+          ([k, p]) => {
+            document.documentElement.style.setProperty('--keyboard', `${k}px`)
+            document.documentElement.style.setProperty('--pan', `${p}px`)
+          },
+          [covered, panned]
+        )
+      const off = () =>
+        page.evaluate(() => {
+          const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
+          const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
+          const covered = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
+          return box && shell ? Math.round(box.bottom - (shell.bottom - covered)) : null
+        })
+      const scrolled = () => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
+      const before = await scrolled()
+      // A keyboard first as tall as it is while it announces itself, with the page panned, and then
+      // as tall as it stays, with the pan gone: the field is on its edge each time, never short of
+      // it by what the first state needed.
+      for (const [covered, panned] of [[399, 297], [259, 0], [312, 241], [259, 227]] as const) {
+        await cover(covered, panned)
+        await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeLessThanOrEqual(1)
+        await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeGreaterThanOrEqual(-1)
+      }
+      await field.blur()
+      await cover(0, 0)
+      await expect.poll(scrolled, { message: 'the session is where it was before the keyboard' }).toBe(before)
+    })
   }
 })
 
