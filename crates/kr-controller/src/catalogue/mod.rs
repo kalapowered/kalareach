@@ -966,6 +966,7 @@ impl CatalogueModule {
                 let views = catalogue.repository_views().map_err(ProtocolError::from)?;
                 encode(&wire::CatalogueListResult {
                     catalogues: views.iter().map(summary).collect(),
+                    enrolment_budgets: wire_budgets(&self.budgets_in_force()),
                 })
             }
             Method::PluginList => {
@@ -2360,6 +2361,20 @@ fn trust_plan(
             .into_iter()
             .collect(),
     ))
+}
+
+/// The budgets a repository may ask for, as the protocol carries them.
+fn wire_budgets(
+    budgets: &kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+) -> wire::CatalogueBudgets {
+    wire::CatalogueBudgets {
+        metadata_bytes: kr_protocol::scalars::U64::new(budgets.metadata_bytes),
+        metadata_entries: kr_protocol::scalars::U64::new(budgets.metadata_entries),
+        retained_generations: kr_protocol::scalars::U64::new(budgets.retained_generations),
+        retained_metadata_bytes: kr_protocol::scalars::U64::new(budgets.retained_metadata_bytes),
+        payload_cache_bytes: kr_protocol::scalars::U64::new(budgets.cached_payload_bytes),
+        full_offline_mirror: budgets.full_offline_mirror,
+    }
 }
 
 /// A plan that cannot be encoded is a request this host cannot describe.

@@ -25,7 +25,7 @@ use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::catalogue::{
-    CatalogueAddParams, CatalogueAddResult, CatalogueBudgets, CatalogueKind, CatalogueListParams,
+    CatalogueAddParams, CatalogueAddResult, CatalogueKind, CatalogueListParams,
     CatalogueListResult, CataloguePinParams, CataloguePinResult, CatalogueRemoveParams,
     CatalogueRemoveResult, CatalogueSummary, CatalogueSyncParams, CatalogueSyncResult,
     PluginAdmission, PluginEnableParams, PluginEnableResult, PluginInstallParams,
@@ -337,7 +337,20 @@ async fn wait_for_an_owner_device<T>(
                     )));
                 }
             }
-            Ok(Err(error)) => return Err(error),
+            // The host's own refusal is its answer, passed on as itself. Anything else, a
+            // connection that ended or an answer that cannot be read, may have come after the host
+            // performed the request.
+            Ok(Err(error @ CliError::Refused(_))) => return Err(error),
+            Ok(Err(_)) => {
+                return Err(CliError::Refused(refusal(
+                    ErrorCode::OutcomeUnknown,
+                    Shown::said(
+                        "the connection to the host ended before it answered the request, so \
+                         whether it was performed is not known: look at what the host lists before \
+                         asking again",
+                    ),
+                )));
+            }
         }
     }
 }
@@ -611,10 +624,9 @@ async fn repo_list(paths: &HostPaths, arguments: &PluginListArguments, json: boo
 /// The root is read from the file the person names and travels with the request, because a host
 /// that fetched it from the location it is meant to verify would be trusting the thing it is
 /// checking. The repository is a directory on this machine when its metadata is addressed by a
-/// `file` location and a community repository otherwise, with the budgets this host's configuration
-/// allows and no capability beyond the default; an owner device confirms exactly that enrolment.
+/// `file` location and a community repository otherwise, with the budgets the host says it allows
+/// and no capability beyond the default; an owner device confirms exactly that enrolment.
 async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: bool) -> Result<()> {
-    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
     let root = std::fs::read(&arguments.root).map_err(|error| {
         CliError::Usage(shown!(
             "the trust root file could not be read: {}",
@@ -622,13 +634,17 @@ async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: b
         ))
     })?;
     let mut daemon = Daemon::open(paths, &arguments.selector).await?;
-    // What this host's own configuration allows a repository, which is the product's default
-    // unless its owner narrowed it: a request for more is refused by the host, and this command
-    // has no option to ask for less.
-    let defaults: EnrolmentBudgets =
-        crate::doctor::configuration::load(&paths.environment(daemon.environment_id()))
-            .ceilings()
-            .enrolment_budgets();
+    // What this host says a repository may ask for. It is what the host enforces, which a document
+    // on disk may no longer say, so it is read from the host: a request for more is refused, and
+    // this command has no option to ask for less.
+    let listed: CatalogueListResult = daemon
+        .read(
+            Method::CatalogueList,
+            &CatalogueListParams {
+                environment_id: daemon.environment_id(),
+            },
+        )
+        .await?;
     let params = CatalogueAddParams {
         environment_id: daemon.environment_id(),
         catalogue_id: arguments.catalogue.clone(),
@@ -640,16 +656,7 @@ async fn repo_add(paths: &HostPaths, arguments: &PluginRepoAddArguments, json: b
         metadata_url: arguments.metadata_url.clone(),
         targets_url: arguments.targets_url.clone(),
         root: base64::engine::general_purpose::STANDARD.encode(&root),
-        budgets: CatalogueBudgets {
-            metadata_bytes: kr_protocol::scalars::U64::new(defaults.metadata_bytes),
-            metadata_entries: kr_protocol::scalars::U64::new(defaults.metadata_entries),
-            retained_generations: kr_protocol::scalars::U64::new(defaults.retained_generations),
-            retained_metadata_bytes: kr_protocol::scalars::U64::new(
-                defaults.retained_metadata_bytes,
-            ),
-            payload_cache_bytes: kr_protocol::scalars::U64::new(defaults.cached_payload_bytes),
-            full_offline_mirror: defaults.full_offline_mirror,
-        },
+        budgets: listed.enrolment_budgets,
         ceiling: Vec::new(),
         // Nothing at this terminal can sign for the owner: an owner device's recorded answer to
         // the challenge for exactly this request is what the host spends.
@@ -908,7 +915,7 @@ mod tests {
 
     /// KR-REQ-07.47: the request is repeated, with nothing added, until the host spends an owner
     /// device's answer, and the result is the host's own.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_request_is_repeated_until_the_host_spends_the_answer() {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
@@ -928,10 +935,11 @@ mod tests {
     /// KR-REQ-07.47: when no owner device answers, the wait ends at the challenge's own deadline
     /// with a refusal that says nothing was changed, and no request is made after it: the host
     /// cannot spend an answer to a challenge that has ended.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_wait_ends_at_the_deadline_and_asks_nothing_after_it() {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
+        let started = tokio::time::Instant::now();
         let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
             asks.note();
             Err(needs_the_owner())
@@ -944,16 +952,19 @@ mod tests {
         let said = &refused.message;
         assert!(said.contains("Nothing was changed"), "{said}");
         let at = asks.at.lock().expect("the record");
-        assert!(at.len() >= 2, "it asked until the deadline: {}", at.len());
+        // On a clock that only the waits move, each poll is 5 ms apart: the requests are the ones
+        // made at 0, 5, 10 ... 55 ms, none at or after the deadline.
+        assert_eq!(at.len(), 12, "it asked at every poll until the deadline");
         assert!(
             at.iter().all(|moment| *moment < deadline),
             "no request was made after the deadline"
         );
+        assert_eq!(at[0], started, "the first request was made at once");
     }
 
     /// KR-REQ-07.47: a challenge that has ended already is asked about once, because the host may
     /// hold an answer it has not spent, and then ends the wait.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_challenge_that_has_ended_is_asked_once() {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now();
@@ -970,7 +981,7 @@ mod tests {
     /// deadline and a bound beyond it, and what it says is that the outcome is not known: the
     /// request may have been performed, and "nothing was changed" would be a claim nobody can
     /// make. The control is a refusal for another reason, which ends the wait at once as itself.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_host_that_does_not_answer_leaves_the_outcome_unknown() {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(20);
         let silent: Result<u32> = wait_for_an_owner_device(
@@ -1007,6 +1018,49 @@ mod tests {
         };
         assert_eq!(refused.code, ErrorCode::QuotaExceeded);
         assert_eq!(asks.count(), 1);
+    }
+
+    /// KR-REQ-07.47: a connection that ends after a request was sent, or an answer that cannot be
+    /// read, leaves the outcome as unknown as a host that said nothing: the host may have
+    /// performed the request, so the command does not say it did not. A host's own refusal is the
+    /// control: it answered, and is passed on as itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_ends_after_the_request_leaves_the_outcome_unknown() {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let failures: [fn() -> CliError; 2] = [
+            || {
+                CliError::Ipc(kr_ipc::IpcError::Socket {
+                    operation: "read the host's answer",
+                    source: std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+                })
+            },
+            || CliError::Other(Shown::said("the host's answer could not be read")),
+        ];
+        for failure in failures {
+            let ended: Result<u32> =
+                wait_for_an_owner_device(deadline, short(), short(), async || Err(failure())).await;
+            let Err(CliError::Refused(refused)) = ended else {
+                panic!("a refusal that says the outcome is not known");
+            };
+            assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
+            assert!(refused.message.contains("not known"), "{}", refused.message);
+            assert!(
+                !refused.message.contains("Nothing was changed"),
+                "{}",
+                refused.message
+            );
+        }
+        let other: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            Err(CliError::Refused(refusal(
+                ErrorCode::QuotaExceeded,
+                Shown::said("past a budget"),
+            )))
+        })
+        .await;
+        let Err(CliError::Refused(refused)) = other else {
+            panic!("a refusal");
+        };
+        assert_eq!(refused.code, ErrorCode::QuotaExceeded);
     }
 
     /// The time a challenge has left is read once, from the host's own expiry and this clock's

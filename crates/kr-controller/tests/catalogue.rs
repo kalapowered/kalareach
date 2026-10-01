@@ -2117,6 +2117,60 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
     assert_eq!(listed().await, 1);
 }
 
+/// KR-REQ-07.47: `catalogue.list` reports the budgets a repository enrolled now may ask for: what
+/// this host's configuration allows, which is what it holds when it has accepted a document and
+/// goes on holding when a later one cannot be used. A client that adds a repository asks for what
+/// this says, so its request is not refused for a number the host never offered.
+#[tokio::test]
+async fn catalogue_list_reports_the_budgets_a_new_enrolment_may_ask_for() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    let host = host();
+    let listed = || async {
+        let listed: wire::CatalogueListResult = ok(host
+            .module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::CatalogueList,
+                    &wire::CatalogueListParams {
+                        environment_id: host.environment_id,
+                    },
+                ),
+                None,
+            )
+            .await);
+        listed.enrolment_budgets
+    };
+    let wire_of = |budgets: EnrolmentBudgets| wire::CatalogueBudgets {
+        metadata_bytes: U64::new(budgets.metadata_bytes),
+        metadata_entries: U64::new(budgets.metadata_entries),
+        retained_generations: U64::new(budgets.retained_generations),
+        retained_metadata_bytes: U64::new(budgets.retained_metadata_bytes),
+        payload_cache_bytes: U64::new(budgets.cached_payload_bytes),
+        full_offline_mirror: budgets.full_offline_mirror,
+    };
+    assert_eq!(listed().await, wire_of(EnrolmentBudgets::default()));
+
+    let narrowed = EnrolmentBudgets {
+        metadata_bytes: 32 * 1024 * 1024,
+        metadata_entries: 50_000,
+        retained_generations: 1,
+        retained_metadata_bytes: 32 * 1024 * 1024,
+        cached_payload_bytes: 512 * 1024 * 1024,
+        full_offline_mirror: false,
+        ..EnrolmentBudgets::default()
+    };
+    host.module
+        .put_budgets_in_force(narrowed)
+        .await
+        .expect("in force");
+    assert_eq!(
+        listed().await,
+        wire_of(narrowed),
+        "what this host allows now"
+    );
+}
+
 /// The configured package limits hold each package, each no larger than the format's own: a
 /// package past `package_bytes`, `object_count` or `expanded_pack_bytes` is refused by that name
 /// and not installed, and within the limits it installs.
