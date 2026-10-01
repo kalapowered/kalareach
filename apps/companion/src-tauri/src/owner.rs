@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kr_client::pairing::owner::{
-    CannotCheck, Ceremony, CeremonyKind, Listed, OwnerConfirmations, ReviewOutcome, SessionChannel,
-    Subject, is_plain_text, reason, shows_value,
+    CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
+    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
@@ -470,12 +470,6 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
     }
 }
 
-/// The longest publisher statement a manifest may carry, and so the longest this page shows whole.
-const STATEMENT_CHARS: usize = 1000;
-
-/// The longest address, name or identifier this page shows whole.
-const FIELD_CHARS: usize = 2048;
-
 /// `text` as written when it is one plain line of at most `limit` characters, and `None` otherwise.
 fn plain(text: &str, limit: usize) -> Option<String> {
     (!text.is_empty() && text.chars().count() <= limit && is_plain_text(text))
@@ -919,6 +913,8 @@ mod tests {
             "tab\there",
             "bell\u{7}",
             "zero\u{200B}width",
+            "soft\u{00AD}hyphen",
+            "mark\u{061C}ed",
         ] {
             let hostile_statement = PluginInstallPlan {
                 grant_statement: Some(bad.to_owned()),
