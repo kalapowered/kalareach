@@ -816,9 +816,9 @@ struct Exchange {
     epoch: InputLeaseEpoch,
     prompt_generation: PromptGeneration,
     reader_revision: ReaderRevision,
-    /// Whether the host queued an answer for the terminal after the exchange began. The reader
-    /// took its snapshot at a moment the worker cannot place against those bytes, so the
-    /// acknowledgement proves nothing about them.
+    /// Whether the host queued an answer for the terminal after the exchange began, or had one
+    /// queued and not yet written when it began. The reader took its snapshot at a moment the
+    /// worker cannot place against those bytes, so the acknowledgement proves nothing about them.
     reached: bool,
 }
 

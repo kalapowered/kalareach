@@ -124,7 +124,12 @@ as a `host_reply_queued` stimulus when the answer is queued, ahead of anything t
 because of it. An answer that arrives while an exchange is in flight withholds the fence that
 exchange would have published, one that arrives after publication invalidates the fence, and a
 launch reserved on the fence is revoked as queued prior input. The reader's next idle callback asks
-again, and its own snapshot is what accounts for the bytes. The writer drops an answer whose response
+again, and its own snapshot is what accounts for the bytes. An answer the writer has not yet written
+when an exchange begins is told to the machine again as that exchange's own, from a count the writer
+keeps and lowers once each piece has reached the terminal. The writer lowers it after the write
+returns, so an exchange that begins between the two is withheld for bytes the reader already has; the
+reader asks again at its next idle report, which a reader that reports idle once until the next key
+makes at that key. The order is the safe one and is kept. The writer drops an answer whose response
 lane deadline passed while it waited for a terminal that would not take it, before its first byte and
 never part way through.
 
