@@ -2254,53 +2254,51 @@ fn invocations(
 ) -> std::result::Result<(), String> {
     match value {
         serde_json::Value::Object(members) => {
-            // A hook may be written as the forwarder's name with its arguments in a list, or as
-            // one command line of plain words that its application runs through a shell: the
-            // forwarder's name, the application it reports for and the surface, and nothing else.
-            // A line with any other word, a quote or a shell operator in it is not one this host
-            // reads as a registration, so it is refused rather than guessed at.
-            let line = members
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .filter(|command| {
-                    *command != "kr-hook" && command.split_whitespace().next() == Some("kr-hook")
-                });
-            if let Some(line) = line {
-                let words: Vec<&str> = line.split(' ').collect();
-                let surface = match words.as_slice() {
-                    ["kr-hook", application, "hook"] => (application, BridgeSurface::Hook),
-                    ["kr-hook", application, "channel"] => (application, BridgeSurface::Channel),
-                    _ => {
-                        return Err(format!(
-                            "{destination} starts the forwarder with arguments it does not accept \
-                             from a bridge"
-                        ));
+            // Every command a registration runs is the forwarder, and in a form this host reads: its
+            // name alone, with the application and the surface as the two arguments in a list, or
+            // one line of the name, the application it reports for and the surface, separated by
+            // single spaces, each word of plain characters, for an application that runs a hook
+            // through a shell. Anything else a registration would run, a quoted or escaped name,
+            // an operator, another word, another command, is refused wherever it stands, so that no
+            // command beside a good one is left unread.
+            if let Some(command) = members.get("command") {
+                let unaccepted = || {
+                    format!(
+                        "{destination} starts the forwarder with arguments it does not accept \
+                         from a bridge, or starts something other than the forwarder"
+                    )
+                };
+                let command = command.as_str().ok_or_else(unaccepted)?;
+                let surface = if command == "kr-hook" {
+                    let arguments = members.get("args").and_then(serde_json::Value::as_array);
+                    let words: Vec<&str> = arguments
+                        .map(|arguments| {
+                            arguments
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match (words.as_slice(), arguments.map(Vec::len)) {
+                        ([application, "hook"], Some(2)) => (*application, BridgeSurface::Hook),
+                        ([application, "channel"], Some(2)) => {
+                            (*application, BridgeSurface::Channel)
+                        }
+                        _ => return Err(unaccepted()),
+                    }
+                } else {
+                    let words: Vec<&str> = command.split(' ').collect();
+                    match words.as_slice() {
+                        ["kr-hook", application, "hook"] if plain_word(application) => {
+                            (*application, BridgeSurface::Hook)
+                        }
+                        ["kr-hook", application, "channel"] if plain_word(application) => {
+                            (*application, BridgeSurface::Channel)
+                        }
+                        _ => return Err(unaccepted()),
                     }
                 };
-                applications.insert((*surface.0).to_owned());
-                surfaces.insert(surface.1);
-            }
-            if members.get("command").and_then(serde_json::Value::as_str) == Some("kr-hook") {
-                let arguments = members.get("args").and_then(serde_json::Value::as_array);
-                let words: Vec<&str> = arguments
-                    .map(|arguments| {
-                        arguments
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let surface = match (words.as_slice(), arguments.map(Vec::len)) {
-                    ([application, "hook"], Some(2)) => (application, BridgeSurface::Hook),
-                    ([application, "channel"], Some(2)) => (application, BridgeSurface::Channel),
-                    _ => {
-                        return Err(format!(
-                            "{destination} starts the forwarder with arguments it does not accept \
-                             from a bridge"
-                        ));
-                    }
-                };
-                applications.insert((*surface.0).to_owned());
+                applications.insert(surface.0.to_owned());
                 surfaces.insert(surface.1);
             }
             for nested in members.values() {
@@ -2315,6 +2313,14 @@ fn invocations(
         _ => {}
     }
     Ok(())
+}
+
+/// True for a word of lower-case letters, digits and hyphens, which a shell reads as itself.
+fn plain_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// True when the file at `path` is one this host published with this digest and still holds it;

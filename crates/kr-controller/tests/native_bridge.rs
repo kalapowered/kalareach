@@ -3515,21 +3515,52 @@ fn kr_req_11_42_a_gemini_cli_installation_stopped_at_each_boundary_is_finished_o
     );
 }
 
-/// KR-REQ-11.42: a hook written as one command line is read as a registration only when it is the
-/// forwarder's name, the application it reports for and the surface, each separated by one space.
-/// A line with another word, an operator, a quote, another white space or another application is
-/// refused, and nothing is written. The control is the line the Gemini CLI package ships.
+/// A package whose hooks file is `bytes`, with a recipe that names it.
+#[cfg(unix)]
+fn gemini_target_with_hooks(site: &GeminiSite, bytes: &[u8]) -> BridgeTarget {
+    std::fs::write(site.package().join("bridge/hooks.json"), bytes).expect("a package file");
+    let mut recipe = serde_json::to_value(gemini_recipe()).expect("the recipe encodes");
+    let digest = PayloadDigest::of(bytes).to_string();
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            if step["destination"] == GEMINI_HOOKS_PATH {
+                step["digest"] = serde_json::json!(digest);
+            }
+        }
+    }
+    BridgeTarget {
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        ..site.release()
+    }
+}
+
+/// A hooks file whose entries run `commands`, one hook each.
+#[cfg(unix)]
+fn gemini_hooks(commands: &[&str]) -> Vec<u8> {
+    let entries: Vec<serde_json::Value> = commands
+        .iter()
+        .map(|command| {
+            serde_json::json!({"hooks": [{"type": "command", "name": "kalareach",
+                                           "command": command, "timeout": 5000}]})
+        })
+        .collect();
+    serde_json::json!({"hooks": {"SessionStart": entries}})
+        .to_string()
+        .into_bytes()
+}
+
+/// KR-REQ-11.42: every command a bridge's registration runs is the forwarder, in a form the host
+/// reads: the forwarder's name alone with its arguments in a list, or one line of the forwarder's
+/// name, the application it reports for and the surface, separated by single spaces, each word of
+/// plain characters. A command that is anything else is refused before anything is written, and
+/// it is refused wherever it stands: a quoted or escaped name, an operator, another application
+/// or surface, white space other than the one space, and a bad command beside a good one. The
+/// control is the line the Gemini CLI package ships.
 #[cfg(unix)]
 #[test]
-fn kr_req_11_42_a_hook_command_line_is_a_registration_only_in_its_plain_form() {
-    let hooks = |command: &str| {
-        serde_json::json!({
-            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach",
-                                                   "command": command, "timeout": 5000}]}]}
-        })
-        .to_string()
-    };
-    for command in [
+fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the_host_reads() {
+    let good = "kr-hook gemini-cli hook";
+    let refused_alone = [
         "kr-hook gemini-cli hook; touch /tmp/other",
         "kr-hook gemini-cli hook && other",
         "kr-hook gemini-cli  hook",
@@ -3537,40 +3568,45 @@ fn kr_req_11_42_a_hook_command_line_is_a_registration_only_in_its_plain_form() {
         "kr-hook gemini-cli",
         "kr-hook gemini-cli hook extra",
         "kr-hook 'gemini-cli' hook",
+        "kr-hook gemini$(other) hook",
+        "kr-hook `other` hook",
         "kr-hook another-agent hook",
         "kr-hook gemini-cli tool",
-    ] {
+        "\"kr-hook\" another-agent channel; other-command",
+        "'kr-hook' gemini-cli hook",
+        "kr\\-hook gemini-cli hook",
+        "other-command",
+        "other-command kr-hook gemini-cli hook",
+        " kr-hook gemini-cli hook",
+        "kr-hook gemini-cli hook ",
+        "",
+    ];
+    for command in refused_alone {
+        // On its own, and beside a command that is good.
+        for commands in [vec![command], vec![good, command], vec![command, good]] {
+            let site = GeminiSite::new();
+            let before = site.tree();
+            let target = gemini_target_with_hooks(&site, &gemini_hooks(&commands));
+            let settled = site
+                .bridges()
+                .reconcile(&gemini(), Some(&target))
+                .expect("reconciles");
+            let reason = refused(&settled);
+            assert!(
+                reason.contains("hooks.json") || reason.contains("forwarder"),
+                "{commands:?}: {reason}"
+            );
+            assert_eq!(site.tree(), before, "{commands:?}: nothing was written");
+        }
+    }
+    // The control: the line the package ships, once and repeated, is applied.
+    for commands in [vec![good], vec![good, good]] {
         let site = GeminiSite::new();
-        let before = site.tree();
-        let bytes = hooks(command).into_bytes();
-        std::fs::write(site.package().join("bridge/hooks.json"), &bytes).expect("a package file");
-        let mut recipe = serde_json::to_value(gemini_recipe()).expect("the recipe encodes");
-        let digest = PayloadDigest::of(&bytes).to_string();
-        for step in recipe["install"].as_array_mut().expect("install steps") {
-            if step["destination"] == GEMINI_HOOKS_PATH {
-                step["digest"] = serde_json::json!(digest);
-            }
-        }
-        for step in recipe["remove"].as_array_mut().expect("removal steps") {
-            if step["destination"] == GEMINI_HOOKS_PATH {
-                step["digest"] = serde_json::json!(digest);
-            }
-        }
-        let target = BridgeTarget {
-            recipe: serde_json::from_value(recipe).expect("a recipe"),
-            ..site.release()
-        };
+        let target = gemini_target_with_hooks(&site, &gemini_hooks(&commands));
         let settled = site
             .bridges()
             .reconcile(&gemini(), Some(&target))
             .expect("reconciles");
-        let reason = refused(&settled);
-        assert!(
-            reason.contains("hooks.json")
-                || reason.contains("another-agent")
-                || reason.contains("gemini-cli"),
-            "{command:?}: {reason}"
-        );
-        assert_eq!(site.tree(), before, "{command:?}: nothing was written");
+        assert_eq!(settled, Settled::Applied, "{commands:?}");
     }
 }
