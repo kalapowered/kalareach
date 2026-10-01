@@ -277,7 +277,7 @@ channel, a proof of another capability set and a proof a grant already spent (se
 `a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else` in
 `crates/kr-controller/tests/network_catalogue.rs`). For `catalogue.add` and `plugin.install` the
 proof can be passed inline with the request too, and an installation needs it only when it goes
-beyond what is already permitted or installs a native bridge. Terminals do not have the owner's key,
+beyond what is already permitted, installs a native bridge or declares a command integration. Terminals do not have the owner's key,
 so they do not send a proof with the request. Instead the host spends the one answer an owner device
 recorded for exactly that request, and only for a challenge the host described itself (see
 `a_recorded_owner_answer_lets_catalogue_add_enrol_a_repository_once` in
