@@ -588,15 +588,122 @@ pub mod platform {
             .ok()
     }
 
+    /// The longest a platform program may take to say what it knows.
+    #[cfg(target_os = "macos")]
+    const PLATFORM_PROGRAM_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
     #[cfg(target_os = "macos")]
     fn run(program: &str, arguments: &[&str]) -> Option<String> {
-        let output = std::process::Command::new(program)
+        run_bounded(program, arguments, PLATFORM_PROGRAM_BOUND)
+    }
+
+    /// Runs a program and returns what it printed, when it ends with success within `bound`.
+    ///
+    /// A program that is still running when the bound passes is killed and waited for, and says
+    /// nothing: a reading that never arrives is an unreadable signal, and never a wait for it.
+    #[cfg(all(unix, any(target_os = "macos", test)))]
+    pub(super) fn run_bounded(
+        program: &str,
+        arguments: &[&str],
+        bound: std::time::Duration,
+    ) -> Option<String> {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(program)
             .args(arguments)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()?;
-        output
-            .status
+        let mut stdout = child.stdout.take()?;
+        // Drained as it is written, so a program with a lot to say is not held up by a full pipe.
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = std::time::Instant::now() + bound;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+        let bytes = reader.join().ok()?;
+        status
             .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+            .then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::run_bounded;
+        use std::time::{Duration, Instant};
+
+        /// Waits until `condition` holds, and says what it waited for when it never does.
+        fn until(what: &str, condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !condition() {
+                assert!(Instant::now() < deadline, "waited for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A program that ends in time is read, and one that does not is killed and reads as
+        /// nothing, so a platform program that hangs leaves a signal unreadable and never waits
+        /// for it: the call returns long before the program would have ended by itself, and the
+        /// program is gone. The control is the same shell, ending at once.
+        #[test]
+        fn a_program_that_does_not_end_within_its_bound_is_killed_and_reads_as_nothing() {
+            assert_eq!(
+                run_bounded("/bin/sh", &["-c", "printf ok"], Duration::from_secs(60)),
+                Some("ok".to_owned()),
+                "a program that ends is read"
+            );
+            assert_eq!(
+                run_bounded("/bin/sh", &["-c", "exit 3"], Duration::from_secs(60)),
+                None,
+                "a program that fails says nothing"
+            );
+
+            let directory = tempfile::tempdir().expect("a directory");
+            let record = directory.path().join("pid");
+            // Long enough that a call which waited for it would be seen to, short enough that a
+            // program left behind by a failure here does not stay for long.
+            let script = format!("echo $$ > '{}'; exec /bin/sleep 120", record.display());
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(run_bounded(
+                    "/bin/sh",
+                    &["-c", &script],
+                    Duration::from_secs(1),
+                ));
+            });
+            let result = returned
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the call returned long before the program would have ended itself");
+            assert_eq!(result, None);
+            let pid: u32 = std::fs::read_to_string(&record)
+                .expect("the program had started within its bound")
+                .trim()
+                .parse()
+                .expect("a process identifier");
+            until("the program that did not end to be gone", || {
+                !std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
+        }
     }
 }
