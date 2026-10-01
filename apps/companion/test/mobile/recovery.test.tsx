@@ -403,6 +403,9 @@ describe('a draft that came back is bound again when the host has said where it 
       expect(screen.getByText(/1 lost its session/)).toBeInTheDocument()
     })
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    // The text is kept where it was, and nothing was sent to anywhere on its account.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('for a session that closed')
+    expect(second.controls.submissions).toBe(0)
   })
 })
 
