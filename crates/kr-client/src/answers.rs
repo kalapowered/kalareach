@@ -317,17 +317,16 @@ impl QuestionHost for Session {
         target: ActionTarget,
         params: QuestionAnswerParams,
     ) -> std::result::Result<QuestionResolveResult, ClientError> {
-        Ok(self
-            .mutate(
-                Method::QuestionAnswer,
-                target,
-                None,
-                &ParamsValue::empty(),
-                &params,
-                ANSWER_TTL,
-            )
-            .await?
-            .to_typed()?)
+        self.mutate(
+            Method::QuestionAnswer,
+            target,
+            None,
+            &ParamsValue::empty(),
+            &params,
+            ANSWER_TTL,
+        )
+        .await?
+        .to_typed()
     }
 
     async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {

@@ -38,9 +38,7 @@ use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionCreateParams,
     QuestionKind, QuestionResolveResult, QuestionState,
 };
-use kr_protocol::receipt::{
-    ActionReadParams, ActionReadResult, Receipt, ReceiptResponse, ReceiptState,
-};
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, ReceiptResponse, ReceiptState};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};

@@ -1294,26 +1294,66 @@ fn written_close(recording: &Recording) -> (kr_protocol::session::SessionCloseRe
     (value.to_typed().expect("a close answer"), carried)
 }
 
+/// How far a device's grant reaches into a session, for the tests of what a close answer shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// No `session.view`.
+    NoView,
+    /// `session.view`, and a history that begins after the session did.
+    ViewAfterTheStart,
+    /// `session.view`, and a history that reaches back to the session's start.
+    ViewFromTheStart,
+}
+
+impl Reach {
+    const ALL: [Self; 3] = [
+        Self::NoView,
+        Self::ViewAfterTheStart,
+        Self::ViewFromTheStart,
+    ];
+
+    /// Whether the description of a session this reach is shown goes with the answer.
+    const fn shows_the_description(self) -> bool {
+        matches!(self, Self::ViewFromTheStart)
+    }
+
+    /// Shapes `grant` to this reach. A description's own date is the moment the session was
+    /// created, which the acceptances here take from the clock, so a bound of the moment the test
+    /// began is after the start and a bound of nothing reaches it.
+    fn shape(self, grant: &mut kr_protocol::grant::Grant) {
+        grant.actions = if self == Self::NoView {
+            [ActionRight::SessionClose].into_iter().collect()
+        } else {
+            [ActionRight::SessionView, ActionRight::SessionClose]
+                .into_iter()
+                .collect()
+        };
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(
+            if self == Self::ViewAfterTheStart {
+                u64::MAX / 2
+            } else {
+                0
+            },
+        ));
+    }
+}
+
 /// KR-REQ-23.34: a `session.close` answer carries the worker's description of the session only
-/// where the decision it is written under lets the device read the session. With `session.view`
-/// it goes whole; without it the acceptance goes and the description does not, not even as a
-/// member that says nothing.
+/// where the decision it is written under lets the device read the session, and the device's
+/// history reaches back to the session's start, as `session.describe` decides it. With both it goes
+/// whole; without `session.view`, or with a history that begins after the session did, the
+/// acceptance goes and the description does not, not even as a member that says nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_answer_carries_the_description_only_to_a_device_that_may_read_the_session() {
-    for may_read in [false, true] {
+    for reach in Reach::ALL {
+        let may_read = reach.shows_the_description();
         let temp = kr_ipc::testing::TempHost::create();
         let controller = super::super::tests::daemon(&temp).await;
         let (mut grant, _) = super::super::tests::granted(
             kr_protocol::grant::GrantExpiry::Never,
             controller.policy().authority_revision(),
         );
-        grant.actions = if may_read {
-            [ActionRight::SessionView, ActionRight::SessionClose]
-                .into_iter()
-                .collect()
-        } else {
-            [ActionRight::SessionClose].into_iter().collect()
-        };
+        reach.shape(&mut grant);
         let device = record_for(&grant);
         controller.devices().commit(&device).expect("paired");
         let recording = Arc::new(Recording::default());
@@ -1362,20 +1402,15 @@ async fn a_close_answer_carries_the_description_only_to_a_device_that_may_read_t
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to_a_device_that_may_not_read_the_session()
  {
-    for may_read in [false, true] {
+    for reach in Reach::ALL {
+        let may_read = reach.shows_the_description();
         let temp = kr_ipc::testing::TempHost::create();
         let controller = super::super::tests::daemon(&temp).await;
         let (mut grant, _) = super::super::tests::granted(
             kr_protocol::grant::GrantExpiry::Never,
             controller.policy().authority_revision(),
         );
-        grant.actions = if may_read {
-            [ActionRight::SessionView, ActionRight::SessionClose]
-                .into_iter()
-                .collect()
-        } else {
-            [ActionRight::SessionClose].into_iter().collect()
-        };
+        reach.shape(&mut grant);
         let device = record_for(&grant);
         controller.devices().commit(&device).expect("paired");
         let recording = Arc::new(Recording::default());
@@ -1481,12 +1516,14 @@ async fn a_close_answer_written_under_a_replacement_lease_without_view_goes_with
         let now = wall.load(Ordering::SeqCst);
         let organisation = TestOrganisation::new(0x49, now - 60 * 60 * 1000);
         let (grant, _) = super::super::tests::leased_member(&controller, &organisation, now);
-        let grant = kr_protocol::grant::Grant {
+        let mut grant = kr_protocol::grant::Grant {
             actions: [ActionRight::SessionView, ActionRight::SessionClose]
                 .into_iter()
                 .collect(),
             ..grant
         };
+        // Its history reaches back to the session's start, so the lease is what decides.
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
         // The member's lease comes to admit closing as well as viewing, while it holds.
         continuous.advance(Duration::from_secs(1));
         super::super::tests::renew_member(
@@ -1556,6 +1593,341 @@ async fn a_close_answer_written_under_a_replacement_lease_without_view_goes_with
                 "the replacement lets the acceptance go without the description"
             );
             assert!(!carried);
+        }
+        drop(controller);
+    }
+}
+
+/// An answered question, asked at `created_at_ms`, with text in every place content is kept.
+fn answered_question(created_at_ms: u64) -> kr_protocol::question::Question {
+    use kr_protocol::ids::{ApplicationInstanceId, QuestionId, QuestionRevision, SessionEpoch};
+    use kr_protocol::question::{
+        AnswerRecord, QuestionAnswer, QuestionKind, QuestionSource, QuestionState,
+    };
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+
+    kr_protocol::question::Question {
+        question_id: QuestionId::new(Uuid::from_bytes([1; 16])),
+        revision: QuestionRevision::new(2),
+        state: QuestionState::Answered,
+        session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([2; 16])),
+        session_epoch: SessionEpoch::V1,
+        kind: QuestionKind::Confirm,
+        context: "Two tests are failing.".to_owned(),
+        question: "Push the branch anyway?".to_owned(),
+        choices: Vec::new(),
+        source: QuestionSource {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            process: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                11,
+            ),
+            executable: Nullable::null(),
+            agent_label: Nullable::some("the release agent".to_owned()),
+            connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+            launch_channel: false,
+            session_member: true,
+            ancestry: true,
+            agent_binding_revision: Nullable::null(),
+        },
+        created_at_ms: TimestampMs::new(created_at_ms),
+        expires_at_ms: TimestampMs::new(created_at_ms + 60_000),
+        answer: Nullable::some(AnswerRecord {
+            answer: QuestionAnswer::Decision { decided: true },
+            actor_id: ActorId::new("device:phone").expect("a principal"),
+            device_id: Nullable::null(),
+            question_revision: QuestionRevision::new(1),
+            answered_at_ms: TimestampMs::new(created_at_ms + 1),
+        }),
+        resolved_at_ms: Nullable::some(TimestampMs::new(created_at_ms + 1)),
+    }
+}
+
+/// The one answer `recording` was written, as the member `name` of it, when it has one.
+fn written_member(recording: &Recording, name: &str) -> Option<kr_cbor::CanonicalValue> {
+    let frames = recording.frames();
+    assert_eq!(frames.len(), 1, "one answer: {frames:?}");
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: kr_protocol::envelope::Outcome::Ok(value),
+        ..
+    }) = &frames[0]
+    else {
+        panic!("not an answer: {:?}", frames[0]);
+    };
+    kr_worker::history_filter::retained::member(value, name).cloned()
+}
+
+/// KR-REQ-10.49: the answer to a question's resolution shows the question only to a device whose
+/// decision carries `session.view`, and shows its own record of the resolution to every device
+/// that took the action: a device that may answer a question and may not view the session is told
+/// the question's identity, revision and state, and the member that would hold the question is
+/// null, not absent, because the member is required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_question_resolution_shows_the_question_only_to_a_device_that_may_view_the_session() {
+    for may_view in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (mut grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        grant.actions = if may_view {
+            [ActionRight::SessionView, ActionRight::QuestionRespond]
+                .into_iter()
+                .collect()
+        } else {
+            [ActionRight::QuestionRespond].into_iter().collect()
+        };
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device,
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = connection
+            .ask(Some(session_id), Method::QuestionAnswer.entry(), false)
+            .expect("the grant admits the answer");
+        let resolved = kr_protocol::question::QuestionResolveResult::whole(answered_question(10));
+        let frame = ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: kr_protocol::envelope::Outcome::Ok(
+                kr_protocol::envelope::ParamsValue::from_typed(&resolved).expect("encodes"),
+            ),
+        });
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame,
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let written = written_member(&recording, "question").expect("the member is there");
+        assert_eq!(
+            written == kr_cbor::CanonicalValue::Null,
+            !may_view,
+            "the question goes only to a device that may view the session"
+        );
+        let state = written_member(&recording, "state").expect("the state is there");
+        assert_eq!(state, kr_cbor::CanonicalValue::text("answered"));
+        drop(controller);
+    }
+}
+
+/// KR-REQ-23.34: an `action.read` carries the result of the method the receipt names, and a
+/// close's description in it goes only as far as the device's history reaches: a device with
+/// `session.view` whose history begins after the session did reads the receipt of its close and
+/// not the description in it, and one whose history reaches back to the session's start reads it
+/// whole. The receipt itself is shown to both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_action_read_of_a_close_carries_the_description_only_as_far_as_the_history_reaches() {
+    for reach in [Reach::ViewAfterTheStart, Reach::ViewFromTheStart] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (mut grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        reach.shape(&mut grant);
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device,
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = connection
+            .ask(Some(session_id), Method::ActionRead.entry(), false)
+            .expect("the grant admits the read");
+        let accepted = acceptance(session_id);
+        let read = kr_protocol::receipt::ActionReadResult {
+            receipt: kr_protocol::receipt::Receipt {
+                action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                actor_id: ActorId::new("device:phone").expect("a principal"),
+                method: Method::SessionClose.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                revision: kr_protocol::scalars::U64::new(2),
+                state: kr_protocol::receipt::ReceiptState::Applied,
+                reason: Nullable::null(),
+                payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+                accepted_deadline_ms: Nullable::null(),
+                error: Nullable::null(),
+                error_withheld: false,
+                updated_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+            },
+            result: Nullable::some(
+                kr_protocol::envelope::ParamsValue::from_typed(&accepted).expect("encodes"),
+            ),
+        };
+        let frame = ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: kr_protocol::envelope::Outcome::Ok(
+                kr_protocol::envelope::ParamsValue::from_typed(&read).expect("encodes"),
+            ),
+        });
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame,
+                    asked: Some(asked.answering(Method::ActionRead)),
+                })
+                .await,
+            "the connection stands"
+        );
+        let frames = recording.frames();
+        let ControlFrame::Response(kr_protocol::envelope::Response {
+            outcome: kr_protocol::envelope::Outcome::Ok(written),
+            ..
+        }) = &frames[0]
+        else {
+            panic!("not the read's answer: {:?}", frames[0]);
+        };
+        let written: kr_protocol::receipt::ActionReadResult =
+            written.to_typed().expect("an action.read answer");
+        assert_eq!(written.receipt, read.receipt, "the receipt goes whole");
+        let result = written.result.as_ref().expect("the result is kept");
+        assert_eq!(
+            kr_worker::history_filter::retained::member(result, "session").is_some(),
+            reach.shows_the_description(),
+            "{reach:?}"
+        );
+        assert_eq!(
+            kr_worker::history_filter::retained::member(result, "state"),
+            Some(&kr_cbor::CanonicalValue::text("closing")),
+            "the acceptance itself goes to both"
+        );
+        drop(controller);
+    }
+}
+
+/// KR-REQ-23.34: a retained answer is written under present view authority over the session it
+/// is about. A replacement lease that keeps `question.respond` and drops `session.view` while the
+/// answer waits refuses it where it is written, and the same lease lets a fresh answer go with the
+/// question left out. The controls are a renewal that kept the right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_refused() {
+    for (retained, renewed_in_time) in [(true, false), (true, true), (false, false)] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let organisation = TestOrganisation::new(0x4a, now - 60 * 60 * 1000);
+        let (grant, _) = super::super::tests::leased_member(&controller, &organisation, now);
+        let mut grant = kr_protocol::grant::Grant {
+            actions: [ActionRight::SessionView, ActionRight::QuestionRespond]
+                .into_iter()
+                .collect(),
+            ..grant
+        };
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+        continuous.advance(Duration::from_secs(1));
+        super::super::tests::renew_member(
+            &controller,
+            &organisation,
+            &grant,
+            now + 1_000,
+            &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        )
+        .expect("written down")
+        .expect("the renewal installs");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            record_for(&grant),
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = if retained {
+            connection
+                .may_read_receipts(Some(session_id), Method::QuestionAnswer)
+                .expect("the lease answers for the read")
+        } else {
+            connection
+                .ask(Some(session_id), Method::QuestionAnswer.entry(), false)
+                .expect("the lease answers for the answer")
+        };
+        if renewed_in_time {
+            continuous.advance(Duration::from_secs(60));
+            super::super::tests::renew_member(
+                &controller,
+                &organisation,
+                &grant,
+                now + 61_000,
+                &[ActionRight::SessionView, ActionRight::QuestionRespond],
+            )
+            .expect("written down")
+            .expect("the renewal installs");
+            continuous.advance(Duration::from_secs(14 * 60 + 30));
+        } else {
+            continuous.advance(Duration::from_secs(15 * 60 + 30));
+            super::super::tests::renew_member(
+                &controller,
+                &organisation,
+                &grant,
+                now + 61_000,
+                &[ActionRight::QuestionRespond],
+            )
+            .expect("written down")
+            .expect("the replacement installs");
+        }
+        let resolved = kr_protocol::question::QuestionResolveResult::whole(answered_question(10));
+        let frame = ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: kr_protocol::envelope::Outcome::Ok(
+                kr_protocol::envelope::ParamsValue::from_typed(&resolved).expect("encodes"),
+            ),
+        });
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame,
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let frames = recording.frames();
+        assert_eq!(frames.len(), 1, "one answer: {frames:?}");
+        let ControlFrame::Response(kr_protocol::envelope::Response { outcome, .. }) = &frames[0]
+        else {
+            panic!("not an answer: {:?}", frames[0]);
+        };
+        match (retained, renewed_in_time) {
+            // A renewal that kept the right: shown whole.
+            (true, true) => {
+                let kr_protocol::envelope::Outcome::Ok(value) = outcome else {
+                    panic!("a renewal lets the answer go: {outcome:?}");
+                };
+                let shown: kr_protocol::question::QuestionResolveResult =
+                    value.to_typed().expect("a resolution result");
+                assert!(shown.question().is_some());
+            }
+            // A replacement that dropped the view of the session: the retained answer is a read
+            // of a receipt over the session, which the lease no longer admits.
+            (true, false) => {
+                let kr_protocol::envelope::Outcome::Error(error) = outcome else {
+                    panic!("the lease no longer admits the read: {outcome:?}");
+                };
+                assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+            }
+            // A fresh answer decided under `question.respond` alone still goes, and without the
+            // question.
+            (false, _) => {
+                let kr_protocol::envelope::Outcome::Ok(value) = outcome else {
+                    panic!("the fresh answer goes: {outcome:?}");
+                };
+                let shown: kr_protocol::question::QuestionResolveResult =
+                    value.to_typed().expect("a resolution result");
+                assert_eq!(shown.question(), None);
+                assert_eq!(shown.state, kr_protocol::question::QuestionState::Answered);
+            }
         }
         drop(controller);
     }

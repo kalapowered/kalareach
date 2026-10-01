@@ -167,6 +167,12 @@ pub struct Forwarded {
     /// present view authority over the subject before it returns either half of a retained
     /// result. Keeping the two apart here is what lets the dispatcher make that check.
     pub retained: bool,
+    /// Whether the worker holds what it retains to the history scope a forwarded frame carries.
+    ///
+    /// A worker that does not keeps a retained answer whole, so passing one on to a paired device
+    /// would show it more than its grant reaches. The dispatcher refuses it by name, after this
+    /// daemon has used it for its own purposes.
+    pub holds_results_to_scopes: bool,
 }
 
 /// One remote connection's link to one worker.
@@ -342,7 +348,9 @@ impl WorkerProxy {
     /// # Errors
     ///
     /// Returns an error when the rights hold a voice right, when the link fails, or when the
-    /// worker does not answer in time.
+    /// worker does not answer in time, and `UNSUPPORTED_CAPABILITY` for an answer or a
+    /// cancellation of a question for a caller that has a history scope, to a worker that does not
+    /// hold results to one, before anything is sent.
     pub async fn forward_mutation(
         &self,
         mutation: &MutationRequest,
@@ -353,6 +361,18 @@ impl WorkerProxy {
             return Err(ControllerError::PermissionDenied {
                 detail: "voice.use never travels to a worker".to_owned(),
             });
+        }
+        // What a worker shows of the answer to a question is held to the caller's grant there, so a
+        // worker that does not hold results to a scope is not asked to resolve one for a caller
+        // that has one: it would answer with the whole question.
+        if vouched.history.is_some()
+            && !self.holds_results_to_scopes
+            && matches!(
+                mutation.method.method(),
+                Some(Method::QuestionAnswer | Method::QuestionCancel)
+            )
+        {
+            return Err(self.cannot_hold_results_to_a_scope());
         }
         let request_id = self.next_request_id();
         let mut forwarded = mutation.clone();
@@ -369,7 +389,28 @@ impl WorkerProxy {
                 .filter(|_| self.holds_results_to_scopes)
                 .cloned(),
         }));
-        self.call(request_id, &frame).await
+        let mut answered = self.call(request_id, &frame).await?;
+        answered.holds_results_to_scopes = self.holds_results_to_scopes;
+        Ok(answered)
+    }
+
+    /// Returns whether the worker holds what it retains to the history scope a forwarded frame
+    /// carries.
+    #[must_use]
+    pub const fn holds_results_to_scopes(&self) -> bool {
+        self.holds_results_to_scopes
+    }
+
+    /// The refusal for an action whose answer a worker of an earlier build would give whole.
+    fn cannot_hold_results_to_a_scope(&self) -> ControllerError {
+        ControllerError::Refused {
+            code: kr_protocol::error::ErrorCode::UnsupportedCapability,
+            detail:
+                "this session's worker is of a build that does not hold what it retains to the \
+                     grant a caller acts under, so it is not asked; the session's own owner can \
+                     still resolve a question at the session"
+                    .to_owned(),
+        }
     }
 
     /// Forwards one admitted read and returns what the worker answered.
@@ -377,13 +418,14 @@ impl WorkerProxy {
     /// `history` is the history scope of the grant the read was decided under, which the worker
     /// holds what it retains to. It goes only to a worker that said, in its answer to this link's
     /// hello, that it reads one. A question read with one goes only to a worker that also said it
-    /// holds a question read to it: the worker is the one place its answer is narrowed, and a
-    /// worker that does not would answer with every question it holds.
+    /// holds a question read to it, and a read of a retained receipt only to one that said it holds
+    /// what it retains to a scope: the worker is the one place its answer is narrowed, and a worker
+    /// that does not would answer with every question it holds, or with a retained answer whole.
     ///
     /// # Errors
     ///
-    /// As [`Self::forward_mutation`], and `UNSUPPORTED_CAPABILITY` for a question read with a
-    /// scope to a worker that does not hold one to it, before anything is sent.
+    /// As [`Self::forward_mutation`], and `UNSUPPORTED_CAPABILITY` for a question read or a read of
+    /// a receipt with a scope to a worker that does not hold one to it, before anything is sent.
     pub async fn forward_read(
         &self,
         request: &Request,
@@ -391,6 +433,12 @@ impl WorkerProxy {
         authority_deadline_boot_ms: Nullable<U64>,
         history: Option<&HistoryScope>,
     ) -> Result<Response> {
+        if history.is_some()
+            && request.method == Method::ActionRead.into()
+            && !self.holds_results_to_scopes
+        {
+            return Err(self.cannot_hold_results_to_a_scope());
+        }
         if history.is_some()
             && request.method == Method::QuestionRead.into()
             && !self.holds_question_reads
@@ -592,6 +640,7 @@ async fn read_loop(
                 Forwarded {
                     response,
                     retained: false,
+                    holds_results_to_scopes: false,
                 },
             ),
             // The worker answered from a receipt it already held rather than by performing the
@@ -602,6 +651,7 @@ async fn read_loop(
                 Forwarded {
                     response: *response,
                     retained: true,
+                    holds_results_to_scopes: false,
                 },
             ),
             // A subscription this link started. It goes to the relay, which is what decides

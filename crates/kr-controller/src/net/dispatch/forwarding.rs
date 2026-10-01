@@ -41,18 +41,44 @@ impl RouteRefusal {
     }
 }
 
+/// The refusal for a retained answer a worker of an earlier build gave whole.
+///
+/// Such a worker keeps an answer as it was produced and does not hold it to the grant a caller acts
+/// under, so a device is not shown it. The refusal says what the host holds and does not do, never
+/// that the action did not happen: it did, and the caller may well have caused it. For a close it
+/// says how to stop the session, because the answer that would have told the caller whether it was
+/// stopped is the one that is not shown.
+pub(super) fn held_by_an_earlier_worker(method: Method) -> ProtocolError {
+    let detail = if method == Method::SessionClose {
+        "this host holds what this action produced and does not show it to this device, because \
+         the session's worker is of an earlier build that cannot hold it to this device's grant; \
+         a close under a new action identifier stops the session while this host still holds it"
+    } else {
+        "this host holds what this action produced and does not show it to this device, because \
+         the session's worker is of an earlier build that cannot hold it to this device's grant"
+    };
+    ProtocolError::new(ErrorCode::UnsupportedCapability, detail)
+}
+
 impl RemoteConnection {
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
     ///
     /// A catalogue action names no session: its receipt is kept by the catalogue, beside the
-    /// state the action changed, under the actor that submitted it. It is read as this device,
-    /// and it is disclosed only while this device's grant still carries `host.manage`, the right
-    /// every catalogue action required. Owning an action identifier is not authority, and a device
-    /// whose authority over the catalogue was withdrawn is not told what it did there.
+    /// state the action changed, under the actor that submitted it. It is read as this device, and
+    /// it is shown only while the device is decided again under the right the action required:
+    /// the entry of the method the receipt names, which for every catalogue action is
+    /// `host.manage`, through the same intersection a request is, so a replacement lease or a
+    /// rights ceiling that removes the right stops the answer where it is written. Owning an action
+    /// identifier is not authority, and a device whose authority over the catalogue was withdrawn
+    /// is not told what it did there.
     ///
     /// `None` is a request this does not answer: one that names a session, or an action the
     /// catalogue holds no receipt for, which the session route then answers.
-    pub(super) async fn host_receipt(&self, request: &Request) -> Option<ControlFrame> {
+    pub(super) async fn host_receipt(
+        &self,
+        request: &Request,
+        asked: &mut Option<Asked>,
+    ) -> Option<ControlFrame> {
         let params: kr_protocol::receipt::ActionReadParams = request.params.to_typed().ok()?;
         if params.session_id.is_some() {
             return None;
@@ -68,15 +94,35 @@ impl RemoteConnection {
             Ok(None) => return None,
             Err(error) => return Some(failure(request.request_id, error)),
         };
-        if !self.device.grant.permits(ActionRight::HostManage) {
+        // The right the receipt's own method required, decided now. A method this build does not
+        // name is not one it can say a device may read the receipt of.
+        let Some(method) = read.receipt.method.method() else {
             return Some(failure(
                 request.request_id,
                 ProtocolError::new(
                     ErrorCode::PermissionDenied,
-                    "this device's grant no longer carries host.manage, which the catalogue \
-                     action it names required",
+                    "the catalogue action this receipt belongs to is not one this host can say \
+                     this device may read",
                 ),
             ));
+        };
+        match self.ask(None, method.entry(), false) {
+            Ok(decided) => {
+                *asked = Some(decided.answering(Method::ActionRead));
+            }
+            Err(error) => {
+                return Some(failure(
+                    request.request_id,
+                    ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "this device's grant no longer carries what the catalogue action it \
+                             names required: {}",
+                            error.message
+                        ),
+                    ),
+                ));
+            }
         }
         Some(match ParamsValue::from_typed(&read) {
             Ok(value) => ControlFrame::Response(Response {
@@ -88,6 +134,27 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()),
             ),
         })
+    }
+
+    /// Returns the session an `action.read` is about: the one it names, or the one this host
+    /// recorded the action's route to.
+    ///
+    /// It is the subject the read is decided over. A read that names only an action is decided
+    /// over the session the action was performed on, because present view authority over that
+    /// session is what decides whether the receipt is shown, and a decision taken with no session
+    /// would have none to check. `None` is an action this host keeps the receipt of itself, which
+    /// the catalogue's route answers, or one it holds no route for, which is refused where the
+    /// receipt is looked for.
+    pub(super) fn receipt_session(&self, request: &Request) -> Option<SessionId> {
+        let params: kr_protocol::receipt::ActionReadParams = request.params.to_typed().ok()?;
+        if let Some(named) = params.session_id {
+            return Some(named);
+        }
+        self.devices
+            .action_route(&self.device.principal(), params.action_id)
+            .ok()
+            .flatten()?
+            .session_id
     }
 
     /// Forwards one read to the worker that owns the session it names.
@@ -149,6 +216,7 @@ impl RemoteConnection {
         accepted: AcceptedDeadline,
         validated: AuthorityRevision,
         grant_rights: CanonicalSet<ActionRight>,
+        asked: &mut Option<Asked>,
     ) -> ControlFrame {
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
             return failure(
@@ -184,6 +252,7 @@ impl RemoteConnection {
         // The effect runs on a task that outlives this connection, for the same reason the
         // daemon's own effects do: the worker commits the intent before it answers, and a
         // cancellation here must not be what decides whether the outcome is recorded.
+        let answering = mutation.method.method().unwrap_or(Method::ActionRead);
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
         // The grant's history scope travels with it too, so what the worker shows of its answer,
@@ -209,10 +278,18 @@ impl RemoteConnection {
         });
         match effect.await {
             Ok(Ok(answered)) => {
-                if answered.retained
-                    && let Err(error) = self.may_read_receipts(Some(session_id))
-                {
-                    return failure(request_id, error);
+                if answered.retained {
+                    // A retained answer is a read of somebody's receipt. A worker that holds
+                    // nothing to a scope gave it whole, so it is not shown; one that does gave
+                    // what this device's grant reached, and it is written under present view
+                    // authority over the session.
+                    if !answered.holds_results_to_scopes {
+                        return failure(request_id, held_by_an_earlier_worker(answering));
+                    }
+                    match self.may_read_receipts(Some(session_id), answering) {
+                        Ok(read) => *asked = Some(read),
+                        Err(error) => return failure(request_id, error),
+                    }
                 }
                 ControlFrame::Response(Response {
                     request_id,
@@ -224,22 +301,73 @@ impl RemoteConnection {
         }
     }
 
-    /// Returns whether this device may be told what one of its own actions produced.
+    /// Decides whether this device may be told what one of its own actions produced, and returns
+    /// the decision the answer is to be written under.
     ///
-    /// A retained answer is a read of a receipt, and section 23 has present view authority over
-    /// the subject decide whether either half of a retained result is returned. The rights that
+    /// A retained answer is a read of a receipt, and section 23 has present view authority over the
+    /// subject decide whether either half of a retained result is returned. The rights that
     /// decide it are `action.read`'s over the session the receipt belongs to, not the ones the
     /// mutation needed: a device that may act on a session it cannot observe does not learn what
-    /// its action produced by submitting it twice.
+    /// its action produced by submitting it twice. The decision is returned so the answer is
+    /// written under it: a lease that drops `session.view` while the answer waits is refused at
+    /// the write boundary, where it is decided again, and `answering` is the method the answer was
+    /// kept for, which says how it is shown.
     pub(super) fn may_read_receipts(
         &self,
         session_id: Option<SessionId>,
-    ) -> std::result::Result<(), ProtocolError> {
+        answering: Method,
+    ) -> std::result::Result<Asked, ProtocolError> {
         let entry = self.admit(
             Method::ActionRead.as_str(),
             Method::ActionRead.entry().version,
         )?;
-        self.check_grant(session_id, entry, false).map(|_| ())
+        Ok(self.ask(session_id, entry, false)?.answering(answering))
+    }
+
+    /// Decides the read a retained answer of this daemon's own is written under, when it has one.
+    ///
+    /// Section 23 wants present view authority over the subject before either half of a retained
+    /// result goes back, and the answer is written under that decision, so a lease that loses the
+    /// right while it waits is refused where it is written. The subject is the session the request
+    /// names (a rename's, a review's, a visit's) or, for a create, the session its answer names,
+    /// which is in the answer rather than in the request.
+    ///
+    /// An owner confirmation's answer is a challenge. Its entry names only the owner's ceremony,
+    /// which the confirmation service checks on a first request and cannot be asked again here, so
+    /// it is decided under the right to read the challenges an owner can still answer, which is what
+    /// `owner.confirmation.pending` requires.
+    ///
+    /// Every other answer is about the environment, and what decides it is the right the mutation
+    /// itself required, which the decision it was admitted under goes on checking where the answer
+    /// is written: `None` leaves it there.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when this device's grant no longer admits the read.
+    pub(super) fn read_of_retained(
+        &self,
+        method: Method,
+        mutation: &MutationRequest,
+        retained: &ControlFrame,
+    ) -> std::result::Result<Option<Asked>, ProtocolError> {
+        let subject = mutation
+            .target
+            .session_id
+            .as_ref()
+            .copied()
+            .or_else(|| super::routes::answered_session(retained));
+        if subject.is_some() {
+            return self.may_read_receipts(subject, method).map(Some);
+        }
+        if matches!(
+            method,
+            Method::OwnerConfirmationRequest | Method::OwnerConfirmationComplete
+        ) {
+            return self
+                .ask(None, Method::OwnerConfirmationPending.entry(), false)
+                .map(|read| Some(read.answering(method)));
+        }
+        Ok(None)
     }
 
     /// Returns this connection's link to one worker, opening it on first use.
@@ -339,12 +467,24 @@ impl RemoteConnection {
     /// which section 9 refuses; a matching digest is the same action, and the worker's own receipt
     /// is the answer. A worker that holds no receipt for it leaves the request to the ordinary
     /// first-admission path, where its window decides.
+    ///
+    /// The answer is returned with the decision it is to be written under: a read of the receipt
+    /// over the session it belongs to ([`Self::may_read_receipts`]). A worker holds what it keeps to
+    /// the history scope of this device's grant, which goes with the read. A worker of an earlier
+    /// build holds nothing to a scope, so it is asked for the daemon's own use, which is to settle
+    /// a close it kept the answer of, and the device is then refused by name rather than shown what
+    /// was kept: the host holds it and does not show it.
+    ///
+    /// A caller that may not read this session's receipts is not told what its action produced,
+    /// and for a close that is all it is not told: a close it may make is still made, because
+    /// section 7 lets an authorised stop go ahead, and the answer a worker gives a retried close is
+    /// checked again where it comes back.
     pub(super) async fn retained_remotely(
         &self,
         mutation: &MutationRequest,
         validated: AuthorityRevision,
         asked: &Asked,
-    ) -> std::result::Result<Option<ControlFrame>, RouteRefusal> {
+    ) -> std::result::Result<Option<(ControlFrame, Asked)>, RouteRefusal> {
         let actor_id = self.device.principal();
         let Some(routed) = self
             .devices
@@ -374,11 +514,17 @@ impl RemoteConnection {
         let Some(session_id) = routed.session_id else {
             return Ok(None);
         };
+        let answering = mutation.method.method().unwrap_or(Method::ActionRead);
         // A refusal here is the answer, not a reason to go on. This action has already been
         // dispatched, and forwarding it again would have the worker answer from the receipt this
-        // device may not read.
-        self.may_read_receipts(Some(session_id))
-            .map_err(RouteRefusal::Conflict)?;
+        // device may not read. A close is the one exception: it is made whether or not its
+        // receipt may be read, and what a worker answers a retried one with is checked on its way
+        // back.
+        let read = match self.may_read_receipts(Some(session_id), answering) {
+            Ok(read) => read,
+            Err(_) if answering == Method::SessionClose => return Ok(None),
+            Err(error) => return Err(RouteRefusal::Conflict(error)),
+        };
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.
@@ -406,13 +552,10 @@ impl RemoteConnection {
         let authority = self
             .authority_deadline(asked)
             .map_err(RouteRefusal::Conflict)?;
+        let holds = proxy.holds_results_to_scopes();
+        let scope = holds.then_some(&self.device.grant.history);
         let Ok(response) = proxy
-            .forward_read(
-                &request,
-                &envelope,
-                authority,
-                Some(&self.device.grant.history),
-            )
+            .forward_read(&request, &envelope, authority, scope)
             .await
         else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
@@ -423,33 +566,37 @@ impl RemoteConnection {
             // answer, and the request goes on to be admitted or refused on its own terms.
             return Ok(None);
         };
-        let Ok(read) = value.to_typed::<kr_protocol::receipt::ActionReadResult>() else {
+        let Ok(read_back) = value.to_typed::<kr_protocol::receipt::ActionReadResult>() else {
             return Ok(None);
         };
+        // A close's result is settled as one given now is, and goes as it came: the daemon keeps
+        // the worker's whole description for its own use, and what a device is shown of it is
+        // decided where the answer is written.
+        if mutation.method == Method::SessionClose.into()
+            && let Some(result) = read_back.result.as_ref()
+            && let Ok(answer) = result.to_typed::<kr_protocol::session::SessionCloseResult>()
+        {
+            let _ = self
+                .controller
+                .settle_close_answer(session_id, &answer)
+                .await;
+        }
+        if !holds {
+            return Err(RouteRefusal::Conflict(held_by_an_earlier_worker(answering)));
+        }
         // The result when the action produced one, and the receipt when it has not: a caller that
         // resubmitted is told what became of its action, and nothing is dispatched again.
-        Ok(Some(match read.result.0 {
-            Some(result) => {
-                // A close's result is settled as one given now is, and goes as it came.
-                if mutation.method == Method::SessionClose.into()
-                    && let Ok(answer) =
-                        result.to_typed::<kr_protocol::session::SessionCloseResult>()
-                {
-                    let _ = self
-                        .controller
-                        .settle_close_answer(session_id, &answer)
-                        .await;
-                }
-                ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Ok(result),
-                })
-            }
+        let answered = match read_back.result.0 {
+            Some(result) => ControlFrame::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(result),
+            }),
             None => ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
                 request_id: mutation.request_id,
-                receipt: read.receipt,
+                receipt: read_back.receipt,
             })),
-        }))
+        };
+        Ok(Some((answered, read)))
     }
 
     /// Returns the link to the worker holding one action's receipt.

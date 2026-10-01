@@ -14,6 +14,7 @@ use kr_protocol::method::Method;
 use super::super::proxy::Vouched;
 use crate::error::Result;
 
+use super::super::Retained;
 use super::decision::{Answered, Asked, claims_geometry, refuses_to_run_git, session_of};
 use super::forwarding::RouteRefusal;
 use super::{RemoteConnection, failure, outcome_unknown};
@@ -269,7 +270,14 @@ impl RemoteConnection {
             Ok(validated) => validated,
             Err(error) => return failure(request.request_id, error),
         };
-        let named = session_of(&request.params, entry).ok();
+        // An `action.read` that names an action only is decided over the session the action was
+        // performed on, so what the decision carries at the write boundary is the authority over
+        // that session.
+        let named = session_of(&request.params, entry).ok().or_else(|| {
+            (entry.method == Method::ActionRead)
+                .then(|| self.receipt_session(request))
+                .flatten()
+        });
         // A read never claims geometry: the condition on `terminal.geometry` is about a request
         // that claims or adds a claim, and only a mutation does either.
         let decided = match self.ask(named, entry, false) {
@@ -317,10 +325,20 @@ impl RemoteConnection {
                 }
                 return failure(request.request_id, refuses_to_run_git());
             }
-            DeviceRead::Receipt => match self.host_receipt(request).await {
-                Some(answer) => answer,
-                None => self.proxied_read(request, entry, validated, &decided).await,
-            },
+            DeviceRead::Receipt => {
+                // A catalogue action's receipt is decided again under the right its method
+                // required, and the answer is written under that decision.
+                let mut held = None;
+                match self.host_receipt(request, &mut held).await {
+                    Some(answer) => {
+                        if let Some(under) = held {
+                            *asked = Some(under);
+                        }
+                        answer
+                    }
+                    None => self.proxied_read(request, entry, validated, &decided).await,
+                }
+            }
             DeviceRead::Worker => self.proxied_read(request, entry, validated, &decided).await,
             DeviceRead::Workflow => {
                 self.controller
@@ -533,17 +551,11 @@ impl RemoteConnection {
                 return failure(mutation.request_id, error);
             }
             // The daemon's own retained answer is a read of what an earlier submission produced,
-            // and a create's names the session it made. Section 23 wants present view authority
-            // over that subject before either half of a retained result goes back, and a create's
-            // subject is in the answer rather than in the request. A rename's is the session its
-            // request names, whether what it came to was a name or a refusal.
-            let subject = if entry.method == Method::SessionRename {
-                mutation.target.session_id.as_ref().copied()
-            } else {
-                answered_session(&retained)
-            };
-            if let Err(error) = self.may_read_receipts(subject) {
-                return failure(mutation.request_id, error);
+            // and is written under the decision that read is ([`Self::read_of_retained`]).
+            match self.read_of_retained(entry.method, mutation, &retained) {
+                Ok(Some(read)) => *asked = Some(read),
+                Ok(None) => {}
+                Err(error) => return failure(mutation.request_id, error),
             }
             return retained;
         }
@@ -553,7 +565,8 @@ impl RemoteConnection {
         // receipt without dispatching anything: so the receipt is asked for before the window is
         // considered, and a reused identifier carrying a different payload is refused here.
         match self.retained_remotely(mutation, validated, &decided).await {
-            Ok(Some(answered)) => {
+            Ok(Some((answered, read))) => {
+                *asked = Some(read);
                 return match self.admitted_to_answer(validated) {
                     Ok(()) => answered,
                     Err(error) => failure(mutation.request_id, error),
@@ -636,10 +649,11 @@ impl RemoteConnection {
                 // A create the daemon answered from the reservation an earlier submission made is
                 // the same read of somebody's result as a retained answer anywhere else, and it
                 // says so: `deduplicated` is what distinguishes it from a session made now.
-                if deduplicated(&answer)
-                    && let Err(error) = self.may_read_receipts(answered_session(&answer))
-                {
-                    return failure(request_id, error);
+                if deduplicated(&answer) {
+                    match self.may_read_receipts(answered_session(&answer), Method::SessionCreate) {
+                        Ok(read) => *asked = Some(read),
+                        Err(error) => return failure(request_id, error),
+                    }
                 }
                 answer
             }
@@ -699,12 +713,29 @@ impl RemoteConnection {
                     Ok(Ok(Ok(closed))) => {
                         // A close the worker answered from its journal is a read of that receipt,
                         // and this is the check section 23 wants before either half of a retained
-                        // result goes back. The close itself happened: section 7's stop does not
-                        // wait on this, and only the answer does.
-                        if closed.retained
-                            && let Err(error) = self.may_read_receipts(Some(session_id))
-                        {
-                            return failure(request_id, error);
+                        // result goes back, under the decision the answer is then written under.
+                        // The close itself happened: section 7's stop does not wait on this, and
+                        // only the answer does. A worker that holds nothing to a scope gave it
+                        // whole, and it has been settled; it is not shown.
+                        match closed.retained {
+                            Retained::Not => {}
+                            Retained::Worker {
+                                holds_results_to_scopes: false,
+                            } => {
+                                return failure(
+                                    request_id,
+                                    super::forwarding::held_by_an_earlier_worker(
+                                        Method::SessionClose,
+                                    ),
+                                );
+                            }
+                            Retained::Record | Retained::Worker { .. } => {
+                                match self.may_read_receipts(Some(session_id), Method::SessionClose)
+                                {
+                                    Ok(read) => *asked = Some(read),
+                                    Err(error) => return failure(request_id, error),
+                                }
+                            }
                         }
                         ControlFrame::Response(Response {
                             request_id,
@@ -1130,7 +1161,7 @@ impl RemoteConnection {
             }
             // Everything else belongs to the worker that owns the session.
             _ => {
-                self.proxied_mutation(mutation, accepted, validated, rights)
+                self.proxied_mutation(mutation, accepted, validated, rights, asked)
                     .await
             }
         }
@@ -1179,7 +1210,7 @@ fn deduplicated(answer: &ControlFrame) -> bool {
 ///
 /// A create's result names the session it made, which is the subject the answer is a read of. An
 /// answer that names none leaves the selector nothing to check, and the grant's own scope decides.
-fn answered_session(answer: &ControlFrame) -> Option<SessionId> {
+pub(super) fn answered_session(answer: &ControlFrame) -> Option<SessionId> {
     let ControlFrame::Response(Response {
         outcome: Outcome::Ok(value),
         ..

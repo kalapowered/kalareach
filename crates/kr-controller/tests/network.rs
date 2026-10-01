@@ -3636,8 +3636,10 @@ async fn asked_in_a_new_session(host: &Host, local: &mut LocalClient) -> Asked {
 
 /// KR-REQ-11.60, KR-REQ-11.64: a question an application inside a session asked is answered
 /// from a paired device only with `question.respond` for that session. A device that may view but
-/// not respond is refused, and so is one that may respond to another session; one that may respond
-/// to this session answers, and the answer it stores names that device, the principal the device
+/// not respond is refused, and so is one that may respond to another session and one that may
+/// respond to this session over a history that begins after the question was asked; one that may
+/// respond to this session and whose history reaches the question answers, and the answer it
+/// stores names that device, the principal the device
 /// acts under, the time and the revision it answered. The yes changes no grant: every grant the
 /// host holds reads back exactly as it did before the answer, and the device that answered still
 /// cannot close the session, which its grant never allowed.
@@ -3687,22 +3689,32 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
         ),
     )
     .await;
+    // A grant answers a question its history reaches: this one reaches back to the start.
+    let mut reaching_the_question = proposing(
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+    );
+    reaching_the_question.history.lower_bound_ms =
+        Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
     let responder = Device::create(&loopback()).await;
-    let responder_record = pair_with(
-        &daemon,
-        &responder,
-        &owner,
-        proposing(
-            &[ActionRight::SessionView, ActionRight::QuestionRespond],
-            SessionSelector::These {
-                session_ids: [session_id].into_iter().collect(),
-            },
-        ),
-    )
-    .await;
+    let responder_record = pair_with(&daemon, &responder, &owner, reaching_the_question).await;
+    // And this one holds the right for this session and begins after the question was asked.
+    let mut after_the_question = proposing(
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+    );
+    after_the_question.history.lower_bound_ms = Nullable::some(
+        kr_protocol::scalars::TimestampMs::new(asked.created_at_ms.get() + 60_000),
+    );
+    let latecomer = Device::create(&loopback()).await;
+    let latecomer_record = pair_with(&daemon, &latecomer, &owner, after_the_question).await;
     let before = authority(&daemon, &mut local).await;
-    // The owner's own device, paired when the host was set up, is on record beside the three.
-    assert_eq!(before.0.len(), 4, "each pairing wrote its device and grant");
+    // The owner's own device, paired when the host was set up, is on record beside the four.
+    assert_eq!(before.0.len(), 5, "each pairing wrote its device and grant");
     let responder_grant = before
         .0
         .iter()
@@ -3721,8 +3733,13 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
         BTreeSet::from([ActionRight::SessionView, ActionRight::QuestionRespond])
     );
 
-    // Without `question.respond`, and with it for another session: refused, and nothing changes.
-    for (device, record) in [(&viewer, &viewer_record), (&elsewhere, &elsewhere_record)] {
+    // Without `question.respond`, with it for another session, and with it for this session over a
+    // history that begins after the question was asked: refused, and nothing changes.
+    for (device, record) in [
+        (&viewer, &viewer_record),
+        (&elsewhere, &elsewhere_record),
+        (&latecomer, &latecomer_record),
+    ] {
         let session = connect(&daemon, device, record).await;
         let refused = session
             .mutate(

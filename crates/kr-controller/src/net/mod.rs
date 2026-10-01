@@ -980,32 +980,36 @@ async fn keep_the_record(
     }
 }
 
-/// The answer to a device's request of `method` as a decision whose rights are `rights` shows it.
+/// The answer to a device's request, as `shown_as`'s answer is shown to the decision it is written
+/// under and the history scope of the device's grant.
 ///
-/// A worker's acceptance of a close carries its description of the session, which is what
-/// `session.read` shows, and `session.read` needs `session.view` over the session a close names.
-/// So the answer to a `session.close`, fresh or retained, goes whole only under a decision that
-/// holds `session.view`; under one that does not, the acceptance goes without the description.
-/// The description is taken out of the answer's map as the worker wrote it, without decoding the
-/// answer: one this build cannot decode, as a worker built after it may write, loses the
-/// description as well, and every other member goes as it came. Every other answer goes as it
-/// came.
-pub(crate) fn close_answer_shown<'a>(
+/// `shown_as` is the method whose answer the frame carries. For a retained answer that is the
+/// method it was kept for, not the `action.read` it is decided under, and for an answer to
+/// `action.read` itself the frame holds a receipt and the result of the method the receipt names,
+/// which is opened by that method.
+///
+/// Two answers carry something the worker leaves for the daemon to decide, or decided under the
+/// authority a request was admitted under and not the one it is written under:
+///
+/// * A close's answer carries the worker's description of the session, which the daemon keeps whole
+///   for its own use. A device is shown it only if the decision holds `session.view` and its
+///   history reaches back to the session's start, as `session.describe` decides it.
+/// * An answer to a question's resolution carries the question only to a decision that holds
+///   `session.view`. Where the decision no longer does, the member that would hold it is set to
+///   null, not removed: it is a required member.
+///
+/// The members are read from, taken out of, or set null in the answer's map as the worker wrote
+/// it, without decoding the answer: one this build cannot decode, as one from a worker built after
+/// it may be, loses what the decision withholds, and every other member goes as it came. Every
+/// other answer goes as it came.
+pub(crate) fn answer_shown<'a>(
     frame: &'a kr_protocol::envelope::ControlFrame,
-    method: kr_protocol::method::Method,
+    shown_as: kr_protocol::method::Method,
     rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+    history: &kr_protocol::grant::HistoryScope,
 ) -> std::borrow::Cow<'a, kr_protocol::envelope::ControlFrame> {
-    use kr_cbor::{CanonicalMap, CanonicalValue};
     use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 
-    /// The member of a close answer that holds the worker's description of the session.
-    const DESCRIPTION: &str = "session";
-
-    if method != kr_protocol::method::Method::SessionClose
-        || rights.contains(&kr_protocol::rights::ActionRight::SessionView)
-    {
-        return std::borrow::Cow::Borrowed(frame);
-    }
     let ControlFrame::Response(Response {
         request_id,
         outcome: Outcome::Ok(value),
@@ -1013,33 +1017,97 @@ pub(crate) fn close_answer_shown<'a>(
     else {
         return std::borrow::Cow::Borrowed(frame);
     };
-    let CanonicalValue::Map(answer) = value.as_value() else {
+    let view = rights.contains(&kr_protocol::rights::ActionRight::SessionView);
+    let Some(changed) = shown_value(shown_as, value, view, history) else {
         return std::borrow::Cow::Borrowed(frame);
     };
-    if answer.get(DESCRIPTION).is_none() {
-        return std::borrow::Cow::Borrowed(frame);
-    }
-    let kept = answer
-        .entries()
-        .iter()
-        .filter(|(name, _)| name != DESCRIPTION)
-        .cloned()
-        .collect();
-    // Taking one entry out of a canonical map leaves it ordered and free of duplicates, so this
-    // does not fail; were it ever to, the answer is not written with the description.
-    let outcome = CanonicalMap::from_sorted_entries(kept).map_or_else(
-        |error| {
-            Outcome::Error(kr_protocol::error::ProtocolError::new(
-                kr_protocol::error::ErrorCode::InvalidArgument,
-                error.to_string(),
-            ))
-        },
-        |members| Outcome::Ok(ParamsValue::new(CanonicalValue::Map(members))),
-    );
     std::borrow::Cow::Owned(ControlFrame::Response(Response {
         request_id: *request_id,
-        outcome,
+        outcome: Outcome::Ok(ParamsValue::new(changed)),
     }))
+}
+
+/// Returns `value` as `method`'s answer is shown, or `None` when it is shown as it is.
+fn shown_value(
+    method: kr_protocol::method::Method,
+    value: &kr_protocol::envelope::ParamsValue,
+    view: bool,
+    history: &kr_protocol::grant::HistoryScope,
+) -> Option<kr_cbor::CanonicalValue> {
+    use kr_protocol::method::Method;
+    use kr_worker::history_filter::retained::{
+        DESCRIPTION_MEMBER, QUESTION_MEMBER, ResultContent, member, result_content,
+        with_member_nulled, without_member,
+    };
+
+    if method == Method::ActionRead {
+        // The receipt names the method that kept the result, and the result is shown as that
+        // method's answer is.
+        let receipt = member(value, "receipt")?;
+        let kr_cbor::CanonicalValue::Map(receipt) = receipt else {
+            return None;
+        };
+        let named = match receipt.get("method") {
+            Some(kr_cbor::CanonicalValue::Text(name)) => Method::from_wire(name)?,
+            _ => return None,
+        };
+        let kept = member(value, "result")?;
+        let shown = shown_value(
+            named,
+            &kr_protocol::envelope::ParamsValue::new(kept.clone()),
+            view,
+            history,
+        )?;
+        let kr_cbor::CanonicalValue::Map(answer) = value.as_value() else {
+            return None;
+        };
+        let replaced = answer
+            .entries()
+            .iter()
+            .map(|(key, held)| {
+                if key == "result" {
+                    (key.clone(), shown.clone())
+                } else {
+                    (key.clone(), held.clone())
+                }
+            })
+            .collect();
+        return kr_cbor::CanonicalMap::from_sorted_entries(replaced)
+            .ok()
+            .map(kr_cbor::CanonicalValue::Map);
+    }
+    match result_content(method) {
+        ResultContent::SessionDescription => {
+            let shows = view
+                && member(value, DESCRIPTION_MEMBER).is_some_and(|session| {
+                    // The session's own start dates its description. A description this build
+                    // cannot read the start of is not one it can show.
+                    kr_cbor::from_canonical_value::<kr_protocol::session::SessionSummary>(session)
+                        .is_ok_and(|summary| {
+                            crate::describe::HistoryReach::of_grant(
+                                history.lower_bound_ms.0,
+                                Some(summary.created_at_ms),
+                            ) == crate::describe::HistoryReach::WholeSession
+                        })
+                });
+            if shows || member(value, DESCRIPTION_MEMBER).is_none() {
+                return None;
+            }
+            match without_member(value, DESCRIPTION_MEMBER).into_value() {
+                kr_cbor::CanonicalValue::Map(members) => {
+                    Some(kr_cbor::CanonicalValue::Map(members))
+                }
+                _ => None,
+            }
+        }
+        ResultContent::Question => {
+            if view || member(value, QUESTION_MEMBER).is_none() {
+                return None;
+            }
+            Some(with_member_nulled(value, QUESTION_MEMBER).into_value())
+        }
+        _ => None,
+    }
 }
 
 /// What a remote close settled as.
@@ -1047,8 +1115,24 @@ pub(crate) fn close_answer_shown<'a>(
 pub(crate) struct ClosedRemotely {
     /// The close result.
     pub value: kr_protocol::envelope::ParamsValue,
-    /// Whether the worker answered from an action it had already performed.
-    pub retained: bool,
+    /// Where the answer came from.
+    pub retained: Retained,
+}
+
+/// Where the answer to a close came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retained {
+    /// A close performed now.
+    Not,
+    /// The closure this daemon recorded, when no worker holds the session any more. No worker
+    /// answered, so there is no worker to hold the answer to a scope: it is the daemon's own.
+    Record,
+    /// The worker answered from an action it had already performed.
+    Worker {
+        /// Whether that worker holds what it retains to the history scope a forwarded frame
+        /// carries. One that does not gave the answer whole.
+        holds_results_to_scopes: bool,
+    },
 }
 
 /// How long a close's link is held for the acceptance to reach the device that asked for it.
@@ -1379,7 +1463,7 @@ impl Controller {
         delivered: tokio::sync::oneshot::Receiver<()>,
     ) {
         let mut link = None;
-        let mut retained = false;
+        let mut retained = Retained::Not;
         let settled = self
             .close_through(
                 mutation,
@@ -1413,7 +1497,7 @@ impl Controller {
         accepted: AcceptedDeadline,
         observer: &dispatch::ExpiryObserver,
         link: &mut Option<Arc<WorkerProxy>>,
-        retained: &mut bool,
+        retained: &mut Retained,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
@@ -1425,7 +1509,7 @@ impl Controller {
             // Whatever comes back here comes from a record rather than from a close performed now,
             // which is the same read the worker's own journal would have been. The caller decides
             // whether this device may be told it.
-            *retained = true;
+            *retained = Retained::Record;
             return match closure {
                 Some(closure) => {
                     crate::service::encode(&kr_protocol::session::SessionCloseResult {
@@ -1478,7 +1562,11 @@ impl Controller {
         // Whether this came from the worker's journal rather than from a close it performed now.
         // The connection that asked decides whether it may be told a retained result; the close
         // itself happened either way, which is what section 7 asks of a stop.
-        *retained = answered.retained;
+        if answered.retained {
+            *retained = Retained::Worker {
+                holds_results_to_scopes: answered.holds_results_to_scopes,
+            };
+        }
         let value = match answered.response.outcome {
             kr_protocol::envelope::Outcome::Ok(value) => value,
             // The worker's own code, carried through rather than flattened. A reused action
@@ -1488,7 +1576,7 @@ impl Controller {
                 return Err(ControllerError::refused(&error));
             }
         };
-        if *retained {
+        if answered.retained {
             // The close this answers happened, and what comes back now is that action's retained
             // answer, which may be its result or its receipt. It is passed through as it is rather
             // than read as a close result it need not be. A close result is settled on the way, as
