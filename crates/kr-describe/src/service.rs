@@ -569,6 +569,19 @@ pub trait PublicationGate: Send {
         generation: PrivacyGeneration,
         publish: &mut dyn FnMut() -> Result<PublishGate>,
     ) -> Option<Result<PublishGate>>;
+
+    /// Runs `register`, which makes a job of a session at `generation` one that is in flight and
+    /// can be cancelled, while a send at that generation is admitted, and says whether it ran. It
+    /// does not run when none is: privacy mode is on, or the generation moved on. A change of
+    /// privacy mode then waits for the registration, and finds the job in flight to cancel, or the
+    /// registration comes after it and is refused: no job starts once privacy mode is published.
+    ///
+    /// A gate that holds nothing runs it.
+    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut()) -> bool {
+        let _ = generation;
+        register();
+        true
+    }
 }
 
 /// The description service for one execution environment.
@@ -1715,8 +1728,25 @@ impl DescriptionService {
                 deadline_ms: budgets.execution_deadline_ms,
                 ceiling_bytes: budgets.process_memory_ceiling_bytes,
             };
-            let cancellation = self.running.started(session_id);
-            self.in_flight.dispatched(session_id);
+            // Registered while whatever admits a send at the session's generation is held, so a
+            // change of privacy mode is ordered wholly before this job (which is then not sent) or
+            // wholly after it (which finds the job in flight and cancels it).
+            let mut registered = None;
+            let mut register = || {
+                registered = Some(self.running.started(session_id));
+                self.in_flight.dispatched(session_id);
+            };
+            let admitted = match &self.gate {
+                Some(gate) => gate.admit_dispatch(generation, &mut register),
+                None => {
+                    register();
+                    true
+                }
+            };
+            let Some(cancellation) = registered.filter(|_| admitted) else {
+                self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                continue;
+            };
             let id = self.take_id();
             let queue_wait_ms = now.since_ms(job.queued_at_ms);
             let requeued_before = self.retried.remove(&session_id);
