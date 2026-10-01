@@ -2070,6 +2070,86 @@ impl Catalogue {
         }
     }
 
+    /// Returns what the release's own manifest says a native bridge it installs does, where it
+    /// installs one: the publisher's statement, taken from the manifest the signed index pins by
+    /// hash for this exact release.
+    ///
+    /// The manifest is read from the cache when it is there and fetched by its hash, like the
+    /// first thing an installation downloads, when it is not; either way it is held to the length
+    /// and hash the index declares and has to agree with the index's own entry for the release. An
+    /// owner confirms an installation against these words, so they come from the signed
+    /// generation and from nothing a caller supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the repository has no activated generation or its
+    /// index does not carry the release, [`CatalogueError::Integrity`] when the hash is not the
+    /// one the index declares or the manifest is not the document it names, and the refusal a
+    /// fetch decided when the manifest has to be fetched and cannot be.
+    pub async fn grant_statement(
+        &mut self,
+        id: &RepositoryId,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: PayloadDigest,
+    ) -> CatalogueResult<Option<String>> {
+        let (store, _lock, enrolled) = self.locked(&self.enrolled(id)?)?;
+        let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
+            detail: format!("{id} has no activated generation yet"),
+        })?;
+        let index = store.index(&active)?;
+        let entry =
+            index
+                .find(plugin_id, version)
+                .cloned()
+                .ok_or_else(|| CatalogueError::NotFound {
+                    detail: format!("{plugin_id} {version} is not in this repository's index"),
+                })?;
+        if entry.manifest_digest != package_hash {
+            return Err(CatalogueError::Integrity {
+                detail: format!(
+                    "{plugin_id} {version} is {} in this generation and the request names \
+                     {package_hash}",
+                    entry.manifest_digest
+                ),
+            });
+        }
+        let subject = format!("{} {}", entry.plugin_id, entry.version);
+        let length = entry.manifest_size_bytes.get();
+        let bytes = match store.read_payload(entry.manifest_digest, length) {
+            Ok(bytes) => bytes,
+            Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {
+                let prefix = format!(
+                    "{PACKAGE_PREFIX}{}/{}/{}",
+                    entry.publisher_id, entry.plugin_name, entry.version
+                );
+                let package: BTreeSet<PayloadDigest> =
+                    std::iter::once(entry.manifest_digest).collect();
+                self.fetch(
+                    &enrolled,
+                    &store,
+                    &format!("{prefix}/{MANIFEST_FILE}"),
+                    entry.manifest_digest,
+                    length,
+                    &package,
+                    FetchReason::ExplicitInstall,
+                    &Owner::acting(),
+                )
+                .await?
+            }
+            Err(other) => return Err(other),
+        };
+        let manifest: kr_plugin_sdk::plugin::PluginManifest = serde_json::from_slice(&bytes)
+            .map_err(|source| CatalogueError::Integrity {
+                detail: format!("the manifest of {subject} is not a manifest: {source}"),
+            })?;
+        extract::reconcile(&entry, &manifest, &subject)?;
+        Ok(manifest
+            .native_bridge
+            .0
+            .map(|bridge| bridge.grant_statement.as_str().to_owned()))
+    }
+
     /// Installs one verified package into one environment, as the owner acting directly.
     ///
     /// # Errors

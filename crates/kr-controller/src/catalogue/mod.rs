@@ -658,6 +658,101 @@ impl CatalogueModule {
         }
     }
 
+    /// Resolves a confirmation subject the catalogue describes into what its challenge names and
+    /// what an owner device is shown, from the exact `catalogue.add` or `plugin.install` request
+    /// and from what this host holds, never from anything the caller says about the request.
+    ///
+    /// The digest is the one the effect builds from the same request, so the challenge issued for
+    /// a subject is spent by that request and by no other. For an installation that asks for a
+    /// native bridge the statement is read from the verified manifest of the exact package hash,
+    /// which may have to be fetched, so this runs before the challenge exists and nothing is
+    /// issued for a release whose manifest cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a request that already carries a proof or for a subject the
+    /// catalogue does not describe, and the refusal the same request would meet: another
+    /// environment, a budget this host does not allow, a root that cannot be read, a repository
+    /// that is not enrolled, or a release the index does not carry.
+    pub async fn resolve_confirmation(
+        &self,
+        subject: &kr_protocol::confirmation::ConfirmationSubject,
+    ) -> Answer<crate::service::net::owner::Resolved> {
+        use kr_protocol::confirmation::{ConfirmationDisplay, ConfirmationSubject};
+        let carries_a_proof = || {
+            ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "a confirmation is asked for a request without its proof: the request that \
+                 carries one is not waiting for an answer",
+            )
+        };
+        match subject {
+            ConfirmationSubject::CatalogueAdd(params) => {
+                if params.owner_confirmation.is_present() {
+                    return Err(carries_a_proof());
+                }
+                self.check_environment(params.environment_id)?;
+                within_budgets(&params.budgets, &self.budgets_in_force())?;
+                let enrolment = enrolment_from(params)?;
+                let plan = trust_plan(params, &enrolment)?;
+                let digest = plan
+                    .action_digest()
+                    .map_err(|error| error.to_protocol_error())?;
+                Ok(crate::service::net::owner::Resolved {
+                    action: crate::sharing::CatalogueTrustPlan::sensitive_action(),
+                    digest,
+                    destination: None,
+                    rights: kr_protocol::scalars::CanonicalSet::new(),
+                    display: ConfirmationDisplay::CatalogueAdd {
+                        environment_id: params.environment_id,
+                        catalogue_id: plan.catalogue_id.clone(),
+                        kind: params.kind,
+                        metadata_url: params.metadata_url.clone(),
+                        targets_url: params.targets_url.clone(),
+                        root_digest: plan.root_digest.clone(),
+                        root_key_ids: plan.root_key_ids.iter().cloned().collect(),
+                        ceiling: plan.ceiling.iter().cloned().collect(),
+                    },
+                    first_owner: false,
+                })
+            }
+            ConfirmationSubject::PluginInstall(params) => {
+                if params.owner_confirmation.is_present() {
+                    return Err(carries_a_proof());
+                }
+                self.check_environment(params.environment_id)?;
+                let mut catalogue = self.catalogue.lock().await;
+                let (plan, _) = install_plan(&mut catalogue, params).await?;
+                drop(catalogue);
+                let digest = plan
+                    .action_digest()
+                    .map_err(|error| error.to_protocol_error())?;
+                Ok(crate::service::net::owner::Resolved {
+                    action: crate::sharing::PluginInstallPlan::sensitive_action(),
+                    digest,
+                    destination: None,
+                    rights: kr_protocol::scalars::CanonicalSet::new(),
+                    display: ConfirmationDisplay::PluginInstall {
+                        environment_id: params.environment_id,
+                        catalogue_id: plan.catalogue_id.clone(),
+                        plugin_id: plan.plugin_id.clone(),
+                        version: plan.version.clone(),
+                        package_digest: plan.package_digest.clone(),
+                        ceiling: plan.ceiling.iter().cloned().collect(),
+                        grant: plan.grant.iter().cloned().collect(),
+                        grant_statement: Nullable(plan.grant_statement.clone()),
+                    },
+                    first_owner: false,
+                })
+            }
+            _ => Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "the catalogue describes a repository's root and an installation, and nothing \
+                 else",
+            )),
+        }
+    }
+
     /// Returns the disable policy in force.
     ///
     /// # Errors
@@ -1255,17 +1350,7 @@ impl CatalogueModule {
                 // wider one. Re-anchoring an existing repository is two deliberate acts,
                 // `catalogue.remove` and `catalogue.add`, so that a root never changes underneath
                 // a repository somebody is already using.
-                let plan = crate::sharing::CatalogueTrustPlan {
-                    environment_id: params.environment_id,
-                    catalogue_id: enrolment.id.to_string(),
-                    root_digest: enrolment.root_digest().to_string(),
-                    root_key_ids: enrolment
-                        .root_key_ids()
-                        .map_err(ProtocolError::from)?
-                        .into_iter()
-                        .collect(),
-                    ceiling: params.ceiling.iter().cloned().collect(),
-                };
+                let plan = trust_plan(&params, &enrolment)?;
                 let action_digest = plan
                     .action_digest()
                     .map_err(|error| error.to_protocol_error())?;
@@ -1273,7 +1358,7 @@ impl CatalogueModule {
                     confirmations,
                     crate::sharing::CatalogueTrustPlan::sensitive_action(),
                     action_digest,
-                    &params.owner_confirmation,
+                    params.owner_confirmation.as_ref(),
                     "enrolment",
                 )?;
                 let confirmed = Confirmed {
@@ -1374,59 +1459,60 @@ impl CatalogueModule {
                 // An installation that may do more than the one it replaces, or than its
                 // repository's ceiling permits by itself, and every release that installs a native
                 // bridge, is the owner's decision, and the catalogue decides whether this one is.
-                // The confirmation names the repository and its ceiling with the release, the hash
-                // and the grant, and is spent the way `plugin.grant` spends one: accepted and
-                // consumed here, and asked again inside the commit.
-                let (confirmed, decided_under) = match params.owner_confirmation.as_ref() {
-                    None => (None, None),
-                    Some(proof) => {
-                        let enrolment = catalogue
-                            .repository(&id)
-                            .map_err(ProtocolError::from)?
-                            .ok_or_else(|| {
-                                ProtocolError::new(
-                                    ErrorCode::ResourceUnavailable,
-                                    format!("{id} is not enrolled"),
-                                )
-                            })?;
-                        let plan = crate::sharing::PluginInstallPlan {
-                            environment_id: params.environment_id,
-                            catalogue_id: id.to_string(),
-                            ceiling: enrolment
-                                .ceiling
-                                .capabilities()
-                                .into_iter()
-                                .map(|capability| capability.as_str().to_owned())
-                                .collect(),
-                            plugin_id: params.plugin_id.clone(),
-                            version: version.to_string(),
-                            package_digest: digest.to_string(),
-                            grant: params.grant.iter().cloned().collect(),
-                        };
-                        let action_digest = plan
-                            .action_digest()
-                            .map_err(|error| error.to_protocol_error())?;
-                        let (confirmations, confirmed) = confirm(
-                            confirmations,
-                            crate::sharing::PluginInstallPlan::sensitive_action(),
-                            action_digest,
-                            proof,
-                            "installation",
-                        )?;
-                        (
-                            Some(Confirmed {
-                                admission,
-                                confirmed,
-                                action_digest,
-                                confirmations,
-                                subject: "installation",
-                            }),
-                            // The ceiling the owner was shown, which the catalogue holds the
-                            // installation to once the repository is held and inside the commit.
-                            Some(enrolment.ceiling),
-                        )
-                    }
-                };
+                // The confirmation names the repository and its ceiling with the release, the hash,
+                // the grant and what the release's manifest says a native bridge does, and is spent
+                // the way `plugin.grant` spends one: accepted and consumed here, and asked again
+                // inside the commit. It is the proof the request presents or, with none, the answer
+                // an owner device recorded to the challenge this host issued for this request; an
+                // installation that needs none asks for neither.
+                let (confirmed, decided_under) =
+                    match (params.owner_confirmation.as_ref(), confirmations) {
+                        (None, None) => (None, None),
+                        (proof, Some(_)) => match install_plan(catalogue, &params).await {
+                            Ok((plan, ceiling)) => {
+                                let action_digest = plan
+                                    .action_digest()
+                                    .map_err(|error| error.to_protocol_error())?;
+                                match confirm(
+                                    confirmations,
+                                    crate::sharing::PluginInstallPlan::sensitive_action(),
+                                    action_digest,
+                                    proof,
+                                    "installation",
+                                ) {
+                                    Ok((confirmations, confirmed)) => (
+                                        Some(Confirmed {
+                                            admission,
+                                            confirmed,
+                                            action_digest,
+                                            confirmations,
+                                            subject: "installation",
+                                        }),
+                                        // The ceiling the owner was shown, which the catalogue holds
+                                        // the installation to once the repository is held and inside
+                                        // the commit.
+                                        Some(ceiling),
+                                    ),
+                                    // No answer recorded for this request: the catalogue decides
+                                    // whether the installation needed one.
+                                    Err(error)
+                                        if proof.is_none()
+                                            && error.code
+                                                == ErrorCode::OwnerConfirmationRequired =>
+                                    {
+                                        (None, None)
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            // An installation that presents no proof and cannot even be described
+                            // (an unknown repository, a release the index does not carry) is refused
+                            // by the catalogue in its own words.
+                            Err(_) if proof.is_none() => (None, None),
+                            Err(error) => return Err(error),
+                        },
+                        (Some(_), None) => return Err(off_the_network("installation")),
+                    };
                 let authority: &dyn Authority = match &confirmed {
                     Some(confirmed) => confirmed,
                     None => admission,
@@ -1450,7 +1536,18 @@ impl CatalogueModule {
                         &mut Change::settling(authority, key, now, &mut render),
                     )
                     .await
-                    .map_err(ProtocolError::from)?;
+                    .map_err(ProtocolError::from)
+                    .map_err(|error| {
+                        // Where the installation needed an owner's confirmation and this host is
+                        // off the network, nothing could give it one.
+                        if confirmations.is_none()
+                            && error.code == ErrorCode::OwnerConfirmationRequired
+                        {
+                            off_the_network("installation")
+                        } else {
+                            error
+                        }
+                    })?;
             }
             Method::PluginRemove => {
                 let params: wire::PluginRemoveParams = typed(&mutation.params)?;
@@ -1552,7 +1649,7 @@ impl CatalogueModule {
                     confirmations,
                     crate::sharing::PluginGrantPlan::sensitive_action(),
                     action_digest,
-                    &params.owner_confirmation,
+                    Some(&params.owner_confirmation),
                     "grant",
                 )?;
                 let confirmed = Confirmed {
@@ -2272,6 +2369,75 @@ const fn kind_of(kind: RepositoryKind) -> wire::CatalogueKind {
     }
 }
 
+/// The plan an enrolment's confirmation covers, from the exact request and the root it carries.
+fn trust_plan(
+    params: &wire::CatalogueAddParams,
+    enrolment: &Enrolment,
+) -> Answer<crate::sharing::CatalogueTrustPlan> {
+    Ok(crate::sharing::CatalogueTrustPlan {
+        environment_id: params.environment_id,
+        catalogue_id: enrolment.id.to_string(),
+        root_digest: enrolment.root_digest().to_string(),
+        root_key_ids: enrolment
+            .root_key_ids()
+            .map_err(ProtocolError::from)?
+            .into_iter()
+            .collect(),
+        ceiling: params.ceiling.iter().cloned().collect(),
+    })
+}
+
+/// The plan an installation's confirmation covers, from the exact request and what this host
+/// holds: the repository's ceiling as `catalogue.list` reports it and, where the grant asks for a
+/// native bridge, the statement the signed index's own manifest for this release makes of it.
+///
+/// Returns the repository's ceiling beside the plan, which the catalogue holds the installation to.
+async fn install_plan(
+    catalogue: &mut Catalogue,
+    params: &wire::PluginInstallParams,
+) -> Answer<(crate::sharing::PluginInstallPlan, CapabilityCeiling)> {
+    let repository = repository_id(&params.catalogue_id)?;
+    let release = version(&params.version)?;
+    let package_hash = digest(&params.package_digest)?;
+    let enrolment = catalogue
+        .repository(&repository)
+        .map_err(ProtocolError::from)?
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                format!("{repository} is not enrolled"),
+            )
+        })?;
+    let grant_statement = if params
+        .grant
+        .iter()
+        .any(|name| name == PluginCapability::NativeBridgeInstall.as_str())
+    {
+        catalogue
+            .grant_statement(&repository, &params.plugin_id, &release, package_hash)
+            .await
+            .map_err(ProtocolError::from)?
+    } else {
+        None
+    };
+    let plan = crate::sharing::PluginInstallPlan {
+        environment_id: params.environment_id,
+        catalogue_id: repository.to_string(),
+        ceiling: enrolment
+            .ceiling
+            .capabilities()
+            .into_iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+        plugin_id: params.plugin_id.clone(),
+        version: release.to_string(),
+        package_digest: package_hash.to_string(),
+        grant: params.grant.iter().cloned().collect(),
+        grant_statement,
+    };
+    Ok((plan, enrolment.ceiling))
+}
+
 /// Accepts the owner's confirmation of one exact action, or refuses the method.
 ///
 /// The challenge is consumed here, once. What the change asks again at its commit is whether the
@@ -2283,22 +2449,31 @@ fn confirm<'a>(
     confirmations: Option<&'a dyn OwnerConfirmations>,
     action: kr_protocol::pairing::SensitiveAction,
     action_digest: Digest256,
-    proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    proof: Option<&kr_protocol::pairing::OwnerConfirmationProof>,
     subject: &str,
 ) -> Answer<(&'a dyn OwnerConfirmations, ConfirmedAction)> {
-    let confirmations = confirmations.ok_or_else(|| {
-        ProtocolError::new(
-            ErrorCode::PermissionDenied,
-            format!(
-                "this {subject} needs the owner's confirmation and this host has no enrolled \
-                 owner signer to check one against"
-            ),
-        )
-    })?;
-    let confirmed = confirmations
-        .accept(action, action_digest, proof)
-        .map_err(|error| error.to_protocol_error())?;
+    let confirmations = confirmations.ok_or_else(|| off_the_network(subject))?;
+    let confirmed = match proof {
+        // The owner's own proof, presented with the request.
+        Some(proof) => confirmations.accept(action, action_digest, proof),
+        // None presented: the answer an owner device recorded to the challenge this host issued
+        // for exactly this request, spent once.
+        None => confirmations.accept_recorded(action, action_digest),
+    }
+    .map_err(|error| error.to_protocol_error())?;
     Ok((confirmations, confirmed))
+}
+
+/// What a confirmed method answers on a host that is not on the network: it has no owner device to
+/// ask, whether or not the request carries a proof.
+fn off_the_network(subject: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::HostNotConfigured,
+        format!(
+            "this {subject} needs an owner device's confirmation, and this host is not on the \
+             network, so it has none to ask; select a network and restart it"
+        ),
+    )
 }
 
 /// Refuses, by name, an enrolment that asks for more than this host's configuration allows.

@@ -97,6 +97,9 @@ struct Ceremony {
     /// A step of a test's own, run once just after this host accepts a confirmation: after the
     /// daemon built what the owner confirmed, and before the change it confirms holds anything.
     after_accept: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The proofs an owner device answered challenges with and nothing has spent yet, as a host
+    /// holds them beside its ledger.
+    recorded: std::sync::Mutex<Vec<OwnerConfirmationProof>>,
 }
 
 impl Ceremony {
@@ -108,7 +111,15 @@ impl Ceremony {
             device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
             endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7u8; 32]),
             after_accept: std::sync::Mutex::new(None),
+            recorded: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Issues a challenge for one action and has the owner's device answer it, leaving the answer
+    /// with this host to be spent by the request that repeats the action with no proof.
+    fn record(&self, action: SensitiveAction, digest: Digest256) {
+        let proof = self.approve(action, digest);
+        self.recorded.lock().expect("the answers").push(proof);
     }
 
     /// Issues a challenge for one action and signs it, as the owner's device does.
@@ -164,6 +175,27 @@ impl OwnerConfirmations for Ceremony {
             then();
         }
         accepted
+    }
+
+    fn accept_recorded(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+    ) -> kr_controller::Result<ConfirmedAction> {
+        let proof = {
+            let mut recorded = self.recorded.lock().expect("the answers");
+            let position = recorded.iter().position(|proof| {
+                proof.request.action == action && proof.request.action_digest == action_digest
+            });
+            position.map(|position| recorded.remove(position))
+        };
+        match proof {
+            Some(proof) => self.accept(action, action_digest, &proof),
+            None => Err(kr_controller::ControllerError::Refused {
+                code: ErrorCode::OwnerConfirmationRequired,
+                detail: "this action needs a fresh owner confirmation naming it".to_owned(),
+            }),
+        }
     }
 
     fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
@@ -331,9 +363,10 @@ fn add_params_for(
         root: base64::engine::general_purpose::STANDARD.encode(&root),
         budgets: budgets(),
         ceiling,
-        owner_confirmation: host
-            .ceremony
-            .approve(SensitiveAction::TrustRepositoryRoot, digest),
+        owner_confirmation: Nullable::some(
+            host.ceremony
+                .approve(SensitiveAction::TrustRepositoryRoot, digest),
+        ),
     }
 }
 
@@ -1162,10 +1195,10 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
             root: base64::engine::general_purpose::STANDARD.encode(&root),
             budgets: budgets(),
             ceiling: Vec::new(),
-            owner_confirmation: ceremony.approve(
+            owner_confirmation: Nullable::some(ceremony.approve(
                 SensitiveAction::TrustRepositoryRoot,
                 Digest256::from_bytes([0u8; 32]),
-            ),
+            )),
         }
     };
     let refused = client
@@ -1178,10 +1211,10 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         .await
         .expect("the call reaches the daemon")
         .expect_err("this host has no owner to confirm with");
-    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert_eq!(refused.code, ErrorCode::HostNotConfigured, "{refused:?}");
     assert!(
-        refused.message.contains("owner"),
-        "the refusal names the ceremony: {refused:?}"
+        refused.message.contains("owner") && refused.message.contains("select a network"),
+        "the refusal names the ceremony and the network selection: {refused:?}"
     );
 
     let listed: wire::PluginListResult = client
@@ -1604,6 +1637,136 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             .await,
     );
     assert_eq!(expired.code, ErrorCode::PermissionDenied);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A terminal's confirmed methods: the recorded answer, and a host off the network
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-07.47: a `catalogue.add` that presents no proof spends, once, the answer an owner device
+/// recorded for exactly this enrolment; without one it is refused as needing the owner, and an
+/// answer recorded for another enrolment is not spent on it.
+#[tokio::test]
+async fn a_catalogue_add_with_no_proof_spends_the_answer_recorded_for_exactly_it() {
+    let host = host();
+    let mut asked = add_params(&host);
+    let confirmed_digest = {
+        let with_proof = add_params(&host);
+        let plan = wire_trust_plan(&with_proof);
+        plan.action_digest().expect("a digest")
+    };
+    asked.owner_confirmation = Nullable::null();
+    async fn send(host: &Host, params: &wire::CatalogueAddParams) -> ControlFrame {
+        host.module
+            .write_frame_admitted(
+                &mutation(Method::CatalogueAdd, host.environment_id, params),
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+            )
+            .await
+    }
+
+    // Control: no answer recorded.
+    let refused = refusal(send(&host, &asked).await);
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+
+    // An answer for another enrolment is not this one's.
+    host.ceremony.record(
+        SensitiveAction::TrustRepositoryRoot,
+        Digest256::from_bytes([9u8; 32]),
+    );
+    let refused = refusal(send(&host, &asked).await);
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+
+    host.ceremony
+        .record(SensitiveAction::TrustRepositoryRoot, confirmed_digest);
+    let added: wire::CatalogueAddResult = ok(send(&host, &asked).await);
+    assert_eq!(added.catalogue.catalogue_id, "development");
+}
+
+/// The plan an enrolment request's confirmation covers, as the daemon builds it.
+fn wire_trust_plan(params: &wire::CatalogueAddParams) -> CatalogueTrustPlan {
+    use base64::Engine as _;
+    let root = base64::engine::general_purpose::STANDARD
+        .decode(&params.root)
+        .expect("a root");
+    let enrolment = Enrolment::new(
+        RepositoryId::new(&params.catalogue_id).expect("an identifier"),
+        RepositoryKind::Local,
+        url::Url::parse(&params.metadata_url).expect("a location"),
+        url::Url::parse(&params.targets_url).expect("a location"),
+        root,
+        kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .expect("an enrolment");
+    CatalogueTrustPlan {
+        environment_id: params.environment_id,
+        catalogue_id: params.catalogue_id.clone(),
+        root_digest: enrolment.root_digest().to_string(),
+        root_key_ids: enrolment
+            .root_key_ids()
+            .expect("a readable root")
+            .into_iter()
+            .collect(),
+        ceiling: params.ceiling.iter().cloned().collect(),
+    }
+}
+
+/// KR-REQ-07.47, KR-REQ-10.52: on a host that is not on the network a confirmed catalogue method
+/// answers `HOST_NOT_CONFIGURED`, naming the network selection, with a proof and without one: it
+/// has no owner device to ask, and falling back to the caller's own identity is what section 10
+/// forbids. The control is the same request on a host that has the ceremony.
+#[tokio::test]
+async fn a_confirmed_method_off_the_network_answers_host_not_configured() {
+    let host = host();
+    let with_proof = add_params(&host);
+    let mut without_proof = add_params(&host);
+    without_proof.owner_confirmation = Nullable::null();
+    for params in [&with_proof, &without_proof] {
+        let refused = refusal(
+            host.module
+                .write_frame_admitted(
+                    &mutation(Method::CatalogueAdd, host.environment_id, params),
+                    Method::CatalogueAdd,
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(refused.code, ErrorCode::HostNotConfigured, "{refused:?}");
+        assert!(
+            refused.message.contains("select a network"),
+            "the answer names the setup: {refused:?}"
+        );
+    }
+    assert!(
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .repositories()
+            .expect("readable")
+            .is_empty(),
+        "nothing was enrolled"
+    );
+
+    // Control: the host that has the ceremony adopts the root.
+    let _: wire::CatalogueAddResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(Method::CatalogueAdd, host.environment_id, &with_proof),
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+        )
+        .await);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2375,6 +2538,7 @@ fn install_plan(
         version: "0.1.0".to_owned(),
         package_digest: digest.to_owned(),
         grant: grant.iter().map(|name| (*name).to_owned()).collect(),
+        grant_statement: None,
     }
 }
 
@@ -3244,6 +3408,22 @@ mod native_bridges {
         "upstream.action",
     ];
 
+    /// What release 0.3.0's own manifest says its native bridge does, which the owner confirms
+    /// with the installation.
+    fn release_statement() -> String {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                generation().join("targets/packages/kalareach/claude-code/0.3.0/plugin.json"),
+            )
+            .expect("a manifest"),
+        )
+        .expect("a readable manifest");
+        manifest["native_bridge"]["grant_statement"]
+            .as_str()
+            .expect("a statement")
+            .to_owned()
+    }
+
     fn claude_code() -> PluginId {
         PluginId::new("kalareach/claude-code").expect("a plugin identifier")
     }
@@ -3419,6 +3599,7 @@ mod native_bridges {
                 version: "0.3.0".to_owned(),
                 package_digest: digest.to_owned(),
                 grant: grant.iter().cloned().collect(),
+                grant_statement: Some(release_statement()),
             };
             Nullable::some(host.ceremony.approve(
                 SensitiveAction::GrantExecutableCapability,
@@ -4387,5 +4568,81 @@ mod native_bridges {
 
         host.module = open(None);
         assert_eq!(site.tree(), placed, "with no list the start puts it back");
+    }
+    /// KR-REQ-07.47: an installation that needs the owner's confirmation, on a host that is not on
+    /// the network, answers `HOST_NOT_CONFIGURED`, with or without a proof; the control is the same
+    /// installation on a host that has the ceremony.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_07_47_a_confirmed_installation_off_the_network_answers_host_not_configured() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let grant: Vec<String> = GRANT.iter().map(|name| (*name).to_owned()).collect();
+        let ceiling = listed_ceiling(&host, "development").await;
+        let plan = PluginInstallPlan {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            ceiling: ceiling.into_iter().collect(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: grant.iter().cloned().collect(),
+            grant_statement: Some(release_statement()),
+        };
+        let params = |owner_confirmation| wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: grant.clone(),
+            owner_confirmation,
+        };
+        let proof = host.ceremony.approve(
+            SensitiveAction::GrantExecutableCapability,
+            plan.action_digest().expect("a digest"),
+        );
+        for given in [Nullable::some(proof), Nullable::null()] {
+            let refused = refusal(
+                host.module
+                    .write_frame_admitted(
+                        &mutation(Method::PluginInstall, host.environment_id, &params(given)),
+                        Method::PluginInstall,
+                        None,
+                    )
+                    .await,
+            );
+            assert_eq!(refused.code, ErrorCode::HostNotConfigured, "{refused:?}");
+            assert!(refused.message.contains("select a network"), "{refused:?}");
+        }
+        assert!(
+            host.module
+                .catalogue()
+                .lock()
+                .await
+                .installations()
+                .expect("readable")
+                .is_empty(),
+            "nothing was installed"
+        );
+
+        // Control: the host that has the ceremony, and an answer recorded for this installation.
+        host.ceremony.record(
+            SensitiveAction::GrantExecutableCapability,
+            plan.action_digest().expect("a digest"),
+        );
+        let _: wire::PluginInstallResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginInstall,
+                    host.environment_id,
+                    &params(Nullable::null()),
+                ),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await);
     }
 }

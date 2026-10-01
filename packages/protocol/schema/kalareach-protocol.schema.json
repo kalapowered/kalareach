@@ -5261,8 +5261,15 @@
           "type": "string"
         },
         "owner_confirmation": {
-          "$ref": "#/$defs/OwnerConfirmationProof",
-          "description": "The owner's confirmation of this exact enrolment.\n\nAdopting a root is one of the actions section 10 requires a fresh confirmation for, bound\nto the exact action digest and consumed once. It is not optional here: a caller's\noperating-system identity is explicitly not that confirmation, so there is no shape of this\nrequest that carries none."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's confirmation of this exact enrolment, presented with the request.\n\nAdopting a root is one of the actions section 10 requires a fresh confirmation for, bound\nto the exact action digest and consumed once. A caller's operating-system identity is\nexplicitly not that confirmation. A caller that holds the owner's signed proof presents it\nhere; a caller that does not, a terminal, leaves this null and the host spends, once, the\nanswer an owner device recorded to the challenge it issued for this exact request\n(`owner.confirmation.request` with the `catalogue_add` subject). With neither, the request\nis refused as needing the owner's confirmation."
         },
         "root": {
           "description": "The trust root, as its bytes, base64 encoded.",
@@ -8037,6 +8044,141 @@
         },
         {
           "additionalProperties": false,
+          "description": "Adopting this repository's trust root.",
+          "properties": {
+            "catalogue_add": {
+              "additionalProperties": false,
+              "properties": {
+                "catalogue_id": {
+                  "description": "This host's identifier for the repository.",
+                  "type": "string"
+                },
+                "ceiling": {
+                  "description": "The capabilities its packages may hold without a further grant, beyond the default\nceiling.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "environment_id": {
+                  "$ref": "#/$defs/EnvironmentId",
+                  "description": "The environment it is enrolled in."
+                },
+                "kind": {
+                  "$ref": "#/$defs/CatalogueKind",
+                  "description": "What kind of repository it is."
+                },
+                "metadata_url": {
+                  "description": "Where its metadata lives.",
+                  "type": "string"
+                },
+                "root_digest": {
+                  "description": "The digest of the exact root bytes being adopted.",
+                  "type": "string"
+                },
+                "root_key_ids": {
+                  "description": "The key identifiers the root declares for its own role: what the owner is trusting.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "targets_url": {
+                  "description": "Where its targets live.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "environment_id",
+                "catalogue_id",
+                "kind",
+                "metadata_url",
+                "targets_url",
+                "root_digest",
+                "root_key_ids",
+                "ceiling"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "catalogue_add"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Installing this release with this grant.",
+          "properties": {
+            "plugin_install": {
+              "additionalProperties": false,
+              "properties": {
+                "catalogue_id": {
+                  "description": "The repository it is installed from.",
+                  "type": "string"
+                },
+                "ceiling": {
+                  "description": "What the repository's ceiling permits by itself.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "environment_id": {
+                  "$ref": "#/$defs/EnvironmentId",
+                  "description": "The environment the package is installed in."
+                },
+                "grant": {
+                  "description": "The capabilities the installation is granted.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "grant_statement": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "What the release's own manifest says a native bridge it installs does, where it\ninstalls one. These are the publisher's words, taken by the host from the verified\nmanifest of the exact package hash and covered by the confirmation; a device shows\nthem apart from [`NATIVE_BRIDGE_NOTICE`], which is the host's."
+                },
+                "package_digest": {
+                  "description": "The exact package hash.",
+                  "type": "string"
+                },
+                "plugin_id": {
+                  "$ref": "#/$defs/PluginId",
+                  "description": "The package."
+                },
+                "version": {
+                  "description": "The release.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "environment_id",
+                "catalogue_id",
+                "plugin_id",
+                "version",
+                "package_digest",
+                "ceiling",
+                "grant",
+                "grant_statement"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "plugin_install"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "An action its caller described.",
           "properties": {
             "described": {
@@ -8144,6 +8286,32 @@
           },
           "required": [
             "confirm_device"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Adopting a repository's trust root, as this exact `catalogue.add` would.\n\nThe host resolves the root's key identifiers, the ceiling and the repository from the\nrequest itself, so what an owner device shows and signs is what the effect then checks. The\nrequest carries no proof of its own here: a request that already carries one is not a thing\nto ask a confirmation for.",
+          "properties": {
+            "catalogue_add": {
+              "$ref": "#/$defs/CatalogueAddParams"
+            }
+          },
+          "required": [
+            "catalogue_add"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Installing a release, as this exact `plugin.install` would.\n\nThe host resolves the repository's ceiling and, from the verified manifest of the exact\npackage hash, the statement of what a native bridge does, so the owner device shows the\npublisher's own words and the confirmation covers them. The request carries no proof.",
+          "properties": {
+            "plugin_install": {
+              "$ref": "#/$defs/PluginInstallParams"
+            }
+          },
+          "required": [
+            "plugin_install"
           ],
           "type": "object"
         },
@@ -22122,7 +22290,7 @@
               "type": "null"
             }
           ],
-          "description": "The owner's confirmation of this exact installation, where it needs one.\n\nAn installation that may do anything the installation it replaces could not, or, with\nnothing to replace, anything the repository's ceiling does not permit by itself, needs it,\nand so does every release that installs a native bridge. It is bound to the repository and\nits ceiling as `catalogue.list` reports them, the release, the package hash and the grant\nabove, so it cannot be carried to another repository, release or grant. One that is given is\nspent whether or not the installation needed it."
+          "description": "The owner's confirmation of this exact installation, where it needs one.\n\nAn installation that may do anything the installation it replaces could not, or, with\nnothing to replace, anything the repository's ceiling does not permit by itself, needs it,\nand so does every release that installs a native bridge. It is bound to the repository and\nits ceiling as `catalogue.list` reports them, the release, the package hash, the grant\nabove and, for a release that installs a native bridge, the statement of what the bridge\ndoes, so it cannot be carried to another repository, release or grant. One that is given is\nspent whether or not the installation needed it. Where none is given, the host spends, once,\nthe answer an owner device recorded to the challenge it issued for this exact request, when\nthere is one."
         },
         "package_digest": {
           "description": "The exact package hash the caller expects.\n\nInstallation verifies the signature before it installs, and the hash makes the caller's\nexpectation explicit: a repository that published something else between the caller reading\nthe index and this request arriving is a refusal rather than a surprise.",
