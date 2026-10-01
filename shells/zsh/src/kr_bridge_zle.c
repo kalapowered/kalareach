@@ -451,16 +451,19 @@ kr_setup_symbol(const char *module_name)
  * What is judged is the image the loader mapped, never a file opened again by its name: the name
  * can be replaced or removed after the module loaded, and the file then found is not the code the
  * shell runs. The module's undefined symbols are read from the tables the loader itself bound it
- * with, which are in memory already, so nothing is opened, read or waited for. What is asked is
- * whether the running shell, the modules already loaded or the module's own libraries provide each
- * name; a name that carries a symbol version is asked for under that version, in the module's own
- * libraries. Every module is judged, the package's own among them: where a module sits says
- * nothing about what it is, and the package's own bind like any other.
+ * with, which are in memory already, so no file is opened or read. What is asked is whether the
+ * running shell, the modules already loaded or the module's own libraries provide each name; the
+ * loader's own lookup answers, which can run the resolver function of a library that defines an
+ * indirect function and takes the loader's locks. A name that carries a symbol version is asked
+ * for under that version, in the shell's global scope and in the module's own libraries. Every
+ * module is judged, the package's own among them: where a module sits says nothing about what it
+ * is, and the package's own bind like any other.
  *
  * What this does not see: a module built against another layout of the same names, one that binds
- * every symbol it imports; a name a library the module loads for itself imports in its turn; a
- * name provided by a package module that is not loaded when the hooks go live; and a module the
- * shell loads afterwards. A module image that does not read as one is reported as such and never as
+ * every symbol it imports; a name a library the module loads for itself imports in its turn; and a
+ * module the shell loads afterwards. A name that a package module not yet loaded provides is
+ * refused: the shell loads a package module for its own features, never because another module
+ * imports from it. A module image that does not read as one is reported as such and never as
  * a module that binds. The reader is made for the shared objects a linker makes: a table that is
  * not where the loader's own bookkeeping puts it is not read.
  */
@@ -892,6 +895,23 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
         if (entry->d_tag == DT_NULL) {
             break;
         }
+        /* A tag that names a table and whose address cannot be placed is a table this cannot read:
+         * it is never taken for a table that is not there. */
+        switch (entry->d_tag) {
+        case DT_SYMTAB:
+        case DT_STRTAB:
+        case DT_VERSYM:
+        case DT_VERNEED:
+        case DT_HASH:
+        case DT_GNU_HASH:
+            if (kr_dynamic_address(&object, entry->d_un.d_ptr) == 0) {
+                kr_scan_not_read(scan, "a table address it holds is not one this can place");
+                return;
+            }
+            break;
+        default:
+            break;
+        }
         switch (entry->d_tag) {
         case DT_SYMTAB:
             symbols = (const ElfW(Sym) *)kr_dynamic_address(&object, entry->d_un.d_ptr);
@@ -955,8 +975,8 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
             kr_scan_not_read(scan, "its string table is not one this reads");
             return;
         }
-        /* A name a version is required for comes from a library that defines versions, never from
-         * the shell: it is asked for under that version, in the module's own libraries. */
+        /* A name a version is required for comes from a library that defines versions: it is asked for
+         * under that version, in the shell's global scope and in the module's own libraries. */
         if (versions != NULL && (versions[n] & 0x7fff) >= 2) {
             const char *version = kr_needed_version(&object, needs, need_count, versions[n] & 0x7fff,
                                                     strings, string_size);
@@ -965,8 +985,9 @@ kr_module_imports(const void *header, void *handle, kr_scan *scan)
                 kr_scan_not_read(scan, "a name it imports is bound to a version it does not list");
                 return;
             }
-            if (!kr_provides_version(RTLD_DEFAULT, name, version) &&
-                !kr_provides_version(handle, name, version) && scan->state == KR_IMPORTS_BOUND) {
+            /* Once a name is missing the rest are not asked: each lookup can run a resolver. */
+            if (scan->state == KR_IMPORTS_BOUND && !kr_provides_version(RTLD_DEFAULT, name, version) &&
+                !kr_provides_version(handle, name, version)) {
                 scan->state = KR_IMPORTS_MISSING;
                 snprintf(scan->detail, sizeof(scan->detail), "%s@%s", name, version);
                 kr_utf8_clean(scan->detail);
