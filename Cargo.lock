@@ -4342,6 +4342,7 @@ name = "kr-cli"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "base64 0.23.1",
  "clap",
  "flate2",
  "jiff",
