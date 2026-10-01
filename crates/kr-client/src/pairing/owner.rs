@@ -572,7 +572,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
         return Err(CannotCheck::CannotShow);
     }
     for names in [40, 24, 16] {
-        let host = shown(host_name, names);
+        let host = shown_host(host_name, names);
         let text = match subject {
             Subject::IssueInvitation {
                 mode,
@@ -768,6 +768,21 @@ fn invisible(character: char) -> bool {
         && !character.is_whitespace()
 }
 
+/// A host's name as a dialog's line and a page both show it: cleaned as [`shown`] cleans every
+/// name, and the unnamed host's where nothing is left to show.
+#[must_use]
+pub fn shown_host(name: &str, limit: usize) -> String {
+    let name = shown(name, limit);
+    if name.is_empty() {
+        UNNAMED_HOST.to_owned()
+    } else {
+        name
+    }
+}
+
+/// What a host without a name to show is called.
+pub const UNNAMED_HOST: &str = "your host";
+
 /// Display text as a dialog may show it: on one line, with the characters that reorder or hide
 /// text left out, runs of space as one, and at most `limit` characters.
 ///
@@ -902,7 +917,7 @@ impl OwnerConfirmations {
         if ceremony.kind() == CeremonyKind::None {
             return ReviewOutcome::NoCeremony;
         }
-        let host_name = self.host.name.as_deref().unwrap_or("your host");
+        let host_name = self.host.name.as_deref().unwrap_or(UNNAMED_HOST);
         let Ok(reason) = reason(subject, host_name, now) else {
             return ReviewOutcome::CannotCheck;
         };
@@ -1152,6 +1167,29 @@ mod tests {
             line.contains("type in terminals and view sessions"),
             "{line}"
         );
+    }
+
+    /// KR-REQ-10.06: a host whose name has nothing left to show once the characters that hide or
+    /// reorder text are gone is the unnamed host, in the dialog's line as on a page, and the line
+    /// never says "on ," for it.
+    #[test]
+    fn a_host_name_with_nothing_left_to_show_is_the_unnamed_host() {
+        let trust = Subject::CatalogueAdd(trust_plan());
+        for name in ["", "\u{202E}\u{200B}\n", "   "] {
+            let line = reason(&trust, name, NOW).expect("a line");
+            assert!(
+                line.contains(" on your host, served from "),
+                "{name:?}: {line}"
+            );
+            assert_eq!(shown_host(name, 40), "your host", "{name:?}");
+        }
+        let device = Subject::ConfirmDevice {
+            candidate: candidate("Pixel 8"),
+            proposed_grant: grant(&[ActionRight::SessionView], an_hour()),
+        };
+        let line = reason(&device, "\u{202E}", NOW).expect("a line");
+        assert!(line.contains(" to your host, which may"), "{line}");
+        assert_eq!(shown_host("studio", 40), "studio");
     }
 
     /// The host a device is paired with.
