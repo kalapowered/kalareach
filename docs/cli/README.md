@@ -909,18 +909,22 @@ file and in the manifest):
 
 A name says credential when it contains the word password, passwd, passphrase, secret, token,
 credential, apikey, privatekey or bearer, or when one of its parts (split at any character that is
-not a letter or a digit, between a lower-case letter and a capital, and before the last capital of a
-run of capitals) is the word pass, auth, authorization, key or cookie. `PWD` would not be redacted
-but `tokenizer` would be. If the value after a name that says credential is quoted, the entire
-quoted string will be treated as the credential value. If the quote is not closed the entire field
-will be withheld and its length reported.
+not a letter or a digit, between a lower-case letter or a digit and a capital, and before the last
+capital of a run of capitals that a lower-case letter follows) is the word pass, auth,
+authorization, key or cookie. `PWD` would not be redacted but `tokenizer` would be. The value after
+a name that says credential is read as a shell reads a word, so a quoted string, or a word made of
+quoted and unquoted parts such as `abc"d e"`, is the credential value, as is the rest of an
+assignment that is itself inside quotes, such as `"PASSWORD=two words"`. If the quote is not closed
+the entire field will be withheld and its length reported.
 
 A filter is not a guarantee that no secret remains, and this one cannot tell a secret from other
 text by its value. It does not filter positional secrets, plain path components, values to `-p` and
-`-u user:secret`, `Authorization` header values, connection string parts, and user names in paths
-(except for your home directory). Make sure to inspect the content in the preview before continuing.
-(Note that invisible terminal characters like text direction overrides and zero-width marks will be
-written as escapes, so the text on your screen is the text in the file.)
+`-u user:secret`, `Authorization` header values, connection string parts, a password with an
+unescaped `/`, `?` or `#` in a URL, a single-dash option such as `-password`, a quoted option name,
+`--user u:secret`, and user names in paths (except for your home directory). Make sure to inspect
+the content in the preview before continuing. (Note that invisible terminal characters like text
+direction overrides and zero-width marks will be written as escapes, so the text on your screen is
+the text in the file.)
 
 #### Writing it
 
@@ -943,16 +947,18 @@ kr doctor --bundle support.tar --include-content --exclude-session <id> --previe
 ```
 
 The second run composes the content again, and if its digest is the same as the one the first run
-printed it prints the content and writes it. If the digest is different it will abort (exit status
-1) without printing the content or writing anything, and a file already at the path stays as it was.
-To exclude a session use `--exclude-session`, which should be included in both invocations, because
-the digest covers what was left out. Invocations without either `--preview` or `--confirm-content`
-in non-terminal environments will fail with a usage error before the host is consulted.
+printed it prints the content and writes it. If the digest is different the command will stop with
+exit status 1, without printing the content or writing anything, and a file already at the path
+stays as it was. To exclude a session use `--exclude-session`, which should be included in both
+invocations, because the digest covers what was left out. Invocations without either `--preview` or
+`--confirm-content` in non-terminal environments will fail with a usage error before the host is
+consulted.
 
 When `--json` is provided and the export is not refused, the `content_digest`, `content_left_out`
-and `content_written` fields will be present in the output document. The `bundle` field will only be
-present if the bundle has been written. Refusing or declining the export operation results in a
-regular failure document without `bundle` and without these fields.
+and `content_written` fields will be present in the output document when the export is neither
+refused nor followed by a failure to write the bundle. The `bundle` field will only be present if
+the bundle has been written. Refusing or declining the export operation results in a regular failure
+document without `bundle` and without these fields.
 
 #### What it cannot do
 

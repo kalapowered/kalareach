@@ -22,25 +22,27 @@
 //!   its authority replaced, wherever in the text it sits, inside a value or not.
 //!
 //! A value with a quote that never closes cannot be told apart from the rest of the field, so the
-//! whole field is withheld, as its length.
+//! whole field is withheld, as its length. A quote that a path opened and nothing closed counts: a
+//! credential after it withholds the field too.
 //!
 //! # What a name says
 //!
 //! A name says credential when its letters, run together, contain `password`, `passwd`,
-//! `passphrase`, `secret`, `token`, `credential`, `apikey`, `privatekey` or `bearer`, or when one of
-//! its parts is `pass`, `auth`, `authorization`, `key` or `cookie`. Parts are split at every
+//! `passphrase`, `secret`, `token`, `credential`, `apikey`, `privatekey` or `bearer`, or when one
+//! of its parts is `pass`, `auth`, `authorization`, `key` or `cookie`. Parts are split at every
 //! character that is not a letter or a digit, between a lower-case letter or a digit and an
-//! upper-case letter, and before the last capital of a run of capitals, so `accessKeyId`,
-//! `X-Auth-Key`, `S3Key` and `HTTPAuth` match and `KEYBOARD` and `PWD` do not. The list errs wide:
-//! `tokenizer` matches too.
+//! upper-case letter, and before the last capital of a run of capitals that a lower-case letter
+//! follows, so `accessKeyId`, `X-Auth-Key`, `S3Key` and `HTTPAuth` match and `KEYBOARD` and `PWD`
+//! do not. The list errs wide: `tokenizer` matches too.
 //!
 //! # What it does not do
 //!
 //! It does not find a credential by its value. A secret that is a positional word, a plain path
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
 //! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
-//! or `#` in a URL, or a name nobody listed stays in the text. So does a user name anywhere in a path but the home directory's. The preview shows
-//! everything that will be written, and a person can leave a session out.
+//! or `#` in a URL, or a name nobody listed stays in the text. So does a user name anywhere in a
+//! path but the home directory's. The preview shows everything that will be written, and a person
+//! can leave a session out.
 
 use std::borrow::Cow;
 
@@ -56,7 +58,8 @@ const HOME: &str = "[home]";
 /// How a platform spells and compares paths, for finding the home directory in a field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Paths {
-    /// Whether upper and lower case letters are the same letter.
+    /// Whether upper and lower case letters are the same letter, as the file system folds them:
+    /// compared as capitals, so the two lower-case sigmas are one.
     pub ignores_case: bool,
     /// Whether `\` separates the parts of a path as `/` does.
     pub backslash_separates: bool,
@@ -74,7 +77,7 @@ impl Paths {
 
     fn same(self, a: char, b: char) -> bool {
         a == b
-            || (self.ignores_case && a.to_lowercase().eq(b.to_lowercase()))
+            || (self.ignores_case && a.to_uppercase().eq(b.to_uppercase()))
             || (self.backslash_separates && self.separates(a) && self.separates(b))
     }
 
@@ -158,10 +161,14 @@ fn credentials(text: &str) -> Option<String> {
     userinfo(text, &mut spans);
     assignments(text, &mut spans)?;
     options(text, &mut spans)?;
-    // The earliest span first. A span that starts inside one already taken is part of it: the
-    // region the first one replaces grows to the end of the later one, so a credential value that
-    // holds another credential name, and a quoted value that runs past the end of the word an
-    // earlier rule stopped at, are replaced whole and nothing of either is left behind.
+    Some(replace_spans(text, spans))
+}
+
+/// Replaces each of `spans` in `text`, earliest first. A span that starts inside one already taken
+/// is part of it: the region the first one replaces grows to the end of the later one, so a value
+/// that holds another credential, and a span that runs past the end of the one an earlier rule
+/// stopped at, are replaced whole and nothing of either is left behind.
+fn replace_spans(text: &str, mut spans: Vec<Span>) -> String {
     spans.sort_by_key(|span| (span.start, span.end));
     let mut out = String::with_capacity(text.len());
     let mut taken = 0;
@@ -185,7 +192,7 @@ fn credentials(text: &str) -> Option<String> {
         taken = region.end;
     }
     out.push_str(&text[taken..]);
-    Some(out)
+    out
 }
 
 /// Each `scheme://` authority's user information, with its `@`.
@@ -225,7 +232,7 @@ fn assignments(text: &str, spans: &mut Vec<Span>) -> Option<()> {
             continue;
         }
         let start = equals + 1;
-        let end = value_end(text, start)?;
+        let end = value_end(text, start, quote_at(text, start))?;
         if end > start {
             spans.push(Span {
                 start,
@@ -268,7 +275,7 @@ fn options(text: &str, spans: &mut Vec<Span>) -> Option<()> {
         if start >= text.len() || text[start..].starts_with("--") {
             continue;
         }
-        let end = value_end(text, start)?;
+        let end = value_end(text, start, quote_at(text, start))?;
         spans.push(Span {
             start,
             end,
@@ -278,27 +285,60 @@ fn options(text: &str, spans: &mut Vec<Span>) -> Option<()> {
     Some(())
 }
 
-/// Where a value that starts at `start` ends, read as a shell reads a word: at the first whitespace
-/// that is not inside a quote and not escaped, so `abc"d e"` and `'it'\''s here'` are one value
-/// each. `None` when a quote never closes: the rest of the field cannot be told from the value.
-fn value_end(text: &str, start: usize) -> Option<usize> {
-    let mut quote: Option<char> = None;
+/// One character of a word read as a shell reads it: moves `quote` when the character opens or
+/// closes a quote, skips what a backslash escapes, and says whether the character is whitespace
+/// outside every quote, which is where a word ends. Only the ASCII whitespace a shell splits on
+/// counts: a no-break space is a character of its word.
+fn step(
+    quote: &mut Option<char>,
+    character: char,
+    rest: &mut impl Iterator<Item = (usize, char)>,
+) -> bool {
+    match *quote {
+        Some(open) if character == open => *quote = None,
+        // Inside double quotes a backslash escapes the next character; inside single quotes it is
+        // a character.
+        Some('"') if character == '\\' => {
+            rest.next();
+        }
+        Some(_) => {}
+        None if character.is_ascii_whitespace() => return true,
+        None if matches!(character, '"' | '\'') => *quote = Some(character),
+        None if character == '\\' => {
+            rest.next();
+        }
+        None => {}
+    }
+    false
+}
+
+/// The quote that is open at `position`, reading the text from its start as a shell reads it: the
+/// quote a whole assignment such as `-e "PASSWORD=two words"` sits in. A quote that opened in a
+/// path earlier in the text and never closed counts too, which withholds the field when a
+/// credential follows it: the rest of the text cannot be told from the value.
+fn quote_at(text: &str, position: usize) -> Option<char> {
+    let mut quote = None;
+    let mut characters = text[..position].char_indices();
+    while let Some((_, character)) = characters.next() {
+        step(&mut quote, character, &mut characters);
+    }
+    quote
+}
+
+/// Where a value that starts at `start` ends, read as a shell reads a word that begins inside
+/// `quote`: at the first whitespace that is not inside a quote and not escaped, so `abc"d e"` and
+/// `'it'\''s here'` are one value each, and so is the rest of a quoted assignment. `None` when a
+/// quote never closes: the rest of the field cannot be told from the value.
+fn value_end(text: &str, start: usize, mut quote: Option<char>) -> Option<usize> {
+    let around = quote;
     let mut characters = text[start..].char_indices();
     while let Some((offset, character)) = characters.next() {
-        match quote {
-            Some(open) if character == open => quote = None,
-            // Inside double quotes a backslash escapes the next character; inside single quotes it
-            // is a character.
-            Some('"') if character == '\\' => {
-                characters.next();
-            }
-            Some(_) => {}
-            None if character.is_whitespace() => return Some(start + offset),
-            None if matches!(character, '"' | '\'') => quote = Some(character),
-            None if character == '\\' => {
-                characters.next();
-            }
-            None => {}
+        // The quote the assignment itself sits in ends the value, and stays in the text.
+        if around.is_some() && quote == around && Some(character) == around {
+            return Some(start + offset);
+        }
+        if step(&mut quote, character, &mut characters) {
+            return Some(start + offset);
         }
     }
     quote.is_none().then_some(text.len())
@@ -335,9 +375,9 @@ fn says_credential(name: &str) -> bool {
             .any(|part| PARTS.contains(&part.as_str()))
 }
 
-/// A name's parts, lower-cased: split at every character that is not a letter or a digit, between a
-/// lower-case letter or a digit and an upper-case letter, and before the last capital of a run of capitals that a
-/// lower-case letter follows (`HTTPAuth` is `http` and `auth`).
+/// A name's parts, lower-cased: split at every character that is not a letter or a digit, between
+/// a lower-case letter or a digit and an upper-case letter, and before the last capital of a run of
+/// capitals that a lower-case letter follows (`HTTPAuth` is `http` and `auth`).
 fn parts(name: &str) -> Vec<String> {
     let characters: Vec<char> = name.chars().collect();
     let mut parts = Vec::new();

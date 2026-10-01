@@ -1115,6 +1115,15 @@ impl Window {
             .expect("types into the window");
     }
 
+    /// Types bytes, then the end of the line.
+    fn type_bytes(&mut self, bytes: &[u8]) {
+        self.typing
+            .write_all(bytes)
+            .and_then(|()| self.typing.write_all(b"\n"))
+            .and_then(|()| self.typing.flush())
+            .expect("types into the window");
+    }
+
     /// Types one line, as a person does.
     fn type_line(&mut self, line: &str) {
         self.typing
@@ -1180,7 +1189,7 @@ async fn at_a_terminal_yes_writes_the_content_that_was_shown() {
 async fn at_a_terminal_declining_writes_nothing() {
     let host = Host::start().await;
     host.create();
-    for answer in ["no", "perhaps", "end of input"] {
+    for answer in ["no", "perhaps", "end of input", "bytes that are not text"] {
         let path = host
             .temp
             .root()
@@ -1195,10 +1204,10 @@ async fn at_a_terminal_declining_writes_nothing() {
             ],
         );
         window.wait_for(QUESTION, 1);
-        if answer == "end of input" {
-            window.end_of_input();
-        } else {
-            window.type_line(answer);
+        match answer {
+            "end of input" => window.end_of_input(),
+            "bytes that are not text" => window.type_bytes(&[0xff, 0xfe, 0x80]),
+            _ => window.type_line(answer),
         }
         let shown = window.wait_for("kr ended", 1);
         assert!(
@@ -1340,6 +1349,15 @@ async fn a_preview_the_error_stream_cannot_take_writes_nothing() {
     let output = command.output().expect("kr runs");
     let document: Value = serde_json::from_slice(&output.stdout).expect("a failure document");
     assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    // The failure is the preview's, not a refusal or a decline (which exit 1): a terminal failure.
+    assert_eq!(output.status.code(), Some(6), "{document}");
+    assert_eq!(document["exit_code"], 6, "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not be shown")),
+        "{document}"
+    );
     assert!(
         document["message"]
             .as_str()
