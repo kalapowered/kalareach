@@ -107,6 +107,24 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
     )
 }
 
+/// What the stand-in for `ssh` does: skip the options and the host, and run what follows them in
+/// the destination's own environment, as the login on the other side would.
+fn ssh_stand_in(destination: &Path, home: &Path) -> String {
+    let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
+    format!(
+        r##"#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+shift
+exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
+  KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' "$@"
+"##,
+        home = home.display(),
+        runtime = destination.join("r").display(),
+        state = destination.join("s").display(),
+    )
+}
+
 /// The source host's daemon, a destination with none, and the stand-in between them.
 struct World {
     source: teardown::Tree,
@@ -142,6 +160,10 @@ impl World {
         let text = tools.join("wsl.exe.text");
         std::fs::write(&text, stand_in(&tools, destination.root(), &home)).expect("the stand-in");
         kr_ipc::testing::place_program(&text, &tools.join("wsl.exe"));
+        let ssh_text = tools.join("ssh.text");
+        std::fs::write(&ssh_text, ssh_stand_in(destination.root(), &home))
+            .expect("the ssh stand-in");
+        kr_ipc::testing::place_program(&ssh_text, &tools.join("ssh"));
         // The destination chooses the standalone start, as a person sets a distribution up.
         kr_ipc::paths::write_owner_only_file(
             &destination.environment().state_dir().join("config.json"),
@@ -158,6 +180,16 @@ impl World {
             .arg(source.root().join("s"))
             .arg("--worker")
             .arg(installation().join("kr-worker"))
+            // The daemon runs `ssh` for a host that is asked who it is, so the stand-in is first
+            // on its path too.
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    tools.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().expect("duplicates the log"))
             .stderr(log)
@@ -740,4 +772,100 @@ async fn a_terminal_attached_through_a_bridge_reaches_the_shell_in_the_destinati
     terminal.expect_within("attach-finished-", "the attachment ended with the session");
     let mut shell = terminal.shell;
     let _ = shell.wait();
+}
+
+/// KR-REQ-25.26: `kr bridge enrol --access ssh --probe` learns the destination's identity from its
+/// helper over ssh, and a refresh then registers the helper's scoped channel for the record. The
+/// destination has to be running: asking over ssh starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel() {
+    let world = World::start().await;
+    // The destination's daemon is started by a create, as for any environment that is running.
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+
+    let helper = support::kr().display().to_string();
+    // The stand-in runs the helper as this test's own account, as a login of that name would.
+    let account = String::from_utf8(
+        std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .expect("id runs")
+            .stdout,
+    )
+    .expect("a name")
+    .trim()
+    .to_owned();
+    let enrolled = world.run(&[
+        "--json",
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "sshdest",
+        "--target",
+        "build.example",
+        "--user",
+        &account,
+        "--helper",
+        &helper,
+        "--probe",
+    ]);
+    assert!(
+        enrolled.status.success(),
+        "{}; it said {}",
+        String::from_utf8_lossy(&enrolled.stdout),
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let row: Value = serde_json::from_slice(&enrolled.stdout).expect("kr printed JSON");
+    assert_eq!(
+        row["row"]["enrolment"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "the identity is the destination's own, learned from its helper: {row}"
+    );
+    assert_eq!(row["row"]["readiness"]["channel_scoped"], false, "{row}");
+
+    let refreshed = world.run(&["--json", "bridge", "refresh", "sshdest"]);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).expect("kr printed JSON");
+    assert_eq!(
+        refreshed["verification"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "{refreshed}"
+    );
+    assert_eq!(
+        refreshed["row"]["readiness"]["channel_scoped"], true,
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["started"], false, "{refreshed}");
+
+    // The identity a destination answers with is checked against one the person gave.
+    let wrong = world.run(&[
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "other",
+        "--target",
+        "build.example",
+        "--user",
+        &account,
+        "--helper",
+        &helper,
+        "--environment-id",
+        "66666666-6666-4666-8666-666666666666",
+        "--probe",
+    ]);
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("different environment"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
 }
