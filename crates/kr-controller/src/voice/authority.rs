@@ -85,6 +85,29 @@ fn at_the_write(
     }
 }
 
+/// The record a voice grant plan is written as.
+///
+/// Written active: a voice grant is not an invitation somebody redeems later. The device it is
+/// issued to is the one that asked for it on an authenticated connection, which is the redemption
+/// an invitation exists to perform.
+fn voice_record(plan: &VoiceGrantPlan) -> GrantRecord {
+    let grant = plan.grant(GrantId::new(kr_ipc::new_uuid()));
+    let now_ms = now_ms();
+    GrantRecord {
+        grant,
+        session_id: match &plan.session_selector {
+            kr_protocol::grant::SessionSelector::These { session_ids } => {
+                session_ids.iter().copied().next()
+            }
+            _ => None,
+        },
+        issued_at_ms: now_ms,
+        activated_at_ms: Some(now_ms),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    }
+}
+
 /// A store failure the coordinator reports rather than swallows.
 fn store(error: crate::error::ControllerError) -> VoiceError {
     VoiceError::Host(kr_protocol::error::ProtocolError::new(
@@ -157,25 +180,8 @@ impl VoiceAuthority for GrantAuthority {
         plan: &VoiceGrantPlan,
         admission: &dyn kr_voice::Admission,
     ) -> kr_voice::Result<Grant> {
-        let grant_id = GrantId::new(kr_ipc::new_uuid());
-        let grant = plan.grant(grant_id);
-        let now_ms = now_ms();
-        // Written active: a voice grant is not an invitation somebody redeems later. The device it
-        // is issued to is the one that asked for it on an authenticated connection, which is the
-        // redemption an invitation exists to perform.
-        let record = GrantRecord {
-            grant: grant.clone(),
-            session_id: match &plan.session_selector {
-                kr_protocol::grant::SessionSelector::These { session_ids } => {
-                    session_ids.iter().copied().next()
-                }
-                _ => None,
-            },
-            issued_at_ms: now_ms,
-            activated_at_ms: Some(now_ms),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        };
+        let record = voice_record(plan);
+        let grant = record.grant.clone();
         // The admission is asked inside the store's own transaction, once its lock is held and the
         // parent has been read, immediately before the record is written: the wait for that lock
         // can outlast it. The admission a voice mutation carries is the check every service asks
@@ -185,6 +191,32 @@ impl VoiceAuthority for GrantAuthority {
             .grants()
             .issue(&record, at_the_write(admission))
             .map_err(store)?;
+        Ok(grant)
+    }
+
+    fn replace(
+        &self,
+        replaced: GrantId,
+        plan: &VoiceGrantPlan,
+        now_ms: u64,
+        admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<Grant> {
+        let record = voice_record(plan);
+        let grant = record.grant.clone();
+        // The withdrawal and the new grant are one transaction of the store, with the admission
+        // asked inside it once both have been read and before either is written. A voice grant's
+        // withdrawal owes no fence, and this publishes what the cascade found it must (see
+        // [`Self::revoke`]), once the transaction has committed and not before.
+        let revocation = self
+            .sharing
+            .grants()
+            .replace(Some(replaced), now_ms, &record, at_the_write(admission))
+            .map_err(store)?;
+        if let Some(debt) = revocation.and_then(|revocation| revocation.debt)
+            && let Some(daemon) = self.daemon.upgrade()
+        {
+            daemon.publish_and_fence(debt);
+        }
         Ok(grant)
     }
 

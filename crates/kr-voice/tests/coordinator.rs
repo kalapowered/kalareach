@@ -92,6 +92,8 @@ struct Authority {
     device_grant: Mutex<Option<Grant>>,
     identity: AuthorisationKey,
     lookups: Lookups,
+    /// Whether the next write of a replacement grant fails.
+    write_fails: std::sync::atomic::AtomicBool,
     /// This host's clock, as a test moves it.
     now: std::sync::atomic::AtomicU64,
 }
@@ -119,6 +121,7 @@ impl Authority {
             device_grant: Mutex::new(Some(device_grant)),
             identity,
             lookups: Lookups::default(),
+            write_fails: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -143,6 +146,30 @@ impl Authority {
     fn release_lookup(&self) {
         *self.lookups.holding.lock().expect("the held lookup") = false;
         self.lookups.resumed.notify_all();
+    }
+
+    /// Waits here while a test holds the next change open ([`Authority::hold_next_lookup`]).
+    fn hold_lookup_if_armed(&self) {
+        if self
+            .lookups
+            .armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut holding = self.lookups.holding.lock().expect("the held lookup");
+            while *holding {
+                holding = self
+                    .lookups
+                    .resumed
+                    .wait(holding)
+                    .expect("the held lookup is released");
+            }
+        }
+    }
+
+    /// Makes the next write of a replacement grant fail.
+    fn fail_the_next_write(&self) {
+        self.write_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How many standing-grant lookups have begun.
@@ -285,11 +312,77 @@ impl VoiceAuthority for Authority {
             admission.still_admitted().is_ok(),
             "a write inside its admission"
         );
+        // A write the store cannot make fails here too, so a replacement made of a withdrawal and
+        // a write of its own is the same failure the one change would have had.
+        if self
+            .write_fails
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(kr_voice::VoiceError::Host(
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::StorageUnavailable,
+                    "the store could not write the grant".to_owned(),
+                ),
+            ));
+        }
         let mut store = self.store.lock().expect("the store");
         let grant_id = GrantId::new(Uuid::from_bytes([store.next; 16]));
         store.next = store.next.wrapping_add(1);
         let grant = plan.grant(grant_id);
         store.grants.push(grant.clone());
+        Ok(grant)
+    }
+
+    fn replace(
+        &self,
+        replaced: GrantId,
+        plan: &VoiceGrantPlan,
+        now_ms: u64,
+        admission: &dyn kr_voice::Admission,
+    ) -> kr_voice::Result<Grant> {
+        // The replacement written whole or not at all, as the host's store writes it: held here, in
+        // the window a second change would read the same grant in, and then written under one hold
+        // of the store. A test can make the write fail, and then the grant it replaces stands.
+        self.hold_lookup_if_armed();
+        if self
+            .write_fails
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(kr_voice::VoiceError::Host(
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::StorageUnavailable,
+                    "the store could not write the grant".to_owned(),
+                ),
+            ));
+        }
+        assert!(
+            admission.still_admitted().is_ok(),
+            "a write inside its admission"
+        );
+        let mut store = self.store.lock().expect("the store");
+        let grant_id = GrantId::new(Uuid::from_bytes([store.next; 16]));
+        store.next = store.next.wrapping_add(1);
+        let grant = plan.grant(grant_id);
+        store.grants.push(grant.clone());
+        let mut going = vec![replaced];
+        let mut index = 0;
+        while index < going.len() {
+            let parent = going[index];
+            let children: Vec<GrantId> = store
+                .grants
+                .iter()
+                .filter(|held| held.parent_grant_id.0 == Some(parent))
+                .map(|held| held.grant_id)
+                .collect();
+            going.extend(children);
+            index += 1;
+        }
+        for going in going {
+            if !store.revoked.contains(&going) {
+                store.revoked.push(going);
+                store.revoked_at_ms.push(now_ms);
+            }
+        }
         Ok(grant)
     }
 
@@ -301,20 +394,7 @@ impl VoiceAuthority for Authority {
     ) -> kr_voice::Result<u64> {
         // Held here, after the grant to replace has been read and before it is withdrawn: that is
         // the window a second change would read the same grant in.
-        if self
-            .lookups
-            .armed
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let mut holding = self.lookups.holding.lock().expect("the held lookup");
-            while *holding {
-                holding = self
-                    .lookups
-                    .resumed
-                    .wait(holding)
-                    .expect("the held lookup is released");
-            }
-        }
+        self.hold_lookup_if_armed();
         let mut store = self.store.lock().expect("the store");
         // The cascade: a revoked parent takes its descendants with it.
         let mut going = vec![grant_id];
@@ -1598,6 +1678,70 @@ async fn a_call_the_broker_ends_is_not_reported() {
         .expect("a narrower standing voice grant");
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
     assert!(told.lock().expect("the report").is_empty());
+}
+
+/// KR-REQ-15.21: a replacement the store cannot write leaves the grant it replaces standing and
+/// the calls under it running: the withdrawal and the new grant are one change. The control: the
+/// same change written again goes through, and withdraws what it replaces.
+#[tokio::test]
+async fn a_replacement_that_cannot_be_written_leaves_the_standing_grant_and_its_calls() {
+    let fixture = fixture();
+    let told = reported_to(&fixture);
+    started(&fixture, None).await;
+    let standing = fixture.authority.standing_grants(device(PHONE));
+    assert_eq!(standing.len(), 1);
+    assert_eq!(fixture.coordinator.live_sessions(), 1);
+
+    fixture.authority.fail_the_next_write();
+    let refused = fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_200,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect_err("the store could not write the replacement");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "{refused}"
+    );
+    assert_eq!(
+        fixture.authority.standing_grants(device(PHONE)),
+        standing,
+        "the standing grant was not withdrawn"
+    );
+    assert!(!fixture.authority.is_revoked(standing[0]));
+    assert_eq!(
+        fixture.coordinator.live_sessions(),
+        1,
+        "the call under it is still running, under authority that stands"
+    );
+    assert!(
+        fixture.broker.closed().is_empty(),
+        "and the broker was not told to end it"
+    );
+    assert!(told.lock().expect("the report").is_empty());
+
+    // The control: written again, the replacement goes through.
+    let second = fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_300,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("the replacement is written");
+    assert!(fixture.authority.is_revoked(standing[0]));
+    assert_eq!(
+        fixture.authority.standing_grants(device(PHONE)),
+        vec![second.grant_id]
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
 }
 
 /// KR-REQ-15.21: replacing a standing voice grant withdraws the one it replaces, so two scopes
