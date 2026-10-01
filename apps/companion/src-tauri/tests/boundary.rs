@@ -612,6 +612,7 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
         "      PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach\n",
         "        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications\n",
         "        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.native-tests\n",
+        "        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.uitests\n",
         "        KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach\n",
         "        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.shared\n",
     ] {
@@ -629,14 +630,47 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
         project.contains("\nsettings:\n  base:\n    DEVELOPMENT_TEAM: L775WGST9V\n"),
         "the project names the organisation's Apple team"
     );
-    for chosen_by_the_signer in [
-        "CODE_SIGN_IDENTITY",
-        "PROVISIONING_PROFILE",
-        "CODE_SIGN_STYLE",
+    // What signs a build is the signer's: the project reads each choice from a build setting that
+    // is undefined unless whoever builds defines it, and names no identity, profile or style of its
+    // own, so a simulator build and an unsigned build are what they were.
+    for line in project.lines() {
+        for chosen_by_the_signer in [
+            "CODE_SIGN_IDENTITY",
+            "PROVISIONING_PROFILE",
+            "CODE_SIGN_STYLE",
+            "OTHER_CODE_SIGN_FLAGS",
+        ] {
+            if line.contains(chosen_by_the_signer) {
+                assert!(
+                    line.contains("$(KR_"),
+                    "project.yml names {chosen_by_the_signer} without reading it from a build \
+                     setting of the signer's: {line}"
+                );
+            }
+        }
+    }
+    for read_from_the_signer in [
+        "KR_SIGN_STYLE",
+        "KR_SIGN_IDENTITY",
+        "KR_SIGN_FLAGS",
+        "KR_APP_PROFILE",
+        "KR_EXTENSION_PROFILE",
+        "KR_RUNNER_PROFILE",
     ] {
         assert!(
-            !project.contains(chosen_by_the_signer),
-            "project.yml names {chosen_by_the_signer}, which belongs to whoever signs"
+            project.contains(&format!("$({read_from_the_signer}")),
+            "project.yml does not read {read_from_the_signer}"
+        );
+    }
+    // The generated project carries those references and no value of its own.
+    let generated = text("gen/apple/companion-tauri.xcodeproj/project.pbxproj");
+    for line in generated
+        .lines()
+        .filter(|line| line.contains("PROVISIONING_PROFILE_SPECIFIER"))
+    {
+        assert!(
+            line.contains("$(KR_"),
+            "the generated project names a provisioning profile of its own: {line}"
         );
     }
     // The application's own group first: the platform files an item written without a group
@@ -684,13 +718,14 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
         .filter_map(|line| line.trim().strip_prefix("PRODUCT_BUNDLE_IDENTIFIER = "))
         .map(|value| value.trim_end_matches(';').trim_matches('"').to_owned())
         .collect();
-    assert_eq!(identifiers.len(), 6, "{identifiers:?}");
+    assert_eq!(identifiers.len(), 8, "{identifiers:?}");
     for identifier in &identifiers {
         assert!(
             [
                 "to.kala.reach",
                 "to.kala.reach.notifications",
-                "to.kala.reach.native-tests"
+                "to.kala.reach.native-tests",
+                "to.kala.reach.uitests"
             ]
             .contains(&identifier.as_str()),
             "the generated project names {identifier}"
