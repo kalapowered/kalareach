@@ -1630,13 +1630,13 @@ impl Controller {
         // another operation may be holding it, and a wait that only started once it was free would
         // not be a bound at all.
         let exchange = async {
-            let mut held = self.worker_client(&worker).await?;
-            // The connection is taken out of the shared slot for the exchange and put back only
-            // when it finished. A cancelled exchange — this one running out of time — would
-            // otherwise leave a connection in the slot with an acknowledgement still on the wire,
-            // and the next caller would read somebody else's answer as its own.
-            let mut client = held.take().expect("the connection is open");
-            let answered = client
+            // The link is taken out of the shared slot for the exchange and goes back only when it
+            // finished. A cancelled exchange, this one running out of time, would otherwise leave
+            // a connection in the slot with an acknowledgement still on the wire, and the next
+            // caller would read somebody else's answer as its own.
+            let mut link = self.worker_client(&worker).await?;
+            let answered = link
+                .client()
                 .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
                     environment_id: self.paths().environment_id(),
                     revision,
@@ -1647,7 +1647,7 @@ impl Controller {
                 .await;
             match answered {
                 Ok(ack) => {
-                    *held = Some(client);
+                    link.give_back();
                     Ok(Some(ack))
                 }
                 Err(error) => Err(ControllerError::from(error)),
@@ -1656,11 +1656,10 @@ impl Controller {
         let answered = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
             Ok(Ok(answered)) => answered,
             // A worker that did not answer, or that could not be reached, has not installed the
-            // revision. Renewal stops for it until it does.
-            Ok(Err(_)) | Err(_) => {
-                self.leases.stop_renewal(session_id, binding);
-                None
-            }
+            // revision. Renewal stops for it until it does: the link it was reached over gave up
+            // its path as it was dropped, while the slot was still held. A wait for the link that
+            // ran out holds nothing and gives nothing up.
+            Ok(Err(_)) | Err(_) => None,
         };
         match answered {
             Some(ack) if ack.revision.get() >= revision.get() => {

@@ -1086,7 +1086,7 @@ pub(super) async fn still_unclaimed(
 /// exchange runs over that connection alone. A worker that cannot be reached, or does not answer in
 /// time, answers nothing here and is told again on its schedule; its connection is retired when an
 /// exchange on it failed part way, because nothing knows where its stream stands.
-async fn tell_privacy(
+pub(super) async fn tell_privacy(
     daemon: &std::sync::Weak<Controller>,
     notice: crate::privacy::Notice,
 ) -> Option<Option<kr_protocol::privacy::PrivacyGenerationAck>> {
@@ -1100,30 +1100,28 @@ async fn tell_privacy(
         .await;
         (reached, controller.paths.environment_id())
     };
-    let Ok(Ok(mut held)) = reached else {
-        return Some(None);
-    };
-    let Some(client) = held.as_mut() else {
+    let Ok(Ok(mut link)) = reached else {
         return Some(None);
     };
     let told = tokio::time::timeout(
         PRIVACY_EXCHANGE,
-        client.announce_privacy(kr_protocol::privacy::PrivacyGenerationNotice {
-            environment_id,
-            generation: kr_protocol::scalars::U64::new(notice.generation.get()),
-            enabled: notice.enabled,
-        }),
+        link.client()
+            .announce_privacy(kr_protocol::privacy::PrivacyGenerationNotice {
+                environment_id,
+                generation: kr_protocol::scalars::U64::new(notice.generation.get()),
+                enabled: notice.enabled,
+            }),
     )
     .await;
     match told {
         // An answer is about the session it names, and this connection is that session's alone.
-        Ok(Ok(ack)) => Some((ack.session_id == session_id).then_some(ack)),
-        Ok(Err(_)) | Err(_) => {
-            *held = None;
-            drop(held);
-            daemon.upgrade()?.lost_control_path(session_id);
-            Some(None)
+        Ok(Ok(ack)) => {
+            link.give_back();
+            Some((ack.session_id == session_id).then_some(ack))
         }
+        // The link is closed and the path given up, before the slot is released, as it goes out
+        // of scope.
+        Ok(Err(_)) | Err(_) => Some(None),
     }
 }
 

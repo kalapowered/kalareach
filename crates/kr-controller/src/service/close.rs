@@ -105,7 +105,7 @@ impl Controller {
             // The connection comes first. Waiting for it can take as long as whatever else is using
             // it, and a deadline computed before that wait would hand the worker time that had
             // already been spent queueing.
-            let mut held = tokio::time::timeout_at(budget, self.worker_client(&worker))
+            let mut link = tokio::time::timeout_at(budget, self.worker_client(&worker))
                 .await
                 .map_err(|_| {
                     // Nothing was dispatched: this close never reached the worker, and the link it
@@ -115,19 +115,15 @@ impl Controller {
                          time, so nothing was closed",
                     )
                 })??;
-            // Taken with the link in hand, not before the wait for it: another operation can lose
-            // this worker's control path and a replacement can be established and acknowledged
-            // while this close is still queueing, and fencing the binding that was current then
-            // would lift nothing. This is the path the exchange below actually runs over.
-            let binding = self.leases.binding(params.session_id);
             // The admission is checked here rather than before the wait, because this is where
             // the wait was. A deadline that ran out while this close queued does not stop it
             // reaching the worker, because the worker is the only thing that knows whether it
             // already holds this action's receipt; what a spent deadline stops is a *first*
             // admission, and the worker refuses that for the same reason this daemon would have.
             // The authority half is different: it refuses outright, because disclosing anything
-            // under authority that has been withdrawn is what the contract forbids.
-            {
+            // under authority that has been withdrawn is what the contract forbids. A refusal
+            // here is no exchange, so the link goes back as it came.
+            let checked = async {
                 // Inside the same budget as the exchange: this daemon is holding the worker's link
                 // while it asks, and a registry another operation is holding must not let that
                 // link be held past what a closure is allowed to take.
@@ -144,11 +140,20 @@ impl Controller {
                     Err(ControllerError::WindowExpired { .. }) => {}
                     Err(error) => return Err(error),
                 }
+                drop(registry);
+                // Remote dispatch additionally needs a live lease, taken at the moment the
+                // dispatch runs rather than one that was valid when the request arrived. Its own
+                // remaining time then bounds the deadline the worker is given.
+                Ok(self.dispatch_lease(params.session_id, actor).await?)
             }
-            // Remote dispatch additionally needs a live lease, taken at the moment the dispatch
-            // runs rather than one that was valid when the request arrived. Its own remaining time
-            // then bounds the deadline the worker is given.
-            let lease_deadline = self.dispatch_lease(params.session_id, actor).await?;
+            .await;
+            let lease_deadline = match checked {
+                Ok(lease_deadline) => lease_deadline,
+                Err(error) => {
+                    link.give_back();
+                    return Err(error);
+                }
+            };
             // What the worker is told is the accepted deadline itself, on the machine's own
             // continuous clock: the same clock the worker reads, so the deadline does not restart
             // on arrival and nothing has to guess at what the journey cost. A deadline already
@@ -164,10 +169,9 @@ impl Controller {
                     )
                 })
                 .unwrap_or_else(|| U64::new(0));
-            let client = held.as_mut().expect("the connection is open");
             match tokio::time::timeout_at(
                 budget,
-                client.forward(
+                link.client().forward(
                     mutation,
                     actor,
                     // A local caller acts under the operating-system identity the listener
@@ -179,16 +183,16 @@ impl Controller {
             )
             .await
             {
-                Ok(Ok(result)) => result,
+                Ok(Ok(result)) => {
+                    link.give_back();
+                    result
+                }
                 // The path this daemon announces authority revisions over is gone, whether it
                 // ended or stopped answering. Renewal stops with it: section 9 lets a remote
                 // dispatch lease be renewed only after the worker has acknowledged the revision,
-                // and this daemon can no longer hear an acknowledgement from that worker.
-                Ok(Err(error)) => {
-                    *held = None;
-                    self.leases.stop_renewal(params.session_id, binding);
-                    return Err(error.into());
-                }
+                // and this daemon can no longer hear an acknowledgement from that worker. The link
+                // is closed and the path given up as it goes out of scope.
+                Ok(Err(error)) => return Err(error.into()),
                 // The close was written and no answer came back inside the time a closure is
                 // allowed to take. The client is retired rather than returned to the shared slot:
                 // its exchange was abandoned part way through, so the next caller to pick it up
@@ -196,8 +200,6 @@ impl Controller {
                 // worker acted on it is not known, which is what the caller is told: section 9
                 // does not let an interrupted dispatch be reported as a refusal.
                 Err(_) => {
-                    *held = None;
-                    self.leases.stop_renewal(params.session_id, binding);
                     return Err(ControllerError::Uncertain {
                         detail:
                             "the worker did not answer this close within the time a closure is \

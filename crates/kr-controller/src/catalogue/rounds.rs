@@ -179,21 +179,22 @@ impl Controller {
                 return self.unanswered(session_id);
             }
         };
+        // A wait for the link that runs out is not a loss of the path: another operation holds it.
         let answered =
             match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client_of(session_id)).await {
-                Ok(Ok(mut held)) => {
-                    let exchanged = match held.as_mut() {
-                        Some(client) => client.exchange_admissions(parts, WORKER_EXCHANGE).await,
-                        None => return self.unanswered(session_id),
-                    };
-                    match exchanged {
-                        Ok(report) => Some(report),
-                        Err(_) => {
-                            // A client whose stream position nothing knows is retired, as an
-                            // announcement retires one.
-                            *held = None;
-                            None
+                Ok(Ok(mut link)) => {
+                    match link
+                        .client()
+                        .exchange_admissions(parts, WORKER_EXCHANGE)
+                        .await
+                    {
+                        Ok(report) => {
+                            link.give_back();
+                            Some(report)
                         }
+                        // A client whose stream position nothing knows is closed, and its path
+                        // given up, as the link goes out of scope.
+                        Err(_) => None,
                     }
                 }
                 Ok(Err(_)) | Err(_) => None,
