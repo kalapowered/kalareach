@@ -948,13 +948,15 @@ impl EnvironmentPrivacy {
     /// session in `live` has a worker running, and each session in `over` has ended.
     ///
     /// `over` is what the daemon's registry shows to be over: a session that is neither running nor
-    /// recorded ([`Self::unreached`]) and whose launch it has no record of, or recorded as failed or
-    /// closed, so no worker is coming for it that could answer. That covers a session that closed
-    /// before privacy mode was turned on and whose output is still on the disk, and every obligation
-    /// a restart read back before any worker was seen. A session that is not in `over` keeps what
-    /// was known of it, and a session `recorded` lists and `live` does not is never taken for
-    /// ended: a worker this daemon has not reached yet, or whose launch has not finished, is not one
-    /// that has ended, and turning privacy mode off waits for it.
+    /// recorded ([`Self::unreached`]) and whose launch it has no record of, or recorded as closed or
+    /// as failed after a worker claimed it, so no worker is coming for it that could answer. That
+    /// covers a session that closed before privacy mode was turned on and whose output is still on
+    /// the disk, and every obligation a restart read back for a session whose worker had run. A
+    /// launch that never produced a worker is not here: it is forgotten
+    /// ([`Self::discharge_unstarted`]). A session that is not in `over` keeps what was known of it,
+    /// and a session `recorded` lists and `live` does not is never taken for ended: a worker this
+    /// daemon has not reached yet, or whose launch has not finished, is not one that has ended, and
+    /// turning privacy mode off waits for it.
     ///
     /// # Errors
     ///
@@ -1554,8 +1556,8 @@ impl crate::service::Controller {
     ///
     /// The sessions the environment holds content for are every worker the registry records, every
     /// launch whose worker may be starting or running (a reservation that is spawned, claimed or
-    /// fenced) and every session whose journal or spool is still on disk, and each owes its own
-    /// cleanup when privacy mode is turned on. The admission is asked again immediately before the change is
+    /// fenced after a claim) and every session whose journal or spool is still on disk, and each
+    /// owes its own cleanup when privacy mode is turned on. The admission is asked again immediately before the change is
     /// written, after every wait ([`EnvironmentPrivacy::set`]).
     ///
     /// # Errors
@@ -1589,6 +1591,7 @@ impl crate::service::Controller {
             // cleanup too, whether or not its worker has opened a journal or reported yet: after a
             // restart this daemon's own record of launches is gone, and the registry is the only
             // place that says a worker may be running there.
+            // A reservation fenced before any worker claimed it handed nobody a specification.
             for phase in [
                 crate::registry::LaunchPhase::Spawned,
                 crate::registry::LaunchPhase::Claimed,
@@ -1598,6 +1601,10 @@ impl crate::service::Controller {
                     registry
                         .reservations_in(phase)?
                         .into_iter()
+                        .filter(|reservation| {
+                            phase != crate::registry::LaunchPhase::Fenced
+                                || reservation.claimed_key.is_some()
+                        })
                         .map(|reservation| reservation.session_id),
                 );
             }

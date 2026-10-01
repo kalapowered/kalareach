@@ -479,3 +479,139 @@ async fn kr_req_24_28_a_launch_that_started_nothing_is_forgotten_not_reported_as
         .await
         .expect("a launch that never started does not hold privacy mode on");
 }
+
+/// KR-REQ-24.27: the state a worker is given is the one in force when its claim is committed, not
+/// the one in force when its create arrived. Privacy mode is turned on after the claim is committed
+/// and before the daemon builds the specification; the worker is told it is on, and its session
+/// owes its cleanup from that change, though its create saw privacy mode off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_27_a_worker_is_given_the_state_in_force_when_its_claim_is_committed() {
+    let daemon = daemon().await;
+    let (mut arrived, release) = daemon.controller.pause_rendezvous_after_claim();
+    let creating = tokio::spawn({
+        let endpoint = daemon.client_endpoint.clone();
+        let environment_id = daemon.environment_id;
+        async move {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            client
+                .mutate(
+                    Method::SessionCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &create(environment_id),
+                )
+                .await
+        }
+    });
+    let launch = daemon
+        .launches
+        .recv_timeout(PATIENCE)
+        .expect("the daemon asks for a worker");
+    let claiming = daemon.present_claim(&launch);
+    tokio::pin!(claiming);
+    tokio::select! {
+        _ = &mut arrived => {}
+        _ = &mut claiming => panic!("the daemon answered the claim before its pause"),
+    }
+    assert!(
+        owing(&daemon.status().await).is_empty(),
+        "privacy mode is off"
+    );
+
+    // The claim is committed and the specification is not built: privacy mode is turned on here.
+    let on = daemon.set(true).await.expect("privacy mode is turned on");
+    assert_eq!(
+        owing(&on),
+        vec![launch.session_id],
+        "its create saw privacy mode off"
+    );
+    release.send(()).expect("the daemon goes on");
+    let specification = claiming.await;
+    assert_eq!(specification.privacy, state(1, true));
+    creating.abort();
+}
+
+/// KR-REQ-24.28: launches the daemon's recovery fails at a start, one reserved and never spawned
+/// and one spawned that recorded no launcher, own an obligation their daemon wrote while privacy
+/// mode was on; read back from the disk before any worker is seen, each is forgotten once the
+/// registry shows its launch never produced a worker, and does not keep privacy mode on or the
+/// report from saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_28_launches_recovery_fails_are_forgotten_with_their_obligations() {
+    let first = daemon().await;
+    first.set(true).await.expect("privacy mode is turned on");
+    let temp = first.stop().await;
+
+    // While no daemon runs, the launches a daemon that stopped part way through two creates left.
+    let environment = temp.environment();
+    let mut registry = kr_controller::registry::Registry::open(
+        environment.registry_database(),
+        environment.environment_id(),
+    )
+    .expect("the registry");
+    let mut left = Vec::new();
+    for token in [1_u8, 2] {
+        let reservation = registry
+            .reserve(
+                &kr_protocol::ids::ActorId::new("local:501").expect("a principal"),
+                kr_protocol::scalars::Uuid::from_bytes([token; 16]),
+                kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+                b"intent",
+                kr_protocol::scalars::TimestampMs::new(1),
+            )
+            .expect("reserves")
+            .reservation;
+        if token == 2 {
+            registry
+                .set_phase(
+                    reservation.reservation_id,
+                    kr_controller::registry::LaunchPhase::Spawned,
+                )
+                .expect("the phase is recorded");
+        }
+        left.push(reservation.session_id);
+    }
+    drop(registry);
+    let record = rusqlite::Connection::open(
+        environment
+            .state_dir()
+            .join(kr_controller::privacy::PRIVACY_RECORD),
+    )
+    .expect("the privacy record");
+    for session_id in &left {
+        record
+            .execute(
+                "INSERT INTO privacy_obligations (session_id, generation, recorded_at_ms)
+                 VALUES (?1, 1, 1)",
+                [session_id.to_string()],
+            )
+            .expect("the obligation the stopped daemon wrote");
+    }
+    drop(record);
+
+    let second = start(temp).await;
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let report = second.status().await;
+        if owing(&report).is_empty() {
+            assert!(
+                report.completion == kr_protocol::privacy::PrivacyCompletion::Complete,
+                "{:?}",
+                report.completion
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never forgot {left:?}: {:?}",
+            report.sessions
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    second
+        .set(false)
+        .await
+        .expect("launches that never started do not hold privacy mode on");
+}
