@@ -628,6 +628,23 @@ impl Controller {
             admitted_revision,
             deadline: accepted.map(|accepted| accepted.deadline),
         };
+        // Four methods take no admission into a service: the environment record and the update
+        // handover change nothing the revision or the deadline decides. They still do not run for a
+        // connection whose registration was withdrawn while the call waited.
+        if matches!(
+            method,
+            Method::EnvironmentEnrol
+                | Method::EnvironmentForget
+                | Method::EnvironmentRefresh
+                | Method::HostUpdateHandover
+        ) && let Err(error) = self.authorised(connection_id)
+        {
+            return error_reply(
+                mutation.request_id,
+                ErrorCode::PermissionDenied,
+                error.to_string(),
+            );
+        }
         let outcome = match method {
             // A create needs freshness of its own. An admission that carries none is a retry of an
             // action this host may already hold: section 9 keeps its record readable after the
