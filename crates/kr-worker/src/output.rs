@@ -45,13 +45,9 @@ pub enum OutputDelivery {
     /// It is not a span of the output stream either: its cursor is where the sequence that caused it
     /// began, and its bytes are what performs it, which need not be as long as that sequence was. A
     /// span can be cut at a cursor; an effect is delivered whole or not at all, because a clipboard
-    /// write cut part way is a terminal left inside an operating-system command.
-    Effect {
-        /// The cursor the sequence that caused it began at.
-        cursor: u64,
-        /// The bytes that perform it.
-        bytes: Arc<Vec<u8>>,
-    },
+    /// write cut part way is a terminal left inside an operating-system command. It keeps the effect
+    /// it renders, so one that cannot be delivered after all can still be recorded.
+    Effect(OwedEffect),
     /// A rendering of the canonical screen as it stands at one cursor.
     ///
     /// It is not a span of the output stream: it is what that stream *produced*, drawn for one
@@ -117,9 +113,8 @@ impl OutputDelivery {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Bytes { bytes, .. } | Self::Effect { bytes, .. } | Self::Screen { bytes, .. } => {
-                bytes.len()
-            }
+            Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
+            Self::Effect(owed) => owed.bytes.len(),
             Self::Projection { bytes, .. }
             | Self::AgentResource { bytes, .. }
             | Self::AgentInstance { bytes, .. } => *bytes,
@@ -144,7 +139,7 @@ impl OutputDelivery {
 #[derive(Clone, Debug)]
 pub struct OwedEffect {
     /// What the application asked for, where its sequence began and where the engine routed it.
-    pub effect: SideEffect,
+    pub effect: Arc<SideEffect>,
     /// The bytes that perform it on a terminal.
     pub bytes: Arc<Vec<u8>>,
 }
@@ -284,6 +279,16 @@ impl OutputStream {
     /// The same accounting rule applies as for [`OutputStream::recv`].
     pub fn try_recv(&mut self) -> Option<OutputDelivery> {
         self.receiver.try_recv().ok()
+    }
+
+    /// Stops this stream taking anything more, and keeps what is already queued for
+    /// [`Self::try_recv`].
+    ///
+    /// What is published to it afterwards is refused, so a producer learns that nobody is reading,
+    /// and what was queued before is for the reader to settle: a reader that is about to stop reads
+    /// the rest, with nothing arriving between its last read and its stopping.
+    pub fn close(&mut self) {
+        self.receiver.close();
     }
 
     /// Releases the bytes of a delivery that has reached the peer.
@@ -635,11 +640,11 @@ impl OutputHub {
         subscriber
             .queued
             .fetch_add(owed.bytes.len(), Ordering::AcqRel);
-        let delivery = OutputDelivery::Effect {
-            cursor,
-            bytes: Arc::clone(&owed.bytes),
-        };
-        if subscriber.sender.send(delivery).is_err() {
+        if subscriber
+            .sender
+            .send(OutputDelivery::Effect(owed.clone()))
+            .is_err()
+        {
             self.subscribers.remove(&attachment_id);
             return EffectOutcome::Refused;
         }
@@ -1184,14 +1189,14 @@ mod tests {
 
     fn owed(bytes: &[u8], at: u64) -> OwedEffect {
         OwedEffect {
-            effect: SideEffect {
+            effect: Arc::new(SideEffect {
                 kind: kr_term::sideeffect::SideEffectKind::Bell,
                 destination: kr_term::sideeffect::SideEffectDestination::Attachment {
                     id: identifier(1),
                     epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
                 },
                 at,
-            },
+            }),
             bytes: Arc::new(bytes.to_vec()),
         }
     }
@@ -1210,7 +1215,7 @@ mod tests {
         let delivery = stream.try_recv().expect("the effect is queued");
         assert_eq!(delivery.len(), 13);
         assert!(
-            matches!(&delivery, OutputDelivery::Effect { cursor: 40, bytes } if bytes.len() == 13),
+            matches!(&delivery, OutputDelivery::Effect(owed) if owed.effect.at == 40 && owed.bytes.len() == 13),
             "{delivery:?}"
         );
         stream.written(delivery.len());

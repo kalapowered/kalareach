@@ -824,6 +824,14 @@ impl Stage {
                         client.live(&bytes, cursor);
                     }
                 }
+                // An effect is valid for either form of client: it is the one thing a terminal of
+                // another size is also sent, when it holds the lease. A client that took the stream
+                // directly performs it on its terminal, which is what the account follows.
+                OutputDelivery::Effect(owed) => {
+                    if client.form == Form::Direct && self.strategy != Strategy::RawFromOffset {
+                        client.live(&owed.bytes, owed.effect.at);
+                    }
+                }
                 OutputDelivery::Screen { bytes, .. } => {
                     if self.strategy != Strategy::RawFromOffset {
                         client.draw(&bytes, "a drawn screen");

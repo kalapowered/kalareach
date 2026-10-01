@@ -731,18 +731,48 @@ impl Journal {
         effect: &kr_term::sideeffect::SideEffect,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        let (kind, detail) = describe_effect(&effect.kind);
-        self.connection
-            .execute(
-                "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    kind,
-                    detail,
-                    i64::try_from(effect.at).unwrap_or(i64::MAX),
-                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
-                ],
-            )
+        self.record_host_events([effect], now_ms)
+    }
+
+    /// Records several side effects that had no attachment to go to, in one transaction.
+    ///
+    /// The store commits once for all of them, so a holder that has stopped taking output, whose
+    /// every later bell has nowhere to go, costs the read loop one commit for the output it reads
+    /// and not one for each bell in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails; none of them is recorded.
+    pub fn record_host_events<'a>(
+        &mut self,
+        effects: impl IntoIterator<Item = &'a kr_term::sideeffect::SideEffect>,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut effects = effects.into_iter().peekable();
+        if effects.peek().is_none() {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        for effect in effects {
+            let (kind, detail) = describe_effect(&effect.kind);
+            transaction
+                .execute(
+                    "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        kind,
+                        detail,
+                        i64::try_from(effect.at).unwrap_or(i64::MAX),
+                        i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
+                    ],
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+        }
+        transaction
+            .commit()
             .map_err(|error| faulted(&self.health, error))?;
         self.attention_changes.notify_waiters();
         Ok(())
