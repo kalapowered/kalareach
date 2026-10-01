@@ -1064,19 +1064,20 @@ async fn a_session_launched_under_privacy_mode_retains_none_of_what_its_shell_fi
         let runtime = start_printing(&temp, session_id, journal.clone(), privacy)
             .unwrap_or_else(|failure| panic!("the session launches: {:?}", failure.error));
         first_output(&runtime).await;
-        let session = runtime.session();
-        assert!(session.output_cursor() > 0, "the shell's output arrived");
-        assert_eq!(
-            session.retained_output_bytes() > 0,
-            retained,
-            "{privacy:?}: what the shell first printed is retained only without privacy mode"
-        );
-        assert_eq!(session.privacy().is_enabled(), privacy.enabled);
-        assert_eq!(
-            session.privacy().generation().get(),
-            privacy.generation.get()
-        );
-        drop(session);
+        {
+            let session = runtime.session();
+            assert!(session.output_cursor() > 0, "the shell's output arrived");
+            assert_eq!(
+                session.retained_output_bytes() > 0,
+                retained,
+                "{privacy:?}: what the shell first printed is retained only without privacy mode"
+            );
+            assert_eq!(session.privacy().is_enabled(), privacy.enabled);
+            assert_eq!(
+                session.privacy().generation().get(),
+                privacy.generation.get()
+            );
+        }
 
         // The generation is on disk, which is what makes it a boundary a restart can see.
         let recorded = kr_worker::journal::Journal::open_read_only(journal)

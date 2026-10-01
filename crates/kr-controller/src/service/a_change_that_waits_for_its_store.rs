@@ -808,8 +808,8 @@ async fn asked_after_a_create(private: bool) -> Vec<(SessionId, i64)> {
         .session_create(&actor_id, &create_request(temp.environment_id()), carried)
         .await
         .expect_err("this test starts no workers");
-    let asked = asked.lock().expect("the record is not poisoned").clone();
-    asked
+    let asked = asked.lock().expect("the record is not poisoned");
+    asked.clone()
 }
 
 /// KR-REQ-24.27: a session created while privacy mode is on has its obligation on the disk when its
@@ -869,9 +869,11 @@ async fn a_create_whose_admission_lapses_while_it_waits_for_the_record(lapse: La
         "and has asked for no worker"
     );
     // The registry is free while it waits: the create holds no guard of it.
-    tokio::time::timeout(Duration::from_secs(10), controller.registry.lock())
-        .await
-        .expect("the registry is not held by a create that is waiting");
+    drop(
+        tokio::time::timeout(Duration::from_secs(10), controller.registry.lock())
+            .await
+            .expect("the registry is not held by a create that is waiting"),
+    );
     lapse.happens(&controller, &clock, connection_id);
     release.send(()).expect("the enabling goes on");
     enabling
