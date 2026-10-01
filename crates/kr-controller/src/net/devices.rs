@@ -1864,11 +1864,66 @@ mod tests {
                     device.device_id,
                     NotificationPreviewKey::from_bytes([42; 32]),
                     DeviceKeyRevision::new(2),
+                    || Ok(()),
                 )
                 .expect("update succeeds"),
             PreviewKeyOutcome::Recorded,
             "the control: another column of the same row is updated"
         );
+    }
+
+    /// The admission a registration carries is asked inside the write, once the registration is
+    /// known to be one: a refusal writes nothing, and a registration that writes nothing is not
+    /// asked about.
+    #[test]
+    fn a_preview_key_update_asks_its_admission_inside_the_write() {
+        let directory = DeviceDirectory::in_memory().expect("an in-memory directory");
+        let device = record(5);
+        directory.commit(&device).expect("a device");
+        let key = NotificationPreviewKey::from_bytes([42; 32]);
+        let asked = std::cell::Cell::new(0);
+
+        let refused =
+            directory.update_preview_key(device.device_id, key, DeviceKeyRevision::new(2), || {
+                asked.set(asked.get() + 1);
+                Err(ControllerError::PermissionDenied {
+                    detail: "the admission lapsed".to_owned(),
+                })
+            });
+        assert!(matches!(
+            refused,
+            Err(ControllerError::PermissionDenied { .. })
+        ));
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            directory
+                .record_for_device(device.device_id)
+                .expect("a read")
+                .expect("the device")
+                .device_key_revision,
+            device.device_key_revision,
+            "a refused admission writes nothing"
+        );
+
+        // The control: the same registration under an admission that stands is written.
+        assert_eq!(
+            directory
+                .update_preview_key(device.device_id, key, DeviceKeyRevision::new(2), || {
+                    asked.set(asked.get() + 1);
+                    Ok(())
+                })
+                .expect("a write"),
+            PreviewKeyOutcome::Recorded
+        );
+        assert_eq!(asked.get(), 2);
+        // A repeat writes nothing, so the admission is not asked about.
+        directory
+            .update_preview_key(device.device_id, key, DeviceKeyRevision::new(2), || {
+                asked.set(asked.get() + 1);
+                Ok(())
+            })
+            .expect("a repeat");
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]
@@ -1880,7 +1935,7 @@ mod tests {
         let preview_key = NotificationPreviewKey::from_bytes([42; 32]);
         let revision = DeviceKeyRevision::new(2);
         let updated = directory
-            .update_preview_key(device.device_id, preview_key, revision)
+            .update_preview_key(device.device_id, preview_key, revision, || Ok(()))
             .expect("update succeeds");
         assert_eq!(updated, PreviewKeyOutcome::Recorded);
 
@@ -1893,7 +1948,7 @@ mod tests {
 
         let missing = DeviceId::new(Uuid::from_bytes([99; 16]));
         let not_found = directory
-            .update_preview_key(missing, preview_key, revision)
+            .update_preview_key(missing, preview_key, revision, || Ok(()))
             .expect("update succeeds");
         assert_eq!(not_found, PreviewKeyOutcome::NotPaired);
     }
@@ -1908,7 +1963,12 @@ mod tests {
         let third = NotificationPreviewKey::from_bytes([3; 32]);
         assert_eq!(
             directory
-                .update_preview_key(device.device_id, third, DeviceKeyRevision::new(3))
+                .update_preview_key(
+                    device.device_id,
+                    third,
+                    DeviceKeyRevision::new(3),
+                    || Ok(())
+                )
                 .expect("a write"),
             PreviewKeyOutcome::Recorded
         );
@@ -1918,6 +1978,7 @@ mod tests {
                     device.device_id,
                     NotificationPreviewKey::from_bytes([9; 32]),
                     DeviceKeyRevision::new(behind),
+                    || Ok(()),
                 )
                 .expect("a write");
             assert_eq!(
@@ -1928,7 +1989,12 @@ mod tests {
         }
         assert_eq!(
             directory
-                .update_preview_key(device.device_id, third, DeviceKeyRevision::new(3))
+                .update_preview_key(
+                    device.device_id,
+                    third,
+                    DeviceKeyRevision::new(3),
+                    || Ok(())
+                )
                 .expect("a write"),
             PreviewKeyOutcome::AlreadyRecorded,
             "the same registration again is the registration this host already holds"
@@ -2199,7 +2265,12 @@ mod tests {
         let rotated = NotificationPreviewKey::from_bytes([0x77; 32]);
         assert_eq!(
             directory
-                .update_preview_key(earlier.device_id, rotated, DeviceKeyRevision::new(2))
+                .update_preview_key(
+                    earlier.device_id,
+                    rotated,
+                    DeviceKeyRevision::new(2),
+                    || Ok(())
+                )
                 .expect("a write"),
             PreviewKeyOutcome::Recorded
         );
