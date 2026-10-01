@@ -369,6 +369,15 @@ pub fn failed(refusal: Refusal) -> CliError {
                  this kr no longer waits for it",
             ),
         },
+        Refusal::UserMismatch { .. } | Refusal::OwnEnvironment => {
+            CliError::Refused(kr_client::error::refusal(
+                ErrorCode::PermissionDenied,
+                Shown::said(
+                    "the helper in that environment is not the one that was enrolled: it ran as \
+                     another user, or answered as this host's own environment",
+                ),
+            ))
+        }
         Refusal::IdentityMismatch { .. } => CliError::Refused(kr_client::error::refusal(
             ErrorCode::PermissionDenied,
             Shown::said(
