@@ -35,7 +35,14 @@ pub const RELAY_DECISIONS: usize = 3;
 pub struct RemoteOutput {
     /// Whose turn it is to write. Exactly one frame is in flight at a time.
     turn: tokio::sync::Mutex<()>,
-    withdrawn: AtomicBool,
+    /// Set once nothing more may go on this connection: by [`Self::withdraw`], and by the
+    /// connection's registration going, which sets it in the critical section that removes the
+    /// registration ([`Controller::latch_registration`]).
+    withdrawn: Arc<AtomicBool>,
+    /// How many writes have begun to wait for the turn. Read by this host's own tests, to know a
+    /// write is queued behind another.
+    #[cfg(test)]
+    queued: std::sync::atomic::AtomicUsize,
     /// Who is waiting to hear that one answer reached the device, by the request it answers.
     ///
     /// A close is the reason this exists: the worker holds the session's termination until the
@@ -344,9 +351,18 @@ impl RemoteOutput {
     }
 
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
+        // Tied to the registration before anything can be sent: a withdrawal that removes the
+        // registration sets the latch with it, so the fence below needs no read of the connection
+        // table, which a poll may not take.
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        authority
+            .controller
+            .latch_registration(authority.connection_id, &withdrawn);
         Self {
             turn: tokio::sync::Mutex::new(()),
-            withdrawn: AtomicBool::new(false),
+            withdrawn,
+            #[cfg(test)]
+            queued: std::sync::atomic::AtomicUsize::new(0),
             delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sink,
             authority,
@@ -390,8 +406,13 @@ impl RemoteOutput {
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
     ) -> Written {
+        #[cfg(test)]
+        self.queued.fetch_add(1, Ordering::SeqCst);
         let _turn = self.turn.lock().await;
         if self.has_withdrawn() {
+            // Found withdrawn here and not by a call to [`Self::withdraw`] when its registration
+            // went, so the connection is ended as that call ends it.
+            self.withdraw();
             return Written::Withdrawn;
         }
         if !self.fence() {
@@ -492,9 +513,10 @@ impl RemoteOutput {
     ///
     /// Synchronous on purpose: it is evaluated inside the poll that hands bytes to the stream, so
     /// no byte is accepted without it having just held. The latch is what a device revocation sets
-    /// and what a withdrawn registration sets through [`Self::withdraw`]; the grant covers its own
-    /// expiry. The registration itself is read by the checks that can wait, which is every request
-    /// and the watch below.
+    /// and what a withdrawn registration sets, by being removed ([`Controller::latch_registration`])
+    /// or through [`Self::withdraw`]; the grant covers its own expiry. The registration itself is
+    /// never read here, because it is behind a lock: it is read by the checks that can wait, which
+    /// is every request and the watch below, and its going has already set the latch.
     fn fence(&self) -> bool {
         !self.has_withdrawn() && self.authority.has_time_left()
     }
@@ -537,5 +559,17 @@ impl RemoteOutput {
 
     fn has_withdrawn(&self) -> bool {
         self.withdrawn.load(Ordering::Acquire)
+    }
+
+    /// Takes the turn, as a frame being written does, and holds it until it is dropped.
+    #[cfg(test)]
+    pub(super) async fn hold_the_turn(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn.lock().await
+    }
+
+    /// How many writes have begun to wait for the turn.
+    #[cfg(test)]
+    pub(super) fn writes_queued(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
     }
 }

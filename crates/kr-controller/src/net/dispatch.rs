@@ -189,10 +189,10 @@ impl RemoteConnection {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         controller.admitted_table().insert(
             connection_id,
-            crate::service::AdmittedConnection {
-                actor_id: device.principal(),
-                admitted_revision: controller.policy().authority_revision(),
-            },
+            crate::service::AdmittedConnection::new(
+                device.principal(),
+                controller.policy().authority_revision(),
+            ),
         );
         let authority = Arc::new(Authorisation {
             grant_deadline: None,
