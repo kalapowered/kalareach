@@ -88,8 +88,11 @@ use crate::delivery::{
     DestinationSecretKind, MailAccount, MailSecurity,
 };
 use crate::describe::{
-    DescriptionProvenance, DescriptionSetup, SessionDescribeParams, SessionDescribeResult,
-    SessionRenameParams, SessionRenameResult,
+    DescriptionCompletion, DescriptionConfigureParams, DescriptionDownload,
+    DescriptionDownloadAction, DescriptionDownloadParams, DescriptionEvent, DescriptionEventKind,
+    DescriptionFacts, DescriptionFactsPage, DescriptionFactsRequest, DescriptionProvenance,
+    DescriptionRepository, DescriptionSetup, DescriptionSetupParams, SessionDescribeParams,
+    SessionDescribeResult, SessionRenameParams, SessionRenameResult,
 };
 use crate::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
@@ -782,6 +785,21 @@ pub fn protocol_schema() -> Value {
         "privacy_set_params" => PrivacySetParams,
         "privacy_status_params" => PrivacyStatusParams,
         "privacy_unavailable" => PrivacyUnavailable,
+        // Session descriptions: the setup read and the two writes, the facts a worker keeps per
+        // session and the request and page the control daemon reads them with. Appended for the
+        // same reason.
+        "description_completion" => DescriptionCompletion,
+        "description_configure_params" => DescriptionConfigureParams,
+        "description_download" => DescriptionDownload,
+        "description_download_action" => DescriptionDownloadAction,
+        "description_download_params" => DescriptionDownloadParams,
+        "description_event" => DescriptionEvent,
+        "description_event_kind" => DescriptionEventKind,
+        "description_facts" => DescriptionFacts,
+        "description_facts_page" => DescriptionFactsPage,
+        "description_facts_request" => DescriptionFactsRequest,
+        "description_repository" => DescriptionRepository,
+        "description_setup_params" => DescriptionSetupParams,
     }
     properties.insert(
         "identifiers".to_owned(),

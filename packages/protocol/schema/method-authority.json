@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 155,
+  "method_count": 158,
   "methods": [
     {
       "capability": "none",
@@ -314,6 +314,94 @@
         "environment"
       ],
       "summary": "Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "description.setup",
+      "name": "description.setup",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "What session descriptions offer on this host: the profile, its exact size and where the fetch would reach before anything is fetched, how a fetch is going, the two settings, and what state inference is in.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "description.configure",
+      "name": "description.configure",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Turn session descriptions on or off, or allow inference on battery, at the host itself. The setting is recorded in the host's configuration and applies at once: turning them off cancels the work in flight and ends the description process.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "description.download",
+      "name": "description.download",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Start or cancel the fetch of the selected profile's files, at the host itself. A fetch needs no account, checks every file against the profile before it keeps it, and a cancellation deletes what it had written.",
       "version": 1
     },
     {

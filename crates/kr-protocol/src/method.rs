@@ -429,6 +429,33 @@ methods! {
           sessions, let the creates it started settle, say how it was started, and stop when \
           told to. No session stops.";
 
+    DescriptionSetup = "description.setup", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "What session descriptions offer on this host: the profile, its exact size and where the \
+          fetch would reach before anything is fetched, how a fetch is going, the two settings, \
+          and what state inference is in.";
+
+    DescriptionConfigure = "description.configure", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Turn session descriptions on or off, or allow inference on battery, at the host \
+          itself. The setting is recorded in the host's configuration and applies at once: \
+          turning them off cancels the work in flight and ends the description process.";
+
+    DescriptionDownload = "description.download", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Start or cancel the fetch of the selected profile's files, at the host itself. A \
+          fetch needs no account, checks every file against the profile before it keeps it, and \
+          a cancellation deletes what it had written.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],
@@ -1637,6 +1664,10 @@ mod tests {
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),
+        // Session descriptions: reading what is offered, and the two changes an owner makes.
+        ("description.setup", &[ActionRight::HostManage]),
+        ("description.configure", &[ActionRight::HostManage]),
+        ("description.download", &[ActionRight::HostManage]),
         // Sharing.
         ("grant.create", &[ActionRight::SessionShare]),
         ("grant.revoke", &[ActionRight::SessionShare]),
