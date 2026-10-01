@@ -2386,9 +2386,9 @@ const COMMAND_MEMBERS: [&str; 5] = ["type", "name", "command", "args", "timeout"
 /// its own, `<root>/<name>/<tail>` for each tail the table lists, and may add the one configuration
 /// key that enables them where the application has one, `enabledPlugins.<name>@skills-dir` set to
 /// `true` in `settings.json`, for the same `<name>`. A destination or a key that is not on the
-/// table is refused, so a bridge never installs a settings document of its own, enables only the
-/// plugin its files make, and adds no value that can hold a command. A name in another case is
-/// another name here: it is refused.
+/// table is refused, so a bridge never installs a settings document of its own and adds no value
+/// that can hold a command. Whether the directory and the name are free is `place_is_free`'s. A
+/// name in another case is another name here: it is refused.
 fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     struct Layout {
         root: &'static str,
@@ -2460,18 +2460,27 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     // Every file of the registration, and each once: an application reads the files beside the
     // ones a recipe leaves out, and a directory that holds another manifest or server file is
     // not one this host has checked.
-    let tails_missing = layout.tails.iter().find(|tail| {
-        placed_tails
+    for tail in layout.tails {
+        let times = placed_tails
             .iter()
             .filter(|destination| destination.ends_with(&format!("/{tail}")))
-            .count()
-            != 1
-    });
-    if let Some(tail) = tails_missing {
-        return Err(format!(
-            "the recipe does not install {tail} exactly once, and this host does not permit a \
-             native bridge for {application} to install less than every file of its registration"
-        ));
+            .count();
+        match times {
+            1 => {}
+            0 => {
+                return Err(format!(
+                    "the recipe does not install {tail}, and this host does not permit a native \
+                     bridge for {application} to install less than every file of its registration"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "the recipe installs {tail} {times} times, and this host does not permit a \
+                     native bridge for {application} to install a file of its registration more \
+                     than once"
+                ));
+            }
+        }
     }
     for step in &recipe.install {
         if let BridgeStep::AddConfigurationKey { file, key, value } = step {
@@ -2501,19 +2510,27 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
 /// An application enables everything it finds in a plugin's directory with the plugin: a directory
 /// that is already there and that this host did not make holds the person's own content, such as
 /// a monitor's command, which the owner's confirmation of the publisher's statement did not
-/// describe. And it keeps one plugin for each name, the first it reads, so a manifest of the same
-/// name in another folder beside this one could be the plugin the enabling key reaches. Both are
-/// refused before anything is written. The other folders are read through their paths, as an
-/// advisory check beside the walk the executor makes from one handle.
+/// describe. A directory is the one this host made when the journal records its publication under
+/// the identity the directory has now, and never because of its path: another directory may have
+/// been put in its place. And an application keeps one plugin for each name, the first it reads, so
+/// a manifest of the same name in another folder beside this one could be the plugin the enabling
+/// key reaches. Another folder's manifest is read as the application reads it, a leading byte order
+/// mark dropped, and one that is there and that this host cannot read whole or parse is a refusal,
+/// never taken for one that is not there. The directory itself under another name (a link to it, a
+/// spelling a volume that ignores case reads alike) is not another folder, and neither is a
+/// hidden one, which Claude Code does not read as a plugin. All are refused before anything is
+/// written. The other folders are read through their paths, as an advisory check beside the walk
+/// the executor makes from one handle: what appears after it is the person's own, as it is after
+/// the install.
 fn place_is_free(
     root: &Dir,
     journal: &Journal,
     recipe: &NativeBridge,
 ) -> std::result::Result<(), String> {
     let application = &recipe.application;
-    let manifest = match application.as_str() {
-        "Claude Code" => ".claude-plugin/plugin.json",
-        _ => "gemini-extension.json",
+    let (manifest, skips_hidden) = match application.as_str() {
+        "Claude Code" => (".claude-plugin/plugin.json", true),
+        _ => ("gemini-extension.json", false),
     };
     let Some((area, name)) = recipe.install.iter().find_map(|step| match step {
         BridgeStep::InstallFile { destination, .. } => destination
@@ -2525,21 +2542,24 @@ fn place_is_free(
         return Ok(());
     };
     let path = format!("{area}/{name}");
-    let ours = journal.changes.iter().any(|change| {
-        matches!(change, Change::Directory { path: made, publication: Publication::Published { .. }, .. }
-            if *made == path)
-    });
     let Child::Directory(areas) = root
         .child(area)
         .map_err(|error| format!("{area} cannot be read: {error}"))?
     else {
         return Ok(());
     };
-    if !ours
-        && let Child::Directory(existing) = areas
-            .child(name)
-            .map_err(|error| format!("{path} cannot be read: {error}"))?
+    let own = match areas
+        .child(name)
+        .map_err(|error| format!("{path} cannot be read: {error}"))?
     {
+        Child::Directory(existing) => Some(existing),
+        Child::Absent | Child::NotADirectory => None,
+    };
+    if let Some(existing) = own.as_ref() {
+        let made = journal.changes.iter().any(|change| {
+            matches!(change, Change::Directory { path: made, publication: Publication::Published { identity }, .. }
+                if *made == path && identity.same_object(&existing.identity()))
+        });
         let registration: Vec<&str> = recipe
             .install
             .iter()
@@ -2551,71 +2571,123 @@ fn place_is_free(
                 BridgeStep::AddConfigurationKey { .. } => None,
             })
             .collect();
-        if !holds_only(existing.path(), "", &registration) {
+        if !made
+            && !holds_only(existing.path(), "", &registration)
+                .map_err(|error| format!("{path} cannot be read: {error}"))?
+        {
             return Err(format!(
-                "{path} is already there with content that is not this registration, and this host \
-                 did not make it, so this host does not permit a native bridge for {application} \
-                 to install into it: {application} would enable everything in it with the \
-                 registration"
+                "{path} is already there with content that is not this registration, so this host \
+                 does not permit a native bridge for {application} to install into it: \
+                 {application} would enable everything in it with the registration"
             ));
         }
     }
-    let Ok(listing) = std::fs::read_dir(areas.path()) else {
-        return Ok(());
-    };
-    for entry in listing.flatten() {
-        if entry.file_name().to_str() == Some(name) {
+    let own = own.as_ref().map(Dir::identity);
+    let listing = std::fs::read_dir(areas.path())
+        .map_err(|error| format!("{area} cannot be listed: {error}"))?;
+    for entry in listing {
+        let entry = entry.map_err(|error| format!("{area} cannot be listed: {error}"))?;
+        let folder = entry.file_name();
+        let shown = folder.to_string_lossy();
+        if folder == name
+            || (skips_hidden && shown.starts_with('.'))
+            || own.as_ref().is_some_and(|identity| {
+                folder
+                    .to_str()
+                    .is_some_and(|folder| areas.path_leads_to(folder, identity))
+            })
+        {
             continue;
         }
-        let claimed = std::fs::File::open(entry.path().join(manifest))
-            .ok()
-            .and_then(|file| {
-                use std::io::Read as _;
-                let mut bytes = Vec::new();
-                file.take(FILE_LIMIT).read_to_end(&mut bytes).ok()?;
-                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-            })
-            .and_then(|value| {
-                value
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
-        if claimed.as_deref() == Some(name) {
-            return Err(format!(
-                "{area}/{} holds a plugin named {name} too, and {application} keeps one of two with a \
-                 name, so this host does not permit a native bridge for {application} to install \
-                 a plugin of that name",
-                entry.file_name().to_string_lossy()
-            ));
+        match claimed_name(&entry.path().join(manifest)) {
+            Ok(Some(claimed)) if claimed == name => {
+                return Err(format!(
+                    "{area}/{shown} holds a plugin named {name} too, and {application} keeps one of \
+                     two with a name, so this host does not permit a native bridge for \
+                     {application} to install a plugin of that name"
+                ));
+            }
+            Ok(_) => {}
+            Err(why) => {
+                return Err(format!(
+                    "{area}/{shown}/{manifest} {why}, so this host cannot tell whether {application} \
+                     keeps a plugin named {name} from it, and does not permit a native bridge for \
+                     {application} to install one"
+                ));
+            }
         }
     }
     Ok(())
 }
 
+/// The name the plugin manifest at `path` gives itself, read as an application reads it: one
+/// leading byte order mark is dropped before the JSON is parsed. `None` when there is no manifest
+/// there, or it names nothing, which an application does not load. An error says why a manifest
+/// that is there could not be read whole within the limit or parsed.
+fn claimed_name(path: &Path) -> std::result::Result<Option<String>, String> {
+    use std::io::Read as _;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("cannot be read: {error}")),
+    };
+    if !metadata.is_file() {
+        return Err("is not a file this host reads".to_owned());
+    }
+    let too_large = || "is larger than this host reads".to_owned();
+    if metadata.len() > FILE_LIMIT {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(FILE_LIMIT + 1).read_to_end(&mut bytes))
+        .map_err(|error| format!("cannot be read: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > FILE_LIMIT {
+        return Err(too_large());
+    }
+    let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    let value: serde_json::Value =
+        serde_json::from_slice(text).map_err(|_| "is not JSON this host reads".to_owned())?;
+    Ok(value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
 /// Whether a directory holds nothing but empty directories and the files of `registration`, which
 /// are named relative to it. `within` is the way from the directory the walk began in. A file of the
 /// registration that is there is the executor's to refuse, as one this host did not write.
-fn holds_only(directory: &Path, within: &str, registration: &[&str]) -> bool {
-    let Ok(listing) = std::fs::read_dir(directory) else {
-        return false;
-    };
-    listing.flatten().all(|entry| {
-        let Ok(kind) = entry.file_type() else {
-            return false;
-        };
+///
+/// # Errors
+///
+/// Returns the error of a listing that fails: what it holds is then not known.
+fn holds_only(directory: &Path, within: &str, registration: &[&str]) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let relative = if within.is_empty() {
             name
         } else {
             format!("{within}/{name}")
         };
-        if kind.is_dir() {
-            holds_only(&entry.path(), &relative, registration)
+        let fits = if kind.is_dir() {
+            holds_only(&entry.path(), &relative, registration)?
         } else {
             kind.is_file() && registration.contains(&relative.as_str())
+        };
+        if !fits {
+            return Ok(false);
         }
-    })
+    }
+    Ok(true)
 }
 
 /// True for a name of ASCII letters, digits, hyphens and underscores, which is one path component

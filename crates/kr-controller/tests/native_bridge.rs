@@ -1139,7 +1139,31 @@ fn a_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
         .bridges()
         .reconcile(&plugin(), Some(&site.release()))
         .expect("reconciles");
-    assert!(refused(&settled).contains("did not make"), "{settled:?}");
+    assert!(
+        refused(&settled).contains("content that is not this registration"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+    // A directory of the same name that holds a folder this host cannot open: what it holds is
+    // not known, so it is not taken for empty.
+    let site = Site::new();
+    let closed = site.application().join("skills/kalareach-channels/private");
+    std::fs::create_dir_all(&closed).expect("a folder");
+    let _restored = Writable(closed.clone());
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+            .expect("the folder cannot be opened");
+    }
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("skills/kalareach-channels cannot be read"),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
     // Another folder that names the same plugin.
     let site = Site::new();
@@ -1157,6 +1181,288 @@ fn a_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
     // The control: a folder of the person's own with another name beside it.
     let site = Site::new();
     claim(&site, "a", "theirs-too");
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+    // The control: a directory of the same name that holds nothing but empty directories is
+    // accepted, as the registration is all the application would enable in it.
+    let site = Site::new();
+    std::fs::create_dir_all(
+        site.application()
+            .join("skills/kalareach-channels/hooks/inner"),
+    )
+    .expect("empty directories");
+    std::fs::create_dir_all(site.application().join("skills/kalareach-channels/empty"))
+        .expect("an empty directory");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+    assert_eq!(
+        site.tree(),
+        applied_tree(&before),
+        "applied beside the empty directories"
+    );
+}
+
+/// Another folder under `skills/` whose plugin manifest holds `bytes`.
+#[cfg(unix)]
+fn plugin_folder(site: &Site, folder: &str, bytes: &[u8]) -> PathBuf {
+    let directory = site.application().join("skills").join(folder);
+    std::fs::create_dir_all(directory.join(".claude-plugin")).expect("a folder");
+    std::fs::write(directory.join(".claude-plugin/plugin.json"), bytes).expect("a manifest");
+    directory
+}
+
+/// A directory this host published is the one its journal names by identity, not by its path. A
+/// run stopped once it recorded the publication of `skills/<name>/`, whose directory the person
+/// then replaced with another (a backup restored over it, holding a monitor), left a directory
+/// this host did not make and that the application would enable with the registration: the next
+/// run refuses to install into it, and leaves it as it is. The control is the same stop with the
+/// directory untouched, which the next run finishes.
+#[cfg(unix)]
+#[test]
+fn a_directory_put_in_the_place_of_the_one_this_host_made_is_refused() {
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let traced = Site::new();
+    let before = traced.tree();
+    let bridges = traced.bridges();
+    apply(&traced, &bridges).expect("applies");
+    let directory = format!(
+        "rename {}",
+        traced
+            .application()
+            .join("skills/kalareach-channels")
+            .display()
+    );
+    let renamed = bridges
+        .steps()
+        .iter()
+        .position(|step| *step == directory)
+        .expect("the directory is renamed into place");
+    assert!(
+        bridges.steps()[renamed + 2].starts_with("save "),
+        "its publication is recorded once it is flushed"
+    );
+    let stop = renamed + 4;
+
+    // The control: the directory is where this host published it.
+    let stopped = stopped_at(stop, &|_| {}, &apply).expect("stops after the record");
+    let site = &stopped.site;
+    assert!(
+        site.application()
+            .join("skills/kalareach-channels")
+            .is_dir(),
+        "the directory is published"
+    );
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("finishes");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+    assert_eq!(site.tree(), applied_tree(&before), "finished exactly");
+
+    // Another directory is in its place.
+    let stopped = stopped_at(stop, &|_| {}, &apply).expect("stops after the record");
+    let site = &stopped.site;
+    let skills = site.application().join("skills");
+    std::fs::create_dir_all(skills.join("restored/monitors")).expect("a folder");
+    std::fs::write(skills.join("restored/monitors/monitors.json"), b"[]").expect("a monitor");
+    std::fs::remove_dir(skills.join("kalareach-channels")).expect("the empty directory goes");
+    std::fs::rename(skills.join("restored"), skills.join("kalareach-channels"))
+        .expect("the other one takes its place");
+    let replaced = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    let Settled::Unsettled(reason) = &settled else {
+        panic!("installed into a directory this host did not make: {settled:?}");
+    };
+    assert!(
+        reason.contains("content that is not this registration"),
+        "{reason}"
+    );
+    assert_eq!(
+        site.tree(),
+        replaced,
+        "nothing was put into it, and it was not taken out"
+    );
+}
+
+/// The name another folder's manifest gives is read as the application reads it, or the install
+/// is refused: a manifest with a byte order mark, which the application skips, is read as the
+/// application reads it and found to be the same name; one that is there and that this host cannot
+/// read whole within its limit, or parse, is never taken for one that is not there. A manifest
+/// over the limit, text that is not JSON, a lone surrogate, a directory in the manifest's place and
+/// a folder this host cannot open are each refused, naming the folder, and nothing is written. The
+/// controls are a manifest with a byte order mark and another name, a folder that holds no
+/// manifest, a manifest that names nothing and a file beside the folders, which are applied.
+#[cfg(unix)]
+#[test]
+fn a_manifest_the_host_cannot_read_is_never_taken_for_one_that_is_not_there() {
+    let named: &[u8] = br#"{"name": "kalareach-channels", "version": "1"}"#;
+    let with_mark = |bytes: &[u8]| [b"\xEF\xBB\xBF".as_slice(), bytes].concat();
+    let over_limit = [
+        br#"{"name": "kalareach-channels","#.as_slice(),
+        " ".repeat(1 << 20).as_bytes(),
+        br#""version": "1"}"#.as_slice(),
+    ]
+    .concat();
+    let refused_cases: [(&str, Vec<u8>, &str); 4] = [
+        ("a byte order mark", with_mark(named), "keeps one of two"),
+        ("a manifest over the limit", over_limit, "larger than"),
+        ("text that is not JSON", b"not json".to_vec(), "is not JSON"),
+        (
+            "a lone surrogate",
+            br#"{"name": "kalareach-channels", "metadata": "\ud800"}"#.to_vec(),
+            "is not JSON",
+        ),
+    ];
+    for (what, bytes, says) in refused_cases {
+        let site = Site::new();
+        plugin_folder(&site, "other", &bytes);
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(
+            reason.contains("skills/other") && reason.contains(says),
+            "{what}: {reason}"
+        );
+        assert_eq!(site.tree(), before, "{what}: nothing was written");
+    }
+    // A directory where the manifest should be.
+    let site = Site::new();
+    let folder = plugin_folder(&site, "other", named);
+    std::fs::remove_file(folder.join(".claude-plugin/plugin.json")).expect("the file goes");
+    std::fs::create_dir(folder.join(".claude-plugin/plugin.json")).expect("a directory");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("skills/other"), "{settled:?}");
+    assert_eq!(site.tree(), before, "a directory: nothing was written");
+    // A folder this host cannot open.
+    let site = Site::new();
+    let folder = plugin_folder(&site, "other", named);
+    let _restored = Writable(folder.clone());
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000))
+            .expect("the folder cannot be opened");
+    }
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("skills/other"), "{settled:?}");
+    assert_eq!(
+        site.tree(),
+        before,
+        "an unopened folder: nothing was written"
+    );
+    // The controls.
+    let another = br#"{"name": "another-name", "version": "1"}"#;
+    for (what, prepare) in [
+        (
+            "a byte order mark and another name",
+            Box::new(move |site: &Site| {
+                plugin_folder(site, "other", &with_mark(another));
+            }) as Box<dyn Fn(&Site)>,
+        ),
+        (
+            "no manifest",
+            Box::new(|site: &Site| {
+                std::fs::create_dir_all(site.application().join("skills/other/.claude-plugin"))
+                    .expect("a folder");
+            }),
+        ),
+        (
+            "a manifest that names nothing",
+            Box::new(|site: &Site| {
+                plugin_folder(site, "other", br#"{"version": "1"}"#);
+            }),
+        ),
+        (
+            "a file beside the folders",
+            Box::new(|site: &Site| {
+                std::fs::write(site.application().join("skills/notes.txt"), b"notes")
+                    .expect("a file");
+            }),
+        ),
+    ] {
+        let site = Site::new();
+        prepare(&site);
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles");
+        assert_eq!(settled, Settled::Applied, "{what}: {settled:?}");
+    }
+}
+
+/// A folder is another plugin only when the application reads it as one: the directory this host
+/// installs into, reached under another name (a link to it, a spelling a volume that ignores case
+/// reads as the same), is itself, and a folder whose name begins with a dot is one the application
+/// skips. A run stopped once it published the manifest, with a link to the directory beside it,
+/// is finished by the next; a hidden folder holding a manifest of the same name is no obstacle.
+#[cfg(unix)]
+#[test]
+fn a_name_for_the_directory_itself_and_a_hidden_folder_are_not_another_plugin() {
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let traced = Site::new();
+    let before = traced.tree();
+    let bridges = traced.bridges();
+    apply(&traced, &bridges).expect("applies");
+    let manifest = format!(
+        "rename {}",
+        traced.application().join(MANIFEST_PATH).display()
+    );
+    let renamed = bridges
+        .steps()
+        .iter()
+        .position(|step| *step == manifest)
+        .expect("the manifest is renamed into place");
+    assert!(
+        bridges.steps()[renamed + 2].starts_with("save "),
+        "its publication is recorded once it is flushed"
+    );
+    let stopped = stopped_at(renamed + 4, &|_| {}, &apply).expect("stops after the record");
+    let site = &stopped.site;
+    std::os::unix::fs::symlink(
+        "kalareach-channels",
+        site.application().join("skills/alias"),
+    )
+    .expect("a link to the directory");
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("finishes");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+    let mut expected = applied_tree(&before);
+    expected.insert(
+        "skills/alias".to_owned(),
+        Node::Link(PathBuf::from("kalareach-channels")),
+    );
+    assert_eq!(site.tree(), expected, "finished exactly");
+
+    let site = Site::new();
+    plugin_folder(
+        &site,
+        ".backup",
+        br#"{"name": "kalareach-channels", "version": "1"}"#,
+    );
     let settled = site
         .bridges()
         .reconcile(&plugin(), Some(&site.release()))
@@ -1249,13 +1555,15 @@ fn a_gemini_cli_registration_outside_its_shape_is_refused() {
 
 /// A bridge installs every file of its registration, each once: a directory an application reads
 /// that holds a manifest or a server file this host has not checked is not one it may enable. A
-/// registration that leaves one out is refused, whichever, and a directory named with a character
+/// registration that leaves one out is refused, whichever, and so is one that names a file twice,
+/// each with a message of its own, and a directory named with a character
 /// a key's name cannot hold is refused with or without the key. The controls are the whole recipe
 /// under a plain name and under another, which are applied.
 #[cfg(unix)]
 #[test]
 fn a_bridge_that_installs_less_than_its_whole_registration_is_refused() {
     for omitted in [MANIFEST_PATH, SERVERS_PATH, HOOKS_PATH] {
+        let omitted_tail = omitted.trim_start_matches("skills/kalareach-channels/");
         let site = Site::new();
         let before = site.tree();
         let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
@@ -1274,7 +1582,8 @@ fn a_bridge_that_installs_less_than_its_whole_registration_is_refused() {
             .reconcile(&plugin(), Some(&target))
             .expect("reconciles");
         assert!(
-            refused(&settled).contains("exactly once"),
+            refused(&settled).contains("does not install")
+                && refused(&settled).contains(omitted_tail),
             "{omitted}: {settled:?}"
         );
         assert_eq!(site.tree(), before, "{omitted}: nothing was written");
@@ -1300,7 +1609,10 @@ fn a_bridge_that_installs_less_than_its_whole_registration_is_refused() {
         .bridges()
         .reconcile(&plugin(), Some(&target))
         .expect("reconciles");
-    assert!(refused(&settled).contains("exactly once"), "{settled:?}");
+    assert!(
+        refused(&settled).contains("2 times") && refused(&settled).contains("hooks/hooks.json"),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
     for with_key in [true, false] {
         let site = Site::new();
@@ -3973,6 +4285,68 @@ fn kr_req_11_42_the_gemini_cli_recipe_writes_its_three_files_and_nothing_else() 
         "the hooks file registers hooks and no channel"
     );
     assert_eq!(facts.forwarder, site.forwarder());
+}
+
+/// KR-REQ-11.42: a Gemini CLI bridge does not install into an extension directory that is already
+/// there with content of the person's own, or beside another extension that names the same, and a
+/// manifest it cannot read is never taken for one that is not there. Each is refused before
+/// anything is written; the controls are an extension of another name beside it, with or without a
+/// byte order mark, which are applied.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_gemini_cli_bridge_does_not_install_into_a_place_that_is_somebody_elses() {
+    let extension = |site: &GeminiSite, folder: &str, bytes: &[u8]| {
+        let directory = site.application().join("extensions").join(folder);
+        std::fs::create_dir_all(&directory).expect("a folder");
+        std::fs::write(directory.join("gemini-extension.json"), bytes).expect("a manifest");
+    };
+    let named = br#"{"name": "kalareach", "version": "1"}"#;
+    let with_mark = |bytes: &[u8]| [b"\xEF\xBB\xBF".as_slice(), bytes].concat();
+    let refused_cases: [(&str, Box<dyn Fn(&GeminiSite)>, &str); 3] = [
+        (
+            "content already in the directory",
+            Box::new(|site| {
+                let commands = site.application().join("extensions/kalareach/commands");
+                std::fs::create_dir_all(&commands).expect("a folder");
+                std::fs::write(commands.join("run.toml"), b"prompt = \"x\"").expect("a command");
+            }),
+            "content that is not this registration",
+        ),
+        (
+            "another folder of the same name",
+            Box::new(|site| extension(site, "other", named)),
+            "keeps one of two",
+        ),
+        (
+            "a manifest with a byte order mark",
+            Box::new(|site| extension(site, "other", &with_mark(named))),
+            "extensions/other",
+        ),
+    ];
+    for (what, prepare, says) in refused_cases {
+        let site = GeminiSite::new();
+        prepare(&site);
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("reconciles");
+        assert!(refused(&settled).contains(says), "{what}: {settled:?}");
+        assert_eq!(site.tree(), before, "{what}: nothing was written");
+    }
+    let another = br#"{"name": "another-name", "version": "1"}"#;
+    for (what, bytes) in [
+        ("another name", another.to_vec()),
+        ("a byte order mark and another name", with_mark(another)),
+    ] {
+        let site = GeminiSite::new();
+        extension(&site, "other", &bytes);
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("reconciles");
+        assert_eq!(settled, Settled::Applied, "{what}: {settled:?}");
+    }
 }
 
 /// KR-REQ-11.42: removal takes the three files and the directories the installation made, and the
