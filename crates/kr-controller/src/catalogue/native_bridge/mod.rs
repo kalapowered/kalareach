@@ -815,11 +815,19 @@ impl NativeBridges {
             }
         }
         // A configuration value is as much a part of the registration as a file is: a settings
-        // key can start the forwarder too, so its invocations are read with the files'.
+        // key can start the forwarder too, so its invocations are read with the files'. It is read
+        // where it will stand, inside the members its key names, so that a key whose last member
+        // is `command` is a command the application runs.
         let mut registered = sources.clone();
         for step in &recipe.install {
             if let BridgeStep::AddConfigurationKey { file, key, value } = step {
-                registered.push((format!("{file} {key}"), value.as_bytes().to_vec()));
+                let value: serde_json::Value = serde_json::from_str(value)
+                    .map_err(|error| format!("the recipe's value {value} is not JSON: {error}"))?;
+                let placed = key
+                    .split('.')
+                    .rev()
+                    .fold(value, |inner, member| serde_json::json!({ member: inner }));
+                registered.push((format!("{file} {key}"), placed.to_string().into_bytes()));
             }
         }
         let facts = registration(&registered, &forwarder)?;
@@ -2258,6 +2266,13 @@ fn registration(
     let mut surfaces = BTreeSet::new();
     for (destination, bytes) in sources {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            // A file named for JSON that this host cannot read as JSON is one an application may
+            // read more leniently, with commands this host never saw.
+            if destination.ends_with(".json") {
+                return Err(format!(
+                    "{destination} cannot be read as JSON, so what it registers cannot be checked"
+                ));
+            }
             continue;
         };
         invocations(&value, destination, &mut applications, &mut surfaces)?;
@@ -2319,6 +2334,11 @@ fn invocations(
                         _ => return Err(unaccepted()),
                     }
                 } else {
+                    // A command written as one line is complete: an argument list beside it is
+                    // another word the application would run.
+                    if members.contains_key("args") {
+                        return Err(unaccepted());
+                    }
                     let words: Vec<&str> = command.split(' ').collect();
                     match words.as_slice() {
                         ["kr-hook", application, "hook"] if plain_word(application) => {
