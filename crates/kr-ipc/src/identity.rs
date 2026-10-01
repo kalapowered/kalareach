@@ -137,12 +137,22 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// What it costs follows the one process, not the host: the kernel keeps the list with each of the
 /// process's threads, and nothing else is read. A process that has gone is the parent of nothing.
 /// A kernel that is built without those lists, and a reading that failed for any other reason, is
-/// an error here rather than an empty answer, so a caller never reads "no children" into it.
+/// an error here rather than an empty answer, so a caller never reads "no children" into it. So is
+/// a process whose threads keep leaving while they are read: a pass in which the listing of them
+/// ended early, or a listed thread had gone, is made again, since the children of such a thread are
+/// in a list the pass may have read already or never reached.
+///
+/// What the kernel lists is not a promise: its list of a thread's children can skip one that was
+/// there throughout when children ahead of it exit while it is read, and a thread that ends or
+/// calls `exec` moves children between lists. So a process is read again until two readings agree,
+/// and a process whose threads or children keep changing is an error here, not a guess. A process
+/// that calls `exec` while it is read can still be read wrong when the next reading that reads
+/// any children misses the same ones.
 ///
 /// # Errors
 ///
-/// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, or when the kernel
-/// keeps no list of children.
+/// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, when the kernel
+/// keeps no list of children, or when its threads or children never hold still long enough to be read.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn children_of(pid: u32) -> Result<Vec<u32>> {
     platform::children_of(pid)
@@ -562,48 +572,299 @@ mod platform {
         stat_field_matches(STAT_TERMINAL, terminal, "controlling terminal")
     }
 
-    pub(super) fn children_of(pid: u32) -> Result<Vec<u32>> {
+    /// How many passes over a process's threads and children are made while they keep changing
+    /// under the reading, before it is given up as one that does not hold still: threads that come
+    /// and go, or children that do.
+    const PASSES: usize = 100;
+
+    /// The most bytes one thread's entry takes in a `getdents64` buffer: a header of 19 bytes, the
+    /// thread identifier's digits (seven at most) and their end, rounded up to eight.
+    const ENTRY_BYTES: usize = 32;
+
+    /// How many threads beyond the process's count a buffer has room for, which is how many may
+    /// start between the count being read and the listing.
+    const ROOM_FOR_NEW_THREADS: usize = 64;
+
+    /// The most entries a buffer for a listing is grown to, which no process's threads reach.
+    const MOST_ENTRIES: usize = 1 << 22;
+
+    /// What one listing of a process's threads came to.
+    pub(super) enum ThreadListing {
+        /// The process has gone.
+        Gone,
+        /// The process's threads: every one that stayed while the listing was made, and any that
+        /// started meanwhile.
+        Whole(Vec<u32>),
+        /// A listing that may have ended before a thread that stayed.
+        Partial,
+    }
+
+    /// Lists the threads of a process once, from one `getdents64` call.
+    ///
+    /// The kernel makes a listing one thread at a time, and ends it at the first thread that has
+    /// gone by the time it moves on, so a listing made while threads exit can end before a thread
+    /// that is still running; the children of that thread are in no other thread's list. What the
+    /// call returns is then a prefix of the threads in the order they were made. A further call does
+    /// not carry on from it: it finds its place again by counting threads from the first, and that
+    /// count lands after a thread that stayed when the ones ahead of it have gone, and takes in
+    /// threads made since. So the whole listing is one call's, and a buffer that cannot take it in
+    /// one call is made larger and the listing begun again, never read on.
+    ///
+    /// The process's thread count, read just before the listing, tells a prefix: a thread that
+    /// stayed and is missing from one has every listed thread made before it, so each of them was
+    /// there when the count was read and the listing is shorter than the count. A listing as long as
+    /// the count holds every thread that stayed. `entries` is how many entries the first buffer
+    /// has room for, where a test sets it, and otherwise the count and room for new threads.
+    pub(super) fn list_threads(pid: u32, entries: Option<usize>) -> Result<ThreadListing> {
         let task = format!("/proc/{pid}/task");
-        let threads = match std::fs::read_dir(&task) {
-            Ok(threads) => threads,
+        let stat = match read_process_file(pid, "stat") {
+            Ok(stat) => stat,
             // A process that has gone is the parent of nothing: its children went to whoever
             // adopts them when it exited.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if gone(&error) => return Ok(ThreadListing::Gone),
             Err(error) => {
                 return Err(unavailable(
                     "children of a process",
-                    format!("{task}: {error}"),
+                    format!("/proc/{pid}/stat: {error}"),
                 ));
             }
         };
-        let mut children = Vec::new();
-        for thread in threads {
-            let thread = thread.map_err(|error| {
-                unavailable("children of a process", format!("{task}: {error}"))
-            })?;
-            let Some(tid) = thread.file_name().to_str().map(str::to_owned) else {
-                continue;
+        let Some(count) = stat_field(&stat, STAT_THREADS) else {
+            return Err(unavailable(
+                "children of a process",
+                format!("/proc/{pid}/stat has no thread count"),
+            ));
+        };
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        // Two more for `.` and `..`.
+        let mut room = entries.unwrap_or_else(|| count.saturating_add(2 + ROOM_FOR_NEW_THREADS));
+        loop {
+            if room > MOST_ENTRIES {
+                return Err(unavailable(
+                    "children of a process",
+                    format!("{task} has more threads than a listing is made for"),
+                ));
+            }
+            let directory = match std::fs::File::open(&task) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ThreadListing::Gone);
+                }
+                Err(error) => {
+                    return Err(unavailable(
+                        "children of a process",
+                        format!("{task}: {error}"),
+                    ));
+                }
             };
+            let mut buffer = vec![std::mem::MaybeUninit::<u8>::uninit(); room * ENTRY_BYTES];
+            // The reader trims its buffer to the alignment of an entry.
+            let capacity = buffer.len() - 8;
+            let mut reader = rustix::fs::RawDir::new(&directory, &mut buffer);
+            let mut threads = Vec::new();
+            let mut used = 0_usize;
+            let mut called = false;
+            // The first fill only: the buffer is read to its end and never filled again.
+            while !called || !reader.is_buffer_empty() {
+                called = true;
+                match reader.next() {
+                    None => break,
+                    Some(Err(error)) if error == rustix::io::Errno::NOENT => {
+                        return Ok(ThreadListing::Gone);
+                    }
+                    Some(Err(error)) => {
+                        return Err(unavailable(
+                            "children of a process",
+                            format!("{task}: {}", std::io::Error::from(error)),
+                        ));
+                    }
+                    Some(Ok(entry)) => {
+                        let name = entry.file_name().to_bytes();
+                        used += (19 + name.len() + 1).next_multiple_of(8);
+                        if let Some(tid) = std::str::from_utf8(name)
+                            .ok()
+                            .and_then(|name| name.parse::<u32>().ok())
+                        {
+                            threads.push(tid);
+                        }
+                    }
+                }
+            }
+            // A buffer with no room for one more entry may have ended the call, and a call that
+            // is carried on may skip a thread that stayed: take a larger one and begin again.
+            if capacity.saturating_sub(used) < ENTRY_BYTES {
+                room = room.saturating_mul(2);
+                continue;
+            }
+            return Ok(if threads.len() >= count {
+                ThreadListing::Whole(threads)
+            } else {
+                ThreadListing::Partial
+            });
+        }
+    }
+
+    /// What one pass over a process's threads and their children came to.
+    enum Pass {
+        /// The process has gone.
+        Gone,
+        /// Every child its threads held.
+        Read(Vec<u32>),
+        /// A thread left, or the listing of them was short, so the pass says nothing.
+        Changed,
+    }
+
+    /// Where one thread of a process stands.
+    #[derive(PartialEq)]
+    enum ThreadState {
+        /// It is running or waiting.
+        Alive,
+        /// It has ended and handed its children on, and the kernel keeps it for now: the process's
+        /// first thread until the rest has gone, and a thread whose end a tracer has yet to collect.
+        Ended,
+        /// The kernel has taken it away, or is taking it.
+        Gone,
+    }
+
+    /// Reads where a thread stands from its own `stat`.
+    ///
+    /// A thread that ends hands its children on and marks itself ended in one step under the
+    /// kernel's lock on the process tree, which a read of its children takes too: a thread that is
+    /// running when its state is read after its children were had them when they were read. One
+    /// that has ended by then has already handed them on, and the pass sees whether they went to a
+    /// thread it has not listed.
+    fn thread_state(pid: u32, tid: u32) -> Result<ThreadState> {
+        match read_process_file(pid, &format!("task/{tid}/stat")) {
+            Ok(text) => Ok(match state_character(&text) {
+                Some('Z') => ThreadState::Ended,
+                Some('X' | 'x') => ThreadState::Gone,
+                _ => ThreadState::Alive,
+            }),
+            Err(error) if gone(&error) => Ok(ThreadState::Gone),
+            Err(error) => Err(unavailable(
+                "children of a process",
+                format!("/proc/{pid}/task/{tid}/stat: {error}"),
+            )),
+        }
+    }
+
+    /// Whether a read failed because what it read about has gone: its entry is not there, or the
+    /// task behind it is not.
+    fn gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound
+            || rustix::io::Errno::from_io_error(error) == Some(rustix::io::Errno::SRCH)
+    }
+
+    /// Whether this kernel keeps a list of children for each thread: whether a thread that is
+    /// certainly there, this one, has one. A thread of another process that has no list may be one
+    /// that is going, which is not the kernel's doing.
+    fn kernel_keeps_children_lists() -> bool {
+        std::fs::metadata("/proc/thread-self/children").is_ok()
+    }
+
+    /// Reads the children of every thread of a process once.
+    ///
+    /// A thread that ends hands its children to a thread that is left, and a thread that has ended
+    /// before its children are read has none. A pass in which a thread that was running when it
+    /// began has ended by its end is made again, since its children may have gone to a thread whose
+    /// list was read already; and so is a pass whose threads, listed again at its end, are not the
+    /// ones it began with, since they may have gone to a thread made after it began. A thread that
+    /// ended before the pass began is as it was throughout: the first thread of a process that left
+    /// while the rest run stays in the list with no children, and so does a thread whose end a
+    /// tracer has not yet collected.
+    fn children_in_one_pass(pid: u32) -> Result<Pass> {
+        let threads = match list_threads(pid, None)? {
+            ThreadListing::Gone => return Ok(Pass::Gone),
+            ThreadListing::Whole(threads) => threads,
+            ThreadListing::Partial => return Ok(Pass::Changed),
+        };
+        let mut running = Vec::new();
+        for &tid in &threads {
+            match thread_state(pid, tid)? {
+                ThreadState::Alive => running.push(tid),
+                ThreadState::Ended => {}
+                ThreadState::Gone => return Ok(Pass::Changed),
+            }
+        }
+        let mut children = Vec::new();
+        for &tid in &threads {
             match read_process_file(pid, &format!("task/{tid}/children")) {
                 Ok(list) => children.extend(
                     list.split_whitespace()
                         .filter_map(|child| child.parse::<u32>().ok()),
                 ),
-                // A thread that ended between the listing and the read had nothing more to say.
-                // One that is still there without a list is a kernel that keeps none.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && !thread.path().exists() => {}
+                // A thread whose list is not there: one that is going, which another pass sees as
+                // changed, or a kernel that keeps no lists, which no pass will change.
+                Err(error) if gone(&error) => {
+                    if kernel_keeps_children_lists() {
+                        return Ok(Pass::Changed);
+                    }
+                    return Err(unavailable(
+                        "children of a process",
+                        format!("/proc/{pid}/task/{tid}/children: {error}"),
+                    ));
+                }
                 Err(error) => {
                     return Err(unavailable(
                         "children of a process",
-                        format!("{task}/{tid}/children: {error}"),
+                        format!("/proc/{pid}/task/{tid}/children: {error}"),
                     ));
                 }
             }
         }
+        for tid in running {
+            if thread_state(pid, tid)? != ThreadState::Alive {
+                return Ok(Pass::Changed);
+            }
+        }
+        match list_threads(pid, None)? {
+            ThreadListing::Gone => return Ok(Pass::Gone),
+            ThreadListing::Whole(mut later) => {
+                let mut first = threads;
+                first.sort_unstable();
+                later.sort_unstable();
+                if first != later {
+                    return Ok(Pass::Changed);
+                }
+            }
+            ThreadListing::Partial => return Ok(Pass::Changed),
+        }
         children.sort_unstable();
         children.dedup();
-        Ok(children)
+        Ok(Pass::Read(children))
+    }
+
+    pub(super) fn children_of(pid: u32) -> Result<Vec<u32>> {
+        // A list is taken once two passes read the same children, the last two that read any.
+        // A pass in which the kernel's list of a thread's children skipped a child printed one that
+        // was collected while it read, and no later pass prints that identifier again, so such a
+        // pass never agrees with the next: two passes that agree hold every child that was there
+        // throughout both. The same holds of a thread that ended and handed its children to a list
+        // already read, and of one that called `exec` and took the first thread's identifier after
+        // that thread's list was read, which no comparison of identifiers sees: the next pass reads
+        // the children where they are. What is not closed is a process that calls `exec` while it
+        // is read and whose next pass that reads any misses the same children, by another `exec`
+        // or by a skip of the kernel's list as another child is collected: no count of passes or
+        // time bounds that, and nothing short of freezing the process closes it.
+        let mut earlier: Option<Vec<u32>> = None;
+        for _ in 0..PASSES {
+            match children_in_one_pass(pid)? {
+                Pass::Gone => return Ok(Vec::new()),
+                Pass::Read(children) => {
+                    if earlier.as_ref() == Some(&children) {
+                        return Ok(children);
+                    }
+                    earlier = Some(children);
+                }
+                Pass::Changed => std::thread::yield_now(),
+            }
+        }
+        // Not an empty answer: a caller that reads "no children" into it would take a process that
+        // has some for one that has none.
+        Err(unavailable(
+            "children of a process",
+            format!("/proc/{pid}/task or its children kept changing while they were read"),
+        ))
     }
 
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
@@ -1853,6 +2114,204 @@ mod tests {
             read.iter().all(|pid| *pid == me),
             "nothing but this process was read: {read:?}"
         );
+    }
+
+    /// The kernel lists a process's threads while they come and go, and a listing ends at a thread
+    /// that left while it was made: the threads after it, and the children they hold, are not in
+    /// it, and a listing taken up again after it finds its place by counting threads, which lands
+    /// after a thread that stayed when the ones ahead of it have gone and takes in the threads made
+    /// since. A child that is alive is listed whatever the process's other threads do.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_live_child_is_listed_while_the_process_s_other_threads_come_and_go() {
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        const ROUNDS: usize = 300;
+        let me = std::process::id();
+        let mut unlisted = Vec::new();
+        for round in 0..ROUNDS {
+            // Threads made before the one that holds the child, which each make a thread and leave
+            // as the child is read: the kernel's listing meets each of them ahead of the thread
+            // with the child, and new threads follow it.
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let over = Arc::new((Mutex::new(false), Condvar::new()));
+            let leaving: Vec<_> = (0..16)
+                .map(|_| {
+                    let gate = Arc::clone(&gate);
+                    let over = Arc::clone(&over);
+                    std::thread::spawn(move || {
+                        let (open, opened) = &*gate;
+                        drop(
+                            opened
+                                .wait_while(open.lock().expect("the gate"), |open| !*open)
+                                .expect("the gate"),
+                        );
+                        std::thread::spawn(move || {
+                            let (done, ended) = &*over;
+                            drop(
+                                ended
+                                    .wait_while(done.lock().expect("the end"), |done| !*done)
+                                    .expect("the end"),
+                            );
+                        })
+                    })
+                })
+                .collect();
+            let (started, child) = mpsc::channel();
+            let (finished, release) = mpsc::channel::<()>();
+            let owner = std::thread::spawn(move || {
+                let mut child = std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("a child");
+                started.send(child.id()).expect("the round is read");
+                let _ = release.recv();
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+            let child = child.recv().expect("the owner started a child");
+            {
+                let (open, opened) = &*gate;
+                *open.lock().expect("the gate") = true;
+                opened.notify_all();
+            }
+            let children =
+                super::children_of(me).expect("the kernel lists this process's children");
+            if !children.contains(&child) {
+                unlisted.push(round);
+            }
+            finished.send(()).expect("the owner is waiting");
+            owner.join().expect("the owner ends");
+            {
+                let (done, ended) = &*over;
+                *done.lock().expect("the end") = true;
+                ended.notify_all();
+            }
+            for thread in leaving {
+                thread
+                    .join()
+                    .expect("a thread ends")
+                    .join()
+                    .expect("its replacement ends");
+            }
+        }
+        assert!(
+            unlisted.is_empty(),
+            "a child that was alive went unlisted in {} of {ROUNDS} readings, the first in round {:?}",
+            unlisted.len(),
+            unlisted.first()
+        );
+    }
+
+    /// A thread that leaves hands its children to the first thread of the process. A reading that
+    /// has read that thread's list by then, and finds the leaving thread gone, has the child in
+    /// neither, so it reads again.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_child_whose_thread_leaves_mid_reading_is_still_listed() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        let me = std::process::id();
+        let (started, child) = mpsc::channel();
+        let (leave, leaving) = mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("a child");
+            started.send(child.id()).expect("the test is waiting");
+            let _ = leaving.recv();
+            // The thread ends with the child running, and the process's first thread has it from
+            // there.
+            child
+        });
+        let child_id = child.recv().expect("the owner started a child");
+        let held = Arc::new(Mutex::new(None));
+        let mut owner = Some((owner, leave));
+        let first = format!("task/{me}/children");
+        let children = super::after_each_read(
+            {
+                let held = Arc::clone(&held);
+                move |_, file| {
+                    // Once the first thread's list has been read, the owner leaves.
+                    if file == first
+                        && let Some((owner, leave)) = owner.take()
+                    {
+                        leave.send(()).expect("the owner is waiting");
+                        *held.lock().expect("the child") = Some(owner.join().expect("it ends"));
+                    }
+                }
+            },
+            || super::children_of(me),
+        )
+        .expect("the kernel lists this process's children");
+        let mut child = held
+            .lock()
+            .expect("the child")
+            .take()
+            .expect("the owner's child");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            children.contains(&child_id),
+            "the child is listed after its thread left: {children:?}"
+        );
+    }
+
+    /// A listing whose first buffer has room for four entries is made again with a larger one, and
+    /// holds every thread that was there throughout.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_listing_that_outgrows_its_buffer_is_made_again_and_holds_every_thread() {
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        let parked = Arc::new((Mutex::new(false), Condvar::new()));
+        let (told, tids) = mpsc::channel();
+        let threads: Vec<_> = (0..64)
+            .map(|_| {
+                let parked = Arc::clone(&parked);
+                let told = told.clone();
+                std::thread::spawn(move || {
+                    let own = std::fs::read_link("/proc/thread-self").expect("this thread");
+                    let tid: u32 = own
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.parse().ok())
+                        .expect("a thread identifier");
+                    told.send(tid).expect("the test is listening");
+                    let (done, ended) = &*parked;
+                    drop(
+                        ended
+                            .wait_while(done.lock().expect("the end"), |done| !*done)
+                            .expect("the end"),
+                    );
+                })
+            })
+            .collect();
+        drop(told);
+        let wanted: Vec<u32> = (0..threads.len())
+            .map(|_| tids.recv().expect("a thread said its identifier"))
+            .collect();
+        // Room for four entries of the sixty-four threads and more.
+        // Made again while other tests' threads come and go makes a listing short of its count.
+        let listed = (0..1_000)
+            .find_map(|_| {
+                match super::platform::list_threads(std::process::id(), Some(4)).expect("lists") {
+                    super::platform::ThreadListing::Whole(listed) => Some(listed),
+                    super::platform::ThreadListing::Partial => None,
+                    super::platform::ThreadListing::Gone => panic!("this process has gone"),
+                }
+            })
+            .expect("a listing made whole within a thousand tries");
+        let (done, ended) = &*parked;
+        *done.lock().expect("the end") = true;
+        ended.notify_all();
+        for thread in threads {
+            thread.join().expect("a thread ends");
+        }
+        for tid in &wanted {
+            assert!(listed.contains(tid), "thread {tid} is listed: {listed:?}");
+        }
     }
 
     #[test]
