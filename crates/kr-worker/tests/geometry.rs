@@ -863,7 +863,8 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
             );
             assert!(
                 near.iter().any(|(same, _)| *same == row),
-                "{far} is on the row it was written on rather than reflowed onto another:                  {placed:?}"
+                "{far} is on the row it was written on rather than reflowed onto another: \
+                 {placed:?}"
             );
         }
     }

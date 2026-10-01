@@ -108,7 +108,9 @@ impl JsonSchema for PromptText {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_INLINE_PROMPT_BYTES,
-            "description": "Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition."
+            "description": "Prompt or steering text carried inline. The normative bound is 65536 \
+                            bytes of UTF-8; maxLength counts characters and is therefore a \
+                            necessary rather than a sufficient condition."
         })
     }
 }

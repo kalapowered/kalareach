@@ -179,7 +179,8 @@ impl StagingArea {
             Err(TransferError::from(
                 crate::authority::Escape::IdentityChanged {
                     detail: format!(
-                        "this environment's staging directory was recorded as {expected} and now                          names {}",
+                        "this environment's staging directory was recorded as {expected} and now \
+                         names {}",
                         self.identity
                     ),
                 },

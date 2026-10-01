@@ -25423,7 +25423,7 @@
       "type": "string"
     },
     "PromptText": {
-      "description": "Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.",
+      "description": "Prompt or steering text carried inline. The normative bound is 65536 bytes of UTF-8; maxLength counts characters and is therefore a necessary rather than a sufficient condition.",
       "maxLength": 65536,
       "minLength": 1,
       "type": "string"

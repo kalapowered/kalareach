@@ -213,7 +213,8 @@ impl Controller {
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
         let Some(session_id) = params.session_id else {
             return Err(ControllerError::InvalidArgument(
-                "a receipt this daemon serves belongs to a session, which this request does not                  name"
+                "a receipt this daemon serves belongs to a session, which this request does not \
+                 name"
                     .to_owned(),
             ));
         };
