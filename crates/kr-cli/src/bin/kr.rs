@@ -5,6 +5,7 @@ use kr_client::shown::Shown;
 use std::process::ExitCode;
 
 use clap::Parser as _;
+use kr_cli::bridge::environments::Selected;
 use kr_cli::cli::{
     AccountCommand, AccountTokenCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand,
 };
@@ -122,20 +123,31 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The environment the session is created in is the one the caller named, resolved
             // before anything connects. A selector that is ignored would create the session
             // somewhere else and say nothing about it.
-            let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
+            //
+            // What `--environment` names may also be an enrolled environment of this host, which a
+            // process bridge reaches and which has no directory here.
+            let environment = match kr_cli::bridge::environments::selected(
+                &paths,
+                arguments.environment.as_deref(),
+            )
+            .await?
+            {
+                Selected::Local(environment) => environment,
+                Selected::Enrolled(enrolment) => {
+                    return new_in_enrolled(
+                        *enrolment,
+                        arguments,
+                        presentation,
+                        shell_mode,
+                        cli.json,
+                    )
+                    .await;
+                }
+            };
             // The palette before the geometry, because the probe form asks this terminal a
             // question and a refusal should come before a session exists rather than after.
-            let chosen = match arguments.palette.as_deref() {
-                Some(value) => Some(kr_cli::create::resolve(
-                    kr_cli::create::PaletteChoice::parse(value)?,
-                    presentation,
-                )?),
-                None => None,
-            };
-            let (palette, typed_while_asking) = match chosen {
-                Some(chosen) => (Some(chosen.palette), chosen.typed),
-                None => (None, Vec::new()),
-            };
+            let (palette, typed_while_asking) =
+                choose_palette(arguments.palette.as_deref(), presentation)?;
             // From here to the attachment, anything the person typed while this terminal was
             // being asked for its colours has nowhere to go but that attachment. It is owed from
             // the moment it was taken, so the guard is taken before anything that can fail:
@@ -235,86 +247,31 @@ async fn run(cli: Cli) -> Result<Completion> {
                 typed_while_asking,
             )
             .await;
-            // A presentation that failed never began an attachment. One that began is presented,
-            // however the attachment then ended, and how it ended is reported the way `kr attach`
-            // reports it.
-            let (presentation_error, outcome) = match presented {
-                Ok(outcome) => (None, outcome),
-                Err(error) => (Some(error), None),
-            };
-            if cli.json {
-                let mut document = report::session(&created.session)
-                    .with("presentation", presentation.as_str())
-                    .with(
-                        "presentation_error",
-                        presentation_error.as_ref().map(|error| output::said(error)),
-                    )
-                    .with(
-                        "execution_context_chosen",
-                        arguments.execution.chosen().is_some(),
-                    )
-                    .with(
-                        "outcome",
-                        outcome.as_ref().map(kr_cli::session::AttachOutcome::detail),
-                    );
-                // An attachment that ended with the session's closure has its record, so the
-                // document describes the session as this command leaves it.
-                if let Some(record) = outcome
-                    .as_ref()
-                    .and_then(kr_cli::session::AttachOutcome::closure)
-                {
-                    document.set("state", kr_protocol::session::SessionState::Closed.as_str());
-                    document.set("closure", report::closure(record));
-                }
-                output::document(&document);
-            } else {
-                output::say(&shown!(
-                    "created session {} ({})",
-                    created.session.display_number.get(),
-                    created.session.session_id
-                ));
-                // The receipt, not the request: what the session was actually created with.
-                output::line(&report::desktop_line(&created.session));
-                let shell = Asked::text(Request::Sessions, &created.session.shell_path);
-                match created.session.shell_mode {
-                    ShellMode::Managed if fenced_launch => output::line(&stdout_line!(
-                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
-                         and a launch installs a command in {}'s own editor",
-                        shell
-                    )),
-                    ShellMode::Managed => output::say(&Shown::said(
-                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
-                         and this session's launch profile admits no fenced launch, so a launch \
-                         installs no command",
-                    )),
-                    ShellMode::NativeCompat => output::line(&stdout_line!(
-                        "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour \
-                         and can close the session, a launch installs no command, and kr detach \
-                         takes --attachment because this session records no originating attachment",
-                        shell
-                    )),
-                }
-                if let Some(error) = presentation_error.as_ref() {
-                    report::say(&shown!(
-                        "kr: the session was created; its terminal was not opened: {}",
-                        *error
-                    ));
-                }
-                if let Some(outcome) = outcome.as_ref() {
-                    output::say(&outcome.detail());
-                }
-            }
-            Ok(match (presentation_error, outcome) {
-                (Some(error), _) => Completion::Reported(error),
-                (None, Some(outcome)) => outcome
-                    .into_error()
-                    .map_or(Completion::Done, Completion::Reported),
-                (None, None) => Completion::Done,
-            })
+            Ok(creation_report(
+                &created,
+                presentation,
+                arguments.execution.chosen().is_some(),
+                fenced_launch,
+                presented,
+                cli.json,
+            ))
         }
         Command::Attach(arguments) => {
             let selector = SessionSelector::parse(&arguments.session)?;
-            let wanted = parse_environment(arguments.environment.as_deref())?;
+            // A name that is one of this host's environments restricts the search to it, as it
+            // always did. One that is an enrolled environment is reached through its bridge.
+            let wanted = match arguments.environment.as_deref() {
+                None => None,
+                Some(named) => {
+                    match kr_cli::bridge::environments::selected(&paths, Some(named)).await? {
+                        Selected::Local(known) => Some(known.environment_id),
+                        Selected::Enrolled(enrolment) => {
+                            return attach_in_enrolled(&enrolment, &selector, &arguments, cli.json)
+                                .await;
+                        }
+                    }
+                }
+            };
             let descriptor = match find(&paths, &selector, wanted) {
                 Ok((_, descriptor)) => descriptor,
                 // No descriptor names it, so it has closed, has not published one yet, or was
@@ -343,20 +300,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 },
             )
             .await?;
-            if cli.json {
-                output::document(
-                    &Document::new()
-                        .with("ok", !outcome.is_failure())
-                        .with("session_id", output::said(&session_id))
-                        .with("outcome", outcome.detail())
-                        .with("closure", outcome.closure().map(report::closure)),
-                );
-            } else {
-                output::say(&outcome.detail());
-            }
-            Ok(outcome
-                .into_error()
-                .map_or(Completion::Done, Completion::Reported))
+            Ok(attach_report(outcome, session_id, cli.json))
         }
         Command::Detach(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
@@ -1300,6 +1244,284 @@ async fn present(
     }
 }
 
+/// What `kr new` tells a person about the session it created, and how it ended.
+///
+/// A presentation that failed never began an attachment. One that began is presented, however the
+/// attachment then ended, and how it ended is reported the way `kr attach` reports it.
+fn creation_report(
+    created: &SessionCreateResult,
+    presentation: Presentation,
+    execution_chosen: bool,
+    fenced_launch: bool,
+    presented: Result<Option<kr_cli::session::AttachOutcome>>,
+    json: bool,
+) -> Completion {
+    let (presentation_error, outcome) = match presented {
+        Ok(outcome) => (None, outcome),
+        Err(error) => (Some(error), None),
+    };
+    if json {
+        let mut document = report::session(&created.session)
+            .with("presentation", presentation.as_str())
+            .with(
+                "presentation_error",
+                presentation_error.as_ref().map(|error| output::said(error)),
+            )
+            .with("execution_context_chosen", execution_chosen)
+            .with(
+                "outcome",
+                outcome.as_ref().map(kr_cli::session::AttachOutcome::detail),
+            );
+        // An attachment that ended with the session's closure has its record, so the document
+        // describes the session as this command leaves it.
+        if let Some(record) = outcome
+            .as_ref()
+            .and_then(kr_cli::session::AttachOutcome::closure)
+        {
+            document.set("state", kr_protocol::session::SessionState::Closed.as_str());
+            document.set("closure", report::closure(record));
+        }
+        output::document(&document);
+    } else {
+        output::say(&shown!(
+            "created session {} ({})",
+            created.session.display_number.get(),
+            created.session.session_id
+        ));
+        // The receipt, not the request: what the session was actually created with.
+        output::line(&report::desktop_line(&created.session));
+        let shell = Asked::text(Request::Sessions, &created.session.shell_path);
+        match created.session.shell_mode {
+            ShellMode::Managed if fenced_launch => output::line(&stdout_line!(
+                "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
+                 and a launch installs a command in {}'s own editor",
+                shell
+            )),
+            ShellMode::Managed => output::say(&Shown::said(
+                "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
+                 and this session's launch profile admits no fenced launch, so a launch \
+                 installs no command",
+            )),
+            ShellMode::NativeCompat => output::line(&stdout_line!(
+                "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour \
+                 and can close the session, a launch installs no command, and kr detach \
+                 takes --attachment because this session records no originating attachment",
+                shell
+            )),
+        }
+        if let Some(error) = presentation_error.as_ref() {
+            report::say(&shown!(
+                "kr: the session was created; its terminal was not opened: {}",
+                *error
+            ));
+        }
+        if let Some(outcome) = outcome.as_ref() {
+            output::say(&outcome.detail());
+        }
+    }
+    match (presentation_error, outcome) {
+        (Some(error), _) => Completion::Reported(error),
+        (None, Some(outcome)) => outcome
+            .into_error()
+            .map_or(Completion::Done, Completion::Reported),
+        (None, None) => Completion::Done,
+    }
+}
+
+/// What `kr attach` tells a person about how an attachment ended.
+fn attach_report(
+    outcome: kr_cli::session::AttachOutcome,
+    session_id: SessionId,
+    json: bool,
+) -> Completion {
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", !outcome.is_failure())
+                .with("session_id", output::said(&session_id))
+                .with("outcome", outcome.detail())
+                .with("closure", outcome.closure().map(report::closure)),
+        );
+    } else {
+        output::say(&outcome.detail());
+    }
+    outcome
+        .into_error()
+        .map_or(Completion::Done, Completion::Reported)
+}
+
+/// Refuses an attach to a session that has closed, with how it ended, and starts nothing.
+fn closed_refusal(
+    session_id: SessionId,
+    record: Option<kr_protocol::session::ClosureRecord>,
+    json: bool,
+) -> Completion {
+    let how = record.as_ref().map_or_else(
+        || Shown::said("the host did not send its record"),
+        kr_cli::session::how_it_closed,
+    );
+    let error = CliError::Refused(kr_client::error::refusal(
+        kr_protocol::error::ErrorCode::SessionClosed,
+        shown!(
+            "session {} has closed: {}; attaching to it starts nothing",
+            session_id,
+            how
+        ),
+    ));
+    if json {
+        output::document(
+            &report::failure(&error)
+                .with("session_id", output::said(&session_id))
+                .with("closure", record.as_ref().map(report::closure)),
+        );
+    } else {
+        report::failed(&error);
+    }
+    Completion::Reported(error)
+}
+
+/// What `--palette` chose, and what the person typed while this terminal was being asked.
+///
+/// The palette comes before the geometry, because the probe form asks this terminal a question and
+/// a refusal should come before a session exists rather than after.
+fn choose_palette(
+    value: Option<&str>,
+    presentation: Presentation,
+) -> Result<(Option<kr_protocol::session::PaletteRequest>, Vec<u8>)> {
+    let chosen = match value {
+        Some(value) => Some(kr_cli::create::resolve(
+            kr_cli::create::PaletteChoice::parse(value)?,
+            presentation,
+        )?),
+        None => None,
+    };
+    Ok(match chosen {
+        Some(chosen) => (Some(chosen.palette), chosen.typed),
+        None => (None, Vec::new()),
+    })
+}
+
+/// Creates a session in an enrolled environment through its bridge, and presents it.
+async fn new_in_enrolled(
+    enrolment: kr_protocol::identity::EnvironmentEnrolment,
+    arguments: kr_cli::cli::NewArguments,
+    presentation: Presentation,
+    shell_mode: ShellMode,
+    json: bool,
+) -> Result<Completion> {
+    use kr_cli::bridge::session as bridged;
+
+    // A terminal application opens where the session runs, and an enrolled environment has no
+    // screen of this host's to open one on.
+    if presentation == Presentation::Terminal {
+        return Err(CliError::Usage(Shown::said(
+            "--terminal opens a terminal application on the machine the session runs on, and an \
+             enrolled environment has none this host can open; use --attach or --invisible",
+        )));
+    }
+    let (palette, typed_while_asking) = choose_palette(arguments.palette.as_deref(), presentation)?;
+    let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
+    let dimensions = match presentation {
+        Presentation::Attach => {
+            let size = ControllingTerminal::open()?.size()?;
+            Some(Dimensions::new(
+                u64::from(size.columns),
+                u64::from(size.rows),
+            ))
+        }
+        Presentation::Terminal | Presentation::Invisible => None,
+    };
+    let launch_profile = arguments.launch_profile()?;
+    let fenced_launch = launch_profile.fenced_launch;
+    let chosen_profile = arguments.execution.chosen();
+    let created = bridged::create(
+        &enrolment,
+        &bridged::NewSession {
+            presentation,
+            shell: arguments.shell,
+            shell_mode,
+            cwd: arguments.cwd,
+            dimensions,
+            profile: chosen_profile,
+            palette,
+            launch_profile,
+        },
+    )
+    .await?;
+    if !json {
+        output::say(&report::execution_context_line(
+            created.profile,
+            chosen_profile.is_some(),
+        ));
+    }
+    // The session exists. Presenting it is a separate step, and a presentation that fails never
+    // produces a second session.
+    undelivered.delivered();
+    let presented = match presentation {
+        Presentation::Attach => {
+            let session = &created.result.session;
+            bridged::attach(
+                &enrolment,
+                kr_cli::attach::Attaching {
+                    session_id: session.session_id,
+                    environment_id: session.environment_id,
+                    display_number: session.display_number,
+                },
+                AttachOptions {
+                    take_geometry: true,
+                    no_probe: false,
+                    follow_live: false,
+                    typed_before: typed_while_asking,
+                },
+                kr_cli::session::UndeliveredTyping::new(0),
+            )
+            .await
+            .map(|(outcome, _)| Some(outcome))
+        }
+        Presentation::Invisible | Presentation::Terminal => Ok(None),
+    };
+    Ok(creation_report(
+        &created.result,
+        presentation,
+        chosen_profile.is_some(),
+        fenced_launch,
+        presented,
+        json,
+    ))
+}
+
+/// Attaches to a session in an enrolled environment through its bridge.
+async fn attach_in_enrolled(
+    enrolment: &kr_protocol::identity::EnvironmentEnrolment,
+    selector: &SessionSelector,
+    arguments: &kr_cli::cli::AttachArguments,
+    json: bool,
+) -> Result<Completion> {
+    use kr_cli::bridge::session as bridged;
+
+    // What the destination retains is read before this terminal is touched, so a closed session is
+    // refused with how it ended rather than after a probe of the terminal.
+    let attaching = match bridged::locate(enrolment, selector).await? {
+        bridged::Found::Closed { session_id, record } => {
+            return Ok(closed_refusal(session_id, record, json));
+        }
+        bridged::Found::Live(attaching) => attaching,
+    };
+    let (outcome, session_id) = bridged::attach(
+        enrolment,
+        attaching,
+        AttachOptions {
+            take_geometry: arguments.take_geometry,
+            no_probe: arguments.no_probe,
+            follow_live: arguments.follow_live,
+            typed_before: Vec::new(),
+        },
+        kr_cli::session::UndeliveredTyping::new(0),
+    )
+    .await?;
+    Ok(attach_report(outcome, session_id, json))
+}
+
 /// Answers `kr attach` for a session that no descriptor names, and starts nothing.
 ///
 /// A closed session is refused with `SESSION_CLOSED` and the closure record the daemon keeps, in
@@ -1314,28 +1536,7 @@ async fn attach_unpublished(
 ) -> Result<Completion> {
     match kr_cli::resolve::registered(paths, selector, environment).await? {
         kr_cli::resolve::Registered::Closed { session_id, record } => {
-            let how = record.as_ref().map_or_else(
-                || Shown::said("the host did not send its record"),
-                kr_cli::session::how_it_closed,
-            );
-            let error = CliError::Refused(kr_client::error::refusal(
-                kr_protocol::error::ErrorCode::SessionClosed,
-                shown!(
-                    "session {} has closed: {}; attaching to it starts nothing",
-                    session_id,
-                    how
-                ),
-            ));
-            if json {
-                output::document(
-                    &report::failure(&error)
-                        .with("session_id", output::said(&session_id))
-                        .with("closure", record.as_ref().map(report::closure)),
-                );
-            } else {
-                report::failed(&error);
-            }
-            Ok(Completion::Reported(error))
+            Ok(closed_refusal(session_id, record, json))
         }
         kr_cli::resolve::Registered::Unpublished { session_id, state } => {
             Err(CliError::HostUnavailable(shown!(
