@@ -836,7 +836,8 @@ while its grant still carries `host.manage`, the right every catalogue mutation 
 
 Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
 `catalogue.add`, and it needs the owner's confirmation of that exact action: a single-use
-confirmation, bound to a digest of the root's keys and the trust it asks for, with a short lifetime.
+confirmation, bound to a digest of the repository, its locations, the root's keys, its budgets and the
+trust it asks for, with a short lifetime.
 Being authenticated as the owner is not that confirmation. `catalogue.add` never re-anchors or
 widens a repository already enrolled: it refuses one this host already holds, so changing a root or
 a ceiling is `catalogue.remove` and then `catalogue.add`, two deliberate acts with a confirmation on
@@ -845,6 +846,24 @@ that would need more.
 Granting a capability is `plugin.grant`, confirmed the same way and bound to the package digest and
 the capabilities it is about; an install refuses a grant wider than the installation already held
 and says which method that decision belongs to.
+
+A terminal asks for the same two decisions without holding an owner key. It asks
+`owner.confirmation.request` for a challenge naming the `catalogue_add` or `plugin_install` subject,
+which carries the exact `catalogue.add` or `plugin.install` request without its proof. The host
+works out what an owner device is shown from that request and from what it holds. For an enrolment
+that is the repository's name, kind and locations, the root's digest and key identifiers, its
+budgets and its ceiling. For an installation it is the repository's ceiling, the release, the
+package hash and the grant, and, if the grant holds `native_bridge.install`, the publisher's
+statement from the verified manifest of that exact package hash. The host then sets the challenge to
+the digest of the plan the effect builds from the same request, which covers everything shown on the
+owner device. The owner device builds the same plan again from what it is shown, and signs only when
+the digest matches the one sent by the host. The host's own notice that a native bridge runs outside
+the plugin sandbox is a separate text, shown apart from the publisher's. The terminal then repeats
+the same request without proof, and the host spends once the oldest answer an owner device recorded
+for exactly that request. The challenge has to be one the host described: it never spends an answer
+for a challenge a caller described, even one with the same digest, unless the proof is presented.
+Only the owner may ask, and that is decided before the host reads anything for the subject. On a
+host that is not on the network, the methods that need an owner device return `HOST_NOT_CONFIGURED`.
 
 Removing a repository stops trusting its root and uninstalls nothing. A package installed from it is
 still installed, on the hash it was installed at, and the answer names what is still there. What it
