@@ -99,9 +99,6 @@ const isNameByte = (byte) =>
   byte === 0x24 ||
   byte === 0x2e
 
-/** The same without the dot: what may not follow a name for it to be that name and not a longer word. */
-const isWordByte = (byte) => byte !== 0x2e && isNameByte(byte)
-
 /**
  * The longest name a token is read to, in characters, so that one long run of name characters
  * costs no more than its length. A name cut off here is marked, and a marked name is never taken
@@ -110,28 +107,29 @@ const isWordByte = (byte) => byte !== 0x2e && isNameByte(byte)
 const TOKEN_REACH = 1024
 
 /**
- * The whole dotted names in `bytes` that contain a name of an earlier identifier, each read out to
- * the name it sits in: `content://` followed by `to.kala.reach.companion.share` answers
- * `to.kala.reach.companion.share`. A name that only begins like one (`to.kala.reach.companionship`)
- * is not one. Linear in the length of `bytes`. `wide` reads the names as UTF-16, which is how a
+ * Every place `bytes` holds a name of an earlier identifier, each read from its first character to
+ * the end of the run of name characters it starts: `content://` followed by
+ * `to.kala.reach.companion.share` answers `to.kala.reach.companion.share`.
+ *
+ * The rule is the same everywhere and has no exception for what follows or precedes a name: bytes
+ * do not say where a string ends (a Rust literal runs into the next one, a binary property list and
+ * a protocol buffer put the next object's tag straight after a value), so a hit is never discarded
+ * because a letter follows it. A name that only begins like an earlier one is reported too, and
+ * fails closed. Linear in the length of `bytes`. `wide` reads the names as UTF-16, which is how a
  * compiled resource table keeps a string.
  */
 function retiredNamesIn(bytes, wide = false) {
   const unit = wide ? 2 : 1
   const nameAt = (at) =>
     at >= 0 && at + unit <= bytes.length && isNameByte(bytes[at]) && (!wide || bytes[at + 1] === 0)
-  const wordAt = (at) => nameAt(at) && bytes[at] !== 0x2e
   const found = new Set()
   for (const name of RETIRED_NAMES) {
     const wanted = Buffer.from(name, wide ? 'utf16le' : 'utf8')
     for (let at = bytes.indexOf(wanted); at !== -1; at = bytes.indexOf(wanted, at + 1)) {
       let to = at + wanted.length
-      if (wordAt(to)) continue
-      let from = at
-      while (at - from < TOKEN_REACH * unit && nameAt(from - unit)) from -= unit
       while (to - at < TOKEN_REACH * unit && nameAt(to)) to += unit
-      const cut = nameAt(from - unit) || nameAt(to) ? '\u2026' : ''
-      found.add(bytes.toString(wide ? 'utf16le' : 'latin1', from, to) + cut)
+      const cut = nameAt(to) ? '\u2026' : ''
+      found.add(bytes.toString(wide ? 'utf16le' : 'latin1', at, to) + cut)
     }
   }
   return [...found]
@@ -164,7 +162,7 @@ function retiredJni(bytes) {
     if (next >= 0x41 && next <= 0x5a) {
       const end = Math.min(bytes.length, at + needle.length + 40)
       let to = at + needle.length
-      while (to < end && isWordByte(bytes[to])) to += 1
+      while (to < end && isNameByte(bytes[to])) to += 1
       found.push(bytes.toString('latin1', at, to))
       break
     }
@@ -340,6 +338,10 @@ function compareEntitlements(problems, name, images, expected) {
       const domains = image['com.apple.developer.associated-domains']
       compare(problems, `${name}'s associated domains`, domains, expected.domains)
     }
+    // A signed build also carries the team on its own, and it must be the one the groups name.
+    for (const key of ['com.apple.developer.team-identifier']) {
+      if (key in image) compare(problems, `${name}'s ${key} entitlement`, image[key], expected.team)
+    }
   }
 }
 
@@ -360,7 +362,8 @@ export function problemsInBundle(app, want = declared()) {
     {
       id: want.privateGroup,
       groups: [want.privateGroup, want.sharedGroup],
-      domains: ASSOCIATED_DOMAINS
+      domains: ASSOCIATED_DOMAINS,
+      team: want.team
     }
   )
 
@@ -387,7 +390,8 @@ export function problemsInBundle(app, want = declared()) {
     compare(problems, `${name}'s shared keychain group`, info.KRSharedKeychainGroup, want.sharedGroup)
     compareEntitlements(problems, name, entitlementsOf(join(folder, info.CFBundleExecutable)), {
       id: `${want.team}.${want.extension}`,
-      groups: [want.sharedGroup]
+      groups: [want.sharedGroup],
+      team: want.team
     })
   }
 
@@ -438,15 +442,16 @@ function dump(apk, ...arguments_) {
 export function attributesFromTree(tree) {
   const values = []
   let element = null
-  for (const line of tree.split('\n')) {
+  for (const line of tree.split(/\r?\n/)) {
     const started = /^\s*E: (\S+)/.exec(line)
     if (started) {
       element = started[1]
       continue
     }
-    // The value runs to the quote before the raw text aapt2 prints after it, so a value that holds
-    // quotes of its own is read whole.
-    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="(.*?)"(?: \(Raw: .*\))?$/.exec(line)
+    // aapt2 prints a string attribute as its value and then the same text again as `(Raw: "...")`.
+    // The value runs to the last quote that precedes that second copy, so a value that holds
+    // quotes, or the text `(Raw: `, is read whole.
+    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="(.*)"(?: \(Raw: ".*"\))?$/.exec(line)
     if (attribute && element) values.push([element, attribute[1], attribute[2]])
   }
   return values
