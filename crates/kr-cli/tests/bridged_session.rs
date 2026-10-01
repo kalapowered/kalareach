@@ -111,6 +111,11 @@ fn stand_in(tools: &Path, destination: &Path, home: &Path, login: Login) -> Stri
     format!(
         r##"#!/bin/sh
 printf '%s\n' "$*" >>'{tools}/invocations'
+# A test that wants the destination unreachable from some run onward says from which.
+if [ -f '{tools}/unreachable-after' ] \
+  && [ "$(wc -l <'{tools}/invocations')" -gt "$(cat '{tools}/unreachable-after')" ]; then
+  exit 1
+fi
 while [ "$#" -gt 0 ] && [ "$1" != "--exec" ]; do shift; done
 shift
 exec /usr/bin/env -i PATH=/usr/bin:/bin {home_variable} TMPDIR='{temporary}' \
@@ -685,8 +690,13 @@ impl Terminal {
     }
 
     fn expect_within(&self, marker: &str, what: &str) {
+        self.expect_nth_within(marker, 1, what);
+    }
+
+    /// Waits until `marker` has been seen `count` times.
+    fn expect_nth_within(&self, marker: &str, count: usize, what: &str) {
         let started = Instant::now();
-        while !self.text().contains(marker) {
+        while self.text().matches(marker).count() < count {
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
                 "{what}: waited {:?} for {marker:?} in the terminal: {}",
@@ -738,9 +748,9 @@ impl Terminal {
 }
 
 impl World {
-    /// Runs `kr attach` for a display number in the destination, on a terminal that answers the
-    /// command's questions about what it is.
-    fn attach_on_a_terminal(&self, display: &str) -> Terminal {
+    /// Runs a shell command on a terminal of its own, in the source host's environment, and
+    /// returns that terminal. The command asks it nothing yet: answering is the test's.
+    fn terminal_running(&self, command: &str) -> Terminal {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -751,10 +761,7 @@ impl World {
             .expect("opens a terminal");
         let mut builder = CommandBuilder::new("/bin/sh");
         builder.arg("-c");
-        builder.arg(format!(
-            "{} attach {display} --environment dest; printf 'attach-finished-%s\\n' \"$?\"",
-            support::kr().display()
-        ));
+        builder.arg(command);
         builder.env_clear();
         builder.env("PATH", format!("{}:/usr/bin:/bin", self.tools.display()));
         builder.env("TERM", "xterm-256color");
@@ -788,12 +795,21 @@ impl World {
         let writer = Arc::new(std::sync::Mutex::new(
             pty.master.take_writer().expect("a writer"),
         ));
-        let terminal = Terminal {
+        Terminal {
             _pty: pty,
             shell,
             seen,
             writer,
-        };
+        }
+    }
+
+    /// Runs `kr attach` for a display number in the destination, on a terminal that answers the
+    /// command's questions about what it is.
+    fn attach_on_a_terminal(&self, display: &str) -> Terminal {
+        let terminal = self.terminal_running(&format!(
+            "{} attach {display} --environment dest; printf 'attach-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
         terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
@@ -884,6 +900,111 @@ async fn a_shell_created_through_a_bridge_has_a_home_when_the_login_gave_none() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shell_created_through_a_bridge_has_no_relative_home() {
     a_shell_has_a_home_and_starts_in_it(Login::RelativeHome).await;
+}
+
+/// Creates a session through a bridge from a terminal that is asked for its colours while the
+/// person types five bytes, with the destination unreachable for the attachment that follows, and
+/// returns what the terminal showed.
+///
+/// `answer_the_attachment` says whether the terminal answers the attachment's own questions about
+/// what it is: where it does not, the attachment fails there, and where it does, it fails reaching
+/// the destination.
+async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
+    let world = World::start().await;
+    world.enrol_destination();
+    // The bridge that creates is the first run of the stand-in; the one that attaches is the
+    // second, and the destination is unreachable from there.
+    std::fs::write(
+        world.tools.join("unreachable-after"),
+        (world.invocations() + 1).to_string(),
+    )
+    .expect("says from which run the destination is unreachable");
+
+    let terminal = world.terminal_running(&format!(
+        "{} new --attach --palette probe --environment dest --shell /bin/sh --startup interactive \
+         --headless; printf 'create-finished-%s\\n' \"$?\"",
+        support::kr().display()
+    ));
+    // The command asks this terminal for its colours, and the person types while it does.
+    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
+    terminal.types(
+        "\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+    );
+    if answer_the_attachment {
+        terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
+        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    }
+    terminal.expect_within("create-finished-", "the command ended");
+    let text = terminal.text();
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
+    assert!(
+        world.invocations() >= 2 || !answer_the_attachment,
+        "the attachment tried the destination"
+    );
+    text
+}
+
+/// KR-REQ-03.14, 03.15, 07.04: what the person typed while the creating terminal was asked for its
+/// colours is theirs. When the session is made and the attachment to it then fails, the command
+/// says how many bytes were never delivered, as a create in this host does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_bridged_attachment_cannot_reach_the_session_says_what_typing_was_lost() {
+    let text = a_create_that_is_not_attached(true).await;
+    assert!(
+        text.contains("5 bytes typed while this terminal was asked for its colours"),
+        "the five bytes the person typed are accounted for: {}",
+        text.escape_debug()
+    );
+    assert!(
+        text.contains("created session"),
+        "and the session is reported as made, once: {}",
+        text.escape_debug()
+    );
+}
+
+/// The same, where the attachment fails before it reaches the destination, asking this terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_bridged_attachment_cannot_ask_the_terminal_says_what_typing_was_lost() {
+    let text = a_create_that_is_not_attached(false).await;
+    assert!(
+        text.contains("5 bytes typed while this terminal was asked for its colours"),
+        "the five bytes the person typed are accounted for: {}",
+        text.escape_debug()
+    );
+}
+
+/// The control for the two above: where the attachment succeeds, what the person typed while the
+/// terminal was asked for its colours reaches the session's shell, and nothing is reported lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_shell() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let terminal = world.terminal_running(&format!(
+        "{} new --attach --palette probe --environment dest --shell /bin/sh --startup interactive \
+         --headless; printf 'create-finished-%s\\n' \"$?\"",
+        support::kr().display()
+    ));
+    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
+    // The five bytes begin a command, which the person finishes once the shell is theirs.
+    terminal.types(
+        "\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+    );
+    terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
+    terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    terminal.types("delivered-$((1+1))\r");
+    // The command typed in two parts is run once, and the sum is not in what was typed.
+    terminal.expect_within("delivered-2", "the command typed in two parts ran");
+    terminal.types("exit\r");
+    terminal.expect_within("create-finished-", "the command ended with the session");
+    let text = terminal.text();
+    assert!(
+        !text.contains("bytes typed while this terminal was asked"),
+        "nothing typed is reported as lost where it was delivered: {}",
+        text.escape_debug()
+    );
+    let mut shell = terminal.shell;
+    let _ = shell.wait();
 }
 
 /// KR-REQ-25.26: `kr bridge enrol --access ssh --probe` learns the destination's identity from its
