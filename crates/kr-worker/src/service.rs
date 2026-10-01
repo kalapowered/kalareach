@@ -8198,8 +8198,9 @@ mod tests {
         connected_with(None).await
     }
 
-    /// A connection whose writing side holds `send_buffer` bytes at most, where the platform lets a
-    /// test say so (a Unix socket): the default is the host's own, which a test cannot rely on.
+    /// A connection whose writing side asks for a send buffer of `send_buffer` bytes, where the
+    /// platform lets a test ask (a Unix socket; the system may round the size up, and Linux doubles
+    /// it): the default is the host's own, which a test cannot rely on.
     async fn connected_with(
         send_buffer: Option<usize>,
     ) -> (
@@ -8745,7 +8746,7 @@ mod tests {
 
     fn a_gap() -> kr_protocol::recovery::HistoryGap {
         kr_protocol::recovery::HistoryGap {
-            cause: None,
+            cause: Some(kr_protocol::recovery::HistoryGapCause::SessionCapacity),
             from_cursor: kr_protocol::scalars::U64::new(1),
             to_cursor: kr_protocol::scalars::U64::new(3),
         }
@@ -8942,17 +8943,17 @@ mod tests {
         }
     }
 
-    /// A Unix socket takes what fits and leaves the rest of a frame waiting, which a Windows pipe does
-    /// not (it takes each frame whole), so a delivery cut part way through a screen is arranged here
-    /// on Unix only; a delivery stopped on its first write is the case that holds on every platform.
+    /// Unix only, because the limit this test sets is a Unix socket's send buffer. On Windows the
+    /// pipe's own buffer decides what a connection holds, and a test cannot set it. A delivery
+    /// stopped on its first write holds on every platform, and its test is not restricted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_screen_stopped_after_its_first_frame_has_not_been_sent_the_beginning_of_its_stream()
     {
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        // The connection holds 4 KiB unread, far less than the three frames after the first, so the
-        // delivery cannot finish before the peer has read the first and the withdrawal below has
-        // stopped it, whatever the host's own socket buffer is.
+        // The connection asks for a 4 KiB send buffer (the system may double it), far less than the
+        // three frames after the first, 768 KiB, so the delivery cannot finish before the peer has
+        // read the first and the withdrawal below has stopped it, whatever the host's own default is.
         let send_buffer = 4 * 1024;
         let (_temp, _subscription, mut outlet, mut reader) =
             an_outlet_over(connected_with(Some(send_buffer)).await);
