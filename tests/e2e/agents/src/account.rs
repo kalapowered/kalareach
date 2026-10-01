@@ -218,8 +218,19 @@ impl KeyScan {
 /// Panics when `value` is shorter than eight bytes, which would find anything.
 #[must_use]
 pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
+    files_holding_any(root, &[value])
+}
+
+/// [`files_holding`] for several values at once, each file read once: a file is listed when it holds
+/// any of them.
+///
+/// # Panics
+///
+/// Panics when a value is shorter than eight bytes, which would find anything.
+#[must_use]
+pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
     assert!(
-        value.len() >= 8,
+        values.iter().all(|value| value.len() >= 8),
         "a key shorter than eight bytes cannot be searched for"
     );
     let single = std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_file());
@@ -234,12 +245,17 @@ pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
             .display()
             .to_string()
     };
+    let holds = |bytes: &[u8]| {
+        values
+            .iter()
+            .any(|value| bytes.windows(value.len()).any(|window| window == *value))
+    };
     let mut scan = KeyScan::default();
     if single {
         let mut bytes = Vec::new();
         match std::fs::File::open(root).and_then(|mut file| file.read_to_end(&mut bytes)) {
             Ok(_) => {
-                if bytes.windows(value.len()).any(|window| window == value) {
+                if holds(&bytes) {
                     scan.held_by.push(KeyHolder {
                         path: relative(root),
                         bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -294,7 +310,7 @@ pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
                 scan.unread.push(format!("{}: {error}", relative(&path)));
                 continue;
             }
-            if bytes.windows(value.len()).any(|window| window == value) {
+            if holds(&bytes) {
                 let metadata = entry.metadata().ok();
                 scan.held_by.push(KeyHolder {
                     path: relative(&path),
@@ -792,6 +808,14 @@ impl Snapshot {
         self.unread.is_empty()
     }
 
+    /// Whether `path` was in the snapshot and its bytes were read whole for a digest.
+    #[must_use]
+    pub fn is_hashed(&self, path: &Path) -> bool {
+        self.files
+            .get(path)
+            .is_some_and(|entry| entry.digest.is_some())
+    }
+
     /// The entries that could not be read, with why.
     #[must_use]
     pub fn unread(&self) -> &[String] {
@@ -1025,7 +1049,9 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
 /// and created, the rewritten files' sizes together, the latest time one was modified, and a
 /// SHA-256 over the rewritten files' names and digests, so a rewrite shows without a name or a
 /// byte of what it holds. The second list has one entry for each rewritten file, with its size,
-/// time and digest before and after, for the part's private evidence.
+/// time and digest before and after, for the part's private evidence. A file whose bytes were too
+/// many to hash whole is not one of the rewrites this lists: the part stops on it (see
+/// [`Snapshot::is_hashed`]).
 #[must_use]
 pub fn reported_rewrites(
     data: &Path,
@@ -1050,7 +1076,6 @@ pub fn reported_rewrites(
             let mut rewritten: Vec<&PathBuf> = found
                 .rewritten
                 .iter()
-                .chain(&found.changed_uncompared)
                 .filter(|path| path.starts_with(&root))
                 .collect();
             rewritten.sort();
@@ -1078,6 +1103,7 @@ pub fn reported_rewrites(
                     "file": relative,
                     "bytes_before": old.bytes,
                     "bytes_after": new.bytes,
+                    "modified_ms_before": millis(old.modified_ns),
                     "modified_ms_after": millis(new.modified_ns),
                     "sha256_before": hex(old.digest),
                     "sha256_after": hex(new.digest),

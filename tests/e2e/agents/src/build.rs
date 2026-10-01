@@ -88,10 +88,25 @@ pub struct Approval {
     /// when the agent's own record of the request names the command and the run's folder.
     #[serde(default)]
     pub relative_log: bool,
-    /// What marks the line of a conversation file that records a request for approval, which
-    /// carries the command and the folder it runs in as `"command":"..."` and `"cwd":"..."`.
+    /// How the conversation file records a request for approval, where it does: the part answers
+    /// only when the record of the request still pending names its command and folder.
     #[serde(default)]
-    pub request_line: Option<String>,
+    pub request: Option<RequestRecord>,
+}
+
+/// The lines of a conversation file that record a request for approval and its answer, as the
+/// agent writes them: the request is JSON with a `kind` of `approval`, an `id`, a `toolCallId` and
+/// a `request` holding the tool's name and `display.command` and `display.cwd`; its answer is a
+/// line with the same `id`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestRecord {
+    /// What marks the line of a request.
+    pub line: String,
+    /// What marks the line that answers one.
+    pub resolved_line: String,
+    /// The tool whose request it is: the one that runs the part's command.
+    pub tool: String,
 }
 
 impl Approval {
@@ -1112,7 +1127,7 @@ mod tests {
             others: Vec::new(),
             refuse: Some("\u{1b}".to_owned()),
             relative_log: false,
-            request_line: None,
+            request: None,
         };
         let rows = |lines: &[&str]| owned(lines);
         let command = "echo kr0123 >> approved.log";

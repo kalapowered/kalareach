@@ -16,7 +16,7 @@ use std::net::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The longest request head the proxy reads before it answers.
 const HEAD_LIMIT: usize = 8192;
@@ -103,11 +103,28 @@ impl Counts {
     }
 }
 
+/// One tunnel the proxy opened: where it went, when, and how many bytes it carried each way once it
+/// ended. Never what the bytes were.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tunnel {
+    /// The authority the agent asked for.
+    pub authority: String,
+    /// The address the proxy connected to, which it chose once from the name's addresses.
+    pub address: SocketAddr,
+    /// When it opened, in milliseconds since the epoch.
+    pub opened_ms: u64,
+    /// The bytes sent to the destination and received from it; `None` while the tunnel is open.
+    pub carried: Option<(u64, u64)>,
+}
+
+type Tunnels = Mutex<Vec<Tunnel>>;
+
 /// A running proxy. It stops, and every tunnel with it, when it is dropped.
 pub struct Proxy {
     port: u16,
     counts: Arc<Counts>,
     names: Arc<Mutex<Vec<String>>>,
+    tunnels: Arc<Tunnels>,
     stop: Arc<AtomicBool>,
     open: Arc<Mutex<Vec<TcpStream>>>,
     accepting: Option<JoinHandle<()>>,
@@ -125,12 +142,18 @@ impl Proxy {
         let port = listener.local_addr()?.port();
         let counts = Arc::new(Counts::default());
         let names = Arc::new(Mutex::new(Vec::new()));
+        let tunnels: Arc<Tunnels> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let open = Arc::new(Mutex::new(Vec::new()));
         let policy = Arc::new(policy);
         let accepting = {
-            let (counts, names, stop, open) =
-                (counts.clone(), names.clone(), stop.clone(), open.clone());
+            let (counts, names, stop, open, tunnels) = (
+                counts.clone(),
+                names.clone(),
+                stop.clone(),
+                open.clone(),
+                tunnels.clone(),
+            );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
@@ -140,15 +163,16 @@ impl Proxy {
                             if client.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            let (policy, counts, names, stop, open) = (
+                            let (policy, counts, names, stop, open, tunnels) = (
                                 policy.clone(),
                                 counts.clone(),
                                 names.clone(),
                                 stop.clone(),
                                 open.clone(),
+                                tunnels.clone(),
                             );
                             std::thread::spawn(move || {
-                                serve(client, &policy, &counts, &names, &stop, &open);
+                                serve(client, &policy, (&counts, &names, &tunnels), &stop, &open);
                             });
                         }
                         Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -163,6 +187,7 @@ impl Proxy {
             port,
             counts,
             names,
+            tunnels,
             stop,
             open,
             accepting: Some(accepting),
@@ -185,6 +210,15 @@ impl Proxy {
     #[must_use]
     pub fn counts(&self) -> &Counts {
         &self.counts
+    }
+
+    /// Every tunnel it opened, in order, for the part's private log and the counts of the record.
+    #[must_use]
+    pub fn tunnels(&self) -> Vec<Tunnel> {
+        self.tunnels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The authorities it refused, one entry each, for the part's private log only.
@@ -270,8 +304,7 @@ fn refuse(client: &mut TcpStream, counts: &Counts, names: &Mutex<Vec<String>>, w
 fn serve(
     mut client: TcpStream,
     policy: &Policy,
-    counts: &Counts,
-    names: &Mutex<Vec<String>>,
+    (counts, names, tunnels): (&Counts, &Mutex<Vec<String>>, &Tunnels),
     stop: &AtomicBool,
     open: &Mutex<Vec<TcpStream>>,
 ) {
@@ -302,10 +335,12 @@ fn serve(
             return;
         }
     };
-    let upstream = candidates
-        .iter()
-        .find_map(|address| TcpStream::connect_timeout(address, WAIT).ok());
-    let Some(upstream) = upstream else {
+    let upstream = candidates.iter().find_map(|address| {
+        TcpStream::connect_timeout(address, WAIT)
+            .ok()
+            .map(|up| (*address, up))
+    });
+    let Some((address, upstream)) = upstream else {
         refuse(
             &mut client,
             counts,
@@ -315,6 +350,20 @@ fn serve(
         return;
     };
     counts.allowed.fetch_add(1, Ordering::SeqCst);
+    let index = {
+        let mut tunnels = tunnels.lock().unwrap_or_else(PoisonError::into_inner);
+        tunnels.push(Tunnel {
+            authority: line.split(' ').nth(1).unwrap_or_default().to_owned(),
+            address,
+            opened_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                }),
+            carried: None,
+        });
+        tunnels.len() - 1
+    };
     if client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .is_err()
@@ -335,13 +384,21 @@ fn serve(
         return;
     };
     let forward = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut client_read, &mut upstream_write);
+        let sent = std::io::copy(&mut client_read, &mut upstream_write).unwrap_or(0);
         let _ = upstream_write.shutdown(Shutdown::Write);
+        sent
     });
     let (mut upstream_read, mut client_write) = (upstream, client);
-    let _ = std::io::copy(&mut upstream_read, &mut client_write);
+    let received = std::io::copy(&mut upstream_read, &mut client_write).unwrap_or(0);
     let _ = client_write.shutdown(Shutdown::Write);
-    let _ = forward.join();
+    let sent = forward.join().unwrap_or(0);
+    if let Some(tunnel) = tunnels
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(index)
+    {
+        tunnel.carried = Some((sent, received));
+    }
 }
 
 /// Whether a tunnel may go to `address`: a public unicast address, none of the ranges that reach a
@@ -545,6 +602,23 @@ mod tests {
         assert_eq!(&echoed, b"hello");
         echo.join().expect("the destination ends");
         assert_eq!((proxy.counts().allowed(), proxy.counts().refused()), (1, 2));
+        drop(stream);
+        // The tunnel is listed with where it went, and, once it ended, how much it carried.
+        let mut tunnels = proxy.tunnels();
+        for _ in 0..100 {
+            if tunnels
+                .first()
+                .is_some_and(|tunnel| tunnel.carried.is_some())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            tunnels = proxy.tunnels();
+        }
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].authority, format!("api.example:{port}"));
+        assert_eq!(tunnels[0].address.port(), port);
+        assert_eq!(tunnels[0].carried, Some((5, 5)));
         let names = proxy.refused_authorities();
         assert_eq!(names.len(), 2);
         assert!(
