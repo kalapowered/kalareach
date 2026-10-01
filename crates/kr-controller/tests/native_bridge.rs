@@ -3565,6 +3565,69 @@ fn kr_req_11_42_a_gemini_cli_installation_stopped_at_each_boundary_is_finished_o
     );
 }
 
+/// What the refusal of a command the host does not read says.
+#[cfg(unix)]
+const UNREAD_COMMAND: &str = "starts the forwarder with arguments it does not accept from a bridge";
+
+/// KR-REQ-11.42: a command that is not a string, and the forwarder's name with an argument list
+/// that is not exactly the application and the surface as two words, are commands the host does
+/// not read, wherever they stand: a list with a third member of any kind, one that is not a word,
+/// or a command member that is not text. Each is refused before anything is written, alone and
+/// beside a good command.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_command_in_a_shape_the_host_does_not_read_is_refused_wherever_it_stands() {
+    let good = serde_json::json!({"type": "command", "name": "kalareach",
+                                  "command": "kr-hook", "args": ["gemini-cli", "hook"]});
+    let shapes = [
+        serde_json::json!({"type": "command", "name": "kalareach", "command": 5}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": null}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": ["kr-hook"]}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", "hook", 5]}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", "hook", "extra"]}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli"]}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook",
+                           "args": ["gemini-cli", 5]}),
+        serde_json::json!({"type": "command", "name": "kalareach", "command": "kr-hook"}),
+    ];
+    for shape in shapes {
+        for hooks in [
+            vec![shape.clone()],
+            vec![good.clone(), shape.clone()],
+            vec![shape.clone(), good.clone()],
+        ] {
+            let site = GeminiSite::new();
+            let before = site.tree();
+            let bytes =
+                serde_json::json!({"hooks": {"SessionStart": [{"hooks": hooks}]}}).to_string();
+            let target = gemini_target_with_hooks(&site, bytes.as_bytes());
+            let settled = site
+                .bridges()
+                .reconcile(&gemini(), Some(&target))
+                .expect("reconciles");
+            let reason = refused(&settled);
+            assert!(
+                reason.contains(UNREAD_COMMAND),
+                "{bytes}: refused as a command the host does not read: {reason}"
+            );
+            assert_eq!(site.tree(), before, "{bytes}: nothing was written");
+        }
+    }
+    // The control: the same list form with exactly the application and the surface is applied.
+    let site = GeminiSite::new();
+    let bytes = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [good]}]}}).to_string();
+    let target = gemini_target_with_hooks(&site, bytes.as_bytes());
+    assert_eq!(
+        site.bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles"),
+        Settled::Applied
+    );
+}
+
 /// A package whose hooks file is `bytes`, with a recipe that names it.
 #[cfg(unix)]
 fn gemini_target_with_hooks(site: &GeminiSite, bytes: &[u8]) -> BridgeTarget {
@@ -3620,7 +3683,9 @@ fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the
         "kr-hook 'gemini-cli' hook",
         "kr-hook gemini$(other) hook",
         "kr-hook `other` hook",
-        "kr-hook another-agent hook",
+        "kr-hook Gemini-CLI hook",
+        "kr-hook 'gemini-cli' channel",
+        "kr-hook Gemini-CLI channel",
         "kr-hook gemini-cli tool",
         "\"kr-hook\" another-agent channel; other-command",
         "'kr-hook' gemini-cli hook",
@@ -3643,12 +3708,28 @@ fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the
                 .expect("reconciles");
             let reason = refused(&settled);
             assert!(
-                reason.contains("hooks.json") || reason.contains("forwarder"),
-                "{commands:?}: {reason}"
+                reason.contains(UNREAD_COMMAND),
+                "{commands:?}: refused as a command the host does not read: {reason}"
             );
             assert_eq!(site.tree(), before, "{commands:?}: nothing was written");
         }
     }
+    // A line in the form the host reads, for another application, is read and refused for what it
+    // says: the registration is for an application other than the package's.
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let target =
+        gemini_target_with_hooks(&site, &gemini_hooks(&[good, "kr-hook another-agent hook"]));
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&target))
+        .expect("reconciles");
+    let reason = refused(&settled);
+    assert!(
+        reason.contains("gemini-cli") && reason.contains("another-agent"),
+        "{reason}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
     // The control: the line the package ships, once and repeated, is applied.
     for commands in [vec![good], vec![good, good]] {
         let site = GeminiSite::new();
