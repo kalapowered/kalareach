@@ -463,7 +463,8 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
             )
             .expect("the path is text");
             assert_eq!(
-                startup::install(&target.path, &body, target.placement, &record).expect("installs"),
+                startup::install(&target.path, &body, &target.placement, &record)
+                    .expect("installs"),
                 Change::Added
             );
         }
