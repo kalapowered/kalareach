@@ -1276,6 +1276,27 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
         vec!["call-1".to_owned()],
         "the call the broker created is closed"
     );
+    // The refusal settled the start's claim: nothing is left pending, so a retry is answered with
+    // the refusal rather than told that an earlier attempt ended without saying what it did.
+    let receipts = rusqlite::Connection::open(environment.registry_database())
+        .expect("opens the authority store");
+    let pending: i64 = receipts
+        .query_row(
+            "SELECT COUNT(*) FROM authority_receipts
+              WHERE result IS NULL AND refusal_code IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counts the claims");
+    assert_eq!(pending, 0, "no claim is left pending after the refusal");
+    let refused_claims: i64 = receipts
+        .query_row(
+            "SELECT COUNT(*) FROM authority_receipts WHERE refusal_code = 'PERMISSION_DENIED'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counts the refusals");
+    assert_eq!(refused_claims, 1, "the refusal is what the claim records");
     clear_the_fault(&registry);
     host.stop().await;
 }
