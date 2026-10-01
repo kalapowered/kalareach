@@ -995,3 +995,157 @@ fn a_shared_runtime_can_be_wrapped_once_and_driven_by_the_same_contract() {
     sync.note_reconciled();
     assert!(PrivacyMode::reconcile(&[&sync]).is_complete());
 }
+
+/// How long a test waits for a shell's first output.
+const FIRST_OUTPUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The privacy state a launch specification says, for a worker started under it.
+fn launched(generation: u64, enabled: bool) -> kr_protocol::worker::PrivacyLaunch {
+    kr_protocol::worker::PrivacyLaunch {
+        generation: kr_protocol::scalars::U64::new(generation),
+        enabled,
+    }
+}
+
+/// Starts a session the way the worker process does, from the privacy state its specification
+/// carries, with a shell that prints at once and then waits.
+fn start_printing(
+    temp: &kr_ipc::testing::TempHost,
+    session_id: SessionId,
+    journal: std::path::PathBuf,
+    privacy: kr_protocol::worker::PrivacyLaunch,
+) -> Result<
+    std::sync::Arc<kr_worker::runtime::SessionRuntime>,
+    Box<kr_worker::runtime::LaunchFailure>,
+> {
+    let mut config = config_at(temp, session_id, journal);
+    config.shell =
+        kr_worker::testing::posix_script("printf 'printed before any notice\\n'; sleep 30");
+    kr_worker::runtime::start_or_record(
+        config,
+        kr_worker::snapshot::PaletteChoice::from_request(None),
+        privacy,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+}
+
+/// Waits until the session's shell has printed something, and fails with how long it waited.
+async fn first_output(runtime: &kr_worker::runtime::SessionRuntime) {
+    let started = tokio::time::Instant::now();
+    while runtime.session().output_cursor() == 0 {
+        assert!(
+            started.elapsed() < FIRST_OUTPUT,
+            "the shell printed nothing in {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Ends a session this test started.
+async fn end(runtime: &std::sync::Arc<kr_worker::runtime::SessionRuntime>) {
+    let (_, gate) = runtime.close(kr_protocol::session::ClosureReason::CloseRequested);
+    gate.release();
+    let _ = tokio::time::timeout(FIRST_OUTPUT, runtime.wait_closed()).await;
+}
+
+/// A session launched while privacy mode is on holds the generation before its shell runs, so none
+/// of what the shell first prints is retained.
+///
+/// The control is the same session launched with privacy mode off, which retains the same output:
+/// the output arrives in both, and only the state the launch carried differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_launched_under_privacy_mode_retains_none_of_what_its_shell_first_prints() {
+    for (privacy, retained) in [(launched(3, true), false), (launched(0, false), true)] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let journal = temp.environment().journal_database(session_id);
+        std::fs::create_dir_all(journal.parent().expect("a parent")).expect("the directory");
+        let runtime = start_printing(&temp, session_id, journal.clone(), privacy)
+            .unwrap_or_else(|failure| panic!("the session launches: {:?}", failure.error));
+        first_output(&runtime).await;
+        let session = runtime.session();
+        assert!(session.output_cursor() > 0, "the shell's output arrived");
+        assert_eq!(
+            session.retained_output_bytes() > 0,
+            retained,
+            "{privacy:?}: what the shell first printed is retained only without privacy mode"
+        );
+        assert_eq!(session.privacy().is_enabled(), privacy.enabled);
+        assert_eq!(
+            session.privacy().generation().get(),
+            privacy.generation.get()
+        );
+        drop(session);
+
+        // The generation is on disk, which is what makes it a boundary a restart can see.
+        let recorded = kr_worker::journal::Journal::open_read_only(journal)
+            .expect("reads the journal")
+            .read_privacy()
+            .expect("reads")
+            .expect("the record is there");
+        assert_eq!(
+            (recorded.generation, recorded.enabled),
+            (privacy.generation.get(), privacy.enabled)
+        );
+        end(&runtime).await;
+    }
+}
+
+/// A launch that says privacy mode is on is applied or it fails the start: a worker that cannot
+/// write the boundary down does not run a shell it cannot say is private. A launch that says it is
+/// off needs nothing written, so an unreadable journal does not stop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_under_privacy_mode_that_cannot_be_recorded_does_not_start_a_shell() {
+    let blocked = |temp: &kr_ipc::testing::TempHost, session_id: SessionId| {
+        // A directory stands where the journal's file belongs.
+        let journal = temp.environment().journal_database(session_id);
+        std::fs::create_dir_all(&journal).expect("blocks the journal");
+        journal
+    };
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let journal = blocked(&temp, session_id);
+    let Err(failure) = start_printing(&temp, session_id, journal, launched(1, true)) else {
+        panic!("a session that cannot record privacy mode does not start");
+    };
+    assert!(
+        matches!(
+            failure.error,
+            kr_worker::error::WorkerError::JournalUnavailable { .. }
+        ),
+        "{:?}",
+        failure.error
+    );
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let journal = blocked(&temp, session_id);
+    let runtime = start_printing(&temp, session_id, journal, launched(2, false))
+        .unwrap_or_else(|failure| panic!("an off launch starts: {:?}", failure.error));
+    first_output(&runtime).await;
+    end(&runtime).await;
+}
+
+/// A specification that says privacy mode is on at the generation of an environment that has never
+/// turned it on contradicts itself, and the worker does not start under it. The control is the same
+/// generation, off, which is what such an environment says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_says_privacy_mode_is_on_at_generation_nought_is_refused() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let journal = temp.environment().journal_database(session_id);
+    std::fs::create_dir_all(journal.parent().expect("a parent")).expect("the directory");
+    let Err(failure) = start_printing(&temp, session_id, journal, launched(0, true)) else {
+        panic!("a launch that contradicts itself does not start");
+    };
+    assert!(
+        matches!(
+            failure.error,
+            kr_worker::error::WorkerError::PreconditionFailed { .. }
+        ),
+        "{:?}",
+        failure.error
+    );
+}
