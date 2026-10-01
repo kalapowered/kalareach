@@ -1101,23 +1101,36 @@ too, and so is any action a worker could not show did not run before the revocat
 | `kr plugin enable <plugin>` and `kr plugin disable <plugin>` | Enables it, or disables it without removing it |
 | `kr plugin integration enable <plugin>` and `kr plugin integration disable <plugin>` | Turns its command integration on or off for the sessions created from now on |
 | `kr plugin repo list` | Lists the enrolled repositories with their roots, generations and budgets |
-| `kr plugin repo add <repository> --root <file> --metadata-url <url> --targets-url <url>` | Refused at a terminal, as below |
+| `kr plugin repo add <repository> --root <file> --metadata-url <url> --targets-url <url>` | Adds a repository once an owner device confirms its root |
 | `kr plugin repo sync <repository>` | Fetches its newest generation inside the trust it already has |
 | `kr plugin repo pin <repository> [--generation <n>]` | Holds it at one generation, or releases it |
 | `kr plugin repo remove <repository>` | Stops trusting its root; what was installed from it stays installed |
 
-Two decisions are the owner's, and section 10 says this account's own identity is not the owner's
-confirmation. The first is adopting a repository's trust root. A request to add a repository
-carries an owner device's signed confirmation of exactly that root, so `kr plugin repo add` refuses
-with `OWNER_CONFIRMATION_REQUIRED` and sends nothing: add the repository from an owner device.
+Adopting a repository's trust root is a decision for the owner, and section 10 says this account's
+own identity is not the owner's confirmation. So when you run `kr plugin repo add`, the command does
+not add the repository right away. It asks the host for a challenge that names this exact request,
+says that an owner device has to confirm it, and prints what that device is shown: the repository's
+name and metadata location, the root's digest and key identifiers, and any capability its packages
+may hold beyond the default. Then the command sends the same request again, once per second, with no
+proof, until the host spends the owner device's answer. The request carries a copy of the trust
+root, which is read from the file you name and never fetched from the repository itself. If the
+location has the `file:` scheme, the repository is added as a local repository, otherwise as a
+community repository. In both cases it uses the host's default budgets and no capability beyond the
+default. If no owner device answers before the challenge ends, the command exits with
+`OWNER_CONFIRMATION_REQUIRED` and says that nothing was changed. If the host has no owner device
+yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
+owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
 
-The second is an installation that may do more than the one it replaces or, with none to replace,
-more than its repository permits by itself, and every release that installs a native bridge or
-declares a command integration.
-`kr plugin install` asks without a confirmation, which is all an installation inside what is
-already permitted needs. When the host answers that this one needs the owner, `kr` exits with
-`OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no
-confirmation waiting.
+The second decision is an installation that may do more than the one it replaces or, with none to
+replace, more than its repository permits by itself, and every release that installs a native bridge
+or declares a command integration. When you run `kr plugin install`, it first tries to install
+without an owner confirmation, which is all an installation inside what is already permitted needs.
+If the host responds that this one needs the owner, the command asks for a challenge and waits for
+the owner's confirmation in the same way as `kr plugin repo add`. It prints what the owner device is
+shown: the release, its package hash and its grant. For a native bridge it also prints the host's
+own notice that the bridge runs outside the plugin sandbox, followed by what the publisher says the
+bridge does, set apart from the host's words. Each answer is spent once, and only by the request it
+was given for. With `--json` the document carries the challenge's identifier and its expiry.
 
 A command integration the owner confirmed at installation applies only once the environment's
 configuration turns it on. `kr plugin integration enable <plugin>` adds the package to the host's

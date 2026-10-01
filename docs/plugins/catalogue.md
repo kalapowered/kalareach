@@ -380,13 +380,26 @@ does not permit by itself, carries the owner's confirmation of that exact instal
 every release that installs a native bridge or declares a command integration. What the replaced
 installation could do is read under the ceiling it was installed under, so a move to a repository
 that permits more is an increase too. The confirmation names the repository and its ceiling, as
-`catalogue.list` reports them, the release, the package hash and the grant; it is accepted and
+`catalogue.list` reports them, the release, the package hash, the grant and, where the grant holds a
+native bridge, the publisher's statement; it is accepted and
 consumed the way `plugin.grant`'s is, and asked again when the installation is recorded. The
 installation is held to the ceiling the owner was shown: a repository whose ceiling changed after
 the confirmation, before the installation holds it or before the installation is recorded, refuses
 it, and a new confirmation is needed. An installation that widens nothing needs none, and one that
 is given is spent all the same. `plugin.grant` takes the same confirmation for every widening of an
 installed package, so removing a package and installing it again is not a way around it.
+
+The owner device shows the installation itself, not a summary of it. For an installation that grants
+`native_bridge.install`, the host reads the publisher's description of what the bridge does from the
+verified manifest of the exact package hash. The manifest of a release that is installed already is
+read where it is installed. Otherwise it comes from the cached payload, or is fetched by its hash
+and checked against the length and hash the signed index declares. The statement is part of the
+digest the confirmation covers, so a confirmation shown one statement cannot install a release whose
+manifest says another. It is shown on the owner device apart from the host's own notice that the
+bridge runs under the application's permissions, outside the plugin sandbox. The terminal signs
+nothing. When you run `kr plugin install` or `kr plugin repo add`, the command asks the host for the
+challenge that names the exact request, an owner device answers it, and the repeated request spends
+that one answer.
 
 Qualification data ships as signed, immutable catalogue artifacts, separately from host binaries. A
 vendor can say "this release was qualified against ExternalApp 1.4" without waiting for a core release,
