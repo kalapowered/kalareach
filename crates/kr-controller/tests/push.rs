@@ -6199,7 +6199,7 @@ fn one_record(environment: &Environment) -> kr_delivery::journal::DeliveryRecord
         .expect("a read")
 }
 
-/// KR-REQ-16.12, D-309: a notification to a paired device is decided against the device's own
+/// KR-REQ-16.12: a notification to a paired device is decided against the device's own
 /// grant at the moment it is presented. It is claimed while the grant holds, its credential is
 /// renewed, which waits on the gateway, and the grant's deadline passes during that wait, in UTC or
 /// on the continuous clock: nothing is presented, and the record says the authority is gone. The

@@ -1540,7 +1540,7 @@ mod tests {
         delivery.pause_after_key_write()
     }
 
-    /// KR-REQ-16.11, D-309: a key registration is checked against the admission it carries where it
+    /// KR-REQ-16.11: a key registration is checked against the admission it carries where it
     /// is written, after it has waited. Its deadline passes on the continuous clock while it is
     /// held before its writes, and both stores are left as they were with the refusal an expired
     /// admission gets; the control, with the deadline still ahead, registers in both.
