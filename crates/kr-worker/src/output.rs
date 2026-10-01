@@ -30,6 +30,14 @@ pub const DEFAULT_SEND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// everything else. It is at least what any marker encodes to, whatever its reason and cursors.
 pub const RESYNC_MARKER_BYTES: usize = 96;
 
+/// What a subscriber's queue keeps for one side effect beside the bytes that perform it: the
+/// effect's shared record, the shared buffer's header and the channel's slot for the delivery.
+///
+/// A bell is one byte on a terminal and a record of about this size in a queue. A queue bounded in
+/// bytes alone would hold many times its bound in memory when an application rings in a loop, so
+/// every effect is charged this much as well.
+pub const EFFECT_RECORD_BYTES: usize = 256;
+
 /// One thing delivered to a subscriber.
 #[derive(Clone, Debug)]
 pub enum OutputDelivery {
@@ -145,9 +153,10 @@ pub struct OwedEffect {
 }
 
 impl OwedEffect {
-    /// What this effect costs a subscriber's queue: the bytes that perform it, and what the effect
-    /// keeps beside them. A clipboard write holds its decoded content and a notification its text
-    /// next to the rendering, and a queue bounded in bytes counts both.
+    /// What this effect costs a subscriber's queue: the bytes that perform it, what the effect keeps
+    /// beside them, and the record the queue holds for it ([`EFFECT_RECORD_BYTES`]). A clipboard
+    /// write holds its decoded content and a notification its text next to the rendering, and a
+    /// queue bounded in bytes counts both.
     #[must_use]
     pub fn cost(&self) -> usize {
         use kr_term::sideeffect::SideEffectKind;
@@ -164,7 +173,10 @@ impl OwedEffect {
             | SideEffectKind::Progress { .. }
             | SideEffectKind::ClipboardRead { .. } => 0,
         };
-        self.bytes.len().saturating_add(kept)
+        self.bytes
+            .len()
+            .saturating_add(kept)
+            .saturating_add(EFFECT_RECORD_BYTES)
     }
 }
 
@@ -1229,20 +1241,59 @@ mod tests {
     #[test]
     fn a_side_effect_is_queued_as_an_effect_and_charged() {
         let mut hub = OutputHub::new();
-        let mut stream = hub.subscribe(identifier(1), 64, Presentation::Direct);
+        let mut stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         assert_eq!(
             hub.publish_effect(identifier(1), &owed(b"\x1b]52;c;eA==\x1b\\", 40), 0),
             EffectOutcome::Queued
         );
-        assert_eq!(stream.queued_bytes(), 13);
+        assert_eq!(stream.queued_bytes(), 13 + EFFECT_RECORD_BYTES);
         let delivery = stream.try_recv().expect("the effect is queued");
-        assert_eq!(delivery.len(), 13);
+        assert_eq!(delivery.len(), 13 + EFFECT_RECORD_BYTES);
         assert!(
             matches!(&delivery, OutputDelivery::Effect(owed) if owed.effect.at == 40 && owed.bytes.len() == 13),
             "{delivery:?}"
         );
         stream.written(delivery.len());
         assert_eq!(stream.queued_bytes(), 0);
+    }
+
+    /// The charge for an effect's record is not a guess that can drift from the types: it covers the
+    /// slot the delivery takes in the channel, the effect's shared record and the shared buffer's
+    /// header.
+    #[test]
+    fn the_charge_for_an_effects_record_covers_what_the_queue_holds_for_it() {
+        let shared_header = 2 * std::mem::size_of::<usize>();
+        let held = std::mem::size_of::<OutputDelivery>()
+            + shared_header
+            + std::mem::size_of::<SideEffect>()
+            + shared_header
+            + std::mem::size_of::<Vec<u8>>();
+        assert!(
+            held <= EFFECT_RECORD_BYTES,
+            "a queued effect holds {held} bytes beside its own bytes, and {EFFECT_RECORD_BYTES} are \
+             charged"
+        );
+    }
+
+    /// A bell is one byte on a terminal and a whole record in a queue, so an application that rings
+    /// in a loop must meet the bound long before it has made a queue hold a multiple of it in memory.
+    #[test]
+    fn an_application_that_rings_in_a_loop_meets_the_queue_bound_after_a_bounded_number_of_bells() {
+        let limit = 1024 * 1024;
+        let mut hub = OutputHub::new();
+        let _stream = hub.subscribe(identifier(1), limit, Presentation::Direct);
+        let mut queued = 0_usize;
+        while hub.publish_effect(identifier(1), &owed(&[0x07], queued as u64), 0)
+            == EffectOutcome::Queued
+        {
+            queued += 1;
+            assert!(queued <= limit, "the bound is never met");
+        }
+        assert!(
+            queued <= limit / 128,
+            "{queued} bells were queued in a bound of {limit} bytes, and each is a record of \
+             more than a byte"
+        );
     }
 
     /// A clipboard write holds its decoded content beside the bytes that perform it, and the queue's
@@ -1265,16 +1316,16 @@ mod tests {
             }),
             bytes: Arc::new(vec![b'y'; 400]),
         };
-        assert_eq!(effect.cost(), 700);
+        assert_eq!(effect.cost(), 700 + EFFECT_RECORD_BYTES);
         assert_eq!(
             hub.publish_effect(identifier(1), &effect, 0),
             EffectOutcome::Queued
         );
-        assert_eq!(stream.queued_bytes(), 700);
+        assert_eq!(stream.queued_bytes(), 700 + EFFECT_RECORD_BYTES);
         let delivery = stream.try_recv().expect("queued");
         assert_eq!(
             delivery.len(),
-            700,
+            700 + EFFECT_RECORD_BYTES,
             "reading it gives back what was charged"
         );
         // A second one does not fit the 1,024 bytes: it is not queued.
