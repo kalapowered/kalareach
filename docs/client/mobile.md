@@ -157,9 +157,10 @@ nothing.
 ## Coming back
 
 A phone suspends an application, terminates it in the background, changes its network underneath it
-and restarts it cold. The draft survives all four. The rebind that would put a recovered draft back
-into its editor is the decision below, and nothing calls it with what the host reports, so a
-recovered draft is kept and shown rather than re-bound. Two rules keep the rest honest.
+and restarts it cold. In each case any drafts that were being worked on will still be there.
+Whenever the shell is in contact with the host, it asks the host where each detached draft's
+conversation stands, even for drafts in a session that is not on screen. Each draft is then offered
+its rebind. Two rules keep the rest honest.
 
 **The draft is durable and the association is not.** A draft is this device's own record with its
 own identity and revision. The attachment that presents it in an editor belongs to the connection,
@@ -168,9 +169,13 @@ offers a rebind, and only the same authorised device against an unchanged target
 changed application or binding revision is a conflict the person resolves, and a session that has
 gone orphans the draft. Nothing is ever submitted automatically.
 
-The rebind itself is not driven by the connection: `rebindAll` is the decision, and no screen calls
-it with what the host reports about each draft's target. A draft that came back is therefore kept
-and shown, and is not re-bound to an editor.
+Contact with the host drives the rebind, not the connection changing. Every time the shell is in
+contact with the host and there is a detached draft, the shell will read the session of that draft
+and attempt to bind the draft to the conversation again if the conversation is the same. This can
+happen either when coming in to contact with the host, or when bringing the application to the front
+over a connection that never dropped. Only a detached draft is offered a rebind. If the host does
+not know the session the drafts will be orphaned, if it isn't the same conversation they will be
+conflicted, and if the read fails they will stay detached until the next time.
 
 **The connection coming back is not an outcome.** A submission in flight when contact was lost is
 unresolved until a receipt says otherwise. Queued, sent and applied are three different states and
