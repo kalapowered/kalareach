@@ -476,15 +476,21 @@ fn base() -> DestinationBase {
         .or_else(|| account().home)
         .filter(|home| home.starts_with('/'))
         .unwrap_or_else(|| "/".to_owned());
+    // The session's `HOME` is the directory it starts in. A login that gave this process none, or
+    // one that is not an absolute path, leaves the shell with the account's home as its directory
+    // and no `HOME`, or with a relative one, so the resolved home is what the snapshot carries.
     let variables = DESTINATION_BASE_VARIABLES
         .iter()
         .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| kr_protocol::session::EnvironmentVariable {
-                    name: (*name).to_owned(),
-                    value,
-                })
+            let value = if *name == "HOME" {
+                home.clone()
+            } else {
+                std::env::var(name).ok()?
+            };
+            Some(kr_protocol::session::EnvironmentVariable {
+                name: (*name).to_owned(),
+                value,
+            })
         })
         .filter(|variable| {
             variable.value.len() <= kr_protocol::identity::DESTINATION_BASE_VALUE_LIMIT
