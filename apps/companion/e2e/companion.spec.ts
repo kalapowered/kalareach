@@ -3438,6 +3438,67 @@ test.describe("the phone's shell and a page the platform panned", () => {
   }
 })
 
+// KR-REQ-13.17: a session that cannot be shown whole above a software keyboard scrolls, and the
+// field being typed into is always above the keyboard and inside what the person sees, where the
+// platform panned the page to it and the shell went with the visual viewport. Each case is a
+// keyboard and a pan as a platform reported them: the first focus and a later one at a person's own
+// text size on a phone's width, a phone on its side, and the sizes where the session fits whole.
+test.describe("the phone's field above a keyboard the platform panned the page for", () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const CASES: readonly { readonly seen: Seen; readonly keyboard: number; readonly pan: number; readonly fits: boolean }[] = [
+    { seen: { width: 320, height: 658, scale: '200%' }, keyboard: 399, pan: 297, fits: false },
+    { seen: { width: 320, height: 658, scale: '200%' }, keyboard: 259, pan: 227, fits: false },
+    { seen: { width: 844, height: 390, scale: '100%' }, keyboard: 210, pan: 90, fits: false },
+    { seen: { width: 390, height: 844, scale: '100%' }, keyboard: 336, pan: 0, fits: true },
+    { seen: { width: 390, height: 844, scale: '100%' }, keyboard: 312, pan: 241, fits: true }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const pane of ['conversation', 'terminal'] as const) {
+      for (const each of CASES) {
+        const { seen, keyboard, pan } = each
+        test(`${surface}, ${pane}, ${seen.width}×${seen.height} at ${seen.scale} text, keyboard ${keyboard}px, panned ${pan}px`, async ({
+          page
+        }) => {
+          await onPhone(page, surface, seen, `&session=${SESSION}`)
+          if (pane === 'terminal') {
+            await page.getByRole('tab', { name: 'Terminal' }).click()
+            await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+          }
+          const field = page.locator('textarea[id^="composer-"]')
+          await field.focus()
+          await page.evaluate(
+            ([covered, panned]) => {
+              document.documentElement.style.setProperty('--keyboard', `${covered}px`)
+              document.documentElement.style.setProperty('--pan', `${panned}px`)
+            },
+            [keyboard, pan]
+          )
+          // What the person sees: from the top of the visual viewport, which the shell goes with, to
+          // where the keyboard begins at the shell's foot.
+          const where = () =>
+            page.evaluate(() => {
+              const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
+              const shell = document.querySelector('.m-shell')?.getBoundingClientRect()
+              const covered = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
+              return box && shell
+                ? { top: box.top - shell.top, bottom: box.bottom, visibleBottom: shell.bottom - covered, shellTop: shell.top }
+                : null
+            })
+          await expect
+            .poll(async () => {
+              const at = await where()
+              return at === null ? 'no field' : at.bottom <= at.visibleBottom + 1 ? 'above the keyboard' : `${Math.round(at.bottom - at.visibleBottom)} px under the keyboard`
+            })
+            .toBe('above the keyboard')
+          const at = await where()
+          expect(at?.bottom, 'the field is not above the top of what the person sees').toBeGreaterThan(at?.shellTop ?? 0)
+        })
+      }
+    }
+  }
+})
+
 // KR-REQ-13.09: the phone's settings open over a live session and leave it behind them, whole at a
 // person's own text size: the bar's controls, the sheet's edges and each appearance choice.
 test.describe("the phone's settings over a live session", () => {
