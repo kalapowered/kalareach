@@ -130,7 +130,9 @@ A module can be refused even though it would work. This can happen when the modu
 
 This check is performed when the hooks are activated, which happens once for each report the integration sends, and the activation builtin can be run again. The check is performed entirely within the shell: no file is opened and no program is run. It involves iterating over the in-memory tables and making at most a couple of lookups to the loader for each undefined name.
 
-The lookup operation involves running the symbol resolver function for each name found in a library that defines an indirect function, including names that the module imports but never calls. The operation also involves taking locks within the loader. The C library's own resolvers only read CPU features, and the loader's locks are normally free since the shell runs one thread. If a library ships a resolver that blocks, the check will wait, as the shell would if it called the function or if it loaded a module that binds its names at once.
+A lookup can run a resolver. If a library defines a name as an indirect function, the loader runs it to find the value, for every such name the module imports, including names it never calls. This also requires taking a lock in the loader. Both are the loader's normal work: a module that binds its names at once, or a call that reaches the same name, does the same in the same thread. The C library's own resolvers only read CPU features, and the lock is normally free because the shell runs one thread.
+
+The check itself waits on nothing outside the process. It opens no file, starts no process, uses no network and sets no sleep or deadline. A library that ships a resolver that blocks would make the check wait, as it would make the shell wait at any call that reached the same name. The medians below are the cost of the check.
 
 Each number is the median of ten sessions, measured with a timer around the whole check in a real session under the built package. The slowest of the ten sessions is in brackets.
 

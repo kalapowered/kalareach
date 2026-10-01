@@ -452,10 +452,13 @@ kr_setup_symbol(const char *module_name)
  * can be replaced or removed after the module loaded, and the file then found is not the code the
  * shell runs. The module's undefined symbols are read from the tables the loader itself bound it
  * with, which are in memory already, so no file is opened or read. What is asked is whether the
- * running shell, the modules already loaded or the module's own libraries provide each name; the
- * loader's own lookup answers, which can run the resolver function of a library that defines an
- * indirect function and takes the loader's locks. A name that carries a symbol version is asked
- * for under that version, in the shell's global scope and in the module's own libraries. Every
+ * running shell, the modules already loaded or the module's own libraries provide each name, and
+ * the loader's own lookup answers. That lookup can run the resolver function of a library that
+ * defines an indirect function, and it takes the loader's lock. This is the loader's normal work,
+ * the work a `dlopen` that binds every name at once does, and it runs in the shell's own thread.
+ * The check waits on nothing outside the process: it reads no file, starts no process, uses no
+ * network and sets no sleep or deadline. A name that carries a symbol version is asked for under
+ * that version, in the shell's global scope and in the module's own libraries. Every
  * module is judged, the package's own among them: where a module sits says nothing about what it
  * is, and the package's own bind like any other.
  *
@@ -520,7 +523,8 @@ kr_utf8_clean(char *text)
     }
 }
 
-/* Whether `handle`'s lookup finds `name`: a symbol whose value is zero is still one that exists. */
+/* Whether `handle`'s lookup finds `name`: a symbol whose value is zero is still one that exists.
+ * The loader's lookup can run an indirect function's resolver, which is its normal work. */
 static int
 kr_provides(void *handle, const char *name)
 {
