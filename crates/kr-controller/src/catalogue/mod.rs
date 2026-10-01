@@ -277,7 +277,10 @@ impl CatalogueModule {
     /// starts: the limits the budgets set hold every package from the first check on, and the
     /// disable policy is recorded, with the admission revision it moves, before any snapshot is
     /// computed, so the first round a worker that outlived the last daemon receives carries it.
-    /// `None` leaves the policy this catalogue already records.
+    /// `None` leaves the policy this catalogue already records. `allowed` is the adapters the
+    /// organisation's policy allows, or `None` for every adapter: it is in force before any native
+    /// bridge is brought to what its installation wants, so a restart puts back no registration
+    /// the list excludes.
     ///
     /// # Errors
     ///
@@ -290,6 +293,7 @@ impl CatalogueModule {
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
         policy: Option<kr_protocol::admission::RevocationPolicy>,
+        allowed: Option<std::collections::BTreeSet<PluginId>>,
     ) -> crate::Result<Self> {
         Self::open_with(
             paths,
@@ -298,6 +302,7 @@ impl CatalogueModule {
             broker,
             budgets,
             policy,
+            allowed,
         )
     }
 
@@ -319,6 +324,7 @@ impl CatalogueModule {
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
         policy: Option<kr_protocol::admission::RevocationPolicy>,
+        allowed: Option<std::collections::BTreeSet<PluginId>>,
     ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
@@ -334,6 +340,9 @@ impl CatalogueModule {
             record_disable_policy(&mut catalogue, admissions::disable_policy_of(policy))
                 .map_err(unavailable)?;
         }
+        catalogue
+            .set_allowed_adapters(allowed, &Owner::acting())
+            .map_err(unavailable)?;
         let limits = kr_plugin_catalogue::LimitsInForce::default();
         limits.put(limits_of(&budgets));
         catalogue.read_limits_from(limits.clone());
@@ -1728,6 +1737,14 @@ fn limits_of(
 }
 
 /// What one package's installation wants of its bridge.
+///
+/// A registration in an application's directory is the package running in that application's
+/// name, so it follows the standing the admissions decide: a package the owner disabled, a release
+/// its repository revoked and one the organisation's allowlist does not name want none, and the
+/// installation stays. What needs no index is decided first, so a package left out by the owner or
+/// by the list loses its registration whatever state the index is in; what does need it, the
+/// revocation and the signed builds, is read once, and where the index cannot be read nothing is
+/// known to stand, so the registration is not kept on its account.
 fn wanted_bridge(
     catalogue: &Catalogue,
     environment_id: EnvironmentId,
@@ -1736,11 +1753,7 @@ fn wanted_bridge(
     let Some(installation) = catalogue.installation(environment_id, plugin_id)? else {
         return Ok(WantedBridge::Nothing);
     };
-    // A registration in an application's directory is the package running in that application's
-    // name, so it follows the standing the admissions decide first: a package the owner disabled,
-    // a release its repository revoked and one the organisation's allowlist does not name want
-    // none, and the installation stays.
-    if catalogue.standing(&installation)?.is_some() {
+    if catalogue.standing(&installation, None).is_some() {
         return Ok(WantedBridge::Nothing);
     }
     // The grant is what permits the bridge: a release installed without it, or an installation
@@ -1765,17 +1778,33 @@ fn wanted_bridge(
     let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
         return Ok(WantedBridge::Nothing);
     };
-    // Which version an executable is comes from the signed builds the current generation of the
-    // installation's origin names for this host's platform, by the executable's digest. With none,
-    // the recipe's version requirement refuses the recipe rather than guessing.
-    let qualified = catalogue
-        .builds(&installation, &kr_plugin_catalogue::this_host())?
-        .into_iter()
-        .map(|build| native_bridge::QualifiedExecutable {
-            digest: Digest256::from_bytes(*build.executable_digest.as_bytes()),
-            version: build.version.to_string(),
-        })
-        .collect();
+    // The current generation of the installation's origin: whether it revoked this release, and
+    // which version an executable is from the signed builds it names for this host's platform. With
+    // none, the recipe's version requirement refuses the recipe rather than guessing.
+    let entry = match catalogue.release_entry(&installation) {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!(
+                "kr-controller: the index that says whether {plugin_id} is revoked could not be \
+                 read, so its native bridge is not kept: {error}"
+            );
+            return Ok(WantedBridge::Nothing);
+        }
+    };
+    if catalogue.standing(&installation, entry.as_ref()).is_some() {
+        return Ok(WantedBridge::Nothing);
+    }
+    let host = kr_plugin_catalogue::this_host();
+    let qualified = match (host.os, host.architecture, entry.as_ref()) {
+        (Some(os), Some(architecture), Some(entry)) => entry
+            .builds_for(os, architecture)
+            .map(|build| native_bridge::QualifiedExecutable {
+                digest: Digest256::from_bytes(*build.executable_digest.as_bytes()),
+                version: build.version.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let target = native_bridge::BridgeTarget {
         plugin_id: plugin_id.clone(),
         package_digest: installation.package_digest,

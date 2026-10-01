@@ -404,11 +404,16 @@ and four lines hold:
 ## Native bridges
 
 A release whose manifest carries a native bridge recipe changes files in the application's own
-directory, which the host does not own. The daemon applies the recipe once an installation that
-holds `native_bridge.install` has committed, and takes it out when the package is removed or that
-grant is withdrawn. Enabling and disabling the package leave it: the registration belongs to the
-installation the owner confirmed, and what the host serves through it follows admission. After every
-plugin change, and each time the daemon starts, each package's bridge is brought to what its
+directory, which the host does not own. A registration there is the package running in that
+application's name, so the daemon applies the recipe only while the installation stands: it holds
+`native_bridge.install`, the package is enabled, its repository has not revoked the release, and the
+organisation's adapter allowlist, where there is one, names it. It takes the recipe out as soon as
+any of those stops holding (a disable, a revocation that reaches the host in a synchronisation, a
+list that no longer names the package, a withdrawn grant, a removal), whatever the disable policy
+says about live bindings, and puts it back when they hold again. The installation stays. Where the
+index that says whether the release is revoked cannot be read, the registration is not kept on its
+account. After every plugin change, every synchronisation, pin and removal, every change of the
+allowlist, and each time the daemon starts, each package's bridge is brought to what its
 installation wants. The method's answer and receipt say what the catalogue did and are never changed
 by the recipe.
 

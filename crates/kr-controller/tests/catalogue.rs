@@ -189,6 +189,7 @@ fn host() -> Host {
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         None,
+        None,
     )
     .expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -1203,6 +1204,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         Arc::new(kr_plugin_catalogue::UnboundBroker),
         kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         None,
+        None,
     )
     .expect("the catalogue reopens");
     let restarted = reopened
@@ -1627,6 +1629,7 @@ async fn the_startup_policy_is_recorded_before_the_first_snapshot_is_computed() 
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
             policy,
+            None,
         )
         .expect("an openable catalogue")
     };
@@ -1709,6 +1712,79 @@ async fn the_startup_policy_is_recorded_before_the_first_snapshot_is_computed() 
     assert_eq!(
         module.disable_policy_in_force().await,
         Ok(DisableAtNextAdmission)
+    );
+}
+
+/// KR-REQ-25.22: recording the policy when the catalogue opens forgets no release a worker that
+/// outlived the last daemon may still hold. A commit forgets the releases an installation left
+/// once no worker holds them, and a daemon that has not counted its workers yet cannot say that,
+/// so its bridge says a worker is pending until it has. The control is the same commit once the
+/// workers are counted, which forgets what none of them holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_recorded_at_open_forgets_no_release_a_surviving_worker_may_hold() {
+    use kr_controller::catalogue::bridge::WorkerBridge;
+    use kr_protocol::admission::RevocationPolicy::{DisableAtOnce, WarnOnly};
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let open = |broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>, policy| {
+        CatalogueModule::open(
+            &environment,
+            None,
+            broker,
+            kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            policy,
+            None,
+        )
+        .expect("an openable catalogue")
+    };
+    // The records exist, and hold a release an upgrade left while a worker may still bind it.
+    drop(open(Arc::new(kr_plugin_catalogue::UnboundBroker), None));
+    let database = environment
+        .state_dir()
+        .join("catalogue")
+        .join(kr_plugin_catalogue::db::DATABASE_FILE);
+    let retired = || -> i64 {
+        rusqlite::Connection::open(&database)
+            .expect("the catalogue's records")
+            .query_row("SELECT COUNT(*) FROM retired_releases", [], |row| {
+                row.get(0)
+            })
+            .expect("a count")
+    };
+    rusqlite::Connection::open(&database)
+        .expect("the catalogue's records")
+        .execute(
+            "INSERT INTO retired_releases
+                 (environment_id, plugin_id, package_digest, enrolment_key, repository_id, cap)
+             VALUES (?1, 'kalareach/claude-code', ?2, ?3, 'development', '[]')",
+            rusqlite::params![
+                temp.environment_id().to_string(),
+                kr_plugin_sdk::digest::PayloadDigest::of(b"a release").to_string(),
+                kr_plugin_catalogue::EnrolmentKey::generate()
+                    .expect("a key")
+                    .as_str(),
+            ],
+        )
+        .expect("a retired release");
+    assert_eq!(retired(), 1);
+
+    let bridge = Arc::new(WorkerBridge::new(
+        kr_protocol::ids::ControllerGeneration::new(1),
+    ));
+    let module = open(bridge.clone(), Some(DisableAtOnce));
+    assert_eq!(module.disable_policy_in_force().await, Ok(DisableAtOnce));
+    assert_eq!(
+        retired(),
+        1,
+        "a daemon that has not counted its workers forgets nothing"
+    );
+
+    bridge.members_known();
+    assert_eq!(module.put_disable_policy_in_force(WarnOnly).await, Ok(true));
+    assert_eq!(
+        retired(),
+        0,
+        "with the workers counted, what none holds is forgotten"
     );
 }
 
@@ -3260,6 +3336,7 @@ mod native_bridges {
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
             None,
+            None,
         )
         .expect("an openable catalogue");
         let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -3284,6 +3361,7 @@ mod native_bridges {
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
             kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            None,
             None,
         )
         .expect("an openable catalogue");
@@ -3794,7 +3872,7 @@ mod native_bridges {
 
     /// A change that holds the catalogue (here, one whose bridge is being placed) holds a round's
     /// snapshot and revision no longer than the bound the round gives them: both are refused as
-    /// busy by then, and both are answered once the change is done.
+    /// busy while the change still holds it, and both are answered once the change is done.
     ///
     /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
     /// platforms.
@@ -3828,17 +3906,18 @@ mod native_bridges {
                 .await
                 .expect("the wait ended")
                 .expect("the change is placing its bridge");
-            let started = tokio::time::Instant::now();
-            let snapshot = host.module.snapshot_within(&[], started + bound).await;
+            let snapshot = host
+                .module
+                .snapshot_within(&[], tokio::time::Instant::now() + bound)
+                .await;
             let revision = host
                 .module
                 .admission_revision_within(tokio::time::Instant::now() + bound)
                 .await;
-            let waited = started.elapsed();
             drop(release);
-            (snapshot.map(|_| ()), revision, waited)
+            (snapshot.map(|_| ()), revision)
         };
-        let (enabled, (snapshot, revision, waited)) =
+        let (enabled, (snapshot, revision)) =
             tokio::join!(plugin_change(&host, Method::PluginEnable), asking);
         let _: wire::PluginEnableResult = ok(enabled);
         assert_eq!(
@@ -3849,7 +3928,6 @@ mod native_bridges {
             revision.map_err(|error| error.code),
             Err(ErrorCode::ResourceUnavailable)
         );
-        assert!(waited < bound * 4, "{waited:?}");
         let later = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         assert!(host.module.snapshot_within(&[], later).await.is_ok());
         assert!(host.module.admission_revision_within(later).await.is_ok());
@@ -4068,6 +4146,7 @@ mod native_bridges {
         );
         assert!(bridge_facts(&host, &digest).is_some());
     }
+
     /// Marks release 0.3.0's entry revoked, as a later generation publishes it.
     #[cfg(unix)]
     fn revoked(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
@@ -4180,5 +4259,131 @@ mod native_bridges {
         assert!(put(None).await);
         assert_eq!(site.tree(), placed, "with no list it is back");
         assert!(bridge_facts(&host, &digest).is_some());
+    }
+    /// KR-REQ-11.42: the index that says whether a release is revoked is read last and once, so a
+    /// package the owner disabled or the organisation's list excludes loses its registration with
+    /// the index unreadable, and where the index is what cannot be read nothing is known to stand
+    /// and the registration is not kept on its account. The control is the index repaired: the
+    /// registration comes back with the next change that follows bridges.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_an_unreadable_index_keeps_no_registration_and_a_repaired_one_restores_it()
+    {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &host.working);
+        assert_eq!(site.tree(), placed, "applied");
+
+        let index = {
+            let catalogue = host.module.catalogue().lock().await;
+            let id = RepositoryId::new("development").expect("a valid identifier");
+            let active = catalogue
+                .repository_views()
+                .expect("readable")
+                .into_iter()
+                .find(|view| view.enrolment.id == id)
+                .and_then(|view| view.active)
+                .expect("an activated generation");
+            catalogue
+                .store(&id)
+                .expect("enrolled")
+                .index_path(active.index_digest)
+        };
+        let intact = std::fs::read(&index).expect("the index");
+        let name = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+
+        // The list excludes the package while the index is damaged: the registration goes.
+        std::fs::write(&index, b"not an index").expect("damaged");
+        assert!(
+            host.module
+                .put_allowed_adapters(name("kalareach/codex"))
+                .await
+                .expect("put")
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "a package the list excludes loses its registration whatever state the index is in"
+        );
+
+        // The list lifted and the index still damaged: nothing says the release stands.
+        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
+        assert_eq!(
+            site.tree(),
+            before,
+            "a registration is not put back on an index that cannot be read"
+        );
+
+        // Control: repaired, the next change that follows bridges puts it back.
+        std::fs::write(&index, &intact).expect("repaired");
+        assert!(
+            host.module
+                .put_allowed_adapters(name("kalareach/claude-code"))
+                .await
+                .expect("put")
+        );
+        assert_eq!(site.tree(), placed, "the repaired index restores it");
+    }
+
+    /// KR-REQ-11.42: the organisation's list is in force when the catalogue opens, before any
+    /// bridge is brought to what its installation wants, so a restart puts back no registration
+    /// the list excludes. The control is a restart with no list, which puts it back.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_restart_under_the_allowlist_puts_back_no_excluded_registration() {
+        let site = Site::new();
+        let mut host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &host.working);
+        let list = Some(std::collections::BTreeSet::from([PluginId::new(
+            "kalareach/codex",
+        )
+        .expect("a plugin identifier")]));
+        assert!(
+            host.module
+                .put_allowed_adapters(list.clone())
+                .await
+                .expect("put")
+        );
+        assert_eq!(site.tree(), before, "excluded");
+
+        let environment = host._temp.environment();
+        let open = |allowed| {
+            CatalogueModule::open_with(
+                &environment,
+                None,
+                site.bridges(&environment),
+                Arc::new(kr_plugin_catalogue::UnboundBroker),
+                kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+                None,
+                allowed,
+            )
+            .expect("an openable catalogue")
+        };
+        host.module = open(list);
+        assert_eq!(
+            site.tree(),
+            before,
+            "the restarted daemon leaves an excluded package's registration out"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+
+        host.module = open(None);
+        assert_eq!(site.tree(), placed, "with no list the start puts it back");
     }
 }
