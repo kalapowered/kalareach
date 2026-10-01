@@ -387,11 +387,118 @@ function request(overrides: Partial<ConfirmationRequest> = {}): ConfirmationRequ
     title: 'Add a device',
     detail: 'Confirm adding Pixel 8 (Android) to studio, which may view sessions for 60 minutes.',
     value: 'f3c1 46fd',
+    facts: [],
+    notice: null,
+    statement: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true,
     ...overrides
   }
 }
+
+const NOTICE =
+  "This package installs a native bridge: code in the application's own directory that runs with the application's permissions, outside the plugin sandbox. The publisher's own statement of what it does follows."
+
+describe("the owner's confirmation of a repository and of an installation", () => {
+  it('lists what the confirmation covers, one fact to a line, with addresses and hashes set apart', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Trust a plugin repository',
+            detail: 'Trust the plugin repository community on studio, served from repo.example.',
+            value: null,
+            facts: [
+              { label: 'Name', value: 'community', code: false },
+              { label: 'Metadata at', value: 'https://repo.example/metadata/', code: true },
+              { label: 'Root', value: '1a2b3c4d 1a2b3c4d', code: true }
+            ]
+          })
+        ]
+      })
+    })
+    const facts = await screen.findByTestId('confirmation-facts')
+    const labels = within(facts)
+      .getAllByRole('term')
+      .map((term) => term.textContent)
+    expect(labels).toEqual(['Name', 'Metadata at', 'Root'])
+    expect(within(facts).getByText('community').tagName).toBe('DD')
+    expect(within(facts).getByText('https://repo.example/metadata/').tagName).toBe('DD')
+    expect(
+      within(facts).getByText('https://repo.example/metadata/').getAttribute('data-code')
+    ).toBe('true')
+    expect(within(facts).getByText('community').getAttribute('data-code')).toBeNull()
+    expect(screen.queryByTestId('confirmation-notice')).toBeNull()
+    expect(screen.queryByTestId('confirmation-statement')).toBeNull()
+    // The button is where it is for every request.
+    expect(screen.getByTestId('confirm-request').textContent).toBe('Confirm with Touch ID')
+  })
+
+  it("quotes the publisher's own words apart from this host's notice about a native bridge", async () => {
+    const { controls } = start({ view: 'attention' })
+    const words = 'Adds one registration file in the application’s directory, which it starts.'
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Install a plugin',
+            detail: 'Install kalareach/claude-code 0.3.0 from community on studio.',
+            value: null,
+            facts: [{ label: 'Plugin', value: 'kalareach/claude-code 0.3.0', code: true }],
+            notice: NOTICE,
+            statement: words
+          })
+        ]
+      })
+    })
+    const notice = await screen.findByTestId('confirmation-notice')
+    const statement = screen.getByTestId('confirmation-statement')
+    expect(notice.textContent).toBe(NOTICE)
+    expect(within(statement).getByText('The publisher says')).toBeInTheDocument()
+    expect(within(statement).getByText(words).tagName).toBe('BLOCKQUOTE')
+    expect(notice.contains(statement)).toBe(false)
+    expect(statement.contains(notice)).toBe(false)
+    expect(notice.textContent).not.toContain(words)
+    // The host's own words come before the publisher's, which the host's notice says follow.
+    expect(
+      notice.compareDocumentPosition(statement) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
+  it('shows no statement for an installation whose release says nothing of a bridge', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Install a plugin',
+            value: null,
+            facts: [{ label: 'Plugin', value: 'kalareach/example 0.1.0', code: true }]
+          })
+        ]
+      })
+    })
+    expect(await screen.findByTestId('confirmation-facts')).toBeInTheDocument()
+    expect(screen.queryByTestId('confirmation-notice')).toBeNull()
+    expect(screen.queryByTestId('confirmation-statement')).toBeNull()
+  })
+
+  it('shows none of it for a request that could not be checked', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [request({ checkable: false, detail: null, value: null })]
+      })
+    })
+    expect(await screen.findByTestId('cannot-check')).toBeInTheDocument()
+    expect(screen.queryByTestId('confirmation-facts')).toBeNull()
+  })
+})
 
 describe("the owner's confirmations", () => {
   it('heads Attention, with a button named for this computer’s ceremony', async () => {

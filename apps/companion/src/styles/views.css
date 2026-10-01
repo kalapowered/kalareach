@@ -1294,6 +1294,68 @@
   color: var(--warning);
 }
 
+/*
+ * What a confirmation covers, one fact to a line. A label sits above its value on a narrow screen
+ * and beside it on a wide one. Addresses, hashes and identifiers are set in the monospace face and
+ * break anywhere, so a 64-character hash never widens the row; every value stays selectable.
+ */
+.confirmation-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  margin: var(--gap-2) 0 0;
+}
+
+.confirmation-fact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.confirmation-fact dt {
+  margin: 0;
+}
+
+.confirmation-fact dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.confirmation-fact dd[data-code='true'] {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.5;
+}
+
+@media (min-width: 30rem) {
+  .confirmation-fact {
+    grid-template-columns: 11rem minmax(0, 1fr);
+    column-gap: var(--gap-3);
+  }
+}
+
+/* The host's notice is its own sentence. The publisher's words come after it, quoted, with the
+   attribution above them: a rule beside the quote marks them as another party's. */
+.confirmation-notice {
+  margin: var(--gap-2) 0 0;
+}
+
+.confirmation-statement {
+  margin: var(--gap-2) 0 0;
+}
+
+.confirmation-statement figcaption {
+  margin-bottom: var(--gap-1);
+}
+
+.confirmation-statement blockquote {
+  margin: 0;
+  padding-left: var(--gap-3);
+  border-left: 2px solid var(--warning-line);
+  user-select: text;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .verification-value {
     transform: none;
