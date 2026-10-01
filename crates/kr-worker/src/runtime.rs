@@ -1391,9 +1391,9 @@ fn qualification_answer(
 
     let choices = match refused.reason {
         QualificationReason::ModuleTreeUnsupported => {
-            "rebuild the module for this reader, load the module that provides the name before \
-             it, stop loading it in KalaReach sessions, or create the session with \
-             --shell-mode native_compat"
+            "rebuild the module for this reader, stop loading it in KalaReach sessions, or create \
+             the session with --shell-mode native_compat; where a name is missing, load the module \
+             that provides it before this one"
         }
         _ => {
             "use a shell package this build qualifies, or create the session with --shell-mode native_compat"

@@ -5016,8 +5016,8 @@ async fn a_module_the_editor_cannot_bind_ends_the_create_with_the_named_error() 
         error.message,
         "module_tree_unsupported: module kr_user imports zle_abi_newer_entry, which neither this \
          reader (zle-5.9) nor anything else the shell holds provides; rebuild the module for this \
-         reader, load the module that provides the name before it, stop loading it in KalaReach \
-         sessions, or create the session with --shell-mode native_compat"
+         reader, stop loading it in KalaReach sessions, or create the session with --shell-mode \
+         native_compat; where a name is missing, load the module that provides it before this one"
     );
     // The session that was being created is closed, and it was never ready.
     tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
