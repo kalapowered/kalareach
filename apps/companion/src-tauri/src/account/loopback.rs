@@ -224,6 +224,10 @@ fn escape(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// How long a closed listener is given to end the connections it never accepted before the
+    /// test calls it open: a bound on a wait that ends as soon as the listener is closed.
+    const CLOSED_WITHIN: Duration = Duration::from_secs(30);
+
     /// The production address is the registered redirect's host and port.
     #[test]
     fn the_listener_binds_the_registered_redirects_address() {
@@ -332,10 +336,25 @@ mod tests {
         assert!(page.contains("referrer-policy: no-referrer"));
         assert!(!page.contains("<script"));
         assert!(!page.contains("href"));
+        // A connection the listener took in and nothing has accepted is reset when the listener
+        // closes, so its end is what shows the listener closed. Dialling the address afterwards
+        // would show nothing of it: a program that took the freed port would answer.
+        let mut waiting = TcpStream::connect(address).await.expect("a connection");
         drop(listener);
+        let mut byte = [0_u8; 1];
+        let ended = tokio::time::timeout(CLOSED_WITHIN, waiting.read(&mut byte))
+            .await
+            .expect("the listener is closed once the attempt is over");
+        let reset = match &ended {
+            Ok(read) => *read == 0,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+        };
         assert!(
-            TcpStream::connect(address).await.is_err(),
-            "the listener is closed once the attempt is over"
+            reset,
+            "the connection the listener never accepted ends with it: {ended:?}"
         );
     }
 
