@@ -689,6 +689,12 @@ pub fn plan(path: &Path, body: &str, placement: &Placement) -> std::io::Result<C
 
 /// Returns what installing `body` into a file with these contents does, and the contents it leaves.
 fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result<(Change, String)> {
+    // A signed profile is never changed: what PowerShell reads as a signature, and where one leaves
+    // the text it signs, are PowerShell's own rules. The words are looked for in the file as it was
+    // read, before this placement's entry is cut out of it, because that cut can hold the block.
+    if placement.shell().is_some() && holds_signature_words(existing) {
+        return Err(cannot_take_the_entry(SIGNED));
+    }
     let (begin, end) = placement.markers();
     let stripped = strip(existing, begin, end);
     let had_entry = stripped.is_some();
@@ -785,22 +791,15 @@ fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
 /// The question both scripts ask first about a profile's text: whether an entry can be added to it
 /// at all.
 ///
-/// A profile the entry would damage is refused by name and left as it is: one that is signed, or
-/// whose line ends cannot be told from each other. A profile that begins with a second byte-order
-/// mark is refused before either script is asked, by [`second_mark`], because reading a file takes
-/// one mark off it and the question could not see the second.
-///
-/// A signed profile is never changed, and one that already holds an entry is not an exception: what
-/// PowerShell reads as a signature, and where a signature leaves the text it signs, are PowerShell's
-/// own rules, and a profile whose signature the host mistook would be written into and broken. The
-/// words are found in any case and anywhere in the text, so a profile that only mentions them is
-/// refused too, which costs a person nothing: nothing was going to be written to a profile that
-/// asks for a signature, and the entries it holds stay.
+/// A profile whose line ends cannot be told from each other is refused by name and left as it is. A
+/// profile that begins with a second byte-order mark is refused before either script is asked, by
+/// [`second_mark`], because reading a file takes one mark off it and the question could not see the
+/// second. A signed profile is refused before either script is asked too, by
+/// [`holds_signature_words`], from the file as it was read.
 macro_rules! unsafe_profile {
     () => {
         "function Unsafe($text) { \
             if ($text -match \"`r(?!`n)\") { return 'it has a line end that is a carriage return alone' }; \
-            if ($text.IndexOf('# SIG # Begin signature block', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'it is signed, and any change to it breaks its signature' }; \
             $null \
         }; "
     };
@@ -814,6 +813,22 @@ macro_rules! unsafe_profile {
 fn second_mark(text: &str) -> bool {
     text.strip_prefix('\u{feff}')
         .is_some_and(|rest| rest.starts_with('\u{feff}'))
+}
+
+/// Why a signed profile is refused.
+const SIGNED: &str = "it is signed, and any change to it breaks its signature";
+
+/// What begins the signature block that a PowerShell signer adds to a script.
+const SIGNATURE_BEGIN: &[u8] = b"# SIG # Begin signature block";
+
+/// Whether a profile's text holds the words that begin a signature block, in any case.
+///
+/// A profile that holds them is taken for signed wherever they are, so one that only mentions them
+/// in a string is refused too.
+fn holds_signature_words(text: &str) -> bool {
+    text.as_bytes()
+        .windows(SIGNATURE_BEGIN.len())
+        .any(|window| window.eq_ignore_ascii_case(SIGNATURE_BEGIN))
 }
 
 /// The refusal of a profile an entry cannot be put into, with its reason.
@@ -3047,6 +3062,7 @@ mod tests {
     }
 
     /// What a PowerShell signer adds to a script: a line end of its own, then the signature block.
+    #[cfg(unix)]
     const SIGNER_BLOCK: &str =
         "\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n";
 
@@ -3058,8 +3074,8 @@ mod tests {
     /// placed before the block) is a way of writing into a profile whose signature the host
     /// mistook. So the rule is the simplest one: a profile that holds the words of a signature block,
     /// in any case, is refused, with the entries it already holds in it, with an entry in the wrong
-    /// place, and with the words in a string; nothing is written, and a dry run says what a real run
-    /// does.
+    /// place, with the words in a string, and with the words inside the lines of the entry an install
+    /// would replace; nothing is written, and a dry run says what a real run does.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
@@ -3079,6 +3095,30 @@ mod tests {
         )
         .expect("text");
         let both = format!("using namespace System\n{load}$x = 1\n{check}");
+        // A profile put to install and to a dry run is refused by name, and is as it was.
+        let refused_and_untouched =
+            |name: &str, theirs: &str, placement: &Placement, body: &str| {
+                let path = root
+                    .path()
+                    .join(format!("{}.ps1", name.replace([' ', '\''], "-")));
+                std::fs::write(&path, theirs).expect("writes");
+                let refused = install(&path, body, placement)
+                    .expect_err(&format!("{name}: a signed profile was written to"));
+                assert!(
+                    refused.to_string().contains("it is signed")
+                        && refused.to_string().contains("nothing was written"),
+                    "{name}: the refusal names the signature: {refused}"
+                );
+                assert!(
+                    plan(&path, body, placement).is_err(),
+                    "{name}: a dry run says what a real one does"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("reads"),
+                    theirs,
+                    "{name}: the profile was touched"
+                );
+            };
         for (name, theirs) in [
             (
                 "signed with no entry",
@@ -3117,31 +3157,63 @@ mod tests {
                 format!("function Get-Later {{\n'x'\n{check}{SIGNER_BLOCK}}}\n"),
             ),
         ] {
-            let path = root
-                .path()
-                .join(format!("{}.ps1", name.replace([' ', '\''], "-")));
-            std::fs::write(&path, &theirs).expect("writes");
             for (placement, body) in [(&first, &load), (&last, &check)] {
-                let refused = install(&path, body, placement)
-                    .expect_err(&format!("{name}: a signed profile was written to"));
-                assert!(
-                    refused.to_string().contains("it is signed")
-                        && refused.to_string().contains("nothing was written"),
-                    "{name}: the refusal names the signature: {refused}"
-                );
-                assert!(
-                    plan(&path, body, placement).is_err(),
-                    "{name}: a dry run says what a real one does"
-                );
+                refused_and_untouched(name, &theirs, placement, body);
             }
-            assert_eq!(
-                std::fs::read_to_string(&path).expect("reads"),
-                theirs,
-                "{name}: the profile was touched"
-            );
         }
-        // The control: the same profiles without the words take their entries, so it is the
-        // signature that refuses and nothing else about them.
+        // The words are looked for in the file as it was read, and not in what is left of it when the
+        // entry an install replaces is cut out: an entry's own lines can hold the block, and a begin
+        // line with no end line takes the block and the text before it into the cut.
+        for (name, theirs, placement, body) in [
+            (
+                "the words inside the entry that opens the bridge",
+                format!("$x = 1\n{MARKER_BEGIN}\n{SIGNER_BLOCK}{MARKER_END}\n"),
+                &first,
+                &load,
+            ),
+            (
+                "the words inside the entry that checks the reader",
+                format!("$x = 1\n{CHECK_MARKER_BEGIN}\n{SIGNER_BLOCK}{CHECK_MARKER_END}\n"),
+                &last,
+                &check,
+            ),
+            (
+                "a begin line of the entry that opens the bridge, the block, and a whole entry",
+                format!("$x = 1\n{MARKER_BEGIN}\n$y = 2{SIGNER_BLOCK}{load}"),
+                &first,
+                &load,
+            ),
+            (
+                "a begin line of the entry that checks the reader, the block, and a whole entry",
+                format!("$x = 1\n{CHECK_MARKER_BEGIN}\n$y = 2{SIGNER_BLOCK}{check}"),
+                &last,
+                &check,
+            ),
+        ] {
+            refused_and_untouched(name, &theirs, placement, body);
+        }
+        // The controls: the lines of an entry that hold no signature are replaced like any entry, and
+        // an ordinary profile takes both entries, so what refuses the files above is the words.
+        let path = root.path().join("replaced-load.ps1");
+        std::fs::write(
+            &path,
+            format!("$x = 1\n{MARKER_BEGIN}\nGet-Date\n{MARKER_END}\n"),
+        )
+        .expect("writes");
+        assert_eq!(
+            install(&path, &load, &first).expect("replaces"),
+            Change::Replaced
+        );
+        let path = root.path().join("replaced-check.ps1");
+        std::fs::write(
+            &path,
+            format!("$x = 1\n{CHECK_MARKER_BEGIN}\nGet-Date\n{CHECK_MARKER_END}\n"),
+        )
+        .expect("writes");
+        assert_eq!(
+            install(&path, &check, &last).expect("replaces"),
+            Change::Replaced
+        );
         let path = root.path().join("unsigned.ps1");
         std::fs::write(&path, "using namespace System\n$x = 1\n").expect("writes");
         assert_eq!(
