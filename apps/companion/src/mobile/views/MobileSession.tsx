@@ -264,21 +264,20 @@ export function MobileSession({
    *
    * The field's last render is not the newest draft: a rebind the host's answer set off may have
    * bound it since, and writing the render's copy back would undo that. The text is the person's,
-   * and everything else is whatever the store holds.
+   * and everything else is whatever the store holds, seen against the conversation the agent is in
+   * now, as the field sees it: an empty draft goes with that conversation, and one that holds text
+   * for another is conflicted.
    */
   const typeInto = useCallback(
     (text: string) => {
       lifecycle.setDrafts((drafts) => {
         const stored = drafts.find((each) => each.draftId === draft.draftId)
-        const base =
-          stored === undefined
-            ? draft
-            : { ...stored, state: stored.state === 'bound' && draft.state === 'conflicted' ? draft.state : stored.state }
+        const base = stored === undefined ? draft : againstCurrent(stored, currentTarget)
         const next = edit(base, text, Date.now())
         return [...drafts.filter((each) => each.draftId !== draft.draftId), next]
       })
     },
-    [lifecycle, draft]
+    [lifecycle, draft, currentTarget]
   )
 
   /** Changes the files on this session's draft, whatever else changed it meanwhile. */

@@ -162,9 +162,9 @@ then offered its rebind. Two rules keep the rest honest.
 **The draft is durable and the association is not.** A draft is this device's own record with its
 own identity and revision. The attachment that presents it in an editor belongs to the connection,
 so losing the connection removes the binding and leaves the draft exactly as it was. Coming back
-offers a rebind, and only the same authorised device against an unchanged target gets one: a
-changed application or binding revision is a conflict the person resolves, and a session that has
-gone orphans the draft. Nothing is ever submitted automatically.
+offers a rebind, and only an unchanged target gets one, or an empty draft, which goes with the
+current conversation: a changed application or binding revision is a conflict the person
+resolves, and a session that has gone orphans the draft. Nothing is ever submitted automatically.
 
 Note that contact starting here means that contact has started with a host, and not merely that the
 connection has changed. Any time the application comes to the front, even if it never lost
