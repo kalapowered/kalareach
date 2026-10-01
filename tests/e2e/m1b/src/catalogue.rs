@@ -169,7 +169,7 @@ pub async fn enrol(
                     full_offline_mirror: false,
                 },
                 ceiling: Vec::new(),
-                owner_confirmation: proof,
+                owner_confirmation: kr_protocol::scalars::Nullable::some(proof),
             },
         )
         .await
