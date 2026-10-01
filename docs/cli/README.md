@@ -915,10 +915,11 @@ not a letter or a digit, between a lower-case letter or a digit and a capital, a
 capital of a run of capitals that a lower-case letter follows) is the word pass, auth,
 authorization, key or cookie. `PWD` would not be redacted but `tokenizer` would be. The value after
 a name that says credential is read as a shell reads a word, so a quoted string, or a word made of
-quoted and unquoted parts such as `abc"d e"`, is the credential value, as is the rest of an
-assignment that is itself inside quotes, such as `"PASSWORD=two words"`. If the quote is not closed
-the entire field will be withheld and its length reported, and so is a field with a credential name
-in it and a quote left open at its end, such as an apostrophe in a path.
+quoted and unquoted parts such as `abc"d e"`, is the credential value, as is everything up to the
+quote that closes the argument, when the assignment sits in a quoted argument, such as
+`"PASSWORD=two words"` or the script of `sh -c`. If the quote is not closed the entire field will be
+withheld and its length reported, and so is a field with a credential name and its value in it and a
+quote left open at its end, such as an apostrophe in a path.
 
 A filter is not a guarantee that no secret remains, and this one cannot tell a secret from other
 text by its value. It does not filter positional secrets, plain path components, values to `-p` and
