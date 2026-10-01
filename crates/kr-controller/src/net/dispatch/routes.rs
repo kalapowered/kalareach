@@ -232,7 +232,9 @@ impl RemoteConnection {
             | ControlFrame::AttentionBarrier(_)
             | ControlFrame::AttentionBarrierAcknowledged(_)
             | ControlFrame::PrivacyGeneration(_)
-            | ControlFrame::PrivacyGenerationAck(_) => return None,
+            | ControlFrame::PrivacyGenerationAck(_)
+            | ControlFrame::DescriptionFacts(_)
+            | ControlFrame::DescriptionFactsPage(_) => return None,
         };
         Some(Answered { frame, asked })
     }

@@ -268,6 +268,12 @@ pub struct Session {
     /// enabled comes back after it, and a host that had forgotten which generation was in force
     /// could not tell that answer from one it had asked for.
     privacy: crate::privacy::PrivacyMode,
+    /// What this session was doing, as the control daemon's descriptions read it.
+    ///
+    /// Recorded into from the places this session decides something happened, and nothing a
+    /// keystroke, a resize or a terminal query reaches. Privacy mode stops it and clears it with
+    /// the other subsystems' fences.
+    description_facts: crate::description_facts::DescriptionFacts,
     /// The durability condition this session publishes.
     ///
     /// It is the journal's own seam when there is a journal, and a seam of this session's own,
@@ -603,6 +609,12 @@ impl Session {
         if privacy.is_enabled() || unresolved {
             history.stop_retaining();
         }
+        // The same reading decides whether facts are captured: a session that cannot say privacy
+        // mode is off captures none.
+        let description_facts = crate::description_facts::DescriptionFacts::new(
+            privacy.is_enabled() || unresolved,
+            privacy.generation(),
+        );
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -615,6 +627,7 @@ impl Session {
             hub: OutputHub::new(),
             journal,
             privacy,
+            description_facts,
             privacy_cleanup: if unresolved {
                 PrivacyCleanup::unresolved(
                     "this host cannot read whether privacy mode is on for this session, so it \
@@ -1044,6 +1057,9 @@ impl Session {
     /// it ends. The second replaces the first rather than joining it, so a reader sees one entry
     /// per command.
     fn record_command_block(&mut self, block: kr_protocol::root::RootCommandBlockParams) {
+        // The place a command's directory, program and ending are decided, and the first thing
+        // done with it: the description facts take the program name and never the command line.
+        self.description_facts.note_command(&block);
         if let Some(existing) = self
             .command_blocks
             .iter_mut()
@@ -1056,6 +1072,12 @@ impl Session {
             self.command_blocks.pop_front();
         }
         self.command_blocks.push_back(block);
+    }
+
+    /// Returns what this session was doing, as the control daemon's descriptions read it.
+    #[must_use]
+    pub fn description_facts(&self) -> crate::description_facts::DescriptionFacts {
+        self.description_facts.clone()
     }
 
     /// Returns the most recent command block the private hooks reported.
@@ -3844,8 +3866,10 @@ impl Session {
         let pending = 0;
         let mut history = crate::privacy::RetainedHistory::over(&mut self.history);
         let mut receipts = crate::privacy::ReceiptMetadata::over(self.journal.as_mut(), pending);
+        let mut facts =
+            crate::description_facts::DescriptionFactsPrivacy::over(self.description_facts.clone());
         let mut subsystems: Vec<&mut dyn crate::privacy::PrivacySubsystem> =
-            vec![&mut history, &mut receipts];
+            vec![&mut history, &mut receipts, &mut facts];
         for subsystem in extra.iter_mut() {
             subsystems.push(&mut **subsystem);
         }
@@ -3953,6 +3977,9 @@ impl Session {
         }
         self.privacy = privacy;
         self.history.resume_retaining();
+        // Capture starts again from this moment, into a record of its own: nothing from before is
+        // brought back.
+        self.description_facts.release(generation);
         Ok(resumed)
     }
 

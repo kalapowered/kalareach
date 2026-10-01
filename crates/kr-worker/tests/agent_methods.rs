@@ -1498,6 +1498,66 @@ fn kr_req_11_22_one_admission_carries_every_check_and_the_transport_it_will_use(
     assert_eq!(stale.code(), ErrorCode::StaleSession);
 }
 
+/// A prompt the worker admits for submission is the session's intent, as its description facts
+/// record it, clipped; a prompt that is refused at the admission, and one that names a draft
+/// instead of carrying text, record none.
+#[test]
+fn a_prompt_the_worker_admits_is_the_sessions_intent_and_a_refused_one_is_not() {
+    let broker = agent_broker_with(std::sync::Arc::new(RecordingUpstream::default()));
+    let facts = kr_worker::description_facts::DescriptionFacts::new(
+        false,
+        kr_worker::privacy::PrivacyGeneration::new(0),
+    );
+    broker.set_description_facts(facts.clone());
+    let intent = || {
+        facts
+            .read(0, Some(0))
+            .facts
+            .and_then(|facts| facts.intent.0)
+    };
+    let text = |text: &str| AgentPromptParams {
+        target: target(1),
+        draft_id: Nullable::null(),
+        text: Nullable::some(PromptText::new(text).expect("valid")),
+    };
+
+    // A prompt that is refused changes nothing: the instance is suspended.
+    broker
+        .suspend_rich_mutations(instance(), "a native selection could not be observed")
+        .expect("suspended");
+    broker
+        .admit_prompt(
+            &caller(),
+            &text("never admitted"),
+            false,
+            TimestampMs::new(2),
+        )
+        .expect_err("a suspended instance admits nothing");
+    assert_eq!(intent(), None);
+    broker.resume_rich_mutations(instance()).expect("resumed");
+
+    broker
+        .admit_prompt(
+            &caller(),
+            &text(&format!("check the pairing flow {}", "x".repeat(300))),
+            false,
+            TimestampMs::new(3),
+        )
+        .expect("the prompt is admitted");
+    let recorded = intent().expect("the admitted prompt is the intent");
+    assert!(recorded.starts_with("check the pairing flow"));
+    assert_eq!(recorded.chars().count(), 120, "clipped to the fact bound");
+
+    // A draft names no text, so there is nothing to record and the intent stands.
+    let draft = AgentPromptParams {
+        target: target(1),
+        draft_id: Nullable::some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+        text: Nullable::null(),
+    };
+    let _ = broker.admit_prompt(&caller(), &draft, false, TimestampMs::new(4));
+    assert_eq!(intent().as_deref(), Some(recorded.as_str()));
+}
+
 /// KR-REQ-11.31: a dispatch is refused by the component answerable for it, not by the set of
 /// components the instance happens to have.
 ///

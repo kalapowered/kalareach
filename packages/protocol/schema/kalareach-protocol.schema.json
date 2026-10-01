@@ -8851,6 +8851,32 @@
             "privacy_generation_ack"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's request for one session's description facts, on its descriptions\nconnection to the worker.",
+          "properties": {
+            "description_facts": {
+              "$ref": "#/$defs/DescriptionFactsRequest"
+            }
+          },
+          "required": [
+            "description_facts"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's answer: the session's facts, or none, with the privacy state they were\ncaptured under.",
+          "properties": {
+            "description_facts_page": {
+              "$ref": "#/$defs/DescriptionFactsPage"
+            }
+          },
+          "required": [
+            "description_facts_page"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -8870,6 +8896,11 @@
         {
           "const": "attention",
           "description": "The connection the daemon reads this session's attention sources over.\n\nIt carries the attention source and text requests and nothing else. A newer one replaces\nit, and a replacement generation fences it along with the authority itself.",
+          "type": "string"
+        },
+        {
+          "const": "descriptions",
+          "description": "The connection the daemon reads this session's description facts over.\n\nIt carries the description facts request and nothing else, and holds one of them at a\ntime. A newer one replaces it, and a replacement generation fences it along with the\nauthority itself.",
           "type": "string"
         }
       ]

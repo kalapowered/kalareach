@@ -1090,7 +1090,10 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::AttentionBarrierAcknowledged(_)
         // The control daemon's privacy notice to a worker and the worker's answer.
         | ControlFrame::PrivacyGeneration(_)
-        | ControlFrame::PrivacyGenerationAck(_) => return false,
+        | ControlFrame::PrivacyGenerationAck(_)
+        // The control daemon's request for a session's description facts, and the worker's page.
+        | ControlFrame::DescriptionFacts(_)
+        | ControlFrame::DescriptionFactsPage(_) => return false,
     }
     true
 }
