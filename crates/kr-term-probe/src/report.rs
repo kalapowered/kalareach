@@ -10,7 +10,8 @@ pub struct Report {
     /// The record's format.
     pub probe: &'static str,
     /// What the launcher read about the terminal outside its own answers: the application, its
-    /// version and its configuration, exactly as the launcher recorded them.
+    /// version and its configuration, with what identifies the account taken out by
+    /// [`keep_private`].
     pub launcher: serde_json::Value,
     /// The terminal's own answers about itself.
     pub terminal: Identity,
@@ -90,7 +91,11 @@ pub fn keep_private(mut launcher: serde_json::Value, home: Option<&str>) -> serd
             }
         }
     }
-    if let Some(home) = home.filter(|home| home.len() > 1) {
+    // A trailing slash does not make another directory, so it is not part of the name matched.
+    if let Some(home) = home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|home| home.len() > 1)
+    {
         write_home_as_tilde(&mut launcher, home);
     }
     launcher
