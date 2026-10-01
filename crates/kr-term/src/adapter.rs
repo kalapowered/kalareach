@@ -49,7 +49,10 @@ impl AdaptContext {
     ///
     /// A cursor movement, an insertion or a scroll cannot do more than fill the screen, so a larger
     /// value asks for work with no effect. A repeat can wrap and scroll, so it is bounded by the
-    /// whole grid instead of one dimension. Everything else keeps the general bound.
+    /// whole grid instead of one dimension. Everything else keeps the general bound, which includes
+    /// the absolute columns (`G`, `` ` `` and the column of `H` and `f`): they cost no work however
+    /// large they are, and the adapter holds them to the last column for the
+    /// grid, as a terminal does for itself, so a sequence that names one is still forwarded.
     ///
     /// Only counts and coordinates are bounded here. A parameter that selects which operation to
     /// perform, as the erase and tab-clear sequences use, means something different at every value:
@@ -59,8 +62,8 @@ impl AdaptContext {
     pub fn limit_for(self, final_byte: u8) -> i64 {
         let dimension = i64::from(self.rows.max(self.cols)).max(1);
         match final_byte {
-            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'I' | b'L' | b'M' | b'P'
-            | b'S' | b'T' | b'X' | b'Z' | b'`' | b'a' | b'd' | b'e' => dimension,
+            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'I' | b'L' | b'M' | b'P' | b'S'
+            | b'T' | b'X' | b'Z' | b'a' | b'd' | b'e' => dimension,
             b'b' => i64::from(self.rows).max(1) * i64::from(self.cols).max(1),
             _ => MAX_CSI_PARAM,
         }
@@ -348,10 +351,12 @@ fn action_is_unrecognised(action: &Action) -> bool {
 /// character would then be placed beyond the row's end and a cursor report would name a column
 /// the grid does not have. Only the grid sees the held value. A terminal given the original bytes
 /// stops on the last column the same way, so the sequence is not counted as clamped and its bytes
-/// are still forwarded.
+/// are still forwarded; a column too large for any terminal to read the same way is bounded, and
+/// withheld, by the general parameter bound before this runs.
 ///
 /// The column is the second field of a cursor position (`H`, `f`) and the first of a column
-/// position (`G`, `` ` ``).
+/// position (`G`). The library already stops a horizontal position (`` ` ``) on the last column,
+/// and it is held here as well so that the one rule covers every absolute column.
 fn keep_the_column_on_the_grid(params: &mut [VtCsiParam], final_byte: u8, cols: u32) {
     let field = match final_byte {
         b'H' | b'f' => 1,
