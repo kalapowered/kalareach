@@ -25,7 +25,7 @@ use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
 use kr_worker::privacy::PrivacyGeneration;
 
-use stub::{Placed, Process, generate, load, wait_until_began};
+use stub::{Placed, Process, generate, load, wait_until_began, wait_until_started};
 use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
@@ -236,6 +236,67 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     ));
 }
 
+/// A cancellation that reaches work in hand is acknowledged before the work's own answer, for a
+/// load and for a job, every time: the control thread writes the acknowledgement before it
+/// cancels, under the lock the model thread takes to forget the work before it answers. The
+/// control is a cancellation that arrives after the answer, which is acknowledged by nothing.
+#[test]
+fn a_cancelled_load_and_job_are_acknowledged_before_they_answer() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("loading");
+    let script = Script {
+        load_until_cancelled: true,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    wait_until_began(&runtime, "load");
+    process.send(&Request::Cancel { id: U64::new(1) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(1) }
+    );
+    assert!(matches!(
+        process.expect_answer(SOON, "the cancelled load"),
+        Answer::LoadEnded { id, why: LoadEnd::Cancelled, .. } if id.get() == 1
+    ));
+
+    // The model looks at its token without pausing, so it answers the moment it is cancelled and
+    // the acknowledgement has to be written before that for the order to hold.
+    let runtime = placed.directory("deciding");
+    let script = Script {
+        generate_until_cancelled: true,
+        spin: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    for round in 0..20_u64 {
+        let id = 2 + round;
+        process.send(&generate(id, 1, 30_000));
+        process.send(&Request::Cancel { id: U64::new(id) });
+        // Either the job was already in the model's hands, which is acknowledged first, or the
+        // cancellation reached it before the model thread had taken it from the queue, which is
+        // answered cancelled with the acknowledgement still first.
+        assert_eq!(
+            process.expect_answer(SOON, "the acknowledgement"),
+            Answer::Cancelling { id: U64::new(id) },
+            "round {round}"
+        );
+        assert!(
+            matches!(
+                process.expect_answer(SOON, "the cancelled job"),
+                Answer::Ended { id: ended, why: JobEnd::Cancelled, .. } if ended.get() == id
+            ),
+            "round {round}"
+        );
+    }
+}
+
 /// The control thread says it has read a cancellation while the model thread is still inside the
 /// work and ignoring its token, and the work's own answer follows when the model stops. The
 /// control is a cancellation of work that has already answered, which is acknowledged by nothing.
@@ -243,8 +304,9 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
 fn a_cancellation_is_acknowledged_while_the_model_goes_on() {
     let placed = Placed::stub();
 
-    // A job whose model does not look at its token for as long as this test lasts: the answer
-    // cannot arrive before the acknowledgement, whatever the machine is doing.
+    // A job whose model does not look at its token for longer than this test needs: the process's
+    // own watchdog ends it once the job's deadline has passed, and the test has long finished with
+    // it by then. The acknowledgement is what the test reads; the job's answer is not due.
     let runtime = placed.directory("busy");
     let script = Script {
         ignore_token_ms: 60_000,
@@ -452,9 +514,12 @@ fn a_process_whose_control_thread_is_stuck_ends_itself() {
     let runtime = placed.directory("stuck");
     let script = Script {
         wedge_output_from: Some(1),
+        mark_start: true,
         ..Script::default()
     };
     let mut process = Process::start(&placed, &script, &runtime);
+    // The bound is counted from a process that is known to be running.
+    wait_until_started(&runtime);
     let asked = Instant::now();
     process.send(&Request::Hello {
         build: "kr-describe-tests/0".to_owned(),

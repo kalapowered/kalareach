@@ -17,7 +17,7 @@ use kr_describe::resource::{
     HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
 };
 use kr_describe::service::{
-    Answered, DescriptionService, HostPlacement, Instruction, Outcome, ProcessEnd,
+    Answered, DescriptionService, Handles, HostPlacement, Instruction, Outcome, ProcessEnd,
     RESTART_FIRST_MS, RESTART_MOST_MS, UnloadReason, Work,
 };
 use kr_describe::store::DescriptionStore;
@@ -1554,8 +1554,9 @@ fn without_the_files_nothing_loads_and_the_state_says_why() {
 }
 
 /// Three failures in a row, none followed by a publication, leave inference failed while the
-/// restart delay runs: a load that failed, a crash and a job that failed all count, and two do
-/// not. A description published ends it. The control is the state after two.
+/// restart delay runs: three jobs that failed here, and two do not. A description published starts
+/// the count again. The control is the state after two, and the fourth failure with no
+/// publication in between, which shows it at once.
 #[test]
 fn three_failures_in_a_row_leave_inference_failed_until_a_description_is_published() {
     let failed = |service: &DescriptionService| {
@@ -1604,7 +1605,8 @@ fn three_failures_in_a_row_leave_inference_failed_until_a_description_is_publish
     service.next(&roomy(), now).expect("the wait");
     assert!(failed(&service), "after three");
 
-    // The delay passes, a description is published, and it is over.
+    // The delay passes and a description is published: the count starts again, so one more
+    // failure does not show it, and neither do two; a third does.
     let (sent, id, request) = next_job(&mut service, now);
     now = sent;
     assert!(matches!(
@@ -1613,49 +1615,146 @@ fn three_failures_in_a_row_leave_inference_failed_until_a_description_is_publish
             .expect("the answer"),
         Outcome::Published { .. }
     ));
-    service.next(&roomy(), now).expect("an instruction");
-    assert!(!failed(&service), "a publication ended it");
+    for failures in 1..=3_u8 {
+        queue(&mut service, &session(10 + failures), "again", now);
+        let (sent, id, _) = next_job(&mut service, now);
+        now = sent;
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Failed,
+                    detail: None,
+                },
+                now,
+            )
+            .expect("the answer");
+        service.next(&roomy(), now).expect("the unload");
+        service.next(&roomy(), now).expect("the wait");
+        assert_eq!(
+            failed(&service),
+            failures == 3,
+            "{failures} failures after the publication"
+        );
+    }
 }
 
-/// A load the daemon had to end because the process did not stop it is no failure of inference:
-/// the next load may happen at once. The control is a process that ended by itself during a load,
-/// which is.
+/// The control for the count a publication starts again: with no publication between, the fourth
+/// failure in a row shows inference failed at once.
 #[test]
-fn a_load_the_daemon_ends_for_not_stopping_is_no_failure_of_inference() {
-    for (why, counts) in [
-        (ProcessEnd::CancelUnanswered, false),
-        (ProcessEnd::Exited, true),
+fn without_a_publication_the_fourth_failure_in_a_row_shows_inference_failed_at_once() {
+    let mut service = service();
+    let mut now = at(3_000);
+    for session_number in 1..=4_u8 {
+        queue(&mut service, &session(session_number), "kalareach", now);
+        let (sent, id, _) = next_job(&mut service, now);
+        now = sent;
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Failed,
+                    detail: None,
+                },
+                now,
+            )
+            .expect("the answer");
+        service.next(&roomy(), now).expect("the unload");
+        service.next(&roomy(), now).expect("the wait");
+    }
+    assert!(inference_failed(&service), "after four");
+}
+
+/// An end the daemon causes to stop work it called off is no failure of inference, and one that
+/// shows the process failing is: a load that was told to stop, said it had read it and did not stop
+/// is ended without a failure, and the next load waits a moment; a check of a file that ran past
+/// its deadline is no failure and delays nothing; a cancellation nothing acknowledged, and a
+/// process that ended by itself, are failures. Three ends of the first two kinds in a row leave
+/// inference not failed, where three of either of the others do.
+#[test]
+fn an_end_the_daemon_causes_to_stop_called_off_work_is_no_failure_of_inference() {
+    let failed = |service: &DescriptionService| {
+        matches!(
+            service.resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::InferenceFailed,
+                ..
+            }
+        )
+    };
+    // The end, whether a load was told to stop first, whether it is a failure of inference, and
+    // whether the next load is delayed by it.
+    for (why, load, failure, delayed) in [
+        (ProcessEnd::StopOverdue, true, false, true),
+        (ProcessEnd::CheckOverdue, false, false, false),
+        (ProcessEnd::CancelUnanswered, true, true, true),
+        (ProcessEnd::Exited, true, true, true),
     ] {
         let mut service = service();
         queue(&mut service, &session(1), "kalareach", at(0));
-        let Instruction::Load { id, .. } =
-            service.next(&roomy(), at(3_000)).expect("an instruction")
-        else {
-            panic!("a load comes first");
-        };
-        service.set_enabled(false);
-        assert_eq!(
-            service.next(&roomy(), at(3_100)).expect("an instruction"),
-            Instruction::Cancel {
-                id,
-                work: Work::Load
+        let mut now = at(3_000);
+        for round in 1..=3_u32 {
+            if load {
+                let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("a step")
+                else {
+                    panic!("{why:?}: a load comes first, round {round}");
+                };
+                service.set_enabled(false);
+                assert_eq!(
+                    service.next(&roomy(), now.after_ms(100)).expect("a step"),
+                    Instruction::Cancel {
+                        id,
+                        work: Work::Load
+                    }
+                );
             }
-        );
-        let outcomes = service.process_ended(why, at(3_200)).expect("the end");
-        assert!(
-            outcomes.contains(&Outcome::LoadEnded {
-                why: if counts {
-                    LoadEnd::Failed
-                } else {
-                    LoadEnd::Cancelled
-                },
-                detail: Some(format!("the description process ended: {}", why.as_str())),
-            }),
-            "{outcomes:?}"
-        );
-        assert_eq!(service.inference_restarts(), u64::from(counts), "{why:?}");
-        assert_eq!(service.restart_not_before_ms().is_some(), counts, "{why:?}");
-        assert!(!service.is_loading());
+            let ended = now.after_ms(200);
+            let outcomes = service.process_ended(why, ended).expect("the end");
+            if load {
+                assert!(
+                    outcomes.contains(&Outcome::LoadEnded {
+                        why: if why == ProcessEnd::Exited {
+                            LoadEnd::Failed
+                        } else {
+                            LoadEnd::Cancelled
+                        },
+                        detail: Some(format!("the description process ended: {}", why.as_str())),
+                    }),
+                    "{why:?}: {outcomes:?}"
+                );
+            }
+            assert!(!service.is_loading(), "{why:?}");
+            assert_eq!(
+                service.inference_restarts(),
+                u64::from(failure) * u64::from(round),
+                "{why:?}, round {round}"
+            );
+            if round == 1 {
+                assert_eq!(
+                    service.restart_not_before_ms(),
+                    delayed.then_some(ended.monotonic_ms() + RESTART_FIRST_MS),
+                    "{why:?}: the next load's delay"
+                );
+            }
+            service.set_enabled(true);
+            if load {
+                // Inside the delay nothing is loaded, and the state says whether inference failed.
+                assert!(
+                    matches!(
+                        service.next(&roomy(), ended.after_ms(1)).expect("a step"),
+                        Instruction::Wait { until_ms: Some(_) }
+                    ),
+                    "{why:?}, round {round}: the next load waits"
+                );
+            }
+            assert_eq!(
+                failed(&service),
+                failure && round == 3,
+                "{why:?}: inference_failed after {round}"
+            );
+            // Past the delay, whatever it was.
+            now = ended.after_ms(10 * 60 * 1_000);
+        }
     }
 }
 
@@ -1680,7 +1779,7 @@ impl kr_describe::service::PublicationGate for Gate {
 }
 
 /// A publication is written inside the gate the host holds it under, and not at all when the gate
-/// admits none: the description is not stored and the result is refused as a late generation. The
+/// admits none: the description is not stored and the result is refused as not admitted. The
 /// control is a service with no gate, which publishes.
 #[test]
 fn a_publication_is_written_inside_its_gate_and_refused_when_none_admits_it() {
@@ -1710,7 +1809,7 @@ fn a_publication_is_written_inside_its_gate_and_refused_when_none_admits_it() {
                     matches!(
                         outcome,
                         Outcome::Rejected {
-                            rejection: Rejection::LateGeneration { .. },
+                            rejection: Rejection::NotAdmitted { .. },
                             ..
                         }
                     ),
@@ -1757,4 +1856,359 @@ fn write_lock(root: &std::path::Path) -> rusqlite::Connection {
         .execute_batch("BEGIN IMMEDIATE")
         .expect("the second connection takes the write lock");
     other
+}
+
+/// How a job that ran past its deadline can end: the process says so, the process answers late
+/// with bytes, or the daemon ends the process for it.
+#[derive(Clone, Copy, Debug)]
+enum Overran {
+    /// The process answers that the job passed its deadline.
+    Said,
+    /// The process answers with a description after the job's deadline.
+    AnsweredLate,
+    /// The daemon ends the process at the job's deadline.
+    Ended,
+}
+
+/// Runs one job to the end in the way a case says, and returns when it ended.
+fn overrun(service: &mut DescriptionService, from: Reading, how: Overran) -> Reading {
+    let (sent, id, request) = next_job(service, from);
+    let deadline = Budgets::DEFAULTS.execution_deadline_ms;
+    match how {
+        Overran::Said => {
+            let now = sent.after_ms(deadline);
+            assert!(matches!(
+                service
+                    .finished(
+                        id,
+                        Answered::Ended {
+                            why: JobEnd::DeadlineExceeded,
+                            detail: None
+                        },
+                        now
+                    )
+                    .expect("the answer"),
+                Outcome::DeadlineExceeded { .. }
+            ));
+            now
+        }
+        Overran::AnsweredLate => {
+            let now = sent.after_ms(deadline + 1);
+            assert!(matches!(
+                service
+                    .finished(id, produced(&request.prompt, 0), now)
+                    .expect("the answer"),
+                Outcome::DeadlineExceeded { .. }
+            ));
+            now
+        }
+        Overran::Ended => {
+            let now = sent.after_ms(deadline + 2_000);
+            let outcomes = service
+                .process_ended(ProcessEnd::PastDeadline, now)
+                .expect("the end");
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::DeadlineExceeded { .. })),
+                "{outcomes:?}"
+            );
+            now
+        }
+    }
+}
+
+/// Three jobs in a row that overran their deadline leave inference failed while the restart delay
+/// runs, whichever way each one was found out, and the model that answered them is still in the
+/// process, so the state does not say it was unloaded. The control is two.
+#[test]
+fn three_deadlines_in_a_row_leave_inference_failed_whichever_way_each_was_found() {
+    let paused = |service: &DescriptionService| match service.resource_state() {
+        ResourceState::ResourcePaused {
+            reason: PauseReason::InferenceFailed,
+            unloaded,
+        } => Some(unloaded),
+        _ => None,
+    };
+    for forms in [
+        [Overran::Said, Overran::AnsweredLate, Overran::Said],
+        [
+            Overran::AnsweredLate,
+            Overran::AnsweredLate,
+            Overran::AnsweredLate,
+        ],
+        [Overran::Said, Overran::Said, Overran::Said],
+        [Overran::Ended, Overran::AnsweredLate, Overran::Said],
+    ] {
+        let mut service = service();
+        let mut now = at(3_000);
+        for (index, how) in forms.into_iter().enumerate() {
+            queue(&mut service, &session(1 + index as u8), "kalareach", now);
+            now = overrun(&mut service, now, how);
+            service.next(&roomy(), now).expect("an instruction");
+            match (index, paused(&service)) {
+                (0 | 1, shown) => assert_eq!(shown, None, "{forms:?}: after {}", index + 1),
+                (_, shown) => assert_eq!(
+                    shown,
+                    Some(false),
+                    "{forms:?}: after three, the model is still in the process"
+                ),
+            }
+        }
+    }
+}
+
+/// A session whose changes wait for its job to end reports no time to settle at, so a host that
+/// sleeps until the earliest one does not wake at once, find nothing to do and wake again for the
+/// whole of the job. The control is a session that is idle, whose pending change settles a
+/// debounce after it was seen.
+#[test]
+fn a_session_whose_changes_wait_for_its_job_reports_no_time_to_settle_at() {
+    let mut service = service();
+    service.session_opened(session(1), SessionEpoch::V1, binding());
+    assert_eq!(service.settle_due_ms(), None);
+    // The control.
+    change(&mut service, &session(1), "kalareach", at(1_000));
+    assert_eq!(service.settle_due_ms(), Some(1_000 + 2_000));
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(3_000))
+            .is_some()
+    );
+    assert_eq!(service.settle_due_ms(), None, "settled");
+
+    // A job runs, a change settles under it and supersedes it, and the job after it runs to its
+    // end while the next change waits.
+    let (sent, id, _) = next_job(&mut service, at(3_000));
+    change(&mut service, &session(1), "crates", sent);
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, sent.after_ms(2_000))
+            .is_some()
+    );
+    assert!(matches!(
+        service
+            .next(&roomy(), sent.after_ms(2_000))
+            .expect("an instruction"),
+        Instruction::Cancel { .. }
+    ));
+    service
+        .finished(
+            id,
+            Answered::Ended {
+                why: JobEnd::Cancelled,
+                detail: None,
+            },
+            sent.after_ms(2_100),
+        )
+        .expect("the answer");
+    let (second, id, request) = next_job(&mut service, sent.after_ms(2_100));
+    change(&mut service, &session(1), "tests", second);
+    assert_eq!(
+        service.settle_due_ms(),
+        Some(second.monotonic_ms() + 2_000),
+        "a change is pending, and the host will ask at its time"
+    );
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, second.after_ms(2_000))
+            .is_none(),
+        "it waits for the job"
+    );
+    assert_eq!(
+        service.settle_due_ms(),
+        None,
+        "nothing settles until the job ends, so there is nothing to wake for"
+    );
+    // The job ends, and the change that waited settles at once.
+    service
+        .finished(id, produced(&request.prompt, 0), second.after_ms(3_000))
+        .expect("the answer");
+    assert_eq!(service.settle_due_ms(), None);
+    assert_eq!(
+        service.scheduler().queued(),
+        1,
+        "the waiting change is queued"
+    );
+
+    // A fenced session's pending change is not waited for either.
+    service.session_opened(session(2), SessionEpoch::V1, binding());
+    change(
+        &mut service,
+        &session(2),
+        "kalareach",
+        second.after_ms(4_000),
+    );
+    assert!(service.settle_due_ms().is_some());
+    service
+        .fence()
+        .raise(session(2), kr_worker::privacy::PrivacyGeneration::INITIAL);
+    assert_eq!(service.settle_due_ms(), None, "fenced");
+}
+
+/// A load in the process is stopped when the files it reads stop being held, as it is when
+/// descriptions are turned off. The control is the same load with its files held, which is left
+/// alone.
+#[test]
+fn a_load_is_cancelled_when_the_files_stop_being_held() {
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let Instruction::Load { id, .. } = service.next(&roomy(), at(3_000)).expect("an instruction")
+    else {
+        panic!("a load comes first");
+    };
+    assert_eq!(
+        service.next(&roomy(), at(3_100)).expect("an instruction"),
+        Instruction::Wait { until_ms: None },
+        "held: the load is left alone"
+    );
+    service.set_assets_held(false);
+    assert_eq!(
+        service.next(&roomy(), at(3_200)).expect("an instruction"),
+        Instruction::Cancel {
+            id,
+            work: Work::Load
+        }
+    );
+}
+
+/// Builds a service over records of work in flight that the test holds clones of.
+fn sharing(handles: &Handles) -> DescriptionService {
+    DescriptionService::sharing(
+        HostPlacement {
+            environment: native(1),
+            data_access: None,
+            target: MAC.to_owned(),
+        },
+        built_in(),
+        MetGates::default(),
+        ResourceSettings::default(),
+        DescriptionStore::in_memory().expect("a store in memory"),
+        handles.clone(),
+    )
+}
+
+/// What a service that goes away leaves behind: a job in the process, a load, and the shared
+/// records of both. Whoever holds a clone of the records sees what the service did until then and
+/// reads nought outstanding once it is gone.
+#[test]
+fn a_service_that_goes_leaves_nothing_outstanding_in_the_records_it_shared() {
+    use std::sync::atomic::Ordering;
+
+    let handles = Handles::default();
+    let mut service = sharing(&handles);
+    queue(&mut service, &session(1), "kalareach", at(0));
+    queue(&mut service, &session(2), "crates", at(0));
+    assert_eq!(service.live_session_ids(), vec![session(1), session(2)]);
+    let Instruction::Load { id, .. } = service.next(&roomy(), at(3_000)).expect("an instruction")
+    else {
+        panic!("a load comes first");
+    };
+    assert_eq!(handles.loading.load(Ordering::Acquire), 1);
+    service
+        .finished(
+            id,
+            Answered::Loaded {
+                load_ms: 0,
+                rss_bytes: 0,
+            },
+            at(3_000),
+        )
+        .expect("the load");
+    assert_eq!(handles.loading.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        service.next(&roomy(), at(3_000)).expect("an instruction"),
+        Instruction::Generate { .. }
+    ));
+    assert_eq!(handles.in_flight.total(), 1, "in flight, for every holder");
+    assert_eq!(service.in_flight(), 1);
+    handles
+        .fence
+        .raise(session(2), kr_worker::privacy::PrivacyGeneration::INITIAL);
+    assert!(
+        service.fence().is_fenced(&session(2)),
+        "one fence, for every holder"
+    );
+    drop(service);
+    assert_eq!(handles.in_flight.total(), 0, "nothing is in flight now");
+    assert!(!handles.running.is_running(&session(1)));
+    assert_eq!(handles.loading.load(Ordering::Acquire), 0);
+
+    // A load in flight when the service goes is not left counted either.
+    let handles = Handles::default();
+    let mut service = sharing(&handles);
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        service.next(&roomy(), at(3_000)).expect("an instruction"),
+        Instruction::Load { .. }
+    ));
+    assert_eq!(handles.loading.load(Ordering::Acquire), 1);
+    drop(service);
+    assert_eq!(handles.loading.load(Ordering::Acquire), 0);
+}
+
+/// A load that failed, a crash and a job that failed are three failures in a row, whichever kind
+/// each is.
+#[test]
+fn a_failed_load_a_crash_and_a_failed_job_are_three_failures_in_a_row() {
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let mut now = at(3_000);
+
+    // A load that failed.
+    let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("an instruction") else {
+        panic!("a load comes first");
+    };
+    service
+        .finished(
+            id,
+            Answered::LoadEnded {
+                why: LoadEnd::Failed,
+                detail: None,
+            },
+            now,
+        )
+        .expect("the answer");
+    service.next(&roomy(), now.after_ms(10)).expect("a wait");
+    assert!(!inference_failed(&service), "one");
+
+    // A process that ended on its own during the next load.
+    now = now.after_ms(10 * 60 * 1_000);
+    assert!(matches!(
+        service.next(&roomy(), now).expect("an instruction"),
+        Instruction::Load { .. }
+    ));
+    service
+        .process_ended(ProcessEnd::Exited, now.after_ms(10))
+        .expect("the end");
+    service.next(&roomy(), now.after_ms(20)).expect("a wait");
+    assert!(!inference_failed(&service), "two");
+
+    // A job that failed.
+    now = now.after_ms(10 * 60 * 1_000);
+    let (sent, id, _) = next_job(&mut service, now);
+    service
+        .finished(
+            id,
+            Answered::Ended {
+                why: JobEnd::Failed,
+                detail: None,
+            },
+            sent,
+        )
+        .expect("the answer");
+    service.next(&roomy(), sent).expect("the unload");
+    service.next(&roomy(), sent).expect("the wait");
+    assert!(inference_failed(&service), "three");
+}
+
+/// Whether the service is paused for repeated failures.
+fn inference_failed(service: &DescriptionService) -> bool {
+    matches!(
+        service.resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::InferenceFailed,
+            ..
+        }
+    )
 }

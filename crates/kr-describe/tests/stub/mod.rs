@@ -3,7 +3,9 @@
 //!
 //! The executable is copied to a directory of the test's own on the internal disk before it is
 //! started, and it runs there with a runtime directory there, so nothing it does touches the volume
-//! the workspace is on.
+//! the workspace is on. The copy is started once and let end before a test begins: the operating
+//! system checks an executable the first time it starts from a new file, which takes as long as
+//! the machine has queued for it, and that is no part of what a test times.
 #![allow(dead_code)]
 
 use std::io::Write;
@@ -35,7 +37,11 @@ impl Placed {
         let program = directory
             .path()
             .join(format!("kr-describe-stub{}", std::env::consts::EXE_SUFFIX));
-        kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-describe-stub")), &program);
+        kr_ipc::testing::place_and_start_once(
+            Path::new(env!("CARGO_BIN_EXE_kr-describe-stub")),
+            &program,
+            &["--version"],
+        );
         Self { directory, program }
     }
 
@@ -52,16 +58,49 @@ impl Placed {
     }
 }
 
-/// Waits until a stub that marks its work has begun some of this kind in `runtime_dir`.
-pub fn wait_until_began(runtime_dir: &Path, kind: &str) {
+/// Returns whether a stub that marks its work has begun some of this kind in `runtime_dir`.
+pub fn began(runtime_dir: &Path, kind: &str) -> bool {
     let prefix = format!("{}{kind}-", kr_describe::testing::BEGAN_PREFIX);
-    let give_up = Instant::now() + Duration::from_secs(20);
+    std::fs::read_dir(runtime_dir)
+        .expect("the runtime directory")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+}
+
+/// Waits until a stub started with `mark_start` has said, in `runtime_dir`, that it is running.
+pub fn wait_until_started(runtime_dir: &Path) {
+    let give_up = Instant::now() + READY_BOUND;
     loop {
-        let began = std::fs::read_dir(runtime_dir)
+        let started = std::fs::read_dir(runtime_dir)
             .expect("the runtime directory")
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
-        if began {
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(kr_describe::testing::STARTED_PREFIX)
+            });
+        if started {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the stub did not mark its start in {} within {READY_BOUND:?}",
+            runtime_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// How long a stub is given to say `ready`, or to mark its start. It is a bound on a start that
+/// the machine may have queued behind other work, and nothing waits for it when the stub answers.
+pub const READY_BOUND: Duration = Duration::from_secs(120);
+
+/// Waits until a stub that marks its work has begun some of this kind in `runtime_dir`.
+pub fn wait_until_began(runtime_dir: &Path, kind: &str) {
+    let give_up = Instant::now() + Duration::from_secs(20);
+    loop {
+        if began(runtime_dir, kind) {
             return;
         }
         assert!(
@@ -148,24 +187,29 @@ impl Process {
         input.flush().expect("the request is flushed");
     }
 
-    /// Returns the next answer, when one arrives in time.
-    pub fn answer(&self, within: Duration) -> Option<Answer> {
+    /// Returns the next answer, when one arrives in time. A process whose output ended is not a
+    /// process that has not answered yet, and says how it ended.
+    pub fn answer(&mut self, within: Duration) -> Option<Answer> {
         match self.answers.recv_timeout(within) {
             Ok(Ok(answer)) => Some(answer),
             Ok(Err(error)) => panic!("the stub's answer did not read: {error}"),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => panic!(
+                "the stub's output ended with nothing more to read; its status is {:?}",
+                self.child.try_wait()
+            ),
         }
     }
 
     /// Returns the next answer, which has to arrive within `within`.
-    pub fn expect_answer(&self, within: Duration, what: &str) -> Answer {
+    pub fn expect_answer(&mut self, within: Duration, what: &str) -> Answer {
         self.answer(within)
             .unwrap_or_else(|| panic!("{what} did not arrive within {within:?}"))
     }
 
     /// Returns the next answer that is not the control thread's acknowledgement of a cancellation,
     /// which has to arrive within `within`.
-    pub fn expect_terminal(&self, within: Duration, what: &str) -> Answer {
+    pub fn expect_terminal(&mut self, within: Duration, what: &str) -> Answer {
         loop {
             let answer = self.expect_answer(within, what);
             if !matches!(answer, Answer::Cancelling { .. }) {
@@ -199,13 +243,43 @@ impl Process {
         let _ = self.child.wait();
     }
 
-    /// Says hello and returns the answer.
+    /// Says hello and returns the answer, which is `ready`.
+    ///
+    /// The wait ends when the answer arrives, when the process is gone, or at [`READY_BOUND`], and
+    /// says which: a process that exited, with how, or one that was still running and had sent
+    /// nothing.
     pub fn hello(&mut self) -> Answer {
+        let asked = Instant::now();
         self.send(&Request::Hello {
             build: "kr-describe-tests/0".to_owned(),
             wire: U64::new(WIRE_VERSION),
         });
-        self.expect_answer(Duration::from_secs(10), "ready")
+        loop {
+            match self.answers.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(answer)) => return answer,
+                Ok(Err(error)) => panic!("the stub's answer to hello did not read: {error}"),
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(status) = self.child.try_wait().expect("the stub's status") {
+                        panic!(
+                            "the stub exited with {status} {:?} after hello, before it said ready",
+                            asked.elapsed()
+                        );
+                    }
+                    assert!(
+                        asked.elapsed() < READY_BOUND,
+                        "ready did not arrive within {READY_BOUND:?} of hello: the stub (pid {}) \
+                         was still running and had sent nothing",
+                        self.child.id()
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "the stub's output ended {:?} after hello, before it said ready; its status \
+                     is {:?}",
+                    asked.elapsed(),
+                    self.child.try_wait()
+                ),
+            }
+        }
     }
 }
 
