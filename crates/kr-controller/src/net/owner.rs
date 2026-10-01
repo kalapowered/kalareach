@@ -499,6 +499,46 @@ impl OwnerAuthority {
         Ok(confirmed)
     }
 
+    /// Spends, once, the oldest answered challenge that equals `expectation`, and returns the
+    /// evidence of it, for an effect whose caller presents no proof of its own.
+    ///
+    /// What an owner device recorded through `owner.confirmation.complete` is verified again here
+    /// against the owner devices of this host as they stand now, the challenge is consumed, and
+    /// the consumption is written to the acceptance record before the effect is performed, so a
+    /// crash between the two wastes the confirmation and never leaves an effect without its
+    /// record. The evidence carries the challenge's own boot and deadline, for an effect that asks
+    /// again at its commit whether the confirmation still covers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no answered challenge equals `expectation`, or
+    /// the one that did was answered under authority this host no longer holds, and a registry
+    /// error when the consumption cannot be recorded.
+    pub fn spend_answered(
+        &self,
+        expectation: &ConfirmationExpectation<'_>,
+        effect: &str,
+    ) -> Result<ConfirmedAction> {
+        let (spendable, mut state) = self.spend(expectation)?;
+        let confirmed = ConfirmedAction::verify(
+            expectation,
+            &mut state.ledger,
+            &self.clock,
+            &spendable.request,
+            &spendable.proof,
+            &spendable.signer,
+            spendable.enrolment,
+        )
+        .map_err(|error| confirmation_required(&error.to_string()))?;
+        state
+            .entries
+            .remove(spendable.request.confirmation_id.get().as_bytes());
+        drop(state);
+        self.rows
+            .record_consumed(spendable.proof(), effect, kr_ipc::now_ms())?;
+        Ok(confirmed)
+    }
+
     /// Returns the authorisation key of the live owner device whose key `signer` identifies.
     fn owner_device_key(&self, signer: KeyId) -> Result<AuthorisationKey> {
         self.owner_devices()?

@@ -360,6 +360,12 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
             rights(&described.destination_rights)?;
             Ok(Subject::Described(described.clone()))
         }
+        // This app describes an invitation, a device and the clock, and a challenge a caller
+        // described. What a repository's root or an installation would authorise it cannot show
+        // in its prompt, and a device that cannot show what it would authorise refuses it.
+        ConfirmationDisplay::CatalogueAdd { .. } | ConfirmationDisplay::PluginInstall { .. } => {
+            Err(CannotCheck::CannotShow)
+        }
     }
 }
 
