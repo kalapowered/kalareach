@@ -977,7 +977,7 @@ mod tests {
             deadline,
             tokio::time::Duration::from_millis(20),
             short(),
-            || std::future::pending(),
+            std::future::pending,
         )
         .await;
         let Err(CliError::Refused(refused)) = silent else {
