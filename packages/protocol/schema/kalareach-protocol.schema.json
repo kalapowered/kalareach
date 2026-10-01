@@ -23089,6 +23089,25 @@
       ],
       "type": "object"
     },
+    "PrivacyLaunch": {
+      "additionalProperties": false,
+      "description": "The environment's privacy state, as a worker is told it when it is launched.\n\nIt is the generation in force and whether privacy mode is on at it, read by the daemon after\nthe worker's claim is accepted and before the specification is sent. A change after that reaches\nthe worker as the daemon's notice of the generation, which the daemon repeats until the worker\nsays its cleanup is complete.",
+      "properties": {
+        "enabled": {
+          "description": "Whether privacy mode is on at that generation.",
+          "type": "boolean"
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation in force. Nought is an environment that has never turned privacy mode on."
+        }
+      },
+      "required": [
+        "generation",
+        "enabled"
+      ],
+      "type": "object"
+    },
     "PrivacyOutstanding": {
       "additionalProperties": false,
       "description": "One subsystem's outstanding work.",
@@ -34814,6 +34833,10 @@
           "$ref": "#/$defs/AdmissionsHeader",
           "description": "The first snapshot of plugin admissions, whose parts follow this specification on the\nsame connection before anything else does. The worker reads them before it starts the\nshell, so a package admitted at launch is there for the shell's first command."
         },
+        "privacy": {
+          "$ref": "#/$defs/PrivacyLaunch",
+          "description": "The environment's privacy state when this worker was launched.\n\nThe worker applies it before it starts its shell. A session created while privacy mode is\non therefore retains nothing from its first byte, and does not wait for the daemon's next\nnotice to learn that it is private."
+        },
         "release": {
           "description": "The release string the session reports as its terminal program version.",
           "type": "string"
@@ -34848,7 +34871,8 @@
         "controller_public_key",
         "controller_generation",
         "release",
-        "plugins"
+        "plugins",
+        "privacy"
       ],
       "type": "object"
     },

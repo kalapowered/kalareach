@@ -444,6 +444,10 @@ fn specification(entries: Vec<CommandIntegration>) -> kr_protocol::worker::Worke
             },
             parts: 1,
         },
+        privacy: kr_protocol::worker::PrivacyLaunch {
+            generation: U64::ZERO,
+            enabled: false,
+        },
     }
 }
 
