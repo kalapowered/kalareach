@@ -188,8 +188,8 @@ function leb128(dex, at) {
 /** The dex layouts this reads. Anything else is refused by name rather than guessed at. */
 const DEX_VERSIONS = ['035', '037', '038', '039', '040']
 
-/** Every class a dex file defines, in source form (`a.b.C`, with `$` for a nested class). */
-function definedClasses(dex) {
+/** Refuses a buffer that is not a dex layout this reads. */
+function requireDex(dex) {
   const magic = dex.subarray(0, 8).toString('latin1')
   if (dex.length < 112 || !magic.startsWith('dex\n') || magic.charCodeAt(7) !== 0) {
     throw new Error('not a dex file')
@@ -198,21 +198,39 @@ function definedClasses(dex) {
   if (!DEX_VERSIONS.includes(version)) {
     throw new Error(`dex version ${version} is not read here`)
   }
-  const stringIdsAt = dex.readUInt32LE(0x3c)
+}
+
+/** The string a dex file's string table holds at `stringIndex`. */
+function stringAt(dex, stringIndex) {
+  const dataAt = dex.readUInt32LE(dex.readUInt32LE(0x3c) + stringIndex * 4)
+  // A string_data_item is its length in UTF-16 units, then modified UTF-8 up to a NUL. The
+  // modified encoding differs from UTF-8 only for the NUL byte, which terminates here anyway,
+  // and for characters outside the basic plane, which a Java identifier may hold but which no
+  // name this check looks for does.
+  const [, textAt] = leb128(dex, dataAt)
+  const end = dex.indexOf(0, textAt)
+  return dex.subarray(textAt, end).toString('utf8')
+}
+
+/**
+ * Every string a dex file's string table holds: names, descriptors and the constants the code
+ * carries. A name the code merely mentions is here as well as one it defines.
+ */
+export function definedStrings(dex) {
+  requireDex(dex)
+  const count = dex.readUInt32LE(0x38)
+  const strings = []
+  for (let index = 0; index < count; index += 1) strings.push(stringAt(dex, index))
+  return strings
+}
+
+/** Every class a dex file defines, in source form (`a.b.C`, with `$` for a nested class). */
+export function definedClasses(dex) {
+  requireDex(dex)
   const typeIdsAt = dex.readUInt32LE(0x44)
   const classDefsCount = dex.readUInt32LE(0x60)
   const classDefsAt = dex.readUInt32LE(0x64)
-  const descriptor = (typeIndex) => {
-    const stringIndex = dex.readUInt32LE(typeIdsAt + typeIndex * 4)
-    const dataAt = dex.readUInt32LE(stringIdsAt + stringIndex * 4)
-    // A string_data_item is its length in UTF-16 units, then modified UTF-8 up to a NUL. The
-    // modified encoding differs from UTF-8 only for the NUL byte, which terminates here anyway,
-    // and for characters outside the basic plane, which a Java identifier may hold but which no
-    // name this check looks for does.
-    const [, textAt] = leb128(dex, dataAt)
-    const end = dex.indexOf(0, textAt)
-    return dex.subarray(textAt, end).toString('utf8')
-  }
+  const descriptor = (typeIndex) => stringAt(dex, dex.readUInt32LE(typeIdsAt + typeIndex * 4))
   const classes = []
   for (let index = 0; index < classDefsCount; index += 1) {
     const type = descriptor(dex.readUInt32LE(classDefsAt + index * 32))
@@ -223,8 +241,8 @@ function definedClasses(dex) {
   return classes
 }
 
-/** Every class the packaged artefact at `path` defines as application code. */
-function packagedClasses(path) {
+/** The application's dex files in the packaged artefact at `path`, each as its bytes. */
+export function applicationDex(path) {
   const application = DEX_MEMBER[extname(path).toLowerCase()]
   if (!application) throw new Error(`${extname(path)} is not a packaged Android application`)
   const handle = openSync(path, 'r')
@@ -232,14 +250,19 @@ function packagedClasses(path) {
     const size = statSync(path).size
     const dexes = members(handle, size).filter((member) => application.test(member.name))
     if (dexes.length === 0) throw new Error('the artefact carries no application dex file')
-    const classes = new Set()
-    for (const member of dexes) {
-      for (const name of definedClasses(contents(handle, member))) classes.add(name)
-    }
-    return classes
+    return dexes.map((member) => contents(handle, member))
   } finally {
     closeSync(handle)
   }
+}
+
+/** Every class the packaged artefact at `path` defines as application code. */
+function packagedClasses(path) {
+  const classes = new Set()
+  for (const dex of applicationDex(path)) {
+    for (const name of definedClasses(dex)) classes.add(name)
+  }
+  return classes
 }
 
 // -- the check --------------------------------------------------------------------------------

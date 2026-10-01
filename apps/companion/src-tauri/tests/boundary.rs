@@ -616,6 +616,28 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
     ] {
         assert!(project.contains(expected), "project.yml lacks {expected:?}");
     }
+    // One Apple team for every target: the prefix of each keychain group and of the application
+    // identifier the website's association names. The project chooses no certificate and no
+    // provisioning profile; whoever signs does.
+    assert_eq!(
+        project.matches("DEVELOPMENT_TEAM:").count(),
+        1,
+        "project.yml names the team once, for every target"
+    );
+    assert!(
+        project.contains("\nsettings:\n  base:\n    DEVELOPMENT_TEAM: L775WGST9V\n"),
+        "the project names the organisation's Apple team"
+    );
+    for chosen_by_the_signer in [
+        "CODE_SIGN_IDENTITY",
+        "PROVISIONING_PROFILE",
+        "CODE_SIGN_STYLE",
+    ] {
+        assert!(
+            !project.contains(chosen_by_the_signer),
+            "project.yml names {chosen_by_the_signer}, which belongs to whoever signs"
+        );
+    }
     // The application's own group first: the platform files an item written without a group
     // under the first one, and the extension may read the shared one.
     let application = project
@@ -633,6 +655,25 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
             "- $(AppIdentifierPrefix)to.kala.reach",
             "- $(AppIdentifierPrefix)to.kala.reach.shared"
         ]
+    );
+
+    // The sign-in's HTTPS callback and the credentials association belong to this application
+    // alone: the extension needs neither, and the website's association names the application.
+    let entitlements = text("gen/apple/companion-tauri_iOS/companion-tauri_iOS.entitlements");
+    for domain in ["applinks:reach.kala.to", "webcredentials:reach.kala.to"] {
+        assert!(
+            project.contains(&format!("          - {domain}\n")),
+            "project.yml lacks the associated domain {domain}"
+        );
+        assert!(
+            entitlements.contains(&format!("<string>{domain}</string>")),
+            "the application's entitlements lack the associated domain {domain}"
+        );
+    }
+    assert!(
+        !text("gen/apple/KalaReachNotificationService/KalaReachNotificationService.entitlements")
+            .contains("associated-domains"),
+        "the extension declares no associated domain"
     );
 
     // What the project generator wrote from it agrees.
@@ -684,5 +725,101 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
         !root
             .join("gen/android/app/src/main/java/to/kala/reach/companion/MainActivity.kt")
             .exists()
+    );
+}
+
+/// Every file of the application, but not what a build leaves beside them.
+fn application_files(directory: &Path, found: &mut Vec<PathBuf>) {
+    const LEFT_BY_BUILDS: [&str; 10] = [
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".gradle",
+        "Externals",
+        "assets",
+        "playwright-report",
+        "test-results",
+        ".build",
+    ];
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            if !LEFT_BY_BUILDS.contains(&name.to_string_lossy().as_ref()) {
+                application_files(&path, found);
+            }
+        } else {
+            found.push(path);
+        }
+    }
+}
+
+/// The names an earlier identifier and an earlier Apple team gave the application are gone.
+///
+/// The Kotlin and Java package `to.kala.reach.companion` stays: it is a code namespace, the
+/// manifest and the packaging check name classes by it, and renaming it would only move files. So
+/// it may appear where it names a package or a class, which is a `package` or `import` line, the
+/// manifest's components and the packaging check's class names, and nowhere else. A string under
+/// it anywhere else is a name that should have followed the application identifier.
+#[test]
+fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
+    const KEPT_NAMESPACE: &str = "to.kala.reach.companion";
+    const NAMES_CLASSES: [&str; 3] = [
+        "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
+        "scripts/android-classes.mjs",
+        "scripts/android-classes-selftest.mjs",
+    ];
+    // These name the retired spellings in order to refuse them.
+    const REFUSES_THEM: [&str; 3] = [
+        "src-tauri/tests/boundary.rs",
+        "scripts/identifiers.mjs",
+        "scripts/identifiers-selftest.mjs",
+    ];
+    let application = crate_root()
+        .parent()
+        .expect("the crate sits inside the application's directory")
+        .to_owned();
+    let mut files = Vec::new();
+    application_files(&application, &mut files);
+    assert!(
+        files.len() > 100,
+        "the walk found the application's files: {}",
+        files.len()
+    );
+    let mut stale = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(&application)
+            .expect("a file of the application")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if REFUSES_THEM.contains(&relative.as_str()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let place = format!("{relative}:{}: {}", number + 1, line.trim());
+            if line.contains("to.kala.companion") || line.contains("JT6GW3W9W6") {
+                stale.push(place);
+            } else if line.contains(KEPT_NAMESPACE) {
+                let trimmed = line.trim_start();
+                let names_a_package = trimmed.starts_with(&format!("package {KEPT_NAMESPACE}"))
+                    || trimmed.starts_with(&format!("import {KEPT_NAMESPACE}"));
+                if !names_a_package && !NAMES_CLASSES.contains(&relative.as_str()) {
+                    stale.push(place);
+                }
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "these lines name an identifier or a team the application no longer has:\n{}",
+        stale.join("\n")
     );
 }

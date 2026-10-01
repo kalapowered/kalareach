@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
+import configuration from '../src-tauri/tauri.conf.json'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
@@ -59,7 +60,9 @@ describe('the identity setup checks before anything else', () => {
   it('names the application a grant would be filed under, and the host beside it', async () => {
     start()
     const identity = await screen.findByTestId('setup-identity')
-    expect(within(identity).getByText('to.kala.companion')).toBeInTheDocument()
+    // The scripted host reports the identifier the real application declares, so what the
+    // assistant shows here is what a person would see.
+    expect(within(identity).getByText(configuration.identifier)).toBeInTheDocument()
     expect(within(identity).getByText('Stable identity')).toBeInTheDocument()
     expect(screen.getByTestId('setup-helper').textContent).toMatch(/kr-controller/)
   })
