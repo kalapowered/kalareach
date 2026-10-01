@@ -87,7 +87,9 @@ fn a_client_arriving_around_a_reset_of_the_alternate_buffer_holds_the_screen() {
 
 /// KR-REQ-27.06: a clipboard write, a bell, a notification or a query that happened before a
 /// client arrived never happens to that client, whatever point it arrived at; one that happens
-/// after it arrived reaches the client holding the input lease once and no other client.
+/// after it arrived reaches the client holding the input lease once and no other client. That
+/// includes an effect a client that joined inside its sequence is owed, when the byte that ends the
+/// sequence is also the byte that lets the client take the stream.
 #[test]
 fn a_side_effect_from_before_a_client_arrived_never_reaches_it() {
     let outcome = restored("side-effects");
@@ -96,28 +98,6 @@ fn a_side_effect_from_before_a_client_arrived_never_reaches_it() {
         "the clipboard writes and bells after the first point were followed to their holders: {}",
         outcome.live_effects
     );
-}
-
-/// A client that arrives inside a clipboard write or a notification is held on a projection until
-/// the sequence ends, and it holds the input lease. The byte that ends the sequence both gives the
-/// client its boundary, at which the session tells it to begin again on the stream, and completes
-/// the side effect it is owed; the session then drops the effect, because it sends nothing to a
-/// subscriber that is beginning again. This shows exactly where that happens and nowhere else.
-///
-/// Once the session delivers such an effect this test fails. It is then removed, together with
-/// `Outcome::lost`, and the check above holds at these points as at every other.
-#[test]
-fn a_side_effect_completed_by_the_byte_that_releases_its_held_holder_does_not_reach_it() {
-    let corpus = corpus("side-effects");
-    let outcome = run(&corpus, Strategy::Product).unwrap_or_else(|error| panic!("{error}"));
-    assert!(
-        !outcome.lost.is_empty(),
-        "every effect owed to a holder released by its last byte now reaches it"
-    );
-    for lost in &outcome.lost {
-        assert_eq!(lost.property, Property::LiveEffect);
-        assert!(lost.what.contains("never performed"), "{lost}");
-    }
 }
 
 /// Every corpus kept for this suite is one a test above runs, so a corpus added without a test is

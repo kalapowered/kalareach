@@ -262,3 +262,57 @@ async fn an_effect_whose_lease_ended_in_the_same_batch_is_a_host_event() {
         );
     }
 }
+
+/// What a stream was sent, leaving out the output spans and the screens: the effects and the
+/// markers, which are what the order of is about.
+fn effects_and_markers(stream: &mut OutputStream) -> Vec<String> {
+    drained(stream)
+        .into_iter()
+        .filter(|seen| seen.starts_with("effect") || seen == "resync")
+        .collect()
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38, KR-REQ-27.06: a terminal that joined inside a clipboard write is held
+/// on a projection until the sequence ends, and the byte that ends it both completes the effect it
+/// is owed and lets the terminal take the stream, which tells it to begin again. The effect is sent
+/// before that marker: a stream that has been told to resynchronise is sent nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_effect_completed_by_the_byte_that_releases_a_held_holder_reaches_it_before_its_marker()
+{
+    let mut fixture = Fixture::new();
+    fixture.output(b"\x1b]52;c;c2Vj");
+    let holder = fixture.attach("xterm-256color");
+    fixture.take_the_keys(holder);
+    let mut stream = fixture.subscribe(holder);
+    assert!(
+        fixture.session.forwarding_held(holder),
+        "it joined inside the sequence, so it waits for a boundary to take the stream"
+    );
+    let _ = drained(&mut stream);
+
+    fixture.output(b"cmV0\x1b\\");
+    assert_eq!(
+        effects_and_markers(&mut stream),
+        vec![effect(0, CLIPBOARD_WRITE), "resync".to_owned()]
+    );
+    assert!(fixture.host_events().is_empty(), "it reached its holder");
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38: a bell and a switch to the alternate buffer in one write. The switch
+/// tells a terminal that takes the stream directly to begin again, and the bell it is owed goes out
+/// before the marker rather than being dropped behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_effect_in_a_batch_that_switches_buffers_reaches_a_direct_holder_before_its_marker() {
+    let mut fixture = Fixture::new();
+    let holder = fixture.attach("xterm-256color");
+    fixture.take_the_keys(holder);
+    let mut stream = fixture.subscribe(holder);
+    let _ = drained(&mut stream);
+
+    fixture.output(b"\x07\x1b[?1049hX");
+    assert_eq!(
+        effects_and_markers(&mut stream),
+        vec![effect(0, BELL), "resync".to_owned()]
+    );
+    assert!(fixture.host_events().is_empty(), "it reached its holder");
+}

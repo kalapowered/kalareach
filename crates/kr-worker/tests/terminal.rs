@@ -616,6 +616,48 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     );
 }
 
+/// Collects the output this client is sent until the worker tells it to begin again.
+///
+/// Everything the worker wrote to this terminal ahead of that marker is what the terminal has been
+/// given by the time it is asked to install a fresh screen. A connection that ends first, or a
+/// marker that never arrives, fails here with what was seen.
+async fn collect_until_told_to_begin_again(client: &mut LocalClient) -> Vec<u8> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification))) => {
+                match notification.event_type.as_str() {
+                    "session.output" => {
+                        if let Ok(event) = notification
+                            .payload
+                            .to_typed::<kr_protocol::recovery::OutputEvent>()
+                        {
+                            seen.extend_from_slice(event.bytes.as_slice());
+                        }
+                    }
+                    "session.resync" => return seen,
+                    _ => {}
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!(
+                "waited {:?} for this terminal to be told to begin again and the connection ended \
+                 ({error}): {:?}",
+                started.elapsed(),
+                String::from_utf8_lossy(&seen).escape_debug()
+            ),
+            Err(_) => panic!(
+                "waited {:?} for this terminal to be told to begin again: {:?}",
+                started.elapsed(),
+                String::from_utf8_lossy(&seen).escape_debug()
+            ),
+        }
+    }
+}
+
 /// The clipboard write the tests below split in half: `secret`, as the host renders it.
 const CLIPBOARD_WRITE: &[u8] = b"\x1b]52;c;c2VjcmV0\x1b\\";
 
@@ -642,6 +684,36 @@ async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole()
         carries(&bytes, CLIPBOARD_WRITE),
         "the clipboard write reaches the terminal holding the lease whole: {}",
         String::from_utf8_lossy(&bytes).escape_debug()
+    );
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38: the byte that completes a side effect can also be the byte that
+/// lets a held terminal take the stream. The terminal is then told to begin again on it, and the
+/// effect it is owed is written before that, not dropped with the stream it replaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_side_effect_completed_by_the_byte_that_releases_a_held_holder_reaches_it() {
+    let host = host(SPLIT_CLIPBOARD_WRITE).await;
+    produced(&host.runtime, b"]52;c;c2Vj").await;
+    let (mut holder, _, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    assert!(
+        host.runtime.session().forwarding_held(keys.attachment()),
+        "the terminal joined inside the sequence, so it waits for a boundary to take the stream"
+    );
+    keys.release(&host.runtime);
+    let before_the_marker = collect_until_told_to_begin_again(&mut holder).await;
+    assert!(
+        carries(&before_the_marker, CLIPBOARD_WRITE),
+        "the clipboard write reached the terminal before it was told to begin again: {}",
+        String::from_utf8_lossy(&before_the_marker).escape_debug()
+    );
+    // And once, not again with the screen it installs.
+    subscribe_over(&mut holder, &host, keys.attachment()).await;
+    let installed = collect_until(&mut holder, b"kr-rang.").await;
+    assert!(
+        !carries(&installed, b"]52;"),
+        "the screen it installs carries no clipboard write: {}",
+        String::from_utf8_lossy(&installed).escape_debug()
     );
 }
 

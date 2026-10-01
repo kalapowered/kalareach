@@ -3197,6 +3197,37 @@ impl Session {
         }
     }
 
+    /// Tells one attachment to begin again, after it has been sent what this batch owes it.
+    ///
+    /// A stream that has been told to resynchronise is sent nothing more, so an effect this batch
+    /// completed for the attachment is delivered first, while its stream still takes them: the
+    /// byte that ends a sequence can also be the byte that makes the attachment begin again, and
+    /// the screen it installs next carries no effect. The spans of this batch are not owed to it,
+    /// because what it installs covers them, so only effects are taken out of `effects` here.
+    fn begin_again(
+        &mut self,
+        attachment_id: AttachmentId,
+        next: u64,
+        oldest: u64,
+        effects: &mut Vec<OwedEffect>,
+        resynchronised: &mut Vec<AttachmentId>,
+    ) {
+        let (owed, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(effects).into_iter().partition(|owed| {
+                matches!(
+                    owed.effect.destination,
+                    SideEffectDestination::Attachment { id, .. } if id == attachment_id
+                )
+            });
+        *effects = rest;
+        for owed in &owed {
+            self.deliver_effect(owed, oldest, resynchronised);
+        }
+        self.hub
+            .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+        resynchronised.push(attachment_id);
+    }
+
     /// Delivers one side effect to the attachment it was routed to, or records it.
     ///
     /// The destination is the attachment that held the input lease, at the epoch it held it, when
@@ -3278,6 +3309,7 @@ impl Session {
         let oldest = self.history.oldest_retained_cursor();
         let next = self.history.next_cursor();
         let mut resynchronised = Vec::new();
+        let mut effects = std::mem::take(&mut filtered.effects);
 
         let projecting: std::collections::BTreeSet<AttachmentId> =
             projected.iter().map(|(id, _)| *id).collect();
@@ -3293,9 +3325,13 @@ impl Session {
                 // become projected is installed from a snapshot rather than continued from a
                 // screen it was drawn in another form.
                 self.projections.forget(attachment_id);
-                self.hub
-                    .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
-                resynchronised.push(attachment_id);
+                self.begin_again(
+                    attachment_id,
+                    next,
+                    oldest,
+                    &mut effects,
+                    &mut resynchronised,
+                );
             }
         }
         // A projection reset, or a span the engine cleared that this host could no longer produce,
@@ -3320,24 +3356,27 @@ impl Session {
                     self.projections.forget(attachment_id);
                     continue;
                 }
-                self.hub
-                    .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
-                resynchronised.push(attachment_id);
+                self.begin_again(
+                    attachment_id,
+                    next,
+                    oldest,
+                    &mut effects,
+                    &mut resynchronised,
+                );
             }
         }
 
         // One ordered stream. The spans a terminal may take and the side effects that belong to
         // the lease holder are two views of the same output, and the holder receives both, so they
         // are published in the order the application produced them.
-        let mut pieces: Vec<Piece> =
-            Vec::with_capacity(filtered.direct.len() + filtered.effects.len());
+        let mut pieces: Vec<Piece> = Vec::with_capacity(filtered.direct.len() + effects.len());
         pieces.extend(
             filtered
                 .direct
                 .into_iter()
                 .map(|(cursor, bytes)| Piece::Span(cursor, bytes)),
         );
-        pieces.extend(filtered.effects.into_iter().map(Piece::Effect));
+        pieces.extend(effects.into_iter().map(Piece::Effect));
         pieces.sort_by_key(Piece::order);
         for piece in pieces {
             match piece {

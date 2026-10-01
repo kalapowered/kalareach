@@ -144,10 +144,6 @@ pub struct Outcome {
     pub live_effects: usize,
     /// Everything that did not hold.
     pub failures: Vec<Failure>,
-    /// Side effects owed to a lease holder that the session told to begin again on the byte that
-    /// completed them, and that never reached it. They are kept apart from the failures, because
-    /// they are one known behaviour of the session with a test of its own.
-    pub lost: Vec<Failure>,
 }
 
 impl Outcome {
@@ -216,9 +212,6 @@ pub struct Delivered {
 pub struct Account {
     /// Owed effects the terminal never performed, and effects it performed that nobody owed it.
     pub failures: Vec<String>,
-    /// Owed effects it never performed that were completed by the very byte at which the session
-    /// told it to begin again: [`Outcome::lost`].
-    pub lost: Vec<String>,
 }
 
 /// Follows each owed side effect to the delivery that performed it.
@@ -226,11 +219,11 @@ pub struct Account {
 /// An occurrence is matched by the cursor it is delivered at, which is where its sequence began, and
 /// by what it is, so two equal effects are never taken for each other; and the deliveries are
 /// matched in the order the effects were caused, because a terminal that performed two clipboard
-/// writes the other way round ends up holding the wrong one. An owed effect with no match is lost
-/// when a resynchronisation was requested at the cursor that completed it, and a failure otherwise;
-/// a delivery that matches no owed effect is a failure.
+/// writes the other way round ends up holding the wrong one. An owed effect with no match is a
+/// failure, wherever the session told the client to begin again; so is a delivery that matches no
+/// owed effect.
 #[must_use]
-pub fn account(owed: &[Caused], delivered: &[Delivered], resyncs_at: &[u64]) -> Account {
+pub fn account(owed: &[Caused], delivered: &[Delivered]) -> Account {
     let mut used = vec![false; delivered.len()];
     let mut found = Account::default();
     // The first delivery a later effect may be matched to.
@@ -253,11 +246,7 @@ pub fn account(owed: &[Caused], delivered: &[Delivered], resyncs_at: &[u64]) -> 
                      completed at byte {} while it held the lease",
                     effect.kind, effect.at, effect.completed_at
                 );
-                if resyncs_at.contains(&effect.completed_at) {
-                    found.lost.push(what);
-                } else {
-                    found.failures.push(what);
-                }
+                found.failures.push(what);
             }
         }
     }
@@ -303,8 +292,6 @@ struct Client {
     restoring: Vec<String>,
     /// Side effects the terminal performed from the live stream.
     live: Vec<Delivered>,
-    /// The cursors the session named when it told this client to begin again.
-    resyncs_at: Vec<u64>,
     ended: bool,
     /// Where the client left, once it has.
     left_at: Option<usize>,
@@ -583,7 +570,6 @@ pub fn run(corpus: &Corpus, strategy: Strategy) -> Result<Outcome, String> {
         outcome.restorations += stage.outcome.restorations;
         outcome.live_effects += stage.outcome.live_effects;
         outcome.failures.append(&mut stage.outcome.failures);
-        outcome.lost.append(&mut stage.outcome.lost);
     }
     Ok(outcome)
 }
@@ -706,7 +692,6 @@ impl Stage {
             served: Served::Nothing,
             restoring: Vec::new(),
             live: Vec::new(),
-            resyncs_at: Vec::new(),
             ended: false,
             left_at: None,
             epoch,
@@ -837,10 +822,9 @@ impl Stage {
                     }
                 }
                 OutputDelivery::Projection { event, .. } => self.projected(client, *event)?,
-                OutputDelivery::Resync(marker) => {
+                OutputDelivery::Resync(_) => {
                     // As the command does: the screen it held is no longer the session, so it asks
                     // for the session's screen again, on the same attachment, from no cursor.
-                    client.resyncs_at.push(marker.cursor.get());
                     self.subscribe(client)?;
                 }
                 OutputDelivery::Detached | OutputDelivery::Closed(_) => {
@@ -1000,7 +984,7 @@ impl Stage {
                 .cloned()
                 .collect();
             self.outcome.live_effects += owed.len();
-            let found = account(&owed, &client.live, &client.resyncs_at);
+            let found = account(&owed, &client.live);
             let failure = |what: String| Failure {
                 property: Property::LiveEffect,
                 attached_at: client.attached_at,
@@ -1011,9 +995,6 @@ impl Stage {
             self.outcome
                 .failures
                 .extend(found.failures.into_iter().map(failure));
-            self.outcome
-                .lost
-                .extend(found.lost.into_iter().map(failure));
         }
         self.clients = clients;
     }
@@ -1270,43 +1251,46 @@ mod tests {
     }
 
     #[test]
-    fn an_owed_effect_lost_at_a_resynchronisation_is_kept_apart_and_nothing_else_is() {
-        // Two bells owed; the first completed at the byte the session told the client to begin
-        // again at, the second at another. Neither was performed.
-        let found = account(&[bell(9, 10), bell(19, 20)], &[], &[10]);
-        assert_eq!(found.lost.len(), 1, "{found:?}");
-        assert!(found.lost[0].contains("completed at byte 10"), "{found:?}");
-        assert_eq!(found.failures.len(), 1, "the other one fails: {found:?}");
+    fn an_owed_effect_the_terminal_never_performed_fails_wherever_it_was_completed() {
+        // Two bells owed and neither performed: each is a failure, whatever else was happening at
+        // the byte that completed it.
+        let found = account(&[bell(9, 10), bell(19, 20)], &[]);
+        assert_eq!(found.failures.len(), 2, "{found:?}");
         assert!(
-            found.failures[0].contains("completed at byte 20"),
+            found.failures[0].contains("completed at byte 10"),
+            "{found:?}"
+        );
+        assert!(
+            found.failures[1].contains("completed at byte 20"),
             "{found:?}"
         );
     }
 
     #[test]
-    fn an_effect_nobody_owed_fails_even_beside_one_that_was_lost() {
+    fn an_effect_nobody_owed_fails_beside_one_that_was_not_performed() {
         let delivered = [Delivered {
             cursor: 30,
             kind: SideEffectKind::Bell,
         }];
-        let found = account(&[bell(9, 10)], &delivered, &[10]);
-        assert_eq!(found.lost.len(), 1, "{found:?}");
-        assert_eq!(found.failures.len(), 1, "{found:?}");
+        let found = account(&[bell(9, 10)], &delivered);
+        assert_eq!(found.failures.len(), 2, "{found:?}");
         assert!(
-            found.failures[0].contains("delivery at byte 30"),
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("delivery at byte 30")),
             "{found:?}"
         );
     }
 
     #[test]
     fn two_equal_effects_are_told_apart_by_where_they_were_delivered() {
-        // The second bell arrived; the first did not, and no resynchronisation explains it.
+        // The second bell arrived; the first did not.
         let delivered = [Delivered {
             cursor: 19,
             kind: SideEffectKind::Bell,
         }];
-        let found = account(&[bell(9, 10), bell(19, 20)], &delivered, &[]);
-        assert!(found.lost.is_empty(), "{found:?}");
+        let found = account(&[bell(9, 10), bell(19, 20)], &delivered);
         assert_eq!(found.failures.len(), 1, "{found:?}");
         assert!(found.failures[0].contains("began at byte 9"), "{found:?}");
     }
@@ -1335,9 +1319,7 @@ mod tests {
         let found = account(
             &[first.clone(), second.clone()],
             &[performed(&second), performed(&first)],
-            &[],
         );
-        assert!(found.lost.is_empty(), "{found:?}");
         assert!(
             found
                 .failures
@@ -1348,27 +1330,30 @@ mod tests {
         let in_order = account(
             &[first.clone(), second.clone()],
             &[performed(&first), performed(&second)],
-            &[],
         );
         assert_eq!(in_order, Account::default());
     }
 
     #[test]
-    fn a_reversed_pair_fails_beside_an_effect_that_was_lost() {
+    fn a_reversed_pair_fails_beside_an_effect_that_was_not_performed() {
         let (first, second) = (clipboard("first", 10), clipboard("second", 20));
         let found = account(
             &[bell(4, 5), first.clone(), second.clone()],
             &[performed(&second), performed(&first)],
-            &[5],
         );
-        assert_eq!(found.lost.len(), 1, "the bell is lost: {found:?}");
-        assert!(found.lost[0].contains("completed at byte 5"), "{found:?}");
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("completed at byte 5")),
+            "the bell fails: {found:?}"
+        );
         assert!(
             found
                 .failures
                 .iter()
                 .any(|failure| failure.contains("out of the order")),
-            "the reversal still fails: {found:?}"
+            "the reversal fails too: {found:?}"
         );
     }
 
