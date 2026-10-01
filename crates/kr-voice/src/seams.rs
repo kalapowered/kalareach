@@ -235,9 +235,17 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
 /// own clock. An effect that happens after it is an effect nobody holds a window for. The
 /// coordinator cannot read that clock — it is the host's, and it is not the wall clock a voice
 /// deadline is written in — so it asks the host the question instead of converting the answer.
+///
+/// The answer is the host's own refusal when it is no, with its own code and its own words: a
+/// fence the host owes, a registration it has replaced or a deadline that has passed are three
+/// different things for a caller to be told, and the coordinator carries the one it was given.
 pub trait Admission: Send + Sync + fmt::Debug {
-    /// Returns true while the change may still reach its effect.
-    fn still_admitted(&self) -> bool;
+    /// Says whether the change may still reach its effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal when the change may not.
+    fn still_admitted(&self) -> std::result::Result<(), kr_protocol::error::ProtocolError>;
 }
 
 /// An admission that never runs out, for a caller with no window of its own.
@@ -245,8 +253,8 @@ pub trait Admission: Send + Sync + fmt::Debug {
 pub struct Unbounded;
 
 impl Admission for Unbounded {
-    fn still_admitted(&self) -> bool {
-        true
+    fn still_admitted(&self) -> std::result::Result<(), kr_protocol::error::ProtocolError> {
+        Ok(())
     }
 }
 
