@@ -16,9 +16,19 @@
 //! rows with their renditions and hyperlinks, the current title, the saved cursor of the buffer
 //! that is showing, the buffer that is not, and the cursor.
 //!
-//! The buffer that is not showing is painted by switching to it with `?47` and back before the
-//! active buffer is drawn: `?47` moves between the two without clearing either, which `?1047` and
-//! `?1049` do not.
+//! The buffer that is not showing is painted by switching to it with `?1049` and back, before
+//! anything else is installed. Entering through `?1049` clears the buffer it enters and leaving
+//! keeps it, so the other buffer is empty when it is painted and the buffer that is showing is
+//! painted afterwards. Mode 47, which would switch without clearing, is not one of the modes
+//! kr-vt/1 tracks, so a restoration never asks a terminal for it.
+//!
+//! `?1049` saves the cursor on the way in and restores it on the way out, and the restore turns
+//! line-feed/new-line mode and shift-out off on some terminals. So the switches come before
+//! anything that would be undone, and what they leave saved is what the session has saved. When the
+//! primary buffer is the one that is showing, the other buffer is painted right after the soft reset
+//! that opens the restoration, and the reset is repeated: the repeat forgets the cursor that
+//! entering the other buffer saved, as a session that never saved one has none. When the alternate
+//! buffer is showing, the switch back into it saves the plain state.
 //!
 //! What a byte stream still cannot carry is named here rather than approximated, and every one of
 //! them is counted in [`Restoration::carried`] rather than left for a caller to discover:
@@ -164,6 +174,22 @@ pub fn render(
 ) -> Restoration {
     let mut writer = Writer::new(viewport, keyboard);
     writer.scope = scope;
+    // The rows of the buffer that is not showing are painted before the operations that carry them,
+    // at the point the buffer that is showing makes it safe.
+    writer.selected = operations
+        .iter()
+        .find_map(|operation| match operation {
+            RestoreOp::SelectBuffer { buffer } => Some(*buffer),
+            _ => None,
+        })
+        .unwrap_or(ActiveBuffer::Primary);
+    writer.inactive = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            RestoreOp::PaintInactiveRow { row } => Some(row.clone()),
+            _ => None,
+        })
+        .collect();
     for operation in operations {
         writer.apply(operation);
     }
@@ -187,6 +213,8 @@ struct Writer {
     /// How much of the screen this caller's authority reaches.
     scope: Scope,
     active: ActiveBuffer,
+    /// The buffer the restoration makes the one that is showing.
+    selected: ActiveBuffer,
     /// The rendition the terminal is in, once this writer has put it in one.
     ///
     /// `None` until something sets it. A writer that assumed the terminal started plain would skip
@@ -222,6 +250,7 @@ impl Writer {
             viewport,
             scope: Scope::WholeScreen,
             active: ActiveBuffer::Primary,
+            selected: ActiveBuffer::Primary,
             pen: None,
             link: None,
             link_is_the_snapshots: false,
@@ -240,6 +269,12 @@ impl Writer {
         if self.link.is_some() && !self.link_is_the_snapshots {
             self.close_link();
         }
+        // Rows of the other buffer that no switch painted, because the operations never selected a
+        // buffer, are what this restoration did not carry, not what it quietly left out.
+        self.carried.inactive_rows = self
+            .carried
+            .inactive_rows
+            .saturating_add(self.inactive.len());
         Restoration {
             bytes: self.out,
             carried: self.carried,
@@ -256,6 +291,16 @@ impl Writer {
                 // A soft reset leaves the terminal in the default rendition, which is a fact about
                 // the terminal rather than an assumption about it.
                 self.pen = Some(Rendition::default());
+                if self.selected == ActiveBuffer::Primary {
+                    // The other buffer is painted from here, in the terminal the reset has just
+                    // put in order, and the reset is repeated: it forgets the cursor that going
+                    // into the other buffer saved, which the session has no counterpart of.
+                    if !self.inactive.is_empty() {
+                        self.paint_inactive_buffer();
+                        self.csi(b"!p");
+                        self.pen = Some(Rendition::default());
+                    }
+                }
                 self.erase(b"2J");
                 self.csi(b"H");
             }
@@ -269,6 +314,9 @@ impl Writer {
                     ActiveBuffer::Primary => self.csi(b"?1049l"),
                     ActiveBuffer::Alternate => self.csi(b"?1049h"),
                 }
+                // Before the palette, the modes and everything else a switch could undo. A
+                // restoration that shows the primary buffer has painted the other one by now.
+                self.paint_inactive_buffer();
             }
             RestoreOp::SetPalette { palette } => self.palette(palette),
             RestoreOp::SetMode { entry } => {
@@ -316,14 +364,11 @@ impl Writer {
             RestoreOp::SetCharsets { charsets } => self.charsets = Some(charsets.clone()),
             // Held back until the rows are painted; see the field's own note.
             RestoreOp::SetMargins { margins } => self.margins = Some(*margins),
-            // Held back. The rows of the buffer that is not showing are painted in one run, by
-            // switching to that buffer and back before the active buffer is painted, so the screen
-            // this restoration is drawing is never left half drawn while the other one is filled.
-            RestoreOp::PaintInactiveRow { row } => self.inactive.push(row.clone()),
-            RestoreOp::PaintRow { row } => {
-                self.paint_inactive_buffer();
-                self.paint(row);
-            }
+            // Already taken: the rows of the buffer that is not showing are painted in one run at
+            // the switch to the buffer that is, so the screen this restoration is drawing is never
+            // left half drawn while the other one is filled.
+            RestoreOp::PaintInactiveRow { .. } => {}
+            RestoreOp::PaintRow { row } => self.paint(row),
             // Inert metadata. The runs of each row carry the link they belong to, and this writer
             // opens and closes it around them, so a terminal already has every range this names.
             RestoreOp::RecordHyperlink { .. } => {}
@@ -743,9 +788,12 @@ impl Writer {
 
     /// Paints the buffer that is not showing, by switching to it and back.
     ///
-    /// `?47` switches without clearing either buffer, which `?1047` and `?1049` do not: entering
-    /// through one of those would empty the buffer this is about to fill. Nothing else about the
-    /// screen changes, and the active buffer is painted afterwards.
+    /// Entering through `?1049` clears the buffer it enters and leaving keeps it, so the other buffer
+    /// is empty when its rows are painted and holds them afterwards. It saves the cursor going in
+    /// and restores it coming out. When the alternate buffer is the one that is showing, the way
+    /// back into it saves the cursor too, and a later `?1049l` from the application restores that,
+    /// so the terminal is put in the plain state first: whatever painting the other buffer's rows
+    /// left in the pen and at the cursor is not what the application saved.
     fn paint_inactive_buffer(&mut self) {
         if self.inactive.is_empty() {
             return;
@@ -764,8 +812,8 @@ impl Writer {
         // against, so this writer's idea of what the terminal is in goes with it, in both
         // directions.
         self.csi(match active {
-            ActiveBuffer::Primary => b"?47h",
-            ActiveBuffer::Alternate => b"?47l",
+            ActiveBuffer::Primary => b"?1049h",
+            ActiveBuffer::Alternate => b"?1049l",
         });
         self.active = match active {
             ActiveBuffer::Primary => ActiveBuffer::Alternate,
@@ -788,10 +836,19 @@ impl Writer {
             self.paint(row);
         }
         self.viewport = window;
+        if active == ActiveBuffer::Alternate {
+            // The switch back into the alternate buffer saves the cursor: the plain pen, no link
+            // open, and the cursor at home.
+            if self.link.is_some() {
+                self.close_link();
+            }
+            self.rendition(Rendition::default());
+            self.csi(b"H");
+        }
         // And back, before anything of the active buffer is drawn.
         self.csi(match active {
-            ActiveBuffer::Primary => b"?47l",
-            ActiveBuffer::Alternate => b"?47h",
+            ActiveBuffer::Primary => b"?1049l",
+            ActiveBuffer::Alternate => b"?1049h",
         });
         self.active = active;
         self.pen = None;
@@ -1481,14 +1538,49 @@ mod tests {
         assert_eq!(rendered.bytes, b"\x1b[0;1;91;48:2::1:2:3m".to_vec());
     }
 
+    /// The positions of every `CSI ? n h` and `CSI ? n l` in `bytes`, with the mode and which it is.
+    fn dec_switches(bytes: &[u8]) -> Vec<(usize, u16, bool)> {
+        let mut found = Vec::new();
+        let mut at = 0;
+        while at + 3 < bytes.len() {
+            if bytes[at..].starts_with(b"\x1b[?") {
+                let digits: String = bytes[at + 3..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .map(|byte| char::from(*byte))
+                    .collect();
+                let end = at + 3 + digits.len();
+                if let (Ok(mode), Some(last)) = (digits.parse::<u16>(), bytes.get(end))
+                    && (*last == b'h' || *last == b'l')
+                {
+                    found.push((at, mode, *last == b'h'));
+                }
+            }
+            at += 1;
+        }
+        found
+    }
+
+    fn lnm() -> RestoreOp {
+        RestoreOp::SetMode {
+            entry: ModeEntry {
+                kind: kr_term::modes::ModeKind::Ansi,
+                mode: 20,
+                enabled: true,
+            },
+        }
+    }
+
     #[test]
-    fn the_buffer_that_is_not_showing_is_painted_before_the_one_that_is() {
-        // `?47` switches without clearing either buffer, so the screen this restoration is drawing
-        // is never emptied to fill the other one.
+    fn the_buffer_that_is_not_showing_is_painted_through_1049_straight_after_the_switch() {
+        // Entering the other buffer through mode 1049 clears it and leaving keeps it, so the buffer
+        // that is showing is never emptied to fill the other one. The profile tracks 1049 and does not
+        // track 47, which is what a restoration may not ask a terminal for.
         let operations = vec![
             RestoreOp::SelectBuffer {
                 buffer: ActiveBuffer::Alternate,
             },
+            lnm(),
             RestoreOp::PaintInactiveRow {
                 row: row(0, 0, "shell"),
             },
@@ -1503,18 +1595,188 @@ mod tests {
             Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
-        let into_primary = text
-            .find("\x1b[?47l")
-            .expect("switches to the other buffer");
+        let switches: Vec<(u16, bool)> = dec_switches(&rendered.bytes)
+            .into_iter()
+            .map(|(_, mode, set)| (mode, set))
+            .collect();
+        assert_eq!(
+            switches,
+            vec![(1049, true), (1049, false), (1049, true)],
+            "into the alternate buffer, out to the other one, and back: {text:?}"
+        );
+        let positions: Vec<usize> = dec_switches(&rendered.bytes)
+            .into_iter()
+            .map(|(at, _, _)| at)
+            .collect();
         let shell = text.find("shell").expect("the other buffer is painted");
-        let back = text.rfind("\x1b[?47h").expect("switches back");
         let application = text
             .find("application")
             .expect("the active buffer is painted");
-        assert!(into_primary < shell, "{text:?}");
-        assert!(shell < back, "{text:?}");
-        assert!(back < application, "{text:?}");
+        assert!(positions[1] < shell && shell < positions[2], "{text:?}");
+        assert!(positions[2] < application, "{text:?}");
         assert_eq!(rendered.carried.inactive_rows, 0);
+    }
+
+    #[test]
+    fn the_other_buffer_is_painted_before_any_state_a_switch_would_undo() {
+        // Leaving the alternate buffer restores the cursor, which turns line-feed/new-line mode off
+        // on the terminals of the xterm family, so every mode is installed after the switches.
+        for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
+            let operations = vec![
+                RestoreOp::SelectBuffer { buffer: active },
+                lnm(),
+                RestoreOp::PaintInactiveRow {
+                    row: row(0, 0, "other"),
+                },
+                RestoreOp::PaintRow {
+                    row: row(0, 0, "showing"),
+                },
+            ];
+            let rendered = render(
+                &operations,
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+            let last_switch = dec_switches(&rendered.bytes)
+                .into_iter()
+                .map(|(at, _, _)| at)
+                .max()
+                .expect("a switch");
+            let mode = text.find("\x1b[20h").expect("line-feed mode is installed");
+            assert!(mode > last_switch, "{active:?}: {text:?}");
+            assert!(text.find("other").expect("painted") < mode, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_saved_cursor_the_other_buffer_is_painted_through_holds_the_plain_state() {
+        // Entering the alternate buffer through 1049 saves the cursor, and the application's own
+        // leaving restores it. What is saved must be the plain state, not wherever painting the rows
+        // of the other buffer left the cursor and the pen.
+        let coloured = GridRow {
+            stable_id: 0,
+            soft_wrapped: false,
+            truncated: false,
+            runs: vec![Run {
+                text: "red".to_owned(),
+                column: 3,
+                cells: 3,
+                rendition: Rendition {
+                    bold: true,
+                    foreground: Colour::Indexed(1),
+                    ..Rendition::default()
+                },
+                hyperlink: None,
+            }],
+        };
+        let operations = vec![
+            RestoreOp::SelectBuffer {
+                buffer: ActiveBuffer::Alternate,
+            },
+            RestoreOp::PaintInactiveRow { row: coloured },
+            RestoreOp::PaintRow {
+                row: row(0, 0, "application"),
+            },
+        ];
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let enter = dec_switches(&rendered.bytes)
+            .into_iter()
+            .filter(|(_, mode, set)| *mode == 1049 && *set)
+            .map(|(at, _, _)| at)
+            .nth(1)
+            .expect("the switch back into the alternate buffer");
+        let before = &rendered.bytes[..enter];
+        assert!(
+            before.ends_with(b"\x1b[0m\x1b[H"),
+            "plain pen and home before it saves the cursor: {:?}",
+            String::from_utf8_lossy(&rendered.bytes[enter.saturating_sub(20)..enter + 8])
+        );
+    }
+
+    #[test]
+    fn a_cursor_saved_going_into_the_other_buffer_is_forgotten_when_the_primary_buffer_shows() {
+        // The session has no saved cursor, so the terminal must not be left holding one: the soft
+        // reset forgets what entering the other buffer saved, and it comes after the last such entry.
+        let operations = vec![
+            RestoreOp::ResetProjection { generation: 1 },
+            RestoreOp::SelectBuffer {
+                buffer: ActiveBuffer::Primary,
+            },
+            RestoreOp::PaintInactiveRow {
+                row: row(0, 0, "other"),
+            },
+            RestoreOp::PaintRow {
+                row: row(0, 0, "showing"),
+            },
+        ];
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        let last_entry = dec_switches(&rendered.bytes)
+            .into_iter()
+            .filter(|(_, mode, set)| *mode == 1049 && *set)
+            .map(|(at, _, _)| at)
+            .max()
+            .expect("the other buffer is entered");
+        let last_reset = text.rfind("\x1b[!p").expect("a soft reset");
+        assert!(last_entry < last_reset, "{text:?}");
+        assert!(
+            text.find("other").expect("painted") < last_reset,
+            "{text:?}"
+        );
+        assert!(
+            text.find("showing").expect("painted") > last_reset,
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_restoration_asks_a_terminal_only_for_modes_the_profile_tracks() {
+        // Section 8 gives kr-vt/1 a list of DEC modes, and a mode outside it is consumed by the
+        // engine without effect. A restoration written for the profile never switches one.
+        for active in [ActiveBuffer::Primary, ActiveBuffer::Alternate] {
+            let operations = vec![
+                RestoreOp::ResetProjection { generation: 1 },
+                RestoreOp::SelectBuffer { buffer: active },
+                RestoreOp::SetMode {
+                    entry: ModeEntry {
+                        kind: kr_term::modes::ModeKind::Dec,
+                        mode: 2004,
+                        enabled: true,
+                    },
+                },
+                RestoreOp::PaintInactiveRow {
+                    row: row(0, 0, "other"),
+                },
+                RestoreOp::PaintRow {
+                    row: row(0, 0, "showing"),
+                },
+            ];
+            let rendered = render(
+                &operations,
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            for (_, mode, _) in dec_switches(&rendered.bytes) {
+                assert!(
+                    kr_term::classify::TRACKED_DEC_MODES.contains(&mode),
+                    "mode {mode} is not one the profile tracks, in {:?}",
+                    String::from_utf8_lossy(&rendered.bytes)
+                );
+            }
+        }
     }
 
     #[test]

@@ -1114,6 +1114,12 @@ negotiation of the buffer that is not showing, the virtual title stack, soft-wra
 right-hand side of a row wider than the window, and a pending wrap on a row outside that window —
 and `Session::restoration_losses` is the count.
 
+The buffer that is not showing is painted by entering it through mode 1049, which clears it, and
+leaving it, which keeps it, before anything else is installed: leaving restores the cursor and turns
+line-feed/new-line mode off on some terminals, so a mode installed first would be undone. Mode 47 is
+not one the profile tracks, so a restoration never asks a terminal for it. What the switches save is
+what the session has saved: nothing, when it has no saved cursor.
+
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
 the input lease has no destination, so it becomes a durable host event in the worker's own journal

@@ -4,9 +4,10 @@
 //! It is one terminal: one engine of the profile, whose two buffers share one cursor, one pen, one
 //! set of modes, one title and one palette, as a terminal of the xterm family keeps them. The
 //! profile does not include DEC mode 47 (section 8 lists the modes it does, and the engine consumes
-//! a request for one it does not), and a restoration switches buffers with it, so the model reads
-//! the two mode-47 switches itself and hands the engine what the pinned terminal library does for
-//! each:
+//! a request for one it does not), and a restoration is written for the profile, so it never asks for
+//! it. A terminal of the xterm family does switch with it, so the model reads the two mode-47
+//! switches itself and hands the engine what the pinned terminal library does for each, which draws a
+//! restoration that did ask for one as such a terminal would; the restoration checks name it:
 //!
 //! | Sequence | What the library does | What the engine is handed |
 //! | --- | --- | --- |
