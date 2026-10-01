@@ -6531,7 +6531,11 @@ fn pair_phone(
     controller: &Controller,
     byte: u8,
     sessions: SessionSelector,
-) -> (DeviceId, PushSenderRecordId) {
+) -> (
+    DeviceId,
+    PushSenderRecordId,
+    kr_crypto::keys::NotificationPreviewKeyPair,
+) {
     let device_id = DeviceId::new(uuid(byte));
     let grant = Grant {
         grant_id: GrantId::new(uuid(byte.wrapping_add(100))),
@@ -6589,7 +6593,7 @@ fn pair_phone(
             sender_record_id: sender,
             ..current_credential(now)
         });
-    (device_id, sender)
+    (device_id, sender, preview)
 }
 
 /// Waits, on a condition and nothing else, until `holds`.
@@ -6663,15 +6667,15 @@ fn delivered_to(gateway: &DeliveringGateway) -> Vec<PushSenderRecordId> {
 async fn an_item_raised_in_the_attention_store_is_delivered_to_each_device_its_grant_reaches() {
     let (_temp, controller) = start_controller().await;
     let session_id = SessionId::new(uuid(60));
-    let (_, first) = pair_phone(&controller, 10, SessionSelector::Any);
-    let (_, second) = pair_phone(
+    let (_, first, _) = pair_phone(&controller, 10, SessionSelector::Any);
+    let (_, second, _) = pair_phone(
         &controller,
         11,
         SessionSelector::These {
             session_ids: [session_id].into_iter().collect(),
         },
     );
-    let (_, elsewhere) = pair_phone(
+    let (_, elsewhere, _) = pair_phone(
         &controller,
         12,
         SessionSelector::These {
@@ -6828,7 +6832,7 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
     let host = net_support::Host::start_unowned().await;
     let controller = host.controller();
     let session_id = SessionId::new(uuid(60));
-    let (device_id, _) = pair_phone(controller, 10, SessionSelector::Any);
+    let (device_id, _, _) = pair_phone(controller, 10, SessionSelector::Any);
     let gateway = Arc::new(DeliveringGateway::default());
     assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
         Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
@@ -6982,4 +6986,165 @@ async fn a_journal_that_cannot_list_what_left_says_so_rather_than_listing_nothin
         report.exported
     );
     host.stop().await;
+}
+
+/// Every byte of the delivery journal's files, as the disk holds them.
+fn journal_bytes(host: &net_support::Host) -> Vec<u8> {
+    let state = host.tree().environment().state_dir().to_path_buf();
+    [
+        "delivery.sqlite3",
+        "delivery.sqlite3-wal",
+        "delivery.sqlite3-shm",
+    ]
+    .into_iter()
+    .filter_map(|name| std::fs::read(state.join(name)).ok())
+    .flatten()
+    .collect()
+}
+
+fn holds_text(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+/// KR-REQ-18.08, KR-REQ-16.13: a pending approval's words are a session's text, which the
+/// attention store keeps no copy of and a notification never holds. After a delivery the journal's
+/// files and the preview the device opens hold none of them: the preview carries the host's own
+/// words, and for an approval there are none. The premise is checked: the announcement's text is a
+/// record of the session, not words of the host's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivered_approval_leaves_none_of_the_session_text_in_the_journal_or_the_preview() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(60));
+    let (_, _, device_preview) = pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, "req-write-hosts")])
+        .expect("the store records the approval");
+    // The premise: the item's words are read from the session's record when they are served.
+    let record_text = controller
+        .attention()
+        .take_for_delivery(|store, _| {
+            store
+                .engine()
+                .expect("the store is this owner's")
+                .items()
+                .all(|item| matches!(item.text, kr_attention::engine::Text::Record(_)))
+        })
+        .expect("the store is taken");
+    assert!(record_text, "an approval's text is the session's record");
+    until_holds("the notification being accepted", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::Accepted))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+
+    let sent = requests_to(&gateway);
+    assert_eq!(sent.len(), 1);
+    let host_preview = controller
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let body = kr_delivery::preview::open_preview(
+        &device_preview,
+        &host_preview,
+        sent[0].preview.as_ref().expect("a preview"),
+        kr_ipc::now_ms().get(),
+    )
+    .expect("the device opens its own preview");
+    assert_eq!(
+        body.summary, "",
+        "the host has no words of its own for an approval"
+    );
+    let opened = format!("{body:?}");
+    let bytes = journal_bytes(&host);
+    for text in ["write /etc/hosts"] {
+        assert!(!opened.contains(text), "the preview holds {text}");
+        assert!(!holds_text(&bytes, text), "the journal holds {text}");
+    }
+    host.stop().await;
+}
+
+/// KR-REQ-24.27, KR-REQ-18.08: privacy mode turned on between the take and the send sends nothing:
+/// the notification the feed produced and no transport has presented yet is taken back at the
+/// boundary, and the gateway is never asked about it. The control: with privacy mode left off, the
+/// same notification is presented once a transport is attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_turned_on_between_the_take_and_the_send_sends_nothing() {
+    for private in [false, true] {
+        let host = net_support::Host::start_unowned().await;
+        let controller = host.controller();
+        let session_id = SessionId::new(uuid(60));
+        pair_phone(controller, 10, SessionSelector::Any);
+        controller
+            .attention()
+            .observe(&[pending_approval_in(session_id, "req-write-hosts")])
+            .expect("the store records the approval");
+        // Taken and produced, and waiting for a transport.
+        until_holds("the notification being queued", || {
+            controller
+                .delivery()
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .deliveries()
+                        .expect("a read")
+                        .iter()
+                        .any(|record| record.state == DeliveryState::Admitted))
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        if private {
+            set_privacy(&host, true).await;
+        }
+        let gateway = Arc::new(DeliveringGateway::default());
+        assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+            Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+        ))));
+        let wanted = if private {
+            DeliveryState::Cancelled
+        } else {
+            DeliveryState::Accepted
+        };
+        until_holds_saying(
+            "the notification reaching its end",
+            || {
+                controller
+                    .delivery()
+                    .with(|producer| {
+                        Ok(producer
+                            .journal()
+                            .deliveries()
+                            .expect("a read")
+                            .iter()
+                            .any(|record| record.state == wanted))
+                    })
+                    .unwrap_or(false)
+            },
+            || journal_of(controller),
+        )
+        .await;
+        assert_eq!(
+            requests_to(&gateway).len(),
+            usize::from(!private),
+            "private {private}"
+        );
+        host.stop().await;
+    }
 }

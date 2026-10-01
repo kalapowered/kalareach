@@ -2701,6 +2701,83 @@ async fn text_held_across_a_commit_the_daemon_never_acknowledged_is_withheld() {
     );
 }
 
+/// A sender that meets `release_delivery`'s contract, for this test alone: no sender of this host
+/// does, because each hands its bytes to a transport that sends them later on its own. It sends a
+/// message in chunks, each chunk one transport write made through the release and nothing waited
+/// for inside it, and the message ends at the first chunk the release refuses: no later chunk is
+/// written, and what the transport already took is all there is of it. `before` runs ahead of each
+/// chunk, which is where a test lets the ticket lapse.
+async fn send_in_chunks(
+    module: &AttentionModule,
+    ticket: &kr_controller::attention::Ticket,
+    text: &str,
+    width: usize,
+    mut before: impl AsyncFnMut(usize),
+) -> (Vec<String>, bool) {
+    let mut sent = Vec::new();
+    for (index, chunk) in text.as_bytes().chunks(width).enumerate() {
+        before(index).await;
+        let chunk = String::from_utf8_lossy(chunk).into_owned();
+        match module.release_delivery(ticket, || chunk.clone()).await {
+            Some(written) => sent.push(written),
+            None => return (sent, false),
+        }
+    }
+    (sent, true)
+}
+
+/// KR-REQ-18.08, KR-REQ-24.11: a message that carries session text goes out through the daemon's
+/// release, one transport write at a time, and a ticket that lapses during the send ends the
+/// message: privacy mode is enabled between two chunks, and no chunk after it is written. The
+/// control: the same message with no change of privacy mode is written whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_sent_in_chunks_ends_at_the_chunk_the_ticket_lapses_before() {
+    for lapses in [false, true] {
+        let one = worker().await;
+        ask(&one, "r-1", "which branch?");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = store_at(&temp);
+        let reach = Arc::new(TestReach::default());
+        reach.add(&one);
+        module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+        let _ = with_text(&module, &reach).await;
+        let question =
+            kr_attention::EventCursor::in_session(one.session_id, AttentionSource::Questions, 1);
+        let (resolved, ticket) = module.delivery_texts(&*reach, &[question]).await;
+        let text = resolved[0].clone().expect("the question's words");
+        assert_eq!(text, "which branch?");
+
+        // The daemon stops answering, so the worker commits privacy mode only once the leases the
+        // text carries have ended: the ticket lapses, and it is the commit that makes it.
+        let mut held = Vec::new();
+        let (sent, whole) = send_in_chunks(&module, &ticket, &text, 4, async |index| {
+            if lapses && index == 2 {
+                *reach.stalled.lock().expect("not poisoned") = Some(one.known.endpoint.as_text());
+                held.push(silent_daemon(&one).await);
+                let transition = one.service.raise_privacy_transition().await;
+                let _attention = enable(&one);
+                transition.settle().await;
+            }
+        })
+        .await;
+        drop(held);
+        if lapses {
+            assert_eq!(
+                sent,
+                vec!["whic", "h br"],
+                "what was written before the lapse"
+            );
+            assert!(
+                !whole,
+                "the message ended at the chunk the ticket lapsed before"
+            );
+        } else {
+            assert_eq!(sent.concat(), text, "the control: written whole");
+            assert!(whole);
+        }
+    }
+}
+
 /// KR-REQ-24.11: text in flight when privacy mode is enabled and the transition then fails. The
 /// acknowledged barrier withholds text the daemon holds; the worker's settling statement after a
 /// commit that did not happen lowers it at the generation it left, and that text goes again.
