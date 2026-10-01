@@ -253,19 +253,29 @@ fn unreadable(archive: &Archive) -> bool {
 }
 
 /// The archive reads a crashed session's journal whose receipts table has its root page
-/// overwritten as if nothing in it were damaged. It counts the receipts from indexes, and SQLite
-/// answers a count from an index without reading the table, so the archive never meets the damaged
-/// page: it reports three receipts and nothing unreadable, while the store's own check finds the
-/// damage and every receipt read fails. Section 24 asks for an explicit incomplete archive here.
-/// This test keeps a record of that behaviour; when the archive checks its store's pages, as the
-/// worker's own recovery does, it fails, and is replaced by one that the archive reports the
-/// journal unreadable.
+/// overwritten as one it cannot read. SQLite answers a plain count of a table from the narrowest of
+/// its indexes, so a count taken that way never meets the damaged page: it reports three receipts
+/// for a store whose own check finds the damage and in which every receipt read fails. Section 24
+/// asks for an explicit incomplete archive here, so the table is checked and counted from itself,
+/// the archive names the receipts table, and it claims no count the table has not stood behind.
+/// The same journal undamaged reads complete, with its three receipts.
 #[test]
-fn the_archive_reads_a_journal_whose_receipts_table_is_damaged_as_one_with_nothing_unreadable() {
+fn the_archive_reports_a_journal_whose_receipts_table_is_damaged_as_unreadable() {
     let (damaged, session_id) = in_a_host("damaged-receipts", Made::WithFault);
     let archive = archive_of(&damaged, session_id);
-    assert!(!unreadable(&archive), "{:?}", archive.incompleteness);
-    assert_eq!(archive.receipts, 3, "counted from an index");
+    assert!(
+        archive.incompleteness.iter().any(|reason| matches!(
+            reason,
+            Incompleteness::JournalUnreadable { detail }
+                if detail.contains("the receipts table cannot be read")
+        )),
+        "{:?}",
+        archive.incompleteness
+    );
+    assert_eq!(
+        archive.receipts, 0,
+        "no count is claimed for a table that cannot be read"
+    );
     let journal = Journal::open_read_only(damaged.environment().journal_database(session_id))
         .expect("the journal opens to be read");
     assert_ne!(
@@ -278,6 +288,11 @@ fn the_archive_reads_a_journal_whose_receipts_table_is_damaged_as_one_with_nothi
             .read(journal::actor().expect("the actor"), action(1))
             .is_err(),
         "and a receipt cannot be read"
+    );
+    assert_eq!(
+        journal.len().ok(),
+        Some(3),
+        "while the count from an index stays whole, which is why it is not the count reported"
     );
 
     let (control, session_id) = in_a_host("damaged-receipts", Made::AsControl);

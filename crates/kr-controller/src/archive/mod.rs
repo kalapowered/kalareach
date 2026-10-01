@@ -161,7 +161,8 @@ pub struct Archive {
     pub summary: Option<SessionSummary>,
     /// Its closure record, when one survived.
     pub closure: Option<ClosureRecord>,
-    /// How many receipts it still holds.
+    /// How many receipts it still holds, counted from the receipts table. It is nothing when that
+    /// table cannot be read, which [`Incompleteness::JournalUnreadable`] then says.
     pub receipts: u64,
     /// The oldest cursor of retained output that can still be served.
     pub oldest_retained_cursor: u64,
@@ -682,7 +683,9 @@ impl ArchiveService {
                 Err(error) => into.receipts_left_behind = Some(error.to_string()),
             }
         }
-        into.receipts_retained = journal.len().ok();
+        // What is left is told only when the table says so: a table that cannot be read leaves
+        // the figure unknown.
+        into.receipts_retained = journal.len_checked().ok();
     }
 
     /// Applies the output bounds that belong to the session: its age, on a clock the caller can
@@ -813,7 +816,11 @@ impl ArchiveService {
                         detail: error.to_string(),
                     }),
                 }
-                match journal.len() {
+                // Checked and counted from the table itself: the cheaper count comes from an
+                // index, which reads whole in a store whose receipts table does not, and a count
+                // the table has not stood behind is not one to report. A table that cannot be
+                // read leaves the count at nothing claimed and the archive incomplete.
+                match journal.len_checked() {
                     Ok(count) => archive.receipts = count,
                     Err(error) => incompleteness.push(Incompleteness::JournalUnreadable {
                         detail: error.to_string(),
