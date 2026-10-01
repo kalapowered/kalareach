@@ -1714,7 +1714,7 @@ mod tests {
                 program: "/bin/sh".to_owned(),
                 arguments: vec![
                     "-c".to_owned(),
-                    format!("cat \"$1\"; {then}"),
+                    format!("head -c 4 >/dev/null; cat \"$1\"; {then}"),
                     "sh".to_owned(),
                     answer
                         .to_str()
@@ -1940,7 +1940,7 @@ mod tests {
                 program: "/bin/sh".to_owned(),
                 arguments: vec![
                     "-c".to_owned(),
-                    "cat \"$1\"; i=0; while [ $i -lt 8 ]; do sleep 0.1; cat \"$2\"; i=$((i+1)); done; \
+                    "head -c 4 >/dev/null; cat \"$1\"; i=0; while [ $i -lt 8 ]; do sleep 0.1; cat \"$2\"; i=$((i+1)); done; \
                      cat \"$3\"; exec sleep 600"
                         .to_owned(),
                     "sh".to_owned(),
