@@ -136,6 +136,11 @@ struct Authority {
     /// There is one: a newer one replaces it, and a replacement generation fences it with the
     /// rest.
     attention_connection: Option<ConnectionId>,
+    /// The connection the control daemon reads this session's description facts over.
+    ///
+    /// There is one, bound as the attention connection is: a newer one replaces it, and a
+    /// replacement generation fences it with the rest.
+    descriptions_connection: Option<ConnectionId>,
     /// The authority revision the controller last announced and this worker acknowledged.
     acknowledged_revision: Option<kr_protocol::ids::AuthorityRevision>,
     /// A revision this worker was told about while it was inside a dispatch transition.
@@ -200,6 +205,9 @@ pub struct WorkerService {
     /// progress, the statements that tell the control daemon about it, and the leases of the text
     /// this worker has answered with.
     attention_fence: Arc<crate::attention_fence::AttentionFence>,
+    /// What this session was doing, as the control daemon's descriptions read it over the
+    /// descriptions connection. The session records into it; this serves it.
+    description_facts: crate::description_facts::DescriptionFacts,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
     /// The plugin admissions the control daemon handed this worker, as it read them.
@@ -234,6 +242,14 @@ pub struct WorkerService {
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     subscriptions_held: std::sync::atomic::AtomicUsize,
+    /// How many description facts requests this service is holding at this moment, waiting for a
+    /// fact to change, for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    facts_held: std::sync::atomic::AtomicUsize,
+    /// How many times a description facts request has begun to be held, in all, for the same
+    /// tests.
+    #[cfg(feature = "testing")]
+    facts_holds_begun: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkerService {
@@ -268,6 +284,12 @@ impl WorkerService {
     #[must_use]
     pub fn runtime(&self) -> &Arc<SessionRuntime> {
         &self.runtime
+    }
+
+    /// Returns what this session was doing, as the description facts record it.
+    #[must_use]
+    pub const fn description_facts(&self) -> &crate::description_facts::DescriptionFacts {
+        &self.description_facts
     }
 
     /// Returns this session's question ledger.
@@ -369,6 +391,10 @@ impl WorkerService {
             session_id,
             health,
         )?);
+        // What the broker decides about threads, events and prompts is recorded in the session's
+        // description facts as well.
+        let description_facts = runtime.session().description_facts();
+        broker.set_description_facts(description_facts.clone());
         // The broker is the bridge that says which launched agent a question's source belongs to
         // and the binding it asks under, so a switch it detects invalidates what was asked under
         // the binding it left.
@@ -410,6 +436,7 @@ impl WorkerService {
                 bound_connection: None,
                 proxy_connections: std::collections::BTreeSet::new(),
                 attention_connection: None,
+                descriptions_connection: None,
                 acknowledged_revision: None,
                 owed_revision: None,
             }),
@@ -421,6 +448,7 @@ impl WorkerService {
             attention_reader: Mutex::new(None),
             journal_changes,
             attention_fence,
+            description_facts,
             broker,
             plugin_admissions: Arc::new(crate::broker::catalogue::Admissions::new()),
             connector_sources: Arc::new(crate::broker::connectors::ConnectorSources::new()),
@@ -434,6 +462,10 @@ impl WorkerService {
             received: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            facts_held: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -740,6 +772,23 @@ impl WorkerService {
     #[must_use]
     pub fn subscriptions_held(&self) -> usize {
         self.subscriptions_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many description facts requests this service is holding at this moment, for the host
+    /// crates' own tests: a test makes its change once the request it means to be held is.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn held_facts_requests(&self) -> usize {
+        self.facts_held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times a description facts request has begun to be held, in all, for the host
+    /// crates' own tests: a request that replaced another is one more.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn facts_holds_begun(&self) -> usize {
+        self.facts_holds_begun
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1150,6 +1199,35 @@ impl WorkerService {
                 state.page_cancel = Some(cancel);
                 state.page_task = Some(tokio::spawn(async move {
                     if let Some(answer) = service.finish_page(pending, &mut cancelled).await {
+                        write_frame_unless(
+                            &answering_writable,
+                            &sender,
+                            &answer,
+                            &answering_withdrawn,
+                            true,
+                            Some(&mut cancelled),
+                        )
+                        .await;
+                    }
+                }));
+            }
+            // The same for the facts the control daemon asked for on its descriptions connection:
+            // read and held on a task of its own, and a newer request replaces a held one.
+            if let Some(pending) = state.pending_facts.take() {
+                {
+                    let _boundary = writer
+                        .lock()
+                        .expect("the connection writer is not poisoned");
+                    drop(state.page_cancel.take());
+                }
+                let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+                let service = Arc::clone(&self);
+                let sender = Arc::clone(&writer);
+                let answering_writable = writable.clone();
+                let answering_withdrawn = Arc::clone(&withdrawn);
+                state.page_cancel = Some(cancel);
+                state.page_task = Some(tokio::spawn(async move {
+                    if let Some(answer) = service.finish_facts(pending, &mut cancelled).await {
                         write_frame_unless(
                             &answering_writable,
                             &sender,
@@ -1666,6 +1744,21 @@ impl WorkerService {
                 ),
             ));
         }
+        // The descriptions connection carries the facts request and nothing else, for the same
+        // reason: it holds no authority to act and forwards no caller.
+        if state.controller_role == ControllerConnectionRole::Descriptions
+            && state.controller
+            && !matches!(message, ControlFrame::DescriptionFacts(_))
+        {
+            return Some(failure(
+                request_id_of(&message),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the descriptions connection carries description facts requests and nothing \
+                     else",
+                ),
+            ));
+        }
         match message {
             ControlFrame::Hello(hello) => Some(self.hello(state, peer, &hello)),
             ControlFrame::VerifyChallenge(challenge) => {
@@ -1743,6 +1836,9 @@ impl WorkerService {
             }
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             ControlFrame::AttentionSources(request) => self.attention_sources(state, request),
+            ControlFrame::DescriptionFacts(request) => {
+                self.description_facts_request(state, request)
+            }
             ControlFrame::AttentionText(request) => Some(self.attention_text(state, &request)),
             ControlFrame::AttentionBarrierAcknowledged(acknowledgement) => {
                 // Only the daemon's current attention connection speaks for the daemon this worker
@@ -1975,6 +2071,92 @@ impl WorkerService {
         Some(ControlFrame::GenerationChallenge(GenerationChallenge {
             nonce,
         }))
+    }
+
+    /// Takes the control daemon's request for this session's description facts.
+    ///
+    /// Only on the daemon's descriptions connection, bound to the generation this worker accepts.
+    /// The answer is read and, when nothing newer has happened, held on a task of its own.
+    fn description_facts_request(
+        &self,
+        state: &mut ConnectionState,
+        request: kr_protocol::describe::DescriptionFactsRequest,
+    ) -> Option<ControlFrame> {
+        if let Err(error) = self.check_descriptions_link(state) {
+            return Some(failure(request.request_id, &error.to_protocol_error()));
+        }
+        state.pending_facts = Some(PendingFacts { request });
+        None
+    }
+
+    /// Refuses a description facts request anywhere but on the daemon's current descriptions
+    /// connection.
+    fn check_descriptions_link(&self, state: &ConnectionState) -> Result<()> {
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Descriptions
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: "description facts are read only over the control daemon's descriptions \
+                         connection"
+                    .to_owned(),
+            });
+        }
+        self.check_authority(state)
+    }
+
+    /// Reads the facts a request asked for, holding it while there is nothing newer.
+    ///
+    /// The request is answered at once when the facts have moved past what it has read or when
+    /// the daemon's recorded privacy generation is not the session's, and otherwise when its wait
+    /// ends. A newer request on the connection replaces this one, which then writes nothing.
+    async fn finish_facts(
+        &self,
+        pending: PendingFacts,
+        cancelled: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> Option<ControlFrame> {
+        let request = pending.request;
+        let bound = request
+            .wait_ms
+            .get()
+            .min(kr_protocol::describe::MAX_DESCRIPTION_FACTS_WAIT_MS);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bound);
+        let named = request.generation.0.map(U64::get);
+        loop {
+            if replaced(cancelled) {
+                return None;
+            }
+            // Taken before the reading, so a change between the two is not missed.
+            let changed = self.description_facts.changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let reading = self.description_facts.read(request.after.get(), named);
+            if reading.answerable || tokio::time::Instant::now() >= deadline {
+                if replaced(cancelled) {
+                    return None;
+                }
+                return Some(ControlFrame::DescriptionFactsPage(Box::new(
+                    kr_protocol::describe::DescriptionFactsPage {
+                        request_id: request.request_id,
+                        session_id: self.runtime.session().id(),
+                        privacy_generation: Nullable::some(U64::new(reading.privacy_generation)),
+                        private: reading.private,
+                        facts: Nullable(reading.facts),
+                    },
+                )));
+            }
+            #[cfg(feature = "testing")]
+            let _held = {
+                self.facts_holds_begun
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                SubscriptionHeld::count(&self.facts_held)
+            };
+            tokio::select! {
+                biased;
+                _ = &mut *cancelled => return None,
+                () = &mut changed => {}
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+        }
     }
 
     /// Takes the control daemon's request for this session's attention source records.
@@ -2371,6 +2553,7 @@ impl WorkerService {
                     fenced.extend(authority.bound_connection.take());
                     fenced.extend(std::mem::take(&mut authority.proxy_connections));
                     fenced.extend(authority.attention_connection.take());
+                    fenced.extend(authority.descriptions_connection.take());
                 }
                 authority.accepted_generation = Some(token.generation);
                 match state.controller_role {
@@ -2408,6 +2591,18 @@ impl WorkerService {
                             token.generation.get(),
                             || self.journal_generation(),
                         ));
+                    }
+                    // The daemon reads this session's description facts over one connection, so
+                    // a newer one replaces the one before it, whose held request goes with it.
+                    ControllerConnectionRole::Descriptions => {
+                        if let Some(previous) = authority
+                            .descriptions_connection
+                            .replace(state.connection_id)
+                            && previous != state.connection_id
+                            && !fenced.contains(&previous)
+                        {
+                            fenced.push(previous);
+                        }
                     }
                 }
                 drop(authority);
@@ -2912,6 +3107,9 @@ impl WorkerService {
             if authority.attention_connection == Some(connection_id) {
                 authority.attention_connection = None;
             }
+            if authority.descriptions_connection == Some(connection_id) {
+                authority.descriptions_connection = None;
+            }
         }
         // And from the privacy fence, when it was the connection the fence speaks through: an
         // acknowledgement or a named generation from it no longer counts.
@@ -3005,6 +3203,9 @@ impl WorkerService {
             }
             ControllerConnectionRole::Attention => {
                 authority.attention_connection == Some(state.connection_id)
+            }
+            ControllerConnectionRole::Descriptions => {
+                authority.descriptions_connection == Some(state.connection_id)
             }
         };
         if !bound {
@@ -6687,6 +6888,9 @@ pub struct ConnectionState {
     pub pending_launch: Option<PendingLaunch>,
     /// A page the control daemon asked for, to be read and answered on its own task.
     pub pending_page: Option<PendingPage>,
+    /// A request for description facts the control daemon made, to be answered on its own task,
+    /// which is held in the same place as a page.
+    pub pending_facts: Option<PendingFacts>,
     /// The task reading or holding that page, while it is.
     pub page_task: Option<tokio::task::JoinHandle<()>>,
     /// What tells that task a newer request has replaced it.
@@ -6759,6 +6963,7 @@ impl ConnectionState {
             close_gate: None,
             pending_launch: None,
             pending_page: None,
+            pending_facts: None,
             page_task: None,
             page_cancel: None,
             pending_upstream: None,
@@ -7322,6 +7527,7 @@ fn request_id_of(frame: &ControlFrame) -> RequestId {
         ControlFrame::ForwardedRead(forwarded) => forwarded.request.request_id,
         ControlFrame::AttentionSources(request) => request.request_id,
         ControlFrame::AttentionText(request) => request.request_id,
+        ControlFrame::DescriptionFacts(request) => request.request_id,
         _ => RequestId::new(0),
     }
 }
@@ -7668,6 +7874,13 @@ pub struct PendingPage {
     pub request: kr_protocol::attention::AttentionSourcesRequest,
     /// What the page may carry, its text included, to fit one frame to the daemon.
     pub max_bytes: usize,
+}
+
+/// A request for one session's description facts, to be answered or held on a task of its own.
+#[derive(Debug)]
+pub struct PendingFacts {
+    /// The request.
+    pub request: kr_protocol::describe::DescriptionFactsRequest,
 }
 
 /// One launch whose answer the reader has not given yet.

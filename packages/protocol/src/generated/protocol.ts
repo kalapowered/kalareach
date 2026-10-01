@@ -429,6 +429,12 @@ export type ControlFrame =
   | {
       privacy_generation_ack: PrivacyGenerationAck
     }
+  | {
+      description_facts: DescriptionFactsRequest
+    }
+  | {
+      description_facts_page: DescriptionFactsPage
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -491,7 +497,7 @@ export type DesktopSessionId = string
  * It confers nothing on its own. Every one of these connections still proves which generation it
  * speaks for, and only the holder of the environment's signing key can produce that proof.
  */
-export type ControllerConnectionRole = 'authority' | 'proxy' | 'attention'
+export type ControllerConnectionRole = 'authority' | 'proxy' | 'attention' | 'descriptions'
 /**
  * One permitted action in a grant.
  */
@@ -526,6 +532,10 @@ export type QuestionId = string
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
+/**
+ * What a worker did with a session's last command, as it recorded it.
+ */
+export type DescriptionCompletion = 'succeeded' | 'failed'
 /**
  * How long a worker's execution context lasts.
  *
@@ -602,10 +612,6 @@ export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'termina
  * An upstream method name, as a connector's declarative or rich table names it.
  */
 export type UpstreamMethod = string
-/**
- * What a worker did with a session's last command, as it recorded it.
- */
-export type DescriptionCompletion = 'succeeded' | 'failed'
 /**
  * How fetching the selected profile's files is going.
  */
@@ -8081,6 +8087,138 @@ export interface PrivacyUnavailable {
   subsystem: string
 }
 /**
+ * The control daemon's request for one session's description facts, made over the connection it
+ * reads them on.
+ *
+ * The worker answers at once when the facts have moved past `after`, or when its privacy state is
+ * not the one `generation` names, and otherwise holds the request for up to `wait_ms`. A newer
+ * request on the connection replaces a held one.
+ */
+export interface DescriptionFactsRequest {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  after: string
+  /**
+   * The session's privacy generation the daemon has recorded, or null when it has recorded
+   * none. A worker whose privacy state is past it answers at once, so the daemon learns of a
+   * transition without waiting for the request's bound.
+   */
+  generation: U64 | null
+  /**
+   * Correlates the page with this request.
+   */
+  request_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  wait_ms: string
+}
+/**
+ * The worker's answer to a [`DescriptionFactsRequest`].
+ */
+export interface DescriptionFactsPage {
+  /**
+   * The session's facts, when their revision is past the request's `after` and privacy mode is
+   * off; null otherwise.
+   */
+  facts: DescriptionFacts | null
+  /**
+   * The privacy generation the session holds, or null when it holds none.
+   */
+  privacy_generation: U64 | null
+  /**
+   * Whether privacy mode is on in the session. While it is, no facts are carried and none are
+   * captured.
+   */
+  private: boolean
+  /**
+   * The request this answers.
+   */
+  request_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * What one session was doing, as its worker recorded it: the whole of what a description is built
+ * from, and nothing a person typed into the terminal.
+ *
+ * Each field is something the session did or was asked to do: the directory a command ran in, the
+ * program it ran, how it ended, the prompt an agent was given, the thread it selected and the
+ * last few semantic events. No keystroke, no output and no query's answer is in it.
+ */
+export interface DescriptionFacts {
+  /**
+   * The program name of the newest command, without its arguments.
+   */
+  application: string | null
+  /**
+   * How the newest command ended, when it has.
+   */
+  completion: DescriptionCompletion | null
+  /**
+   * The directory's last component.
+   */
+  directory: string | null
+  /**
+   * The most recent events, newest first, at most [`MAX_DESCRIPTION_FACT_EVENTS`].
+   */
+  events: DescriptionEvent[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * The last prompt an agent in the session was given.
+   */
+  intent: string | null
+  /**
+   * The repository the directory is inside, when it is inside one.
+   */
+  repository: DescriptionRepository | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The thread the session selected.
+   */
+  thread: string | null
+}
+/**
+ * One recent semantic event: its place in the session's stream, its kind and a clipped summary.
+ */
+export interface DescriptionEvent {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * What kind of event it is.
+   */
+  kind:
+    'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
+  /**
+   * A summary of at most [`MAX_DESCRIPTION_FACT_CODEPOINTS`] codepoints.
+   */
+  summary: string
+}
+/**
+ * The repository a session's directory is inside.
+ */
+export interface DescriptionRepository {
+  /**
+   * The branch checked out, when there is one.
+   */
+  branch: string | null
+  /**
+   * The repository's name.
+   */
+  name: string
+}
+/**
  * Everything one installation of one application can currently do.
  *
  * Section 12: "The feature set is a per-installation capability map, not a single label assigned
@@ -10755,138 +10893,6 @@ export interface DescriptionDownloadParams {
    * What to do.
    */
   action: 'start' | 'cancel'
-}
-/**
- * One recent semantic event: its place in the session's stream, its kind and a clipped summary.
- */
-export interface DescriptionEvent {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  cursor: string
-  /**
-   * What kind of event it is.
-   */
-  kind:
-    'command_accepted' | 'task_started' | 'task_completed' | 'approval_requested' | 'file_changed'
-  /**
-   * A summary of at most [`MAX_DESCRIPTION_FACT_CODEPOINTS`] codepoints.
-   */
-  summary: string
-}
-/**
- * What one session was doing, as its worker recorded it: the whole of what a description is built
- * from, and nothing a person typed into the terminal.
- *
- * Each field is something the session did or was asked to do: the directory a command ran in, the
- * program it ran, how it ended, the prompt an agent was given, the thread it selected and the
- * last few semantic events. No keystroke, no output and no query's answer is in it.
- */
-export interface DescriptionFacts {
-  /**
-   * The program name of the newest command, without its arguments.
-   */
-  application: string | null
-  /**
-   * How the newest command ended, when it has.
-   */
-  completion: DescriptionCompletion | null
-  /**
-   * The directory's last component.
-   */
-  directory: string | null
-  /**
-   * The most recent events, newest first, at most [`MAX_DESCRIPTION_FACT_EVENTS`].
-   */
-  events: DescriptionEvent[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  generation: string
-  /**
-   * The last prompt an agent in the session was given.
-   */
-  intent: string | null
-  /**
-   * The repository the directory is inside, when it is inside one.
-   */
-  repository: DescriptionRepository | null
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revision: string
-  /**
-   * The thread the session selected.
-   */
-  thread: string | null
-}
-/**
- * The repository a session's directory is inside.
- */
-export interface DescriptionRepository {
-  /**
-   * The branch checked out, when there is one.
-   */
-  branch: string | null
-  /**
-   * The repository's name.
-   */
-  name: string
-}
-/**
- * The worker's answer to a [`DescriptionFactsRequest`].
- */
-export interface DescriptionFactsPage {
-  /**
-   * The session's facts, when their revision is past the request's `after` and privacy mode is
-   * off; null otherwise.
-   */
-  facts: DescriptionFacts | null
-  /**
-   * The privacy generation the session holds, or null when it holds none.
-   */
-  privacy_generation: U64 | null
-  /**
-   * Whether privacy mode is on in the session. While it is, no facts are carried and none are
-   * captured.
-   */
-  private: boolean
-  /**
-   * The request this answers.
-   */
-  request_id: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-}
-/**
- * The control daemon's request for one session's description facts, made over the connection it
- * reads them on.
- *
- * The worker answers at once when the facts have moved past `after`, or when its privacy state is
- * not the one `generation` names, and otherwise holds the request for up to `wait_ms`. A newer
- * request on the connection replaces a held one.
- */
-export interface DescriptionFactsRequest {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  after: string
-  /**
-   * The session's privacy generation the daemon has recorded, or null when it has recorded
-   * none. A worker whose privacy state is past it answers at once, so the daemon learns of a
-   * transition without waiting for the request's bound.
-   */
-  generation: U64 | null
-  /**
-   * Correlates the page with this request.
-   */
-  request_id: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  wait_ms: string
 }
 /**
  * Parameters of `description.setup`. The environment is the one the connection reaches.

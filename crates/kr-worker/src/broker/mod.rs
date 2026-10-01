@@ -830,6 +830,9 @@ pub struct Broker {
     /// connection and no file, so nothing can hold its write up; that ledger's recovery takes the
     /// lock for the write itself.
     recorder: Mutex<Option<Ledger>>,
+    /// Where the session's description facts take what this broker decides: the thread an
+    /// application selected, the events it reported, and the prompts it admitted.
+    description_facts: std::sync::OnceLock<crate::description_facts::DescriptionFacts>,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
@@ -961,11 +964,18 @@ impl Broker {
             }),
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
+            description_facts: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             channel_write_pause: Mutex::new(None),
         })
+    }
+
+    /// Hands the broker the session's description facts, once: what it decides from then on is
+    /// recorded there as well.
+    pub fn set_description_facts(&self, facts: crate::description_facts::DescriptionFacts) {
+        let _ = self.description_facts.set(facts);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, BrokerState> {
