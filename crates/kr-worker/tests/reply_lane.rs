@@ -180,11 +180,11 @@ async fn a_reply_that_waited_over_two_seconds_is_dropped_when_the_paste_ends() {
     assert!(after.is_empty(), "the reply expired: {after:?}");
 }
 
-/// Section 9: a step of the wall clock, forwards or back, moves nothing the response lane decides.
-/// The session is handed a wall clock this test steps by an hour each way while the reply waits, and
-/// the reply is written exactly as it is when nothing steps.
+/// Section 9: a wall clock stepped an hour forward while a reply waits does not drop it. The reply
+/// has waited half a second of continuous time, and a lane that measured the wait on the wall clock
+/// would read an hour and drop it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_step_of_the_wall_clock_neither_drops_a_reply_nor_holds_it_longer() {
+async fn a_wall_clock_stepped_forward_does_not_drop_a_reply_that_has_waited_half_a_second() {
     let (clock, mut time) = manual();
     let wall = ManualWallClock::new(1_790_000_000_000);
     time.wall = Arc::new(wall.clone());
@@ -195,9 +195,27 @@ async fn a_step_of_the_wall_clock_neither_drops_a_reply_nor_holds_it_longer() {
     let _ = fixture.session.ingest_output(QUESTION);
     wall.set(1_790_000_000_000 + 3_600_000);
     clock.advance(Duration::from_millis(500));
-    wall.set(1_790_000_000_000 - 3_600_000);
-    clock.advance(Duration::from_millis(500));
     fixture.type_bytes(PASTE_CLOSE);
     fixture.session.pump_replies();
     assert_eq!(fixture.replies(), vec![b"\x1b[1;1R".to_vec()]);
+}
+
+/// Section 9: and a wall clock stepped an hour back does not keep a reply past its two seconds.
+/// The reply has waited 2.1 seconds of continuous time, and a lane that measured the wait on the
+/// wall clock would read a negative wait and keep it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wall_clock_stepped_back_does_not_keep_a_reply_that_has_waited_over_two_seconds() {
+    let (clock, mut time) = manual();
+    let wall = ManualWallClock::new(1_790_000_000_000);
+    time.wall = Arc::new(wall.clone());
+    let mut fixture = Fixture::new(time);
+    let _ = fixture.session.ingest_output(b"\x1b[?2004h");
+    fixture.type_bytes(PASTE_OPEN);
+    let _ = fixture.replies();
+    let _ = fixture.session.ingest_output(QUESTION);
+    wall.set(1_790_000_000_000 - 3_600_000);
+    clock.advance(Duration::from_millis(2_100));
+    fixture.type_bytes(PASTE_CLOSE);
+    fixture.session.pump_replies();
+    assert!(fixture.replies().is_empty(), "the reply expired");
 }
