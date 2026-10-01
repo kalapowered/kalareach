@@ -880,11 +880,11 @@ exports a session that was created when privacy mode was on but has completed it
 
 It reads the privacy mode, then it reads the sessions, and it reads the privacy mode again. If the
 privacy mode is on at either read, or if it detects a change in the generation number of the privacy
-mode between the two reads, it does not export any sessions and says why; when privacy mode changed
-between the reads, the message tells you to run this command again. If it encounters an error while
-reading the privacy mode or while reading the sessions it fails without writing anything to disk. A
-bundle with no sessions included is a valid bundle, so the command exits as the diagnostics alone
-would have:
+mode between the two reads, it does not export any sessions and says why; when privacy mode is off
+at the second read but changed since the first, the message tells you to run this command again. If
+it encounters an error while reading the privacy mode or while reading the sessions it fails without
+writing anything to disk. A bundle with no sessions included is a valid bundle, so the command exits
+as the diagnostics alone would have:
 
 ```text
   content/sessions.json: the shell, working directory and closure of 0 sessions, redacted by session-content-1 and printed before it was written (digest 9f2c...); 2 sessions left out: privacy mode is on
@@ -910,7 +910,8 @@ rules listed below, which it names `session-content-1` in the file and in the ma
 - It replaces the user information of a URL, such as `https://user:secret@host/`, with
   `[redacted]@`.
 - It replaces the value of your home directory (`HOME`, or `USERPROFILE` on Windows) where a path
-  starts with `[home]`, unless that value is empty, a root or not an absolute path.
+  starts with `[home]`, unless that value is empty, a root, not an absolute path or without a letter
+  or a digit.
 
 A name is made of ASCII letters, digits, `_`, `.` and `-`. It says credential when its letters,
 without the punctuation and in either case, contain password, passwd, passphrase, secret, token,
