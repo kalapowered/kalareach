@@ -499,10 +499,11 @@ waits on a clock. A step that moves time says by how much, and a timer that fall
 step, so a race happens in the same order on every run.
 
 The session decides its windows on the continuous clock the replayer moves, so a trace states what
-it expects of each: a reply to a question the application asks while the person's input is inside a
-paste or a held delimiter waits until that closes and is dropped after two seconds, the replies of
-one read past 4 KiB wait for a later read and are dropped after the same two seconds, and replies
-past 256 a second are dropped until the clock has moved on. A `step_wall` moves none of them.
+it expects of each one. A reply to a question the application asks while the person's input is
+inside a paste or a held delimiter waits until that closes, and is dropped after two seconds. The
+replies of one read past 4 KiB wait for a later read and are dropped after the same two seconds. And
+for each reply after 256 per second, it will be dropped until time passes. A `step_wall` moves none
+of them.
 
 | Step (`do`) | Fields | What happens |
 | --- | --- | --- |
