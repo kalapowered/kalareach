@@ -873,7 +873,12 @@ async fn with_a_job_stopped_in_the_process_input_queries_and_resize_still_answer
         session
             .resize(VIEW, Dimensions::new(90, 28), epoch)
             .expect("the owner resizes");
+        assert_eq!(session.geometry().dimensions, Dimensions::new(90, 28));
     }
+    // The input was delivered while the job was stopped: the terminal echoed the line, and the
+    // program answered it. Terminal queries have no path to the facts or the job, which the
+    // worker's own suite exercises with the shell's queries in play.
+    environment.workers[0].until_echoed("still typing", 2).await;
     assert_eq!(environment.state_of(session_id).await, SessionState::Live);
     let described = environment.describe(session_id).await;
     assert_eq!(
@@ -1103,6 +1108,7 @@ async fn a_process_that_ends_inside_a_job_is_restarted_and_the_session_keeps_its
     let described = environment.describe(session_id).await;
     assert_eq!(described.source, LabelSource::Metadata);
     environment.workers[0].type_in(b"echo still typing\n");
+    environment.workers[0].until_echoed("still typing", 2).await;
     assert_eq!(environment.state_of(session_id).await, SessionState::Live);
     environment.stop().await;
 }
