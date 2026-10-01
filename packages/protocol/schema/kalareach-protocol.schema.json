@@ -26747,7 +26747,7 @@
           "description": "The failure recorded with a refusal, rejection or unknown outcome."
         },
         "error_withheld": {
-          "description": "True when the host replaced the message of [`Self::error`] with one of its own, because the\nreader is not the local owner. An error's message can quote an upstream, a session or a\nperson, and it carries no date of its own to hold to a history bound, so only the owner is\nshown it again. The code, the retry category and the diagnostic identifier stay.\n\nIt is absent from the wire when it is false, so a receipt the host shows in full is byte\nfor byte what a reader built before this member expects. Remove the default and the omission\nonce no worker of a build before this member can still be running.",
+          "description": "True when the host replaced the message of [`Self::error`] with one of its own, because the\nreader is not the local owner. An error's message can quote an upstream, a session or a\nperson, and it carries no date of its own to hold to a history bound, so only the owner is\nshown it again. The code, the retry category and the diagnostic identifier stay.\n\nIt is absent from the wire when it is false, so a receipt the host shows in full is byte\nfor byte what a reader built before this member expects. Remove the default and the omission\nonce no reader of a build before this member can still be running: a `kr` of another\nrelease reads a worker's receipts directly, and a paired device runs its own release.",
           "type": "boolean"
         },
         "method": {

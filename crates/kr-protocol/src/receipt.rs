@@ -240,7 +240,8 @@ pub struct Receipt {
     ///
     /// It is absent from the wire when it is false, so a receipt the host shows in full is byte
     /// for byte what a reader built before this member expects. Remove the default and the omission
-    /// once no worker of a build before this member can still be running.
+    /// once no reader of a build before this member can still be running: a `kr` of another
+    /// release reads a worker's receipts directly, and a paired device runs its own release.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub error_withheld: bool,
     /// When this revision was written.

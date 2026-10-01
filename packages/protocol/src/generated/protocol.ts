@@ -2531,7 +2531,8 @@ export interface Receipt {
    *
    * It is absent from the wire when it is false, so a receipt the host shows in full is byte
    * for byte what a reader built before this member expects. Remove the default and the omission
-   * once no worker of a build before this member can still be running.
+   * once no reader of a build before this member can still be running: a `kr` of another
+   * release reads a worker's receipts directly, and a paired device runs its own release.
    */
   error_withheld?: boolean
   /**
@@ -2737,7 +2738,8 @@ export interface Receipt1 {
    *
    * It is absent from the wire when it is false, so a receipt the host shows in full is byte
    * for byte what a reader built before this member expects. Remove the default and the omission
-   * once no worker of a build before this member can still be running.
+   * once no reader of a build before this member can still be running: a `kr` of another
+   * release reads a worker's receipts directly, and a paired device runs its own release.
    */
   error_withheld?: boolean
   /**
@@ -6544,7 +6546,8 @@ export interface Receipt2 {
    *
    * It is absent from the wire when it is false, so a receipt the host shows in full is byte
    * for byte what a reader built before this member expects. Remove the default and the omission
-   * once no worker of a build before this member can still be running.
+   * once no reader of a build before this member can still be running: a `kr` of another
+   * release reads a worker's receipts directly, and a paired device runs its own release.
    */
   error_withheld?: boolean
   /**
@@ -21579,7 +21582,8 @@ export interface Receipt3 {
    *
    * It is absent from the wire when it is false, so a receipt the host shows in full is byte
    * for byte what a reader built before this member expects. Remove the default and the omission
-   * once no worker of a build before this member can still be running.
+   * once no reader of a build before this member can still be running: a `kr` of another
+   * release reads a worker's receipts directly, and a paired device runs its own release.
    */
   error_withheld?: boolean
   /**
