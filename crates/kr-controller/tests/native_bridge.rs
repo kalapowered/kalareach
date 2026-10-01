@@ -3110,3 +3110,467 @@ fn copy_tree(from: &Path, to: &Path) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The Gemini CLI recipe
+// ---------------------------------------------------------------------------------------------
+
+/// The digests the Gemini CLI package's recipe names for its three files, which the files this
+/// repository pins in `fixtures/bridges/gemini-cli/` carry.
+const GEMINI_RECORD_DIGEST: &str =
+    "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb";
+const GEMINI_MANIFEST_DIGEST: &str =
+    "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7";
+const GEMINI_HOOKS_DIGEST: &str =
+    "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba";
+
+const GEMINI_RECORD_PATH: &str = "extensions/kalareach/.gemini-extension-install.json";
+const GEMINI_MANIFEST_PATH: &str = "extensions/kalareach/gemini-extension.json";
+const GEMINI_HOOKS_PATH: &str = "extensions/kalareach/hooks/hooks.json";
+
+/// Somebody's own Gemini CLI settings, with a number a rewrite would spell differently.
+const GEMINI_SETTINGS: &str = "{\n  \"theme\": \"dark\",\n  \"maxSessionTurns\": 1e2,\n  \"security\": {\"allowedExtensions\": [\"^/dev/null/kalareach$\"]}\n}\n";
+
+/// The stand-in for Gemini CLI's executable, hashed for its version and never run.
+const GEMINI_EXECUTABLE: &[u8] = b"\x7fELF a stand-in for Gemini CLI, hashed and never run";
+
+fn gemini() -> PluginId {
+    PluginId::new("kalareach/gemini-cli").expect("a plugin identifier")
+}
+
+/// The bytes of one pinned Gemini CLI file.
+fn gemini_pinned(name: &str) -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/bridges/gemini-cli")
+            .join(name),
+    )
+    .expect("a pinned Gemini CLI file")
+}
+
+/// The recipe the Gemini CLI package ships, as its manifest states it.
+fn gemini_recipe() -> NativeBridge {
+    serde_json::from_value(serde_json::json!({
+        "application": "Gemini CLI",
+        "application_range": "=0.60.0",
+        "install": [
+            {"type": "install_file", "source": "bridge/gemini-extension-install.json",
+             "destination": GEMINI_RECORD_PATH, "digest": GEMINI_RECORD_DIGEST},
+            {"type": "install_file", "source": "bridge/gemini-extension.json",
+             "destination": GEMINI_MANIFEST_PATH, "digest": GEMINI_MANIFEST_DIGEST},
+            {"type": "install_file", "source": "bridge/hooks.json",
+             "destination": GEMINI_HOOKS_PATH, "digest": GEMINI_HOOKS_DIGEST}
+        ],
+        "remove": [
+            {"type": "remove_file", "destination": GEMINI_HOOKS_PATH,
+             "digest": GEMINI_HOOKS_DIGEST},
+            {"type": "remove_file", "destination": GEMINI_MANIFEST_PATH,
+             "digest": GEMINI_MANIFEST_DIGEST},
+            {"type": "remove_file", "destination": GEMINI_RECORD_PATH,
+             "digest": GEMINI_RECORD_DIGEST}
+        ],
+        "grant_statement": "Installs three files under your own Gemini CLI directory: the manifest of an extension named kalareach, its hooks, and the record of where it is installed. Gemini CLI then starts the KalaReach forwarder itself, through bash, so the forwarder runs under Gemini CLI's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime."
+    }))
+    .expect("the Gemini CLI recipe")
+}
+
+fn gemini_match_rules() -> Vec<MatchRule> {
+    serde_json::from_value(serde_json::json!([
+        {"id": "gemini-cli-npm",
+         "executable": {"file_stem": "gemini", "path_suffix": [], "version_range": null},
+         "distribution": {"registry": "npm", "package": "@google/gemini-cli"},
+         "confidence": "exact"},
+        {"id": "gemini-cli-executable",
+         "executable": {"file_stem": "gemini", "path_suffix": [], "version_range": null},
+         "distribution": null,
+         "confidence": "inferred"}
+    ]))
+    .expect("the release's match rules")
+}
+
+/// One test's own directories for the Gemini CLI: its directory with somebody's settings and
+/// somebody's own extension in it, a search path with a stand-in for its executable and for the
+/// forwarder, and a package directory holding the recipe's files.
+struct GeminiSite {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl GeminiSite {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let root = temp.path().to_path_buf();
+        let site = Self { _temp: temp, root };
+        std::fs::create_dir_all(site.application().join("extensions/theirs"))
+            .expect("an extension");
+        std::fs::write(site.application().join("settings.json"), GEMINI_SETTINGS)
+            .expect("settings");
+        std::fs::write(
+            site.application()
+                .join("extensions/theirs/gemini-extension.json"),
+            "{\"name\": \"theirs\", \"version\": \"1.0.0\"}\n",
+        )
+        .expect("an extension manifest");
+        std::fs::create_dir_all(site.root.join("bin")).expect("a search path");
+        std::fs::write(site.root.join("bin/gemini"), GEMINI_EXECUTABLE).expect("an executable");
+        std::fs::write(site.forwarder(), b"a stand-in for the forwarder").expect("a forwarder");
+        for name in [
+            "gemini-extension-install.json",
+            "gemini-extension.json",
+            "hooks.json",
+        ] {
+            let path = site.package().join("bridge").join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a package");
+            std::fs::write(path, gemini_pinned(name)).expect("a package file");
+        }
+        site
+    }
+
+    fn application(&self) -> PathBuf {
+        self.root.join("home/.gemini")
+    }
+
+    fn forwarder(&self) -> PathBuf {
+        self.root.join("bin/kr-hook")
+    }
+
+    fn package(&self) -> PathBuf {
+        self.root.join("packages/gemini")
+    }
+
+    fn host(&self) -> BridgeHost {
+        BridgeHost {
+            journals: self.root.join("state/native-bridges"),
+            applications: vec![ApplicationDirectory {
+                application: "Gemini CLI".to_owned(),
+                directory: self.application(),
+            }],
+            search_path: vec![self.root.join("bin")],
+            forwarder: Some(self.forwarder()),
+            signed_records: Vec::new(),
+        }
+    }
+
+    fn bridges(&self) -> NativeBridges {
+        NativeBridges::new(self.host())
+    }
+
+    /// The release the package ships, with a signed record naming the stand-in executable at the
+    /// one version the recipe accepts.
+    fn release(&self) -> BridgeTarget {
+        BridgeTarget {
+            plugin_id: gemini(),
+            package_digest: PayloadDigest::of(b"gemini release"),
+            package_dir: self.package(),
+            recipe: gemini_recipe(),
+            match_rules: gemini_match_rules(),
+            qualified: vec![QualifiedExecutable {
+                digest: hex_digest(GEMINI_EXECUTABLE),
+                version: "0.60.0".to_owned(),
+            }],
+        }
+    }
+
+    fn tree(&self) -> BTreeMap<String, Node> {
+        snapshot(&self.application())
+    }
+
+    /// The tree a Gemini CLI directory has once the recipe is applied: the extension's
+    /// directories and its three files, and nothing of anybody's own touched.
+    fn applied(&self, before: &BTreeMap<String, Node>) -> BTreeMap<String, Node> {
+        let mut expected = before.clone();
+        for directory in ["extensions/kalareach", "extensions/kalareach/hooks"] {
+            expected.insert(directory.to_owned(), Node::Directory);
+        }
+        for (path, name) in [
+            (GEMINI_RECORD_PATH, "gemini-extension-install.json"),
+            (GEMINI_MANIFEST_PATH, "gemini-extension.json"),
+            (GEMINI_HOOKS_PATH, "hooks.json"),
+        ] {
+            expected.insert(path.to_owned(), Node::File(gemini_pinned(name)));
+        }
+        expected
+    }
+}
+
+/// KR-REQ-11.42: a host names Gemini CLI's directory, `.gemini` under the account's home, beside
+/// Claude Code's, and no other application's: the recipe's destinations are under the directory
+/// the application is named for.
+#[test]
+fn kr_req_11_42_the_host_names_gemini_clis_directory() {
+    use kr_controller::catalogue::native_bridge::application_directories;
+    let home = Path::new("/home/somebody");
+    let named: Vec<(String, PathBuf)> = application_directories(home)
+        .into_iter()
+        .map(|directory| (directory.application, directory.directory))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("Claude Code".to_owned(), home.join(".claude")),
+            ("Gemini CLI".to_owned(), home.join(".gemini")),
+        ]
+    );
+}
+
+/// KR-REQ-11.42: the Gemini CLI recipe writes the extension's three files, in the directories it
+/// makes, and nothing else: somebody's settings and somebody's own extension keep their bytes.
+/// The forwarder its hooks start is named for the application the registration says, and the
+/// registration is a hook.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_the_gemini_cli_recipe_writes_its_three_files_and_nothing_else() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+
+    let settled = bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    assert_eq!(
+        site.tree(),
+        site.applied(&before),
+        "exactly the recipe's changes"
+    );
+    for path in ["settings.json", "extensions/theirs/gemini-extension.json"] {
+        assert_eq!(site.tree()[path], before[path], "{path} keeps its bytes");
+    }
+    let facts = bridges
+        .facts(&gemini(), site.release().package_digest)
+        .expect("reads")
+        .expect("applied, with the registration read from the hooks file");
+    assert_eq!(
+        facts.application, "gemini-cli",
+        "the name the hooks invoke the forwarder for"
+    );
+    assert_eq!(
+        facts.surfaces,
+        [BridgeSurface::Hook].into_iter().collect(),
+        "the hooks file registers hooks and no channel"
+    );
+    assert_eq!(facts.forwarder, site.forwarder());
+}
+
+/// KR-REQ-11.42: removal takes the three files and the directories the installation made, and the
+/// Gemini CLI directory is again byte for byte what it was. The control is a directory that holds
+/// nothing of anybody's own, which is left empty.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_removing_the_gemini_cli_recipe_restores_the_directory() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("applies");
+    assert_ne!(site.tree(), before);
+
+    let settled = bridges.reconcile(&gemini(), None).expect("removes");
+
+    assert_eq!(settled, Settled::Removed);
+    assert_eq!(site.tree(), before, "the directory is what it was");
+    assert!(bridges.reports().expect("reads").is_empty());
+    assert!(
+        bridges
+            .facts(&gemini(), site.release().package_digest)
+            .expect("reads")
+            .is_none()
+    );
+}
+
+/// KR-REQ-11.42: an application the host does not know places nothing: a Gemini CLI recipe on a
+/// host that names only Claude Code's directory is refused, naming the application, and nothing is
+/// written anywhere.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_an_application_the_host_does_not_know_places_nothing() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let claude_only = NativeBridges::new(BridgeHost {
+        applications: vec![ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: site.root.join("home/.claude"),
+        }],
+        ..site.host()
+    });
+
+    let settled = claude_only
+        .reconcile(&gemini(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("Gemini CLI"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
+    assert!(
+        !site.root.join("home/.claude").exists(),
+        "no other application's directory was made"
+    );
+}
+
+/// KR-REQ-11.42: an installation of the Gemini CLI recipe stopped before any of its steps is never
+/// reported as applied, and the next reconciliation finishes it when the release is still wanted
+/// and takes it out when it is not. Something made and not yet recorded is named, and the bridge
+/// is not reported as applied until its owner removes it.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_gemini_cli_installation_stopped_at_each_boundary_is_finished_or_undone() {
+    let reference = GeminiSite::new();
+    let before = reference.tree();
+    let applied = reference.applied(&before);
+    let mut boundaries = 0;
+    let mut unrecorded = 0;
+    for step in 1.. {
+        let site = GeminiSite::new();
+        let bridges = site.bridges();
+        bridges.stop_before(step);
+        if bridges.reconcile(&gemini(), Some(&site.release())).is_ok() {
+            break;
+        }
+        boundaries += 1;
+        let left_unrecorded = bridges
+            .steps()
+            .last()
+            .is_some_and(|last| last.starts_with("stage ") || last.starts_with("make "));
+        assert!(
+            site.bridges()
+                .facts(&gemini(), site.release().package_digest)
+                .expect("reads")
+                .is_none(),
+            "step {step}: never reported as applied while unfinished"
+        );
+        let finished = site
+            .bridges()
+            .reconcile(&gemini(), Some(&site.release()))
+            .expect("finishes");
+        if left_unrecorded {
+            unrecorded += 1;
+            let Settled::Unsettled(reason) = &finished else {
+                panic!("step {step}: {finished:?}");
+            };
+            let left: Vec<String> = site
+                .tree()
+                .into_keys()
+                .filter(|name| name.contains(".kalareach"))
+                .collect();
+            assert_eq!(left.len(), 1, "step {step}: {left:?}");
+            let name = Path::new(&left[0])
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(reason.contains(&name), "step {step}: {reason}");
+            let path = site.application().join(&left[0]);
+            if path.is_dir() {
+                std::fs::remove_dir(&path).expect("the owner removes it");
+            } else {
+                std::fs::remove_file(&path).expect("the owner removes it");
+            }
+            assert_eq!(
+                site.bridges()
+                    .reconcile(&gemini(), Some(&site.release()))
+                    .expect("finishes"),
+                Settled::Unchanged,
+                "step {step}"
+            );
+        } else {
+            assert_eq!(finished, Settled::Applied, "step {step}");
+        }
+        assert_eq!(site.tree(), applied, "step {step}: finished exactly");
+
+        // The same stop, and the release no longer wanted: undone to the byte.
+        let site = GeminiSite::new();
+        let bridges = site.bridges();
+        bridges.stop_before(step);
+        assert!(bridges.reconcile(&gemini(), Some(&site.release())).is_err());
+        let undone = site
+            .bridges()
+            .reconcile(&gemini(), None)
+            .expect("takes it out");
+        if left_unrecorded {
+            let Settled::Unsettled(_) = &undone else {
+                panic!("step {step}: {undone:?}");
+            };
+            for name in site
+                .tree()
+                .into_keys()
+                .filter(|name| name.contains(".kalareach"))
+                .collect::<Vec<_>>()
+            {
+                let path = site.application().join(&name);
+                if path.is_dir() {
+                    std::fs::remove_dir(&path).expect("the owner removes it");
+                } else {
+                    std::fs::remove_file(&path).expect("the owner removes it");
+                }
+            }
+            site.bridges().reconcile(&gemini(), None).expect("finishes");
+        }
+        assert_eq!(site.tree(), before, "step {step}: undone exactly");
+    }
+    assert!(boundaries > 8, "every step was a boundary: {boundaries}");
+    assert!(
+        unrecorded >= 3,
+        "files and directories were made unrecorded: {unrecorded}"
+    );
+}
+
+/// KR-REQ-11.42: a hook written as one command line is read as a registration only when it is the
+/// forwarder's name, the application it reports for and the surface, each separated by one space.
+/// A line with another word, an operator, a quote, another white space or another application is
+/// refused, and nothing is written. The control is the line the Gemini CLI package ships.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_hook_command_line_is_a_registration_only_in_its_plain_form() {
+    let hooks = |command: &str| {
+        serde_json::json!({
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach",
+                                                   "command": command, "timeout": 5000}]}]}
+        })
+        .to_string()
+    };
+    for command in [
+        "kr-hook gemini-cli hook; touch /tmp/other",
+        "kr-hook gemini-cli hook && other",
+        "kr-hook gemini-cli  hook",
+        "kr-hook gemini-cli\thook",
+        "kr-hook gemini-cli",
+        "kr-hook gemini-cli hook extra",
+        "kr-hook 'gemini-cli' hook",
+        "kr-hook another-agent hook",
+        "kr-hook gemini-cli tool",
+    ] {
+        let site = GeminiSite::new();
+        let before = site.tree();
+        let bytes = hooks(command).into_bytes();
+        std::fs::write(site.package().join("bridge/hooks.json"), &bytes).expect("a package file");
+        let mut recipe = serde_json::to_value(gemini_recipe()).expect("the recipe encodes");
+        let digest = PayloadDigest::of(&bytes).to_string();
+        for step in recipe["install"].as_array_mut().expect("install steps") {
+            if step["destination"] == GEMINI_HOOKS_PATH {
+                step["digest"] = serde_json::json!(digest);
+            }
+        }
+        for step in recipe["remove"].as_array_mut().expect("removal steps") {
+            if step["destination"] == GEMINI_HOOKS_PATH {
+                step["digest"] = serde_json::json!(digest);
+            }
+        }
+        let target = BridgeTarget {
+            recipe: serde_json::from_value(recipe).expect("a recipe"),
+            ..site.release()
+        };
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(
+            reason.contains("hooks.json")
+                || reason.contains("another-agent")
+                || reason.contains("gemini-cli"),
+            "{command:?}: {reason}"
+        );
+        assert_eq!(site.tree(), before, "{command:?}: nothing was written");
+    }
+}

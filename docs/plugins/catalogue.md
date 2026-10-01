@@ -445,7 +445,9 @@ that writes nothing:
   walk the directory from one handle without following a link and check what a replacement keeps,
   as the steps below describe;
 - the application is one whose directory this host knows: Claude Code's is `.claude` in the
-  account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set;
+  account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set, and Gemini CLI's is
+  `.gemini` there, where its `settings.json` and its `extensions/` are. A recipe for any other
+  application places nothing;
 - the forwarder the registration is expected to start is the `kr-hook` beside the daemon;
 - every step the recipe installs has the removal that undoes it, and every file it installs is the
   bytes its recipe names;
