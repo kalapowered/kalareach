@@ -685,10 +685,13 @@ async fn run(cli: Cli) -> Result<Completion> {
             // after a result that already said everything went well.
             let bundle = match arguments.bundle.as_deref() {
                 Some(path) => {
-                    let content = if arguments.include_content {
-                        let selected =
-                            kr_cli::doctor::content_export(&mut client, environment.environment_id)
+                    let (content, left_out) = if arguments.include_content {
+                        let reading =
+                            kr_cli::doctor::content::read(&mut client, environment.environment_id)
                                 .await?;
+                        let composed = kr_cli::doctor::content::compose(&reading)?;
+                        let left_out = composed.left_out().to_vec();
+                        let selected = vec![composed.into_content()];
                         // On the error stream, because standard output is one document. A person
                         // sees what they selected either way, and a `--json` reader is not handed
                         // two things to parse.
@@ -698,9 +701,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                         for entry in &selected {
                             report::say(&entry.describe());
                         }
-                        selected
+                        (selected, left_out)
                     } else {
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     };
                     let bundle = kr_protocol::hostinfo::ComposedBundle::new(
                         kr_protocol::scalars::TimestampMs::new(
@@ -714,7 +717,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         Vec::new(),
                     );
                     kr_cli::doctor::bundle::write(path, &bundle, &content)?;
-                    Some((path, bundle, content.len()))
+                    Some((path, bundle, content.len(), left_out))
                 }
                 None => None,
             };
@@ -733,7 +736,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         "environment",
                         report::environment_capabilities(&capabilities),
                     );
-                if let Some((path, written, entries)) = bundle.as_ref() {
+                if let Some((path, written, entries, left_out)) = bundle.as_ref() {
                     document.set(
                         "bundle",
                         Document::new()
@@ -745,7 +748,20 @@ async fn run(cli: Cli) -> Result<Completion> {
                             .with("software", written.software().len())
                             .with("capabilities", written.capabilities().len())
                             .with("checks", written.doctor().get().checks.len())
-                            .with("content_entries", *entries),
+                            .with("content_entries", *entries)
+                            // What the content export left out and why, so a script can tell a
+                            // bundle with no sessions in it from a host with none.
+                            .with(
+                                "content_left_out",
+                                left_out
+                                    .iter()
+                                    .map(|(why, sessions)| {
+                                        Document::new()
+                                            .with("reason", Shown::said(why.code()))
+                                            .with("sessions", *sessions)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
                     );
                 }
                 output::document(&document);
@@ -769,7 +785,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 output::say(&report::power_line(&info.power));
                 output::lines(&kr_cli::doctor::configurable_lines(&checks.configuration));
                 output::lines(&kr_cli::doctor::doctor_lines(&checks, arguments.verbose));
-                if let Some((path, written, entries)) = bundle.as_ref() {
+                if let Some((path, written, entries, _)) = bundle.as_ref() {
                     output::say(&shown!(
                         "support bundle written to {} ({} software versions, {} capability \
                          records, {} checks, {} content-bearing entries)",
