@@ -986,7 +986,8 @@ struct Spool {
 struct Suspension {
     /// The first cursor the spool did not take.
     at: u64,
-    /// What stopped it, in words a person can act on.
+    /// What stops it now, in words a person can act on: the obstacle the last attempt to take
+    /// output again found, which is the one `boundary` says whether it is.
     reason: String,
     /// Whether a later pass may let it take output again.
     ///
@@ -1471,7 +1472,7 @@ impl Spool {
         }
     }
 
-    /// Whether the spool stopped because its boundary could not be written.
+    /// Whether what stops the spool now is a boundary that could not be written.
     fn awaits_boundary(&self) -> bool {
         self.suspended
             .as_ref()
@@ -1516,6 +1517,7 @@ impl Spool {
             // Still stopped where it first stopped, and for what it has found this time: an append
             // tries the boundary again, and only a retention pass tries anything else.
             self.suspended = Some(Suspension {
+                reason: no_room.reason,
                 boundary: no_room.boundary,
                 ..held
             });
@@ -2205,6 +2207,13 @@ mod tests {
             history.suspended().map(|(at, _)| at),
             Some(32),
             "and the spool is still stopped where it stopped, for the segment now"
+        );
+        assert!(
+            history
+                .suspended()
+                .is_some_and(|(_, reason)| reason.contains("could not be removed")),
+            "and says so: {:?}",
+            history.suspended()
         );
         assert_eq!(history.oldest_retained_cursor(), oldest);
         // The way is clear, and the next append does not take it: only a retention pass does.
