@@ -909,6 +909,9 @@ impl Session {
                 // The line is about to run what it names, which can take the terminal from the
                 // root shell.
                 self.activity.note();
+                // The file the shell's own search found is what names the program a description
+                // shows, whatever answer the command is given.
+                self.description_facts.note_resolved(&params);
                 let answer = self.resolve_invocation(&params);
                 self.answered.record(
                     params.prompt_generation,
@@ -1057,15 +1060,10 @@ impl Session {
     /// it ends. The second replaces the first rather than joining it, so a reader sees one entry
     /// per command.
     fn record_command_block(&mut self, block: kr_protocol::root::RootCommandBlockParams) {
-        // The place a command's directory, program and ending are decided, and the first thing
-        // done with it: the description facts take the program name and never the command line.
+        // The place a command's directory and ending are decided, and the first thing done with
+        // it: the description facts take the directory and the ending and never the command line.
         let shell = self.root_identity().map(|identity| identity.pid.get());
-        // The shell the bridge declared, which decides what a command line may start with.
-        let kind = self
-            .fence
-            .as_ref()
-            .and_then(|driver| driver.phase().shell());
-        self.description_facts.note_command(&block, shell, kind);
+        self.description_facts.note_command(&block, shell);
         if let Some(existing) = self
             .command_blocks
             .iter_mut()

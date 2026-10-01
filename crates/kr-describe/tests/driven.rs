@@ -1844,6 +1844,9 @@ struct Gate {
     /// Whether it admits a job's registration; a test of publications leaves it on.
     dispatches: bool,
     ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The service's own records of work in flight, which the gate reads to say where a job is
+    /// registered.
+    handles: kr_describe::service::Handles,
 }
 
 impl kr_describe::service::PublicationGate for Gate {
@@ -1851,8 +1854,26 @@ impl kr_describe::service::PublicationGate for Gate {
         &self,
         _generation: kr_worker::privacy::PrivacyGeneration,
         register: &mut dyn FnMut(),
-    ) -> bool {
-        self.dispatches.then(register).is_some()
+    ) {
+        if self.dispatches {
+            assert_eq!(
+                self.handles.in_flight.total(),
+                0,
+                "no job is registered before the gate runs the registration"
+            );
+            register();
+            // Inside the gate, where privacy mode's change waits for it: the job is in flight and
+            // has the token that cancels it.
+            assert_eq!(
+                self.handles.in_flight.total(),
+                1,
+                "registered inside the gate"
+            );
+            assert!(
+                self.handles.running.is_running(&session(1)),
+                "the job has its cancellation token inside the gate"
+            );
+        }
     }
 
     fn hold(
@@ -1881,6 +1902,7 @@ fn a_job_is_registered_inside_its_gate_and_never_sent_when_none_admits_it() {
                 admits: true,
                 dispatches: case == "admitting",
                 ran: ran.clone(),
+                handles: service.handles(),
             }));
         }
         queue(&mut service, &session(1), "kalareach", at(0));
@@ -1916,6 +1938,7 @@ fn a_publication_is_written_inside_its_gate_and_refused_when_none_admits_it() {
                 admits: case == "admitting",
                 dispatches: true,
                 ran: ran.clone(),
+                handles: service.handles(),
             })),
             _ => {}
         }

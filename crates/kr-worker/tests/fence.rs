@@ -2891,8 +2891,89 @@ async fn a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_
     }
 }
 
+/// KR-REQ-22.05: a real managed shell names the program its own search resolved to a file, and
+/// the word it found no file for is no program: a command found on the path is recorded as the
+/// program of its line, and a token typed at the prompt as one plain word, which the shell
+/// reports as not found, is recorded as no program and is in no fact.
+///
+/// It needs the built Zsh and Bash packages, which only a run that built them has, so an ordinary
+/// run leaves it out; see [`package_root`].
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for() {
+    use kr_protocol::describe::DescriptionCompletion;
+
+    let root = package_root();
+    let set =
+        kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = set
+            .select(Some(kind.as_str()))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
+            .clone();
+        let shell = RealShell::start(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+        )
+        .await;
+
+        let mut keys = shell.keys();
+        keys.type_line(&shell, "uname");
+        let ran = shell
+            .until_described("`uname` to end, named as the program it ran", |facts| {
+                facts.completion.0 == Some(DescriptionCompletion::Succeeded)
+            })
+            .await;
+        assert_eq!(ran.application.0.as_deref(), Some("uname"), "{kind:?}");
+
+        keys.type_line(&shell, "kr-9f3a7c1e-notacommand");
+        let pasted = shell
+            .until_described("the word with no file to end as not found", |facts| {
+                facts.completion.0 == Some(DescriptionCompletion::Failed)
+            })
+            .await;
+        assert_eq!(
+            pasted.application.0, None,
+            "{kind:?}: a word the shell found no file for is no program"
+        );
+        let encoded = serde_json::to_string(&pasted).expect("facts encode");
+        assert!(!encoded.contains("9f3a7c1e"), "{kind:?}: {encoded}");
+        shell.close().await;
+    }
+}
+
 #[cfg(unix)]
 impl RealShell {
+    /// Waits until the session's description facts satisfy `holds`, and returns them; says what
+    /// they were when they never do.
+    async fn until_described(
+        &self,
+        waited_for: &str,
+        holds: impl Fn(&kr_protocol::describe::DescriptionFacts) -> bool,
+    ) -> kr_protocol::describe::DescriptionFacts {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let facts = self
+                .runtime
+                .session()
+                .description_facts()
+                .read(0, None)
+                .facts;
+            if let Some(facts) = facts.as_ref().filter(|facts| holds(facts)) {
+                return facts.clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited for {waited_for}; the facts are {facts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until the session's description facts name `directory`, and says what they did name
     /// when they never do.
     async fn directory_described_as(&self, directory: &str, waited_for: &str) {
