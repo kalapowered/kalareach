@@ -1583,17 +1583,43 @@ mod tests {
     use kr_crypto::keys::NotificationPreviewKeyPair;
     use kr_protocol::ids::{InstallationId, PushSenderRecordId};
 
+    /// A recipient whose grant holds every right a notice can ask for, from the beginning of time,
+    /// over the sessions it names, or over every session when it names none.
     #[derive(Debug)]
     struct Everything(BTreeSet<SessionId>);
 
+    impl Everything {
+        fn scope(&self) -> RecipientScope {
+            RecipientScope {
+                viewer: ViewerScope::owner(),
+                sessions: if self.0.is_empty() {
+                    SessionSelector::Any
+                } else {
+                    SessionSelector::These {
+                        session_ids: self.0.iter().copied().collect(),
+                    }
+                },
+                rights: [
+                    ActionRight::SessionView,
+                    ActionRight::AutomationManage,
+                    ActionRight::HostManage,
+                ]
+                .into_iter()
+                .collect(),
+                grant_id: GrantId::new(Uuid::from_bytes([9; 16])),
+                recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+                history_from_ms: 0,
+            }
+        }
+    }
+
     impl RecipientAuthority for Everything {
         fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
-            Some(RecipientScope {
-                viewer: ViewerScope::owner(),
-                sessions: SessionSelector::These {
-                    session_ids: self.0.iter().copied().collect(),
-                },
-            })
+            Some(self.scope())
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            Some(self.scope())
         }
     }
 
@@ -1603,6 +1629,18 @@ mod tests {
     impl RecipientAuthority for Revoked {
         fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
             None
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            None
+        }
+    }
+
+    /// The audience of a condition in session one first seen at `at_ms`.
+    fn audience(at_ms: u64) -> Audience {
+        Audience::Sessions {
+            sessions: vec![session(1)],
+            at_ms,
         }
     }
 
@@ -1720,6 +1758,7 @@ mod tests {
                 kr_protocol::attention::AttentionSource::Questions,
                 3,
             ))),
+            audience(0),
             1_000,
         );
         assert_eq!(from_record.summary, "");
@@ -1727,6 +1766,7 @@ mod tests {
         assert_eq!(from_record.rule, "attention.pending_approval");
         let from_host = Notice::from_announcement(
             &announcement(Text::Host("the workflow is paused".to_owned())),
+            audience(0),
             1_000,
         );
         assert_eq!(from_host.summary, "the workflow is paused");
@@ -1744,6 +1784,7 @@ mod tests {
             observed_at_ms: TimestampMs::new(now_ms),
             collapse_group: "session-1/attention.pending_approval".to_owned(),
             expires_at_ms: TimestampMs::new(now_ms + DEFAULT_NOTIFICATION_LIFETIME_MS),
+            audience: audience(0),
         }
     }
 
@@ -2560,6 +2601,368 @@ mod tests {
                 .unwrap()
                 .contains("encrypted object")
         );
+    }
+
+    // ----- Taking announcements from the attention store ---------------------------------------
+
+    use kr_attention::event::{EventCursor, EventKind, SourceEvent};
+    use kr_attention::{Attention, Claimant, HostReading, Liveness};
+    use kr_protocol::attention::AttentionSource;
+    use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+
+    /// A wall-clock moment at noon UTC on the first day of the epoch: long before any journal in a
+    /// test is lifted, so a decision made then is older than the lift.
+    const NOON: u64 = 12 * 60 * 60 * 1_000;
+
+    fn reading(continuous_ms: u64, wall_ms: u64) -> HostReading {
+        HostReading::new(
+            kr_attention::time::BootMark::from_bytes([7; 16]),
+            continuous_ms,
+            wall_ms,
+            true,
+        )
+    }
+
+    fn unknown(_: &ProcessStartIdentity) -> Liveness {
+        Liveness::Unknown
+    }
+
+    fn store() -> Attention {
+        Attention::in_memory(
+            reading(0, NOON),
+            &Claimant::new(
+                ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+                &unknown,
+            ),
+        )
+        .expect("an in-memory store")
+    }
+
+    /// A pending approval in session one, seen at `wall_ms`, which the store announces at once.
+    fn raise_approval(attention: &mut Attention, sequence: u64, wall_ms: u64, request: &str) {
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Receipts, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::ApprovalRequested {
+                        request_id: kr_protocol::ids::ApprovalRequestId::new(request)
+                            .expect("an identifier"),
+                        session_id: session(1),
+                        summary: "write /etc/hosts".to_owned(),
+                    },
+                ),
+                reading(0, wall_ms),
+            )
+            .expect("the store records the approval");
+    }
+
+    /// A command that failed in session one, seen at `wall_ms`: an announcement that is not a
+    /// pending question or approval.
+    fn raise_failure(attention: &mut Attention, sequence: u64, wall_ms: u64) {
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Receipts, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::CommandCompleted {
+                        session_id: session(1),
+                        command: "cargo test".to_owned(),
+                        exit_code: 101,
+                    },
+                ),
+                reading(0, wall_ms),
+            )
+            .expect("the store records the failure");
+    }
+
+    const NORMAL: PrivacyView = PrivacyView {
+        generation: 0,
+        private: false,
+    };
+
+    fn take(
+        producer: &mut Producer,
+        attention: &mut Attention,
+        authority: &dyn RecipientAuthority,
+        privacy: PrivacyView,
+    ) -> Taken {
+        producer
+            .take_from_attention(attention, &|_| true, authority, SCOPE, privacy, 1_000)
+            .expect("a take")
+    }
+
+    /// A paired device in one destination, to every one of which a notification is admitted.
+    fn two_phones(producer: &mut Producer) -> [DestinationRecord; 2] {
+        let mut second = push_destination("phone-b", true);
+        if let Destination::Push(push) = &mut second.destination {
+            push.installation_id = InstallationId::new(Uuid::from_bytes([4; 16]));
+            push.sender_record_id = PushSenderRecordId::new(Uuid::from_bytes([5; 16]));
+        }
+        let phones = [push_destination("phone-a", true), second];
+        for phone in &phones {
+            producer
+                .journal_mut()
+                .configure_destination(phone)
+                .expect("a destination");
+        }
+        phones
+    }
+
+    /// One announcement is one event, and one notification for each destination whose recipient
+    /// the notice's audience admits; the store is told only after the journal holds the event, and
+    /// does not offer it again. The control: with the recipients' grant not reaching the session,
+    /// nothing is written for it at all, and the announcement is still settled.
+    #[test]
+    fn an_announcement_becomes_one_notification_for_each_destination_that_may_be_told() {
+        let mut producer = producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = store();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(taken.taken, 1);
+        assert_eq!(
+            attention.awaiting_delivery().expect("a count"),
+            0,
+            "settled once the journal holds the event"
+        );
+        assert_eq!(producer.journal().pending_count().expect("a count"), 1);
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(produced.admitted, 2);
+        assert_eq!(producer.journal().pending_count().expect("a count"), 0);
+
+        // Not offered again, and nothing more is produced.
+        let again = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(again, Taken::default());
+
+        // The control.
+        let mut other = store();
+        raise_approval(&mut other, 1, NOON, "req-1");
+        let elsewhere = Everything([session(2)].into_iter().collect());
+        let mut fresh = self::producer();
+        let phones = two_phones(&mut fresh);
+        take(&mut fresh, &mut other, &elsewhere, NORMAL);
+        let produced = fresh
+            .finish_pending(&phones, &elsewhere, 1_000)
+            .expect("production");
+        assert_eq!(
+            produced.admitted, 0,
+            "a grant over another session is not told"
+        );
+        assert!(fresh.journal().deliveries().expect("a read").is_empty());
+        assert_eq!(other.awaiting_delivery().expect("a count"), 0);
+    }
+
+    /// The take is made only while the journal stands where the published privacy state says.
+    #[test]
+    fn nothing_is_taken_while_the_journal_and_the_published_state_disagree() {
+        let mut producer = producer();
+        two_phones(&mut producer);
+        let mut attention = store();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+
+        // Published private, journal not yet fenced.
+        let private = PrivacyView {
+            generation: 1,
+            private: true,
+        };
+        assert!(
+            take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                private
+            )
+            .skipped
+        );
+        // Published normal at the next generation, journal still fenced at the one before.
+        producer.journal_mut().fence(1).expect("a fence");
+        let lifted = PrivacyView {
+            generation: 2,
+            private: false,
+        };
+        assert!(
+            take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                lifted
+            )
+            .skipped
+        );
+        assert_eq!(
+            attention.awaiting_delivery().expect("a count"),
+            1,
+            "nothing was taken, so the store still offers it"
+        );
+        // The control: where the two agree it is taken.
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            private,
+        );
+        assert!(!taken.skipped);
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+    }
+
+    /// While privacy mode is on, a pending approval still owes an alert, with no preview and a
+    /// collapse group that names no session, and any other announcement is taken as an event with
+    /// nothing produced; once it is off, nothing decided while it was on is ever sent.
+    #[test]
+    fn privacy_mode_lets_a_pending_approval_alert_through_and_sends_nothing_else() {
+        let mut producer = producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = store();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+        raise_failure(&mut attention, 2, NOON);
+        producer.journal_mut().fence(1).expect("a fence");
+        let private = PrivacyView {
+            generation: 1,
+            private: true,
+        };
+
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            private,
+        );
+        assert_eq!(taken.taken, 2);
+        assert_eq!(taken.alerts, 2, "the approval, once for each phone");
+        assert_eq!(taken.dropped, 1, "the failed command is not an alert");
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 2);
+        for delivery in &deliveries {
+            assert_eq!(delivery.privacy_generation, 1);
+            assert_eq!(delivery.state, DeliveryState::Admitted);
+            let request: PushDeliveryRequest =
+                serde_json::from_slice(delivery.content.as_deref().expect("a request"))
+                    .expect("a push request");
+            assert!(
+                request.preview.as_ref().is_none(),
+                "the alert carries no preview"
+            );
+            assert_eq!(request.hints.alert, PushAlert::ApprovalWaiting);
+        }
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+        // Nothing is produced from an event under the fence.
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(produced, Produced::default());
+
+        // Privacy mode off: what is queued of the alerts is taken back, and a decision made
+        // before the lift is never sent.
+        raise_approval(&mut attention, 3, NOON, "req-2");
+        producer.journal_mut().lift_fence(2).expect("a lift");
+        let lifted = PrivacyView {
+            generation: 2,
+            private: false,
+        };
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            lifted,
+        );
+        assert_eq!(taken.dropped, 1, "decided before the lift, so never sent");
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+        for delivery in producer.journal().deliveries().expect("a read") {
+            assert_eq!(delivery.state, DeliveryState::Cancelled);
+        }
+
+        // The control: a decision made after the lift is produced as any other is.
+        let after = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a time")
+                .as_millis(),
+        )
+        .expect("a time")
+            + 3_600_000;
+        raise_approval(&mut attention, 4, after, "req-3");
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            lifted,
+        );
+        assert_eq!(taken.taken, 1);
+        assert_eq!(taken.dropped, 0);
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(produced.admitted, 2);
+    }
+
+    /// What a grant reaches is decided by its history and by the right each kind of subject asks
+    /// for.
+    #[test]
+    fn an_audience_is_admitted_by_the_grants_rights_and_history() {
+        let scope = |rights: &[ActionRight], from: u64| RecipientScope {
+            viewer: ViewerScope::owner(),
+            sessions: SessionSelector::These {
+                session_ids: [session(1)].into_iter().collect(),
+            },
+            rights: rights.iter().copied().collect(),
+            grant_id: GrantId::new(Uuid::from_bytes([9; 16])),
+            recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+            history_from_ms: from,
+        };
+        let view = [ActionRight::SessionView];
+        // A session item: the right, the session, and a time at or after the grant's reach.
+        assert!(audience(100).admits(&scope(&view, 100)));
+        assert!(
+            !audience(99).admits(&scope(&view, 100)),
+            "before the grant's cursor"
+        );
+        assert!(!audience(100).admits(&scope(&[], 0)), "no session.view");
+        let two = Audience::Sessions {
+            sessions: vec![session(1), session(2)],
+            at_ms: 100,
+        };
+        assert!(
+            !two.admits(&scope(&view, 0)),
+            "one session the grant does not reach"
+        );
+        // A workflow: the right and the grant it acts under.
+        let workflow = Audience::Automation {
+            grant: Some(GrantId::new(Uuid::from_bytes([9; 16]))),
+            at_ms: 100,
+        };
+        assert!(workflow.admits(&scope(&[ActionRight::AutomationManage], 0)));
+        assert!(
+            !workflow.admits(&scope(&view, 0)),
+            "session.view is not automation.manage"
+        );
+        let another = Audience::Automation {
+            grant: Some(GrantId::new(Uuid::from_bytes([8; 16]))),
+            at_ms: 100,
+        };
+        assert!(!another.admits(&scope(&[ActionRight::AutomationManage], 0)));
+        let unnamed = Audience::Automation {
+            grant: None,
+            at_ms: 100,
+        };
+        assert!(!unnamed.admits(&scope(&[ActionRight::AutomationManage], 0)));
+        // The environment: host.manage.
+        let environment = Audience::Environment { at_ms: 100 };
+        assert!(environment.admits(&scope(&[ActionRight::HostManage], 0)));
+        assert!(!environment.admits(&scope(&view, 0)));
     }
 
     #[test]

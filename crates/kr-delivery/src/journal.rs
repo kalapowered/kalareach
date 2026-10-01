@@ -4272,6 +4272,312 @@ mod tests {
         journal
     }
 
+    /// The request of an alert privacy mode lets through: no preview.
+    fn alert_request(byte: u8) -> Vec<u8> {
+        serde_json::to_vec(&kr_protocol::push::PushDeliveryRequest {
+            collapse_id: crate::budget::collapse_id(&[1; 32], "private/1/rule"),
+            expires_at_ms: TimestampMs::new(100_000),
+            hints: kr_protocol::push::PushPlatformHints {
+                alert: kr_protocol::push::PushAlert::ApprovalWaiting,
+                urgency: kr_protocol::push::PushUrgency::Attention,
+            },
+            notification_id: NotificationId::new(uuid(byte)),
+            preview: kr_protocol::scalars::Nullable::null(),
+            sender_record_id: PushSenderRecordId::new(uuid(6)),
+        })
+        .expect("a request")
+    }
+
+    /// One alert for the phone, under `generation`, as the producer builds it.
+    fn private_entry(byte: u8, generation: u64, content: Option<Vec<u8>>) -> PrivateEntry {
+        let phone = phone();
+        PrivateEntry {
+            event: TakenEvent {
+                key: event(byte),
+                source_cursor: 1,
+                session_id: None,
+                recorded_at_ms: TimestampMs::new(1_000),
+                notice: Vec::new(),
+            },
+            records: vec![DeliveryRecord {
+                privacy_generation: generation,
+                content,
+                destination_id: phone.id.clone(),
+                destination_digest: phone.binding_digest(),
+                ..delivery(byte, event(byte), "phone")
+            }],
+            spent: Vec::new(),
+        }
+    }
+
+    /// An alert is taken only while the journal is fenced at the generation it names, only as a
+    /// request that holds no preview, and only once: the event it came from is what makes a
+    /// second take of it write nothing.
+    #[test]
+    fn an_alert_is_taken_only_while_fenced_at_its_generation_and_only_as_an_alert() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        let entry = private_entry(1, 1, Some(alert_request(1)));
+        assert!(
+            matches!(
+                journal.take_private(&consumer(), &entry, 1, 1),
+                Err(DeliveryError::LateResult { .. })
+            ),
+            "not while the journal is not fenced"
+        );
+        journal.fence(1).expect("a fence");
+        assert!(
+            matches!(
+                journal.take_private(&consumer(), &entry, 1, 2),
+                Err(DeliveryError::LateResult { .. })
+            ),
+            "not at a generation the journal is not at"
+        );
+        for refused in [
+            private_entry(2, 0, Some(alert_request(2))),
+            private_entry(3, 1, Some(b"{}".to_vec())),
+            PrivateEntry {
+                event: TakenEvent {
+                    notice: b"a notice".to_vec(),
+                    ..private_entry(4, 1, None).event
+                },
+                ..private_entry(4, 1, None)
+            },
+        ] {
+            assert!(
+                matches!(
+                    journal.take_private(&consumer(), &refused, 1, 1),
+                    Err(DeliveryError::NotAuthorised(_))
+                ),
+                "a record that is not an alert, or an event with a notice, is refused whole"
+            );
+        }
+        assert!(journal.events().expect("a read").is_empty());
+
+        assert!(
+            journal
+                .take_private(&consumer(), &entry, 1, 1)
+                .expect("taken")
+        );
+        assert!(
+            !journal
+                .take_private(&consumer(), &entry, 1, 1)
+                .expect("taken again"),
+            "an event already taken admits nothing twice"
+        );
+        let deliveries = journal.deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].privacy_generation, 1);
+        assert_eq!(
+            journal.pending_count().expect("a count"),
+            0,
+            "decided, not pending"
+        );
+        // The control: the same take under the ordinary entry is still refused while fenced.
+        assert!(matches!(
+            journal.take_events(&consumer(), &[taken(9, 2)], 2),
+            Err(DeliveryError::Fenced)
+        ));
+    }
+
+    /// The generation alone decides which rows are sent. While the outbox is fenced the rows of the
+    /// generation in force are the alerts, and a row admitted before the fence is not offered,
+    /// claimed or sent, whatever it was selected as.
+    #[test]
+    fn an_alert_is_sent_under_the_fence_and_the_content_before_it_is_not() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(1, event(1), "hook"))
+            .expect("admitted");
+        journal.fence(1).expect("a fence");
+        journal
+            .take_private(
+                &consumer(),
+                &private_entry(2, 1, Some(alert_request(2))),
+                2,
+                1,
+            )
+            .expect("an alert");
+
+        let due = journal.due(2_000, 10).expect("a read");
+        assert_eq!(
+            due.len(),
+            1,
+            "the content admitted before the fence is not offered"
+        );
+        assert_eq!(due[0].notification_id, NotificationId::new(uuid(2)));
+        assert_eq!(
+            journal
+                .claim(NotificationId::new(uuid(1)), 2_000)
+                .expect("a claim"),
+            Claim::Refused(ClaimRefusal::WrongGeneration)
+        );
+        let claimed = claim(&mut journal, 2, 2_000);
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_000)),
+                    next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    next: crate::push::NextAction::Send,
+                    detail: Some("the gateway asked for later".to_owned()),
+                    suppression: None,
+                    left_this_host: false,
+                    reported_by_destination: false,
+                })
+                .expect("a transition")
+        );
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(2)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::Retrying,
+            "an alert's answer schedules its next attempt as any other's does"
+        );
+    }
+
+    /// Privacy mode's cleanup acts on what came before the fence, however many times it runs, and
+    /// leaves the alerts alone: it takes back the content, strips the requests of content and
+    /// counts as outstanding only the work from before the boundary.
+    #[test]
+    fn cleanup_leaves_the_alerts_privacy_mode_let_through_alone() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1), taken(5, 2)], 2)
+            .expect("a page");
+        journal
+            .admit(&delivery(1, event(1), "hook"))
+            .expect("admitted");
+        journal
+            .admit(&delivery(5, event(5), "hook"))
+            .expect("admitted");
+        claim(&mut journal, 5, 2_000);
+        journal.fence(1).expect("a fence");
+        journal
+            .take_private(
+                &consumer(),
+                &private_entry(2, 1, Some(alert_request(2))),
+                3,
+                1,
+            )
+            .expect("an alert");
+        claim(&mut journal, 2, 2_000);
+        journal
+            .take_private(
+                &consumer(),
+                &private_entry(3, 1, Some(alert_request(3))),
+                4,
+                1,
+            )
+            .expect("an alert");
+
+        for _ in 0..2 {
+            let (cancelled, _) = journal.cancel_undispatched(3_000).expect("a cleanup");
+            let _ = cancelled;
+            journal.remove_retained().expect("a cleanup");
+        }
+        let state_of = |journal: &DeliveryJournal, byte: u8| {
+            journal
+                .delivery(NotificationId::new(uuid(byte)))
+                .expect("a read")
+                .expect("the record")
+        };
+        assert_eq!(state_of(&journal, 1).state, DeliveryState::Cancelled);
+        assert_eq!(state_of(&journal, 1).content, None);
+        assert_eq!(state_of(&journal, 3).state, DeliveryState::Admitted);
+        assert!(
+            state_of(&journal, 3).content.is_some(),
+            "an alert keeps the request it is waiting to present, through every run of the cleanup"
+        );
+        assert_eq!(state_of(&journal, 2).state, DeliveryState::InFlight);
+        assert_eq!(
+            journal.outstanding().expect("a count"),
+            1,
+            "the content on the wire from before the fence, and not the alert on the wire"
+        );
+    }
+
+    /// Lifting the fence takes back the alerts nothing sent, so none is sent once privacy mode is
+    /// off, records the time, and does nothing the second time it is asked at the same generation.
+    #[test]
+    fn lifting_the_fence_takes_back_the_alerts_and_records_when() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        assert_eq!(journal.lifted_at_ms().expect("a read"), 0);
+        journal.fence(1).expect("a fence");
+        journal
+            .take_private(
+                &consumer(),
+                &private_entry(2, 1, Some(alert_request(2))),
+                1,
+                1,
+            )
+            .expect("an alert");
+        journal.lift_fence(2).expect("a lift");
+        assert_eq!(
+            journal.standing().expect("a read"),
+            PrivacyStanding {
+                generation: 2,
+                fenced: false
+            }
+        );
+        let lifted = journal.lifted_at_ms().expect("a read");
+        assert!(lifted > 0);
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(2)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::Cancelled
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        journal.lift_fence(2).expect("a second lift");
+        assert_eq!(
+            journal.lifted_at_ms().expect("a read"),
+            lifted,
+            "lifting again at every start moves nothing"
+        );
+    }
+
+    /// A take made under a generation says so, and a journal at another takes nothing; an event
+    /// taken before a boundary and not produced from is decided by the walk that finds it, and
+    /// never stands in front of the ones after it.
+    #[test]
+    fn an_event_under_a_generation_that_has_passed_is_decided_not_left_pending() {
+        let mut journal = journal();
+        assert!(matches!(
+            journal.take_events_under(&consumer(), &[taken(1, 1)], 1, 3),
+            Err(DeliveryError::LateResult { .. })
+        ));
+        journal
+            .take_events_under(&consumer(), &[taken(1, 1)], 1, 0)
+            .expect("taken at the generation in force");
+        journal.lift_fence(1).expect("a generation moves on");
+        assert_eq!(journal.pending_count().expect("a count"), 1);
+        assert_eq!(journal.cancel_stale_events().expect("a write"), 1);
+        assert_eq!(journal.pending_count().expect("a count"), 0);
+        assert_eq!(journal.cancel_stale_events().expect("a write"), 0);
+    }
+
     /// A notice holds the summary a notification is built from, so capturing one while the outbox
     /// is fenced would write plaintext privacy mode has already walked past.
     #[test]
@@ -4398,7 +4704,7 @@ mod tests {
             journal
                 .claim(selected[0].notification_id, 2_000)
                 .expect("a claim"),
-            Claim::Refused(ClaimRefusal::Fenced)
+            Claim::Refused(ClaimRefusal::WrongGeneration)
         );
     }
 
@@ -6162,10 +6468,10 @@ mod tests {
     }
 
     /// A journal another schema version wrote is refused at open, whichever version it was, except
-    /// the one version this build brings forward.
+    /// the versions this build brings forward.
     #[test]
     fn a_journal_written_under_another_schema_version_is_refused() {
-        for version in [PREVIOUS_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+        for version in [OLDEST_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("delivery.sqlite3");
             drop(DeliveryJournal::open(&path).expect("a journal"));
@@ -6191,6 +6497,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE delivery_destinations DROP COLUMN credential_stamp;
+                 ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
                  UPDATE delivery_schema SET version = 6;",
             )
             .expect("the version 6 shape");
@@ -6242,13 +6549,43 @@ mod tests {
                     .expect("a claim"),
                 Claim::Taken(_)
             ),
-            "the binding version 6 recorded is the binding version 7 computes"
+            "the binding version 6 recorded is the binding the current version computes"
         );
         drop(journal);
         assert!(
             DeliveryJournal::open(&path).is_ok(),
-            "and it opens again as version 7"
+            "and it opens again as the current version"
         );
+    }
+
+    /// A version 7 journal is brought forward in place: its privacy row gains the time privacy mode
+    /// was last turned off, which reads as no time at all, and its fence stays where it stood.
+    #[test]
+    fn a_version_7_journal_is_brought_forward_with_its_fence_where_it_stood() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        {
+            let mut journal = DeliveryJournal::open(&path).expect("a journal");
+            journal.fence(3).expect("a fence");
+        }
+        {
+            let connection = rusqlite::Connection::open(&path).expect("a connection");
+            connection
+                .execute_batch(
+                    "ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
+                     UPDATE delivery_schema SET version = 7;",
+                )
+                .expect("the version 7 shape");
+        }
+        let journal = DeliveryJournal::open(&path).expect("brought forward");
+        assert_eq!(
+            journal.standing().expect("a read"),
+            PrivacyStanding {
+                generation: 3,
+                fenced: true
+            }
+        );
+        assert_eq!(journal.lifted_at_ms().expect("a read"), 0);
     }
 
     /// A credential replaced under a configured destination is a new binding: what was admitted
