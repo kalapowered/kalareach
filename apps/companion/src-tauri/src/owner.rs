@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
-    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shows_value,
+    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, reason, shown, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{CatalogueTrustPlan, NATIVE_BRIDGE_NOTICE, PluginInstallPlan};
@@ -36,6 +36,9 @@ use crate::error::{CommandError, Result};
 
 /// How often each owned host is asked what it wants confirmed.
 pub const INTERVAL: Duration = Duration::from_secs(2);
+
+/// The most characters of a host's name the page shows, as the dialog's line shows it first.
+const HOST_NAME_CHARS: usize = 40;
 
 /// How long one visit to an owned host may take, from connecting to its answer. A host that has
 /// not answered by then is out of contact until the next cycle.
@@ -393,12 +396,17 @@ fn held_now<'a>(holding: &'a [Listed], shown: &Listed) -> Held<'a> {
     }
 }
 
-/// What the page is shown of one listed request.
+/// What the page is shown of one listed request. `host_name` is the name the host goes by as the
+/// host or a person wrote it: the page is shown it as the dialog's line shows it.
 fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> RequestView {
     let expires_at_ms = listed.request.expires_at_ms.get();
+    let name = match shown(host_name, HOST_NAME_CHARS) {
+        name if name.is_empty() => UNNAMED_HOST.to_owned(),
+        name => name,
+    };
     let unchecked = |title: &str| RequestView {
         reference: reference.to_owned(),
-        host_name: host_name.to_owned(),
+        host_name: name.clone(),
         title: title.to_owned(),
         detail: None,
         value: None,
@@ -448,7 +456,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         .unwrap_or(&line);
     RequestView {
         reference: reference.to_owned(),
-        host_name: host_name.to_owned(),
+        host_name: name,
         title: title.to_owned(),
         detail: Some(sentence(line)),
         value,
@@ -1039,6 +1047,35 @@ mod tests {
         let view = describe("a reference", "studio", &a_device_being_added(), NOW);
         assert!(view.facts.is_empty());
         assert_eq!((view.notice, view.statement), (None, None));
+    }
+
+    /// KR-REQ-10.06: the name a host goes by is text the host or a person chose. The page puts it in
+    /// its title and its lines, so it reaches the page as the platform's dialog shows it: on one
+    /// line, without a character that hides or reorders text, and shortened, for a request that was
+    /// checked and for one that was not. A name left with nothing to show is the unnamed host's.
+    #[test]
+    fn a_host_name_reaches_the_page_as_the_dialog_shows_it() {
+        let checked = a_device_being_added();
+        let mut unchecked = a_device_being_added();
+        unchecked.subject = Err(CannotCheck::DigestMismatch);
+        let long = "n".repeat(60);
+        let cases = [
+            ("studio", "studio".to_owned()),
+            ("stu\u{202e}dio\n\u{ad}box\u{200b}", "studio box".to_owned()),
+            ("  build   box  ", "build box".to_owned()),
+            (long.as_str(), format!("{}\u{2026}", "n".repeat(39))),
+            ("\u{202e}\u{200b}\n", UNNAMED_HOST.to_owned()),
+            ("", UNNAMED_HOST.to_owned()),
+        ];
+        for (raw, shown) in cases {
+            for listed in [&checked, &unchecked] {
+                assert_eq!(
+                    describe("a reference", raw, listed, NOW).host_name,
+                    shown,
+                    "{raw:?}"
+                );
+            }
+        }
     }
 
     /// An enrolment as a host lists it.
