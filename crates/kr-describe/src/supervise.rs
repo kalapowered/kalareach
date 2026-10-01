@@ -17,7 +17,8 @@
 //! | The handshake | [`HANDSHAKE_MS`] for `ready` |
 //! | A load | its own deadline, plus [`ANSWER_GRACE_MS`] |
 //! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`] |
-//! | A cancellation | [`CANCEL_MS`] for the work's answer |
+//! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is held to the same bound |
+//! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
 //! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job |
 //!
 //! Nothing here reads a clock for a decision: every turn takes the host's reading, as the service
@@ -43,12 +44,12 @@ use crate::error::Result;
 use crate::resource::HostConditions;
 use crate::serve::DAEMON_IDENTITY_ARGUMENT;
 use crate::service::{
-    Answered, DescriptionService, Instruction, Outcome, ProcessEnd, UnloadReason,
+    Answered, DescriptionService, Instruction, Outcome, ProcessEnd, UnloadReason, Work,
 };
 use crate::time::Reading;
 use crate::wire::{
-    Answer, AssetFile, Background, JobLimits, Request, WIRE_VERSION, WireError, frame_of,
-    read_message, same_release,
+    Answer, AssetFile, Background, JobLimits, Request, VerifyResult, WIRE_VERSION, WireError,
+    frame_of, read_message, same_release,
 };
 
 /// How long a process has to answer `hello`.
@@ -57,7 +58,14 @@ pub const HANDSHAKE_MS: u64 = 10_000;
 /// How far past its own deadline a load or a job may go before the process is ended.
 pub const ANSWER_GRACE_MS: u64 = 2_000;
 
-/// How long a process has to answer the work it was told to cancel.
+/// How long a process has to say it has read a cancellation, and how long a load or a check of a
+/// file has to answer one.
+///
+/// A job's cancellation is held to the first alone: the control thread says at once that it has
+/// read it, and the job's own answer is then bounded by the job's deadline and the process's own
+/// watchdog, so a busy host that takes a moment to stop a job is not mistaken for a process that is
+/// not listening. A load and a check of a file lose nothing when the process is ended, so each is
+/// held to this bound for its own answer too.
 pub const CANCEL_MS: u64 = 2_000;
 
 /// How often the process's resident set is read while it loads or runs a job.
@@ -138,6 +146,48 @@ pub enum Report {
         /// Why.
         why: UnloadReason,
     },
+    /// A check of a file came to an end.
+    Checked {
+        /// The check's identifier.
+        id: u64,
+        /// How it came out.
+        checked: Checked,
+    },
+}
+
+/// How a check of a file came out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checked {
+    /// The process answered.
+    Answered {
+        /// What it found.
+        result: VerifyResult,
+        /// What it said besides, when it said anything.
+        detail: Option<String>,
+    },
+    /// The process ended before it answered.
+    ProcessEnded {
+        /// How.
+        why: ProcessEnd,
+    },
+}
+
+/// A file to check, and what it is to be checked against: a file of one of the profiles the
+/// process's own catalogue holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    /// The check's identifier, which the host chooses and the driver reports back.
+    pub id: u64,
+    /// The profile.
+    pub profile_id: String,
+    /// The profile's revision.
+    pub revision: u64,
+    /// The file's name, as the profile records it.
+    pub file_name: String,
+    /// Where the file is.
+    pub path: PathBuf,
+    /// How long it may take, in milliseconds.
+    pub deadline_ms: u64,
 }
 
 /// A timer on one piece of work.
@@ -157,8 +207,35 @@ struct Running {
     hello_at_ms: u64,
     identity: Option<ProcessStartIdentity>,
     work: Option<Due>,
-    cancel: Option<Due>,
+    cancel: Option<Cancel>,
+    /// The check of a file in the process, when one is.
+    check: Option<Due>,
     next_sample_ms: u64,
+}
+
+/// What kind of work a cancellation is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Job,
+    Load,
+    Check,
+}
+
+/// A cancellation sent, and whether the control thread has said it has read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cancel {
+    id: u64,
+    at_ms: u64,
+    kind: Kind,
+    acknowledged: bool,
+}
+
+impl Cancel {
+    /// Whether this cancellation is still held to its timer: always before it is acknowledged, and
+    /// after it for a load or a check, whose own answer is bounded the same way.
+    const fn timed(self) -> bool {
+        !self.acknowledged || !matches!(self.kind, Kind::Job)
+    }
 }
 
 /// The daemon's driver of the description service and its process.
@@ -174,6 +251,7 @@ pub struct Driver {
     tag: u64,
     started: u64,
     background: Option<Background>,
+    ceiling: Option<String>,
     until_ms: Option<u64>,
 }
 
@@ -194,6 +272,7 @@ impl Driver {
             tag: 0,
             started: 0,
             background: None,
+            ceiling: None,
             until_ms: None,
         }
     }
@@ -235,6 +314,31 @@ impl Driver {
         self.background.as_ref()
     }
 
+    /// Returns how the last process to say it was ready has its memory ceiling enforced.
+    #[must_use]
+    pub fn ceiling(&self) -> Option<&str> {
+        self.ceiling.as_deref()
+    }
+
+    /// Returns whether a check of a file is in the process, by its identifier.
+    #[must_use]
+    pub fn checking(&self) -> Option<u64> {
+        self.process
+            .as_ref()
+            .and_then(|running| running.check)
+            .map(|due| due.id)
+    }
+
+    /// Returns the work a cancellation has been sent for and not yet seen answered, and whether
+    /// the control thread has said it has read it.
+    #[must_use]
+    pub fn cancelling(&self) -> Option<(u64, bool)> {
+        self.process
+            .as_ref()
+            .and_then(|running| running.cancel)
+            .map(|cancel| (cancel.id, cancel.acknowledged))
+    }
+
     /// Returns how many processes this driver has started.
     #[must_use]
     pub const fn started(&self) -> u64 {
@@ -253,7 +357,10 @@ impl Driver {
             if let Some(due) = running.work {
                 soonest = soonest.min(due.at_ms).min(running.next_sample_ms);
             }
-            if let Some(due) = running.cancel {
+            if let Some(cancel) = running.cancel.filter(|cancel| cancel.timed()) {
+                soonest = soonest.min(cancel.at_ms);
+            }
+            if let Some(due) = running.check {
                 soonest = soonest.min(due.at_ms);
             }
             soonest
@@ -277,6 +384,95 @@ impl Driver {
                 true
             }
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => false,
+        }
+    }
+
+    /// Sends a check of a file to the process, starting the process when there is none.
+    ///
+    /// One check is in the process at a time, and the host that asks for one is the host that
+    /// knows nothing else is running: a check holds the process's model thread, so a job sent
+    /// behind it would be waiting while its own deadline ran. The result comes back as
+    /// [`Report::Checked`] on a later turn. A check the process cannot be started for, or that
+    /// the process ends before answering, is reported as ended with the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store failures the service returns when the process's end is told to it.
+    pub fn verify(&mut self, check: &Check, now: Reading) -> Result<Vec<Report>> {
+        let mut reports = Vec::new();
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|running| running.check.is_some())
+        {
+            return Ok(reports);
+        }
+        if let Err(why) = self.start(now, &mut reports) {
+            reports.extend(
+                self.service
+                    .process_ended(why, now)?
+                    .into_iter()
+                    .map(Report::Outcome),
+            );
+            reports.push(Report::Checked {
+                id: check.id,
+                checked: Checked::ProcessEnded { why },
+            });
+            return Ok(reports);
+        }
+        // Recorded before it is sent, so a process that cannot take the request ends with the
+        // check reported as ended with it.
+        if let Some(running) = self.process.as_mut() {
+            running.check = Some(Due {
+                id: check.id,
+                at_ms: now
+                    .monotonic_ms()
+                    .saturating_add(check.deadline_ms)
+                    .saturating_add(ANSWER_GRACE_MS),
+            });
+        }
+        let request = Request::Verify {
+            id: U64::new(check.id),
+            profile_id: check.profile_id.clone(),
+            revision: U64::new(check.revision),
+            file_name: check.file_name.clone(),
+            path: check.path.to_string_lossy().into_owned(),
+            deadline_ms: U64::new(check.deadline_ms),
+        };
+        self.send(&request, now, &mut reports)?;
+        Ok(reports)
+    }
+
+    /// Tells the process to stop the check it is making, if it is making one. The process is
+    /// ended when it has not answered within [`CANCEL_MS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the store failures the service returns when the process's end is told to it.
+    pub fn cancel_check(&mut self, now: Reading) -> Result<Vec<Report>> {
+        let mut reports = Vec::new();
+        let Some(id) = self.checking() else {
+            return Ok(reports);
+        };
+        if self.send(&Request::Cancel { id: U64::new(id) }, now, &mut reports)?
+            && let Some(running) = self.process.as_mut()
+        {
+            running.cancel = Some(Cancel {
+                id,
+                at_ms: now.monotonic_ms().saturating_add(CANCEL_MS),
+                kind: Kind::Check,
+                acknowledged: false,
+            });
+        }
+        Ok(reports)
+    }
+
+    /// Lets go of the process without ending it or its input, as a daemon that was killed does:
+    /// what a test uses to have a process outlive the daemon that started it.
+    #[cfg(feature = "testing")]
+    pub fn abandon(mut self) {
+        if let Some(running) = self.process.take() {
+            std::mem::forget(running);
         }
     }
 
@@ -357,13 +553,18 @@ impl Driver {
                         self.start_work(id, now, deadline_ms);
                     }
                 }
-                Instruction::Cancel { id, .. } => {
+                Instruction::Cancel { id, work } => {
                     if self.send(&Request::Cancel { id: U64::new(id) }, now, &mut reports)?
                         && let Some(running) = self.process.as_mut()
                     {
-                        running.cancel = Some(Due {
+                        running.cancel = Some(Cancel {
                             id,
                             at_ms: now.monotonic_ms().saturating_add(CANCEL_MS),
+                            kind: match work {
+                                Work::Load => Kind::Load,
+                                Work::Job => Kind::Job,
+                            },
+                            acknowledged: false,
                         });
                     }
                 }
@@ -489,6 +690,7 @@ impl Driver {
             identity: None,
             work: None,
             cancel: None,
+            check: None,
             next_sample_ms: u64::MAX,
         });
         let hello = Request::Hello {
@@ -568,6 +770,7 @@ impl Driver {
                         wire,
                         identity,
                         background,
+                        ceiling,
                         ..
                     },
             } => {
@@ -587,6 +790,50 @@ impl Driver {
                     running.identity = identity.0;
                 }
                 self.background = Some(background);
+                self.ceiling = Some(ceiling);
+            }
+            Event::Answer {
+                tag,
+                answer: Answer::Cancelling { id },
+            } => {
+                // The control thread says it has read the cancellation. It is not an answer to the
+                // work: the work's timer, the sampler and the service's records are left as they
+                // are, and one that names nothing outstanding is not a dropped answer.
+                if Some(tag) == current
+                    && let Some(running) = self.process.as_mut()
+                    && running.ready
+                    && let Some(cancel) = running.cancel.as_mut()
+                    && cancel.id == id.get()
+                {
+                    cancel.acknowledged = true;
+                }
+            }
+            Event::Answer {
+                tag,
+                answer: Answer::Verified { id, result, detail },
+            } => {
+                if Some(tag) != current {
+                    return Ok(());
+                }
+                let Some(running) = self.process.as_mut() else {
+                    return Ok(());
+                };
+                if !running.ready {
+                    return self.kill(ProcessEnd::BrokenWire, now, reports);
+                }
+                if running.check.is_some_and(|due| due.id == id.get()) {
+                    running.check = None;
+                    if running.cancel.is_some_and(|cancel| cancel.id == id.get()) {
+                        running.cancel = None;
+                    }
+                    reports.push(Report::Checked {
+                        id: id.get(),
+                        checked: Checked::Answered {
+                            result,
+                            detail: detail.0,
+                        },
+                    });
+                }
             }
             Event::Answer { tag, answer } => {
                 let Some(id) = answer.id() else {
@@ -605,7 +852,7 @@ impl Driver {
                         running.work = None;
                         running.next_sample_ms = u64::MAX;
                     }
-                    if running.cancel.is_some_and(|due| due.id == id) {
+                    if running.cancel.is_some_and(|cancel| cancel.id == id) {
                         running.cancel = None;
                     }
                 }
@@ -626,9 +873,14 @@ impl Driver {
         let at = now.monotonic_ms();
         let why = if !running.ready && at >= running.hello_at_ms.saturating_add(HANDSHAKE_MS) {
             Some(ProcessEnd::SilentAtStart)
-        } else if running.cancel.is_some_and(|due| at >= due.at_ms) {
+        } else if running
+            .cancel
+            .is_some_and(|cancel| cancel.timed() && at >= cancel.at_ms)
+        {
             Some(ProcessEnd::CancelUnanswered)
-        } else if running.work.is_some_and(|due| at >= due.at_ms) {
+        } else if running.work.is_some_and(|due| at >= due.at_ms)
+            || running.check.is_some_and(|due| at >= due.at_ms)
+        {
             Some(ProcessEnd::PastDeadline)
         } else if running.work.is_some() && at >= running.next_sample_ms {
             running.next_sample_ms = at.saturating_add(SAMPLE_MS);
@@ -648,10 +900,17 @@ impl Driver {
 
     /// Ends the process at once, collects it, and tells the service how it ended.
     fn kill(&mut self, why: ProcessEnd, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
-        if self.process.is_none() {
+        let Some(running) = self.process.as_ref() else {
             return Ok(());
-        }
+        };
+        let checking = running.check.map(|due| due.id);
         self.kill_only();
+        if let Some(id) = checking {
+            reports.push(Report::Checked {
+                id,
+                checked: Checked::ProcessEnded { why },
+            });
+        }
         reports.extend(
             self.service
                 .process_ended(why, now)?
@@ -725,11 +984,14 @@ fn answered(answer: Answer) -> Answered {
             why,
             detail: detail.0,
         },
-        // `ready` carries no work and is handled before this is reached.
-        Answer::Ready { .. } => Answered::Ended {
-            why: crate::wire::JobEnd::Failed,
-            detail: Some("ready is not an answer to work".to_owned()),
-        },
+        // `ready`, a check's result and a cancellation's acknowledgement carry no job or load and
+        // are handled before this is reached.
+        Answer::Ready { .. } | Answer::Verified { .. } | Answer::Cancelling { .. } => {
+            Answered::Ended {
+                why: crate::wire::JobEnd::Failed,
+                detail: Some("this is not an answer to a job or a load".to_owned()),
+            }
+        }
     }
 }
 

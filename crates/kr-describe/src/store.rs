@@ -457,10 +457,14 @@ impl DescriptionStore {
         predicate: &str,
         parameters: &[&dyn rusqlite::ToSql],
     ) -> Result<RemovedText> {
-        let transaction = self
-            .connection
-            .unchecked_transaction()
-            .map_err(store_error)?;
+        // Immediate, so the write lock is taken before the count is read. Another connection
+        // writes to this file (a rename pins a name while a description is published), and a
+        // deferred transaction that read first would fail the moment that connection committed.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(store_error)?;
         let (records, bytes): (i64, i64) = transaction
             .query_row(
                 &format!(

@@ -11,6 +11,12 @@ use kr_describe_model::llama::Llama;
 
 fn main() {
     let given: Vec<String> = std::env::args().skip(1).collect();
+    // What every executable this product installs answers, so a release can start each one where
+    // it was built and an installed layout can be checked by asking each for its version.
+    if given.as_slice() == ["--version"] {
+        println!("kr-describe-inference {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let (runtime_dir, daemon) = match arguments(&given) {
         Ok(read) => read,
         Err(error) => {

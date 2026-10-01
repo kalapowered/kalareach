@@ -130,6 +130,11 @@ pub enum PauseReason {
     },
     /// An owner turned inference off.
     Disabled,
+    /// The selected profile's files are not here and verified, so nothing is loaded.
+    NotDownloaded,
+    /// The description process has failed three times running, and is left alone for the restart
+    /// delay before it is tried again.
+    InferenceFailed,
 }
 
 impl PauseReason {
@@ -143,6 +148,8 @@ impl PauseReason {
             Self::Battery => "battery",
             Self::SignalUnqualified { .. } => "signal_unqualified",
             Self::Disabled => "disabled",
+            Self::NotDownloaded => "not_downloaded",
+            Self::InferenceFailed => "inference_failed",
         }
     }
 }

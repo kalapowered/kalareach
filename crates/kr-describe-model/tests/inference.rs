@@ -348,10 +348,24 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     std::thread::sleep(Duration::from_millis(500));
     send(&Request::Cancel { id: U64::new(2) });
     let asked = Instant::now();
-    let answer = answers.recv_timeout(Duration::from_secs(30));
+    // The control thread says it has read the cancellation, then the model thread answers the job.
+    let mut acknowledged_in = None;
+    let answer = loop {
+        let answer = answers.recv_timeout(Duration::from_secs(30));
+        if matches!(&answer, Ok(Answer::Cancelling { id }) if id.get() == 2) {
+            acknowledged_in = Some(asked.elapsed());
+            continue;
+        }
+        break answer;
+    };
     eprintln!(
-        "the real model answered its cancellation in {:?}: {answer:?}",
+        "the real model acknowledged its cancellation in {acknowledged_in:?} and answered it in \
+         {:?}: {answer:?}",
         asked.elapsed()
+    );
+    assert!(
+        acknowledged_in.is_some(),
+        "the control thread said it had read the cancellation"
     );
     assert!(
         matches!(

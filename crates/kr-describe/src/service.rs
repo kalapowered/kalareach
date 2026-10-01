@@ -37,6 +37,8 @@
 //! repeat, until a description is published.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_worker::privacy::PrivacyGeneration;
@@ -79,6 +81,9 @@ pub const RESTART_FIRST_MS: u64 = 1_000;
 
 /// The longest the next load waits after repeated failures.
 pub const RESTART_MOST_MS: u64 = 5 * 60 * 1000;
+
+/// How many failures in a row, none of them followed by a publication, make inference failed.
+pub const INFERENCE_FAILED_AFTER: u32 = 3;
 
 /// How soon a paused service with work waiting looks at the host's conditions again.
 pub const PAUSE_RECHECK_MS: u64 = 10_000;
@@ -482,12 +487,54 @@ impl Restart {
             .saturating_mul(1_u64 << doublings)
             .min(RESTART_MOST_MS);
         self.not_before_ms = now.monotonic_ms().saturating_add(wait_ms);
-        self.pause = pause;
+        // A pressure pause is what it says. Failing again and again without one is the
+        // service's own: shown while the restart delay runs, so a host that only hears that
+        // descriptions have stopped is told why.
+        self.pause = pause.or_else(|| {
+            (self.failures >= INFERENCE_FAILED_AFTER).then_some(PauseReason::InferenceFailed)
+        });
     }
 
     fn succeeded(&mut self) {
         *self = Self::default();
     }
+}
+
+/// The records of work in flight that other threads read, shared with whoever drives the service.
+///
+/// A host that raises privacy mode's fence, cancels a job or asks what is outstanding does so from
+/// a thread that is not the service's, so it holds clones of these before the service moves to its
+/// own thread. Each clone is the same record: the fence is raised in the service's own, and the
+/// running job's token is the one the service cancels.
+#[derive(Clone, Debug, Default)]
+pub struct Handles {
+    /// Which sessions have description processing stopped.
+    pub fence: DescriptionFence,
+    /// The job in the process, and the handle that cancels it.
+    pub running: RunningJob,
+    /// How many jobs are dispatched and not yet reconciled.
+    pub in_flight: InFlight,
+    /// Cleanup privacy mode was asked to do and could not finish.
+    pub debt: CleanupDebt,
+    /// How many loads are in the process: nought or one.
+    pub loading: Arc<AtomicU64>,
+}
+
+/// What a host holds a publication under.
+///
+/// Privacy mode's admission is the host's, and this crate cannot name it, so the service asks it
+/// through this: the write that publishes a description runs inside [`Self::hold`], while whatever
+/// admits a publication at the job's generation is held, and does not run at all when nothing
+/// does. A change of privacy mode then waits for the write, or finds the generation changed and
+/// refuses the publication.
+pub trait PublicationGate: Send {
+    /// Runs `publish` while a publication produced under `generation` is admitted, and returns
+    /// what it returned; or returns `None`, without running it, when none is.
+    fn hold(
+        &self,
+        generation: PrivacyGeneration,
+        publish: &mut dyn FnMut() -> Result<PublishGate>,
+    ) -> Option<Result<PublishGate>>;
 }
 
 /// The description service for one execution environment.
@@ -507,6 +554,9 @@ pub struct DescriptionService {
     in_flight: InFlight,
     running: RunningJob,
     debt: CleanupDebt,
+    loading: Arc<AtomicU64>,
+    gate: Option<Box<dyn PublicationGate>>,
+    assets_held: bool,
     trackers: BTreeMap<SessionId, ContextTracker>,
     bindings: BTreeMap<SessionId, ContextBinding>,
     epochs: BTreeMap<SessionId, SessionEpoch>,
@@ -561,6 +611,20 @@ impl DescriptionService {
         settings: ResourceSettings,
         store: DescriptionStore,
     ) -> Self {
+        Self::sharing(host, catalogue, met, settings, store, Handles::default())
+    }
+
+    /// Builds the service for one environment over records of work in flight its host already
+    /// holds, so that a thread that is not the service's reads and cancels the same ones.
+    #[must_use]
+    pub fn sharing(
+        host: HostPlacement,
+        catalogue: Catalogue,
+        met: MetGates,
+        settings: ResourceSettings,
+        store: DescriptionStore,
+        handles: Handles,
+    ) -> Self {
         let HostPlacement {
             environment,
             data_access: choice,
@@ -581,10 +645,13 @@ impl DescriptionService {
             state: policy.state(),
             policy,
             store,
-            fence: DescriptionFence::new(),
-            in_flight: InFlight::new(),
-            running: RunningJob::new(),
-            debt: CleanupDebt::new(),
+            fence: handles.fence,
+            in_flight: handles.in_flight,
+            running: handles.running,
+            debt: handles.debt,
+            loading: handles.loading,
+            gate: None,
+            assets_held: true,
             trackers: BTreeMap::new(),
             bindings: BTreeMap::new(),
             epochs: BTreeMap::new(),
@@ -645,6 +712,61 @@ impl DescriptionService {
     #[must_use]
     pub const fn fence(&self) -> &DescriptionFence {
         &self.fence
+    }
+
+    /// Returns the records of work in flight, which another thread may hold clones of.
+    #[must_use]
+    pub fn handles(&self) -> Handles {
+        Handles {
+            fence: self.fence.clone(),
+            running: self.running.clone(),
+            in_flight: self.in_flight.clone(),
+            debt: self.debt.clone(),
+            loading: Arc::clone(&self.loading),
+        }
+    }
+
+    /// Holds every publication under `gate` from now on.
+    pub fn set_publication_gate(&mut self, gate: Box<dyn PublicationGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// Says whether the selected profile's files are here and verified.
+    ///
+    /// A service nobody has said otherwise to takes them to be: a host that fetches its files
+    /// says they are not until they have been checked. While they are not, nothing is loaded and
+    /// the state is `resource_paused` for `not_downloaded`, and a model that is loaded is
+    /// unloaded.
+    pub const fn set_assets_held(&mut self, held: bool) {
+        self.assets_held = held;
+    }
+
+    /// Returns whether the selected profile's files are here and verified.
+    #[must_use]
+    pub const fn assets_held(&self) -> bool {
+        self.assets_held
+    }
+
+    /// Returns whether a load is in the process.
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        self.loading.load(Ordering::Acquire) != 0
+    }
+
+    /// Returns when the changes now waiting in any live session have waited long enough to
+    /// settle, on the continuous clock, when any are waiting.
+    #[must_use]
+    pub fn settle_due_ms(&self) -> Option<u64> {
+        self.trackers
+            .values()
+            .filter_map(ContextTracker::settles_at_ms)
+            .min()
+    }
+
+    /// Returns the sessions this environment is tracking.
+    #[must_use]
+    pub fn live_session_ids(&self) -> Vec<SessionId> {
+        self.live_sessions.iter().copied().collect()
     }
 
     /// Returns how many jobs are dispatched and not yet reconciled, across every session.
@@ -1129,6 +1251,20 @@ impl DescriptionService {
                 },
             });
         }
+        // Without the files nothing is loaded, and a model that is loaded without them is let go.
+        if !self.assets_held {
+            self.state = ResourceState::ResourcePaused {
+                reason: PauseReason::NotDownloaded,
+                unloaded: resident,
+            };
+            if resident {
+                self.release();
+                return Ok(Instruction::Unload {
+                    why: UnloadReason::Paused(PauseReason::NotDownloaded),
+                });
+            }
+            return Ok(Instruction::Wait { until_ms: None });
+        }
         // Before a load the model's cost has to come out of the memory this host can see; once it
         // is loaded it is already out. Which world this is comes from what the process answered,
         // not from the policy's own previous answer.
@@ -1233,6 +1369,16 @@ impl DescriptionService {
             self.after_job(&session_id, outlived, superseded, requeued, now);
             outcomes.push(outcome);
         }
+        // A load that was told to stop and did not, ended by the daemon, lost nothing and is no
+        // failure of inference: the next load may happen at once.
+        let load_cancel_unanswered = why == ProcessEnd::CancelUnanswered
+            && matches!(
+                self.model,
+                Model::Loading {
+                    cancel_sent: true,
+                    ..
+                }
+            );
         if let Model::Loading { cancel_sent, .. } = &self.model {
             let load_why = match why {
                 ProcessEnd::PastDeadline => LoadEnd::DeadlineExceeded,
@@ -1245,11 +1391,13 @@ impl DescriptionService {
             });
         }
         self.release();
-        self.inference_restarts = self.inference_restarts.saturating_add(1);
-        self.restart.failed(
-            now,
-            (why == ProcessEnd::MemoryCeiling).then_some(PauseReason::MemoryPressure),
-        );
+        if !load_cancel_unanswered {
+            self.inference_restarts = self.inference_restarts.saturating_add(1);
+            self.restart.failed(
+                now,
+                (why == ProcessEnd::MemoryCeiling).then_some(PauseReason::MemoryPressure),
+            );
+        }
         if why == ProcessEnd::MemoryCeiling {
             self.state = ResourceState::ResourcePaused {
                 reason: PauseReason::MemoryPressure,
@@ -1397,12 +1545,12 @@ impl DescriptionService {
             return Instruction::Wait { until_ms: None };
         }
         let id = self.take_id();
-        self.model = Model::Loading {
+        self.set_model(Model::Loading {
             id,
             profile: Box::new(profile.clone()),
             asked_ms: now.monotonic_ms(),
             cancel_sent: false,
-        };
+        });
         Instruction::Load {
             id,
             profile: Box::new(profile),
@@ -1491,7 +1639,7 @@ impl DescriptionService {
     fn finish_load(&mut self, answer: Answered, now: Reading) -> Outcome {
         let Model::Loading {
             profile, asked_ms, ..
-        } = std::mem::replace(&mut self.model, Model::Absent)
+        } = self.set_model(Model::Absent)
         else {
             unreachable!("a load is in flight")
         };
@@ -1507,7 +1655,7 @@ impl DescriptionService {
                     &self.target,
                     now.wall_ms(),
                 );
-                self.model = Model::Resident { profile };
+                self.set_model(Model::Resident { profile });
                 Outcome::Loaded {
                     cold_start_ms: now.since_ms(asked_ms),
                 }
@@ -1650,17 +1798,37 @@ impl DescriptionService {
         if dispatched.outlived {
             return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
         }
-        let gate = self.fence.publish_under_lock(
-            &self.store,
-            &session_id,
-            &description,
-            now.wall_ms().get(),
-            produced_under.generation,
-            self.privacy_generation(&session_id),
-            &dispatched.cancellation,
-            execution_ms,
-            self.policy.budgets().execution_deadline_ms,
-        )?;
+        let mut write = || {
+            self.fence.publish_under_lock(
+                &self.store,
+                &session_id,
+                &description,
+                now.wall_ms().get(),
+                produced_under.generation,
+                self.privacy_generation(&session_id),
+                &dispatched.cancellation,
+                execution_ms,
+                self.policy.budgets().execution_deadline_ms,
+            )
+        };
+        let gate = match &self.gate {
+            None => write()?,
+            Some(held) => match held.hold(produced_under.generation, &mut write) {
+                Some(done) => done?,
+                // Nothing admits a publication at the generation the job was produced under: privacy
+                // mode is on, or the generation moved on.
+                None => {
+                    let expected = self.privacy_generation(&session_id);
+                    return Ok(rejected(
+                        &mut self.counts,
+                        Rejection::LateGeneration {
+                            expected,
+                            found: produced_under.generation,
+                        },
+                    ));
+                }
+            },
+        };
         Ok(match gate {
             PublishGate::Allowed => {
                 self.scheduler.record_success(&session_id, now);
@@ -1718,6 +1886,7 @@ impl DescriptionService {
             }
             JobEnd::DeadlineExceeded => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                self.restart.failed(now, None);
                 Outcome::DeadlineExceeded { session_id }
             }
             JobEnd::MemoryCeiling => {
@@ -1850,8 +2019,18 @@ impl DescriptionService {
 
     /// Lets go of the model: this service no longer counts on the process having one.
     fn release(&mut self) {
-        self.model = Model::Absent;
+        self.set_model(Model::Absent);
         self.mapping.unload(self.environment.id());
+    }
+
+    /// Replaces what this service believes the process has, and says so to whoever reads whether a
+    /// load is in it, from another thread. Returns what it replaced.
+    fn set_model(&mut self, model: Model) -> Model {
+        self.loading.store(
+            u64::from(matches!(model, Model::Loading { .. })),
+            Ordering::Release,
+        );
+        std::mem::replace(&mut self.model, model)
     }
 
     /// Returns a new identifier for a piece of work.

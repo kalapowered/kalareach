@@ -650,6 +650,16 @@ impl ContextTracker {
         }
     }
 
+    /// Returns when the changes now waiting have waited long enough to settle, on the continuous
+    /// clock, when any are waiting.
+    #[must_use]
+    pub const fn settles_at_ms(&self) -> Option<u64> {
+        match self.pending_since_ms {
+            Some(since) => Some(since.saturating_add(self.debounce_ms)),
+            None => None,
+        }
+    }
+
     /// Returns the completion the host last recorded, when it has recorded one.
     #[must_use]
     pub const fn completion(&self) -> Option<Completion> {

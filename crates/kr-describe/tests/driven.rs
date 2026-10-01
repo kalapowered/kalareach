@@ -1496,6 +1496,243 @@ fn a_session_opened_again_carries_no_earlier_events() {
     }
 }
 
+/// A host that fetches its files says they are not held until they have been checked: nothing is
+/// loaded and the state says `not_downloaded`, and a model that is loaded when they go is let go.
+/// The control is the same service with its files held, which loads.
+#[test]
+fn without_the_files_nothing_loads_and_the_state_says_why() {
+    let mut service = service();
+    service.set_assets_held(false);
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert_eq!(
+        service.next(&roomy(), at(3_000)).expect("an instruction"),
+        Instruction::Wait { until_ms: None }
+    );
+    assert_eq!(
+        service.resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::NotDownloaded,
+            unloaded: false
+        }
+    );
+    assert!(!service.is_loading());
+
+    // Held, the same queue loads.
+    service.set_assets_held(true);
+    let Instruction::Load { id, .. } = service.next(&roomy(), at(3_000)).expect("an instruction")
+    else {
+        panic!("a load comes first once the files are held");
+    };
+    assert!(service.is_loading(), "the load is in the process");
+    service
+        .finished(
+            id,
+            Answered::Loaded {
+                load_ms: 0,
+                rss_bytes: 0,
+            },
+            at(3_000),
+        )
+        .expect("the load");
+    assert!(!service.is_loading(), "the load is over");
+
+    // A model that is loaded when the files go is let go, and the state says why.
+    service.set_assets_held(false);
+    assert_eq!(
+        service.next(&roomy(), at(3_100)).expect("an instruction"),
+        Instruction::Unload {
+            why: UnloadReason::Paused(PauseReason::NotDownloaded)
+        }
+    );
+    assert_eq!(
+        service.resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::NotDownloaded,
+            unloaded: true
+        }
+    );
+}
+
+/// Three failures in a row, none followed by a publication, leave inference failed while the
+/// restart delay runs: a load that failed, a crash and a job that failed all count, and two do
+/// not. A description published ends it. The control is the state after two.
+#[test]
+fn three_failures_in_a_row_leave_inference_failed_until_a_description_is_published() {
+    let failed = |service: &DescriptionService| {
+        matches!(
+            service.resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::InferenceFailed,
+                ..
+            }
+        )
+    };
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    queue(&mut service, &session(2), "crates", at(0));
+    let mut now = at(3_000);
+    for failures in 1..=2 {
+        let (sent, id, _) = next_job(&mut service, now);
+        now = sent;
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Failed,
+                    detail: None,
+                },
+                now,
+            )
+            .expect("the answer");
+        service.next(&roomy(), now).expect("the unload");
+        service.next(&roomy(), now).expect("the wait");
+        assert!(!failed(&service), "after {failures} failures");
+    }
+    let (sent, id, _) = next_job(&mut service, now);
+    now = sent;
+    service
+        .finished(
+            id,
+            Answered::Ended {
+                why: JobEnd::Failed,
+                detail: None,
+            },
+            now,
+        )
+        .expect("the answer");
+    service.next(&roomy(), now).expect("the unload");
+    service.next(&roomy(), now).expect("the wait");
+    assert!(failed(&service), "after three");
+
+    // The delay passes, a description is published, and it is over.
+    let (sent, id, request) = next_job(&mut service, now);
+    now = sent;
+    assert!(matches!(
+        service
+            .finished(id, produced(&request.prompt, 0), now)
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
+    service.next(&roomy(), now).expect("an instruction");
+    assert!(!failed(&service), "a publication ended it");
+}
+
+/// A load the daemon had to end because the process did not stop it is no failure of inference:
+/// the next load may happen at once. The control is a process that ended by itself during a load,
+/// which is.
+#[test]
+fn a_load_the_daemon_ends_for_not_stopping_is_no_failure_of_inference() {
+    for (why, counts) in [
+        (ProcessEnd::CancelUnanswered, false),
+        (ProcessEnd::Exited, true),
+    ] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Load { id, .. } =
+            service.next(&roomy(), at(3_000)).expect("an instruction")
+        else {
+            panic!("a load comes first");
+        };
+        service.set_enabled(false);
+        assert_eq!(
+            service.next(&roomy(), at(3_100)).expect("an instruction"),
+            Instruction::Cancel {
+                id,
+                work: Work::Load
+            }
+        );
+        let outcomes = service.process_ended(why, at(3_200)).expect("the end");
+        assert!(
+            outcomes.contains(&Outcome::LoadEnded {
+                why: if counts {
+                    LoadEnd::Failed
+                } else {
+                    LoadEnd::Cancelled
+                },
+                detail: Some(format!("the description process ended: {}", why.as_str())),
+            }),
+            "{outcomes:?}"
+        );
+        assert_eq!(service.inference_restarts(), u64::from(counts), "{why:?}");
+        assert_eq!(service.restart_not_before_ms().is_some(), counts, "{why:?}");
+        assert!(!service.is_loading());
+    }
+}
+
+/// What a test holds publications under: it admits them or it does not, and says whether the write
+/// ran inside it.
+struct Gate {
+    admits: bool,
+    ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl kr_describe::service::PublicationGate for Gate {
+    fn hold(
+        &self,
+        _generation: kr_worker::privacy::PrivacyGeneration,
+        publish: &mut dyn FnMut() -> kr_describe::Result<kr_describe::privacy::PublishGate>,
+    ) -> Option<kr_describe::Result<kr_describe::privacy::PublishGate>> {
+        self.admits.then(|| {
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            publish()
+        })
+    }
+}
+
+/// A publication is written inside the gate the host holds it under, and not at all when the gate
+/// admits none: the description is not stored and the result is refused as a late generation. The
+/// control is a service with no gate, which publishes.
+#[test]
+fn a_publication_is_written_inside_its_gate_and_refused_when_none_admits_it() {
+    for case in ["no gate", "admitting", "refusing"] {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service = service();
+        match case {
+            "admitting" | "refusing" => service.set_publication_gate(Box::new(Gate {
+                admits: case == "admitting",
+                ran: ran.clone(),
+            })),
+            _ => {}
+        }
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let (now, id, request) = next_job(&mut service, at(3_000));
+        let outcome = service
+            .finished(id, produced(&request.prompt, 0), now)
+            .expect("the answer");
+        let stored = service
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .is_some();
+        match case {
+            "refusing" => {
+                assert!(
+                    matches!(
+                        outcome,
+                        Outcome::Rejected {
+                            rejection: Rejection::LateGeneration { .. },
+                            ..
+                        }
+                    ),
+                    "{outcome:?}"
+                );
+                assert!(!stored, "nothing was stored");
+                assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(service.counts().refused, 1);
+            }
+            _ => {
+                assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+                assert!(stored, "the description was stored");
+                assert_eq!(
+                    ran.load(std::sync::atomic::Ordering::SeqCst),
+                    case == "admitting",
+                    "the write ran inside the gate: {case}"
+                );
+            }
+        }
+    }
+}
+
 /// Builds a service over a store of the test's own.
 fn service_over(store: DescriptionStore) -> DescriptionService {
     DescriptionService::new(
