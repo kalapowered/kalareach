@@ -249,10 +249,11 @@ struct Envelope<T> {
     error: Option<Refusal>,
 }
 
-/// What a refusal says, for a person reading why a renewal did not happen.
+/// What a refusal says that this host repeats: the code the gateway named. Its message is the
+/// gateway's own words and is never read, so nothing it holds can reach a record or a log.
 #[derive(serde::Deserialize)]
 struct Refusal {
-    message: String,
+    code: String,
 }
 
 /// The `data` of one answer, or why there is none.
@@ -275,10 +276,13 @@ fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result
         Ok(Envelope {
             error: Some(refusal),
             ..
-        }) => Err(format!(
-            "the gateway refused the renewal ({}): {}",
-            answer.status, refusal.message
-        )),
+        }) => Err(match super::client::known_code(&refusal.code) {
+            Some(code) => format!(
+                "the gateway refused the renewal ({}, {code})",
+                answer.status
+            ),
+            None => format!("the gateway refused the renewal ({})", answer.status),
+        }),
         Ok(_) => Err(format!(
             "the gateway answered {} without a renewal",
             answer.status
