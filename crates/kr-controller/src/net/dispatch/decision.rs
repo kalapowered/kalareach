@@ -13,6 +13,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::config::ceilings::CeilingRefusal;
 use crate::grants::policy::HeldBound;
+use crate::service::net::lifetimes::GrantStanding;
 
 use super::output::{RELAY_DECISIONS, Written};
 use super::{RemoteConnection, failure};
@@ -460,7 +461,7 @@ impl RemoteConnection {
                 "this device's grant has expired",
             ));
         }
-        let grant = self.decided_grant(entry);
+        let grant = self.decided_grant(entry)?;
         // The device's record is where its grant's standing is written: when it was committed,
         // which is when its invitation was redeemed, and when it was revoked.
         let record = crate::grants::GrantRecord {
@@ -511,26 +512,53 @@ impl RemoteConnection {
     }
 
     /// The grant this device's requests are decided against ([`decided_with_voice`]).
-    fn decided_grant(&self, entry: &'static MethodEntry) -> kr_protocol::grant::Grant {
-        decided_with_voice(&self.device.grant, entry, || self.holds_voice_grant())
+    ///
+    /// # Errors
+    ///
+    /// Refuses a method that needs a voice grant while this host cannot say whether the device's
+    /// voice grant has run out, because the clock floor an end of it was found on is not on
+    /// record yet ([`Self::voice_standing`]).
+    fn decided_grant(
+        &self,
+        entry: &'static MethodEntry,
+    ) -> std::result::Result<kr_protocol::grant::Grant, ProtocolError> {
+        decided_with_voice(&self.device.grant, entry, || self.voice_standing())
     }
 
-    /// Whether this device holds a live voice grant on this host.
+    /// Whether this device holds a voice grant that stands now on this host.
     ///
     /// Read from the host's one authority store at the moment of the question, because a voice
-    /// grant is written, replaced and withdrawn while a connection stands.
-    fn holds_voice_grant(&self) -> bool {
-        let now_ms = super::super::super::wall_clock_ms();
-        self.controller
-            .sharing()
-            .grants()
-            .records_for_device(self.device.device_id)
-            .is_ok_and(|records| {
-                records.into_iter().any(|record| {
-                    record.state(now_ms) == kr_protocol::sharing::GrantState::Active
-                        && record.grant.permits(ActionRight::VoiceUse)
-                })
-            })
+    /// grant is written, replaced and withdrawn while a connection stands. Each live record is
+    /// decided as every stored grant is: on both clocks, with the UTC one read through this host's
+    /// floor, which the reading raises, so a wall clock wound back does not bring a lapsed grant
+    /// back to life. A lapse the floor decided is stated only once the floor is on record, and
+    /// until then the answer is neither ([`VoiceStanding::Unrecorded`]): a daemon started in a new
+    /// boot could decide the other way. A record this host cannot read leaves the device without
+    /// a voice grant.
+    fn voice_standing(&self) -> VoiceStanding {
+        let grants = self.controller.sharing().grants();
+        let Ok(records) = grants.records_for_device(self.device.device_id) else {
+            return VoiceStanding::Lacks;
+        };
+        let mut unrecorded = false;
+        for record in records {
+            if record.revoked_at_ms.is_some()
+                || !record.is_active()
+                || !record.grant.permits(ActionRight::VoiceUse)
+            {
+                continue;
+            }
+            match self.controller.lifetimes().stored_standing(grants, &record) {
+                Ok(GrantStanding::InForce) => return VoiceStanding::Holds,
+                Ok(GrantStanding::OutOfForce) | Err(_) => {}
+                Ok(GrantStanding::Unrecorded) => unrecorded = true,
+            }
+        }
+        if unrecorded {
+            VoiceStanding::Unrecorded
+        } else {
+            VoiceStanding::Lacks
+        }
     }
 
     /// Refuses a read whose content is outside the grant's history scope.
@@ -725,7 +753,7 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
 /// not in the grant a connection was admitted under: a person holds their ordinary authority and
 /// chooses separately how much of it voice may use. So it is taken out of the pairing grant and
 /// put back only for a method that needs it, when the device holds a live voice grant carrying it
-/// (`holds_voice_grant`, asked only then). The policy and the configured ceiling then apply to it
+/// (`voice_standing`, asked only then). The policy and the configured ceiling then apply to it
 /// like any other right, and the coordinator takes the intersection again at the moment of each
 /// decision.
 ///
@@ -735,8 +763,8 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
 fn decided_with_voice(
     paired: &kr_protocol::grant::Grant,
     entry: &MethodEntry,
-    holds_voice_grant: impl FnOnce() -> bool,
-) -> kr_protocol::grant::Grant {
+    voice_standing: impl FnOnce() -> VoiceStanding,
+) -> std::result::Result<kr_protocol::grant::Grant, ProtocolError> {
     let needs_voice = entry.required_rights.iter().any(|required| {
         matches!(
             required.authority,
@@ -751,11 +779,33 @@ fn decided_with_voice(
         .copied()
         .filter(|right| *right != ActionRight::VoiceUse)
         .collect();
-    if needs_voice && holds_voice_grant() {
-        actions.insert(ActionRight::VoiceUse);
+    if needs_voice {
+        match voice_standing() {
+            VoiceStanding::Holds => {
+                actions.insert(ActionRight::VoiceUse);
+            }
+            VoiceStanding::Lacks => {}
+            VoiceStanding::Unrecorded => {
+                return Err(
+                    CeilingRefusal::Refused(crate::grants::Refusal::FloorUnrecorded)
+                        .to_protocol_error(),
+                );
+            }
+        }
     }
-    kr_protocol::grant::Grant {
+    Ok(kr_protocol::grant::Grant {
         actions,
         ..paired.clone()
-    }
+    })
+}
+
+/// Whether a device holds a voice grant that stands now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceStanding {
+    /// A live voice grant stands on both clocks.
+    Holds,
+    /// None does.
+    Lacks,
+    /// None stands, and the end that decides it is not written down yet.
+    Unrecorded,
 }
