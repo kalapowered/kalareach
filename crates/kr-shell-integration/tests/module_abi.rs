@@ -233,8 +233,8 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     assert_eq!(
         refused.error.message,
-        "module kr_user_newer imports zle_abi_newer_entry, which this reader (zle-5.9) does not \
-         provide"
+        "module kr_user_newer imports zle_abi_newer_entry, which neither this reader (zle-5.9) nor \
+         anything else the shell holds provides"
     );
 }
 
@@ -273,6 +273,26 @@ fn a_module_that_imports_from_a_package_module_is_judged_by_whether_that_module_
         module(&listed, "kr_user_lazy").imports,
         ModuleImports::Bound,
         "the provider is loaded: {}",
+        refusals(&setup)
+    );
+    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+}
+
+/// A module that calls the C library, whose names carry a version on Linux, binds: a versioned name
+/// is asked for under its version, in the module's own libraries and the shell's.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
+fn a_module_that_imports_versioned_names_from_the_c_library_binds() {
+    let package = Package::built(ShellKind::Zsh);
+    let modules = built_modules(&package);
+    let setup = home_loading(&package, &modules, "kr_user_versioned");
+
+    let mut session = Session::start_for(&package, &case(), &setup);
+    let listed = activation_report(&mut session);
+    assert_eq!(
+        module(&listed, "kr_user_versioned").imports,
+        ModuleImports::Bound,
+        "{}",
         refusals(&setup)
     );
     assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
@@ -504,6 +524,16 @@ fn each_of_the_packages_own_modules_binds_when_it_is_the_only_one_loaded() {
             "{name} did not load: {}",
             refusals(&setup)
         );
+        // The report names what was loaded and the editor, so a report with nothing in it is not
+        // a pass for the module.
+        assert!(
+            listed.iter().any(|held| held.name == *name),
+            "with {name} loaded, the report does not list it: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|held| held.name == "zsh/zle"),
+            "with {name} loaded, the report does not list the editor: {listed:?}"
+        );
         for held in &listed {
             assert_eq!(
                 held.imports,
@@ -579,7 +609,7 @@ fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
         .filter(|module| Path::new(&module.path).starts_with(&home_modules))
         .count();
     // What the shell held before the startup file ran came from the package's own directory, and a
-    // `zmodload` of it changed nothing, so it is not the person's and is not in the report.
+    // `zmodload` of it changed nothing, so it did not load from the home and is not counted here.
     let preloaded: Vec<String> = std::fs::read_to_string(setup.home.join("preloaded"))
         .expect("the startup file recorded what the shell already held")
         .lines()
