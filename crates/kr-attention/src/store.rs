@@ -104,12 +104,16 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 
 /// The schema this build writes and reads.
 ///
-/// A store written under any other version is refused rather than read. Two things in here are
+/// A store written under any other version is refused rather than read, except the one before it,
+/// which is brought forward once as it is opened ([`migrate_from_nine`]). Two things in here are
 /// derived rather than stored on their own - an item's key, and the order a review page continues
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
 /// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
+
+/// The schema before the one this build writes, which [`migrate_from_nine`] brings forward.
+const PREVIOUS_SCHEMA_VERSION: i64 = 9;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -541,6 +545,37 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
     })
 }
 
+/// Brings a store written under schema 9 forward to this build's, in one transaction.
+///
+/// What changed is one column on the items: the time the announcement an item last made was first
+/// decided, which an item written before this carries nowhere. Its existing rows are given the time
+/// of their last announcement, which is the best value they have: it is the time the decision was
+/// made, or the time it was made again when quiet hours released it. Nothing reads schema 9 after
+/// this has run.
+fn migrate_from_nine(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    // The tables first, because a start that stopped after it recorded its version and before it
+    // created them left a store with a version and no items.
+    transaction.execute_batch(SCHEMA)?;
+    let has_column: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('attention_items') WHERE name = 'decided_at_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        transaction.execute_batch(
+            "ALTER TABLE attention_items ADD COLUMN decided_at_ms INTEGER;
+             UPDATE attention_items SET decided_at_ms = last_notified_ms;",
+        )?;
+    }
+    transaction.execute(
+        "UPDATE attention_schema SET version = ?1",
+        params![SCHEMA_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_schema (version INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS attention_consumed (
@@ -588,7 +623,8 @@ const SCHEMA: &str = "
         announcements INTEGER NOT NULL,
         pending_handoff INTEGER,
         uncertain INTEGER NOT NULL,
-        deferred INTEGER NOT NULL
+        deferred INTEGER NOT NULL,
+        decided_at_ms INTEGER
     );
     CREATE TABLE IF NOT EXISTS attention_actors (
         actor TEXT PRIMARY KEY,
@@ -767,6 +803,7 @@ const ITEMS: TableDef = TableDef {
         "pending_handoff",
         "uncertain",
         "deferred",
+        "decided_at_ms",
     ],
 };
 const ACTORS: TableDef = TableDef {
@@ -1202,6 +1239,7 @@ fn environment_rows(state: &StoredState) -> Result<Vec<Rows>> {
                 optional_integer(item.pending_handoff, "announcement number")?,
                 flag(item.uncertain),
                 flag(item.deferred),
+                optional_integer(item.decided_at_ms.map(TimestampMs::get), "decided at")?,
             ],
         );
     }
@@ -1575,7 +1613,7 @@ impl Store {
         Self::prepare(connection, None)
     }
 
-    fn prepare(connection: Connection, file: Option<&Path>) -> Result<Self> {
+    fn prepare(mut connection: Connection, file: Option<&Path>) -> Result<Self> {
         // Another process can hold the file for a moment, a reader among them. The wait is
         // bounded: past it the caller is told the store is unavailable rather than left blocked.
         connection.busy_timeout(BUSY_TIMEOUT)?;
@@ -1602,6 +1640,9 @@ impl Store {
             .optional()?;
         match recorded {
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if version == PREVIOUS_SCHEMA_VERSION => {
+                migrate_from_nine(&mut connection)?;
+            }
             Some(_) => return Err(unreadable("schema version")),
             None => {
                 connection.execute(
@@ -1942,6 +1983,7 @@ impl Store {
             let pending_handoff: Option<i64> = row.get(29)?;
             let uncertain: i64 = row.get(30)?;
             let deferred: i64 = row.get(31)?;
+            let decided_at: Option<i64> = row.get(32)?;
             let session_id = session
                 .map(|text| SessionId::from_str(&text).map_err(|_| unreadable("session")))
                 .transpose()?;
@@ -1968,6 +2010,9 @@ impl Store {
             };
             let last_notified_ms = last_notified
                 .map(|at| as_u64(at, "last announced").map(TimestampMs::new))
+                .transpose()?;
+            let decided_at_ms = decided_at
+                .map(|at| as_u64(at, "decided at").map(TimestampMs::new))
                 .transpose()?;
             items.push(Item {
                 key: AttentionKey::new(key).map_err(|_| unreadable("item key"))?,
@@ -1998,6 +2043,7 @@ impl Store {
                 notification: NotificationState::from_wire(&notification)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
+                decided_at_ms,
                 announced_anchor: anchor(
                     announced_boot.as_deref(),
                     announced_continuous,

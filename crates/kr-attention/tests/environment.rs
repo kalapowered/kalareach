@@ -4,6 +4,7 @@
 //! source that ran ahead, actions answered from their records, and a store that reopens exactly as
 //! it was written.
 
+use kr_attention::engine::Item;
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::host::{ActionKey, Answer, Mutation, Performed};
 use kr_attention::{
@@ -1996,4 +1997,138 @@ fn a_store_reopens_exactly_as_it_was_written() {
         !owner_inbox(&attention).is_empty(),
         "the stream left work in the inbox"
     );
+}
+
+/// The one item an engine holds.
+fn only_item(attention: &Attention) -> Item {
+    let engine = attention.engine().expect("the store is this owner's");
+    let mut items = engine.items();
+    let item = items.next().expect("one item").clone();
+    assert!(items.next().is_none(), "no other item");
+    item
+}
+
+/// A quiet-hours window that covers noon, which every reading in these tests falls inside until
+/// the clock moves two hours on.
+fn quiet_over_noon() -> QuietHours {
+    QuietHours {
+        start_minute: U64::new(11 * 60),
+        end_minute: U64::new(13 * 60),
+        zone: Nullable::null(),
+    }
+}
+
+/// The time an announcement was decided is kept through the release quiet hours give it, and
+/// through a restart, while the time of the last announcement moves to the release. The control:
+/// an announcement nothing holds back has the one time for both.
+#[test]
+fn a_released_announcement_keeps_the_time_it_was_decided() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()))
+        .expect("the store records the window");
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    let decided = TimestampMs::new(NOON + 1_000);
+    let held = only_item(&attention);
+    assert!(held.deferred, "quiet hours hold it back");
+    assert_eq!(held.decided_at_ms, Some(decided));
+    assert_eq!(held.last_notified_ms, Some(decided));
+
+    drop(attention);
+    let mut attention =
+        Attention::open(&path, reading(2_000), &opener()).expect("the feature store opens");
+    assert_eq!(
+        only_item(&attention).decided_at_ms,
+        Some(decided),
+        "a restart keeps it"
+    );
+
+    // Two hours on the window has ended and the held announcement is released.
+    let after = HostReading::new(boot(), 7_200_000, NOON + 7_200_000, true);
+    let outcomes = attention
+        .tick(after, &all_read)
+        .expect("the store records the release");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Released { .. })),
+        "released: {outcomes:?}"
+    );
+    let released = only_item(&attention);
+    assert!(!released.deferred);
+    assert_eq!(
+        released.last_notified_ms,
+        Some(TimestampMs::new(NOON + 7_200_000)),
+        "the last announcement is the release"
+    );
+    assert_eq!(
+        released.decided_at_ms,
+        Some(decided),
+        "and the decision keeps the time it was made"
+    );
+
+    // The control: nothing held back, one time for both.
+    let mut attention = engine();
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    let sent = only_item(&attention);
+    assert!(!sent.deferred);
+    assert_eq!(sent.decided_at_ms, Some(decided));
+    assert_eq!(sent.last_notified_ms, sent.decided_at_ms);
+}
+
+/// A store written under the schema before the time of decision was kept is brought forward once,
+/// as it opens: every item it holds is given the time of its last announcement, and the store
+/// records the schema it now is. One older than that is refused, as any store of another schema is.
+#[test]
+fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    attention
+        .apply(&approval(session(1), 1, "req-1"), reading(1_000))
+        .expect("the store records the decision");
+    let announced = only_item(&attention).last_notified_ms;
+    assert!(announced.is_some());
+    drop(attention);
+
+    // The store as the previous build wrote it: no such column, and its schema's number.
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    raw.execute_batch(
+        "ALTER TABLE attention_items DROP COLUMN decided_at_ms;
+         UPDATE attention_schema SET version = 9;",
+    )
+    .expect("the previous shape");
+    drop(raw);
+
+    let attention =
+        Attention::open(&path, reading(2_000), &opener()).expect("the previous schema opens");
+    assert_eq!(
+        only_item(&attention).decided_at_ms,
+        announced,
+        "the best time its store has for it"
+    );
+    drop(attention);
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    let version: i64 = raw
+        .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+        .expect("a version");
+    assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
+    // The next open reads it as it is, and one older than the previous is refused.
+    raw.execute("UPDATE attention_schema SET version = 8", [])
+        .expect("an older schema");
+    drop(raw);
+    assert!(matches!(
+        Attention::open(&path, reading(3_000), &opener()),
+        Err(kr_attention::Error::StoreUnreadable {
+            field: "schema version"
+        })
+    ));
 }
