@@ -463,18 +463,20 @@ that writes nothing:
   back, and when a replacement keeps its protection: one with an access-control list, one in a
   directory that would give its replacement one, and one another user owns are refused.
 
-Every file the recipe installs is JSON this host can read, whatever its name says. Every command in
-one is the forwarder, in a form this host reads: its name alone, with the application and the
+Every file the recipe installs is JSON this host can read, whatever its name says, and every command
+in one is the forwarder, in a form this host reads: its name alone, with the application and the
 surface as the two arguments in a list, or one line of its name, the application and the surface,
 separated by single spaces. An object that holds a command carries only a type, a name, the command,
 its arguments and a time limit, so that nothing beside the command can run it in another place or
 environment.
 
-Every configuration key the recipe adds is one this host names for the application, with the one
-value that enables what the release installed. For Claude Code that is `enabledPlugins.<name>` in
-`settings.json`, set to `true`. A key that would make the application run a program, such as a
-status line, an API key helper or a credential refresh, is not on the list, so no value a bridge
-adds can hold a command.
+A bridge places only what this host names for its application. For Claude Code that is three files,
+`.claude-plugin/plugin.json`, `.mcp.json` and `hooks/hooks.json`, in one directory `skills/<name>/`,
+and the one key that enables them, `enabledPlugins.<name>@skills-dir` in `settings.json`, set to
+`true`, for the same name. For Gemini CLI it is three files in `extensions/<name>/` and no key. A
+destination or a key that is not on that list is refused, and so is a name in another case. A bridge
+therefore never writes a settings document, never enables a plugin it did not install, and no value
+it adds can hold a command.
 
 This host does not read what else a registration file asks the application to do. The owner's
 confirmation of the publisher's statement is the only control on that.
