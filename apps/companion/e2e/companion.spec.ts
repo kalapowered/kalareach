@@ -3439,10 +3439,11 @@ test.describe("the phone's shell and a page the platform panned", () => {
 })
 
 // KR-REQ-13.17: a session that cannot be shown whole above a software keyboard scrolls, and the
-// field being typed into is always above the keyboard and inside what the person sees, where the
-// platform panned the page to it and the shell went with the visual viewport. Each case is a
-// keyboard and a pan as a platform reported them: the first focus and a later one at a person's own
-// text size on a phone's width, a phone on its side, and the sizes where the session fits whole.
+// field being typed into is always above the keyboard and wholly in view, where the platform
+// panned the page to it and the shell went with the visual viewport. Each case is a keyboard and a
+// pan as a platform reported them, through the visual viewport the page reads them from: the first
+// focus and a later one at a person's own text size on a phone's width, a phone on its side, and
+// the sizes where the session fits whole.
 test.describe("the phone's field above a keyboard the platform panned the page for", () => {
   const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
   const CASES: readonly { readonly seen: Seen; readonly keyboard: number; readonly pan: number; readonly fits: boolean }[] = [
@@ -3453,6 +3454,44 @@ test.describe("the phone's field above a keyboard the platform panned the page f
     { seen: { width: 390, height: 844, scale: '100%' }, keyboard: 312, pan: 241, fits: true }
   ]
 
+  /**
+   * Replaces the visual viewport with one the test moves, as a platform does: a keyboard takes
+   * `covered` pixels of the height and the page is panned `panned` pixels, and the page measures
+   * both from it, as it does from a real one.
+   */
+  async function withViewport(page: Page): Promise<(covered: number, panned: number) => Promise<void>> {
+    await page.addInitScript(() => {
+      class Moved extends EventTarget {
+        covered = 0
+        offsetTop = 0
+        readonly scale = 1
+        get height(): number {
+          return window.innerHeight - this.covered
+        }
+      }
+      const fake = new Moved()
+      Object.defineProperty(window, 'visualViewport', { configurable: true, value: fake })
+      ;(window as unknown as { krMoveViewport: (covered: number, panned: number) => void }).krMoveViewport = (
+        covered,
+        panned
+      ) => {
+        fake.covered = covered
+        fake.offsetTop = panned
+        fake.dispatchEvent(new Event('resize'))
+        fake.dispatchEvent(new Event('scroll'))
+      }
+    })
+    return (covered, panned) =>
+      page.evaluate(
+        ([k, p]) =>
+          (window as unknown as { krMoveViewport: (covered: number, panned: number) => void }).krMoveViewport(
+            k,
+            p
+          ),
+        [covered, panned]
+      )
+  }
+
   for (const surface of ['ios', 'android'] as const) {
     for (const pane of ['conversation', 'terminal'] as const) {
       for (const each of CASES) {
@@ -3460,6 +3499,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
         test(`${surface}, ${pane}, ${seen.width}×${seen.height} at ${seen.scale} text, keyboard ${keyboard}px, panned ${pan}px`, async ({
           page
         }) => {
+          const move = await withViewport(page)
           await onPhone(page, surface, seen, `&session=${SESSION}`)
           if (pane === 'terminal') {
             await page.getByRole('tab', { name: 'Terminal' }).click()
@@ -3467,13 +3507,7 @@ test.describe("the phone's field above a keyboard the platform panned the page f
           }
           const field = page.locator('textarea[id^="composer-"]')
           await field.focus()
-          await page.evaluate(
-            ([covered, panned]) => {
-              document.documentElement.style.setProperty('--keyboard', `${covered}px`)
-              document.documentElement.style.setProperty('--pan', `${panned}px`)
-            },
-            [keyboard, pan]
-          )
+          await move(keyboard, pan)
           // What the person sees: from the top of the visual viewport, which the shell goes with, to
           // where the keyboard begins at the shell's foot.
           const where = () =>
@@ -3492,13 +3526,17 @@ test.describe("the phone's field above a keyboard the platform panned the page f
               const off = Math.round(at.bottom - at.visibleBottom)
               // Under the terminal the field is the foot of the session and rests on the keyboard's
               // edge. Under the conversation, in a session that fits whole, the pickers lie under the
-              // field and it is above the keyboard by their height, as it always was.
+              // field and it is above the keyboard by their height, as it always was; in one that does
+              // not, the session is scrolled until the composer's field is on the keyboard's edge.
               const rests = pane === 'terminal' || !each.fits ? Math.abs(off) <= 1 : off <= 1
               return rests ? 'where it rests' : off > 0 ? `${off} px under the keyboard` : `${-off} px above the keyboard`
             })
             .toBe('where it rests')
           const at = await where()
           expect(at?.bottom, 'the field is not above the top of what the person sees').toBeGreaterThan(at?.shellTop ?? 0)
+          // Whole in view: no box around it (the composer's own scrolling area, the session's, the
+          // shell) clips any of it, which its rectangle alone does not say.
+          expect(await hiddenPart(field), 'no part of the field is clipped').toBeLessThanOrEqual(1)
         })
       }
     }
@@ -3508,19 +3546,12 @@ test.describe("the phone's field above a keyboard the platform panned the page f
     test(`follows a keyboard that changes its height and goes, on ${surface}, and leaves the session where it was`, async ({
       page
     }) => {
+      const move = await withViewport(page)
       await onPhone(page, surface, { width: 320, height: 658, scale: '200%' }, `&session=${SESSION}`)
       await page.getByRole('tab', { name: 'Terminal' }).click()
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
       const field = page.locator('textarea[id^="composer-"]')
       await field.focus()
-      const cover = (covered: number, panned: number) =>
-        page.evaluate(
-          ([k, p]) => {
-            document.documentElement.style.setProperty('--keyboard', `${k}px`)
-            document.documentElement.style.setProperty('--pan', `${p}px`)
-          },
-          [covered, panned]
-        )
       const off = () =>
         page.evaluate(() => {
           const box = document.querySelector('textarea[id^="composer-"]')?.getBoundingClientRect()
@@ -3534,13 +3565,42 @@ test.describe("the phone's field above a keyboard the platform panned the page f
       // as tall as it stays, with the pan gone: the field is on its edge each time, never short of
       // it by what the first state needed.
       for (const [covered, panned] of [[399, 297], [259, 0], [312, 241], [259, 227]] as const) {
-        await cover(covered, panned)
+        await move(covered, panned)
         await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeLessThanOrEqual(1)
         await expect.poll(off, { message: `keyboard ${covered}px, panned ${panned}px` }).toBeGreaterThanOrEqual(-1)
       }
       await field.blur()
-      await cover(0, 0)
+      await move(0, 0)
       await expect.poll(scrolled, { message: 'the session is where it was before the keyboard' }).toBe(before)
+    })
+
+    test(`leaves the shell's scrolling area where it was when the person leaves the session with the keyboard up, on ${surface}`, async ({
+      page
+    }) => {
+      const move = await withViewport(page)
+      await onPhone(page, surface, { width: 320, height: 658, scale: '200%' }, `&session=${SESSION}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await page.locator('textarea[id^="composer-"]').focus()
+      const scrolled = () => page.evaluate(() => document.querySelector('.m-main')?.scrollTop ?? -1)
+      const before = await scrolled()
+      await move(399, 297)
+      await expect.poll(scrolled, { message: 'the session scrolled to its field' }).toBeGreaterThan(before)
+      // Away from the session while the keyboard is still up: what the destination opens on is not
+      // scrolled by what the session did. The tab bar is under the keyboard, so the tab is pressed
+      // as a pointer would press it, not scrolled to.
+      await page.getByRole('button', { name: 'Attention' }).dispatchEvent('click')
+      await expect(page.locator('.m-session')).toHaveCount(0)
+      expect(
+        await page.evaluate(() => {
+          const main = document.querySelector('.m-main')
+          return main ? main.scrollHeight - main.clientHeight : -1
+        }),
+        'the destination holds more than it shows, so it can keep a position'
+      ).toBeGreaterThan(before)
+      // No further down than the session was before it scrolled to its field: its own scrolling is
+      // not carried into the next view.
+      await expect.poll(scrolled, { message: 'the destination opens where it would have' }).toBeLessThanOrEqual(before)
     })
   }
 })
