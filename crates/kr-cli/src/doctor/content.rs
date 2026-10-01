@@ -499,6 +499,11 @@ impl Composed {
              the text, and so does a user name elsewhere in a path."
         ));
         lines.push(stdout_line!(
+            "A field shown as [withheld: N characters] has a quote before a credential's value or \
+             a quote left open, and the rules cannot tell where the credential ends, so none of \
+             its text is shown."
+        ));
+        lines.push(stdout_line!(
             "Privacy mode turned on after the host was last read does not stop this preview or \
              the write, and turned on after this preview is printed or the bundle is written \
              cannot recall either. A session that was created while privacy mode was on and has \

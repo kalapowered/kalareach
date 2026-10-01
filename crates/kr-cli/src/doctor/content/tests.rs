@@ -1107,6 +1107,9 @@ async fn the_preview_states_what_the_export_cannot_promise() {
     for stated in [
         "A filter is not a guarantee that no secret remains",
         "the home directory of the user running this command",
+        "A field shown as [withheld: N characters] has a quote before a credential's value or a \
+         quote left open",
+        "so none of its text is shown",
         "after the host was last read does not stop this preview or the write",
         "after this preview is printed or the bundle is written cannot recall either",
         "finished its cleanup is in the content once privacy mode is off",
