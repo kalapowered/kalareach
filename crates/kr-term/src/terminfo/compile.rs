@@ -28,8 +28,9 @@ const MAGIC: u16 = 0o432;
 /// The most bytes the names line may hold, its NUL included.
 const MAX_NAMES_BYTES: usize = 128;
 
-/// The most bytes a compiled entry may hold.
-const MAX_ENTRY_BYTES: usize = 32_768;
+/// The most bytes a compiled entry may hold: the limit of the format this writes, which a library
+/// older than the one that added the larger format reads as the end of the entry.
+const MAX_ENTRY_BYTES: usize = 4_096;
 
 /// Why a description cannot be compiled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -213,7 +214,7 @@ impl Description {
         }
         if out.len() > MAX_ENTRY_BYTES {
             return Err(CompileError::TooLarge {
-                what: "more than 32768 bytes",
+                what: "more than 4096 bytes",
             });
         }
         Ok(out)
