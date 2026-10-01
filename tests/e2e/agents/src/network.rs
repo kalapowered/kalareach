@@ -443,8 +443,9 @@ fn serve(
     }
 }
 
-/// Copies `from` to `to` until either ends or fails, and returns the bytes that were written: an
-/// error after some bytes went through leaves the count of those, where a plain copy would lose it.
+/// Copies `from` to `to` until either ends or fails, and returns the bytes that were written: each
+/// successful write is counted, so a failure partway through a buffer, or after some bytes went
+/// through, leaves the count of those, where a plain copy would lose it.
 fn relay(from: &mut impl Read, to: &mut impl Write) -> u64 {
     let mut buffer = [0_u8; 16 * 1024];
     let mut written = 0_u64;
@@ -453,10 +454,16 @@ fn relay(from: &mut impl Read, to: &mut impl Write) -> u64 {
             Ok(0) | Err(_) => return written,
             Ok(read) => read,
         };
-        if to.write_all(&buffer[..read]).is_err() {
-            return written;
+        let mut sent = 0;
+        while sent < read {
+            match to.write(&buffer[sent..read]) {
+                Ok(0) | Err(_) => return written,
+                Ok(count) => {
+                    sent += count;
+                    written += count as u64;
+                }
+            }
         }
-        written += read as u64;
     }
 }
 
@@ -617,6 +624,32 @@ mod tests {
             self.0 = &self.0[count..];
             Ok(count)
         }
+    }
+
+    /// A writer that takes a few bytes of a buffer and then fails.
+    struct Partial(usize, Vec<u8>);
+
+    impl Write for Partial {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::new(ErrorKind::BrokenPipe, "closed"));
+            }
+            let count = self.0.min(buffer.len());
+            self.0 -= count;
+            self.1.extend_from_slice(&buffer[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_that_took_part_of_a_buffer_and_then_failed_counts_what_it_took() {
+        let mut writer = Partial(3, Vec::new());
+        assert_eq!(relay(&mut Failing(b"hello", false), &mut writer), 3);
+        assert_eq!(writer.1, b"hel");
     }
 
     #[test]

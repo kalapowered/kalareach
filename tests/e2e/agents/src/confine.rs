@@ -328,24 +328,36 @@ pub fn wire_prompts(bucket: &Path) -> Result<WirePrompts, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(counts),
         Err(error) => return Err(format!("the run's sessions cannot be listed: {error}")),
     };
-    for session in sessions.flatten() {
+    for session in sessions {
+        let session =
+            session.map_err(|error| format!("the run's sessions cannot be listed: {error}"))?;
         let agents = match std::fs::read_dir(session.path().join("agents")) {
             Ok(agents) => agents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("a conversation's agents cannot be listed: {error}")),
         };
-        for agent in agents.flatten() {
+        for agent in agents {
+            let agent = agent
+                .map_err(|error| format!("a conversation's agents cannot be listed: {error}"))?;
             let text = match std::fs::read(agent.path().join("wire.jsonl")) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(format!("a wire file cannot be read: {error}")),
             };
-            for line in text.lines() {
+            // A last line the agent was stopped in the middle of has no line end; a line that has
+            // one and holds a prompt's mark but is not JSON is a record that could not be counted.
+            let whole = text.ends_with('\n');
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
                 if !line.contains("turn.prompt") && !line.contains("turn.steer") {
                     continue;
                 }
+                let cut_off = index + 1 == lines.len() && !whole;
                 let Ok(value) = serde_json::from_str::<Value>(line) else {
-                    continue;
+                    if cut_off {
+                        continue;
+                    }
+                    return Err("a record of a prompt in a wire file is not JSON".to_owned());
                 };
                 match value.get("type").and_then(Value::as_str) {
                     Some("turn.prompt") => {
@@ -395,9 +407,12 @@ pub fn secret_values(text: &str) -> Vec<String> {
 /// The strings of every key a TOML configuration holds, at any depth: each string of 16 characters
 /// or more under a key named `api_key`, `token` or `secret`, or ending in `_key`, `_token` or
 /// `_secret`, such as the key a third party's provider is given. They are searched for, never
-/// printed; a configuration that is not TOML has none.
-#[must_use]
-pub fn config_secrets(text: &str) -> Vec<String> {
+/// printed.
+///
+/// # Errors
+///
+/// Returns that the configuration is not TOML: the strings it holds are then not known.
+pub fn config_secrets(text: &str) -> Result<Vec<String>, String> {
     fn walk(item: &Item, key: &str, found: &mut Vec<String>) {
         let named = ["api_key", "token", "secret"].contains(&key)
             || ["_key", "_token", "_secret"]
@@ -434,16 +449,16 @@ pub fn config_secrets(text: &str) -> Vec<String> {
             _ => {}
         }
     }
-    let Ok(document) = text.parse::<DocumentMut>() else {
-        return Vec::new();
-    };
+    let document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("the configuration is not TOML: {error}"))?;
     let mut found = Vec::new();
     for (name, item) in document.iter() {
         walk(item, name, &mut found);
     }
     found.sort();
     found.dedup();
-    found
+    Ok(found)
 }
 
 /// The strings the person's data directory keeps for logins: those of every credentials file, the
@@ -469,12 +484,17 @@ pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
         {
             let text = std::fs::read_to_string(&path)
                 .map_err(|error| format!("a credentials file cannot be read: {error}"))?;
+            if serde_json::from_str::<Value>(&text).is_err() {
+                return Err(
+                    "a credentials file is not JSON, so its strings are not known".to_owned(),
+                );
+            }
             values.extend(secret_values(&text));
         }
     }
     let config = std::fs::read_to_string(data.join("config.toml"))
         .map_err(|error| format!("the configuration cannot be read: {error}"))?;
-    values.extend(config_secrets(&config));
+    values.extend(config_secrets(&config)?);
     values.sort();
     values.dedup();
     if values.is_empty() {
@@ -1149,6 +1169,24 @@ mod tests {
                 other: 2
             })
         );
+        // A record of a prompt that is whole but is not JSON cannot be counted; one cut off at the end
+        // of a file, with no line end, is the agent's stopping.
+        std::fs::write(
+            main.join("wire.jsonl"),
+            "{\"type\":\"turn.prompt\",\"origin\":{\"kind\":\"user\"}}\n{\"type\":\"turn.prompt\" oops\n",
+        )
+        .expect("write");
+        assert!(wire_prompts(&bucket).is_err());
+        std::fs::write(
+            main.join("wire.jsonl"),
+            "{\"type\":\"turn.prompt\",\"origin\":{\"kind\":\"user\"}}\n{\"type\":\"turn.prompt\" oops",
+        )
+        .expect("write");
+        assert_eq!(
+            wire_prompts(&bucket).map(|counts| counts.user + counts.other),
+            Ok(1 + 1),
+            "the subagent's prompt and the one whole prompt"
+        );
         let _ = std::fs::remove_dir_all(&bucket);
     }
 
@@ -1206,6 +1244,12 @@ mod tests {
         assert!(login_strings(&data).is_err(), "no configuration");
         std::fs::write(data.join("config.toml"), "default_model = \"x\"\n").expect("write");
         assert!(login_strings(&data).is_err(), "no string at all");
+        std::fs::write(data.join("credentials/broken.json"), "{ not json").expect("write");
+        assert!(
+            login_strings(&data).is_err(),
+            "a credentials file that is not JSON"
+        );
+        std::fs::remove_file(data.join("credentials/broken.json")).expect("remove");
         std::fs::write(
             data.join("credentials/slot-a.json"),
             r#"{"access":"abcdefghijklmnopqrstuvwxyz"}"#,
@@ -1236,6 +1280,16 @@ mod tests {
             ]),
             "every slot, the keys of the configuration, and no other string or file"
         );
+        std::fs::write(data.join("config.toml"), "api_key = [oops").expect("write");
+        assert!(
+            login_strings(&data).is_err(),
+            "a configuration that is not TOML"
+        );
+        std::fs::write(
+            data.join("config.toml"),
+            "[providers.third]\napi_key = 'sk-0123456789abcdef0123'\n[providers.other]\nrefresh_token = \"refresh-0123456789abcdef\"\n",
+        )
+        .expect("write");
         // The login in use is refreshed: the strings it now holds are read.
         std::fs::write(
             data.join("credentials/slot-a.json"),
