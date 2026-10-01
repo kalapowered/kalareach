@@ -678,7 +678,7 @@ impl CatalogueModule {
         &self,
         subject: &kr_protocol::confirmation::ConfirmationSubject,
     ) -> Answer<crate::service::net::owner::Resolved> {
-        use kr_protocol::confirmation::{ConfirmationDisplay, ConfirmationSubject};
+        use kr_protocol::confirmation::ConfirmationSubject;
         let carries_a_proof = || {
             ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -695,24 +695,13 @@ impl CatalogueModule {
                 within_budgets(&params.budgets, &self.budgets_in_force())?;
                 let enrolment = enrolment_from(params)?;
                 let plan = trust_plan(params, &enrolment)?;
-                let digest = plan
-                    .action_digest()
-                    .map_err(|error| error.to_protocol_error())?;
+                let digest = plan.action_digest().map_err(plan_error)?;
                 Ok(crate::service::net::owner::Resolved {
-                    action: crate::sharing::CatalogueTrustPlan::sensitive_action(),
+                    action: kr_protocol::confirmation::CatalogueTrustPlan::sensitive_action(),
                     digest,
                     destination: None,
                     rights: kr_protocol::scalars::CanonicalSet::new(),
-                    display: ConfirmationDisplay::CatalogueAdd {
-                        environment_id: params.environment_id,
-                        catalogue_id: plan.catalogue_id.clone(),
-                        kind: params.kind,
-                        metadata_url: params.metadata_url.clone(),
-                        targets_url: params.targets_url.clone(),
-                        root_digest: plan.root_digest.clone(),
-                        root_key_ids: plan.root_key_ids.iter().cloned().collect(),
-                        ceiling: plan.ceiling.iter().cloned().collect(),
-                    },
+                    display: plan.display(),
                     first_owner: false,
                 })
             }
@@ -724,24 +713,13 @@ impl CatalogueModule {
                 let mut catalogue = self.catalogue.lock().await;
                 let (plan, _) = install_plan(&mut catalogue, params).await?;
                 drop(catalogue);
-                let digest = plan
-                    .action_digest()
-                    .map_err(|error| error.to_protocol_error())?;
+                let digest = plan.action_digest().map_err(plan_error)?;
                 Ok(crate::service::net::owner::Resolved {
-                    action: crate::sharing::PluginInstallPlan::sensitive_action(),
+                    action: kr_protocol::confirmation::PluginInstallPlan::sensitive_action(),
                     digest,
                     destination: None,
                     rights: kr_protocol::scalars::CanonicalSet::new(),
-                    display: ConfirmationDisplay::PluginInstall {
-                        environment_id: params.environment_id,
-                        catalogue_id: plan.catalogue_id.clone(),
-                        plugin_id: plan.plugin_id.clone(),
-                        version: plan.version.clone(),
-                        package_digest: plan.package_digest.clone(),
-                        ceiling: plan.ceiling.iter().cloned().collect(),
-                        grant: plan.grant.iter().cloned().collect(),
-                        grant_statement: Nullable(plan.grant_statement.clone()),
-                    },
+                    display: plan.display(),
                     first_owner: false,
                 })
             }
@@ -1351,12 +1329,10 @@ impl CatalogueModule {
                 // `catalogue.remove` and `catalogue.add`, so that a root never changes underneath
                 // a repository somebody is already using.
                 let plan = trust_plan(&params, &enrolment)?;
-                let action_digest = plan
-                    .action_digest()
-                    .map_err(|error| error.to_protocol_error())?;
+                let action_digest = plan.action_digest().map_err(plan_error)?;
                 let (confirmations, confirmed) = confirm(
                     confirmations,
-                    crate::sharing::CatalogueTrustPlan::sensitive_action(),
+                    kr_protocol::confirmation::CatalogueTrustPlan::sensitive_action(),
                     action_digest,
                     params.owner_confirmation.as_ref(),
                     "enrolment",
@@ -1470,12 +1446,11 @@ impl CatalogueModule {
                         (None, None) => (None, None),
                         (proof, Some(_)) => match install_plan(catalogue, &params).await {
                             Ok((plan, ceiling)) => {
-                                let action_digest = plan
-                                    .action_digest()
-                                    .map_err(|error| error.to_protocol_error())?;
+                                let action_digest = plan.action_digest().map_err(plan_error)?;
                                 match confirm(
                                     confirmations,
-                                    crate::sharing::PluginInstallPlan::sensitive_action(),
+                                    kr_protocol::confirmation::PluginInstallPlan::sensitive_action(
+                                    ),
                                     action_digest,
                                     proof,
                                     "installation",
@@ -1635,19 +1610,17 @@ impl CatalogueModule {
                         ),
                     ));
                 }
-                let plan = crate::sharing::PluginGrantPlan {
+                let plan = kr_protocol::confirmation::PluginGrantPlan {
                     environment_id: params.environment_id,
                     plugin_id: params.plugin_id.clone(),
                     version: installed.version.to_string(),
                     package_digest: named.to_string(),
                     grant: params.grant.iter().cloned().collect(),
                 };
-                let action_digest = plan
-                    .action_digest()
-                    .map_err(|error| error.to_protocol_error())?;
+                let action_digest = plan.action_digest().map_err(plan_error)?;
                 let (confirmations, confirmed) = confirm(
                     confirmations,
-                    crate::sharing::PluginGrantPlan::sensitive_action(),
+                    kr_protocol::confirmation::PluginGrantPlan::sensitive_action(),
                     action_digest,
                     Some(&params.owner_confirmation),
                     "grant",
@@ -2378,18 +2351,21 @@ const fn kind_of(kind: RepositoryKind) -> wire::CatalogueKind {
 fn trust_plan(
     params: &wire::CatalogueAddParams,
     enrolment: &Enrolment,
-) -> Answer<crate::sharing::CatalogueTrustPlan> {
-    Ok(crate::sharing::CatalogueTrustPlan {
-        environment_id: params.environment_id,
-        catalogue_id: enrolment.id.to_string(),
-        root_digest: enrolment.root_digest().to_string(),
-        root_key_ids: enrolment
+) -> Answer<kr_protocol::confirmation::CatalogueTrustPlan> {
+    Ok(kr_protocol::confirmation::CatalogueTrustPlan::of_request(
+        params,
+        enrolment.root_digest().to_string(),
+        enrolment
             .root_key_ids()
             .map_err(ProtocolError::from)?
             .into_iter()
             .collect(),
-        ceiling: params.ceiling.iter().cloned().collect(),
-    })
+    ))
+}
+
+/// A plan that cannot be encoded is a request this host cannot describe.
+fn plan_error(error: kr_cbor::CborError) -> ProtocolError {
+    ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
 }
 
 /// The plan an installation's confirmation covers, from the exact request and what this host
@@ -2400,7 +2376,10 @@ fn trust_plan(
 async fn install_plan(
     catalogue: &mut Catalogue,
     params: &wire::PluginInstallParams,
-) -> Answer<(crate::sharing::PluginInstallPlan, CapabilityCeiling)> {
+) -> Answer<(
+    kr_protocol::confirmation::PluginInstallPlan,
+    CapabilityCeiling,
+)> {
     let repository = repository_id(&params.catalogue_id)?;
     let release = version(&params.version)?;
     let package_hash = digest(&params.package_digest)?;
@@ -2425,7 +2404,7 @@ async fn install_plan(
     } else {
         None
     };
-    let plan = crate::sharing::PluginInstallPlan {
+    let plan = kr_protocol::confirmation::PluginInstallPlan {
         environment_id: params.environment_id,
         catalogue_id: repository.to_string(),
         ceiling: enrolment

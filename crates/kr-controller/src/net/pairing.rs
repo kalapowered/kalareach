@@ -468,6 +468,16 @@ impl PairingHost {
         self.owner.request(caller, resolved, action, admission)
     }
 
+    /// Refuses a caller that is not this host's owner before the catalogue resolves a subject for
+    /// it: what resolving reads, and may fetch, is for the owner to ask about.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for a caller without owner authority.
+    pub fn require_owner(&self, caller: &Caller) -> Result<()> {
+        self.owner.require_owner(caller)
+    }
+
     /// `owner.confirmation.request` for a subject the catalogue has already resolved into what
     /// the challenge names and what an owner device is shown.
     ///
@@ -613,7 +623,7 @@ impl PairingHost {
                 identity.network_config = network_config;
                 let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
-                let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+                let (spendable, mut challenges) = self.owner.spend(&expectation, &|_| true)?;
                 if let Some(invited) = self.invited(&open, caller, action) {
                     return invited;
                 }
@@ -667,7 +677,7 @@ impl PairingHost {
                 identity.network_config = network_config;
                 let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
-                let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+                let (spendable, mut challenges) = self.owner.spend(&expectation, &|_| true)?;
                 if let Some(invited) = self.invited(&open, caller, action) {
                     return invited;
                 }
@@ -811,7 +821,7 @@ impl PairingHost {
         // Asked before the answer is spent, and again inside the commit's own transaction.
         admission()?;
         let slot = offered.admission.clone();
-        let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+        let (spendable, mut challenges) = self.owner.spend(&expectation, &|_| true)?;
         // Asked again with the challenge lock held as well as the invitation's, where a request or
         // a completion records its action: an identifier one of them spent since the check above is
         // found before the owner's answer is spent, and the answer stays for the next action.
@@ -1711,7 +1721,20 @@ impl crate::sharing::OwnerConfirmations for PairingHost {
     ) -> Result<crate::sharing::ConfirmedAction> {
         let rights = CanonicalSet::new();
         let expectation = self.owner.expectation(action, action_digest, None, &rights);
-        self.owner.spend_answered(&expectation, "catalogue")
+        // The two actions the catalogue spends from a recorded answer are the two it describes
+        // itself: an owner device was shown the repository, or the release and its grant, that
+        // the host resolved from the request. A challenge a caller described for the same action
+        // and digest was shown as the caller's words, and is never taken for either.
+        let shows: fn(&ConfirmationDisplay) -> bool = match action {
+            SensitiveAction::TrustRepositoryRoot => {
+                |display| matches!(display, ConfirmationDisplay::CatalogueAdd { .. })
+            }
+            SensitiveAction::GrantExecutableCapability => {
+                |display| matches!(display, ConfirmationDisplay::PluginInstall { .. })
+            }
+            _ => |_| false,
+        };
+        self.owner.spend_answered(&expectation, &shows, "catalogue")
     }
 
     fn host_device_id(&self) -> DeviceId {

@@ -10,15 +10,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kr_controller::catalogue::{Admission, CatalogueModule, TestingPoint};
-use kr_controller::sharing::{
-    CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan, PluginInstallPlan,
-};
+use kr_controller::sharing::{ConfirmedAction, OwnerConfirmations};
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Effect, Enrolment, Owner,
     RepositoryId, RepositoryKind,
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::catalogue as wire;
+use kr_protocol::confirmation::{CatalogueTrustPlan, PluginGrantPlan, PluginInstallPlan};
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
 };
@@ -341,55 +340,33 @@ fn add_params_for(
 ) -> wire::CatalogueAddParams {
     use base64::Engine as _;
     let root = std::fs::read(host.working.join("root.json")).expect("a trust root");
-    let metadata_url = directory_url(&host.working.join("metadata"));
-    let targets_url = directory_url(&host.working.join("targets"));
-    // The owner is asked about this exact enrolment: this repository, this root and this ceiling.
-    // The client builds the plan the host will build, which is what makes the digests agree.
-    let digest = CatalogueTrustPlan {
-        environment_id: host.environment_id,
-        catalogue_id: catalogue_id.to_owned(),
-        root_digest: kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string(),
-        root_key_ids: root_key_ids(&root, &metadata_url, &targets_url),
-        ceiling: ceiling.iter().cloned().collect(),
-    }
-    .action_digest()
-    .expect("a digest");
-    wire::CatalogueAddParams {
-        environment_id: host.environment_id,
-        catalogue_id: catalogue_id.to_owned(),
-        kind: wire::CatalogueKind::Local,
-        metadata_url,
-        targets_url,
-        root: base64::engine::general_purpose::STANDARD.encode(&root),
-        budgets: budgets(),
-        ceiling,
-        owner_confirmation: Nullable::some(
-            host.ceremony
-                .approve(SensitiveAction::TrustRepositoryRoot, digest),
-        ),
-    }
+    confirmed(
+        host,
+        wire::CatalogueAddParams {
+            environment_id: host.environment_id,
+            catalogue_id: catalogue_id.to_owned(),
+            kind: wire::CatalogueKind::Local,
+            metadata_url: directory_url(&host.working.join("metadata")),
+            targets_url: directory_url(&host.working.join("targets")),
+            root: base64::engine::general_purpose::STANDARD.encode(&root),
+            budgets: budgets(),
+            ceiling,
+            owner_confirmation: Nullable::null(),
+        },
+    )
 }
 
-/// The key identifiers the root declares for its own role, read out of the root document.
-fn root_key_ids(
-    root: &[u8],
-    metadata_url: &str,
-    targets_url: &str,
-) -> kr_protocol::scalars::CanonicalSet<String> {
-    Enrolment::new(
-        RepositoryId::new("development").expect("a valid identifier"),
-        RepositoryKind::Local,
-        url::Url::parse(metadata_url).expect("a location"),
-        url::Url::parse(targets_url).expect("a location"),
-        root.to_vec(),
-        kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
-        CapabilityCeiling::default_ceiling(),
-    )
-    .expect("an enrolment")
-    .root_key_ids()
-    .expect("a readable root")
-    .into_iter()
-    .collect()
+/// `params` with the owner's confirmation of exactly what they name: this repository, its kind
+/// and locations, this root, its budgets and this ceiling. The client builds the plan the host
+/// will build, which is what makes the digests agree, so a request changed after this is a
+/// request nobody confirmed.
+fn confirmed(host: &Host, mut params: wire::CatalogueAddParams) -> wire::CatalogueAddParams {
+    let digest = wire_trust_plan(&params).action_digest().expect("a digest");
+    params.owner_confirmation = Nullable::some(
+        host.ceremony
+            .approve(SensitiveAction::TrustRepositoryRoot, digest),
+    );
+    params
 }
 
 /// The parameters of a `plugin.grant`, with the owner's confirmation of that exact grant.
@@ -1708,17 +1685,15 @@ fn wire_trust_plan(params: &wire::CatalogueAddParams) -> CatalogueTrustPlan {
         CapabilityCeiling::default_ceiling(),
     )
     .expect("an enrolment");
-    CatalogueTrustPlan {
-        environment_id: params.environment_id,
-        catalogue_id: params.catalogue_id.clone(),
-        root_digest: enrolment.root_digest().to_string(),
-        root_key_ids: enrolment
+    CatalogueTrustPlan::of_request(
+        params,
+        enrolment.root_digest().to_string(),
+        enrolment
             .root_key_ids()
             .expect("a readable root")
             .into_iter()
             .collect(),
-        ceiling: params.ceiling.iter().cloned().collect(),
-    }
+    )
 }
 
 /// KR-REQ-07.47, KR-REQ-10.52: on a host that is not on the network a confirmed catalogue method
@@ -2118,7 +2093,7 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
         .expect("in force");
     let mut mirror = add_params(&host);
     mirror.budgets.full_offline_mirror = true;
-    let refused = refusal(add(mirror).await);
+    let refused = refusal(add(confirmed(&host, mirror)).await);
     assert!(
         refused.message.contains("full_offline_mirror"),
         "{refused:?}"
@@ -2138,7 +2113,7 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
     wide.budgets.metadata_bytes = U64::new(100 * MIB);
     wide.budgets.retained_metadata_bytes = U64::new(200 * MIB);
     wide.budgets.full_offline_mirror = true;
-    let _: wire::CatalogueAddResult = ok(add(wide).await);
+    let _: wire::CatalogueAddResult = ok(add(confirmed(&host, wide)).await);
     assert_eq!(listed().await, 1);
 }
 
@@ -2313,6 +2288,7 @@ async fn a_synchronisation_holds_each_entry_to_the_extracted_limit() {
             .expect("in force");
         let mut params = add_params(&host);
         params.budgets.full_offline_mirror = mirror;
+        let params = confirmed(&host, params);
         let _: wire::CatalogueAddResult = ok(host
             .module
             .write_frame_admitted(

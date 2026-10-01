@@ -8061,6 +8061,10 @@
             "catalogue_add": {
               "additionalProperties": false,
               "properties": {
+                "budgets": {
+                  "$ref": "#/$defs/CatalogueBudgets",
+                  "description": "The budgets its syncs and its cache run inside."
+                },
                 "catalogue_id": {
                   "description": "This host's identifier for the repository.",
                   "type": "string"
@@ -8108,6 +8112,7 @@
                 "targets_url",
                 "root_digest",
                 "root_key_ids",
+                "budgets",
                 "ceiling"
               ],
               "type": "object"
@@ -8334,7 +8339,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "An action whose effect no served method performs yet: enlarging a persistent grant,\ntrusting a new repository root or granting an executable capability.\n\nThe host issues a challenge for exactly this description. Only an effect whose own\nexpectation is equal to it, member for member, can ever consume the answer.",
+          "description": "An action its caller describes: enlarging a persistent grant, or trusting a repository\nroot or granting an executable capability where the caller presents the answer's proof\nitself.\n\nThe host issues a challenge for exactly this description and shows the owner device the\ndescription and nothing it resolved. Only an effect whose own expectation is equal to it,\nmember for member, can consume the answer, and only by the proof being presented with the\nrequest: a method that spends a recorded answer takes only a challenge of the subject the\nhost describes for it, [`ConfirmationSubject::CatalogueAdd`] or\n[`ConfirmationSubject::PluginInstall`].",
           "properties": {
             "described": {
               "$ref": "#/$defs/DescribedAction"
@@ -9451,7 +9456,7 @@
     },
     "DescribedAction": {
       "additionalProperties": false,
-      "description": "An action described by its caller, for the three actions no served method performs yet.",
+      "description": "An action described by its caller, which an owner device is shown as the caller's own words.",
       "properties": {
         "action": {
           "$ref": "#/$defs/SensitiveAction",

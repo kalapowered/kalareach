@@ -167,8 +167,18 @@ impl Controller {
                     params.subject,
                     ConfirmationSubject::CatalogueAdd(_) | ConfirmationSubject::PluginInstall(_)
                 ) {
-                    // A retried request is answered with the challenge it was given, before
-                    // anything about the subject is resolved again.
+                    // Only the owner asks, and that is decided before the catalogue reads or
+                    // fetches anything for the subject: what it refuses with names the
+                    // repository and the release, which a device without owner authority has no
+                    // right to learn. A retried request was answered earlier, with the challenge
+                    // it was given.
+                    let owner = Arc::clone(&pairing);
+                    let asker = caller.clone();
+                    tokio::task::spawn_blocking(move || owner.require_owner(&asker))
+                        .await
+                        .map_err(|_| ControllerError::Uncertain {
+                            detail: "the pairing step stopped before it answered".to_owned(),
+                        })??;
                     let resolved = self
                         .catalogue
                         .resolve_confirmation(&params.subject)

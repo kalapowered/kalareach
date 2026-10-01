@@ -25,7 +25,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ConfirmationId, InvitationId};
+use crate::ids::{ConfirmationId, EnvironmentId, InvitationId, PluginId};
 use crate::invitation::{InviteGrantKind, InviteModeKind, PairCandidateView};
 use crate::pairing::{
     ConfirmationChannel, DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest,
@@ -82,15 +82,20 @@ pub enum ConfirmationSubject {
     PluginInstall(Box<crate::catalogue::PluginInstallParams>),
     /// Establishing this host's clock again after it was found to have gone backwards.
     EstablishClock,
-    /// An action whose effect no served method performs yet: enlarging a persistent grant,
-    /// trusting a new repository root or granting an executable capability.
+    /// An action its caller describes: enlarging a persistent grant, or trusting a repository
+    /// root or granting an executable capability where the caller presents the answer's proof
+    /// itself.
     ///
-    /// The host issues a challenge for exactly this description. Only an effect whose own
-    /// expectation is equal to it, member for member, can ever consume the answer.
+    /// The host issues a challenge for exactly this description and shows the owner device the
+    /// description and nothing it resolved. Only an effect whose own expectation is equal to it,
+    /// member for member, can consume the answer, and only by the proof being presented with the
+    /// request: a method that spends a recorded answer takes only a challenge of the subject the
+    /// host describes for it, [`ConfirmationSubject::CatalogueAdd`] or
+    /// [`ConfirmationSubject::PluginInstall`].
     Described(DescribedAction),
 }
 
-/// An action described by its caller, for the three actions no served method performs yet.
+/// An action described by its caller, which an owner device is shown as the caller's own words.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DescribedAction {
@@ -186,6 +191,8 @@ pub enum ConfirmationDisplay {
         root_digest: String,
         /// The key identifiers the root declares for its own role: what the owner is trusting.
         root_key_ids: Vec<String>,
+        /// The budgets its syncs and its cache run inside.
+        budgets: crate::catalogue::CatalogueBudgets,
         /// The capabilities its packages may hold without a further grant, beyond the default
         /// ceiling.
         ceiling: Vec<String>,
@@ -222,6 +229,292 @@ pub enum ConfirmationDisplay {
 pub const NATIVE_BRIDGE_NOTICE: &str = "This package installs a native bridge: code in the \
      application's own directory that runs with the application's permissions, outside the plugin \
      sandbox. The publisher's own statement of what it does follows.";
+
+/// Adopting a repository's trust root, as the owner is asked to confirm it.
+///
+/// The digest covers everything an owner device is shown: the repository's name, kind and
+/// locations, the root's identity, the budgets it runs inside and the ceiling the enrolment
+/// would carry. A confirmation obtained for one repository cannot enrol another, cannot swap the
+/// root, the locations or the budgets underneath it, and cannot widen the ceiling it was shown.
+/// The host builds the digest from the request, and an owner device builds it again from what it
+/// is shown, so both come from this one definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogueTrustPlan {
+    /// The environment the repository is enrolled in.
+    pub environment_id: EnvironmentId,
+    /// This host's identifier for the repository.
+    pub catalogue_id: String,
+    /// What kind of repository it is.
+    pub kind: crate::catalogue::CatalogueKind,
+    /// Where its metadata lives.
+    pub metadata_url: String,
+    /// Where its targets live.
+    pub targets_url: String,
+    /// The digest of the exact root bytes being adopted.
+    pub root_digest: String,
+    /// The key identifiers the root declares for its own role, which is what the owner is trusting.
+    pub root_key_ids: CanonicalSet<String>,
+    /// The budgets its syncs and its cache run inside.
+    pub budgets: crate::catalogue::CatalogueBudgets,
+    /// The capabilities the enrolment would permit beyond the default ceiling.
+    pub ceiling: CanonicalSet<String>,
+}
+
+impl CatalogueTrustPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::TrustRepositoryRoot
+    }
+
+    /// The plan the request `params` names, for the root whose digest and key identifiers are
+    /// given. Everything but the root's identity, which only a reader of the root can state, is
+    /// the request's own, so the host that builds a plan to describe a request and the client that
+    /// builds one to confirm it start from the same words.
+    #[must_use]
+    pub fn of_request(
+        params: &crate::catalogue::CatalogueAddParams,
+        root_digest: String,
+        root_key_ids: CanonicalSet<String>,
+    ) -> Self {
+        Self {
+            environment_id: params.environment_id,
+            catalogue_id: params.catalogue_id.clone(),
+            kind: params.kind,
+            metadata_url: params.metadata_url.clone(),
+            targets_url: params.targets_url.clone(),
+            root_digest,
+            root_key_ids,
+            budgets: params.budgets,
+            ceiling: params.ceiling.iter().cloned().collect(),
+        }
+    }
+
+    /// The digest an owner's confirmation for this exact enrolment covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&(
+            "kr-catalogue-trust/2",
+            self.environment_id,
+            &self.catalogue_id,
+            self.kind,
+            &self.metadata_url,
+            &self.targets_url,
+            &self.root_digest,
+            &self.root_key_ids,
+            self.budgets,
+            &self.ceiling,
+        ))
+    }
+
+    /// What an owner device is shown of this plan.
+    #[must_use]
+    pub fn display(&self) -> ConfirmationDisplay {
+        ConfirmationDisplay::CatalogueAdd {
+            environment_id: self.environment_id,
+            catalogue_id: self.catalogue_id.clone(),
+            kind: self.kind,
+            metadata_url: self.metadata_url.clone(),
+            targets_url: self.targets_url.clone(),
+            root_digest: self.root_digest.clone(),
+            root_key_ids: self.root_key_ids.iter().cloned().collect(),
+            budgets: self.budgets,
+            ceiling: self.ceiling.iter().cloned().collect(),
+        }
+    }
+
+    /// The plan an owner device is shown, or `None` when the display is another subject's or
+    /// lists a set in an order that is not canonical, which no host that follows this definition
+    /// sends.
+    #[must_use]
+    pub fn of_display(display: &ConfirmationDisplay) -> Option<Self> {
+        let ConfirmationDisplay::CatalogueAdd {
+            environment_id,
+            catalogue_id,
+            kind,
+            metadata_url,
+            targets_url,
+            root_digest,
+            root_key_ids,
+            budgets,
+            ceiling,
+        } = display
+        else {
+            return None;
+        };
+        Some(Self {
+            environment_id: *environment_id,
+            catalogue_id: catalogue_id.clone(),
+            kind: *kind,
+            metadata_url: metadata_url.clone(),
+            targets_url: targets_url.clone(),
+            root_digest: root_digest.clone(),
+            root_key_ids: canonical(root_key_ids)?,
+            budgets: *budgets,
+            ceiling: canonical(ceiling)?,
+        })
+    }
+}
+
+/// Granting an installed package a capability, as the owner is asked to confirm it.
+///
+/// The release is part of the digest. A grant confirmed for the release in front of the owner
+/// cannot be spent on whatever is installed by the time it arrives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginGrantPlan {
+    /// The environment the installation belongs to.
+    pub environment_id: EnvironmentId,
+    /// The package.
+    pub plugin_id: PluginId,
+    /// The release the grant is for.
+    pub version: String,
+    /// The exact package hash the grant is for.
+    pub package_digest: String,
+    /// The capabilities the installation would hold after the change, as a whole set.
+    pub grant: CanonicalSet<String>,
+}
+
+impl PluginGrantPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::GrantExecutableCapability
+    }
+
+    /// The digest an owner's confirmation for this exact grant covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&(
+            "kr-plugin-grant/1",
+            self.environment_id,
+            &self.plugin_id,
+            &self.version,
+            &self.package_digest,
+            &self.grant,
+        ))
+    }
+}
+
+/// Installing a package where the installation needs the owner's confirmation, as the owner is
+/// asked to confirm it.
+///
+/// What an installation may do depends on the repository it comes from as well as on its grant, so
+/// the repository and its ceiling are in the digest with the release and the grant: a confirmation
+/// shown for an installation from one repository cannot install the same package from another
+/// that permits it more. An owner device builds the same digest from what it is shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginInstallPlan {
+    /// The environment the package is installed in.
+    pub environment_id: EnvironmentId,
+    /// This host's identifier for the repository the package is installed from.
+    pub catalogue_id: String,
+    /// The capabilities that repository's ceiling permits, as `catalogue.list` reports them.
+    pub ceiling: CanonicalSet<String>,
+    /// The package.
+    pub plugin_id: PluginId,
+    /// The release being installed.
+    pub version: String,
+    /// The exact package hash being installed.
+    pub package_digest: String,
+    /// The capabilities the installation is granted, as a whole set.
+    pub grant: CanonicalSet<String>,
+    /// What the release's manifest says a native bridge it installs does, which the owner reads
+    /// before confirming. It is in the digest, so a confirmation shown one statement cannot
+    /// install a release whose manifest says another.
+    pub grant_statement: Option<String>,
+}
+
+impl PluginInstallPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::GrantExecutableCapability
+    }
+
+    /// The digest an owner's confirmation for this exact installation covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        digest_of(&(
+            "kr-plugin-install/2",
+            self.environment_id,
+            &self.catalogue_id,
+            &self.ceiling,
+            &self.plugin_id,
+            &self.version,
+            &self.package_digest,
+            &self.grant,
+            &self.grant_statement,
+        ))
+    }
+
+    /// What an owner device is shown of this plan.
+    #[must_use]
+    pub fn display(&self) -> ConfirmationDisplay {
+        ConfirmationDisplay::PluginInstall {
+            environment_id: self.environment_id,
+            catalogue_id: self.catalogue_id.clone(),
+            plugin_id: self.plugin_id.clone(),
+            version: self.version.clone(),
+            package_digest: self.package_digest.clone(),
+            ceiling: self.ceiling.iter().cloned().collect(),
+            grant: self.grant.iter().cloned().collect(),
+            grant_statement: Nullable(self.grant_statement.clone()),
+        }
+    }
+
+    /// The plan an owner device is shown, or `None` when the display is another subject's or
+    /// lists a set in an order that is not canonical, which no host that follows this definition
+    /// sends.
+    #[must_use]
+    pub fn of_display(display: &ConfirmationDisplay) -> Option<Self> {
+        let ConfirmationDisplay::PluginInstall {
+            environment_id,
+            catalogue_id,
+            plugin_id,
+            version,
+            package_digest,
+            ceiling,
+            grant,
+            grant_statement,
+        } = display
+        else {
+            return None;
+        };
+        Some(Self {
+            environment_id: *environment_id,
+            catalogue_id: catalogue_id.clone(),
+            ceiling: canonical(ceiling)?,
+            plugin_id: plugin_id.clone(),
+            version: version.clone(),
+            package_digest: package_digest.clone(),
+            grant: canonical(grant)?,
+            grant_statement: grant_statement.0.clone(),
+        })
+    }
+}
+
+/// The set a list names, or `None` when the list is not strictly ascending: a set a host shows is
+/// shown in its canonical order, and one that is not has not been through this definition.
+fn canonical(list: &[String]) -> Option<CanonicalSet<String>> {
+    let set: CanonicalSet<String> = list.iter().cloned().collect();
+    set.iter().eq(list.iter()).then_some(set)
+}
+
+fn digest_of<T: Serialize>(value: &T) -> Result<Digest256, kr_cbor::CborError> {
+    let value = kr_cbor::to_canonical_value(value)?;
+    Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+        &value,
+    ))))
+}
 
 /// One challenge an owner can still answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -359,6 +652,7 @@ mod tests {
                 targets_url: "https://repo.example/targets/".to_owned(),
                 root_digest: "sha256:aa".to_owned(),
                 root_key_ids: vec!["k1".to_owned()],
+                budgets: add_params().budgets,
                 ceiling: Vec::new(),
             },
             ConfirmationDisplay::PluginInstall {
@@ -381,6 +675,273 @@ mod tests {
             NATIVE_BRIDGE_NOTICE.contains("outside"),
             "the host's own sentence says the bridge runs outside the plugin sandbox"
         );
+    }
+
+    fn trust_plan() -> CatalogueTrustPlan {
+        CatalogueTrustPlan::of_request(
+            &add_params(),
+            "sha256:aa".to_owned(),
+            ["k1".to_owned()].into_iter().collect(),
+        )
+    }
+
+    fn grant_plan() -> PluginGrantPlan {
+        PluginGrantPlan {
+            environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+            plugin_id: crate::ids::PluginId::new("kalareach/example").expect("a plugin id"),
+            version: "0.1.0".to_owned(),
+            package_digest: "sha256:bb".to_owned(),
+            grant: CanonicalSet::new(),
+        }
+    }
+
+    fn install_plan() -> PluginInstallPlan {
+        PluginInstallPlan {
+            environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+            catalogue_id: "community".to_owned(),
+            ceiling: ["metadata.match".to_owned()].into_iter().collect(),
+            plugin_id: crate::ids::PluginId::new("kalareach/example").expect("a plugin id"),
+            version: "0.1.0".to_owned(),
+            package_digest: "sha256:bb".to_owned(),
+            grant: ["native_bridge.install".to_owned()].into_iter().collect(),
+            grant_statement: Some("Installs three registration files".to_owned()),
+        }
+    }
+
+    /// Every part of an enrolment an owner device shows is part of what the owner confirmed: the
+    /// repository's name, kind and locations, the root, the budgets it runs inside and the
+    /// ceiling. A confirmation for one enrolment is never a confirmation for another.
+    #[test]
+    fn every_part_of_an_enrolment_is_a_different_action() {
+        let confirmed = trust_plan().action_digest().expect("a digest");
+        let mut other_budgets = add_params().budgets;
+        other_budgets.metadata_entries = crate::scalars::U64::new(2);
+        let changed = [
+            CatalogueTrustPlan {
+                environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([3; 16])),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                catalogue_id: "elsewhere".to_owned(),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                kind: crate::catalogue::CatalogueKind::Official,
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                metadata_url: "https://other.example/metadata/".to_owned(),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                targets_url: "https://other.example/targets/".to_owned(),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                root_digest: "sha256:cc".to_owned(),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                root_key_ids: ["k1".to_owned(), "k2".to_owned()].into_iter().collect(),
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                budgets: other_budgets,
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                budgets: crate::catalogue::CatalogueBudgets {
+                    full_offline_mirror: true,
+                    ..add_params().budgets
+                },
+                ..trust_plan()
+            },
+            CatalogueTrustPlan {
+                ceiling: ["terminal.stream".to_owned()].into_iter().collect(),
+                ..trust_plan()
+            },
+        ];
+        for plan in changed {
+            assert_ne!(
+                confirmed,
+                plan.action_digest().expect("a digest"),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_release_is_a_different_grant() {
+        let first = grant_plan().action_digest().expect("a digest");
+        let second = PluginGrantPlan {
+            package_digest: "sha256:cc".to_owned(),
+            ..grant_plan()
+        }
+        .action_digest()
+        .expect("a digest");
+        assert_ne!(first, second);
+    }
+
+    /// Each part of an installation is part of what the owner confirmed: the repository it comes
+    /// from and that repository's ceiling as much as the release and the grant. And confirming an
+    /// installation is never confirming a grant or an enrolment, whatever they name.
+    #[test]
+    fn every_part_of_an_installation_is_a_different_action() {
+        let confirmed = install_plan().action_digest().expect("a digest");
+        let changed = [
+            PluginInstallPlan {
+                environment_id: crate::ids::EnvironmentId::new(Uuid::from_bytes([3; 16])),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                catalogue_id: "wide".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                ceiling: ["metadata.match".to_owned(), "terminal.stream".to_owned()]
+                    .into_iter()
+                    .collect(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                plugin_id: crate::ids::PluginId::new("kalareach/other").expect("a plugin id"),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                version: "0.2.0".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                package_digest: "sha256:cc".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant: ["terminal.input".to_owned()].into_iter().collect(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant_statement: Some("Installs three other files".to_owned()),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant_statement: None,
+                ..install_plan()
+            },
+        ];
+        for plan in changed {
+            assert_ne!(
+                confirmed,
+                plan.action_digest().expect("a digest"),
+                "{plan:?}"
+            );
+        }
+        assert_ne!(confirmed, grant_plan().action_digest().expect("a digest"));
+        assert_ne!(confirmed, trust_plan().action_digest().expect("a digest"));
+    }
+
+    /// What an owner device is shown is the plan, member for member: a device that builds the
+    /// plan again from the display gets the digest the host built, and changing any member it
+    /// shows changes the digest.
+    #[test]
+    fn a_display_states_the_plan_its_digest_covers() {
+        let trust = trust_plan();
+        assert_eq!(
+            CatalogueTrustPlan::of_display(&trust.display()),
+            Some(trust.clone())
+        );
+        let install = install_plan();
+        assert_eq!(
+            PluginInstallPlan::of_display(&install.display()),
+            Some(install.clone())
+        );
+        // Each display is only its own plan's.
+        assert_eq!(PluginInstallPlan::of_display(&trust.display()), None);
+        assert_eq!(CatalogueTrustPlan::of_display(&install.display()), None);
+        assert_eq!(
+            CatalogueTrustPlan::of_display(&ConfirmationDisplay::EstablishClock),
+            None
+        );
+
+        let ConfirmationDisplay::CatalogueAdd {
+            environment_id,
+            catalogue_id,
+            kind,
+            metadata_url,
+            targets_url,
+            root_digest,
+            root_key_ids,
+            budgets,
+            ceiling,
+        } = trust.display()
+        else {
+            panic!("an enrolment is shown as an enrolment");
+        };
+        let shown = |edit: &dyn Fn(&mut ConfirmationDisplay)| {
+            let mut display = ConfirmationDisplay::CatalogueAdd {
+                environment_id,
+                catalogue_id: catalogue_id.clone(),
+                kind,
+                metadata_url: metadata_url.clone(),
+                targets_url: targets_url.clone(),
+                root_digest: root_digest.clone(),
+                root_key_ids: root_key_ids.clone(),
+                budgets,
+                ceiling: ceiling.clone(),
+            };
+            edit(&mut display);
+            CatalogueTrustPlan::of_display(&display)
+                .map(|plan| plan.action_digest().expect("a digest"))
+        };
+        let confirmed = Some(trust.action_digest().expect("a digest"));
+        assert_eq!(shown(&|_| {}), confirmed, "the control: nothing changed");
+        for (name, edit) in [
+            (
+                "the location of the metadata",
+                &(|display: &mut ConfirmationDisplay| {
+                    if let ConfirmationDisplay::CatalogueAdd { metadata_url, .. } = display {
+                        "https://other.example/metadata/".clone_into(metadata_url);
+                    }
+                }) as &dyn Fn(&mut ConfirmationDisplay),
+            ),
+            (
+                "the location of the targets",
+                &|display: &mut ConfirmationDisplay| {
+                    if let ConfirmationDisplay::CatalogueAdd { targets_url, .. } = display {
+                        "https://other.example/targets/".clone_into(targets_url);
+                    }
+                },
+            ),
+            ("the kind", &|display: &mut ConfirmationDisplay| {
+                if let ConfirmationDisplay::CatalogueAdd { kind, .. } = display {
+                    *kind = crate::catalogue::CatalogueKind::Official;
+                }
+            }),
+            ("a budget", &|display: &mut ConfirmationDisplay| {
+                if let ConfirmationDisplay::CatalogueAdd { budgets, .. } = display {
+                    budgets.payload_cache_bytes = crate::scalars::U64::new(2);
+                }
+            }),
+            ("the ceiling", &|display: &mut ConfirmationDisplay| {
+                if let ConfirmationDisplay::CatalogueAdd { ceiling, .. } = display {
+                    ceiling.push("terminal.stream".to_owned());
+                }
+            }),
+        ] {
+            assert_ne!(shown(edit), confirmed, "{name}");
+        }
+
+        // A list that is not in canonical order, or repeats a member, is not a display a host
+        // that follows this definition sends.
+        let mut unordered = install.display();
+        if let ConfirmationDisplay::PluginInstall { grant, .. } = &mut unordered {
+            *grant = vec!["b".to_owned(), "a".to_owned()];
+        }
+        assert_eq!(PluginInstallPlan::of_display(&unordered), None);
+        let mut repeated = trust.display();
+        if let ConfirmationDisplay::CatalogueAdd { root_key_ids, .. } = &mut repeated {
+            *root_key_ids = vec!["k1".to_owned(), "k1".to_owned()];
+        }
+        assert_eq!(CatalogueTrustPlan::of_display(&repeated), None);
     }
 
     #[test]

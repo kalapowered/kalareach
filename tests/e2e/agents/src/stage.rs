@@ -293,7 +293,7 @@ pub fn install_package(
         .map(|catalogue| catalogue.ceiling.into_iter().collect())
         .unwrap_or_else(|| panic!("catalogue.list names {CATALOGUE}"));
     let plugin_id = PluginId::new(package).expect("a plugin identifier");
-    let plan = kr_controller::sharing::PluginInstallPlan {
+    let plan = kr_protocol::confirmation::PluginInstallPlan {
         environment_id,
         catalogue_id: CATALOGUE.to_owned(),
         ceiling,

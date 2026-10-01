@@ -19,10 +19,10 @@ mod net_support;
 use std::path::Path;
 
 use kr_client::session::Session;
-use kr_controller::sharing::{CatalogueTrustPlan, PluginGrantPlan};
 use kr_crypto::keys::DeviceKeys;
 use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
 use kr_protocol::catalogue as wire;
+use kr_protocol::confirmation::{CatalogueTrustPlan, PluginGrantPlan};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{EnvironmentId, PluginId, RepositoryGeneration};
@@ -214,31 +214,29 @@ fn add_params(host: &Host, owner: &DeviceKeys, published: &Published) -> wire::C
     let root = published.root_bytes();
     let metadata_url = published.metadata_url();
     let targets_url = published.targets_url();
-    // The owner is asked about this exact enrolment: this repository, this root and this ceiling.
-    let digest = CatalogueTrustPlan {
-        environment_id: host.environment_id,
-        catalogue_id: "development".to_owned(),
-        root_digest: kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string(),
-        root_key_ids: root_key_ids(&root, &metadata_url, &targets_url),
-        ceiling: kr_protocol::scalars::CanonicalSet::new(),
-    }
-    .action_digest()
-    .expect("a digest");
-    wire::CatalogueAddParams {
+    let mut params = wire::CatalogueAddParams {
         environment_id: host.environment_id,
         catalogue_id: "development".to_owned(),
         kind: wire::CatalogueKind::Local,
-        metadata_url,
-        targets_url,
+        metadata_url: metadata_url.clone(),
+        targets_url: targets_url.clone(),
         root: base64::engine::general_purpose::STANDARD.encode(&root),
         budgets: budgets(),
         ceiling: Vec::new(),
-        owner_confirmation: Nullable::some(host.confirm(
-            owner,
-            SensitiveAction::TrustRepositoryRoot,
-            digest,
-        )),
-    }
+        owner_confirmation: Nullable::null(),
+    };
+    // The owner is asked about this exact enrolment: this repository, its locations, this root,
+    // its budgets and this ceiling.
+    let digest = CatalogueTrustPlan::of_request(
+        &params,
+        kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string(),
+        root_key_ids(&root, &metadata_url, &targets_url),
+    )
+    .action_digest()
+    .expect("a digest");
+    params.owner_confirmation =
+        Nullable::some(host.confirm(owner, SensitiveAction::TrustRepositoryRoot, digest));
+    params
 }
 
 /// The parameters of a `plugin.grant`, with the owner's confirmation of that exact grant.
