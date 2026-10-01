@@ -4,8 +4,8 @@
 use std::io::Cursor;
 
 use kr_describe::wire::{
-    Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, WIRE_VERSION,
-    WireError, frame_of, read_frame, read_message, same_release, write_message,
+    Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
+    WIRE_VERSION, WireError, frame_of, read_frame, read_message, same_release, write_message,
 };
 use kr_protocol::frame::FrameError;
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
@@ -39,6 +39,14 @@ fn every_request() -> Vec<Request> {
             deadline_ms: U64::new(30_000),
             ceiling_bytes: U64::new(4 << 30),
         },
+        Request::Verify {
+            id: U64::new(3),
+            profile_id: "minicpm5-2b-q4-k-m".to_owned(),
+            revision: U64::new(1),
+            file_name: "MiniCPM5-2B-Q4_K_M.gguf".to_owned(),
+            path: "/state/models/minicpm5-2b-q4-k-m/1/MiniCPM5-2B-Q4_K_M.gguf.partial".to_owned(),
+            deadline_ms: U64::new(600_000),
+        },
         Request::Cancel { id: U64::new(2) },
     ]
 }
@@ -60,6 +68,7 @@ fn every_answer() -> Vec<Answer> {
                 io: false,
                 why: Nullable::null(),
             },
+            ceiling: "sampler".to_owned(),
         },
         Answer::Loaded {
             id: U64::new(1),
@@ -82,10 +91,16 @@ fn every_answer() -> Vec<Answer> {
             },
             peak_rss_bytes: U64::new(2_930_000_000),
         },
+        Answer::Cancelling { id: U64::new(2) },
         Answer::Ended {
             id: U64::new(2),
             why: JobEnd::Cancelled,
             detail: Nullable::null(),
+        },
+        Answer::Verified {
+            id: U64::new(3),
+            result: VerifyResult::Mismatch,
+            detail: Nullable::some("the digest is not the recorded one".to_owned()),
         },
     ]
 }

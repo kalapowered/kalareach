@@ -52,6 +52,27 @@ impl Placed {
     }
 }
 
+/// Waits until a stub that marks its work has begun some of this kind in `runtime_dir`.
+pub fn wait_until_began(runtime_dir: &Path, kind: &str) {
+    let prefix = format!("{}{kind}-", kr_describe::testing::BEGAN_PREFIX);
+    let give_up = Instant::now() + Duration::from_secs(20);
+    loop {
+        let began = std::fs::read_dir(runtime_dir)
+            .expect("the runtime directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+        if began {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "no {kind} began in {}",
+            runtime_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// One running stub, spoken to directly.
 pub struct Process {
     child: Child,
@@ -62,11 +83,27 @@ pub struct Process {
 impl Process {
     /// Starts the stub with a script and a runtime directory.
     pub fn start(placed: &Placed, script: &Script, runtime_dir: &Path) -> Self {
-        let mut child = Command::new(placed.program())
+        Self::start_with(placed, script, runtime_dir, None)
+    }
+
+    /// Starts the stub with a script and a runtime directory, and the test catalogue at
+    /// `catalogue` when one is given.
+    pub fn start_with(
+        placed: &Placed,
+        script: &Script,
+        runtime_dir: &Path,
+        catalogue: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(placed.program());
+        command
             .arg("--runtime-dir")
             .arg(runtime_dir)
             .current_dir(runtime_dir)
-            .env(SCRIPT_VARIABLE, script.to_env())
+            .env(SCRIPT_VARIABLE, script.to_env());
+        if let Some(catalogue) = catalogue {
+            command.env(kr_describe::testing::CATALOGUE_VARIABLE, catalogue);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -124,6 +161,17 @@ impl Process {
     pub fn expect_answer(&self, within: Duration, what: &str) -> Answer {
         self.answer(within)
             .unwrap_or_else(|| panic!("{what} did not arrive within {within:?}"))
+    }
+
+    /// Returns the next answer that is not the control thread's acknowledgement of a cancellation,
+    /// which has to arrive within `within`.
+    pub fn expect_terminal(&self, within: Duration, what: &str) -> Answer {
+        loop {
+            let answer = self.expect_answer(within, what);
+            if !matches!(answer, Answer::Cancelling { .. }) {
+                return answer;
+            }
+        }
     }
 
     /// Closes the process's input, which is what it sees when its daemon goes.

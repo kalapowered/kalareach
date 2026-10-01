@@ -12,17 +12,18 @@
 //! None of this is compiled without the `testing` feature.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_protocol::scalars::{Bytes, Nullable, U64};
+use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, Signature64, U64};
 
 use crate::priority::Cancellation;
 use crate::profile::catalogue::Catalogue;
-use crate::serve::{Generating, Job, LoadWork, Loading, Model, Options};
+use crate::profile::{Asset, ProfileDocument, ProfileTrust, SignedProfile};
+use crate::serve::{Generating, Job, LoadWork, Loading, Model, Options, Verifying};
 use crate::wire::{
-    Answer, Background, JobEnd, Phases, Request, WIRE_VERSION, frame_of, read_message,
-    write_message,
+    Answer, Background, JobEnd, Phases, Request, VerifyResult, WIRE_VERSION, frame_of,
+    read_message, write_message,
 };
 
 /// The environment variable a stub executable reads its script from.
@@ -37,6 +38,15 @@ const LOOK: Duration = Duration::from_millis(2);
 /// The start of the name of the file a stub that marks its start leaves in its runtime directory,
 /// followed by its process identifier.
 pub const STARTED_PREFIX: &str = "stub-started-";
+
+/// The start of the name of the file a stub that marks its work leaves in its runtime directory
+/// when its model thread begins some, followed by the kind of work (`load`, `job` or `check`) and
+/// its process identifier.
+pub const BEGAN_PREFIX: &str = "stub-began-";
+
+/// The start of the name of the file a stub that marks its loads leaves in its runtime directory,
+/// followed by its process identifier.
+pub const LOADED_PREFIX: &str = "stub-loaded-";
 
 thread_local! {
     /// The frame thread a driver on this thread does not start next, by name.
@@ -104,6 +114,19 @@ pub struct Script {
     pub load_ms: u64,
     /// Whether a load waits until it is cancelled or passes its deadline.
     pub load_until_cancelled: bool,
+    /// How long a load sleeps without looking at its token, in milliseconds.
+    pub load_ignore_token_ms: u64,
+    /// How long checking a file takes, in milliseconds.
+    pub verify_ms: u64,
+    /// Whether checking a file waits until it is cancelled or passes its deadline.
+    pub verify_until_cancelled: bool,
+    /// Whether the process leaves a file named [`LOADED_PREFIX`] and its identifier in its runtime
+    /// directory when a load succeeds, holding the identifier of the profile it loaded.
+    pub mark_loads: bool,
+    /// Whether the process leaves a file named [`BEGAN_PREFIX`], the kind of work and its
+    /// identifier in its runtime directory when its model thread begins a load, a job or a check:
+    /// what a test waits for before it cancels work it means to be in the middle of.
+    pub mark_work: bool,
     /// How long a job takes, in milliseconds.
     pub generate_ms: u64,
     /// Whether a job waits until it is cancelled or passes its deadline.
@@ -150,6 +173,9 @@ pub enum Output {
     OverlongActivity,
     /// A description that claims a revision other than the prompt's.
     WrongRevision(u64),
+    /// A well-formed description that claims what only the host can know: that tests passed and
+    /// that an approval was given.
+    Claims,
 }
 
 /// A process that breaks the wire on purpose.
@@ -176,6 +202,8 @@ impl Script {
             }
         };
         number("load-ms", self.load_ms);
+        number("load-ignore-token-ms", self.load_ignore_token_ms);
+        number("verify-ms", self.verify_ms);
         number("generate-ms", self.generate_ms);
         number("ignore-token-ms", self.ignore_token_ms);
         if let Some(bytes) = self.peak_rss_bytes {
@@ -193,6 +221,9 @@ impl Script {
             }
         };
         flag("load-until-cancelled", self.load_until_cancelled);
+        flag("verify-until-cancelled", self.verify_until_cancelled);
+        flag("mark-loads", self.mark_loads);
+        flag("mark-work", self.mark_work);
         flag("generate-until-cancelled", self.generate_until_cancelled);
         flag("memory-ceiling", self.memory_ceiling);
         flag("crash-in-generate", self.crash_in_generate);
@@ -208,6 +239,7 @@ impl Script {
             Output::WrongRevision(revision) => {
                 parts.push(format!("output=wrong-revision-{revision}"));
             }
+            Output::Claims => parts.push("output=claims".to_owned()),
         }
         match self.raw {
             None => {}
@@ -239,12 +271,17 @@ impl Script {
             };
             match name {
                 "load-ms" => script.load_ms = number()?,
+                "load-ignore-token-ms" => script.load_ignore_token_ms = number()?,
+                "verify-ms" => script.verify_ms = number()?,
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
+                "verify-until-cancelled" => script.verify_until_cancelled = true,
+                "mark-loads" => script.mark_loads = true,
+                "mark-work" => script.mark_work = true,
                 "generate-until-cancelled" => script.generate_until_cancelled = true,
                 "memory-ceiling" => script.memory_ceiling = true,
                 "crash-in-generate" => script.crash_in_generate = true,
@@ -257,6 +294,7 @@ impl Script {
                         "control-character" => Output::ControlCharacter,
                         "overlong-title" => Output::OverlongTitle,
                         "overlong-activity" => Output::OverlongActivity,
+                        "claims" => Output::Claims,
                         other => match other.strip_prefix("wrong-revision-") {
                             Some(revision) => Output::WrongRevision(
                                 revision
@@ -287,13 +325,34 @@ impl Script {
 #[derive(Clone, Debug, Default)]
 pub struct StubModel {
     script: Script,
+    runtime_dir: Option<PathBuf>,
 }
 
 impl StubModel {
+    /// Leaves the mark of work begun, when the script asks for it.
+    fn began(&self, kind: &str) {
+        if self.script.mark_work
+            && let Some(runtime_dir) = &self.runtime_dir
+        {
+            let mark = runtime_dir.join(format!("{BEGAN_PREFIX}{kind}-{}", std::process::id()));
+            let _ = std::fs::write(mark, kind);
+        }
+    }
+
     /// Builds a model that follows a script.
     #[must_use]
     pub const fn new(script: Script) -> Self {
-        Self { script }
+        Self {
+            script,
+            runtime_dir: None,
+        }
+    }
+
+    /// Gives the model the runtime directory it leaves its marks in.
+    #[must_use]
+    pub fn in_runtime_dir(mut self, runtime_dir: PathBuf) -> Self {
+        self.runtime_dir = Some(runtime_dir);
+        self
     }
 }
 
@@ -323,11 +382,23 @@ fn wait(duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> 
 }
 
 impl Model for StubModel {
-    fn load(&mut self, _work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
+    fn load(&mut self, work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
+        self.began("load");
+        if self.script.load_ignore_token_ms > 0 {
+            std::thread::sleep(Duration::from_millis(self.script.load_ignore_token_ms));
+        }
         let duration =
             (!self.script.load_until_cancelled).then(|| Duration::from_millis(self.script.load_ms));
         match wait(duration, token, deadline) {
-            Waited::Done => Loading::Loaded,
+            Waited::Done => {
+                if self.script.mark_loads
+                    && let Some(runtime_dir) = &self.runtime_dir
+                {
+                    let mark = runtime_dir.join(format!("{LOADED_PREFIX}{}", std::process::id()));
+                    let _ = std::fs::write(mark, work.profile.profile_id());
+                }
+                Loading::Loaded
+            }
             Waited::Cancelled => Loading::Ended {
                 why: crate::wire::LoadEnd::Cancelled,
                 detail: None,
@@ -340,6 +411,7 @@ impl Model for StubModel {
     }
 
     fn generate(&mut self, job: &Job<'_>, token: &Cancellation, deadline: Instant) -> Generating {
+        self.began("job");
         let started = Instant::now();
         if self.script.crash_in_generate {
             eprintln!("kr-describe-stub: ending inside a job, as its script says");
@@ -391,6 +463,61 @@ impl Model for StubModel {
                 .script
                 .peak_rss_bytes
                 .unwrap_or_else(|| crate::serve::own_rss_bytes().unwrap_or(0)),
+        }
+    }
+
+    fn verify(
+        &mut self,
+        asset: &Asset,
+        path: &Path,
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> Verifying {
+        self.began("check");
+        let duration = (!self.script.verify_until_cancelled)
+            .then(|| Duration::from_millis(self.script.verify_ms));
+        match wait(duration, token, deadline) {
+            Waited::Done => check_file(asset, path),
+            Waited::Cancelled => Verifying::Ended {
+                result: VerifyResult::Cancelled,
+                detail: None,
+            },
+            Waited::PastDeadline => Verifying::Ended {
+                result: VerifyResult::DeadlineExceeded,
+                detail: None,
+            },
+        }
+    }
+}
+
+/// Checks a file against an asset's recorded size and digest, reading it whole: a stub's files
+/// are small.
+fn check_file(asset: &Asset, path: &Path) -> Verifying {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Verifying::Ended {
+                result: VerifyResult::Unreadable,
+                detail: Some(error.to_string()),
+            };
+        }
+    };
+    let digest: String = kr_cbor::sha256(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if bytes.len() as u64 == asset.bytes && digest == asset.sha256 {
+        Verifying::Verified
+    } else {
+        Verifying::Ended {
+            result: VerifyResult::Mismatch,
+            detail: Some(format!(
+                "{} is {} bytes with digest {digest}, and its profile records {} bytes with {}",
+                asset.file_name,
+                bytes.len(),
+                asset.bytes,
+                asset.sha256
+            )),
         }
     }
 }
@@ -455,6 +582,10 @@ pub fn answer_of(prompt: &str, output: &Output) -> Vec<u8> {
         .or_else(|| data_field(prompt, "thread"))
         .unwrap_or("Working in this session");
     let (title, activity) = match output {
+        Output::Claims => (
+            "All tests passed".to_owned(),
+            "Approved the deploy after every test passed".to_owned(),
+        ),
         Output::ControlCharacter => (format!("{subject}\u{7}"), doing.to_owned()),
         Output::OverlongTitle => ("t".repeat(65), doing.to_owned()),
         Output::OverlongActivity => (subject.to_owned(), "a".repeat(161)),
@@ -508,6 +639,185 @@ pub fn stub_build() -> String {
     format!("kr-describe-stub/{}", crate::wire::RELEASE)
 }
 
+/// The environment variable a stub executable reads a test catalogue's bundle from, as a path.
+pub const CATALOGUE_VARIABLE: &str = "KR_DESCRIBE_STUB_CATALOGUE";
+
+/// The catalogue a stub executable holds: the one a test signed for it, or this build's own.
+fn stub_catalogue() -> Result<Catalogue, String> {
+    match std::env::var_os(CATALOGUE_VARIABLE) {
+        None => Catalogue::builtin().map_err(|error| error.to_string()),
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("{} is not readable: {error}", path.to_string_lossy()))?;
+            catalogue_from_bundle(&text)
+        }
+    }
+}
+
+/// A test catalogue as a file: the one key its profiles were signed with, and each profile's
+/// document with its signature.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Bundle {
+    key: AuthorisationKey,
+    profiles: Vec<BundledProfile>,
+}
+
+/// One profile of a bundle.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BundledProfile {
+    document: String,
+    signature: Signature64,
+}
+
+/// Reads a catalogue from a bundle: every profile is verified under the bundle's own key, so what
+/// comes out has passed the checks a shipped profile passes.
+///
+/// # Errors
+///
+/// Returns what is wrong with the bundle.
+pub fn catalogue_from_bundle(text: &str) -> Result<Catalogue, String> {
+    let bundle: Bundle = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let trust = ProfileTrust::new(vec![bundle.key]);
+    let mut profiles = Vec::new();
+    for bundled in bundle.profiles {
+        let signed = SignedProfile {
+            document: ProfileDocument::new(bundled.document.into_bytes()),
+            key: bundle.key,
+            signature: bundled.signature,
+        };
+        profiles.push(trust.verify(&signed).map_err(|error| error.to_string())?);
+    }
+    Catalogue::new(profiles).map_err(|error| error.to_string())
+}
+
+/// One file of a test profile, with the bytes it is to hold.
+#[derive(Clone, Debug)]
+pub struct TestAsset {
+    /// The file's name.
+    pub file_name: String,
+    /// Where it is fetched from.
+    pub url: String,
+    /// What it holds, which fixes the size and the digest the profile records.
+    pub bytes: Vec<u8>,
+}
+
+/// A profile a test signs, derived from one this build ships.
+#[derive(Clone, Debug)]
+pub struct TestProfile {
+    /// Its identifier.
+    pub profile_id: String,
+    /// Its revision.
+    pub revision: u64,
+    /// Whether it is the gated candidate (derived from the shipped candidate) rather than the
+    /// default (derived from the shipped default).
+    pub candidate: bool,
+    /// The targets it lists, in place of the shipped profile's.
+    pub targets: Option<Vec<String>>,
+    /// Its files, in place of the shipped profile's one weights file.
+    pub assets: Vec<TestAsset>,
+}
+
+impl TestProfile {
+    /// The document this profile signs as.
+    fn document(&self) -> String {
+        let shipped = if self.candidate {
+            crate::profile::catalogue::CANDIDATE_PROFILE_DOCUMENT
+        } else {
+            crate::profile::catalogue::DEFAULT_PROFILE_DOCUMENT
+        };
+        let mut document: serde_json::Value =
+            serde_json::from_str(shipped).expect("a shipped profile is JSON");
+        document["profile_id"] = self.profile_id.clone().into();
+        document["profile_revision"] = self.revision.into();
+        if let Some(targets) = &self.targets {
+            document["targets"] = targets.clone().into();
+        }
+        let total: u64 = self
+            .assets
+            .iter()
+            .map(|asset| asset.bytes.len() as u64)
+            .sum();
+        document["assets"] = self
+            .assets
+            .iter()
+            .enumerate()
+            .map(|(index, asset)| {
+                serde_json::json!({
+                    "role": if index == 0 { "weights" } else { "extra" },
+                    "file_name": asset.file_name,
+                    "url": asset.url,
+                    "bytes": asset.bytes.len(),
+                    "sha256": kr_cbor::sha256(&asset.bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        document["execution"]["resident_estimate"]["weights_bytes"] = total.into();
+        document.to_string()
+    }
+}
+
+/// A catalogue a test signs with a key of its own, for a daemon and for the stub executable it
+/// starts.
+#[derive(Clone, Debug)]
+pub struct TestCatalogue {
+    bundle: String,
+}
+
+impl TestCatalogue {
+    /// Signs `profiles`, which have to hold exactly one default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the profiles are not a catalogue this product would run, which is a mistake in
+    /// the test.
+    #[must_use]
+    pub fn sign(profiles: &[TestProfile]) -> Self {
+        let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a test key");
+        let bundled = profiles
+            .iter()
+            .map(|profile| {
+                let document = ProfileDocument::new(profile.document().into_bytes());
+                let transcript = document.transcript().expect("a transcript");
+                let signature = kr_crypto::sign::sign(&keys, &transcript).expect("a signature");
+                BundledProfile {
+                    document: String::from_utf8(document.bytes().to_vec()).expect("text"),
+                    signature,
+                }
+            })
+            .collect();
+        let bundle = serde_json::to_string(&Bundle {
+            key: *keys.public(),
+            profiles: bundled,
+        })
+        .expect("a bundle");
+        catalogue_from_bundle(&bundle).expect("the signed profiles are a catalogue");
+        Self { bundle }
+    }
+
+    /// Returns the catalogue.
+    ///
+    /// # Panics
+    ///
+    /// Never, for a catalogue this type signed.
+    #[must_use]
+    pub fn catalogue(&self) -> Catalogue {
+        catalogue_from_bundle(&self.bundle).expect("a catalogue this type signed")
+    }
+
+    /// Writes the bundle to `path`, which a stub executable reads through [`CATALOGUE_VARIABLE`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file cannot be written.
+    pub fn write_to(&self, path: &Path) {
+        std::fs::write(path, &self.bundle).expect("the bundle is written");
+    }
+}
+
 /// Runs the stub executable: serves its script's model over standard input and output, or breaks
 /// the wire as its script says. It returns the process's exit status.
 #[must_use]
@@ -544,7 +854,7 @@ pub fn stub_main() -> i32 {
     if let Some(raw) = script.raw {
         return run_raw(raw, &script);
     }
-    let catalogue = match Catalogue::builtin() {
+    let catalogue = match stub_catalogue() {
         Ok(catalogue) => catalogue,
         Err(error) => {
             eprintln!("kr-describe-stub: {error}");
@@ -559,7 +869,8 @@ pub fn stub_main() -> i32 {
     };
     let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
     let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
-    crate::serve::run(options, StubModel::new(script), input, output).code()
+    let model = StubModel::new(script).in_runtime_dir(options.runtime_dir.clone());
+    crate::serve::run(options, model, input, output).code()
 }
 
 /// Runs a stub daemon, which a test ends to see its description process go with it.
@@ -796,6 +1107,7 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                     io: false,
                     why: Some("this stub applies nothing"),
                 }),
+                ceiling: crate::serve::CEILING_MECHANISM.to_owned(),
             }],
             Request::Load { id, .. } => vec![Answer::Loaded {
                 id,
@@ -827,6 +1139,11 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                     Raw::Silent => Vec::new(),
                 }
             }
+            Request::Verify { id, .. } => vec![Answer::Verified {
+                id,
+                result: VerifyResult::Refused,
+                detail: Nullable::some("this stub checks nothing".to_owned()),
+            }],
             Request::Cancel { .. } => Vec::new(),
         };
         for answer in answers {

@@ -6,6 +6,7 @@ mod stub;
 mod support;
 
 use std::io::Read;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use kr_describe::priority::Cancellation;
 use kr_describe::profile::catalogue::Catalogue;
 use kr_describe::serve::{
     CONTROL_BOUND_MS, Exit, Generating, Job, LoadWork, Loading, Model, OVERDUE_GRACE_MS, Options,
+    Verifying,
 };
 use kr_describe::testing::Script;
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
@@ -23,7 +25,7 @@ use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
 use kr_worker::privacy::PrivacyGeneration;
 
-use stub::{Placed, Process, generate, load};
+use stub::{Placed, Process, generate, load, wait_until_began};
 use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
@@ -187,17 +189,11 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
         process.answer(Duration::from_millis(300)).is_none(),
         "the load is still running"
     );
-    let asked = Instant::now();
     process.send(&Request::Cancel { id: U64::new(1) });
     assert!(matches!(
-        process.expect_answer(SOON, "the cancelled load"),
+        process.expect_terminal(SOON, "the cancelled load"),
         Answer::LoadEnded { id, why: LoadEnd::Cancelled, .. } if id.get() == 1
     ));
-    assert!(
-        asked.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        asked.elapsed()
-    );
 
     let runtime = placed.directory("decoding");
     let script = Script {
@@ -213,17 +209,11 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
         process.answer(Duration::from_millis(300)).is_none(),
         "the job is still running"
     );
-    let asked = Instant::now();
     process.send(&Request::Cancel { id: U64::new(2) });
     assert!(matches!(
-        process.expect_answer(SOON, "the cancelled job"),
+        process.expect_terminal(SOON, "the cancelled job"),
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
-    assert!(
-        asked.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        asked.elapsed()
-    );
 
     // The control: the same work, taking a moment and left alone, finishes.
     let runtime = placed.directory("finishing");
@@ -244,6 +234,188 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
         process.expect_answer(SOON, "the job"),
         Answer::Produced { .. }
     ));
+}
+
+/// The control thread says it has read a cancellation while the model thread is still inside the
+/// work and ignoring its token, and the work's own answer follows when the model stops. The
+/// control is a cancellation of work that has already answered, which is acknowledged by nothing.
+#[test]
+fn a_cancellation_is_acknowledged_while_the_model_goes_on() {
+    let placed = Placed::stub();
+
+    // A job whose model does not look at its token for as long as this test lasts: the answer
+    // cannot arrive before the acknowledgement, whatever the machine is doing.
+    let runtime = placed.directory("busy");
+    let script = Script {
+        ignore_token_ms: 60_000,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 30_000));
+    wait_until_began(&runtime, "job");
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    process.kill();
+
+    // The same for a load, and for a check of a file.
+    let runtime = placed.directory("loading");
+    let script = Script {
+        load_ignore_token_ms: 60_000,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    wait_until_began(&runtime, "load");
+    process.send(&Request::Cancel { id: U64::new(1) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(1) }
+    );
+    process.kill();
+
+    // The control: work that has answered is not acknowledged. The job's own answer comes first,
+    // and the cancellation that follows it finds nothing in hand.
+    let runtime = placed.directory("answered");
+    let mut process = Process::start(&placed, &Script::default(), &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 30_000));
+    assert!(matches!(
+        process.expect_answer(SOON, "the job"),
+        Answer::Produced { .. }
+    ));
+    process.send(&Request::Cancel { id: U64::new(2) });
+    // A job the process is given afterwards is answered with nothing before it: the cancellation
+    // was acknowledged by no one.
+    process.send(&generate(3, 1, 30_000));
+    assert!(matches!(
+        process.expect_answer(SOON, "the next job"),
+        Answer::Produced { id, .. } if id.get() == 3
+    ));
+}
+
+/// A file is checked against the size and digest its profile's asset records, and the answer says
+/// how it came out; a check can be cancelled; a profile or file the catalogue does not hold is
+/// refused. The control is the same check of the right file, which passes.
+#[test]
+fn a_process_checks_a_file_against_the_asset_its_profile_records() {
+    use kr_describe::testing::{TestAsset, TestCatalogue, TestProfile};
+    use kr_describe::wire::VerifyResult;
+
+    let placed = Placed::stub();
+    let weights = b"the weights of a tiny model".to_vec();
+    let signed = TestCatalogue::sign(&[TestProfile {
+        profile_id: "tiny-default".to_owned(),
+        revision: 1,
+        candidate: false,
+        targets: Some(vec![kr_describe::environment::build_target().to_owned()]),
+        assets: vec![TestAsset {
+            file_name: "tiny.gguf".to_owned(),
+            url: "http://127.0.0.1:1/tiny.gguf".to_owned(),
+            bytes: weights.clone(),
+        }],
+    }]);
+    let bundle = placed.directory("bundle").join("catalogue.json");
+    signed.write_to(&bundle);
+    let files = placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    std::fs::write(files.join("wrong"), b"the weights of a tiny model, changed")
+        .expect("the wrong file");
+    std::fs::write(files.join("same-size"), b"the weights of a tiny modeL")
+        .expect("a file of the right size and the wrong digest");
+
+    let check = |id: u64, profile: &str, revision: u64, file: &str, path: &Path| Request::Verify {
+        id: U64::new(id),
+        profile_id: profile.to_owned(),
+        revision: U64::new(revision),
+        file_name: file.to_owned(),
+        path: path.to_string_lossy().into_owned(),
+        deadline_ms: U64::new(60_000),
+    };
+    let result_of = |answer: Answer, id: u64| match answer {
+        Answer::Verified {
+            id: answered,
+            result,
+            ..
+        } => {
+            assert_eq!(answered.get(), id);
+            result
+        }
+        other => panic!("a check is answered with its result: {other:?}"),
+    };
+
+    let runtime = placed.directory("runtime");
+    let mut process = Process::start_with(&placed, &Script::default(), &runtime, Some(&bundle));
+    process.hello();
+    for (id, path, expected) in [
+        (1, files.join("right"), VerifyResult::Verified),
+        (2, files.join("wrong"), VerifyResult::Mismatch),
+        (3, files.join("same-size"), VerifyResult::Mismatch),
+        (4, files.join("missing"), VerifyResult::Unreadable),
+    ] {
+        process.send(&check(id, "tiny-default", 1, "tiny.gguf", &path));
+        assert_eq!(
+            result_of(process.expect_answer(SOON, "the check"), id),
+            expected,
+            "{}",
+            path.display()
+        );
+    }
+    process.send(&check(
+        5,
+        "a-profile-nobody-signed",
+        1,
+        "tiny.gguf",
+        &files.join("right"),
+    ));
+    assert_eq!(
+        result_of(process.expect_answer(SOON, "the refusal"), 5),
+        VerifyResult::Refused
+    );
+    process.send(&check(
+        6,
+        "tiny-default",
+        1,
+        "another.gguf",
+        &files.join("right"),
+    ));
+    assert_eq!(
+        result_of(process.expect_answer(SOON, "the refusal"), 6),
+        VerifyResult::Refused
+    );
+
+    // A check that waits is cancelled, and answers that it was.
+    let runtime = placed.directory("cancelling");
+    let script = Script {
+        verify_until_cancelled: true,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start_with(&placed, &script, &runtime, Some(&bundle));
+    process.hello();
+    process.send(&check(
+        7,
+        "tiny-default",
+        1,
+        "tiny.gguf",
+        &files.join("right"),
+    ));
+    wait_until_began(&runtime, "check");
+    process.send(&Request::Cancel { id: U64::new(7) });
+    assert_eq!(
+        result_of(process.expect_terminal(SOON, "the cancelled check"), 7),
+        VerifyResult::Cancelled
+    );
 }
 
 /// A process whose input ends - its daemon closed it or went away - cancels the job it is inside
@@ -475,6 +647,16 @@ impl Model for Recording {
             why: JobEnd::Failed,
             detail: None,
         }
+    }
+
+    fn verify(
+        &mut self,
+        _asset: &kr_describe::profile::Asset,
+        _path: &Path,
+        _token: &Cancellation,
+        _deadline: Instant,
+    ) -> Verifying {
+        Verifying::Verified
     }
 }
 

@@ -8,10 +8,11 @@
 //!
 //! | The daemon sends | The process answers |
 //! | --- | --- |
-//! | `hello`: the daemon's build and this wire's version | `ready`: its build, target, start identity and background class |
+//! | `hello`: the daemon's build and this wire's version | `ready`: its build, target, start identity, background class and how its memory ceiling is enforced |
 //! | `load`: a profile by identifier and revision, its asset files and a deadline | `loaded`, or `load_ended` with why |
 //! | `generate`: a prompt, the grammar, the limits, a deadline and the memory ceiling | `produced` with the bytes, or `ended` with why |
-//! | `cancel`: the work with this identifier | that work's own answer, sooner |
+//! | `verify`: a profile's asset by name, the file to check and a deadline | `verified` with the result |
+//! | `cancel`: the work with this identifier | `cancelling` at once, then that work's own answer, sooner |
 //!
 //! Every request that is answered carries an identifier and every answer to it repeats it, so an
 //! answer the daemon is not waiting for is recognised and dropped rather than attributed to whatever
@@ -92,7 +93,28 @@ pub enum Request {
         /// The resident set past which the job is ended rather than finished, in bytes.
         ceiling_bytes: U64,
     },
-    /// Stop the work with this identifier. Its own answer says how it ended.
+    /// Check one of a profile's files against the size and digest the process's own catalogue
+    /// records for it.
+    ///
+    /// The expected size and digest are never sent: a daemon that named them would be telling the
+    /// process what to accept. The process hashes the file under its own background class, and
+    /// answers `verified` with how it came out.
+    Verify {
+        /// The request's identifier, repeated by its answer.
+        id: U64,
+        /// The profile, which the process finds in its own signed catalogue.
+        profile_id: String,
+        /// The profile's revision, which has to be the one the process's catalogue holds.
+        revision: U64,
+        /// The file's name, as the profile records it.
+        file_name: String,
+        /// Where the file is on this host.
+        path: String,
+        /// How long the check may take from the moment the process reads this, in milliseconds.
+        deadline_ms: U64,
+    },
+    /// Stop the work with this identifier. The process says at once that it is stopping it, and
+    /// the work's own answer says how it ended.
     Cancel {
         /// The work to stop.
         id: U64,
@@ -137,6 +159,9 @@ pub enum Answer {
         identity: Nullable<ProcessStartIdentity>,
         /// The background class the process runs its model under.
         background: Background,
+        /// How the process's memory ceiling is enforced: `sampler` when the daemon's own reading
+        /// of the process ends it past the ceiling, and nothing the platform enforces besides.
+        ceiling: String,
     },
     /// The model is loaded.
     Loaded {
@@ -176,6 +201,24 @@ pub enum Answer {
         /// What the process said, when it said anything.
         detail: Nullable<String>,
     },
+    /// A file was checked.
+    Verified {
+        /// The check's identifier.
+        id: U64,
+        /// How it came out.
+        result: VerifyResult,
+        /// What the process said, when it said anything.
+        detail: Nullable<String>,
+    },
+    /// The control thread has read a cancellation of this work, which is still running.
+    ///
+    /// It says the process is listening, and nothing about when the work will stop: the work's own
+    /// answer says that. A process whose control thread does not say it has read a cancellation is
+    /// one that is not reading.
+    Cancelling {
+        /// The work being cancelled.
+        id: U64,
+    },
 }
 
 impl Answer {
@@ -187,7 +230,9 @@ impl Answer {
             Self::Loaded { id, .. }
             | Self::LoadEnded { id, .. }
             | Self::Produced { id, .. }
-            | Self::Ended { id, .. } => Some(id.get()),
+            | Self::Ended { id, .. }
+            | Self::Verified { id, .. }
+            | Self::Cancelling { id } => Some(id.get()),
         }
     }
 }
@@ -281,6 +326,42 @@ impl JobEnd {
             Self::NotLoaded => "not_loaded",
             Self::Refused => "refused",
             Self::Failed => "failed",
+        }
+    }
+}
+
+/// How the check of one file came out.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyResult {
+    /// The file is the one the profile records: its size and its digest.
+    Verified,
+    /// The file is not the one the profile records.
+    Mismatch,
+    /// The file could not be read.
+    Unreadable,
+    /// The check was cancelled.
+    Cancelled,
+    /// The check passed its deadline.
+    DeadlineExceeded,
+    /// The process would not check it: a profile or a file its catalogue does not hold, or more
+    /// work waiting than it holds.
+    Refused,
+}
+
+impl VerifyResult {
+    /// Returns the stable name this result is reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Mismatch => "mismatch",
+            Self::Unreadable => "unreadable",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Refused => "refused",
         }
     }
 }
