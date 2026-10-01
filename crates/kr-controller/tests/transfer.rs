@@ -1776,3 +1776,177 @@ async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_deriv
         &host.root().join("daemon.log"),
     );
 }
+
+/// What a transfer mutation that has passed the daemon's own check meets once it is inside the
+/// service: the admission it arrived under lapses in the place the service takes its own lock and
+/// opens its own transaction, which the daemon's check cannot cover.
+#[derive(Clone, Copy, Debug)]
+enum Lapse {
+    /// This host comes to owe a fence it could not raise.
+    AFence,
+    /// The authority the mutation arrived under is withdrawn.
+    TheRegistration,
+}
+
+impl Lapse {
+    /// Brings the lapse about, returning what has to be undone when the test ends.
+    async fn happens(self, host: &Host) -> Option<rusqlite::Connection> {
+        match self {
+            Self::AFence => {
+                Some(fence_support::owe_a_fence(&host.controller, &host.temp.environment()).await)
+            }
+            Self::TheRegistration => {
+                host.controller
+                    .revoke_authority()
+                    .await
+                    .expect("the authority is withdrawn");
+                None
+            }
+        }
+    }
+}
+
+/// Sends one mutation, stops it where it has passed the daemon's own check and not yet entered the
+/// service, lets `lapse` happen there, lets the mutation go on, and returns the answer it got.
+async fn mutated_through_a_lapse(
+    host: &Host,
+    control: &mut LocalClient,
+    lapse: Lapse,
+    method: Method,
+    params: &(impl serde::Serialize + Sync),
+) -> (std::result::Result<ParamsValue, ProtocolError>, ActionId) {
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let (arrived, release) = host.controller.transfer().pause_after_the_outer_check();
+    let (answer, registry) = tokio::join!(
+        control.mutate(
+            method,
+            action_id,
+            ActionTarget::environment(host.environment_id),
+            params
+        ),
+        async {
+            tokio::task::spawn_blocking(move || {
+                arrived.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await
+            .expect("the waiting thread finishes")
+            .expect("the mutation reaches the place it is stopped at");
+            let registry = lapse.happens(host).await;
+            release.send(()).expect("the mutation goes on");
+            registry
+        }
+    );
+    if let Some(registry) = registry {
+        fence_support::clear_the_fault(&registry);
+    }
+    (answer.expect("the call reaches the daemon"), action_id)
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: the transfer service asks the admission again where it begins a
+/// new effect, under its own lock, so a mutation whose admission lapses after the daemon's check and
+/// before the service's lock writes nothing. A draft is the effect here: neither a fence this host
+/// comes to owe nor a registration withdrawn in that interval lets it be created, and the refusal
+/// is not kept as the action's answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_whose_admission_lapses_before_the_services_lock_is_not_created() {
+    for lapse in [Lapse::AFence, Lapse::TheRegistration] {
+        let host = host().await;
+        let mut control = client(&host).await;
+        let params = DraftCreateParams {
+            environment_id: host.environment_id,
+            device_id: Nullable::null(),
+            session_id: Nullable::null(),
+            application_instance_id: Nullable::null(),
+            text: "admitted, then lapsed".to_owned(),
+        };
+        let (answer, _action) =
+            mutated_through_a_lapse(&host, &mut control, lapse, Method::DraftCreate, &params).await;
+        let refusal = failure(answer);
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{lapse:?}: {refusal:?}"
+        );
+        // The draft was not written, and nothing was kept for the action: the journal holds no
+        // draft and no retained answer, so the same action under an admission that stands is a
+        // first admission.
+        let journal = rusqlite::Connection::open(kr_transfer::staging::StagingArea::store_path(
+            &host.temp.environment(),
+        ))
+        .expect("opens the transfer journal");
+        let held = |table: &str| -> i64 {
+            journal
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("counts the rows")
+        };
+        assert_eq!(held("drafts"), 0, "{lapse:?}: no draft was written");
+        assert_eq!(
+            held("actions"),
+            0,
+            "{lapse:?}: nothing was kept for the action"
+        );
+        drop(journal);
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: the same for the first write of an upload, which is a file in the
+/// staging area: a mutation whose admission lapses between the daemon's check and the service's lock
+/// reserves nothing and leaves no staged file. The control: the same upload under an admission that
+/// stands is reserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_whose_admission_lapses_before_the_services_lock_reserves_nothing() {
+    for lapse in [Lapse::AFence, Lapse::TheRegistration] {
+        let host = host().await;
+        let mut control = client(&host).await;
+        let bytes = pattern(64);
+        let (answer, _action) = mutated_through_a_lapse(
+            &host,
+            &mut control,
+            lapse,
+            Method::UploadBegin,
+            &begin_params(&host, &bytes, "notes.bin"),
+        )
+        .await;
+        let refusal = failure(answer);
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{lapse:?}: {refusal:?}"
+        );
+        let service = host.controller.transfer().service();
+        assert_eq!(
+            service.staged_byte_len().expect("reads the staged total"),
+            0,
+            "{lapse:?}: nothing is reserved"
+        );
+        host.stop().await;
+    }
+
+    // The control: nothing lapses, and the upload is reserved.
+    let host = host().await;
+    let mut control = client(&host).await;
+    let bytes = pattern(64);
+    let begun = control
+        .mutate(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &begin_params(&host, &bytes, "notes.bin"),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("an upload under an admission that stands is reserved");
+    let begun: UploadBeginResult = typed(&begun);
+    assert_eq!(
+        host.controller
+            .transfer()
+            .service()
+            .staged_byte_len()
+            .expect("reads the staged total"),
+        begun.staged_byte_len.get()
+    );
+    host.stop().await;
+}

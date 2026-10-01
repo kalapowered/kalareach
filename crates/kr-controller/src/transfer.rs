@@ -102,6 +102,75 @@ pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
 pub struct TransferModule {
     service: Arc<TransferService>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Where this host's own tests stop a mutation that has passed the daemon's own check and not
+    /// yet entered the service, so that its admission can lapse there and the service's own question
+    /// is what refuses it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_outer_check: Arc<crate::attention::Pause>,
+}
+
+/// The admission one transfer mutation arrived under, as the transfer service asks about it.
+///
+/// Every answer is the check each service asks from inside the work a mutation has begun,
+/// [`Controller::check_registration`]: a fence this host owes and could not raise, then the
+/// connection's registration under the revision the mutation was admitted at, then the accepted
+/// deadline. The service asks it where the mutation begins an effect, with its own lock held, and
+/// runs each commit through [`Controller::under_registration`], so the connection table, which a
+/// withdrawal takes, is held from the check to the end of the commit. The refusal the check gave is
+/// kept, so that [`TransferModule::write`] can answer with it and not retain it.
+pub struct TransferAdmission {
+    controller: Arc<Controller>,
+    carried: crate::authority::AdmittedMutation,
+    refusal: std::sync::Mutex<Option<ProtocolError>>,
+}
+
+impl TransferAdmission {
+    pub(crate) fn new(
+        controller: Arc<Controller>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            controller,
+            carried,
+            refusal: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Asks the check, and keeps its refusal.
+    fn check(&self) -> std::result::Result<(), ProtocolError> {
+        self.controller
+            .check_registration(&self.carried)
+            .map_err(|error| self.refused(&error))
+    }
+
+    fn refused(&self, error: &ControllerError) -> ProtocolError {
+        let refusal = error.to_protocol_error();
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| refusal.clone());
+        refusal
+    }
+
+    /// The first refusal the check gave, when it gave one.
+    fn refusal(&self) -> Option<ProtocolError> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl kr_transfer::service::AdmissionHook for TransferAdmission {
+    fn ask(&self) -> std::result::Result<(), ProtocolError> {
+        self.check()
+    }
+
+    fn run(&self, commit: &mut dyn FnMut()) -> std::result::Result<(), ProtocolError> {
+        self.controller
+            .under_registration(&self.carried, commit)
+            .map_err(|error| self.refused(&error))
+    }
 }
 
 /// Where a test stops one sweep: where its store work begins, once the daemon has answered it.
@@ -163,7 +232,22 @@ impl TransferModule {
         Ok(Self {
             service: Arc::new(service),
             tasks: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
+            after_the_outer_check: Arc::new(crate::attention::Pause::default()),
         })
+    }
+
+    /// Arms the pause a mutation stops at once it has passed the daemon's own check, before it
+    /// enters the transfer service. Returns the end that says the mutation has arrived, and the end
+    /// that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_outer_check(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_the_outer_check.arm()
     }
 
     /// Returns the service itself.
@@ -290,16 +374,13 @@ impl TransferModule {
     ///
     /// `admission` is as [`Self::write`].
     #[must_use]
-    pub async fn write_frame<A>(
+    pub(crate) async fn write_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        admission: A,
-    ) -> ControlFrame
-    where
-        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
-    {
+        admission: Arc<TransferAdmission>,
+    ) -> ControlFrame {
         frame(
             mutation.request_id,
             self.write(actor_id, mutation, method, admission).await,
@@ -412,22 +493,21 @@ impl TransferModule {
     ///
     /// `admission` is the daemon's answer to whether the admission the mutation was accepted under
     /// still stands. It is asked inside the blocking work, once no retained record has answered
-    /// and immediately before the action, the way the project service asks it.
+    /// and immediately before the action, the way the project service asks it; and the service asks
+    /// it again, inside its own lock, at each place the mutation begins an effect and around each
+    /// commit that makes one durable ([`TransferAdmission`]).
     ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code, or the admission's
     /// refusal.
-    pub async fn write<A>(
+    pub(crate) async fn write(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        admission: A,
-    ) -> Answer<ParamsValue>
-    where
-        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
-    {
+        admission: Arc<TransferAdmission>,
+    ) -> Answer<ParamsValue> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let service = Arc::clone(&self.service);
@@ -435,6 +515,8 @@ impl TransferModule {
         let params = mutation.params.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
+        #[cfg(feature = "testing")]
+        let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         blocking(move || {
             if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
                 return match retained {
@@ -457,9 +539,11 @@ impl TransferModule {
             // withdrawn or replaced, or after its deadline. The refusal is not retained, so the
             // same action submitted again under a window that still stands is decided again. A
             // retry of a completed action never reaches this, because the record above answered
-            // it. What this does not cover is the service's own lock and transaction, which each
-            // action takes inside the call below.
-            admission()?;
+            // it. The service asks again inside its own lock and around each commit, because
+            // taking the lock and opening the transaction wait as well.
+            admission.check()?;
+            #[cfg(feature = "testing")]
+            after_the_outer_check.wait();
             // The action this mutation is performed under. The three methods whose idempotency is
             // their own identifier commit it beside the state they change, which is what makes a
             // crash between the mutation and its record impossible.
@@ -468,6 +552,7 @@ impl TransferModule {
                 action_id,
                 method: name.to_owned(),
                 payload_digest: digest,
+                admission: kr_transfer::service::Admission::new(admission.clone()),
             };
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // retention below instead of returning from the task. An action whose failure was not
@@ -510,6 +595,13 @@ impl TransferModule {
                     )),
                 }
             })();
+            // An admission that no longer stood where the service asked it wrote nothing, and what
+            // it says is about this attempt: it is the answer to this call and is not retained, so
+            // the same action under an admission that stands is decided as a first admission.
+            if let Some(refusal) = admission.refusal() {
+                debug_assert!(outcome.is_err(), "a refused admission performed the action");
+                return Err(refusal);
+            }
             // The outcome is retained before it is returned, so the reply and the record cannot
             // disagree about what happened. The three methods above recorded their own inside
             // their transaction; this insert leaves an existing row alone and covers the rest.
