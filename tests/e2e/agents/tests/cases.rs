@@ -1021,24 +1021,19 @@ fn confine_holds(stage: &Stage<'_, '_>) {
 }
 
 /// How many requests for a conversation's title the agent made during the part, as far as it shows
-/// them: the lines its log gained that name a failed request, and the run's conversations whose
-/// own record says their title came from a request. Each is a request to the agent's model that no
-/// submission of the part made. Read before the run's sessions are removed.
-fn confine_titles(
-    confinement: &Confinement,
-    setup: &Setup,
-    data: &Path,
-    bucket: &Path,
-) -> Result<u64, String> {
+/// them: the lines of the run's own conversations' logs that name a request that failed, and the
+/// run's conversations whose own record says a request titled them. Each is a request to the agent's
+/// model that no submission of the part made. Read before the run's sessions are removed.
+fn confine_titles(confinement: &Confinement, bucket: &Path) -> Result<u64, String> {
     let titles = &confinement.title_requests;
-    let in_log = confine::count_marks(data, &titles.logs, &titles.log_mark)?;
+    let failed = confine::count_marks(bucket, &titles.logs, &titles.log_mark)?;
     let generated = confine::titled_conversations(
         bucket,
         &titles.state_file,
         &titles.state_key,
         &titles.state_value,
     )?;
-    Ok(in_log.saturating_sub(setup.log_titles_before) + generated)
+    Ok(failed + generated)
 }
 
 /// What a confined part's search found, made before anything of the run is cleaned up: the strings
@@ -1208,7 +1203,7 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
                 .load(std::sync::atomic::Ordering::SeqCst)
         }),
         wire: confine::wire_prompts(&bucket),
-        titles: confine_titles(confinement, setup, &data, &bucket),
+        titles: confine_titles(confinement, &bucket),
         values,
     })
 }
@@ -1405,8 +1400,10 @@ fn confine_close(
             json!({ "charged": charged })
         }
     };
-    // A request for a conversation's title is a request to the agent's model that no submission
-    // of the part made: each is charged as a turn, beyond the limit where need be.
+    // A request for a conversation's title is a request to the agent's model that no submission of
+    // the part made: each is charged as a turn, beyond the limit where need be, and since the part
+    // reserved turns for its own submissions alone, the part stops: the pinned terminal makes none,
+    // so one that is seen is a path nobody has looked at.
     let titles = match &searched.titles {
         Ok(count) => {
             if *count > 0 {
@@ -1418,18 +1415,16 @@ fn confine_close(
                         *count,
                     )
                     .map_or_else(
-                        |why| {
-                            stop.push((
-                                "uncharged_turns",
-                                format!("the requests for a title could not be charged: {why}"),
-                            ));
-                            "not charged".to_owned()
-                        },
+                        |why| format!("the ledger could not be written: {why}"),
                         |total| format!("the ledger now says {total} spent"),
                     );
-                eprintln!(
-                    "the agent made {count} request(s) for a conversation's title, charged as turns ({said})"
-                );
+                stop.push((
+                    "uncharged_turns",
+                    format!(
+                        "the agent made {count} request(s) for a conversation's title, which the \
+                         part did not reserve turns for; charged as turns ({said})"
+                    ),
+                ));
             }
             *count
         }
@@ -1706,6 +1701,7 @@ fn confine_checks(stage: &Stage<'_, '_>, logged: &mut Logged) {
     // digit typed on its own is text, and Ctrl-U clears what was typed. (The approval keys and
     // Ctrl-S act on a dialog and a queued prompt, which only a turn makes.)
     let probe = format!("kr-zk-{token}");
+    logged.no_dialog_now(stage, "before the keyboard probe");
     logged.type_text(stage, &probe);
     logged.type_text(stage, "1");
     let typed = logged
@@ -1944,7 +1940,6 @@ fn staged(
                 &confinement.data,
                 &confinement.provider,
                 &confinement.servers,
-                &confinement.title_requests,
             )
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
             account.guarded.extend(setup.other_logins.iter().cloned());
@@ -3447,7 +3442,10 @@ impl Logged {
         // A launch that resumes a saved conversation runs none of the checks: an earlier launch of
         // the part showed the same sandbox, proxy and files, and a shell line typed now would go
         // into the conversation the part resumes.
-        let resumes = !extra.is_empty();
+        let resumes = account
+            .resume
+            .first()
+            .is_some_and(|word| extra.first() == Some(word));
         if resumes {
             if stage
                 .login

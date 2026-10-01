@@ -382,28 +382,39 @@ pub fn wire_prompts(bucket: &Path) -> Result<WirePrompts, String> {
     Ok(counts)
 }
 
-/// How many lines of the agent's log files hold `mark`, a missing file counting none: the log of the
-/// requests the agent made for a conversation's title that failed, which it writes by this word.
+/// How many lines hold `mark` in the `files` (relative to each conversation) of every conversation
+/// of `bucket`, the run's directory of sessions, a missing file counting none: the conversation's own
+/// log of the requests the agent made for its title that failed. A bucket that is not there holds
+/// none.
 ///
 /// # Errors
 ///
-/// Returns why a file that is there could not be read: the count is then not known.
-pub fn count_marks(data: &Path, logs: &[String], mark: &str) -> Result<u64, String> {
+/// Returns why a directory or a file that is there could not be read: the count is then not known.
+pub fn count_marks(bucket: &Path, files: &[String], mark: &str) -> Result<u64, String> {
+    let sessions = match std::fs::read_dir(bucket) {
+        Ok(sessions) => sessions,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("the run's sessions cannot be listed: {error}")),
+    };
     let mut count = 0;
-    for relative in logs {
-        let bytes = match std::fs::read(data.join(relative)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "the agent's log {relative} cannot be read: {error}"
-                ));
-            }
-        };
-        count += String::from_utf8_lossy(&bytes)
-            .lines()
-            .filter(|line| line.contains(mark))
-            .count() as u64;
+    for session in sessions {
+        let session =
+            session.map_err(|error| format!("the run's sessions cannot be listed: {error}"))?;
+        for relative in files {
+            let bytes = match std::fs::read(session.path().join(relative)) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "a conversation's {relative} cannot be read: {error}"
+                    ));
+                }
+            };
+            count += String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| line.contains(mark))
+                .count() as u64;
+        }
     }
     Ok(count)
 }
@@ -452,6 +463,17 @@ pub fn titled_conversations(
         }
     }
     Ok(count)
+}
+
+/// Whether a string of a login's files can be held out of a part's result by replacing it: it holds
+/// no quote, brace, bracket or backslash and no control character, which the text of a result is made
+/// of. A string that holds one could be part of the result's own words and syntax, which cannot be
+/// written without it; the part is then not run, before any turn.
+#[must_use]
+pub fn searchable(string: &str) -> bool {
+    !string.chars().any(|character| {
+        character.is_control() || matches!(character, '{' | '}' | '[' | ']' | '"' | '\\')
+    })
 }
 
 /// How many characters a string of a login's files has at least to be searched for: shorter ones
@@ -587,6 +609,13 @@ pub fn login_strings(data: &Path) -> Result<Vec<String>, String> {
     values.dedup();
     if values.is_empty() {
         return Err("no login file or configuration of the person's holds a string".to_owned());
+    }
+    if values.iter().any(|value| !searchable(value)) {
+        return Err(
+            "a string of the login's files holds a quote, a brace, a bracket, a backslash or a \
+             control character, so a result of the part could not be kept clear of it"
+                .to_owned(),
+        );
     }
     Ok(values)
 }
@@ -785,9 +814,6 @@ pub struct Setup {
     /// The credentials files of every other slot, and the files of the OAuth directory, relative to
     /// the person's home: none may change.
     pub other_logins: Vec<String>,
-    /// How many lines of the agent's log named a failed request for a title before the part: those
-    /// the part's own requests add to are counted after it.
-    pub log_titles_before: u64,
 }
 
 impl Setup {
@@ -801,7 +827,6 @@ impl Setup {
         data: &str,
         provider: &str,
         servers: &crate::build::ProjectServers,
-        titles: &crate::build::TitleRequests,
     ) -> Result<Self, String> {
         let directory = person.join(data);
         let read = |relative: &str| {
@@ -843,7 +868,6 @@ impl Setup {
             servers: names,
             secrets,
             other_logins,
-            log_titles_before: count_marks(&directory, &titles.logs, &titles.log_mark)?,
         })
     }
 }
@@ -1403,32 +1427,13 @@ mod tests {
     }
 
     #[test]
-    fn the_requests_for_a_title_are_the_log_lines_that_name_one_and_the_conversations_titled() {
+    fn the_requests_for_a_title_are_the_failed_lines_of_the_conversations_logs_and_the_conversations_titled()
+     {
         let data = std::env::temp_dir().join(format!("kr-confine-title-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(data.join("logs")).expect("logs");
-        let logs = ["logs/a.log".to_owned(), "logs/a.log.1".to_owned()];
-        // No log yet counts none.
-        assert_eq!(count_marks(&data, &logs, "chat_title"), Ok(0));
-        std::fs::write(
-            data.join("logs/a.log"),
-            "info start\ndebug chat_title request failed: HTTP 500\ninfo chat_titled is not it\n",
-        )
-        .expect("write");
-        std::fs::write(
-            data.join("logs/a.log.1"),
-            "debug chat_title request unavailable: x\ndebug chat_title request failed: y\n",
-        )
-        .expect("write");
-        assert_eq!(
-            count_marks(&data, &logs, "chat_title"),
-            Ok(4),
-            "each line that holds the mark, in every file of the log"
-        );
-        // A log that cannot be read is a count that is not known.
-        std::fs::remove_file(data.join("logs/a.log.1")).expect("remove");
-        std::fs::create_dir(data.join("logs/a.log.1")).expect("a directory is no log");
-        assert!(count_marks(&data, &logs, "chat_title").is_err());
         let bucket = data.join("sessions/wd_x_0");
+        let files = ["logs/a.log".to_owned(), "logs/a.log.1".to_owned()];
+        // No bucket yet holds none.
+        assert_eq!(count_marks(&bucket, &files, "title request failed"), Ok(0));
         for (name, state) in [
             (
                 "session_a",
@@ -1437,10 +1442,25 @@ mod tests {
             ("session_b", "{\"titleKind\": \"replaceable\"}"),
             ("session_c", "{\"titleKind\":\"generated\"}"),
         ] {
-            std::fs::create_dir_all(bucket.join(name)).expect("session");
+            std::fs::create_dir_all(bucket.join(name).join("logs")).expect("session");
             std::fs::write(bucket.join(name).join("state.json"), state).expect("state");
         }
-        std::fs::create_dir_all(bucket.join("session_d")).expect("a session with no state yet");
+        std::fs::create_dir_all(bucket.join("session_d")).expect("a session with no files yet");
+        std::fs::write(
+            bucket.join("session_a/logs/a.log"),
+            "info start\ndebug title request failed: HTTP 500\ndebug title request unavailable: no token\n",
+        )
+        .expect("write");
+        std::fs::write(
+            bucket.join("session_c/logs/a.log.1"),
+            "debug title request failed: x\ndebug title request failed: y\n",
+        )
+        .expect("write");
+        assert_eq!(
+            count_marks(&bucket, &files, "title request failed"),
+            Ok(3),
+            "each line that holds the mark in each conversation's files; a request that never went out is none"
+        );
         assert_eq!(
             titled_conversations(&bucket, "state.json", "titleKind", "generated"),
             Ok(2)
@@ -1455,10 +1475,71 @@ mod tests {
             Ok(0),
             "a bucket that is not there holds none"
         );
+        // A log that cannot be read, and a state that is not JSON, are counts that are not known.
+        std::fs::create_dir(bucket.join("session_d/logs")).expect("logs");
+        std::fs::create_dir(bucket.join("session_d/logs/a.log")).expect("a directory is no log");
+        assert!(count_marks(&bucket, &files, "title request failed").is_err());
         std::fs::write(bucket.join("session_d/state.json"), "{ oops").expect("state");
         assert!(
             titled_conversations(&bucket, "state.json", "titleKind", "generated").is_err(),
             "a state that is not JSON is a count that is not known"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_string_the_results_own_text_could_hold_is_not_one_a_part_can_be_run_against() {
+        // The text of a result is made of quotes, braces, brackets, backslashes and its own words; a
+        // string of the login's files that holds one of these cannot be kept out of it.
+        for held in [
+            "abc\"def-0123456789",
+            "{\"part\":\"3\"",
+            "a]b-0123456789abcdef",
+            "abc\\def-0123456789",
+            "abc\ndef-0123456789xyz",
+        ] {
+            assert!(!searchable(held), "{held:?}");
+        }
+        for fine in [
+            "sk-0123456789abcdefghij",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            "https://auth.example/oauth/token",
+            "kimi-code offline_access",
+        ] {
+            assert!(searchable(fine), "{fine:?}");
+        }
+        // Read from the files, so the part is not started against a string it could not clear.
+        let data = std::env::temp_dir().join(format!("kr-confine-punct-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(data.join("credentials")).expect("directories");
+        std::fs::write(data.join("config.toml"), "default_model = \"x\"\n").expect("write");
+        std::fs::write(
+            data.join("credentials/a.json"),
+            r#"{"access":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","note":"has \"a quote\" in a value of the file"}"#,
+        )
+        .expect("write");
+        let refused = login_strings(&data).expect_err("a quote in a string of the files");
+        assert!(
+            !refused.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                && !refused.contains("in a value of the file"),
+            "what the files hold is not printed"
+        );
+        std::fs::write(
+            data.join("credentials/a.json"),
+            r#"{"access":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","n":1}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            login_strings(&data),
+            Ok(vec!["ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned()])
+        );
+        std::fs::write(
+            data.join("config.toml"),
+            "api_key = 'abc{d-0123456789abcdef'\n",
+        )
+        .expect("write");
+        assert!(
+            login_strings(&data).is_err(),
+            "a brace in a key of the configuration"
         );
         let _ = std::fs::remove_dir_all(&data);
     }

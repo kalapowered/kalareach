@@ -468,9 +468,9 @@ pub struct Confinement {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleRequests {
-    /// The word a line of the agent's log holds for a request that failed.
+    /// The words a line of a conversation's own log holds for a request that went out and failed.
     pub log_mark: String,
-    /// The files of that log and its rotations, relative to the data directory.
+    /// The files of that log and its rotations, relative to each conversation's directory.
     pub logs: Vec<String>,
     /// The file of each conversation that records its title, relative to the conversation's directory.
     pub state_file: String,
@@ -483,15 +483,21 @@ pub struct TitleRequests {
 impl Confinement {
     /// Why the paths the build list names in the data directory are not safe, where they are not:
     /// each must lie inside the directory and none may hold a credential. The paths whose rewrite
-    /// is only reported are recorded by their size, time and digest alone, and the log files are
-    /// read for a word.
+    /// is only reported are recorded by their size, time and digest alone, and the files of each
+    /// conversation that are read for a word or a member lie inside it.
     ///
     /// # Errors
     ///
     /// Returns the first path that is absolute, climbs out of the directory, is the directory
     /// itself, or lies in or holds a credential's directory.
     pub fn check_paths(&self) -> Result<(), String> {
-        for path in self.reported.iter().chain(&self.title_requests.logs) {
+        let titles = &self.title_requests;
+        for path in self
+            .reported
+            .iter()
+            .chain(&titles.logs)
+            .chain(std::iter::once(&titles.state_file))
+        {
             let parts: Vec<&str> = path.split('/').collect();
             if path.is_empty()
                 || path.starts_with('/')
@@ -1016,7 +1022,7 @@ mod tests {
 
     #[test]
     fn a_path_the_build_list_names_lies_inside_the_data_directory_and_holds_no_credential() {
-        let confinement = |reported: &[&str], logs: &[&str]| -> Confinement {
+        let confinement = |reported: &[&str], logs: &[&str], state: &str| -> Confinement {
             serde_json::from_value(serde_json::json!({
                 "profile": "/p.sb", "data": ".agent", "variable": "HOME_VARIABLE",
                 "hosts": ["api.example"], "proxy_variables": ["HTTPS_PROXY"],
@@ -1024,7 +1030,7 @@ mod tests {
                 "servers": {"source": "mcp.json", "member": "servers", "file": ".agent/mcp.json", "entry": {}},
                 "process_names": ["agent"], "unasked_tools": [], "reported": reported,
                 "title_requests": {
-                    "log_mark": "title", "logs": logs, "state_file": "state.json",
+                    "log_mark": "title", "logs": logs, "state_file": state,
                     "state_key": "kind", "state_value": "generated",
                 },
                 "residuals": ["a limit"],
@@ -1034,7 +1040,8 @@ mod tests {
         assert_eq!(
             confinement(
                 &["cache", "logs/agent.log", "sessions/.index-dirty"],
-                &["logs/agent.log", "logs/agent.log.1"]
+                &["logs/agent.log", "logs/agent.log.1"],
+                "state.json"
             )
             .check_paths(),
             Ok(())
@@ -1050,12 +1057,20 @@ mod tests {
             "oauth/key",
         ] {
             assert!(
-                confinement(&[bad], &[]).check_paths().is_err(),
+                confinement(&[bad], &[], "state.json")
+                    .check_paths()
+                    .is_err(),
                 "{bad:?} is not a path the build list may name"
             );
             assert!(
-                confinement(&[], &[bad]).check_paths().is_err(),
+                confinement(&[], &[bad], "state.json")
+                    .check_paths()
+                    .is_err(),
                 "{bad:?} is not a log the build list may name"
+            );
+            assert!(
+                confinement(&[], &[], bad).check_paths().is_err(),
+                "{bad:?} is not a state file the build list may name"
             );
         }
     }

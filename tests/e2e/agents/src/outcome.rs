@@ -263,8 +263,9 @@ impl Outcome {
     /// record says why the agent stops.
     ///
     /// Where what is left still holds one (a number's digits, or the part's own name), a result of
-    /// the part, its process numbers and the stop alone, in words shorter than any string searched
-    /// for, with the part and test named `?` where they are what holds one.
+    /// the part, its process numbers and the stop alone, then of the stop alone with the part and
+    /// test named `?`: that last form holds none of any string a search can be run for, which
+    /// [`crate::confine::searchable`] holds to a text no such string is part of.
     #[must_use]
     pub fn without(mut self, values: &[String]) -> Self {
         if !self.mentions(values) {
@@ -298,9 +299,12 @@ impl Outcome {
         if !kept.mentions(values) {
             return kept;
         }
-        let terminal = |part: &str, test: &str| {
+        // What is left holds one still: the part's name or the process numbers, or the digits of a
+        // number. The result then keeps what it can, the part and its process numbers first, so the
+        // harness can still read it, and the last form keeps nothing a string could be part of.
+        let terminal = |part: &str, test: &str, pids: Option<&Value>| {
             let mut evidence = json!({ "stop_agent": true });
-            if let (Some(pids), Some(evidence)) = (&pids, evidence.as_object_mut()) {
+            if let (Some(pids), Some(evidence)) = (pids, evidence.as_object_mut()) {
                 evidence.insert("provenance".to_owned(), json!({ "pids": pids }));
             }
             Self {
@@ -314,11 +318,16 @@ impl Outcome {
         };
         let part = if held(&kept.part) { "?" } else { &kept.part };
         let test = if held(&kept.test) { "?" } else { &kept.test };
-        let terminal_result = terminal(part, test);
-        if terminal_result.mentions(values) {
-            return terminal("?", "?");
+        for (part, test, pids) in [(part, test, pids.as_ref()), ("?", "?", pids.as_ref())] {
+            let result = terminal(part, test, pids);
+            if !result.mentions(values) {
+                return result;
+            }
         }
-        terminal_result
+        // Every string a search is run for ([`crate::confine::searchable`]) holds none of the quotes,
+        // braces and brackets this text is made of, and its longest run between them is shorter than
+        // any such string: none can be part of it.
+        terminal("?", "?", None)
     }
 
     /// Appends the line, and says so.
@@ -553,30 +562,44 @@ mod tests {
         assert_eq!(kept.part, "?");
         assert_eq!(kept.outcome, "failed");
         assert_eq!(kept.evidence["stop_agent"], true);
-        // The fixed words of such a result are shorter than any string a login's files give the
-        // searches, so none of them can hold one.
-        let vocabulary = [
-            SHORT,
-            "failed",
-            "stop_agent",
-            FAILURE_CODES,
-            "provenance",
-            "pids",
-            "agent_stops",
-            "secret_found",
-            "code",
-            "class",
-            "part",
-            "test",
-            "outcome",
-            "reason",
-            "evidence",
-        ];
-        assert!(
-            vocabulary
-                .iter()
-                .all(|word| word.chars().count() < crate::confine::SECRET_LENGTH)
+    }
+
+    #[test]
+    fn a_result_is_written_in_the_form_that_holds_none_and_the_last_form_holds_none_by_construction()
+     {
+        // Digits and commas are a string a search can be run for, and the process numbers are such
+        // a string: the result without the part's name and the process numbers is the last form.
+        let digits = "41,42,43,44,45,46".to_owned();
+        assert!(crate::confine::searchable(&digits));
+        let outcome = Outcome::passed(
+            "3",
+            "a test",
+            json!({ "provenance": { "pids": [41, 42, 43, 44, 45, 46, 47] }, "note": format!("x{digits}") }),
         );
+        let kept = outcome.without(std::slice::from_ref(&digits));
+        assert!(!kept.mentions(std::slice::from_ref(&digits)));
+        assert_eq!(kept.outcome, "failed");
+        assert_eq!(kept.part, "?");
+        assert_eq!(
+            kept.evidence,
+            json!({
+                "stop_agent": true,
+                "failure_codes": [{ "code": "agent_stops", "class": "secret_found" }],
+            })
+        );
+        // Every string a search can be run for lies inside one token of the last form's text or
+        // crosses a quote, a brace or a bracket, which the form is made of: so none can be part of
+        // it. This is the text; the longest run between such characters is shorter than the
+        // shortest string searched for.
+        let last = serde_json::to_string(&kept).expect("JSON");
+        let longest = last
+            .split(['{', '}', '[', ']', '"', '\\'])
+            .map(|run| run.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(longest < crate::confine::SECRET_LENGTH, "{last}");
+        let printed = format!("{}{}", kept.part, kept.reason.as_deref().unwrap_or(""));
+        assert!(printed.chars().count() < crate::confine::SECRET_LENGTH);
     }
 
     #[test]
