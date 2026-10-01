@@ -1238,6 +1238,22 @@ test.describe("the program's keyboard", () => {
     await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
   })
 
+  test("the harness strip's reset leaves no draft behind once the page has been reloaded", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`/harness.html?surface=ios&session=${SESSION}`)
+    const field = page.getByLabel('Message this session')
+    await field.fill('a draft the reset must remove')
+    await expect(field).toHaveValue('a draft the reset must remove')
+    // The page writes what it holds as it goes, so a reset that only cleared the store would be undone.
+    await page.locator('#kr-strip-toggle').click()
+    await Promise.all([page.waitForEvent('load'), page.locator('#kr-strip-reset').click()])
+    await expect(page.getByLabel('Message this session')).toHaveValue('')
+    // The reset is done once: what is typed after it is kept across another reload.
+    await page.getByLabel('Message this session').fill('a draft written after')
+    await page.reload()
+    await expect(page.getByLabel('Message this session')).toHaveValue('a draft written after')
+  })
+
   test("the phone's draft field moves on with Control-Tab and back with Control-Shift-Tab while the view watches", async ({
     page
   }) => {

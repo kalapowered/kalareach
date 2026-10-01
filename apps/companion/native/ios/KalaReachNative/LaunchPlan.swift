@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import UserNotifications
 
 /// One thing a launch does.
 enum LaunchAction: Equatable {
@@ -57,5 +58,20 @@ enum LaunchPlan {
             plan.append(.runDebugMode(mode))
         }
         return plan
+    }
+}
+
+extension PushPermission {
+    /// What the system's notification setting says about the person's answer.
+    ///
+    /// Read without asking: a provisional or ephemeral grant is a yes, and a setting this code does
+    /// not know is no answer yet, which waits rather than agrees.
+    init(status: UNAuthorizationStatus) {
+        switch status {
+        case .authorized, .provisional, .ephemeral: self = .granted
+        case .denied: self = .refused
+        case .notDetermined: self = .unknown
+        @unknown default: self = .unknown
+        }
     }
 }
