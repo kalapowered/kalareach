@@ -304,6 +304,14 @@ impl Controller {
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                // An SSH host is not a process bridge, and no request crosses ssh. Its helper is asked
+                // once who it is, which is how the host registers an identity and the channel the
+                // helper holds there.
+                if cached.enrolment.access == kr_protocol::identity::EnvironmentAccess::SshHost {
+                    return self
+                        .register_ssh(actor, bridged, cached, environment_id, now_ms)
+                        .await;
+                }
                 if !cached.enrolment.access.is_process_bridge() {
                     let connection = format!(
                         "{} is not reached by a process bridge, so none was opened",
@@ -419,6 +427,88 @@ impl Controller {
                 other.as_str()
             ))),
         }
+    }
+
+    /// Registers an SSH host's identity and scoped channel from its helper's own answer.
+    ///
+    /// The evidence belongs to the approved record that was read, and a refusal takes back what an
+    /// earlier answer established for that record, exactly as for a process bridge.
+    async fn register_ssh(
+        &self,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        bridged: bool,
+        cached: kr_protocol::identity::EnvironmentInventoryRow,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        now_ms: u64,
+    ) -> Result<ParamsValue> {
+        use kr_protocol::identity::EnvironmentRefreshResult;
+
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let reading = state_dir.clone();
+        let instance = tokio::task::spawn_blocking(move || {
+            crate::bridge::store::Store::with_locked(&reading, |store| {
+                store.instance_of(environment_id).ok_or_else(|| {
+                    ControllerError::supervision(format!(
+                        "this host has no approved record for environment {environment_id}"
+                    ))
+                })
+            })
+        })
+        .await
+        .map_err(|error| ControllerError::supervision(error.to_string()))??;
+        let opened_for = cached.enrolment.clone();
+        let mut row = cached;
+        let (verification, connection) = match crate::bridge::verify::through_identity_probe(
+            actor,
+            bridged,
+            &opened_for,
+            self.paths.environment_id(),
+            self.build_id.clone(),
+        )
+        .await
+        {
+            Ok(verification) => {
+                let outcome = record_outcome(
+                    &state_dir,
+                    environment_id,
+                    instance,
+                    crate::bridge::store::BridgeAnswer::Answered,
+                    now_ms,
+                )
+                .await?;
+                row.readiness = outcome.readiness;
+                let detail = if outcome.established {
+                    format!(
+                        "environment {} answered as {} on the helper installed there, over ssh; \
+                         no request crosses ssh",
+                        verification.environment_id, verification.os_user
+                    )
+                } else {
+                    "this environment's record changed while its helper was asked, so what \
+                     answered says nothing about what is recorded now"
+                        .to_owned()
+                };
+                (Nullable::some(verification), detail)
+            }
+            Err(refusal) => {
+                let outcome = record_outcome(
+                    &state_dir,
+                    environment_id,
+                    instance,
+                    crate::bridge::store::BridgeAnswer::Refused,
+                    now_ms,
+                )
+                .await?;
+                row.readiness = outcome.readiness;
+                (Nullable::null(), refusal.to_string())
+            }
+        };
+        encode(&EnvironmentRefreshResult {
+            row,
+            started: false,
+            verification,
+            connection,
+        })
     }
 
     pub(super) async fn host_doctor(self: &Arc<Self>) -> Result<HostDoctorResult> {

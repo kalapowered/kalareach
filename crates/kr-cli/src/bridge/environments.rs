@@ -83,29 +83,55 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         EnvironmentAccess::Container => resolve_container_target(&arguments.target)?,
         _ => arguments.target.clone(),
     };
-    let environment_id = match arguments.environment_id.as_deref() {
-        Some(text) => text.parse::<EnvironmentId>().map_err(|_| {
+    let named = match arguments.environment_id.as_deref() {
+        Some(text) => Some(text.parse::<EnvironmentId>().map_err(|_| {
             CliError::Usage(Shown::said(
                 "--environment-id takes an environment identifier, a UUID",
             ))
-        })?,
+        })?),
+        None => None,
+    };
+    let environment_id = match named {
+        Some(named) if !arguments.probe => named,
         // Asking a destination which environment it is means running the helper inside it, and
         // running anything inside a stopped environment starts it. Section 3 leaves starting to
         // refresh, create and attach, so a probe is asked for by name and is put only to an
-        // environment that is already running.
-        None if arguments.probe => {
-            probe_permitted(access_class, &target, &arguments.user, &arguments.helper)?;
-            query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
-                .await
-                .map_err(|error| {
-                    CliError::Usage(shown!(
-                        "the destination did not say which environment it is ({}); pass \
-                         --environment-id <uuid> instead",
-                        error
-                    ))
-                })?
+        // environment that is already running. An SSH host is asked through ssh, which starts
+        // nothing.
+        _ if arguments.probe => {
+            if access_class != EnvironmentAccess::SshHost {
+                probe_permitted(access_class, &target, &arguments.user, &arguments.helper)?;
+            }
+            let answered =
+                query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
+                    .await
+                    .map_err(|error| {
+                        CliError::Usage(shown!(
+                            "the destination did not say which environment it is ({}); pass \
+                             --environment-id <uuid> instead",
+                            error
+                        ))
+                    })?;
+            // A socket forwarded from here is answered by this host's own daemon, so an answer
+            // that is one of this host's own environments says nothing about the destination.
+            if resolve::environments(&paths)?
+                .iter()
+                .any(|known| known.environment_id == answered)
+            {
+                return Err(CliError::Usage(Shown::said(
+                    "the destination answered as one of this host's own environments, so it is \
+                     not another one; socket forwarding does not install the integration",
+                )));
+            }
+            if named.is_some_and(|named| named != answered) {
+                return Err(CliError::Usage(Shown::said(
+                    "the destination is a different environment from the one --environment-id \
+                     names",
+                )));
+            }
+            answered
         }
-        None => {
+        _ => {
             return Err(CliError::Usage(Shown::said(
                 "an enrolment records the environment's own identity: pass --environment-id \
                  <uuid>, or start the environment and pass --probe to ask it",
@@ -234,7 +260,7 @@ async fn query_helper_identity(
 ) -> std::result::Result<EnvironmentId, Shown> {
     // What the launch and the destination said is not repeated: it carries the target, the user
     // and whatever the destination wrote.
-    let command = kr_controller::bridge::launch::helper_command(access, target, user, helper)
+    let command = kr_controller::bridge::launch::identity_command(access, target, user, helper)
         .map_err(|_| Shown::said("the helper's command could not be built"))?;
     let hello = kr_protocol::identity::BridgeHello {
         protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
