@@ -400,10 +400,21 @@ impl DeliveryModule {
             push.preview_keys = push.preview_keys.rotated(key, revision, outstanding);
             #[cfg(feature = "testing")]
             self.key_write[0].wait();
-            admitted()?;
+            // Asked once the journal's write lock is held and everything the write reads has been
+            // read, so a wait for another writer counts against the admission too.
+            let mut refused = None;
             journal
-                .configure_destination(&record)
+                .configure_destination_if(&record, || match admitted() {
+                    Ok(()) => true,
+                    Err(refusal) => {
+                        refused = Some(refusal);
+                        false
+                    }
+                })
                 .map_err(unavailable)?;
+            if let Some(refusal) = refused {
+                return Err(refusal);
+            }
             #[cfg(feature = "testing")]
             self.key_write[1].wait();
             Ok(true)

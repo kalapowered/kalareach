@@ -1225,9 +1225,27 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn configure_destination(&mut self, record: &DestinationRecord) -> Result<()> {
+        self.configure_destination_if(record, || true).map(|_| ())
+    }
+
+    /// Writes down one configured destination as [`Self::configure_destination`] does, and asks
+    /// `admit` once the write lock is held and everything the write reads has been read: the
+    /// moment before the row is written, after every wait the write could have had. Returns whether
+    /// it wrote. When `admit` says no, nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn configure_destination_if(
+        &mut self,
+        record: &DestinationRecord,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Destination::Push(push) = &record.destination {
-            let conflict: Option<String> = self
-                .connection
+            let conflict: Option<String> = transaction
                 .query_row(
                     "SELECT destination_id FROM delivery_destinations
                      WHERE installation_id = ?1 AND destination_id != ?2",
@@ -1300,7 +1318,10 @@ impl DeliveryJournal {
                     .map(|stamp| stamp.as_str().to_owned()),
             ),
         };
-        self.connection.execute(
+        if !admit() {
+            return Ok(false);
+        }
+        transaction.execute(
             "INSERT INTO delivery_destinations
                  (destination_id, kind, enabled, configured_at_ms, rule_name, grant_id,
                   installation_id, sender_record_id, preview_key, preview_revision,
@@ -1349,7 +1370,8 @@ impl DeliveryJournal {
                 credential_stamp,
             ],
         )?;
-        Ok(())
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Records that one destination now sends with another stored credential.
@@ -5848,6 +5870,47 @@ mod tests {
             second.is_err(),
             "one underlying event and one destination is one notification"
         );
+    }
+
+    /// A destination is written only when the question asked once the write lock is held says so:
+    /// the question is asked with every other writer of the journal shut out, and a no writes
+    /// nothing. The control: a yes writes the record.
+    #[test]
+    fn a_destination_is_written_only_when_the_question_asked_under_the_write_lock_says_so() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let mut journal = DeliveryJournal::open(&path).expect("a journal");
+        let other = rusqlite::Connection::open(&path).expect("another writer");
+        other
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no wait");
+
+        for says in [true, false] {
+            let record = destination(if says { "yes" } else { "no" });
+            let mut asked = 0;
+            let wrote = journal
+                .configure_destination_if(&record, || {
+                    asked += 1;
+                    let shut_out = other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+                    assert!(
+                        shut_out.is_err(),
+                        "another writer cannot begin while the question is asked"
+                    );
+                    says
+                })
+                .expect("the write");
+            assert_eq!(asked, 1, "the question is asked once");
+            assert_eq!(wrote, says);
+            assert_eq!(
+                journal.destination(&record.id).expect("a read").is_some(),
+                says,
+                "a destination is recorded only when the question said yes"
+            );
+        }
+        // Nothing is left holding the lock after a no.
+        other
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("the write lock is free");
     }
 
     #[test]
