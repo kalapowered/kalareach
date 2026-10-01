@@ -1271,7 +1271,7 @@ mod tests {
             + shared_header
             + std::mem::size_of::<Vec<u8>>();
         assert!(
-            held <= EFFECT_RECORD_BYTES,
+            held < EFFECT_RECORD_BYTES,
             "a queued effect holds {held} bytes beside its own bytes, and {EFFECT_RECORD_BYTES} are \
              charged"
         );

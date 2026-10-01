@@ -8195,12 +8195,30 @@ mod tests {
         Arc<Mutex<kr_ipc::framed::FrameWriter>>,
         kr_ipc::framed::FrameReader,
     ) {
+        connected_with(None).await
+    }
+
+    /// A connection whose writing side holds `send_buffer` bytes at most, where the platform lets a
+    /// test say so (a Unix socket): the default is the host's own, which a test cannot rely on.
+    async fn connected_with(
+        send_buffer: Option<usize>,
+    ) -> (
+        kr_ipc::testing::TempHost,
+        Writing,
+        Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+        kr_ipc::framed::FrameReader,
+    ) {
         let temp = kr_ipc::testing::TempHost::create();
         let endpoint = temp
             .environment()
             .worker_endpoint(kr_protocol::session::DisplayNumber::new(9))
             .expect("an endpoint");
-        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds");
+        let listener = match send_buffer {
+            #[cfg(unix)]
+            Some(bytes) => kr_ipc::endpoint::Listener::bind_with_send_buffer(&endpoint, bytes),
+            _ => kr_ipc::endpoint::Listener::bind(&endpoint),
+        }
+        .expect("binds");
         let accepting = tokio::spawn(async move { listener.accept().await });
         let client = kr_ipc::endpoint::Connection::connect(&endpoint)
             .await
@@ -8749,7 +8767,23 @@ mod tests {
         Outlet,
         kr_ipc::framed::FrameReader,
     ) {
-        let (temp, writable, writer, reader) = connected().await;
+        an_outlet_over(connected().await)
+    }
+
+    fn an_outlet_over(
+        connection: (
+            kr_ipc::testing::TempHost,
+            Writing,
+            Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+            kr_ipc::framed::FrameReader,
+        ),
+    ) -> (
+        kr_ipc::testing::TempHost,
+        tokio::sync::oneshot::Sender<()>,
+        Outlet,
+        kr_ipc::framed::FrameReader,
+    ) {
+        let (temp, writable, writer, reader) = connection;
         let (subscription, replaced) = tokio::sync::oneshot::channel();
         let outlet = Outlet {
             writable,
@@ -8803,8 +8837,8 @@ mod tests {
                     let reported: kr_protocol::recovery::HistoryGap =
                         notification.payload.to_typed().expect("a gap");
                     assert_eq!(
-                        (reported.from_cursor.get(), reported.to_cursor.get()),
-                        (1, 3),
+                        reported,
+                        a_gap(),
                         "the gap says what was lost, and not where the screen was taken: {what}"
                     );
                 }
@@ -8908,13 +8942,20 @@ mod tests {
         }
     }
 
+    /// A Unix socket takes what fits and leaves the rest of a frame waiting, which a Windows pipe does
+    /// not (it takes each frame whole), so a delivery cut part way through a screen is arranged here
+    /// on Unix only; a delivery stopped on its first write is the case that holds on every platform.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_screen_stopped_after_its_first_frame_has_not_been_sent_the_beginning_of_its_stream()
     {
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
-        let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
-        // Four frames are more than a connection holds unread, so the delivery cannot finish before
-        // the peer has read and the withdrawal below has stopped it.
+        // The connection holds 4 KiB unread, far less than the three frames after the first, so the
+        // delivery cannot finish before the peer has read the first and the withdrawal below has
+        // stopped it, whatever the host's own socket buffer is.
+        let send_buffer = 4 * 1024;
+        let (_temp, _subscription, mut outlet, mut reader) =
+            an_outlet_over(connected_with(Some(send_buffer)).await);
         let screen = a_large_screen(4);
         let withdrawn = Arc::clone(&outlet.withdrawn);
         let mut sequence = 0_u64;
