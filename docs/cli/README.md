@@ -1248,11 +1248,14 @@ may hold beyond the default. Then the command sends the same request again, once
 proof, until the host spends the owner device's answer. The request carries a copy of the trust
 root, which is read from the file you name and never fetched from the repository itself. If the
 location has the `file:` scheme, the repository is added as a local repository, otherwise as a
-community repository. In both cases it uses the host's default budgets and no capability beyond the
-default. If no owner device answers before the challenge ends, the command exits with
-`OWNER_CONFIRMATION_REQUIRED` and says that nothing was changed. If the host has no owner device
-yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
-owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
+community repository. In both cases it asks for the budgets this host's configuration allows, which
+are the product's defaults unless the owner narrowed them, and for no capability beyond the default.
+If no owner device answers before the challenge ends, the command exits with
+`OWNER_CONFIRMATION_REQUIRED` and says that nothing was changed. A host that does not answer a
+request the command sent leaves the outcome unknown, and the command says so. If the host has no
+owner device yet, it says so at once and names `kr pair invite --owner`. A host that is not on the
+network has no owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart
+it.
 
 The second decision is an installation that may do more than the one it replaces or, with none to
 replace, more than its repository permits by itself, and every release that installs a native bridge
