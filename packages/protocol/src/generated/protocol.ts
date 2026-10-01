@@ -124,7 +124,7 @@ export type CommandBypassReason =
   | 'session_closing'
   | 'flags_conflict'
 /**
- * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
+ * Prompt or steering text carried inline. The normative bound is 65536 bytes of UTF-8; maxLength counts characters and is therefore a necessary rather than a sufficient condition.
  */
 export type PromptText = string
 /**
@@ -4334,7 +4334,7 @@ export interface AgentSnapshotEntry {
 export interface AgentSteerParams {
   target: AgentMutationTarget3
   /**
-   * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
+   * Prompt or steering text carried inline. The normative bound is 65536 bytes of UTF-8; maxLength counts characters and is therefore a necessary rather than a sufficient condition.
    */
   text: string
   /**
@@ -22263,7 +22263,7 @@ export interface RelayLeaseRevocation {
  */
 export interface RequestReviewParams {
   /**
-   * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
+   * Prompt or steering text carried inline. The normative bound is 65536 bytes of UTF-8; maxLength counts characters and is therefore a necessary rather than a sufficient condition.
    */
   instructions: string
   /**

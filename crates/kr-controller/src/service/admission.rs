@@ -151,7 +151,8 @@ impl Controller {
         // nothing here can admit a new one without it.
         if admission.deadline.is_none() {
             return Err(ControllerError::WindowExpired {
-                detail: "this action carries no freshness, so it may be answered from what this                          host holds and may not write"
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not write"
                     .to_owned(),
             });
         }

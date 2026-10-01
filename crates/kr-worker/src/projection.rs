@@ -1678,7 +1678,8 @@ mod projection_tests {
                 engine.resize(dimensions(2_048, 1_024)),
                 Err(WorkerError::InvalidArgument(_))
             ),
-            "and a geometry outside the cell count is the caller's mistake, which is a different              refusal"
+            "and a geometry outside the cell count is the caller's mistake, which is a different \
+             refusal"
         );
         assert_eq!(
             engine.canonical(),
