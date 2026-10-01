@@ -232,8 +232,12 @@ def scan_paths(paths, tracked):
         for path in files:
             if os.path.islink(path):
                 continue
-            with open(path, "rb") as handle:
-                data = handle.read()
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            except OSError as error:
+                found.append((path, f"was not inspected, because it cannot be read ({error.strerror})"))
+                continue
             found += scan_member(path, data, 0) if path.lower().endswith(ARCHIVE_SUFFIXES) \
                 else scan_bytes(path, data)
     return found
@@ -348,6 +352,22 @@ def self_test():
         found = scan_paths([clean_tar], False)
         if found:
             failures.append(f"the near misses in an archive were refused: {found}")
+
+    # A file that cannot be read is named as one that was not inspected, and never counted as clean.
+    if os.name == "posix" and os.geteuid() != 0:
+        with tempfile.TemporaryDirectory(prefix="kalareach-secrets-") as scratch:
+            hidden = os.path.join(scratch, "tree", "unreadable.bin")
+            os.makedirs(os.path.dirname(hidden))
+            with open(hidden, "wb") as handle:
+                handle.write(b"anything")
+            os.chmod(hidden, 0)
+            try:
+                found = scan_paths([os.path.dirname(hidden)], False)
+            except OSError as error:
+                found = None
+                failures.append(f"a file that cannot be read stopped the scan with {error!r}")
+            if found is not None and not any("not inspected" in what for _, what in found):
+                failures.append(f"a file that cannot be read was counted clean: {found}")
 
     # A document too large to read for a private JSON Web Key is refused and never counted as clean.
     global TEXT_LIMIT
