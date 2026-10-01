@@ -576,11 +576,11 @@ pub enum Change {
 const SEPARATOR_NOTE: &str = "# The file above did not end in a line break, so this entry began on a line of its own; \
                               `kr shell remove` takes that line break out again.";
 
-/// The block with the separator note as its second line.
-fn with_separator_note(body: &str) -> String {
+/// The block with the separator note as its second line, after the line `begin` that opens it.
+fn with_separator_note(body: &str, begin: &str) -> String {
     body.replacen(
-        &format!("{MARKER_BEGIN}\n"),
-        &format!("{MARKER_BEGIN}\n{SEPARATOR_NOTE}\n"),
+        &format!("{begin}\n"),
+        &format!("{begin}\n{SEPARATOR_NOTE}\n"),
         1,
     )
 }
@@ -699,31 +699,33 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
     let (begin, end) = placement.markers();
     let stripped = strip(existing, begin, end);
     let had_entry = stripped.is_some();
-    let theirs = stripped.as_ref().map_or_else(
-        || existing.to_owned(),
-        |(before, _block, after)| format!("{before}{after}"),
-    );
+    // What is placed again is the file as it was before the entry: an entry that is the last thing
+    // in it takes the line break it owns back out first.
+    let theirs = match &stripped {
+        Some((before, block, after)) if owns_separator(block) && after.is_empty() => {
+            before.strip_suffix('\n').unwrap_or(before).to_owned()
+        }
+        Some((before, _block, after)) => format!("{before}{after}"),
+        None => existing.to_owned(),
+    };
     let rebuilt = match placement {
         Placement::End => match stripped {
             Some((before, block, after)) => {
                 let body = if owns_separator(&block) {
-                    with_separator_note(body)
+                    with_separator_note(body, begin)
                 } else {
                     body.to_owned()
                 };
                 format!("{before}{body}{after}")
             }
-            None if !existing.is_empty() && !existing.ends_with('\n') => {
-                format!("{existing}\n{}", with_separator_note(body))
-            }
-            None => appended(existing, body),
+            None => appended(existing, body, begin),
         },
         Placement::AfterPrologue { shell } => {
             let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement)?;
             rebuilt
         }
         Placement::Last { .. } => {
-            let rebuilt = appended(&theirs, body);
+            let rebuilt = appended(&theirs, body, begin);
             checked(&theirs, &rebuilt, placement)?;
             rebuilt
         }
@@ -738,13 +740,15 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
 }
 
 /// Puts `body` after everything in a file, on a line of its own.
-fn appended(existing: &str, body: &str) -> String {
-    let mut rebuilt = existing.to_owned();
-    if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
-        rebuilt.push('\n');
+///
+/// A file that did not end in a line break is given one, and the entry owns it: the entry says so
+/// after the line `begin` that opens it, and the removal takes the break back with the entry.
+fn appended(existing: &str, body: &str, begin: &str) -> String {
+    if existing.is_empty() || existing.ends_with('\n') {
+        format!("{existing}{body}")
+    } else {
+        format!("{existing}\n{}", with_separator_note(body, begin))
     }
-    rebuilt.push_str(body);
-    rebuilt
 }
 
 /// Puts `body` into a PowerShell profile after the parts that have to stay first, at the point the
@@ -773,7 +777,7 @@ fn after_the_prologue(
     // that nothing but whitespace, a semicolon or a comment follows the prologue on it. This is an
     // entry added at the end, and it is added the way one is.
     let rebuilt = if rest.is_empty() && !head.is_empty() && !head.ends_with('\n') {
-        format!("{mark}{}", appended(head, body))
+        format!("{mark}{}", appended(head, body, placement.markers().0))
     } else {
         format!("{mark}{head}{body}{rest}")
     };
@@ -2845,7 +2849,7 @@ mod tests {
             );
         }
         // The control: nothing but whitespace, a semicolon or a comment after the prologue is the
-        // entry's to follow, and it goes on a line of its own.
+        // entry's to follow, and it goes on a line of its own, which is the entry's to take back.
         for (name, theirs) in [
             ("a comment after param", "param() # note"),
             ("a semicolon after using", "using namespace System;"),
@@ -2856,7 +2860,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!(
                 std::fs::read_to_string(&path).expect("reads"),
-                format!("{theirs}\n{body}"),
+                format!("{theirs}\n{}", with_separator_note(&body, MARKER_BEGIN)),
                 "{name}"
             );
         }
@@ -3417,6 +3421,65 @@ mod tests {
         }
     }
 
+    /// KR-REQ-26.05: a PowerShell profile that did not end in a line break is given back exactly.
+    ///
+    /// An entry that goes after a profile's last line, or directly below a prologue that is the
+    /// profile's last line, begins on a line of its own, and that line break is the entry's: the
+    /// removal takes it back with the entry. Where the person has written after the entry since,
+    /// the file is no longer the one that was there and the break stays.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_powershell_profile_with_no_final_line_break_is_given_back_exactly() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let first = root.path().join("profile.ps1");
+        let last = root.path().join("Microsoft.PowerShell_profile.ps1");
+        let targets = powershell_targets(&a_powershell(), first.clone(), last.clone());
+        let bodies = targets
+            .iter()
+            .map(|target| entry(target, package, false).expect("the path is text"))
+            .collect::<Vec<_>>();
+        // The entry that opens the bridge goes below a prologue that is the whole file, and the one
+        // that checks the reader goes after a statement that has no line end.
+        let cases = [
+            (&first, &targets[0], &bodies[0], "using namespace System"),
+            (&last, &targets[1], &bodies[1], "Read-Host 'name'"),
+        ];
+        for (path, target, body, theirs) in cases {
+            std::fs::write(path, theirs).expect("writes");
+            assert_eq!(
+                install(path, body, &target.placement).expect("installs"),
+                Change::Added
+            );
+            // Installing again keeps the entry, and the line break it took with it.
+            assert_eq!(
+                install(path, body, &target.placement).expect("installs again"),
+                Change::Unchanged
+            );
+            assert_eq!(remove(path).expect("removes"), Change::Removed);
+            assert_eq!(
+                std::fs::read_to_string(path).expect("reads"),
+                theirs,
+                "the profile came back different"
+            );
+
+            // The person wrote a line after the entry, so what was there before it is not at the end.
+            std::fs::write(path, theirs).expect("writes");
+            install(path, body, &target.placement).expect("installs");
+            let with_more = format!(
+                "{}$later = 1\n",
+                std::fs::read_to_string(path).expect("reads")
+            );
+            std::fs::write(path, with_more).expect("writes");
+            assert_eq!(remove(path).expect("removes"), Change::Removed);
+            assert_eq!(
+                std::fs::read_to_string(path).expect("reads"),
+                format!("{theirs}\n$later = 1\n")
+            );
+        }
+    }
+
     /// KR-REQ-07.23: a PowerShell entry goes directly below what PowerShell requires to come first,
     /// and removal gives the profile back byte for byte.
     ///
@@ -3496,7 +3559,7 @@ mod tests {
     }
 
     /// KR-REQ-07.23: a profile that is nothing but a prologue with no final line end gets its entry
-    /// the way any file does, on a line of its own.
+    /// the way any file does, on a line of its own that the entry owns.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
@@ -3509,7 +3572,10 @@ mod tests {
         install(&path, &body, &target.placement).expect("installs");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads"),
-            format!("using namespace System\n{body}")
+            format!(
+                "using namespace System\n{}",
+                with_separator_note(&body, MARKER_BEGIN)
+            )
         );
         assert!(holds_an_entry(&path));
     }
@@ -3673,10 +3739,13 @@ mod tests {
                  data=\"${{XDG_DATA_HOME:-$HOME/.local/share}}/powershell/Modules\"\n\
                  mkdir -p \"$cache\" \"$data\" && : > \"$cache/StartupProfileData-NonInteractive\"\n\
                  printf '%s\\n%s\\n' \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" > '{seen}'\n\
-                 printf '%s\\n' '{profile}'\n",
+                 printf '%s\\n%s\\n' '{all_hosts}' '{current_host}'\n",
                 home = home.display(),
                 seen = seen.display(),
-                profile = home.join(".config/powershell/profile.ps1").display(),
+                all_hosts = home.join(".config/powershell/profile.ps1").display(),
+                current_host = home
+                    .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+                    .display(),
             ),
         )
         .expect("writes the program's text");
@@ -3688,7 +3757,7 @@ mod tests {
             ..layout(&home)
         };
         let targets = asking.targets(ShellKind::PowerShell);
-        assert_eq!(targets.len(), 1, "the shell's answer is taken");
+        assert_eq!(targets.len(), 2, "the shell's answer is taken");
         assert_eq!(
             std::fs::read_dir(&home).expect("the home reads").count(),
             0,
