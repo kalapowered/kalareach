@@ -45,6 +45,42 @@ pub const RENEW_ROUTE: &str = "/api/push/sender/renew";
 /// past this is one this host does not trust.
 pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 
+/// The codes a gateway names a refusal by, which are the only words of a refusal this host
+/// repeats.
+///
+/// A gateway's own words are the gateway's, and one that repeats what it was sent repeats the
+/// bearer credential. So a refusal's body is read by the envelope decoder and never turned into
+/// text: a renewal's refusal is recorded by its status and, when it names one of these codes
+/// exactly, by that code, as this host's own constant. The list is the one the managed service
+/// client keeps for the same gateway's answers, which that crate does not export.
+const GATEWAY_CODES: [&str; 20] = [
+    "UNAUTHENTICATED",
+    "REAUTHENTICATION_REQUIRED",
+    "FORBIDDEN",
+    "RATE_LIMITED",
+    "QUOTA_EXHAUSTED",
+    "NOT_CONFIGURED",
+    "INTERNAL",
+    "INVALID_REQUEST",
+    "INVALID_ARGUMENT",
+    "NOT_FOUND",
+    "METHOD_NOT_ALLOWED",
+    "ID_CONFLICT",
+    "CONFLICT",
+    "REQUEST_FENCED",
+    "COLLECTION_ABSENT",
+    "KEY_EPOCH_RETIRED",
+    "SIGNED_BEFORE_CUTOFF",
+    "COLLECTION_DELETED",
+    "SERVICE_UNAVAILABLE",
+    "OUTCOME_UNKNOWN",
+];
+
+/// The code of [`GATEWAY_CODES`] that `named` is exactly, as this host's own constant.
+fn known_code(named: &str) -> Option<&'static str> {
+    GATEWAY_CODES.iter().copied().find(|code| *code == named)
+}
+
 /// The host key a sender authorisation is proven with.
 pub struct HostSigner {
     key: kr_crypto::keys::AuthorisationKeyPair,
@@ -276,7 +312,7 @@ fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result
         Ok(Envelope {
             error: Some(refusal),
             ..
-        }) => Err(match super::client::known_code(&refusal.code) {
+        }) => Err(match known_code(&refusal.code) {
             Some(code) => format!(
                 "the gateway refused the renewal ({}, {code})",
                 answer.status

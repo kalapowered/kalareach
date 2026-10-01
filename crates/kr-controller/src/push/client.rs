@@ -35,40 +35,6 @@ use crate::error::{ControllerError, Result};
 /// The route a delivery is presented on.
 pub const DELIVER_ROUTE: &str = "/api/push/deliver";
 
-/// The codes a gateway names a refusal by, which are the only words of an answer this host repeats.
-///
-/// A gateway's own words are the gateway's, and one that repeats what it was sent repeats the
-/// bearer credential. So an answer's body is read by the envelope decoder and never turned into
-/// text: a refusal is recorded by its status and, when it names one of these codes exactly, by
-/// that code, as this host's own constant.
-pub const GATEWAY_CODES: [&str; 20] = [
-    "UNAUTHENTICATED",
-    "REAUTHENTICATION_REQUIRED",
-    "FORBIDDEN",
-    "RATE_LIMITED",
-    "QUOTA_EXHAUSTED",
-    "NOT_CONFIGURED",
-    "INTERNAL",
-    "INVALID_REQUEST",
-    "INVALID_ARGUMENT",
-    "NOT_FOUND",
-    "METHOD_NOT_ALLOWED",
-    "ID_CONFLICT",
-    "CONFLICT",
-    "REQUEST_FENCED",
-    "COLLECTION_ABSENT",
-    "KEY_EPOCH_RETIRED",
-    "SIGNED_BEFORE_CUTOFF",
-    "COLLECTION_DELETED",
-    "SERVICE_UNAVAILABLE",
-    "OUTCOME_UNKNOWN",
-];
-
-/// The code of [`GATEWAY_CODES`] that `named` is exactly, as this host's own constant.
-pub(super) fn known_code(named: &str) -> Option<&'static str> {
-    GATEWAY_CODES.iter().copied().find(|code| *code == named)
-}
-
 /// The most bytes this client reads from an answer.
 ///
 /// An acknowledgement is a few hundred bytes. An answer past this reached the host, so whatever

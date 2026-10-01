@@ -5610,7 +5610,7 @@ fn an_organisation_delivery_rule_admits_its_bound_recipient_with_a_live_lease() 
 
 // ----- What a gateway says never reaches a record or a log -------------------------------------
 
-/// The directory the child run of the echo test reads and writes.
+/// The directory the child run of the log test reads and writes.
 const ECHO_DIR: &str = "KR_TEST_GATEWAY_ECHO_DIR";
 
 /// A phrase no record or log of this host may ever hold, which the gateway puts in its answers
@@ -5754,7 +5754,22 @@ async fn the_runtime_against_a_gateway_that_repeats_the_bearer() {
                 DeliveryState::Admitted | DeliveryState::InFlight
             )
         });
+        // The refusal of a renewal is written down by the attempt after the one that was
+        // refused, which is due a moment later, so this waits for that record.
+        let renewal_recorded = produced.iter().any(|id| {
+            module
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .delivery(*id)
+                        .expect("a read")
+                        .and_then(|record| record.detail)
+                        .is_some_and(|detail| detail.contains("refused the renewal")))
+                })
+                .expect("a read")
+        });
         if attempted
+            && renewal_recorded
             && ["status 403", "renew 403"]
                 .iter()
                 .all(|seen| echoed.contains(&(*seen).to_owned()))
@@ -5777,16 +5792,26 @@ async fn the_runtime_against_a_gateway_that_repeats_the_bearer() {
     // The runtime and the module are let go here, which closes the journal.
 }
 
-/// KR-REQ-23.20, KR-REQ-16.12: what a gateway answers is read by the decoder and never turned
-/// into text. A gateway that answers a delivery 401, 403, 429, 500 and 302, a renewal and a
-/// question about an outcome nobody knows with a body that repeats the bearer and its own words
-/// leaves neither in the outcomes, the journal's files, or the log of the process that ran the
-/// deliveries. The control: the gateway did answer every one of those, with the bearer in it.
+/// KR-REQ-16.12: what a gateway answers is read by the decoder and never turned into text. A
+/// gateway that answers a delivery 401, 403, 429, 500 and 302, a renewal and a question about an
+/// outcome nobody knows with a body that repeats the bearer and its own words leaves neither in
+/// the journal's files nor in the log of the process that ran the deliveries. The controls: the
+/// gateway did answer every one of those, with the bearer in it, and the journal does hold this
+/// host's own account of a refused credential and of a refused renewal, so a scan that finds
+/// nothing is a scan of records that were written. A question's answer is not written down at all
+/// (a refused question leaves the record as it was), so that leg is a control and no more.
 #[test]
 fn a_gateway_that_repeats_the_bearer_leaves_it_out_of_the_journal_and_the_log() {
     let directory = tempfile::tempdir().expect("a directory");
-    let program = std::env::current_exe().expect("this test program");
-    let ran = std::process::Command::new(program)
+    // The child runs from a copy on the internal disk and from a directory there, as every
+    // process this suite launches does.
+    let program = directory.path().join("push-test-program");
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test program"),
+        &program,
+    );
+    let ran = std::process::Command::new(&program)
+        .current_dir(directory.path())
         .args([
             "--ignored",
             "--exact",
@@ -5828,26 +5853,43 @@ fn a_gateway_that_repeats_the_bearer_leaves_it_out_of_the_journal_and_the_log() 
         "the 500 and the 302 are outcomes nobody knows: {outcome}"
     );
 
+    let journal: Vec<(&str, Vec<u8>)> = [
+        "delivery.sqlite3",
+        "delivery.sqlite3-wal",
+        "delivery.sqlite3-shm",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::fs::read(directory.path().join(name))
+            .ok()
+            .map(|bytes| (name, bytes))
+    })
+    .collect();
+    assert!(
+        journal.iter().any(|(name, _)| *name == "delivery.sqlite3"),
+        "the journal is where the child was told to keep it"
+    );
+    let holds = |bytes: &[u8], text: &str| {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    };
+    for host_words in [
+        "the gateway refused the credential (401)",
+        "refused the renewal",
+    ] {
+        assert!(
+            journal.iter().any(|(_, bytes)| holds(bytes, host_words)),
+            "the journal holds this host's own words, {host_words}"
+        );
+    }
     for secret in [bearer.as_str(), GATEWAY_WORDS] {
         assert!(
             !log.contains(secret),
             "the process's log holds {secret}: {log}"
         );
-        for name in [
-            "delivery.sqlite3",
-            "delivery.sqlite3-wal",
-            "delivery.sqlite3-shm",
-        ] {
-            let path = directory.path().join(name);
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            assert!(
-                !bytes
-                    .windows(secret.len())
-                    .any(|window| window == secret.as_bytes()),
-                "{name} holds {secret}"
-            );
+        for (name, bytes) in &journal {
+            assert!(!holds(bytes, secret), "{name} holds {secret}");
         }
     }
 }
