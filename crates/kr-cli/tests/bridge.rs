@@ -74,6 +74,8 @@ struct Helper {
     child: Child,
     input: std::process::ChildStdin,
     output: std::process::ChildStdout,
+    /// Set once the helper has been waited for, which is what stops its watchdog.
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Helper {
@@ -102,11 +104,31 @@ impl Helper {
             .expect("the bridge helper starts");
         let input = child.stdin.take().expect("its standard input");
         let output = child.stdout.take().expect("its standard output");
+        // A read that waits for a frame the helper will never write would hold this suite for good.
+        // The helper is this test's own child and is not collected until `done` is set, so its
+        // number is still its own when the watchdog ends it.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watched = std::sync::Arc::clone(&done);
+        let pid = child.id();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(90));
+            if !watched.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        });
         Self {
             child,
             input,
             output,
+            done,
         }
+    }
+
+    /// Says the helper is about to be collected, so the watchdog leaves its number alone.
+    fn disarm(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Writes one bridge frame to the helper.
@@ -139,6 +161,7 @@ impl Helper {
 
     /// Ends the helper's input and waits for it, returning its exit code and standard error.
     fn finish(mut self) -> (Option<i32>, String) {
+        self.disarm();
         drop(self.input);
         let mut diagnostics = String::new();
         if let Some(mut stderr) = self.child.stderr.take() {
@@ -851,6 +874,7 @@ fn a_helper_exits_without_hanging_when_input_remains_open_after_refusal() {
     // Note: helper.input is NOT dropped yet. The helper process must terminate without
     // hanging even though the input pipe remains open.
     let (tx, rx) = std::sync::mpsc::channel();
+    helper.disarm();
     let mut child = helper.child;
     let waiter = std::thread::spawn(move || {
         let status = child.wait().expect("child finishes");
