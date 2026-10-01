@@ -28,8 +28,9 @@ use std::time::Duration;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
-    CLOCK_PURPOSE, ConfirmationDisplay, DescribedAction, OwnerConfirmationCompleteParams,
-    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, PendingConfirmation,
+    CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
+    OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
+    OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -205,6 +206,12 @@ pub enum Subject {
     },
     /// Trusting the host's clock again.
     EstablishClock,
+    /// Adopting a repository's trust root, as the host's catalogue described the enrolment: the
+    /// plan whose digest this device recomputed from what it shows.
+    CatalogueAdd(CatalogueTrustPlan),
+    /// Installing a release with a grant, as the host's catalogue described the installation: the
+    /// plan whose digest this device recomputed from what it shows.
+    PluginInstall(PluginInstallPlan),
     /// An action its caller described by class, rights and digest only.
     Described(DescribedAction),
 }
@@ -226,6 +233,8 @@ impl std::fmt::Debug for Subject {
                 .debug_struct("ConfirmDevice")
                 .finish_non_exhaustive(),
             Self::EstablishClock => formatter.write_str("EstablishClock"),
+            Self::CatalogueAdd(_) => formatter.write_str("CatalogueAdd(..)"),
+            Self::PluginInstall(_) => formatter.write_str("PluginInstall(..)"),
             Self::Described(_) => formatter.write_str("Described(..)"),
         }
     }
@@ -360,11 +369,31 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
             rights(&described.destination_rights)?;
             Ok(Subject::Described(described.clone()))
         }
-        // This app describes an invitation, a device and the clock, and a challenge a caller
-        // described. What a repository's root or an installation would authorise it cannot show
-        // in its prompt, and a device that cannot show what it would authorise refuses it.
-        ConfirmationDisplay::CatalogueAdd { .. } | ConfirmationDisplay::PluginInstall { .. } => {
-            Err(CannotCheck::CannotShow)
+        ConfirmationDisplay::CatalogueAdd { .. } => {
+            expect(SensitiveAction::TrustRepositoryRoot)?;
+            // The plan is built again from what the person is shown, so a host that shows one
+            // enrolment and asks for the confirmation of another is found here.
+            let plan =
+                CatalogueTrustPlan::of_display(&pending.display).ok_or(CannotCheck::Unreadable)?;
+            let digest = plan.action_digest().map_err(|_| CannotCheck::Unreadable)?;
+            if digest != request.action_digest {
+                return Err(CannotCheck::DigestMismatch);
+            }
+            no_destination()?;
+            rights(&kr_protocol::scalars::CanonicalSet::new())?;
+            Ok(Subject::CatalogueAdd(plan))
+        }
+        ConfirmationDisplay::PluginInstall { .. } => {
+            expect(SensitiveAction::GrantExecutableCapability)?;
+            let plan =
+                PluginInstallPlan::of_display(&pending.display).ok_or(CannotCheck::Unreadable)?;
+            let digest = plan.action_digest().map_err(|_| CannotCheck::Unreadable)?;
+            if digest != request.action_digest {
+                return Err(CannotCheck::DigestMismatch);
+            }
+            no_destination()?;
+            rights(&kr_protocol::scalars::CanonicalSet::new())?;
+            Ok(Subject::PluginInstall(plan))
         }
     }
 }
@@ -477,6 +506,38 @@ fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
     }
 }
 
+/// Where a repository's metadata is served from.
+enum Location {
+    /// A named host.
+    Host(String),
+    /// A folder on the host's own machine.
+    Folder,
+    /// An address this prompt cannot name.
+    Unknown,
+}
+
+/// Where the repository at `metadata_url` is served from, in the words a prompt uses.
+fn location(metadata_url: &str) -> Location {
+    match url::Url::parse(metadata_url) {
+        Ok(url) if url.scheme() == "file" => Location::Folder,
+        Ok(url) => url
+            .host_str()
+            .map_or(Location::Unknown, |name| Location::Host(name.to_owned())),
+        Err(_) => Location::Unknown,
+    }
+}
+
+/// The first eight characters of a hash a host reports, grouped as a verification value is, or
+/// `None` when it is not a hash as a host writes one: sixty-four lower-case hexadecimal
+/// characters.
+fn hash_start(hash: &str) -> Option<String> {
+    (hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| group_verification_value(&hash[..8]))
+}
+
 /// True for a verification value as a host computes it: eight lower-case hexadecimal characters.
 fn is_verification_value(value: &str) -> bool {
     value.len() == kr_protocol::pairing::VERIFICATION_VALUE_LEN
@@ -541,6 +602,50 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 shows_value(&group_verification_value(&candidate.verification_value))
             ),
             Subject::EstablishClock => format!("trust the clock of {host} again"),
+            Subject::CatalogueAdd(plan) => {
+                let served = match location(&plan.metadata_url) {
+                    Location::Host(name) => shown(&name, names + 20),
+                    Location::Folder => "a folder on that host".to_owned(),
+                    Location::Unknown => return Err(CannotCheck::CannotShow),
+                };
+                let root = hash_start(&plan.root_digest).ok_or(CannotCheck::CannotShow)?;
+                let may = match plan.ceiling.len() {
+                    0 => "its packages may hold nothing beyond the default".to_owned(),
+                    1 => "its packages may hold 1 capability beyond the default".to_owned(),
+                    more => format!("its packages may hold {more} capabilities beyond the default"),
+                };
+                format!(
+                    "trust the plugin repository {} on {host}, served from {served}: its root \
+                     starts {root}, and {may}",
+                    shown(&plan.catalogue_id, names)
+                )
+            }
+            Subject::PluginInstall(plan) => {
+                let package = hash_start(&plan.package_digest).ok_or(CannotCheck::CannotShow)?;
+                let bridge = plan.grant_statement.is_some()
+                    || plan.grant.contains(&"native_bridge.install".to_owned());
+                let granting = match (plan.grant.len(), bridge) {
+                    (0, false) => "nothing beyond what the repository allows".to_owned(),
+                    (0, true) => "a native bridge that runs outside the plugin sandbox".to_owned(),
+                    (1, false) => "1 capability".to_owned(),
+                    (more, false) => format!("{more} capabilities"),
+                    (1, true) => {
+                        "1 capability, a native bridge that runs outside the plugin sandbox"
+                            .to_owned()
+                    }
+                    (more, true) => format!(
+                        "{more} capabilities, among them a native bridge that runs outside the \
+                         plugin sandbox"
+                    ),
+                };
+                format!(
+                    "install {} {} from {} on {host}, granting {granting}; package starts \
+                     {package}",
+                    shown(plan.plugin_id.as_str(), names),
+                    shown(&plan.version, names),
+                    shown(&plan.catalogue_id, names)
+                )
+            }
             Subject::Described(described) => {
                 let action = match described.action {
                     SensitiveAction::EnlargeGrant => "widen what devices may do",
@@ -569,13 +674,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
         };
         // Every part of the line is fixed text, a checked value or a name `shown` cleaned, so a
         // character a dialog must not show here is a fault: no line is better than a wrong one.
-        if text
-            .chars()
-            .any(|character| character.is_control() || invisible(character))
-            || text
-                .chars()
-                .any(|character| character.is_whitespace() && character != ' ')
-        {
+        if !is_plain_text(&text) {
             return Err(CannotCheck::CannotShow);
         }
         if text.chars().count() <= MAX_REASON_CHARS {
@@ -602,6 +701,21 @@ const fn platform(platform: DevicePlatform) -> &'static str {
         DevicePlatform::Ios => "iOS",
         DevicePlatform::Android => "Android",
     }
+}
+
+/// True when `text` is one line a person reads as it is written: no control character, no
+/// character that reorders or hides text, and no white space but the space.
+///
+/// What a host or a publisher wrote is shown as it is or not at all, never cleaned into words it
+/// did not write.
+#[must_use]
+pub fn is_plain_text(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|character| character.is_control() || invisible(character))
+        && !text
+            .chars()
+            .any(|character| character.is_whitespace() && character != ' ')
 }
 
 /// True for a character that reorders or hides text, which a dialog's line leaves out.
@@ -997,6 +1111,420 @@ mod tests {
             line.contains("type in terminals and view sessions"),
             "{line}"
         );
+    }
+
+    /// The host a device is paired with.
+    fn paired_host() -> PairedHost {
+        let host_keys = DeviceKeys::generate().expect("keys").public_keys();
+        PairedHost {
+            host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            host_key_revision: DeviceKeyRevision::new(1),
+            host_endpoint_id: host_keys.transport,
+            host_keys,
+            network_config: NetworkConfig::empty(),
+            device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
+            grant_id: GrantId::new(Uuid::from_bytes([3; 16])),
+            proposed_grant: grant(&[ActionRight::HostManage], GrantExpiry::Never),
+            name: Some("studio".to_owned()),
+            paired_at_ms: NOW,
+        }
+    }
+
+    /// The challenge a host issues for an action with `digest`: no destination, no rights.
+    fn challenge_for(
+        host: &PairedHost,
+        action: SensitiveAction,
+        digest: Digest256,
+    ) -> OwnerConfirmationRequest {
+        OwnerConfirmationRequest {
+            confirmation_id: ConfirmationId::new(Uuid::from_bytes([4; 16])),
+            action,
+            action_digest: digest,
+            destination_keys: Nullable::null(),
+            destination_rights: CanonicalSet::new(),
+            host_device_id: host.host_device_id,
+            host_endpoint_id: host.host_endpoint_id,
+            nonce: Nonce256::from_bytes([6; 32]),
+            expires_at_ms: TimestampMs::new(NOW + 60_000),
+        }
+    }
+
+    fn environment() -> kr_protocol::ids::EnvironmentId {
+        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([8; 16]))
+    }
+
+    /// The enrolment a host describes: a community repository, its root and what it may do.
+    fn trust_plan() -> CatalogueTrustPlan {
+        use kr_protocol::catalogue::{CatalogueAddParams, CatalogueBudgets, CatalogueKind};
+        use kr_protocol::scalars::U64;
+        let params = CatalogueAddParams {
+            environment_id: environment(),
+            catalogue_id: "community".to_owned(),
+            kind: CatalogueKind::Community,
+            metadata_url: "https://repo.example/metadata/".to_owned(),
+            targets_url: "https://repo.example/targets/".to_owned(),
+            root: "cm9vdA==".to_owned(),
+            budgets: CatalogueBudgets {
+                metadata_bytes: U64::new(67_108_864),
+                metadata_entries: U64::new(100_000),
+                retained_generations: U64::new(2),
+                retained_metadata_bytes: U64::new(268_435_456),
+                payload_cache_bytes: U64::new(2_147_483_648),
+                full_offline_mirror: false,
+            },
+            ceiling: vec!["terminal.stream".to_owned()],
+            owner_confirmation: Nullable::null(),
+        };
+        CatalogueTrustPlan::of_request(
+            &params,
+            "1a2b3c4d".repeat(8),
+            ["key-one".to_owned(), "key-two".to_owned()]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// The installation a host describes: a release with a native bridge and what it grants.
+    fn install_plan() -> PluginInstallPlan {
+        PluginInstallPlan {
+            environment_id: environment(),
+            catalogue_id: "community".to_owned(),
+            ceiling: ["metadata.match".to_owned()].into_iter().collect(),
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+                .expect("a plugin identifier"),
+            version: "0.3.0".to_owned(),
+            package_digest: "e5f60718".repeat(8),
+            grant: [
+                "approval.respond".to_owned(),
+                "native_bridge.install".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            grant_statement: Some(
+                "Adds one registration file in Claude Code's directory.".to_owned(),
+            ),
+        }
+    }
+
+    fn pending_for(
+        host: &PairedHost,
+        action: SensitiveAction,
+        digest: Digest256,
+        display: ConfirmationDisplay,
+    ) -> PendingConfirmation {
+        PendingConfirmation {
+            request: challenge_for(host, action, digest),
+            display,
+            answered: false,
+        }
+    }
+
+    /// KR-REQ-11.42, KR-REQ-10.05: an owner device shows what a host describes of an enrolment or
+    /// an installation, builds the plan again from it, and takes the challenge only when the
+    /// digest it recomputes is the one the host issued: what the person is shown is what the
+    /// confirmation covers.
+    #[test]
+    fn what_a_host_describes_of_an_enrolment_and_an_installation_is_checked_against_its_digest() {
+        let host = paired_host();
+        let trust = trust_plan();
+        let pending = pending_for(
+            &host,
+            SensitiveAction::TrustRepositoryRoot,
+            trust.action_digest().expect("a digest"),
+            trust.display(),
+        );
+        assert_eq!(
+            check(&pending, &host),
+            Ok(Subject::CatalogueAdd(trust.clone())),
+            "an enrolment the host describes"
+        );
+
+        let install = install_plan();
+        let pending = pending_for(
+            &host,
+            SensitiveAction::GrantExecutableCapability,
+            install.action_digest().expect("a digest"),
+            install.display(),
+        );
+        assert_eq!(
+            check(&pending, &host),
+            Ok(Subject::PluginInstall(install)),
+            "an installation the host describes"
+        );
+    }
+
+    /// A change to one member of a plan, named for what it changes.
+    type Edits<P> = Vec<(&'static str, Box<dyn Fn(&mut P)>)>;
+
+    /// KR-REQ-11.42, KR-REQ-10.05: a challenge whose digest covers something other than what the
+    /// display shows is refused, whichever member of the display differs. The control is the
+    /// display the digest covers.
+    #[test]
+    fn a_display_that_differs_from_its_digest_in_any_member_is_refused() {
+        let host = paired_host();
+        let trust = trust_plan();
+        let confirmed = trust.action_digest().expect("a digest");
+        let edits: Edits<CatalogueTrustPlan> = vec![
+            (
+                "the environment",
+                Box::new(|plan| {
+                    plan.environment_id =
+                        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]))
+                }),
+            ),
+            (
+                "the name",
+                Box::new(|plan| "elsewhere".clone_into(&mut plan.catalogue_id)),
+            ),
+            (
+                "the kind",
+                Box::new(|plan| plan.kind = kr_protocol::catalogue::CatalogueKind::Official),
+            ),
+            (
+                "the metadata location",
+                Box::new(|plan| {
+                    "https://other.example/metadata/".clone_into(&mut plan.metadata_url)
+                }),
+            ),
+            (
+                "the targets location",
+                Box::new(|plan| "https://other.example/targets/".clone_into(&mut plan.targets_url)),
+            ),
+            (
+                "the root",
+                Box::new(|plan| plan.root_digest = "ffff0000".repeat(8)),
+            ),
+            (
+                "the root's keys",
+                Box::new(|plan| {
+                    plan.root_key_ids.insert("key-three".to_owned());
+                }),
+            ),
+            (
+                "a budget",
+                Box::new(|plan| {
+                    plan.budgets.payload_cache_bytes = kr_protocol::scalars::U64::new(1)
+                }),
+            ),
+            (
+                "the offline mirror",
+                Box::new(|plan| plan.budgets.full_offline_mirror = true),
+            ),
+            (
+                "the ceiling",
+                Box::new(|plan| {
+                    plan.ceiling.insert("native_bridge.install".to_owned());
+                }),
+            ),
+        ];
+        for (name, edit) in &edits {
+            let mut shown = trust.clone();
+            edit(&mut shown);
+            assert_ne!(shown, trust, "{name}: the edit changes the plan");
+            let pending = pending_for(
+                &host,
+                SensitiveAction::TrustRepositoryRoot,
+                confirmed,
+                shown.display(),
+            );
+            assert_eq!(
+                check(&pending, &host),
+                Err(CannotCheck::DigestMismatch),
+                "{name}"
+            );
+        }
+
+        let install = install_plan();
+        let confirmed = install.action_digest().expect("a digest");
+        let edits: Edits<PluginInstallPlan> = vec![
+            (
+                "the environment",
+                Box::new(|plan| {
+                    plan.environment_id =
+                        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]))
+                }),
+            ),
+            (
+                "the repository",
+                Box::new(|plan| "wide".clone_into(&mut plan.catalogue_id)),
+            ),
+            (
+                "the repository's ceiling",
+                Box::new(|plan| {
+                    plan.ceiling.insert("terminal.stream".to_owned());
+                }),
+            ),
+            (
+                "the package",
+                Box::new(|plan| {
+                    plan.plugin_id =
+                        kr_protocol::ids::PluginId::new("kalareach/other").expect("an identifier")
+                }),
+            ),
+            (
+                "the release",
+                Box::new(|plan| "0.4.0".clone_into(&mut plan.version)),
+            ),
+            (
+                "the package hash",
+                Box::new(|plan| plan.package_digest = "00000000".repeat(8)),
+            ),
+            (
+                "the grant",
+                Box::new(|plan| {
+                    plan.grant.insert("upstream.action".to_owned());
+                }),
+            ),
+            (
+                "the publisher's statement",
+                Box::new(|plan| plan.grant_statement = Some("Does something else.".to_owned())),
+            ),
+            ("no statement", Box::new(|plan| plan.grant_statement = None)),
+        ];
+        for (name, edit) in &edits {
+            let mut shown = install.clone();
+            edit(&mut shown);
+            assert_ne!(shown, install, "{name}: the edit changes the plan");
+            let pending = pending_for(
+                &host,
+                SensitiveAction::GrantExecutableCapability,
+                confirmed,
+                shown.display(),
+            );
+            assert_eq!(
+                check(&pending, &host),
+                Err(CannotCheck::DigestMismatch),
+                "{name}"
+            );
+        }
+    }
+
+    /// KR-REQ-10.05: a display is checked against the kind of action it would authorise, the host
+    /// it is for, and the destination and rights the challenge carries, which an enrolment and an
+    /// installation have none of.
+    #[test]
+    fn an_enrolment_or_an_installation_is_refused_for_another_action_host_destination_or_rights() {
+        let host = paired_host();
+        let trust = trust_plan();
+        let digest = trust.action_digest().expect("a digest");
+        let asked = |action, edit: &dyn Fn(&mut PendingConfirmation)| {
+            let mut pending = pending_for(&host, action, digest, trust.display());
+            edit(&mut pending);
+            check(&pending, &host)
+        };
+        assert!(matches!(
+            asked(SensitiveAction::TrustRepositoryRoot, &|_| {}),
+            Ok(Subject::CatalogueAdd(_))
+        ));
+        assert_eq!(
+            asked(SensitiveAction::GrantExecutableCapability, &|_| {}),
+            Err(CannotCheck::ActionMismatch),
+            "an enrolment is not an installation"
+        );
+        assert_eq!(
+            asked(SensitiveAction::TrustRepositoryRoot, &|pending| {
+                pending.request.host_device_id = DeviceId::new(Uuid::from_bytes([42; 16]));
+            }),
+            Err(CannotCheck::AnotherHost)
+        );
+        assert_eq!(
+            asked(SensitiveAction::TrustRepositoryRoot, &|pending| {
+                pending.request.destination_keys =
+                    Nullable::some(DeviceKeys::generate().expect("keys").public_keys());
+            }),
+            Err(CannotCheck::Destination)
+        );
+        assert_eq!(
+            asked(SensitiveAction::TrustRepositoryRoot, &|pending| {
+                pending.request.destination_rights =
+                    [ActionRight::SessionView].into_iter().collect();
+            }),
+            Err(CannotCheck::Rights)
+        );
+
+        // A host that lists a set out of its canonical order has not followed the definition.
+        let install = install_plan();
+        let mut display = install.display();
+        if let ConfirmationDisplay::PluginInstall { grant, .. } = &mut display {
+            grant.reverse();
+        }
+        let pending = pending_for(
+            &host,
+            SensitiveAction::GrantExecutableCapability,
+            install.action_digest().expect("a digest"),
+            display,
+        );
+        assert_eq!(check(&pending, &host), Err(CannotCheck::Unreadable));
+    }
+
+    /// KR-REQ-11.42: the dialog's line names what an enrolment and an installation authorise: the
+    /// repository and where it is served from, the first characters of the root or package hash
+    /// the page shows in full, the capabilities, and for a native bridge that it runs outside the
+    /// plugin sandbox. It is one line whatever the names, and a hash that is not a hash has no
+    /// line.
+    #[test]
+    fn a_reason_for_an_enrolment_and_an_installation_names_what_each_authorises() {
+        let trust = Subject::CatalogueAdd(trust_plan());
+        assert_eq!(
+            reason(&trust, "studio", NOW).expect("a line"),
+            "trust the plugin repository community on studio, served from repo.example: its \
+             root starts 1a2b 3c4d, and its packages may hold 1 capability beyond the default"
+        );
+        let nothing_more = Subject::CatalogueAdd(CatalogueTrustPlan {
+            ceiling: CanonicalSet::new(),
+            metadata_url: "file:///srv/community/metadata/".to_owned(),
+            ..trust_plan()
+        });
+        assert_eq!(
+            reason(&nothing_more, "studio", NOW).expect("a line"),
+            "trust the plugin repository community on studio, served from a folder on that \
+             host: its root starts 1a2b 3c4d, and its packages may hold nothing beyond the \
+             default"
+        );
+
+        let install = Subject::PluginInstall(install_plan());
+        assert_eq!(
+            reason(&install, "studio", NOW).expect("a line"),
+            "install kalareach/claude-code 0.3.0 from community on studio, granting 2 \
+             capabilities, among them a native bridge that runs outside the plugin sandbox; \
+             package starts e5f6 0718"
+        );
+        let plain = Subject::PluginInstall(PluginInstallPlan {
+            grant: CanonicalSet::new(),
+            grant_statement: None,
+            ..install_plan()
+        });
+        assert_eq!(
+            reason(&plain, "studio", NOW).expect("a line"),
+            "install kalareach/claude-code 0.3.0 from community on studio, granting nothing \
+             beyond what the repository allows; package starts e5f6 0718"
+        );
+
+        let hostile = Subject::PluginInstall(PluginInstallPlan {
+            catalogue_id: "com\u{2028}mu\u{202E}nity\n".repeat(20),
+            ..install_plan()
+        });
+        let line = reason(&hostile, &"h\u{2029}".repeat(60), NOW).expect("a line");
+        assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
+        assert!(
+            line.contains("runs outside the plugin sandbox"),
+            "authority is never shortened away: {line}"
+        );
+        for hidden_character in ['\n', '\u{2028}', '\u{2029}', '\u{202E}'] {
+            assert!(!line.contains(hidden_character), "{line:?}");
+        }
+
+        for broken in ["", "not a hash", &"G".repeat(64), &"a".repeat(63)] {
+            let subject = Subject::CatalogueAdd(CatalogueTrustPlan {
+                root_digest: (*broken).to_owned(),
+                ..trust_plan()
+            });
+            assert_eq!(
+                reason(&subject, "studio", NOW),
+                Err(CannotCheck::CannotShow),
+                "{broken:?}"
+            );
+        }
     }
 
     /// An owner channel over a listing a test writes, which counts what is sent.
