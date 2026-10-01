@@ -58,19 +58,14 @@ final class PushRegistration: NSObject {
     /// answered, and goes on only once they have agreed. Called again for a token that changes.
     var onTokenUsable: ((Data) -> Void)?
 
-    /// The registration token Firebase most recently offered, counted or not.
-    private var offeredToken: String?
-
-    /// The registration token this device can be reached at.
+    /// Whether Firebase has been given this device's APNs token, which is what a registration token
+    /// needs before it can be asked for: one made earlier was made for an APNs token that may since
+    /// have changed, and a message sent to it cannot be delivered. Withdrawn when the person takes
+    /// their agreement back and when the system refuses to register; given again with a new token.
     ///
-    /// Firebase can offer one before the system's APNs token has been mapped to it, and a message
-    /// sent to a token made for another APNs token cannot be delivered. So it is held until an APNs
-    /// token is here, is dropped when the APNs token changes, since Firebase then makes a new one,
-    /// and is taken away if the system refuses to register.
-    var fcmToken: String? {
-        if case .registered = state { return offeredToken }
-        return nil
-    }
+    /// Nothing here keeps a registration token. The one a message is sent to is asked of Firebase
+    /// when this is true, so it is always made for the APNs token that is current.
+    private(set) var tokenHandedToFirebase = false
 
     /// Asks for permission and, if it is given, for a token.
     ///
@@ -94,30 +89,28 @@ final class PushRegistration: NSObject {
     /// Records where the person's answer stands, however it was learnt.
     func permissionKnown(_ answer: PushPermission) {
         permission = answer
+        if answer != .granted { tokenHandedToFirebase = false }
         offerTokenToFirebase()
     }
 
     /// Records the token the system produced.
     func registered(deviceToken: Data) {
-        if let earlier = apnsToken, earlier != deviceToken { offeredToken = nil }
         apnsToken = deviceToken
+        tokenHandedToFirebase = false
         state = .registered(token: deviceToken.map { String(format: "%02x", $0) }.joined())
         offerTokenToFirebase()
     }
 
     private func offerTokenToFirebase() {
-        guard permission == .granted, let token = apnsToken else { return }
-        onTokenUsable?(token)
-    }
-
-    /// Records the registration token Firebase offered, or that it has none.
-    func fcmTokenReceived(_ token: String?) {
-        offeredToken = token
+        guard permission == .granted, let token = apnsToken, let hand = onTokenUsable else { return }
+        hand(token)
+        tokenHandedToFirebase = true
     }
 
     /// Records why the system would not register this device.
     func failed(with error: Error) {
         apnsToken = nil
+        tokenHandedToFirebase = false
         state = .failed(reason: error.localizedDescription)
     }
 }
