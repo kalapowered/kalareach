@@ -9,7 +9,7 @@ use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Outcome
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
-use kr_protocol::ids::{ActorId, ConnectionId, RequestId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, RequestId};
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
@@ -37,6 +37,19 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Controller {
+    /// Arms the pause a retry stops at once it has found its retained answer, before the
+    /// admission it arrived under is asked again. Returns the end that says the retry has
+    /// arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_retained_lookup(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_the_retained_lookup.arm()
+    }
+
     /// Answers an action this daemon has already admitted for this caller, if it has.
     ///
     /// The de-duplication key is the actor and the action together, and the payload digest decides
@@ -49,10 +62,11 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
     ) -> Option<ControlFrame> {
         if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
             return self
-                .retained_installation(actor_id, mutation, connection_id)
+                .retained_installation(actor_id, mutation, connection_id, admitted)
                 .await;
         }
         // An authority change this host already holds a claim on is answered from it, here, before
@@ -406,7 +420,7 @@ impl Controller {
     /// commit cannot be left half done by a peer going away, so the effect runs in its own task.
     /// Dropping the handle this awaits does not stop that task; it only stops this connection
     /// hearing the answer.
-    async fn perform(
+    pub(super) async fn perform(
         self: &Arc<Self>,
         actor_id: &ActorId,
         connection_id: ConnectionId,
@@ -447,11 +461,11 @@ impl Controller {
         // to agree. A revocation of somebody else's device advances the revision and leaves every
         // surviving registration stamped with the new one, so a door that read the revision after
         // a retained lookup, a lock or a task being scheduled would admit a mutation under an
-        // authority the other door refuses the same mutation under. The project and change-set
-        // paths use it; every other effect still reads it where its own transaction does.
+        // authority the other door refuses the same mutation under. A retained answer is checked
+        // against it.
         let admitted = self.admitted_revision(connection_id).ok();
         let mut retained = self
-            .retained(actor_id, &mutation, method, connection_id)
+            .retained(actor_id, &mutation, method, connection_id, admitted)
             .await;
         if retained.is_none() && crate::transfer::TransferModule::serves(method) {
             retained = self.transfer.retained(actor_id, &mutation, method).await;
@@ -481,13 +495,11 @@ impl Controller {
                 .await
                 .map(|outcome| respond(mutation.request_id, outcome));
         }
+        #[cfg(feature = "testing")]
+        self.after_the_retained_lookup.wait().await;
         if let Some(retained) = retained {
-            if let Err(error) = self.authorised(connection_id) {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    error.to_string(),
-                );
+            if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+                return error_reply(mutation.request_id, error.code(), error.to_string());
             }
             return retained;
         }
@@ -541,6 +553,7 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
     ) -> Option<ControlFrame> {
         let installer = self.installer().ok()?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
@@ -548,7 +561,7 @@ impl Controller {
         // Waiting for that lock takes time, and a retained result is a read of somebody's action.
         // Section 9 checks current authority before returning one, so it is checked after the wait
         // rather than before it.
-        if let Err(error) = self.authorised(connection_id) {
+        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
             return Some(respond(mutation.request_id, Err(error)));
         }
         match installer.retained(actor_id, mutation.action_id, &digest) {

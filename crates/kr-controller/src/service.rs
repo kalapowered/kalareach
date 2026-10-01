@@ -316,6 +316,11 @@ pub struct Controller {
     /// its specification is made. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_claim: ReadPause,
+    /// Where this host's own tests stop a retry that has found its retained answer, before the
+    /// admission it arrived under is asked again, so that a withdrawal can land in between.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_retained_lookup: ReadPause,
     /// Where this host's own tests stop a read whose worker has stopped answering, once it has
     /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
     /// away in every shipped build.
@@ -740,6 +745,10 @@ mod the_debt_pass;
 /// the tick that takes a session for ended only when the registry shows its launch is over.
 #[cfg(test)]
 mod a_change_that_waits_for_its_store;
+
+/// What the local door asks again where a retained answer goes back and where a mutation lands.
+#[cfg(test)]
+mod the_fence_at_every_effect;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.

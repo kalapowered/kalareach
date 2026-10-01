@@ -493,7 +493,13 @@ impl RemoteConnection {
         // its reply is answered there rather than dispatched again.
         let mut held = self
             .controller
-            .retained(&actor_id, mutation, entry.method, self.connection_id)
+            .retained(
+                &actor_id,
+                mutation,
+                entry.method,
+                self.connection_id,
+                Some(validated),
+            )
             .await;
         if held.is_none() && crate::project::ProjectModule::serves(entry.method) {
             held = self

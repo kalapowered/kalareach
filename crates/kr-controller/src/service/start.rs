@@ -431,6 +431,8 @@ impl Controller {
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             after_the_claim: ReadPause::default(),
+            #[cfg(feature = "testing")]
+            after_the_retained_lookup: ReadPause::default(),
             #[cfg(test)]
             before_the_record: ReadPause::default(),
             #[cfg(test)]

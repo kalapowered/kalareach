@@ -176,6 +176,39 @@ impl Controller {
         }
     }
 
+    /// Refuses a retained answer that this host may not give back now: a fence this host owes, a
+    /// registration that has been withdrawn or replaced since `admitted` was read.
+    ///
+    /// Finding a retained answer waits (for the registry, for a store's lock, for a blocking
+    /// thread), and section 9 has the host check current authority before a retained receipt goes
+    /// back, so a caller whose registration was withdrawn or replaced meanwhile cannot use an old
+    /// action identifier to read what the action produced. It is the check every service asks from
+    /// inside its work, asked without a deadline: a receipt stays readable after the window that
+    /// admitted its action is gone. `admitted` is the revision read beside the first registration
+    /// check, and none is read here; a caller that could read none has no registration to answer
+    /// under.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check_registration`] returns, and
+    /// [`ControllerError::PermissionDenied`] when there is no revision to check against.
+    pub(super) fn check_retained_answer(
+        &self,
+        connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
+    ) -> Result<()> {
+        let admitted_revision = admitted.ok_or_else(|| ControllerError::PermissionDenied {
+            detail: "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection"
+                .to_owned(),
+        })?;
+        self.check_registration(&crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision,
+            deadline: None,
+        })
+    }
+
     /// The admission a service asks again from inside the work a mutation has begun.
     ///
     /// Every service that performs a mutation's effect after a wait is handed this one check, the
