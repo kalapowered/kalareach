@@ -269,26 +269,40 @@ runs without rewriting anything they own. Nothing replaces `.bashrc`, points a s
 
 PowerShell's first entry loads the module that opens the bridge, and the session takes no input from
 outside until the bridge has authenticated, so a profile that asks a question ahead of the entry
-would ask one nobody could answer. The entry therefore goes first: `kr shell install` puts it at
-the start of the per-user profile that every host reads, below what PowerShell requires to come first
-(a byte-order mark, comments, `#Requires` lines, `using` statements and a script `param` block), so
-that a question the person's own profiles ask, in that file or in the one their host reads after it,
-is asked of a shell whose bridge is open. It moves an entry an earlier install left somewhere else. A
-question asked in an all-users profile, which an administrator owns and PowerShell reads before any of
-the user's, still runs before the bridge exists and cannot be answered. Every other shell's reader
-comes with the shell itself and its entry only says, after the user's configuration, that the hooks
-are live, so those entries stay last.
+would ask one nobody could answer. The entry therefore goes first: `kr shell install` puts it in
+the per-user profile that every host reads, below what PowerShell requires to come first, so that a
+question the person's own profiles ask, in that file or in the one their host reads after it, is asked
+of a shell whose bridge is open. What has to stay first is a question for PowerShell's grammar, so
+PowerShell answers it: the PowerShell this host would launch parses the profile, and the entry goes
+on the line after the last `using` statement or `param` block, at a line end the parser itself
+reports, which is never inside a string, a here-string or a comment. A byte-order mark is the file's
+encoding and belongs to no line. The profile is parsed again with the entry in it, and an entry that
+would add an error the profile did not have is refused by name and writes nothing: a profile that
+already has an error, such as a `using module` for a module that is not installed, keeps it. The
+install moves an entry an earlier install left somewhere else. Where the two profiles are one file,
+as when one is a link to the other, that file gets this entry and no other. A question asked in an
+all-users profile, which an administrator owns and PowerShell reads before any of the user's, still
+runs before the bridge exists and cannot be answered. Every other shell's reader comes with the shell
+itself and its entry only says, after the user's configuration, that the hooks are live, so those
+entries stay last.
 
 The second entry is the last thing in the profile PowerShell's own host reads, which is the last
-profile it runs. It asks the module whether the module's read-line entry point is still the one the
-host calls. The module goes in front of that entry point when it loads, so a function of the same
-name that a later profile defines, whether it replaces the entry point or wraps the one before it,
-takes the host's calls away from the module: the session would stay authenticated and not ready with
-nothing to say why. The second entry refuses it by name, as `reader_replaced`, through an integration
-loss that closes the session being created, and nothing the reader sends after a loss that closes the
-session says the hooks are live. A profile that leaves the entry point alone is never asked anything.
-The module qualifies the editor when it loads and again when the hooks activate after the profile,
-because a profile that runs in between can import another one.
+profile it runs. It asks the module whether the host would still call the module's read-line entry
+point. The module goes in front of that entry point when it loads, so a command of the same name that
+a later profile defines takes the host's calls away from the module: the session would stay
+authenticated and not ready with nothing to say why. What decides is whose command the host would
+run, not what its text says. A function that replaces the entry point, one that wraps the function it
+replaced, one that calls the editor directly and an alias are all the host's reader being somebody
+else's rather than the editor the package was qualified against, and each is refused by name, as
+`reader_replaced`, through an integration loss that closes the session being created; the loss's
+detail starts with that name, and nothing the reader sends after a loss that closes the session says
+the hooks are live. The editor imported again puts its own function back, which is the qualified
+reader, so the module goes back in front of it. A tool whose setup wraps the read-line entry point
+has to be guarded on `$env:KR_SESSION` to stay out of a KalaReach shell. A profile that leaves the
+entry point alone is never asked anything. The check runs where the last profile reaches its end: a
+terminating error, `return` or `exit` in that profile before it, and a change made after the
+profiles have run, are not seen by it. The module qualifies the editor when it loads and again when
+the hooks activate after the profile, because a profile that runs in between can import another one.
 
 PowerShell's profile paths differ by edition, by platform and by whether the user's Documents
 directory is redirected, so they are not derived: the shell this host would launch is asked for

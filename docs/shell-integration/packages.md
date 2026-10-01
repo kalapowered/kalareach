@@ -226,9 +226,11 @@ runs in between can import another editor. An editor whose queue stops answering
 queues as not drained rather than empty.
 
 The module goes in front of the host's read-line entry point when it loads, before the person's
-profiles run. A profile that defines a function of the same name, whether it replaces the entry
-point or wraps the one before it, is refused as `reader_replaced` by a check the last profile ends
-with, and the session being created closes with that loss.
+profiles run. A profile that defines a command of the same name, whether a function that replaces the
+entry point, wraps the one before it or calls the editor directly, or an alias, is refused as
+`reader_replaced` by a check the last profile ends with, and the session being created closes with
+that loss. The check looks at whose command the host would run and not at its text; the editor
+imported again puts its own function back and the module goes back in front of it.
 
 Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt
 ends the shell the way the editor's own would; when a wrapped handler is what runs, the exit the

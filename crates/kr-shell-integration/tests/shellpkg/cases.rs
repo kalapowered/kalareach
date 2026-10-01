@@ -2539,7 +2539,7 @@ pub fn a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_w
 }
 
 /// The profile text that changes what the host calls to read a line, in each shape a person writes
-/// it in.
+/// it in, and the shapes that leave the editor's own function in front of the module.
 #[derive(Clone, Copy)]
 pub enum ReadLineChange {
     /// The profile leaves the host's entry point alone.
@@ -2548,6 +2548,13 @@ pub enum ReadLineChange {
     Replaced,
     /// A function of the same name that calls what was there before it.
     Wrapped,
+    /// A function of the same name that calls the editor directly, which is what a wrapper some
+    /// tool's setup adds does.
+    CallsTheEditor,
+    /// An alias of the same name, which the host resolves ahead of a function.
+    Aliased,
+    /// The editor imported again, which puts its own function back in front of the module.
+    EditorImportedAgain,
 }
 
 impl ReadLineChange {
@@ -2559,46 +2566,51 @@ impl ReadLineChange {
                 "$kr_inner = ${function:PSConsoleHostReadLine}\n\
                  function PSConsoleHostReadLine { & $kr_inner }\n"
             }
+            Self::CallsTheEditor => {
+                "function PSConsoleHostReadLine { [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($host.Runspace, $ExecutionContext, $?) }\n"
+            }
+            Self::Aliased => "Set-Alias PSConsoleHostReadLine Get-Date -Scope Global\n",
+            Self::EditorImportedAgain => "Import-Module PSReadLine -Force\n",
         }
+    }
+
+    /// Whether the module's own function still runs after this, inside the profile's.
+    fn reader_still_runs(self) -> bool {
+        matches!(self, Self::Wrapped)
+    }
+
+    /// Whether the reader is still the qualified editor's after this, so the session carries on.
+    fn leaves_the_qualified_reader(self) -> bool {
+        matches!(self, Self::None | Self::EditorImportedAgain)
     }
 }
 
 /// KR-REQ-07.23, KR-REQ-07.85: a profile that changes the host's read-line entry point is diagnosed
-/// by name at the end of the last profile, and one that leaves it alone is not.
+/// by name at the end of the last profile, and one that leaves the qualified reader in front of the
+/// host is not.
 ///
 /// The module goes in front of the entry point when it loads, first in the first profile, so a
 /// function of the same name that a later profile defines takes the host's calls away from it and
 /// the reader never runs: nothing would say so, and the session would stay authenticated and not
 /// ready. The entry at the end of the last profile asks the module whether its own function is still
-/// the one the host calls. A function that replaces it and one that wraps the one before it are both
-/// the host's reader being somebody else's rather than the editor the package was qualified
-/// against, and both are refused by the name the integration loss carries; the session that was
-/// being created closes with it, and is never reported to have its hooks live afterwards.
+/// the one the host calls. What decides is whose function it is, not what its text says: a
+/// function that replaces the entry point, one that wraps the one before it, one that calls the
+/// editor directly and an alias are all the host's reader being somebody else's rather than the
+/// editor the package was qualified against, and each is refused by the name the integration loss
+/// carries. The session that was being created closes with it, and is never reported to have its
+/// hooks live afterwards. The editor imported again puts its own function back, which is the
+/// qualified reader, so the module goes back in front of it and the session carries on.
 pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kind: ShellKind) {
     let package = Package::built(kind);
 
-    // The control: a profile that leaves it alone activates, and nothing is lost.
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_entry: ReadLineChange::None.profile(),
-            ..Profile::ORDINARY
-        },
-    );
-    let mut phase = PhaseGate::unauthenticated();
-    assert!(phase.authenticated(kind));
-    let lost = std::cell::Cell::new(false);
-    session.expect_event("hooks_activated", |event| {
-        lost.set(lost.get() || matches!(event, BridgeEvent::IntegrationLost(_)));
-        matches!(event, BridgeEvent::HooksActivated(_))
-    });
-    assert!(
-        !lost.get(),
-        "a profile that left the read-line entry point alone was diagnosed"
-    );
-    drop(session);
-
-    for change in [ReadLineChange::Replaced, ReadLineChange::Wrapped] {
+    for change in [
+        ReadLineChange::None,
+        ReadLineChange::EditorImportedAgain,
+        ReadLineChange::Replaced,
+        ReadLineChange::Wrapped,
+        ReadLineChange::CallsTheEditor,
+        ReadLineChange::Aliased,
+    ] {
         let mut session = Session::start_with_profile(
             &package,
             Profile {
@@ -2608,6 +2620,22 @@ pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kin
         );
         let mut phase = PhaseGate::unauthenticated();
         assert!(phase.authenticated(kind));
+        if change.leaves_the_qualified_reader() {
+            // The control: nothing is lost, the hooks go live, and the first reader is the module's.
+            let lost = std::cell::Cell::new(false);
+            session.expect_event("hooks_activated", |event| {
+                lost.set(lost.get() || matches!(event, BridgeEvent::IntegrationLost(_)));
+                matches!(event, BridgeEvent::HooksActivated(_))
+            });
+            assert!(
+                !lost.get(),
+                "a profile that left the qualified reader in front of the host was diagnosed"
+            );
+            session.expect_event("the first editor entry", |event| {
+                matches!(event, BridgeEvent::EditorEnter(_))
+            });
+            continue;
+        }
         let (_, event) = session.expect_event("integration_lost", |event| {
             matches!(event, BridgeEvent::IntegrationLost(_))
         });
@@ -2616,18 +2644,19 @@ pub fn a_profile_that_changes_the_read_line_entry_point_is_diagnosed_by_name(kin
         };
         assert_eq!(lost.loss, IntegrationLoss::PostStartupFailure);
         assert!(
-            lost.detail.contains("read-line entry point"),
-            "the diagnostics name what changed: {}",
+            lost.detail.starts_with("reader_replaced: ")
+                && lost.detail.contains("read-line entry point"),
+            "the diagnostics carry the name and say what changed: {}",
             lost.detail
         );
         assert!(
             phase.lost(lost.loss).closes_session,
             "a loss before the session qualified closes the session that was being created"
         );
-        if matches!(change, ReadLineChange::Wrapped) {
-            // The module's own function still runs, inside the profile's, and its reader goes on to
-            // its first step. Everything it sent before that step is what the session was told
-            // after the loss, and none of it says the hooks are live.
+        // Where the module's own function still runs, inside the profile's, its reader goes on to
+        // its first step. What it sends before that is what the session was told after the loss, and
+        // none of it says the hooks are live.
+        if change.reader_still_runs() {
             let hooks = std::cell::Cell::new(false);
             session.expect_event("the first editor entry", |event| {
                 hooks.set(hooks.get() || matches!(event, BridgeEvent::HooksActivated(_)));
