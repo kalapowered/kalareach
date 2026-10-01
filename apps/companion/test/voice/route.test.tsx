@@ -232,6 +232,10 @@ describe('while a call is running', () => {
       expect(screen.getByText(/its grant may still be open/)).toBeInTheDocument()
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    // The host's words and what to do, and never the protocol code the client library puts before them.
+    const said = screen.getByText(/its grant may still be open/).textContent ?? ''
+    expect(said).toContain('This host cannot be contacted right now. Wait a moment and try again.')
+    expect(said).not.toContain('RESOURCE_UNAVAILABLE')
   })
 
   // Section 15 ¶10: whether the voice service is answering is the call's own report about its

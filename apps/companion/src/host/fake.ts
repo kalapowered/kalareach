@@ -1201,8 +1201,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           settled: null,
           host_failure: {
             code: 'RESOURCE_UNAVAILABLE',
-            message: 'This host cannot be contacted right now.',
-            user_action: 'retry'
+            // Native code sends a host's refusal as its code, a colon and the host's words.
+            message: 'RESOURCE_UNAVAILABLE: This host cannot be contacted right now.',
+            user_action: 'wait'
           }
         })
       }
