@@ -13,23 +13,41 @@ final class PreviewDecisionTests: XCTestCase {
     private let recipient = Data(repeating: 0x91, count: previewKeyIDLength)
     private let sender = Data(repeating: 0x76, count: previewKeyIDLength)
 
+    /// The preview as the gateway sends it: FCM data carries only strings, so the sealed envelope
+    /// travels as the JSON text of an object and the notification's own user info holds that text.
+    private func previewText(
+        expiresAtMilliseconds: UInt64? = nil,
+        recipientKeyID: Data? = nil,
+        nonceLength: Int = previewNonceLength
+    ) -> String {
+        let envelope: [String: Any] = [
+            "nonce": base64URL(Data(repeating: 0x01, count: nonceLength)),
+            "ciphertext": base64URL(Data(repeating: 0x02, count: 64)),
+            "routing": [
+                "envelope_id": "e-1",
+                "recipient_key_id": base64URL(recipientKeyID ?? recipient),
+                "sender_key_id": base64URL(sender),
+                "expires_at_ms": String(expiresAtMilliseconds ?? (now + 60_000)),
+                "payload_type": "notification_preview",
+                "size_bucket_bytes": "1024",
+                "thread_id": NSNull(),
+            ] as [String: Any],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func payload(
         expiresAtMilliseconds: UInt64? = nil,
         recipientKeyID: Data? = nil,
         nonceLength: Int = previewNonceLength
     ) -> [AnyHashable: Any] {
         [
-            "preview": [
-                "nonce": base64URL(Data(repeating: 0x01, count: nonceLength)),
-                "ciphertext": base64URL(Data(repeating: 0x02, count: 64)),
-                "routing": [
-                    "envelope_id": "e-1",
-                    "recipient_key_id": base64URL(recipientKeyID ?? recipient),
-                    "sender_key_id": base64URL(sender),
-                    "expires_at_ms": String(expiresAtMilliseconds ?? (now + 60_000)),
-                    "size_bucket_bytes": "1024",
-                ],
-            ]
+            "preview": previewText(
+                expiresAtMilliseconds: expiresAtMilliseconds,
+                recipientKeyID: recipientKeyID,
+                nonceLength: nonceLength
+            )
         ]
     }
 
@@ -120,6 +138,37 @@ final class PreviewDecisionTests: XCTestCase {
         let decision = decider(keys: FailingKeys(.groupNotConfigured))
             .decide(userInfo: payload(), nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.keyUnavailable))
+    }
+
+    func testThePreviewIsReadFromTheTextTheGatewaySends() throws {
+        // The exact text the gateway's `JSON.stringify` makes of a sealed envelope, key order and
+        // `null` thread included, with 24 and 32 bytes of base64url in the fields that need them.
+        let nonce = base64URL(Data(repeating: 0x93, count: previewNonceLength))
+        let ciphertext = base64URL(Data(repeating: 0xab, count: 1040))
+        let recipientID = base64URL(Data(repeating: 0x91, count: previewKeyIDLength))
+        let senderID = base64URL(Data(repeating: 0x92, count: previewKeyIDLength))
+        let text = """
+        {"ciphertext":"\(ciphertext)","nonce":"\(nonce)","routing":{"envelope_id":"7d0c2c9a-5ad3-4d63-8c27-0e8e9a2a1b11","expires_at_ms":"1763000060000","payload_type":"notification_preview","recipient_key_id":"\(recipientID)","sender_key_id":"\(senderID)","size_bucket_bytes":"1024","thread_id":null}}
+        """
+        let decision = decider(keys: ProvidingKeys(), opener: OpeningTo("Allow scripts/release.sh?"))
+            .decide(userInfo: ["preview": text], nowMilliseconds: now)
+        XCTAssertEqual(decision, .reveal("Allow scripts/release.sh?"))
+    }
+
+    func testAPreviewThatIsNotJSONIsNeverInterpreted() {
+        for text in ["not json", "", "[]", "\"a string\"", "{\"routing\":"] {
+            let decision = decider(keys: ProvidingKeys())
+                .decide(userInfo: ["preview": text], nowMilliseconds: now)
+            XCTAssertEqual(decision, .generic(.malformedPreview), "preview text \(text)")
+        }
+    }
+
+    func testAPreviewThatIsAnObjectAndNotTextIsNeverInterpreted() {
+        // FCM data carries strings, so an object here is not what the gateway sent.
+        let object = try! JSONSerialization.jsonObject(with: Data(previewText().utf8))
+        let decision = decider(keys: ProvidingKeys())
+            .decide(userInfo: ["preview": object], nowMilliseconds: now)
+        XCTAssertEqual(decision, .generic(.malformedPreview))
     }
 
     func testTheRoutingIsReadExactlyAsTheProtocolDeclaresIt() throws {
