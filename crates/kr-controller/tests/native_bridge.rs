@@ -1038,6 +1038,23 @@ fn a_registration_file_outside_the_shape_this_host_names_is_refused() {
             "bridge/hooks.json",
             r#"{"hooks": {"SessionStart": {"hooks": []}}}"#.to_owned(),
         ),
+        // A handler of another kind with only members a command has, a server of another kind
+        // with only members a stdio server has, a matcher that is not text.
+        (
+            "bridge/hooks.json",
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "prompt", "command": "kr-hook", "args": ["claude-code", "hook"]}]}]}}"#.to_owned(),
+        ),
+        (
+            "bridge/hooks.json",
+            r#"{"hooks": {"SessionStart": [{"matcher": 5, "hooks": [{"type": "command", "command": "kr-hook", "args": ["claude-code", "hook"]}]}]}}"#.to_owned(),
+        ),
+        (
+            "bridge/mcp-servers.json",
+            r#"{"mcpServers": {"kalareach": {"type": "http", "command": "kr-hook", "args": ["claude-code", "channel"]}}}"#.to_owned(),
+        ),
+        ("bridge/plugin-manifest.json", manifest("").replace(r#""channels": [{"server": "kalareach"}]"#, r#""channels": "kalareach""#)),
+        ("bridge/plugin-manifest.json", manifest("").replace(r#"{"server": "kalareach"}"#, r#"{"server": 5}"#)),
+        ("bridge/plugin-manifest.json", manifest("").replace(r#""defaultEnabled": false"#, r#""defaultEnabled": "no""#)),
         ("bridge/plugin-manifest.json", manifest(r#", "dependencies": ["theirs"]"#)),
         ("bridge/plugin-manifest.json", manifest(r#", "hooks": "./hooks/other.json""#)),
         ("bridge/plugin-manifest.json", manifest(r#", "mcpServers": {}"#)),
