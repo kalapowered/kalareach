@@ -150,12 +150,22 @@ pub struct ApplicationDirectory {
 /// `skills/` sits: the directory it reads when `CLAUDE_CONFIG_DIR` is not set, and the one the
 /// contact skill's installation uses. The daemon's environment is not the one Claude Code runs in,
 /// so a directory that variable names elsewhere is not read from it, and does not get the bridge.
+///
+/// Gemini CLI's is `.gemini` in the home directory, where its `settings.json` lives and its
+/// `extensions/` sits, each extension in a directory of its own. An application this host does not
+/// name here has no directory, and a recipe for it places nothing.
 #[must_use]
 pub fn application_directories(home: &Path) -> Vec<ApplicationDirectory> {
-    vec![ApplicationDirectory {
-        application: "Claude Code".to_owned(),
-        directory: home.join(".claude"),
-    }]
+    vec![
+        ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: home.join(".claude"),
+        },
+        ApplicationDirectory {
+            application: "Gemini CLI".to_owned(),
+            directory: home.join(".gemini"),
+        },
+    ]
 }
 
 /// What an installation wants in place: one release's recipe, and what it is checked against.
@@ -2244,6 +2254,32 @@ fn invocations(
 ) -> std::result::Result<(), String> {
     match value {
         serde_json::Value::Object(members) => {
+            // A hook may be written as the forwarder's name with its arguments in a list, or as
+            // one command line of plain words that its application runs through a shell: the
+            // forwarder's name, the application it reports for and the surface, and nothing else.
+            // A line with any other word, a quote or a shell operator in it is not one this host
+            // reads as a registration, so it is refused rather than guessed at.
+            let line = members
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .filter(|command| {
+                    *command != "kr-hook" && command.split_whitespace().next() == Some("kr-hook")
+                });
+            if let Some(line) = line {
+                let words: Vec<&str> = line.split(' ').collect();
+                let surface = match words.as_slice() {
+                    ["kr-hook", application, "hook"] => (application, BridgeSurface::Hook),
+                    ["kr-hook", application, "channel"] => (application, BridgeSurface::Channel),
+                    _ => {
+                        return Err(format!(
+                            "{destination} starts the forwarder with arguments it does not accept \
+                             from a bridge"
+                        ));
+                    }
+                };
+                applications.insert((*surface.0).to_owned());
+                surfaces.insert(surface.1);
+            }
             if members.get("command").and_then(serde_json::Value::as_str) == Some("kr-hook") {
                 let arguments = members.get("args").and_then(serde_json::Value::as_array);
                 let words: Vec<&str> = arguments
