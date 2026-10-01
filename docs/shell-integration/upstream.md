@@ -81,7 +81,7 @@ A person can load a native Zsh module of their own into a managed session. Zsh's
 editor ABI and refuses nothing for a module that binds its imports lazily, so a module built against
 an editor whose functions this package lacks loads without complaint and ends the shell at the first
 call that needs the missing function. The session answers that with a named error before it is
-ready. It never reaches a ready state with such a module loaded.
+ready, for the modules and the limits below; it does not claim to find every incompatible module.
 
 The triage record above, the update target and the requalification steps are the standing record for
 the packages. This section is the proof that the editor check refuses what it claims to, and the
@@ -90,19 +90,17 @@ limits of what it claims.
 ### What the check does
 
 When the integration reports that its hooks are live, which is after every startup file has run, the
-Zsh package lists each dynamic module the shell holds that did not come from the package's own
-module directory. That directory is read from where the running executable is (`<prefix>/bin/zsh`
-gives `<prefix>/lib/zsh/<version>`), never from where the integration was loaded, so a copy of the
-editor a person puts first on their module path does not make its neighbours the package's.
+Zsh package judges every dynamic module the shell holds, the package's own among them: where a module
+sits says nothing about what it is, and the package's own modules bind like any other.
 
 Each module is judged as the shell loaded it. The check reads the module's undefined symbols from the
 tables the loader bound it with, which are in memory (the dynamic section on Linux, the `__LINKEDIT`
 segment on macOS), and opens no file: the name a module was loaded by can be removed or replaced
-afterwards, and the file then found is not the code the shell runs. It asks the running shell
-whether the shell, the modules already loaded, the module's own libraries or a module of the package
-that is not loaded yet provide each name; a name bound to a symbol version is asked for under that
-version, in the module's own libraries. A name the module imports weakly is not judged. The report
-says, for each module,
+afterwards, and the file then found is not the code the shell runs. On Linux every table is read
+only where the object's own loadable segments say memory is. The check asks the running shell
+whether the shell, the modules already loaded or the module's own libraries provide each name; a name
+bound to a symbol version is asked for under that version. A name the module imports weakly is not
+judged. The report says, for each module,
 
 * `bound`: every name resolves;
 * `missing`: the first name that does not, with the module and its path;
@@ -113,6 +111,9 @@ The worker refuses the session on `missing` and on `not_read`, because an inspec
 made whole is not a pass. The create answers `SHELL_INTEGRATION_UNSUPPORTED` with the reason
 `module_tree_unsupported` and names the module and the import, or the module and why it could not
 be checked. The Bash, Fish and PowerShell bridges send an empty list.
+
+The reader is made for the shared objects a linker makes, on macOS and on Linux with glibc. On
+another platform every module is `not_read`, which refuses the session.
 
 ### The proof
 
@@ -126,16 +127,17 @@ and on Linux.
 | compatible | imports only what the package provides | loads, `bound`, the session may qualify |
 | newer | also calls a function no editor of this release has | loads, `missing` naming that function, the session is refused with `module_tree_unsupported` |
 | newer, then removed | the startup file that loaded it removes its file | still `missing`: the module the shell holds is judged |
-| newer, then replaced | the startup file puts a module that binds where its file was | still `missing`; and a compatible module replaced by a newer one is still `bound` |
-| lazy | imports from a package module that is not loaded yet | `bound`: the shell loads that module on demand |
+| newer, then replaced | the startup file puts a module that binds where its file was, or a link to a module of the package | still `missing`; and a compatible module replaced by a newer one is still `bound` |
+| newer, beside a copy of the editor | a copy of the package's editor is first on the module path | `missing`: a neighbour of a copy is not the package's |
+| lazy | imports from a package module | `missing` while that module is not loaded, `bound` once the startup file has loaded it |
 | weak | imports a name it is content to lose | `bound` |
 | a file the loader refuses | not a module in any format the shell loads | the loader reports it; the report has no entry, and the session is not refused for a module that never loaded |
-| the package's own modules, loaded from another directory | what a module of the shell's own kind imports | every one `bound` |
+| the package's own modules, all loaded from another directory, and each alone | what a module of the shell's own kind imports | every one `bound` |
 
 The newer module is the control that matters: the loader accepts it, which is the false ready state
 the check exists to prevent, and the check refuses it. `not_read` and the refusal it carries are
-proved in the contract's own tests; no module the shell's loader accepts leaves the bridge unable to
-read it.
+proved in the contract's own tests: a module made by an ordinary compiler and linker is always read,
+so no module of these tests reaches it.
 
 ### What it does not detect
 
@@ -147,40 +149,45 @@ read it.
   binds in either build. A module that calls one of the 27 functions only the multibyte build
   exports, or one of the 8 only the other does, is refused by the other.
 * **A changed signature, meaning or data type** behind a name that still resolves.
+* **A name a library imports in its turn.** The check reads the module, not the libraries the module
+  needs or opens for itself; a name the module imports from a library resolves in that library, and
+  what that library imports is not read. On macOS a lazily bound name is found in any loaded image,
+  not only in the library its two-level namespace names, and a module whose setup function comes
+  from a library it links is judged as that library.
+* **A name provided by a package module that is not loaded** when the hooks go live. The shell loads
+  a package module for its own features, never because another module imports a name from it, so a
+  call that needs it before it is loaded ends the shell. The check refuses such a module; a startup
+  file that loads the provider first makes it bind.
 * **A module loaded after the hooks go live**: a later `precmd`, `zle-line-init`, deferred or
   on-demand loading, or a `module_path` the person extended after the check.
 * **A module the loader refuses.** The loader reports that itself.
-* **A module in the package's own directory.** What is loaded from there is taken to be the
-  package's. That directory is the installation's own, and a program that can write into it can
-  replace the shell as well.
+* **A module that is not an honest shared object.** The check is for the accidental mismatch, not
+  for a module made to be missed: a module is the person's own code, running with their authority.
 * **Loadable builtins and modules of other shells**: Bash's `enable -f`, Fish and PowerShell's
   binary modules. PowerShell's own editor range is enforced by the PSReadLine package, and this
   proof does not cover it.
 
 ### What the check costs at activation
 
-The check runs once per session, when the hooks go live, inside the shell, and opens no file for a
-module. A shell that loaded no module of its own pays for the list and a path check per package
-module. Each module of the person's own adds a walk of its symbol table and one lookup per
-undefined name. A name that nothing loaded provides sends one pass over the package's own modules,
-which are in the installation's own directory; a module that binds every name never does.
+The check runs when the hooks go live, which is once for each report the integration sends (the
+activation builtin can be run again), inside the shell, and opens no file and calls no program: it
+walks tables that are in memory and asks the loader one question for each undefined name. It does
+not wait on anything.
 
 Measured from a timer around the whole check in a session under the built package, median of ten
-sessions per row:
+sessions per row, with the slowest of the ten beside it:
 
 | The shell holds | Apple M4 Pro, macOS 26 | AMD EPYC 7502P, Linux (glibc 2.43) |
 | --- | --- | --- |
-| no module of its own | 0.10 ms | 0.11 ms |
-| 1 small module | 0.18 ms | 0.15 ms |
-| 3 small modules | 0.26 ms | 0.19 ms |
-| 8 small modules | 0.37 ms | 0.24 ms |
-| 10 of the package's own modules, read from another directory | 1.7 ms | 0.69 ms |
-| about 35 of the package's own modules, read from another directory | 2.7 ms | 1.4 ms |
+| the editor and what the shell loaded itself | 0.22 ms (slowest 0.32) | 0.14 ms (0.17) |
+| and 1 small module of the person's own | 0.22 ms (0.50) | 0.12 ms (0.15) |
+| and 3 | 0.24 ms (0.51) | 0.13 ms (0.18) |
+| and 8 | 0.29 ms (0.59) | 0.12 ms (0.16) |
+| 10 of the package's modules read from another directory | 1.2 ms (1.3) | 0.39 ms (0.48) |
+| about 35 of the package's modules read from another directory | 1.9 ms (3.2) | 0.58 ms (0.79) |
 
-A `.zshrc` that loads the package's own modules pays only the path check. One that loads a few
-modules of its own pays under a tenth of a millisecond for each. The last two rows are the worst
-case, every one of the package's dozens of modules checked as if it were the person's, and they stay
-under three milliseconds.
+A `.zshrc` that loads a few modules pays under half a millisecond. The last two rows load the whole of
+the package's module tree, dozens of modules, and stay under four milliseconds.
 
 
 ## Requalifying a package
