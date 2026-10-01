@@ -328,6 +328,22 @@ describe('drafts', () => {
     expect(rebind(early, { ...target, sessionId: 's2' }, 'att-2').state).toBe('orphaned')
   })
 
+  it('keeps a draft that holds only a file to the conversation it was written for', () => {
+    const file = {
+      localId: 'file-1',
+      transferId: 'transfer-1',
+      name: 'trace.log',
+      byteLen: 12,
+      mediaType: 'text/plain',
+      presentedAsImage: false,
+      upload: 'uploaded' as const,
+      acceptedUpstream: false
+    }
+    const withFile = connectionLost({ ...startDraft('d1', target, 0), attachments: [file] })
+    expect(withFile.text).toBe('')
+    expect(rebind(withFile, { ...target, agentBindingRevision: '9' }, 'att-2').state).toBe('conflicted')
+  })
+
   it('never submits a conflicted draft, and clears the conflict only on an explicit retarget', () => {
     const conflicted = rebind(
       connectionLost(edit(startDraft('d1', target, 0), 'text', 1)),
