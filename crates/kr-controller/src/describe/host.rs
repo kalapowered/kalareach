@@ -535,6 +535,14 @@ impl PublicationGate for Admission {
         let _admission = self.privacy.admit_send(generation)?;
         Some(publish())
     }
+
+    fn admit_dispatch(&self, generation: PrivacyGeneration, register: &mut dyn FnMut()) -> bool {
+        let Some(_admission) = self.privacy.admit_send(generation) else {
+            return false;
+        };
+        register();
+        true
+    }
 }
 
 /// The host's thread.
@@ -1342,6 +1350,35 @@ mod tests {
                 .len();
             assert_eq!(held, usize::from(running), "running: {running}");
         }
+    }
+
+    /// A job is registered as in flight only while a send at its session's generation is admitted:
+    /// while privacy mode is off at that generation, and not while it is on or when the generation
+    /// in force is another. The registration is what a change of privacy mode finds to cancel, so
+    /// a job that is not registered is never sent.
+    #[test]
+    fn a_dispatch_registers_only_while_its_generation_is_admitted() {
+        let registered = |state: Published, generation: u64| {
+            let gate = Admission {
+                privacy: PrivacyState::at(state),
+            };
+            let mut ran = false;
+            let admitted = gate.admit_dispatch(PrivacyGeneration::new(generation), &mut || {
+                ran = true;
+            });
+            (ran, admitted)
+        };
+        assert_eq!(registered(state(3, false), 3), (true, true));
+        assert_eq!(
+            registered(state(3, true), 3),
+            (false, false),
+            "privacy mode is on"
+        );
+        assert_eq!(
+            registered(state(4, false), 3),
+            (false, false),
+            "another generation"
+        );
     }
 
     /// A reading of the host's conditions serves while it is under a minute old and says nothing
