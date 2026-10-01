@@ -47,6 +47,7 @@ class MainActivity : TauriActivity() {
   // Before Android 11 the bars and the keyboard share one rectangle, the window's system insets,
   // and setting a bar's inset rewrites that rectangle from the bars alone, so the keyboard would
   // be taken out with them. It is set whole instead, to what the keyboard alone takes.
+  @Suppress("DEPRECATION")
   private fun keepOnlyTheKeyboard(remaining: WindowInsetsCompat.Builder, insets: WindowInsetsCompat) {
     val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime())
     remaining
