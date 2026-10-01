@@ -36,7 +36,112 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 /// so the control stream carries one itself.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long the loop that serves a local connection waits for the peer to take one frame it
+/// writes without being asked: a keepalive or a replacement window.
+///
+/// The loop writes them between reads, so while it waits for the peer it reads nothing, and a
+/// peer that has stopped reading would hold the connection for ever. Past this the connection
+/// ends, as a failed write ends it. The same bound the daemon gives a worker's answer.
+pub const LOCAL_WRITE_BOUND: std::time::Duration = super::workers::WORKER_EXCHANGE;
+
+/// How often the loop that serves a local connection writes unasked, and how long it waits for the
+/// peer to take what it writes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LocalPace {
+    renewal: std::time::Duration,
+    keepalive: std::time::Duration,
+    write_bound: std::time::Duration,
+}
+
+impl Default for LocalPace {
+    fn default() -> Self {
+        Self {
+            renewal: WINDOW_RENEWAL,
+            keepalive: LOCAL_KEEPALIVE,
+            write_bound: LOCAL_WRITE_BOUND,
+        }
+    }
+}
+
 impl Controller {
+    /// Makes this daemon's local connections write unasked at the pace given, and wait for their
+    /// peer for `write_bound`, from the next connection on.
+    #[cfg(feature = "testing")]
+    pub fn pace_local_connections(
+        &self,
+        renewal: std::time::Duration,
+        keepalive: std::time::Duration,
+        write_bound: std::time::Duration,
+    ) {
+        *self
+            .local_pace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = LocalPace {
+            renewal,
+            keepalive,
+            write_bound,
+        };
+    }
+
+    /// How many writes of a local connection's loop have had to wait for their peer.
+    #[cfg(feature = "testing")]
+    pub fn local_writes_blocked(&self) -> usize {
+        self.local_writes_blocked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The pace local connections write unasked at.
+    fn local_pace(&self) -> LocalPace {
+        #[cfg(feature = "testing")]
+        {
+            *self
+                .local_pace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            LocalPace::default()
+        }
+    }
+
+    /// Writes one frame the loop was not asked for, and says whether the connection goes on.
+    ///
+    /// The write waits for the peer for at most `bound`: a peer that has stopped reading is a
+    /// connection that ends rather than one that holds its loop, and the frame it was part way
+    /// through is not continued, because the connection goes with it. The wait is the one
+    /// [`kr_ipc::framed::Writable`] gives a caller whose peer may stall, under a deadline of its
+    /// own.
+    async fn write_within(
+        &self,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        kind: StreamKind,
+        frame: &ControlFrame,
+        bound: std::time::Duration,
+    ) -> bool {
+        use kr_ipc::framed::{FrameWriter, Wrote};
+
+        let Ok(bytes) = FrameWriter::encode(kind, frame) else {
+            return false;
+        };
+        let written = async {
+            let mut outcome = writer.begin_frame(&bytes)?;
+            let mut waited = false;
+            while outcome == Wrote::Blocked {
+                if !waited {
+                    waited = true;
+                    #[cfg(feature = "testing")]
+                    self.local_writes_blocked
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                writer.writable().ready().await?;
+                outcome = writer.resume_frame()?;
+            }
+            kr_ipc::Result::Ok(())
+        };
+        matches!(tokio::time::timeout(bound, written).await, Ok(Ok(())))
+    }
+
     /// Arms the pause a retry stops at once it has found its retained answer, before the
     /// admission it arrived under is asked again. Returns the end that says the retry has
     /// arrived, and the end that lets it go. The pause fires once.
@@ -217,9 +322,10 @@ impl Controller {
         let mut negotiated = false;
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the first one.
-        let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
+        let pace = self.local_pace();
+        let mut renewal = tokio::time::interval(pace.renewal);
         renewal.tick().await;
-        let mut keepalive = tokio::time::interval(LOCAL_KEEPALIVE);
+        let mut keepalive = tokio::time::interval(pace.keepalive);
         keepalive.tick().await;
         loop {
             let frame = tokio::select! {
@@ -235,14 +341,14 @@ impl Controller {
                         break;
                     };
                     let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
-                    if writer.write_message(&renewed).await.is_err() {
+                    if !self.write_within(writer, kind, &renewed, pace.write_bound).await {
                         break;
                     }
                     continue;
                 }
                 _ = keepalive.tick(), if negotiated => {
                     let beat = ControlFrame::Event(ControlEvent::Keepalive);
-                    if writer.write_message(&beat).await.is_err() {
+                    if !self.write_within(writer, kind, &beat, pace.write_bound).await {
                         break;
                     }
                     continue;
