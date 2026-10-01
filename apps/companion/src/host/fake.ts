@@ -233,6 +233,14 @@ export interface FakeHostControls {
    * change the host while a read is on its way and answer reads in any order.
    */
   hold(read: HeldRead): HeldReads
+  /**
+   * Holds the answer to every composer send from now on, as a host does that has the request and has
+   * not answered it: the host has acted on each send the moment it arrives, and the page hears
+   * nothing until the test releases it.
+   */
+  holdMutation(): HeldMutations
+  /** How many composer sends the host has received, answered or held. */
+  readonly submissions: number
   /** Hands the window a set of dropped files. */
   dropFiles(files: readonly DroppedFile[]): void
   /** What the interface asked the platform to save, in order. */
@@ -440,6 +448,14 @@ export interface HeldReads {
   release(): void
 }
 
+/** The sends of one kind a test is holding: the host has each, and has not answered it. */
+export interface HeldMutations {
+  /** How many sends have been held so far. */
+  readonly count: number
+  /** Answers every send still held, with what the host did with it, and holds no more. */
+  release(): void
+}
+
 /** The fake host, and the controls a test drives it with. */
 export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let connected = true
@@ -585,6 +601,19 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
   /** The answers each held kind of read is waiting to give, in the order the reads were made. */
   const holds = new Map<HeldRead, (() => void)[]>()
+  /** The composer sends the host has received, and the ones whose answer a test is holding. */
+  let submissions = 0
+  let heldSends: (() => void)[] | null = null
+  const answeredWhenReleased = <T>(answer: T): Promise<T> => {
+    const waiting = heldSends
+    return waiting === null
+      ? Promise.resolve(answer)
+      : new Promise<T>((resolve) => {
+          waiting.push(() => {
+            resolve(answer)
+          })
+        })
+  }
   /**
    * Answers a read with what the host holds now: at once, or when the test answers it while it
    * holds this kind of read. A refusal is kept as the answer too, and arrives as a rejection then,
@@ -773,11 +802,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       }),
     composerSubmit: (params) => {
       requireConnection()
-      return Promise.resolve(records.prompt(params, false))
+      submissions += 1
+      return answeredWhenReleased(records.prompt(params, false))
     },
     composerQueue: (params) => {
       requireConnection()
-      return Promise.resolve(records.prompt(params, true))
+      submissions += 1
+      return answeredWhenReleased(records.prompt(params, true))
     },
     composerSteer: (params) => {
       requireConnection()
@@ -1385,6 +1416,22 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           for (let index = 0; index < waiting.length; index += 1) answer(index)
         }
       }
+    },
+    holdMutation() {
+      const waiting: (() => void)[] = []
+      heldSends = waiting
+      return {
+        get count() {
+          return waiting.length
+        },
+        release() {
+          if (heldSends === waiting) heldSends = null
+          for (const settle of waiting) settle()
+        }
+      }
+    },
+    get submissions() {
+      return submissions
     },
     dropFiles(files) {
       for (const listener of dropListeners) listener(files)
