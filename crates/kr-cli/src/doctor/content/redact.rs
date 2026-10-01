@@ -73,7 +73,7 @@ impl Paths {
 
     fn same(self, a: char, b: char) -> bool {
         a == b
-            || (self.ignores_case && a.eq_ignore_ascii_case(&b))
+            || (self.ignores_case && a.to_lowercase().eq(b.to_lowercase()))
             || (self.backslash_separates && self.separates(a) && self.separates(b))
     }
 
@@ -98,9 +98,10 @@ pub fn field(text: &str, home: Option<&str>, paths: Paths) -> String {
 /// every path of the machine into `[home]` followed by itself.
 fn replace_home(text: &str, home: &str, paths: Paths) -> String {
     let home = home.trim_end_matches(|character| paths.separates(character));
-    let absolute = home.starts_with('/')
-        || (paths.backslash_separates
-            && (home.starts_with('\\') || home.chars().nth(1).is_some_and(|second| second == ':')));
+    // A drive's own root (`C:`) is a root like `/`, so a drive needs a directory after it.
+    let drive = home.chars().nth(1) == Some(':') && home.chars().count() > 2;
+    let absolute =
+        home.starts_with('/') || (paths.backslash_separates && (home.starts_with('\\') || drive));
     if home.is_empty() || !absolute || !home.chars().any(char::is_alphanumeric) {
         return text.to_owned();
     }
@@ -109,9 +110,15 @@ fn replace_home(text: &str, home: &str, paths: Paths) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     while at < characters.len() {
+        // A path starts at the field's start, after whitespace, a quote or a separator of values
+        // (`=`, `:` or `;`), or after the verbatim prefix Windows puts before a drive.
+        let verbatim = paths.backslash_separates
+            && at >= 4
+            && matches!(characters[at - 4..at], ['\\', '\\', '?' | '.', '\\']);
         let starts = at == 0
+            || verbatim
             || characters.get(at - 1).is_some_and(|before| {
-                before.is_whitespace() || matches!(before, '=' | ':' | '"' | '\'')
+                before.is_whitespace() || matches!(before, '=' | ':' | ';' | '"' | '\'')
             });
         let end = at + home.len();
         let matches = starts
@@ -123,7 +130,7 @@ fn replace_home(text: &str, home: &str, paths: Paths) -> String {
             && characters.get(end).is_none_or(|after| {
                 after.is_whitespace()
                     || paths.separates(*after)
-                    || matches!(after, ':' | '"' | '\'')
+                    || matches!(after, ':' | ';' | '"' | '\'')
             });
         if matches {
             out.push_str(HOME);
@@ -150,18 +157,31 @@ fn credentials(text: &str) -> Option<String> {
     userinfo(text, &mut spans);
     assignments(text, &mut spans)?;
     options(text, &mut spans)?;
-    // The earliest span first, and none that starts inside one already taken: a user name in a URL
-    // that is itself a credential's value is gone with the value.
+    // The earliest span first. A span that starts inside one already taken is part of it: the
+    // region the first one replaces grows to the end of the later one, so a credential value that
+    // holds another credential name, and a quoted value that runs past the end of the word an
+    // earlier rule stopped at, are replaced whole and nothing of either is left behind.
     spans.sort_by_key(|span| (span.start, span.end));
     let mut out = String::with_capacity(text.len());
     let mut taken = 0;
+    let mut pending: Option<Span> = None;
     for span in spans {
-        if span.start < taken {
-            continue;
+        match pending.as_mut() {
+            Some(region) if span.start < region.end => region.end = region.end.max(span.end),
+            _ => {
+                if let Some(region) = pending.take() {
+                    out.push_str(&text[taken..region.start]);
+                    out.push_str(region.with);
+                    taken = region.end;
+                }
+                pending = Some(span);
+            }
         }
-        out.push_str(&text[taken..span.start]);
-        out.push_str(span.with);
-        taken = span.end;
+    }
+    if let Some(region) = pending {
+        out.push_str(&text[taken..region.start]);
+        out.push_str(region.with);
+        taken = region.end;
     }
     out.push_str(&text[taken..]);
     Some(out)
@@ -171,9 +191,12 @@ fn credentials(text: &str) -> Option<String> {
 fn userinfo(text: &str, spans: &mut Vec<Span>) {
     for (at, _) in text.match_indices("://") {
         let start = at + 3;
+        // An authority ends where a URL's does. A quote does not end it: an apostrophe is a valid
+        // character of user information, and a quote that closes the argument the URL is in comes
+        // after the host, so it is never between the user information and its `@`.
         let end = text[start..]
             .find(|character: char| {
-                matches!(character, '/' | '?' | '#' | '"' | '\'') || character.is_whitespace()
+                matches!(character, '/' | '?' | '#' | '\\') || character.is_whitespace()
             })
             .map_or(text.len(), |offset| start + offset);
         if let Some(last) = text[start..end].rfind('@') {
@@ -310,24 +333,33 @@ fn says_credential(name: &str) -> bool {
             .any(|part| PARTS.contains(&part.as_str()))
 }
 
-/// A name's parts, lower-cased: split at every character that is not a letter or a digit, and
-/// between a lower-case letter and an upper-case one.
+/// A name's parts, lower-cased: split at every character that is not a letter or a digit, between a
+/// lower-case letter and an upper-case one, and before the last capital of a run of capitals that a
+/// lower-case letter follows (`HTTPAuth` is `http` and `auth`).
 fn parts(name: &str) -> Vec<String> {
+    let characters: Vec<char> = name.chars().collect();
     let mut parts = Vec::new();
     let mut part = String::new();
-    let mut previous_lower = false;
-    for character in name.chars() {
+    for (index, character) in characters.iter().copied().enumerate() {
         if !character.is_ascii_alphanumeric() {
             if !part.is_empty() {
                 parts.push(std::mem::take(&mut part));
             }
-            previous_lower = false;
             continue;
         }
-        if previous_lower && character.is_ascii_uppercase() && !part.is_empty() {
-            parts.push(std::mem::take(&mut part));
+        if let Some(previous) = index.checked_sub(1).map(|before| characters[before])
+            && !part.is_empty()
+        {
+            let lower_then_upper = previous.is_ascii_lowercase() && character.is_ascii_uppercase();
+            let end_of_a_run = previous.is_ascii_uppercase()
+                && character.is_ascii_uppercase()
+                && characters
+                    .get(index + 1)
+                    .is_some_and(char::is_ascii_lowercase);
+            if lower_then_upper || end_of_a_run {
+                parts.push(std::mem::take(&mut part));
+            }
         }
-        previous_lower = character.is_ascii_lowercase();
         part.push(character.to_ascii_lowercase());
     }
     if !part.is_empty() {

@@ -51,14 +51,20 @@ fn an_ordinary_path_and_command_stay_readable() {
         "cargo test --workspace --no-fail-fast",
         "PWD=/work KEYBOARD=us ls",
         "git clone https://example.com/repo.git",
-        "--tokenizer is not a flag here",
+        "curl \"https://example.com/a?b=c\" 'user@example.com'",
     ] {
-        // The last is the one name the rules read too widely, so it is shown as redacted below.
-        if text.starts_with("--tokenizer") {
-            continue;
-        }
         assert_eq!(redacted(text), text, "{text}");
     }
+}
+
+/// KR-REQ-29.04: the one place the name list reads too widely, stated: `tokenizer` says credential,
+/// so what follows it goes.
+#[test]
+fn a_name_the_list_reads_too_widely_is_redacted_too() {
+    assert_eq!(
+        redacted("run --tokenizer fast now"),
+        "run --tokenizer [redacted] now"
+    );
 }
 
 /// KR-REQ-29.04: the same forms with an equals sign, a quoted value that holds a space, and in the
@@ -243,5 +249,162 @@ fn what_the_rules_do_not_read_stays() {
         format!("curl -H 'Authorization: Bearer {MARKER}'"),
     ] {
         assert!(redacted(&text).contains(MARKER), "{text}");
+    }
+}
+
+/// KR-REQ-29.04: a credential value that holds another credential name with a quoted value is one
+/// span, replaced whole: nothing of the quoted part is left after the earlier span's end.
+#[test]
+fn overlapping_credentials_are_replaced_as_one() {
+    for (text, expected) in [
+        (
+            format!("run --password TOKEN=\"prefix {MARKER}\" next"),
+            "run --password [redacted] next".to_owned(),
+        ),
+        (
+            format!("AUTH_OPTS=--token=\"x {MARKER}\" next"),
+            "AUTH_OPTS=[redacted] next".to_owned(),
+        ),
+        (
+            format!("/tmp/TOKEN=a,SECRET=\"b {MARKER} d\" tail"),
+            "/tmp/TOKEN=[redacted] tail".to_owned(),
+        ),
+        (
+            format!("TOKEN=a SECRET={MARKER} PASSWORD='b {MARKER}'"),
+            "TOKEN=[redacted] SECRET=[redacted] PASSWORD=[redacted]".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+}
+
+/// KR-REQ-29.04: an apostrophe is a valid character of URL user information, and a quote around the
+/// whole argument is not part of it: both forms lose the user information, and a URL with none keeps
+/// its text, quotes and all.
+#[test]
+fn user_information_with_an_apostrophe_is_taken_out_inside_quotes() {
+    for (text, expected) in [
+        (
+            format!("--url=\"https://o'neil:{MARKER}@host/\""),
+            "--url=\"https://[redacted]@host/\"".to_owned(),
+        ),
+        (
+            format!("'https://user:{MARKER}@host'"),
+            "'https://[redacted]@host'".to_owned(),
+        ),
+        (
+            format!("\"https://user:{MARKER}@host:8443/x?y=z\""),
+            "\"https://[redacted]@host:8443/x?y=z\"".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+    assert_eq!(
+        redacted("\"https://host/a?mail=x@y.z\""),
+        "\"https://host/a?mail=x@y.z\""
+    );
+}
+
+/// KR-REQ-29.04: a run of capitals ends before the capital a lower-case letter follows, so
+/// `HTTPAuth` and `SSHKey` say credential, and a name that only looks like one does not.
+#[test]
+fn a_name_is_split_before_the_last_capital_of_a_run() {
+    for name in [
+        "HTTPAuth",
+        "SSHKey",
+        "xAuthKey",
+        "OAuthToken",
+        "DB_PASS",
+        "dbPass",
+    ] {
+        assert!(says_credential(name), "{name}");
+    }
+    for name in [
+        "HTTPS",
+        "HTTPHost",
+        "PASSENGER",
+        "Keyboard",
+        "AUTHOR",
+        "monkeyTime",
+    ] {
+        assert!(!says_credential(name), "{name}");
+    }
+    assert_eq!(parts("HTTPAuth"), ["http", "auth"]);
+    assert_eq!(parts("accessKeyId"), ["access", "key", "id"]);
+}
+
+/// KR-REQ-29.04: on Windows the verbatim prefix before a drive does not hide the home directory,
+/// `;` separates values as `:` does, and a drive's own root is a root and is never replaced.
+#[test]
+fn windows_paths_the_home_directory_can_sit_in() {
+    let home = Some("C:\\Users\\Tom");
+    assert_eq!(
+        field("\\\\?\\C:\\Users\\Tom\\work", home, WINDOWS),
+        "\\\\?\\[home]\\work"
+    );
+    assert_eq!(
+        field("PATH=C:\\bin;C:\\Users\\Tom\\bin", home, WINDOWS),
+        "PATH=C:\\bin;[home]\\bin"
+    );
+    for root in ["C:\\", "C:", "D:/"] {
+        assert_eq!(
+            field("C:\\Windows\\System32", Some(root), WINDOWS),
+            "C:\\Windows\\System32",
+            "{root}"
+        );
+    }
+    // Case folds beyond ASCII where the platform folds case.
+    assert_eq!(
+        field(
+            "c:\\users\\\u{c9}milie\\x",
+            Some("C:\\Users\\\u{e9}milie"),
+            WINDOWS
+        ),
+        "[home]\\x"
+    );
+    assert_eq!(
+        field(
+            "c:\\users\\\u{c9}milie\\x",
+            Some("C:\\Users\\\u{e9}milie"),
+            UNIX
+        ),
+        "c:\\users\\\u{c9}milie\\x"
+    );
+}
+
+/// KR-REQ-29.04: hostile text never panics a rule: every cut falls on a character boundary and
+/// every position is in range, whatever the characters are.
+#[test]
+fn hostile_and_non_ascii_text_is_handled_without_a_panic() {
+    for text in [
+        "",
+        "=",
+        "==",
+        "--",
+        "-- ",
+        "TOKEN=",
+        "TOKEN=\"",
+        "TOKEN='",
+        "--password",
+        "--password ",
+        "://",
+        "://@",
+        "https://@",
+        "https://@@@/",
+        "\u{e9}TOKEN=\u{e9}\u{e9}",
+        "TOKEN=\u{202e}\u{200b}x y",
+        "--p\u{e4}ssword x",
+        "\u{1f600}=\u{1f600} --token \u{1f600}",
+        "/home/tom\u{301}/x",
+        "[home]/[redacted]@[withheld",
+    ] {
+        let said = redacted(text);
+        assert!(!said.contains(MARKER), "{text:?}");
+        let again = redacted(&said);
+        assert_eq!(again, said, "{text:?}: redacting twice is redacting once");
     }
 }
