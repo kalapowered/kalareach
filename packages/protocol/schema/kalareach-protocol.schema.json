@@ -4564,6 +4564,10 @@
           "$ref": "#/$defs/ProtocolVersion",
           "description": "The protocol version the invoker speaks."
         },
+        "start": {
+          "description": "Whether this invocation may start what it needs inside the destination.\n\nSection 3 leaves starting an environment to refresh, create and attach, and a listing, an\nenrolment or a verification starts nothing. A create or an attach says `true`, and the\nhelper then reaches the destination's control daemon through that environment's own\nconfigured startup when none is running. Everything else says `false`, and a destination\nwith no daemon answers that it has none.",
+          "type": "boolean"
+        },
         "target": {
           "$ref": "#/$defs/BridgeTarget",
           "description": "What to reach inside the destination environment."
@@ -4575,6 +4579,7 @@
         "origin_environment_id",
         "origin_ingress",
         "already_bridged",
+        "start",
         "target"
       ],
       "type": "object"
@@ -4587,9 +4592,24 @@
           "$ref": "#/$defs/ActionWindow",
           "description": "The first action window of this connection, issued by the destination."
         },
+        "base": {
+          "$ref": "#/$defs/DestinationBase",
+          "description": "The destination's own starting point for a session created through this bridge."
+        },
         "boot_identity": {
           "$ref": "#/$defs/BootIdentity",
           "description": "The boot the destination is running."
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBuild"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The build of the process the helper reached, stated as that process stated it.\n\nAn invoker refuses a destination whose protocol version does not share its compatibility\nlevel before it sends a request, because the frames that follow are closed schemas. A\nprocess of a build before this member states none, and is refused the same way.\n\nRemove the default and the omission once no process of a build before this member can\nstill be running."
         },
         "connection_id": {
           "$ref": "#/$defs/ConnectionId",
@@ -4624,7 +4644,8 @@
         "connection_id",
         "boot_identity",
         "max_frame_len",
-        "action_window"
+        "action_window",
+        "base"
       ],
       "type": "object"
     },
@@ -10452,6 +10473,28 @@
           "type": "string"
         }
       ]
+    },
+    "DestinationBase": {
+      "additionalProperties": false,
+      "description": "Where a session created through a bridge starts, and what it starts with, as the destination's\nown helper states it.\n\nA person creating a session from another environment has no working directory or variables of\nthe destination to send: the invoking host's mean nothing there. The helper runs as the\ndestination's user inside the destination, so what it reads of its own environment is what a\n`kr new` run there would have sent.",
+      "properties": {
+        "home": {
+          "description": "The destination user's home directory, where a session starts unless it is told otherwise.",
+          "type": "string"
+        },
+        "variables": {
+          "description": "The helper's own values of [`DESTINATION_BASE_VARIABLES`], in that order, where it has them.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentVariable"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "home",
+        "variables"
+      ],
+      "type": "object"
     },
     "DestinationClass": {
       "description": "Where an apply or a revert puts what it carries.\n\nThere is no default. Section 14 makes an apply default to an immutable proposal rather than to\na blind overwrite of an actively edited working tree, and this type is how that default is\nexpressed: a caller that wants the working tree written names [`Self::SharedExisting`] and is\nshown its limitation before it can choose it.",
