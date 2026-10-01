@@ -773,7 +773,10 @@ fn invisible(character: char) -> bool {
 ///
 /// A control character becomes a space, and splitting on Unicode white space turns every other
 /// break, the line and paragraph separators U+2028 and U+2029 among them, into single spaces.
-fn shown(text: &str, limit: usize) -> String {
+/// What an interface shows of a name a host or a person chose goes through this too, so that it
+/// reads as the dialog's line does.
+#[must_use]
+pub fn shown(text: &str, limit: usize) -> String {
     let spaced: String = text
         .chars()
         .filter(|character| !invisible(*character))
