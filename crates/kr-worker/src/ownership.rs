@@ -651,7 +651,8 @@ pub fn force_stop(owned: &OwnedProcesses) {
                 }
             }
             None => owned.note_unestablished(format!(
-                "the job object holding the session's root shell {root} is no longer this                  worker's to end"
+                "the job object holding the session's root shell {root} is no longer this \
+                 worker's to end"
             )),
         }
     }

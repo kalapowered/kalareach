@@ -317,7 +317,8 @@ fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Resu
     let (again, again_reference) = repository.head(profile)?;
     if again.as_deref() != Some(head_revision.as_str()) || again_reference != reference {
         return Err(ChangeSetError::SourceChanged {
-            detail: "the branch this working tree is on moved while this host was reading it, so                      what it read is against two different commits rather than one"
+            detail: "the branch this working tree is on moved while this host was reading it, so \
+                     what it read is against two different commits rather than one"
                 .into(),
         });
     }
