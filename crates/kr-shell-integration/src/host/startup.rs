@@ -271,7 +271,7 @@ pub fn powershell_targets(
             reason: "the profile this shell reads last, which checks the reader once everything \
                      the user configured has run; the entry adds to it rather than replaces it",
             shared: false,
-            placement: Placement::End,
+            placement: Placement::Last,
         });
     }
     targets
@@ -524,7 +524,7 @@ pub fn entry(
             // The last of them asks the module whether the reader it went in front of is still the
             // one the host calls. Nothing here is the integration's logic: the module is the one
             // that knows, and a shell that never loaded it has nothing to ask.
-            Placement::End => {
+            Placement::End | Placement::Last => {
                 body.push_str(&format!("{POWERSHELL_READER_CHECK}\n"));
             }
         },
@@ -574,6 +574,9 @@ fn owns_separator(block: &str) -> bool {
 pub enum Placement {
     /// After everything the user wrote, so the entry runs once their configuration has.
     End,
+    /// After everything the user wrote, wherever an earlier install put an entry of its own: an
+    /// entry already there is taken out and put at the end, where `End` rebuilds it in place.
+    Last,
     /// Before everything the user wrote that is a statement, so the entry runs before anything
     /// they wrote can ask a question.
     ///
@@ -656,6 +659,10 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
             };
             (rebuilt, false)
         }
+        (Some((before, _block, after)), Placement::Last) => {
+            (appended(&format!("{before}{after}"), body), true)
+        }
+        (None, Placement::Last) => (appended(existing, body), false),
         (stripped, Placement::AfterPrologue { shell }) => {
             let had_entry = stripped.is_some();
             let theirs = stripped.map_or_else(
@@ -2401,7 +2408,7 @@ mod tests {
     fn the_powershell_entry_at_the_start_loads_the_bridge_and_the_one_at_the_end_checks_the_reader()
     {
         let mut check = for_shell(ShellKind::PowerShell);
-        check.placement = Placement::End;
+        check.placement = Placement::Last;
         let package = Path::new("/opt/kr/entry");
 
         let loading =
@@ -2413,6 +2420,54 @@ mod tests {
         assert!(
             !checking.contains("/opt/kr/entry"),
             "the check copies nothing of the package and names none of it: {checking}"
+        );
+    }
+
+    /// KR-REQ-07.23: the entry that checks the reader is the last thing in its profile after an
+    /// upgrade too, where an earlier install had put the entry that opens the bridge at the start of
+    /// that same profile.
+    ///
+    /// An entry already there is rebuilt where its placement says, so the check does not take the
+    /// old entry's place at the start and run before the rest of the profile has changed anything.
+    #[test]
+    fn the_check_entry_moves_to_the_end_of_a_profile_an_earlier_install_put_the_load_entry_at_the_start_of()
+     {
+        let root = tempfile::tempdir().expect("a directory");
+        let mut check = for_shell(ShellKind::PowerShell);
+        check.placement = Placement::Last;
+        let package = Path::new("/opt/kr/entry");
+        let loading =
+            entry(&for_shell(ShellKind::PowerShell), package, false).expect("the path is text");
+        let checking = entry(&check, package, false).expect("the path is text");
+        let theirs = "$env:EDITOR = 'vim'\nfunction PSConsoleHostReadLine { 'theirs' }\n";
+        let path = root.path().join("Microsoft.PowerShell_profile.ps1");
+        std::fs::write(&path, format!("{loading}{theirs}")).expect("writes");
+
+        assert_eq!(
+            install(&path, &checking, &check.placement).expect("installs"),
+            Change::Replaced
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            format!("{theirs}{checking}"),
+            "the check is after everything the person wrote"
+        );
+        assert_eq!(
+            install(&path, &checking, &check.placement).expect("installs"),
+            Change::Unchanged
+        );
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
+
+        // The other shells' entries stay where they are put: a person who moved one on purpose
+        // keeps it there.
+        let zsh = for_shell(ShellKind::Zsh);
+        let body = entry(&zsh, package, false).expect("the path is text");
+        let rc = root.path().join(".zshrc");
+        std::fs::write(&rc, format!("{body}export A=1\n")).expect("writes");
+        assert_eq!(
+            install(&rc, &body, &Placement::End).expect("installs"),
+            Change::Unchanged
         );
     }
 
@@ -2655,7 +2710,7 @@ mod tests {
                         shell: asking.powershell.clone().expect("a shell")
                     }
                 ),
-                (current_host, Placement::End)
+                (current_host, Placement::Last)
             ]
         );
 
