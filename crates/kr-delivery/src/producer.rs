@@ -537,6 +537,10 @@ impl Fate {
         let Some(audience) = Audience::of_item(engine, item) else {
             return Self::Drop;
         };
+        // A lease holder is not a destination of this host, whatever the state of privacy mode.
+        if announcement.routing == AttentionRouting::LeaseHolder {
+            return Self::Drop;
+        }
         if privacy.private {
             return if matches!(
                 announcement.rule,
@@ -559,9 +563,6 @@ impl Fate {
         // while it was on is never sent once it is off.
         let decided_at_ms = item.last_notified_ms.map_or(0, |at| at.get());
         if lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms {
-            return Self::Drop;
-        }
-        if announcement.routing == AttentionRouting::LeaseHolder {
             return Self::Drop;
         }
         Self::Produce(Notice::from_announcement(announcement, audience, now_ms))
@@ -696,7 +697,11 @@ impl Producer {
         now_ms: u64,
     ) -> Result<Taken> {
         let consumer = EventSource::Attention.consumer(scope);
-        self.journal.register_consumer(&consumer, now_ms)?;
+        // Registered once: asking is a read, and registering is a write that a pass every second
+        // has no reason to make.
+        if !self.journal.is_registered(&consumer)? {
+            self.journal.register_consumer(&consumer, now_ms)?;
+        }
         let standing = self.journal.standing()?;
         if standing.generation != privacy.generation || standing.fenced != privacy.private {
             return Ok(Taken::skipped());
