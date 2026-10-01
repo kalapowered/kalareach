@@ -819,6 +819,7 @@ impl NativeBridges {
         // registration files in one directory of the application's own, and the one key that
         // enables them. Nothing else a bridge adds can hold a command, so none is left unread.
         permitted(recipe)?;
+        place_is_free(&root, journal, recipe)?;
         let facts = registration(&sources, &forwarder, recipe.application.as_str())?;
         // The forwarder a registration starts reports for the application it names, and a
         // launch of this package admits only its own: a registration for another package's
@@ -2385,9 +2386,9 @@ const COMMAND_MEMBERS: [&str; 5] = ["type", "name", "command", "args", "timeout"
 /// its own, `<root>/<name>/<tail>` for each tail the table lists, and may add the one configuration
 /// key that enables them where the application has one, `enabledPlugins.<name>@skills-dir` set to
 /// `true` in `settings.json`, for the same `<name>`. A destination or a key that is not on the
-/// table is refused, so a bridge never writes a document an application reads its own settings or
-/// helper commands from, never enables a plugin its recipe did not install, and no value it adds
-/// can hold a command. A name in another case is another name here: it is refused.
+/// table is refused, so a bridge never installs a settings document of its own, enables only the
+/// plugin its files make, and adds no value that can hold a command. A name in another case is
+/// another name here: it is refused.
 fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     struct Layout {
         root: &'static str,
@@ -2492,6 +2493,129 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether the directory a bridge installs its registration in is one it may make or already made,
+/// and whether the name its manifest gives is one the application keeps once.
+///
+/// An application enables everything it finds in a plugin's directory with the plugin: a directory
+/// that is already there and that this host did not make holds the person's own content, such as
+/// a monitor's command, which the owner's confirmation of the publisher's statement did not
+/// describe. And it keeps one plugin for each name, the first it reads, so a manifest of the same
+/// name in another folder beside this one could be the plugin the enabling key reaches. Both are
+/// refused before anything is written. The other folders are read through their paths, as an
+/// advisory check beside the walk the executor makes from one handle.
+fn place_is_free(
+    root: &Dir,
+    journal: &Journal,
+    recipe: &NativeBridge,
+) -> std::result::Result<(), String> {
+    let application = &recipe.application;
+    let manifest = match application.as_str() {
+        "Claude Code" => ".claude-plugin/plugin.json",
+        _ => "gemini-extension.json",
+    };
+    let Some((area, name)) = recipe.install.iter().find_map(|step| match step {
+        BridgeStep::InstallFile { destination, .. } => destination
+            .as_str()
+            .split_once('/')
+            .and_then(|(area, rest)| rest.split_once('/').map(|(name, _)| (area, name))),
+        BridgeStep::AddConfigurationKey { .. } => None,
+    }) else {
+        return Ok(());
+    };
+    let path = format!("{area}/{name}");
+    let ours = journal.changes.iter().any(|change| {
+        matches!(change, Change::Directory { path: made, publication: Publication::Published { .. }, .. }
+            if *made == path)
+    });
+    let Child::Directory(areas) = root
+        .child(area)
+        .map_err(|error| format!("{area} cannot be read: {error}"))?
+    else {
+        return Ok(());
+    };
+    if !ours
+        && let Child::Directory(existing) = areas
+            .child(name)
+            .map_err(|error| format!("{path} cannot be read: {error}"))?
+    {
+        let registration: Vec<&str> = recipe
+            .install
+            .iter()
+            .filter_map(|step| match step {
+                BridgeStep::InstallFile { destination, .. } => destination
+                    .as_str()
+                    .strip_prefix(path.as_str())
+                    .and_then(|rest| rest.strip_prefix('/')),
+                BridgeStep::AddConfigurationKey { .. } => None,
+            })
+            .collect();
+        if !holds_only(existing.path(), "", &registration) {
+            return Err(format!(
+                "{path} is already there with content that is not this registration, and this host \
+                 did not make it, so this host does not permit a native bridge for {application} \
+                 to install into it: {application} would enable everything in it with the \
+                 registration"
+            ));
+        }
+    }
+    let Ok(listing) = std::fs::read_dir(areas.path()) else {
+        return Ok(());
+    };
+    for entry in listing.flatten() {
+        if entry.file_name().to_str() == Some(name) {
+            continue;
+        }
+        let claimed = std::fs::File::open(entry.path().join(manifest))
+            .ok()
+            .and_then(|file| {
+                use std::io::Read as _;
+                let mut bytes = Vec::new();
+                file.take(FILE_LIMIT).read_to_end(&mut bytes).ok()?;
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+            })
+            .and_then(|value| {
+                value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if claimed.as_deref() == Some(name) {
+            return Err(format!(
+                "{area}/{} holds a plugin named {name} too, and {application} keeps one of two with a \
+                 name, so this host does not permit a native bridge for {application} to install \
+                 a plugin of that name",
+                entry.file_name().to_string_lossy()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a directory holds nothing but empty directories and the files of `registration`, which
+/// are named relative to it. `within` is the way from the directory the walk began in. A file of the
+/// registration that is there is the executor's to refuse, as one this host did not write.
+fn holds_only(directory: &Path, within: &str, registration: &[&str]) -> bool {
+    let Ok(listing) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    listing.flatten().all(|entry| {
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = if within.is_empty() {
+            name
+        } else {
+            format!("{within}/{name}")
+        };
+        if kind.is_dir() {
+            holds_only(&entry.path(), &relative, registration)
+        } else {
+            kind.is_file() && registration.contains(&relative.as_str())
+        }
+    })
 }
 
 /// True for a name of ASCII letters, digits, hyphens and underscores, which is one path component
