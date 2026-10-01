@@ -24,7 +24,10 @@
 //! A value with a quote that never closes cannot be told apart from the rest of the field, so the
 //! whole field is withheld, as its length. So is a field with a credential name and a value in it
 //! and a quote open at its end, an apostrophe in a path that nothing closed: every quote after it
-//! reads the other way, and where a value ends cannot be told.
+//! reads the other way, and where a value ends cannot be told. A value that starts in a quote is
+//! read both as part of that quote and as a word of its own, and ends where the later reading ends;
+//! where only one of the two finds a close, so that the readings cannot be told apart, the field is
+//! withheld as well.
 //!
 //! # What a name says
 //!
@@ -334,15 +337,25 @@ fn quote_at(text: &str, position: usize) -> Option<char> {
     open
 }
 
-/// Where the value that starts at `start` ends, read as a shell reads it from the quote state the
-/// text has there: in a quote that an earlier part of the text opened, such as the argument
-/// `"PASSWORD=two words"` or the script of `sh -c "tool --password \"a b\""`, the value runs to
-/// the quote that closes that argument ([`value_end_in`]); anywhere else it is a word read from
-/// where it starts ([`value_end`]).
+/// Where the value that starts at `start` ends.
+///
+/// The quote that is open at `start` is read from the start of the text, and an apostrophe in a path
+/// (`/Users/Tom's x TOKEN='a b' y/o'neil`) can turn it the other way round where the value is a
+/// quoted word of its own. So a value that starts in a quote is read both ways, as a shell reads it
+/// from that quote ([`value_end_in`]: the argument `"PASSWORD=two words"`, the script of
+/// `sh -c "tool --password \"a b\""`) and as the word it is ([`value_end`]), and ends where the
+/// later reading ends, so neither shortens the other. When the word reading finds a quote that
+/// never closes before the end of the argument reading, the readings cannot be told apart and the
+/// field is withheld; a quote it finds open at that end, or after it, is the argument's own
+/// closing quote (`curl "https://h/?token=x"`) and says nothing about the value.
 fn value_end_from(text: &str, start: usize) -> Option<usize> {
-    match quote_at(text, start) {
-        Some(outer) => value_end_in(text, start, outer),
-        None => value_end(text, start),
+    let Some(outer) = quote_at(text, start) else {
+        return value_end(text, start);
+    };
+    let inside = value_end_in(text, start, outer)?;
+    match value_end(text, start) {
+        Some(word) => Some(inside.max(word)),
+        None => value_end(&text[..inside], start).map(|_| inside),
     }
 }
 
