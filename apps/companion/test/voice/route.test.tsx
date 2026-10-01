@@ -232,9 +232,10 @@ describe('while a call is running', () => {
       expect(screen.getByText(/its grant may still be open/)).toBeInTheDocument()
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
-    // The host's words and what to do, and never the protocol code the client library puts before them.
+    // The host's words and never the protocol code the client library puts before them. The call is
+    // closed and there is nothing here to try again, so no action is said after them.
     const said = screen.getByText(/its grant may still be open/).textContent ?? ''
-    expect(said).toContain('This host cannot be contacted right now. Wait a moment and try again.')
+    expect(said.endsWith('its grant may still be open: This host cannot be contacted right now.')).toBe(true)
     expect(said).not.toContain('RESOURCE_UNAVAILABLE')
   })
 
