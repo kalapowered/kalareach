@@ -2972,7 +2972,9 @@ mod tests {
 
     /// Holds the write lock of one store's file from a second connection, until it is dropped, so
     /// that a write to that file waits and fails the way a store that is briefly unavailable does.
-    struct Locked(rusqlite::Connection);
+    struct Locked {
+        _connection: rusqlite::Connection,
+    }
 
     impl Locked {
         fn of(path: &std::path::Path) -> Self {
@@ -2980,7 +2982,9 @@ mod tests {
             connection
                 .execute_batch("BEGIN IMMEDIATE")
                 .expect("the write lock is taken");
-            Self(connection)
+            Self {
+                _connection: connection,
+            }
         }
     }
 
