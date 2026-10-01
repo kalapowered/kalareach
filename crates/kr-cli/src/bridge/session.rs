@@ -48,7 +48,7 @@ use crate::session::{AttachOptions, AttachOutcome, UndeliveredTyping};
 ///
 /// Everything about where the session runs is the destination's to fill in: the directory unless
 /// one was named, the variables, and the execution context unless one was chosen.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NewSession {
     /// How the session is presented. An enrolled environment has no terminal application to open,
     /// so only attaching and no presentation at all are served.
@@ -70,7 +70,6 @@ pub struct NewSession {
 }
 
 /// A session this host created in an enrolled environment.
-#[derive(Debug)]
 pub struct Created {
     /// What the destination answered.
     pub result: SessionCreateResult,
@@ -80,7 +79,6 @@ pub struct Created {
 }
 
 /// Where a session that a person named is, as the destination retains it.
-#[derive(Debug)]
 pub enum Found {
     /// A session that is live, and what an attachment needs to reach it.
     Live(Attaching),
@@ -92,6 +90,10 @@ pub enum Found {
         record: Option<ClosureRecord>,
     },
 }
+
+kr_client::debug_as_name!(NewSession);
+kr_client::debug_as_name!(Created);
+kr_client::debug_as_name!(Found);
 
 /// Opens a bridge to what `target` names in an enrolled environment.
 ///
