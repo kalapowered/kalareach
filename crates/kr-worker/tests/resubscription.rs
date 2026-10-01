@@ -617,21 +617,17 @@ async fn a_side_effect_of_several_frames_is_written_whole_when_it_is_replaced_pa
     );
 }
 
-/// KR-REQ-08.06, KR-REQ-08.38: a subscription replaced before it has written anything does not
-/// write a side effect it is owed, because the first frame of a stream is the one its client takes
-/// for the stream's beginning, and an effect is not that. What it was owed is a durable host event.
-///
-/// A terminal of another size holds the lease and is subscribed second, while the first
-/// subscription's delivery is part way through a frame; the second delivery is made to wait for it,
-/// and a third subscription replaces the second before it has begun. A bell is rung in between.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_subscription_replaced_before_it_wrote_anything_records_the_effect_it_was_owed() {
+/// A terminal holding the lease is subscribed second, while the first subscription's delivery is
+/// part way through a frame; the second delivery is made to wait for it, and a third subscription
+/// replaces the second before it has written anything. A bell is rung in between, and is owed to
+/// the holder. Returns once the third subscription has begun.
+async fn replaced_before_it_wrote_anything(holder_dimensions: Dimensions) {
     let host = host().await;
     let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
     let watcher = attach(&mut client, &host).await;
-    let holder = attach_sized(&mut client, &host, true, Dimensions::new(40, 12)).await;
+    let holder = attach_sized(&mut client, &host, true, holder_dimensions).await;
     host.runtime
         .session()
         .acquire_input(
@@ -639,7 +635,7 @@ async fn a_subscription_replaced_before_it_wrote_anything_records_the_effect_it_
             kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
             None,
         )
-        .expect("the terminal of another size takes the keys");
+        .expect("the holder takes the keys");
     client
         .request(Method::EventsSubscribe, &subscription(&host, watcher))
         .await
@@ -747,4 +743,22 @@ async fn a_subscription_replaced_before_it_wrote_anything_records_the_effect_it_
         .map(|event| event.kind)
         .collect();
     assert_eq!(recorded, vec!["bell".to_owned()], "once");
+}
+
+/// KR-REQ-08.06, KR-REQ-08.38: a subscription replaced before it has written anything does not
+/// write a side effect it is owed, because the first frame of a stream is the one its client takes
+/// for the stream's beginning, and an effect is not that. What it was owed is a durable host event.
+/// This is the holder a projection is drawn for, whose screen is the events that follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_projected_holders_subscription_replaced_before_it_wrote_records_the_effect_it_was_owed()
+{
+    replaced_before_it_wrote_anything(Dimensions::new(40, 12)).await;
+}
+
+/// The same for a holder of the session's own size, whose first frame is the screen its terminal is
+/// restored to: the attempt to write it was refused, and the frame counter it advanced does not make
+/// the effect writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_holders_subscription_replaced_before_it_wrote_records_the_effect_it_was_owed() {
+    replaced_before_it_wrote_anything(Dimensions::new(80, 24)).await;
 }
