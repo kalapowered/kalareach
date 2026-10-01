@@ -164,9 +164,9 @@ fn a_restoration_with_its_switches_reversed_fails_the_check_it_is_there_for() {
         .unwrap_or_else(|error| panic!("{error}"));
     let caught = outcome.of(Property::Restored);
     assert!(
-        caught.iter().any(|failure| {
-            failure.what.contains("showing the") || failure.what.contains("other buffer's line")
-        }),
+        caught
+            .iter()
+            .any(|failure| failure.what.contains("other buffer's line")),
         "the buffers painted the wrong way round are caught: {caught:#?}"
     );
 }

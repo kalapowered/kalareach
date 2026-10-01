@@ -456,6 +456,46 @@ pub fn forbidden_in_a_restoration(bytes: &[u8]) -> Vec<&'static str> {
         .collect()
 }
 
+/// What an engine of the profile makes of a restoration beyond drawing it: a sequence it has no
+/// class for, a side effect it would perform, a question it would answer, or any other diagnostic.
+///
+/// A restoration is written for the profile, so a fresh engine of the profile reads nothing in it
+/// but rendering operations. This is the check that holds for every sequence, where
+/// [`forbidden_in_a_restoration`] names a few by their bytes.
+#[must_use]
+pub fn outside_the_profile(bytes: &[u8], columns: u16, rows: u16) -> Vec<String> {
+    let Ok(mut engine) = Engine::new(EngineConfig {
+        size: GridSize {
+            cols: u32::from(columns),
+            rows: u32::from(rows),
+        },
+        ..EngineConfig::DEFAULT
+    }) else {
+        return vec!["a terminal the profile cannot make".to_owned()];
+    };
+    let fed = engine.feed(bytes, 0);
+    let settled = engine.quiesce(0);
+    let mut found = Vec::new();
+    for outcome in [&fed, &settled] {
+        found.extend(
+            outcome
+                .side_effects
+                .iter()
+                .map(|effect| format!("a side effect ({:?})", effect.kind)),
+        );
+        if outcome.responses > 0 {
+            found.push(format!("{} question(s) to answer", outcome.responses));
+        }
+    }
+    found.extend(
+        engine
+            .diagnostic_totals()
+            .into_iter()
+            .map(|(kind, total)| format!("{total} diagnostic(s) of kind {}", kind.id())),
+    );
+    found
+}
+
 /// The side effects a corpus causes, and the offset at which each is complete.
 ///
 /// A terminal engine of the session's size reads the corpus one byte at a time; the byte after
@@ -767,6 +807,12 @@ impl Stage {
             Strategy::ReversedSwitch => with_the_switches_reversed(&joined.bytes),
             Strategy::Product | Strategy::RawFromOffset => joined.bytes,
         };
+        for sequence in outside_the_profile(&bytes, self.columns, self.rows) {
+            client.restoring.push(format!(
+                "the restoration is read by a terminal of the profile as {sequence}, which a \
+                 restoration never asks of one"
+            ));
+        }
         client.draw(&bytes, "the restoration");
         client.served = Served::Stream;
         // The restored screen, checked before anything later is drawn on it. When the session
@@ -810,8 +856,7 @@ impl Stage {
             };
             stream.written(delivery.len());
             match delivery {
-                OutputDelivery::Bytes { cursor, bytes }
-                | OutputDelivery::Effect { cursor, bytes } => {
+                OutputDelivery::Bytes { cursor, bytes } => {
                     if client.form == Form::Projected {
                         let at = self.fed;
                         self.fail(
@@ -1185,40 +1230,16 @@ fn same_effect(got: &SideEffectKind, owed: &SideEffectKind) -> bool {
     }
 }
 
-/// A restoration with every switch between the two buffers turned the other way.
-///
-/// The switches are the ones of mode 1049, which is how a restoration enters and leaves a buffer.
-#[must_use]
-pub fn with_the_switches_reversed(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let rest = &bytes[at..];
-        if rest.starts_with(b"\x1b[?1049h") {
-            out.extend_from_slice(b"\x1b[?1049l");
-            at += 8;
-        } else if rest.starts_with(b"\x1b[?1049l") {
-            out.extend_from_slice(b"\x1b[?1049h");
-            at += 8;
-        } else {
-            out.push(bytes[at]);
-            at += 1;
-        }
-    }
-    out
-}
-
-/// A restoration with the part that paints the buffer that is not showing cut out.
+/// Where the two switches of the paint of the buffer that is not showing are in a restoration.
 ///
 /// A restoration switches buffers three times when there is a buffer not showing: once to make the
 /// one that shows the one that does, and twice to paint the other, into it and out of it. With the
-/// primary buffer showing the paint comes first and the switch that follows it is the one that
+/// primary buffer showing the paint comes first, and the switch that follows it is the one that
 /// leaves the primary buffer showing, so the first two are the paint (`h`, `l`, `l`); with the
 /// alternate buffer showing the switch comes first and the paint is the other two (`h`, `l`, `h`).
-/// This removes the paint's two switches and everything between them, and returns the bytes
-/// unchanged when there are not three.
-#[must_use]
-pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
+/// The offsets are those of the escape that begins each of the two switches, and `None` says the
+/// bytes are not such a restoration.
+fn paint_switches(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut switches = Vec::new();
     let mut at = 0;
     while let Some(found) = find(&bytes[at..], b"\x1b[?1049") {
@@ -1230,13 +1251,42 @@ pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
         }
         at = start + 8;
     }
-    let paint = match switches.as_slice() {
-        [(first, true), (second, false), (_, false)] => (*first, *second),
-        [(_, true), (second, false), (third, true)] => (*second, *third),
-        _ => return bytes.to_vec(),
+    match switches.as_slice() {
+        [(first, true), (second, false), (_, false)] => Some((*first, *second)),
+        [(_, true), (second, false), (third, true)] => Some((*second, *third)),
+        _ => None,
+    }
+}
+
+/// A restoration with the switches that paint the buffer that is not showing turned the other way.
+///
+/// The paint then goes into the buffer that is showing and out of the one that is not, so the
+/// shell's lines are painted where the application's belong and the other way round. The switch
+/// that makes a buffer the one that shows is left as it is. Bytes that are not such a restoration
+/// are returned unchanged.
+#[must_use]
+pub fn with_the_switches_reversed(bytes: &[u8]) -> Vec<u8> {
+    let Some((first, second)) = paint_switches(bytes) else {
+        return bytes.to_vec();
     };
-    let mut cut = bytes[..paint.0].to_vec();
-    cut.extend_from_slice(&bytes[paint.1 + 8..]);
+    let mut out = bytes.to_vec();
+    for at in [first, second] {
+        out[at + 7] = if out[at + 7] == b'h' { b'l' } else { b'h' };
+    }
+    out
+}
+
+/// A restoration with the part that paints the buffer that is not showing cut out.
+///
+/// This removes the paint's two switches and everything between them, and returns the bytes
+/// unchanged when they are not such a restoration.
+#[must_use]
+pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
+    let Some((first, second)) = paint_switches(bytes) else {
+        return bytes.to_vec();
+    };
+    let mut cut = bytes[..first].to_vec();
+    cut.extend_from_slice(&bytes[second + 8..]);
     cut
 }
 
@@ -1260,11 +1310,158 @@ mod tests {
     }
 
     #[test]
-    fn reversing_the_switches_turns_each_mode_1049_switch_the_other_way() {
+    fn reversing_the_switches_turns_only_the_paints_switches_the_other_way() {
+        let primary = b"\x1b[!p\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[!p\x1b[?1049l\x1b[Hshowing";
         assert_eq!(
-            with_the_switches_reversed(b"a\x1b[?1049hb\x1b[?1049lc\x1b[?1047h"),
-            b"a\x1b[?1049lb\x1b[?1049hc\x1b[?1047h".to_vec()
+            with_the_switches_reversed(primary),
+            b"\x1b[!p\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[!p\x1b[?1049l\x1b[Hshowing".to_vec()
         );
+        let alternate = b"\x1b[!p\x1b[?1049h\x1b[?1049l\x1b[Hother\x1b[?1049h\x1b[Hshowing";
+        assert_eq!(
+            with_the_switches_reversed(alternate),
+            b"\x1b[!p\x1b[?1049h\x1b[?1049h\x1b[Hother\x1b[?1049l\x1b[Hshowing".to_vec()
+        );
+        assert_eq!(with_the_switches_reversed(b"plain"), b"plain".to_vec());
+    }
+
+    fn bell(at: u64, completed_at: u64) -> Caused {
+        Caused {
+            kind: SideEffectKind::Bell,
+            at,
+            completed_at,
+        }
+    }
+
+    #[test]
+    fn an_owed_effect_the_terminal_never_performed_fails_wherever_it_was_completed() {
+        // Two bells owed and neither performed: each is a failure, whatever else was happening at
+        // the byte that completed it.
+        let found = account(&[bell(9, 10), bell(19, 20)], &[]);
+        assert_eq!(found.failures.len(), 2, "{found:?}");
+        assert!(
+            found.failures[0].contains("completed at byte 10"),
+            "{found:?}"
+        );
+        assert!(
+            found.failures[1].contains("completed at byte 20"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_effect_nobody_owed_fails_beside_one_that_was_not_performed() {
+        let delivered = [Delivered {
+            cursor: 30,
+            kind: SideEffectKind::Bell,
+        }];
+        let found = account(&[bell(9, 10)], &delivered);
+        assert_eq!(found.failures.len(), 2, "{found:?}");
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("delivery at byte 30")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn two_equal_effects_are_told_apart_by_where_they_were_delivered() {
+        // The second bell arrived; the first did not.
+        let delivered = [Delivered {
+            cursor: 19,
+            kind: SideEffectKind::Bell,
+        }];
+        let found = account(&[bell(9, 10), bell(19, 20)], &delivered);
+        assert_eq!(found.failures.len(), 1, "{found:?}");
+        assert!(found.failures[0].contains("began at byte 9"), "{found:?}");
+    }
+
+    fn clipboard(content: &str, at: u64) -> Caused {
+        Caused {
+            kind: SideEffectKind::ClipboardWrite {
+                selection: kr_term::sideeffect::ClipboardSelection::Clipboard,
+                content: content.as_bytes().to_vec(),
+            },
+            at,
+            completed_at: at + 5,
+        }
+    }
+
+    fn performed(effect: &Caused) -> Delivered {
+        Delivered {
+            cursor: effect.at,
+            kind: effect.kind.clone(),
+        }
+    }
+
+    #[test]
+    fn two_effects_performed_the_other_way_round_fail() {
+        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
+        let found = account(
+            &[first.clone(), second.clone()],
+            &[performed(&second), performed(&first)],
+        );
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("out of the order")),
+            "{found:?}"
+        );
+        let in_order = account(
+            &[first.clone(), second.clone()],
+            &[performed(&first), performed(&second)],
+        );
+        assert_eq!(in_order, Account::default());
+    }
+
+    #[test]
+    fn a_reversed_pair_fails_beside_an_effect_that_was_not_performed() {
+        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
+        let found = account(
+            &[bell(4, 5), first.clone(), second.clone()],
+            &[performed(&second), performed(&first)],
+        );
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("completed at byte 5")),
+            "the bell fails: {found:?}"
+        );
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("out of the order")),
+            "the reversal fails too: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_engine_of_the_profile_finds_a_restoration_only_rendering() {
+        assert!(
+            outside_the_profile(
+                b"\x1b[!p\x1b[?1049h\x1b[Hone\x1b[?1049l\x1b[?25h\x1b]2;title\x1b\\",
+                20,
+                3
+            )
+            .is_empty()
+        );
+        // A switch of mode 47, a question, a bell and a clipboard write are each found.
+        for bytes in [
+            &b"\x1b[?47h"[..],
+            &b"\x1b[6n"[..],
+            &b"\x07"[..],
+            &b"\x1b]52;c;eA==\x1b\\"[..],
+        ] {
+            assert!(
+                !outside_the_profile(bytes, 20, 3).is_empty(),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
     }
 
     #[test]

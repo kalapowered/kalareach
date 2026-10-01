@@ -552,15 +552,14 @@ fn a_reply_held_behind_a_paste_is_dropped_when_it_has_waited_over_two_seconds() 
     ));
 }
 
-/// Section 9: a step of the wall clock moves neither decision. A reply that has waited 1.5 s is
-/// still owed after the wall clock is stepped an hour forward and then two hours back, and one that
-/// has waited 2.5 s is dropped although the wall clock was last stepped back by ten seconds.
+/// Section 9: a step of the wall clock moves neither decision. A reply that has waited half a second
+/// is still owed after the wall clock is stepped an hour forward, which a lane measuring on the wall
+/// clock would read as an hour and drop; and one that has waited 2.5 s is dropped although the wall
+/// clock was stepped back by ten seconds, which such a lane would read as no time at all.
 #[test]
 fn a_step_of_the_wall_clock_neither_drops_a_held_reply_nor_keeps_it_longer() {
     replays_as_written(&waiting_behind_a_paste(
         r#"{ "do": "step_wall", "ms": 3600000 },
-    { "do": "advance", "ms": 1000 },
-    { "do": "step_wall", "ms": -7200000 },
     { "do": "advance", "ms": 500 },"#,
         true,
     ));
@@ -571,16 +570,52 @@ fn a_step_of_the_wall_clock_neither_drops_a_held_reply_nor_keeps_it_longer() {
     ));
 }
 
-/// KR-REQ-08.49: the replies a read may write are bounded to 4 KiB, and the rest wait for a later
-/// read and are written, in order, while they are inside the two seconds they may wait.
+/// KR-REQ-08.48: a reply held behind a delimiter the person's input may be starting, a lone escape
+/// after the application turned bracketed paste on, waits until the escape is released and is then
+/// written, with the escape first. The same rule that holds it behind an open paste, on the same
+/// clock.
 #[test]
-fn replies_past_one_reads_budget_are_written_by_later_reads_while_they_are_fresh() {
+fn a_reply_held_behind_a_lone_escape_is_written_when_the_escape_is_released() {
+    let trace = Trace::parse(&format!(
+        r#"{{
+  "format": "kalareach.trace/1",
+  "name": "waiting-behind-an-escape",
+  "about": "a question asked while a lone escape may begin a paste delimiter",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "steps": [
+    {{ "do": "output", "text": "\u001b[?2004h$ " }},
+    {{ "do": "attach", "client": "a", "form": "direct" }},
+    {{ "do": "acquire", "client": "a" }},
+    {{ "do": "input", "client": "a", "text": "\u001b" }},
+    {{ "do": "take_input", "expect": [ {{ "batch": "lease_changed" }} ] }},
+    {{ "do": "output", "text": "\u001b[6n" }},
+    {{ "do": "take_input", "expect": [] }},
+    {{ "do": "advance", "ms": 100 }},
+    {{ "do": "take_input", "expect": [
+      {{ "batch": "input", "client": "a", "text": "\u001b", "paste": [] }},
+      {}
+    ] }}
+  ]
+}}"#,
+        // The cursor is after the prompt, in the third column.
+        reply(b"\x1b[1;3R")
+    ))
+    .unwrap_or_else(|error| panic!("{error}"));
+    replays_as_written(&trace);
+}
+
+/// KR-REQ-08.49: the replies one drain of the lane writes are bounded to 4 KiB, and the rest wait
+/// for a later drain and are written, in order, while they are inside the two seconds they may wait.
+#[test]
+fn replies_past_one_drains_budget_are_written_by_later_drains_while_they_are_fresh() {
     let answer = reply_to(b"\x1b[>q");
     let per_read = 4096 / answer.len();
     let asked = 200;
     assert!(
         per_read < asked,
-        "{asked} questions are more than one read writes, {per_read}"
+        "{asked} questions are more than one drain writes, {per_read}"
     );
     let batch = |count: usize| vec![reply(&answer); count].join(",");
     let mut steps = vec![format!(
@@ -608,10 +643,10 @@ fn replies_past_one_reads_budget_are_written_by_later_reads_while_they_are_fresh
     replays_as_written(&trace);
 }
 
-/// KR-REQ-08.49: and the ones that have waited past two seconds are dropped, not written by the read
-/// that comes after.
+/// KR-REQ-08.49: and the ones that have waited past two seconds are dropped, not written by the
+/// drain that comes after.
 #[test]
-fn replies_past_one_reads_budget_are_dropped_when_the_next_read_comes_after_two_seconds() {
+fn replies_past_one_drains_budget_are_dropped_when_the_next_drain_comes_after_two_seconds() {
     let answer = reply_to(b"\x1b[>q");
     let per_read = 4096 / answer.len();
     let asked = 200;
