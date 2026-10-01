@@ -1356,7 +1356,20 @@ impl WorkerService {
                         // delivery stops there rather than keeping its successor waiting.
                         let delivery = tokio::select! {
                             biased;
-                            _ = &mut outlet.replaced => break,
+                            _ = &mut outlet.replaced => {
+                                // A side effect already queued on this stream is owed to the
+                                // terminal whatever stream comes next: the one that replaces
+                                // this begins only once this has stopped, so the effect is
+                                // written first and nothing of it is lost with the queue.
+                                send_queued_effects(
+                                    &mut outlet,
+                                    &stream_id,
+                                    &mut sequence,
+                                    &mut stream,
+                                )
+                                .await;
+                                break;
+                            }
                             delivery = stream.recv() => match delivery {
                                 Some(delivery) => delivery,
                                 None => break,
@@ -1384,6 +1397,14 @@ impl WorkerService {
                                     &bytes[skip..],
                                 )
                                 .await
+                            }
+                            // A side effect is not a span of the stream, so the cut above is not
+                            // for it: whatever the screen this attachment joined on covers, an
+                            // effect the application caused after the attachment arrived is owed
+                            // to it whole.
+                            OutputDelivery::Effect { cursor, bytes } => {
+                                send_effect(&mut outlet, &stream_id, &mut sequence, cursor, &bytes)
+                                    .await
                             }
                             // A rendering is one screen at one cursor, however many frames it
                             // takes: its cursor is the state it describes rather than an offset,
@@ -7367,6 +7388,56 @@ async fn send_stream(
         at += chunk.len() as u64;
     }
     true
+}
+
+/// Writes one side effect, in frames the control stream can carry.
+///
+/// An effect is one operating-system command or one bell, and a terminal that is sent part of a
+/// command is left inside it: the next thing it is sent is read as the rest of the string. So every
+/// frame of an effect is written even when a newer subscription has replaced this delivery since
+/// the effect began, and only a withdrawal stops it. Every frame carries the cursor the sequence
+/// that caused the effect began at, because the frames are parts of one effect and not consecutive
+/// positions in a stream.
+async fn send_effect(
+    outlet: &mut Outlet,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    cursor: u64,
+    bytes: &[u8],
+) -> bool {
+    for chunk in bytes.chunks(MAX_OUTPUT_EVENT_BYTES) {
+        let event = OutputEvent {
+            cursor: U64::new(cursor),
+            bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
+        };
+        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
+        else {
+            return false;
+        };
+        *sequence += 1;
+        if !outlet.write_even_if_replaced(&notification).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Writes the side effects a replaced stream still has queued, in the order they were queued.
+///
+/// Everything else on that stream describes the screen the replacement is about to draw again.
+async fn send_queued_effects(
+    outlet: &mut Outlet,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    stream: &mut crate::output::OutputStream,
+) {
+    while let Some(delivery) = stream.try_recv() {
+        if let OutputDelivery::Effect { cursor, bytes } = delivery
+            && !send_effect(outlet, stream_id, sequence, cursor, &bytes).await
+        {
+            return;
+        }
+    }
 }
 
 /// Writes a rendering of the canonical screen, in frames the control stream can carry.

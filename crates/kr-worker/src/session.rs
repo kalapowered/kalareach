@@ -43,7 +43,7 @@ use crate::error::{Result, WorkerError};
 use crate::history::{OutputHistory, SpoolLayout};
 use crate::input::{InputLease, LeaseRefusal, PasteFramer};
 use crate::journal::Journal;
-use crate::output::{OutputHub, OutputStream};
+use crate::output::{EffectOutcome, OutputHub, OutputStream, OwedEffect};
 use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
 
@@ -120,6 +120,25 @@ pub struct CloseAcceptance {
     pub closure: Option<ClosureRecord>,
     /// True when this request began the closure rather than joining one already running.
     pub initiated: bool,
+}
+
+/// One thing a batch of output has for the attachments, in the order the application produced it.
+enum Piece {
+    /// A span of the raw stream a terminal may take unchanged, and the cursor it starts at.
+    Span(u64, Vec<u8>),
+    /// A side effect for the attachment holding the input lease.
+    Effect(OwedEffect),
+}
+
+impl Piece {
+    /// Where this piece sorts: by the cursor it began at, and a span before an effect at the same
+    /// cursor.
+    const fn order(&self) -> (u64, bool) {
+        match self {
+            Self::Span(cursor, _) => (*cursor, false),
+            Self::Effect(owed) => (owed.effect.at, true),
+        }
+    }
 }
 
 /// What ending a lease established, read on the boundary the writer shares.
@@ -3268,32 +3287,34 @@ impl Session {
         // One ordered stream. The spans a terminal may take and the side effects that belong to
         // the lease holder are two views of the same output, and the holder receives both, so they
         // are published in the order the application produced them.
-        let mut pieces: Vec<(u64, bool, Vec<u8>)> =
+        let mut pieces: Vec<Piece> =
             Vec::with_capacity(filtered.direct.len() + filtered.effects.len());
         pieces.extend(
             filtered
                 .direct
                 .into_iter()
-                .map(|(cursor, bytes)| (cursor, false, bytes)),
+                .map(|(cursor, bytes)| Piece::Span(cursor, bytes)),
         );
-        pieces.extend(
-            filtered
-                .effects
-                .into_iter()
-                .map(|(cursor, bytes)| (cursor, true, bytes)),
-        );
-        pieces.sort_by_key(|(cursor, effect, _)| (*cursor, *effect));
+        pieces.extend(filtered.effects.into_iter().map(Piece::Effect));
+        pieces.sort_by_key(Piece::order);
         let holder = self.lease.holder();
-        for (cursor, is_effect, bytes) in pieces {
-            let shared = Arc::new(bytes);
-            if is_effect {
-                if let Some(holder) = holder
-                    && self.hub.publish_to(holder, cursor, &shared, oldest)
-                {
-                    resynchronised.push(holder);
+        for piece in pieces {
+            match piece {
+                Piece::Effect(owed) => {
+                    if let Some(holder) = holder
+                        && self.hub.publish_effect(holder, &owed, oldest)
+                            == EffectOutcome::Overflowed
+                    {
+                        resynchronised.push(holder);
+                    }
                 }
-            } else {
-                resynchronised.extend(self.hub.publish_direct(cursor, &shared, oldest));
+                Piece::Span(cursor, bytes) => {
+                    resynchronised.extend(self.hub.publish_direct(
+                        cursor,
+                        &Arc::new(bytes),
+                        oldest,
+                    ));
+                }
             }
         }
 

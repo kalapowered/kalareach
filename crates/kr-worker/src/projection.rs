@@ -72,8 +72,9 @@ pub struct Filtered {
     /// history and with a snapshot's own cursor. They are not contiguous: what the engine withheld
     /// leaves a gap, which is the point.
     pub direct: Vec<(u64, Vec<u8>)>,
-    /// Bytes that belong to the one attachment holding the input lease.
-    pub effects: Vec<(u64, Vec<u8>)>,
+    /// The side effects that belong to the one attachment holding the input lease, in the order
+    /// the application caused them.
+    pub effects: Vec<crate::output::OwedEffect>,
     /// What the host owes the application, to be written into its terminal input.
     pub replies: Vec<Vec<u8>>,
     /// Where the stream stopped being something a direct attachment can take unchanged.
@@ -866,7 +867,10 @@ impl TerminalEngine {
             match effect.destination {
                 kr_term::sideeffect::SideEffectDestination::Attachment { .. } => {
                     if let Some(rendered) = crate::render::side_effect(&effect.kind) {
-                        filtered.effects.push((effect.at, rendered));
+                        filtered.effects.push(crate::output::OwedEffect {
+                            effect: effect.clone(),
+                            bytes: std::sync::Arc::new(rendered),
+                        });
                     }
                 }
                 // Nothing holds the lease, so there is no terminal this belongs to. It is reported
@@ -972,7 +976,7 @@ mod tests {
         let filtered = engine.feed(0, b"\x07", LaneGate::default(), 0);
         assert!(filtered.direct.is_empty(), "nothing is broadcast");
         assert_eq!(filtered.effects.len(), 1);
-        assert_eq!(filtered.effects[0].1, vec![0x07]);
+        assert_eq!(*filtered.effects[0].bytes, vec![0x07]);
         assert!(filtered.host_events.is_empty());
     }
 

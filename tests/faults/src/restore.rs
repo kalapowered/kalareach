@@ -817,7 +817,8 @@ impl Stage {
             };
             stream.written(delivery.len());
             match delivery {
-                OutputDelivery::Bytes { cursor, bytes } => {
+                OutputDelivery::Bytes { cursor, bytes }
+                | OutputDelivery::Effect { cursor, bytes } => {
                     if client.form == Form::Projected {
                         let at = self.fed;
                         self.fail(

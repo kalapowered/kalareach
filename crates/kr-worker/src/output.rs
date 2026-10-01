@@ -18,6 +18,7 @@ use kr_protocol::ids::AttachmentId;
 use kr_protocol::recovery::{ResyncReason, ResyncRequired};
 use kr_protocol::scalars::U64;
 use kr_protocol::session::ClosureRecord;
+use kr_term::sideeffect::SideEffect;
 use tokio::sync::mpsc;
 
 /// The bound on one subscriber's queued bytes.
@@ -37,6 +38,18 @@ pub enum OutputDelivery {
         /// The cursor these bytes start at.
         cursor: u64,
         /// The bytes. Shared, because every subscriber receives the same ones.
+        bytes: Arc<Vec<u8>>,
+    },
+    /// One side effect, rendered for the terminal of the attachment that holds the input lease.
+    ///
+    /// It is not a span of the output stream either: its cursor is where the sequence that caused it
+    /// began, and its bytes are what performs it, which need not be as long as that sequence was. A
+    /// span can be cut at a cursor; an effect is delivered whole or not at all, because a clipboard
+    /// write cut part way is a terminal left inside an operating-system command.
+    Effect {
+        /// The cursor the sequence that caused it began at.
+        cursor: u64,
+        /// The bytes that perform it.
         bytes: Arc<Vec<u8>>,
     },
     /// A rendering of the canonical screen as it stands at one cursor.
@@ -104,7 +117,9 @@ impl OutputDelivery {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
+            Self::Bytes { bytes, .. } | Self::Effect { bytes, .. } | Self::Screen { bytes, .. } => {
+                bytes.len()
+            }
             Self::Projection { bytes, .. }
             | Self::AgentResource { bytes, .. }
             | Self::AgentInstance { bytes, .. } => *bytes,
@@ -118,6 +133,33 @@ impl OutputDelivery {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// A side effect and the bytes that perform it on a terminal.
+///
+/// The effect keeps what the engine routed: its destination names the attachment that held the
+/// input lease, and the lease epoch it held it at, so whoever delivers it can tell that the lease has
+/// since moved and the effect has no destination left. What cannot be delivered is recorded from
+/// the effect itself, so nothing is rebuilt from the bytes.
+#[derive(Clone, Debug)]
+pub struct OwedEffect {
+    /// What the application asked for, where its sequence began and where the engine routed it.
+    pub effect: SideEffect,
+    /// The bytes that perform it on a terminal.
+    pub bytes: Arc<Vec<u8>>,
+}
+
+/// What became of one effect offered to a subscriber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectOutcome {
+    /// It is on the subscriber's queue.
+    Queued,
+    /// The queue had no room: the subscriber has been told to resynchronise, and the effect is not
+    /// on its queue.
+    Overflowed,
+    /// There is nothing to queue it on: no subscription, one that has been told to resynchronise
+    /// and has not come back, or one whose end has gone.
+    Refused,
 }
 
 /// One attachment's copy of how its session closed.
@@ -558,20 +600,50 @@ impl OutputHub {
         resynchronised
     }
 
-    /// Delivers bytes to one subscriber.
+    /// Offers one side effect to the subscriber that is its destination.
     ///
-    /// This is how anything computed for a single attachment reaches it: the rendering of the
-    /// canonical screen a terminal of another size is shown, and the side effects that belong to
-    /// the one attachment holding the input lease. Returns whether the subscriber was told to
-    /// resynchronise.
-    pub fn publish_to(
+    /// The destination is the attachment holding the input lease, and the effect is for that
+    /// attachment alone. It is queued, like any other delivery, only while the subscriber is
+    /// keeping up: a queue with no room for it tells the subscriber to resynchronise, and a
+    /// subscriber that has been told to is sent nothing more until it comes back. Either way the
+    /// effect is not on a queue, and the outcome says so, because what becomes of it is the
+    /// caller's to decide: an effect nobody can be sent is a durable host event, not a loss.
+    pub fn publish_effect(
         &mut self,
         attachment_id: AttachmentId,
-        cursor: u64,
-        bytes: &Arc<Vec<u8>>,
+        owed: &OwedEffect,
         oldest_retained_cursor: u64,
-    ) -> bool {
-        self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, false)
+    ) -> EffectOutcome {
+        let cursor = owed.effect.at;
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return EffectOutcome::Refused;
+        };
+        if subscriber.resynchronising {
+            return EffectOutcome::Refused;
+        }
+        let queued = subscriber.queued.load(Ordering::Acquire);
+        if queued.saturating_add(owed.bytes.len()) > subscriber.limit {
+            if !subscriber.resynchronise(
+                ResyncReason::SendQueueFull,
+                cursor,
+                oldest_retained_cursor,
+            ) {
+                self.subscribers.remove(&attachment_id);
+            }
+            return EffectOutcome::Overflowed;
+        }
+        subscriber
+            .queued
+            .fetch_add(owed.bytes.len(), Ordering::AcqRel);
+        let delivery = OutputDelivery::Effect {
+            cursor,
+            bytes: Arc::clone(&owed.bytes),
+        };
+        if subscriber.sender.send(delivery).is_err() {
+            self.subscribers.remove(&attachment_id);
+            return EffectOutcome::Refused;
+        }
+        EffectOutcome::Queued
     }
 
     /// Delivers one attachment event to the subscriber it is about.
@@ -596,7 +668,7 @@ impl OutputHub {
         bytes: &Arc<Vec<u8>>,
         oldest_retained_cursor: u64,
     ) -> bool {
-        self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, true)
+        self.deliver_screen(attachment_id, cursor, bytes, oldest_retained_cursor)
     }
 
     /// Delivers one projection event to one subscriber.
@@ -731,13 +803,12 @@ impl OutputHub {
         false
     }
 
-    fn deliver_one(
+    fn deliver_screen(
         &mut self,
         attachment_id: AttachmentId,
         cursor: u64,
         bytes: &Arc<Vec<u8>>,
         oldest_retained_cursor: u64,
-        screen: bool,
     ) -> bool {
         let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
             return false;
@@ -757,16 +828,9 @@ impl OutputHub {
             return true;
         }
         subscriber.queued.fetch_add(bytes.len(), Ordering::AcqRel);
-        let delivery = if screen {
-            OutputDelivery::Screen {
-                cursor,
-                bytes: Arc::clone(bytes),
-            }
-        } else {
-            OutputDelivery::Bytes {
-                cursor,
-                bytes: Arc::clone(bytes),
-            }
+        let delivery = OutputDelivery::Screen {
+            cursor,
+            bytes: Arc::clone(bytes),
         };
         if subscriber.sender.send(delivery).is_err() {
             self.subscribers.remove(&attachment_id);
@@ -1116,6 +1180,98 @@ mod tests {
             }))
         ));
         assert_eq!(fresh.queued_bytes(), RESYNC_MARKER_BYTES);
+    }
+
+    fn owed(bytes: &[u8], at: u64) -> OwedEffect {
+        OwedEffect {
+            effect: SideEffect {
+                kind: kr_term::sideeffect::SideEffectKind::Bell,
+                destination: kr_term::sideeffect::SideEffectDestination::Attachment {
+                    id: identifier(1),
+                    epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+                },
+                at,
+            },
+            bytes: Arc::new(bytes.to_vec()),
+        }
+    }
+
+    /// An effect is its own delivery: it keeps the cursor its sequence began at, it is charged to the
+    /// subscriber's queue like any other bytes, and reading it gives them back.
+    #[test]
+    fn a_side_effect_is_queued_as_an_effect_and_charged() {
+        let mut hub = OutputHub::new();
+        let mut stream = hub.subscribe(identifier(1), 64, Presentation::Direct);
+        assert_eq!(
+            hub.publish_effect(identifier(1), &owed(b"\x1b]52;c;eA==\x1b\\", 40), 0),
+            EffectOutcome::Queued
+        );
+        assert_eq!(stream.queued_bytes(), 13);
+        let delivery = stream.try_recv().expect("the effect is queued");
+        assert_eq!(delivery.len(), 13);
+        assert!(
+            matches!(&delivery, OutputDelivery::Effect { cursor: 40, bytes } if bytes.len() == 13),
+            "{delivery:?}"
+        );
+        stream.written(delivery.len());
+        assert_eq!(stream.queued_bytes(), 0);
+    }
+
+    /// A queue with no room for an effect tells the subscriber to resynchronise, once, and the effect
+    /// is reported as not queued so that its caller can record it.
+    #[test]
+    fn an_effect_that_does_not_fit_tells_the_subscriber_to_resynchronise() {
+        let mut hub = OutputHub::new();
+        let mut stream = hub.subscribe(identifier(1), 8, Presentation::Direct);
+        assert_eq!(
+            hub.publish_effect(identifier(1), &owed(&[0x07; 9], 3), 0),
+            EffectOutcome::Overflowed
+        );
+        assert!(hub.is_resynchronising(identifier(1)));
+        assert!(matches!(
+            stream.try_recv(),
+            Some(OutputDelivery::Resync(ResyncRequired {
+                reason: ResyncReason::SendQueueFull,
+                ..
+            }))
+        ));
+        assert!(
+            stream.try_recv().is_none(),
+            "the effect is not on the queue"
+        );
+    }
+
+    /// A subscriber that has been told to resynchronise is sent nothing more until it comes back,
+    /// effects included, and the outcome says so rather than dropping the effect unseen.
+    #[test]
+    fn an_effect_for_a_resynchronising_subscriber_is_refused() {
+        let mut hub = OutputHub::new();
+        let mut stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        hub.require_resync(identifier(1), ResyncReason::ProjectionReset, 0, 0);
+        assert_eq!(
+            hub.publish_effect(identifier(1), &owed(&[0x07], 1), 0),
+            EffectOutcome::Refused
+        );
+        assert_eq!(stream.queued_bytes(), RESYNC_MARKER_BYTES);
+        assert!(matches!(stream.try_recv(), Some(OutputDelivery::Resync(_))));
+        assert!(stream.try_recv().is_none());
+    }
+
+    /// An effect for an attachment with no subscription, or whose end has gone, is refused, and the
+    /// subscriber that has gone is removed.
+    #[test]
+    fn an_effect_for_nobody_is_refused() {
+        let mut hub = OutputHub::new();
+        assert_eq!(
+            hub.publish_effect(identifier(1), &owed(&[0x07], 1), 0),
+            EffectOutcome::Refused
+        );
+        drop(hub.subscribe(identifier(2), 1024, Presentation::Direct));
+        assert_eq!(
+            hub.publish_effect(identifier(2), &owed(&[0x07], 1), 0),
+            EffectOutcome::Refused
+        );
+        assert!(hub.is_empty(), "the subscriber that went is removed");
     }
 
     #[test]

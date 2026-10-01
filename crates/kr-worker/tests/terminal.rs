@@ -616,6 +616,35 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
     );
 }
 
+/// The clipboard write the tests below split in half: `secret`, as the host renders it.
+const CLIPBOARD_WRITE: &[u8] = b"\x1b]52;c;c2VjcmV0\x1b\\";
+
+/// The application begins a clipboard write, waits for a line, and finishes it.
+const SPLIT_CLIPBOARD_WRITE: &str = "stty -echo -echonl || exit 1; printf '\\033]52;c;c2Vj'; read -r _; \
+     printf 'cmV0\\033\\\\kr-rang.\\n'; read -r _";
+
+/// KR-REQ-08.06, KR-REQ-08.38: a side effect that began before a terminal of another size joined,
+/// and was completed after, reaches the terminal holding the input lease whole. It is neither
+/// dropped, because the screen the terminal joined on already covers the cursor the sequence began
+/// at, nor cut where that screen ends: an operating-system command that is sent in part leaves the
+/// terminal inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_side_effect_begun_before_a_terminal_joined_reaches_its_holder_whole() {
+    let host = host(SPLIT_CLIPBOARD_WRITE).await;
+    produced(&host.runtime, b"]52;c;c2Vj").await;
+    // Another size, so it is served a projection for as long as it is attached, and takes the keys.
+    let (mut holder, presentation, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(40, 12)).await;
+    assert_eq!(presentation, Some(TerminalPresentationMode::Viewport));
+    keys.release(&host.runtime);
+    let (bytes, _, _) = collect_projection_until(&mut holder, "kr-rang.").await;
+    assert!(
+        carries(&bytes, CLIPBOARD_WRITE),
+        "the clipboard write reaches the terminal holding the lease whole: {}",
+        String::from_utf8_lossy(&bytes).escape_debug()
+    );
+}
+
 /// KR-REQ-08.38, KR-REQ-08.06: with nobody holding the input lease a side effect has no
 /// destination, so it is recorded as a durable host event and reaches no attached terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
