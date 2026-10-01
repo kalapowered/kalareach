@@ -50,6 +50,15 @@ impl CommandError {
         }
     }
 
+    /// The failure for something this application cannot do on this device or in this build.
+    ///
+    /// The words say what is missing and nothing the person does supplies it, so, as for any cause
+    /// the application knows, they ask nothing more: waiting would not bring it.
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::stated(ErrorCode::ResourceUnavailable, message)
+    }
+
     /// The failure for a request this application refuses to make at all.
     #[must_use]
     pub fn refused(message: impl Into<String>) -> Self {
@@ -163,6 +172,18 @@ mod tests {
             action(&CommandError::too_large("the image exceeds the limit")),
             "nothing"
         );
+        // The limit is said in megabytes, and nothing on a phone points at a window to drop it on.
+        assert!(
+            error.message.contains("at most 64 MiB"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.message.contains("drop a larger one on the window"),
+            !cfg!(mobile),
+            "{}",
+            error.message
+        );
     }
 
     /// A dropped folder is not a file, and the words say so: an update would not change it.
@@ -186,6 +207,13 @@ mod tests {
         assert_eq!(
             (refused.code, action(&refused)),
             (ErrorCode::PermissionDenied, "nothing")
+        );
+        // Something this build cannot do keeps the code a host would give for what it cannot reach,
+        // and asks no waiting for it.
+        let unsupported = CommandError::unsupported("this build cannot open a voice call");
+        assert_eq!(
+            (unsupported.code, action(&unsupported)),
+            (ErrorCode::ResourceUnavailable, "nothing")
         );
     }
 

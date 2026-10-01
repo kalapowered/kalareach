@@ -124,7 +124,7 @@ impl AudioDevice {
     where
         F: FnMut(&[i16]) + Send + 'static,
     {
-        Err(CommandError::unavailable(
+        Err(CommandError::unsupported(
             "this platform has no desktop audio backend yet; use an iOS or Android device",
         ))
     }
