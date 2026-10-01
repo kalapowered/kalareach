@@ -131,15 +131,83 @@ final class ProbeSupportTests: XCTestCase {
         XCTAssertEqual(sorted.matching.count, 0)
     }
 
-    // MARK: One report
+    // MARK: How the push check ends
 
-    func testOnlyTheFirstClaimReports() {
-        var report = OneReport()
-        XCTAssertFalse(report.claimed)
-        XCTAssertTrue(report.claim())
-        XCTAssertTrue(report.claimed)
-        XCTAssertFalse(report.claim(), "a late answer after a timeout leaves nothing behind")
-        XCTAssertFalse(report.claim())
+    /// What a report did: the order of its effects and what each held.
+    private final class Effects {
+        var log: [String] = []
+        var files: [[String: String]] = []
+        var finished: [[String: String]] = []
+    }
+
+    private func report(_ effects: Effects) -> PushCheckReport {
+        PushCheckReport(
+            nonce: "nonce-1",
+            group: "TEAM.to.kala.reach",
+            writeFile: { data in
+                effects.log.append("file")
+                effects.files.append((try? JSONSerialization.jsonObject(with: data)) as? [String: String] ?? [:])
+            },
+            finish: { facts in
+                effects.log.append("finish")
+                effects.finished.append(facts)
+            }
+        )
+    }
+
+    func testATokenIsFiledBeforeTheCheckReportsAndReportsOnce() {
+        let effects = Effects()
+        var check = report(effects)
+        check.token("fcm-1", facts: ["a": "1"])
+        XCTAssertEqual(effects.log, ["file", "finish"], "a reader that waits for the report finds the file")
+        XCTAssertEqual(effects.files, [["nonce": "nonce-1", "group": "TEAM.to.kala.reach", "fcm_token": "fcm-1"]])
+        XCTAssertEqual(effects.finished.first?["token"], "ready")
+        XCTAssertEqual(effects.finished.first?["a"], "1")
+        // A second answer from Firebase changes nothing.
+        check.token("fcm-2", facts: [:])
+        check.failed(facts: [:], domain: "d", code: 1)
+        XCTAssertEqual(effects.log, ["file", "finish"])
+    }
+
+    func testATimeoutThenALateTokenLeavesNoFileAndReportsNothingMore() {
+        let effects = Effects()
+        var check = report(effects)
+        check.timedOut(facts: [:], state: "awaitingPermission", permission: "unknown")
+        check.token("late", facts: [:])
+        XCTAssertEqual(effects.log, ["finish"], "the late token filed nothing")
+        XCTAssertEqual(effects.files.count, 0)
+        XCTAssertEqual(effects.finished.count, 1)
+        XCTAssertEqual(effects.finished.first?["token"], "timeout")
+        XCTAssertEqual(effects.finished.first?["state"], "awaitingPermission")
+        XCTAssertEqual(effects.finished.first?["permission"], "unknown")
+    }
+
+    func testARefusalThenALateTokenLeavesNoFile() {
+        let effects = Effects()
+        var check = report(effects)
+        check.refused(facts: ["x": "y"])
+        check.token("late", facts: [:])
+        XCTAssertEqual(effects.log, ["finish"])
+        XCTAssertEqual(effects.finished.first?["permission"], "refused")
+        XCTAssertEqual(effects.finished.first?["x"], "y")
+    }
+
+    func testAnErrorIsReportedByItsDomainAndCodeAndAnythingLaterIsIgnored() {
+        let effects = Effects()
+        var check = report(effects)
+        check.failed(facts: [:], domain: "com.firebase.installations", code: 501)
+        check.token("late", facts: [:])
+        XCTAssertEqual(effects.log, ["finish"])
+        XCTAssertEqual(effects.finished.first?["token"], "error")
+        XCTAssertEqual(effects.finished.first?["token.error"], "com.firebase.installations/501")
+    }
+
+    func testTheCheckKnowsWhenItHasReported() {
+        let effects = Effects()
+        var check = report(effects)
+        XCTAssertFalse(check.reported)
+        check.refused(facts: [:])
+        XCTAssertTrue(check.reported)
     }
 }
 #endif

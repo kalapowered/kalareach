@@ -28,6 +28,20 @@ enum PushRegistrationState: Equatable {
     case failed(reason: String)
 }
 
+extension PushRegistrationState {
+    /// What state this is, without the token or the reason: a token is a secret of this device, and
+    /// a check reports it only as a digest.
+    var name: String {
+        switch self {
+        case .idle: return "idle"
+        case .awaitingPermission: return "awaitingPermission"
+        case .refused: return "refused"
+        case .registered: return "registered"
+        case .failed: return "failed"
+        }
+    }
+}
+
 /// Where the person's answer to the notification permission stands.
 enum PushPermission: Equatable {
     /// Not known yet: the person has not been asked, or the answer has not been read.
@@ -58,13 +72,15 @@ final class PushRegistration: NSObject {
     /// answered, and goes on only once they have agreed. Called again for a token that changes.
     var onTokenUsable: ((Data) -> Void)?
 
-    /// Whether Firebase has been given this device's APNs token, which is what a registration token
-    /// needs before it can be asked for: one made earlier was made for an APNs token that may since
-    /// have changed, and a message sent to it cannot be delivered. Withdrawn when the person takes
-    /// their agreement back and when the system refuses to register; given again with a new token.
+    /// Whether the current APNs token has been handed to Firebase.
     ///
-    /// Nothing here keeps a registration token. The one a message is sent to is asked of Firebase
-    /// when this is true, so it is always made for the APNs token that is current.
+    /// A registration token is made for one APNs token, so one is asked of Firebase only when this
+    /// is true, and a message is sent to a token made for the APNs token the system gave last. It is
+    /// withdrawn when the person takes their agreement back and when the system refuses to
+    /// register, and it is true again once a new token has been handed over.
+    ///
+    /// Nothing here keeps a registration token: Firebase holds them, and gives back one it made
+    /// earlier only for the same APNs token.
     private(set) var tokenHandedToFirebase = false
 
     /// Asks for permission and, if it is given, for a token.

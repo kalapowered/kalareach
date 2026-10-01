@@ -102,4 +102,9 @@ final class LaunchPlanTests: XCTestCase {
         XCTAssertEqual(PushPermission(status: .denied), .refused)
         XCTAssertEqual(PushPermission(status: .notDetermined), .unknown)
     }
+
+    func testASettingThisCodeDoesNotKnowWaitsRatherThanAgrees() throws {
+        let later = try XCTUnwrap(UNAuthorizationStatus(rawValue: 99))
+        XCTAssertEqual(PushPermission(status: later), .unknown)
+    }
 }
