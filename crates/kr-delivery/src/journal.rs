@@ -69,14 +69,16 @@ use crate::error::{DeliveryError, Result};
 /// notification in the table itself, and keeps with each notification when its outcome is next
 /// asked about. Version 7 adds the stamp of the stored credential an external destination sends
 /// with, and binds a destination to it only when it has one, so every binding version 6 computed
-/// is computed the same way. A version 6 journal is brought forward in place, once, when it is
-/// opened ([`migrate_from_6`]); a journal written under any other version is refused rather than
-/// read with the columns of another shape, matched against bindings this build no longer computes
-/// the same way, or trusted to hold no request it should not.
-const SCHEMA_VERSION: i64 = 7;
+/// is computed the same way. Version 8 adds the time privacy mode was last turned off, which is
+/// how a decision made while it was on is told from one made after. A journal written under
+/// version 6 or 7 is brought forward in place, once, when it is opened ([`migrate_forward`]); a
+/// journal written under any other version is refused rather than read with the columns of
+/// another shape, matched against bindings this build no longer computes the same way, or trusted
+/// to hold no request it should not.
+const SCHEMA_VERSION: i64 = 8;
 
-/// The one earlier schema this build brings forward rather than refusing.
-const PREVIOUS_SCHEMA_VERSION: i64 = 6;
+/// The oldest schema this build brings forward rather than refusing.
+const OLDEST_SCHEMA_VERSION: i64 = 6;
 
 /// The binding a notification is given when its destination is removed while an attempt is on the
 /// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
@@ -409,6 +411,29 @@ impl std::fmt::Display for DeliveryState {
     }
 }
 
+/// Where the journal stands on privacy mode: the generation it last recorded, and whether it is
+/// fenced at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivacyStanding {
+    /// The generation the journal last recorded.
+    pub generation: u64,
+    /// Whether the outbox is fenced.
+    pub fenced: bool,
+}
+
+/// One underlying event taken while privacy mode is on, with the alerts it warrants
+/// ([`DeliveryJournal::take_private`]).
+#[derive(Clone, Debug)]
+pub struct PrivateEntry {
+    /// The event, taken with no notice.
+    pub event: TakenEvent,
+    /// The alerts, one for each destination that is told. None records an event that warranted
+    /// nothing.
+    pub records: Vec<DeliveryRecord>,
+    /// What those alerts spent from each destination's allowance.
+    pub spent: Vec<(DestinationId, StoredBudget)>,
+}
+
 /// One notification or external message as the journal holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveryRecord {
@@ -622,9 +647,8 @@ pub enum Claim {
 pub enum ClaimRefusal {
     /// The delivery is not in this journal.
     Missing,
-    /// Privacy mode has stopped this environment's outbox.
-    Fenced,
-    /// The record belongs to a privacy generation that is no longer in force.
+    /// The record belongs to a privacy generation that is no longer in force, which is every record
+    /// admitted before privacy mode fenced the outbox.
     WrongGeneration,
     /// Something else moved the record since it was selected.
     NotEligible,
@@ -640,7 +664,6 @@ impl ClaimRefusal {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Missing => "the delivery is no longer in this journal",
-            Self::Fenced => "privacy mode has stopped this environment's outbox",
             Self::WrongGeneration => "the record belongs to a privacy generation that has passed",
             Self::NotEligible => "another pass moved the record since it was selected",
             Self::NotDue => "the next attempt is not due yet",
@@ -741,8 +764,8 @@ impl DeliveryJournal {
                 journal.check_schema()?;
                 Ok(journal)
             }
-            Some(PREVIOUS_SCHEMA_VERSION) => {
-                migrate_from_6(&mut connection)?;
+            Some(version) if (OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
+                migrate_forward(&mut connection)?;
                 let journal = Self { connection };
                 journal.check_schema()?;
                 Ok(journal)
@@ -899,6 +922,37 @@ impl DeliveryJournal {
         events: &[TakenEvent],
         cursor: u64,
     ) -> Result<usize> {
+        self.take_events_in(consumer, events, cursor, None)
+    }
+
+    /// Takes a page of underlying events as [`Self::take_events`] does, only while the journal is
+    /// at generation `under`.
+    ///
+    /// A caller that decided what to take from the privacy state it read says which generation
+    /// that was, and the journal checks it inside the transaction that writes: a state that moved
+    /// in between takes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::take_events`], and [`DeliveryError::LateResult`] when the journal is at another
+    /// generation.
+    pub fn take_events_under(
+        &mut self,
+        consumer: &str,
+        events: &[TakenEvent],
+        cursor: u64,
+        under: u64,
+    ) -> Result<usize> {
+        self.take_events_in(consumer, events, cursor, Some(under))
+    }
+
+    fn take_events_in(
+        &mut self,
+        consumer: &str,
+        events: &[TakenEvent],
+        cursor: u64,
+        under: Option<u64>,
+    ) -> Result<usize> {
         if !self.is_registered(consumer)? {
             return Err(DeliveryError::NotAuthorised(format!(
                 "{consumer} has not registered, so it has no claim on collection"
@@ -914,6 +968,12 @@ impl DeliveryJournal {
         )?;
         if fenced != 0 {
             return Err(DeliveryError::Fenced);
+        }
+        if let Some(under) = under.filter(|under| *under != as_u64(generation)) {
+            return Err(DeliveryError::LateResult {
+                produced_under: under,
+                in_force: as_u64(generation),
+            });
         }
         let mut taken = 0usize;
         for event in events {
@@ -948,6 +1008,102 @@ impl DeliveryJournal {
         )?;
         transaction.commit()?;
         Ok(taken)
+    }
+
+    /// Takes one underlying event while privacy mode is on, and admits the alerts it warrants, in
+    /// one transaction.
+    ///
+    /// Privacy mode fences every queue that carries content, and what a pending question or
+    /// approval still owes is an alert that carries none. This is the one way anything is written
+    /// under the fence: it is refused unless the journal is fenced at generation `under`, the
+    /// event is recorded as decided with no notice at all, and every record it admits is checked
+    /// here to be what privacy mode lets through: a notification to a paired device, whose request
+    /// holds no preview, or one this host collapsed or refused, which holds nothing. Everything
+    /// else is refused whole. A row admitted here is of the fence's generation, and no row of that
+    /// generation can be admitted any other way, which is what lets every other read and write
+    /// treat a row of the generation in force as the alert it is.
+    ///
+    /// An event this journal has already taken writes nothing and returns `false`, so a host that
+    /// stopped before it told the source is handed the announcement again and admits nothing twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::NotAuthorised`] when the consumer has not registered or a record is
+    /// not an alert, [`DeliveryError::LateResult`] when the journal is not fenced at `under`, and
+    /// [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn take_private(
+        &mut self,
+        consumer: &str,
+        entry: &PrivateEntry,
+        cursor: u64,
+        under: u64,
+    ) -> Result<bool> {
+        if !self.is_registered(consumer)? {
+            return Err(DeliveryError::NotAuthorised(format!(
+                "{consumer} has not registered, so it has no claim on collection"
+            )));
+        }
+        if !entry.event.notice.is_empty() {
+            return Err(DeliveryError::NotAuthorised(
+                "an event taken while privacy mode is on holds no notice".to_owned(),
+            ));
+        }
+        for record in &entry.records {
+            check_alert(record, under)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (generation, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if fenced == 0 || as_u64(generation) != under {
+            return Err(DeliveryError::LateResult {
+                produced_under: under,
+                in_force: as_u64(generation),
+            });
+        }
+        let event = &entry.event;
+        let changed = transaction.execute(
+            "INSERT INTO delivery_events
+                 (event_key, source, source_cursor, session_id, recorded_at_ms, taken_seq,
+                  notice, produced, privacy_generation, decision)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     (SELECT COALESCE(MAX(taken_seq), 0) + 1 FROM delivery_events), NULL, 1,
+                     ?6, ?7)
+             ON CONFLICT (event_key) DO NOTHING",
+            params![
+                event.key.stored(),
+                event.key.source().as_str(),
+                as_i64(event.source_cursor),
+                event.session_id.map(|id| id.to_string()),
+                as_i64(event.recorded_at_ms.get()),
+                generation,
+                if entry.records.is_empty() {
+                    DECISION_NOTHING
+                } else {
+                    DECISION_PRODUCED
+                },
+            ],
+        )?;
+        if changed > 0 {
+            for record in &entry.records {
+                admit_alert_in(&transaction, record)?;
+            }
+            for (destination, budget) in &entry.spent {
+                record_budget_in(&transaction, destination, budget)?;
+            }
+        }
+        transaction.execute(
+            "UPDATE delivery_consumers
+                SET cursor = MAX(cursor, ?2), applied = applied + ?3
+              WHERE consumer = ?1",
+            params![consumer, as_i64(cursor), as_i64(changed as u64)],
+        )?;
+        transaction.commit()?;
+        Ok(changed > 0)
     }
 
     /// Returns whether this journal has taken one underlying event.
@@ -1628,10 +1784,10 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (generation, fenced): (i64, i64) = transaction.query_row(
-            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        let generation: i64 = transaction.query_row(
+            "SELECT generation FROM delivery_privacy WHERE id = 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
         type Row = (
             String,
@@ -1692,9 +1848,9 @@ impl DeliveryJournal {
         else {
             return Ok(Claim::Refused(ClaimRefusal::Missing));
         };
-        if fenced != 0 {
-            return Ok(Claim::Refused(ClaimRefusal::Fenced));
-        }
+        // The generation alone decides, fenced or not. Content admitted before privacy mode fenced
+        // the outbox is of an earlier generation, and the only rows of the generation the fence
+        // stands at are the alerts privacy mode lets through ([`DeliveryJournal::take_private`]).
         if record_generation != generation {
             return Ok(Claim::Refused(ClaimRefusal::WrongGeneration));
         }
@@ -1895,12 +2051,12 @@ impl DeliveryJournal {
         // and the row would stop counting as outstanding while the gateway was still retrying it.
         // What is left instead is what is true: an outcome nobody knows, when the attempt reached
         // the gateway, and a cancellation when it did not.
-        let (generation, fenced): (i64, i64) = transaction.query_row(
-            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        let generation: i64 = transaction.query_row(
+            "SELECT generation FROM delivery_privacy WHERE id = 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
-        let walked_past = fenced != 0 || record_generation != as_u64(generation);
+        let walked_past = record_generation != as_u64(generation);
         let transition = &if walked_past && !transition.state.is_settled() {
             Transition {
                 state: if left_this_host {
@@ -2043,12 +2199,13 @@ impl DeliveryJournal {
     /// transaction. What this read is for is choosing which records to try to claim, and for a
     /// caller that wants to see what the outbox is holding.
     ///
-    /// A fenced outbox returns nothing: privacy mode stops the queue reaching anything outside
-    /// this host at once, and that is expressed by the read rather than by every caller
-    /// remembering to ask. Nor does a record admitted under an earlier generation, which is
-    /// content privacy mode has already walked past, and nor does one whose own expiry has
-    /// passed: section 16 stops retrying at expiry, and the read is where that is kept rather
-    /// than every sender remembering it.
+    /// Only rows of the generation in force are offered: privacy mode stops the queue reaching
+    /// anything outside this host at once by starting a new generation, and that is expressed by
+    /// the read rather than by every caller remembering to ask. While the outbox is fenced the
+    /// generation in force is the fence's, and the rows of it are the alerts privacy mode lets
+    /// through. A record admitted under an earlier generation is content privacy mode has already
+    /// walked past, and nor is one whose own expiry has passed offered: section 16 stops retrying
+    /// at expiry, and the read is where that is kept rather than every sender remembering it.
     ///
     /// A record with no request left is selected only when what is due is a status question,
     /// which carries the notification identifier and nothing else. Anything that would present a
@@ -2064,9 +2221,6 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn due(&self, now_ms: u64, each: usize) -> Result<Vec<DueDelivery>> {
-        if self.is_fenced()? {
-            return Ok(Vec::new());
-        }
         let generation = self.generation()?;
         let mut due = Vec::new();
         for kind in [
@@ -2257,7 +2411,8 @@ impl DeliveryJournal {
         Ok(as_u64(generation))
     }
 
-    /// Takes back everything admitted and not dispatched.
+    /// Takes back everything admitted and not dispatched, under a generation before the one in
+    /// force.
     ///
     /// The dispatch fact decides, not the state. A record waiting for its next attempt may be one
     /// nothing has sent, which is taken back; or it may be a notification the gateway is holding,
@@ -2269,6 +2424,10 @@ impl DeliveryJournal {
     /// two a record becomes is decided by the kind it was admitted for, never by what its
     /// destination identifier is configured as now. Every one of them loses its request bytes.
     ///
+    /// While the outbox is fenced, the alerts privacy mode lets through are of the generation in
+    /// force and are left alone, so that running this again, as every start does, takes back only
+    /// what the fence found.
+    ///
     /// Returns how many were taken back and how much had already left this host and cannot be.
     ///
     /// # Errors
@@ -2278,80 +2437,39 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = generations_before_the_fence(&transaction)?;
         let in_flight: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM delivery_notifications
-              WHERE state IN ('in_flight', 'outcome_unknown')
-                 OR (dispatched = 1 AND state IN ('admitted', 'retrying'))",
-            [],
+              WHERE (state IN ('in_flight', 'outcome_unknown')
+                     OR (dispatched = 1 AND state IN ('admitted', 'retrying')))
+                AND privacy_generation < ?1",
+            params![before],
             |row| row.get(0),
         )?;
-        // Every record still waiting for an attempt, with the kind it was admitted for. What has
-        // left and can still be asked about is left in a state a reconciliation resolves; what
-        // has left and cannot is marked as the uncertainty it is; what never left is taken back.
-        // Each is settled the way any other settlement is, so each loses its request, its outbox
-        // row and any collapse window it can no longer fill.
-        let waiting: Vec<(String, i64, i64, String)> = {
-            let mut statement = transaction.prepare(
-                "SELECT notification_id, attempts, dispatched, destination_kind
-                   FROM delivery_notifications
-                  WHERE state IN ('admitted', 'retrying')
-                  ORDER BY admitted_at_ms",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
-            let mut waiting = Vec::new();
-            for row in rows {
-                waiting.push(row?);
-            }
-            waiting
-        };
-        let mut cancelled = 0_u64;
-        for (identifier, attempts, dispatched, kind) in waiting {
-            let kind =
-                DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
-                    "a stored destination kind is not one this build writes",
-                ))?;
-            if dispatched == 0 {
-                settle_in(
-                    &transaction,
-                    &identifier,
-                    as_u64(attempts),
-                    now_ms,
-                    DeliveryState::Cancelled,
-                    "privacy mode took this back before it was dispatched",
-                )?;
-                cancelled += 1;
-            } else {
-                settle_in(
-                    &transaction,
-                    &identifier,
-                    as_u64(attempts),
-                    now_ms,
-                    unresolved_for(kind),
-                    "privacy mode stopped this after it had already left this host",
-                )?;
-            }
-        }
+        let cancelled = cancel_waiting_in(&transaction, before, now_ms)?;
         // An event taken and not yet produced from is a notification this host has not built. It
         // is decided here rather than left pending: after the fence lifts, producing from it
         // would give content captured before the boundary the generation that came after it.
         transaction.execute(
-            "UPDATE delivery_events SET produced = 1, decision = ?1 WHERE produced = 0",
-            params![DECISION_CANCELLED],
+            "UPDATE delivery_events SET produced = 1, decision = ?1
+              WHERE produced = 0 AND privacy_generation < ?2",
+            params![DECISION_CANCELLED, before],
         )?;
         transaction.commit()?;
         Ok((cancelled, as_u64(in_flight)))
     }
 
-    /// Removes the queued content and the preview material this journal holds.
+    /// Removes the queued content and the preview material this journal holds, of every generation
+    /// before the one in force.
     ///
     /// The records stay: what happened is not content, and a host that forgot its own attempts
     /// could not tell a person what the device did not see. The bytes go, all of them but one
     /// kind: the request of an attempt on the wire at this moment, which the pass that claimed it
     /// is presenting and which goes with that attempt's settlement. Under the fence privacy mode
     /// raised first, every answer settles, so that is the end of it. A delivery whose outcome is
-    /// unknown keeps nothing: what resolves it is a question about its identifier.
+    /// unknown keeps nothing: what resolves it is a question about its identifier. While the
+    /// outbox is fenced, an alert privacy mode lets through holds no content and is of the
+    /// generation in force, so it keeps the request it is waiting to present.
     ///
     /// Returns how many bytes and how many records were emptied.
     ///
@@ -2362,10 +2480,11 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = generations_before_the_fence(&transaction)?;
         let bytes: i64 = transaction.query_row(
             "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM delivery_notifications
-              WHERE content IS NOT NULL AND state <> 'in_flight'",
-            [],
+              WHERE content IS NOT NULL AND state <> 'in_flight' AND privacy_generation < ?1",
+            params![before],
             |row| row.get(0),
         )?;
         let object_bytes: i64 = transaction.query_row(
@@ -2380,8 +2499,8 @@ impl DeliveryJournal {
         )?;
         let emptied = transaction.execute(
             "UPDATE delivery_notifications SET content = NULL
-              WHERE content IS NOT NULL AND state <> 'in_flight'",
-            [],
+              WHERE content IS NOT NULL AND state <> 'in_flight' AND privacy_generation < ?1",
+            params![before],
         )?;
         let objects = transaction.execute("DELETE FROM delivery_objects", [])?;
         // A notice holds the plaintext summary a notification would have been built from, so it
@@ -2401,20 +2520,23 @@ impl DeliveryJournal {
         ))
     }
 
-    /// Returns how much work this journal still has outstanding.
+    /// Returns how much work this journal still has outstanding from before the generation in
+    /// force.
     ///
     /// An attempt on the wire and an unknown outcome both count. Reconciliation is this reaching
     /// nought, and a journal that answered nought while a send was in flight would make privacy
-    /// mode report complete before it was.
+    /// mode report complete before it was. While the outbox is fenced, an alert privacy mode lets
+    /// through is not cleanup of content captured before the boundary and does not count.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn outstanding(&self) -> Result<u64> {
+        let before = generations_before_the_fence(&self.connection)?;
         let outstanding: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM delivery_notifications
-              WHERE state IN ('in_flight', 'outcome_unknown')",
-            [],
+              WHERE state IN ('in_flight', 'outcome_unknown') AND privacy_generation < ?1",
+            params![before],
             |row| row.get(0),
         )?;
         Ok(as_u64(outstanding))
@@ -2485,17 +2607,102 @@ impl DeliveryJournal {
         Ok(exported)
     }
 
-    /// Lifts the fence when privacy mode is turned off.
+    /// Lifts the fence when privacy mode is turned off, at the generation after it.
+    ///
+    /// The alerts privacy mode let through are of the generation the fence stood at and are done
+    /// with: the ones nothing has sent are taken back in the same transaction, so none is sent
+    /// once privacy mode is off, and the time is recorded. The time is how a decision made while
+    /// privacy mode was on is told from one made after it
+    /// ([`DeliveryJournal::lifted_at_ms`]). A journal already at that generation and not fenced is
+    /// left as it is, so lifting again at every start moves nothing.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn lift_fence(&mut self, generation: u64) -> Result<()> {
-        self.connection.execute(
-            "UPDATE delivery_privacy SET generation = ?1, fenced = 0 WHERE id = 0",
-            params![as_i64(generation)],
+        let now_ms = wall_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (held, fenced): (i64, i64) = transaction.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if fenced == 0 && as_u64(held) == generation {
+            return Ok(());
+        }
+        if fenced != 0 {
+            cancel_waiting_in(&transaction, held.saturating_add(1), now_ms)?;
+            transaction.execute(
+                "UPDATE delivery_events SET produced = 1, decision = ?1
+                  WHERE produced = 0 AND privacy_generation <= ?2",
+                params![DECISION_CANCELLED, held],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE delivery_privacy SET generation = ?1, fenced = 0, lifted_at_ms = ?2
+              WHERE id = 0",
+            params![as_i64(generation), as_i64(now_ms)],
+        )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Returns where this journal stands on privacy mode, in one read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn standing(&self) -> Result<PrivacyStanding> {
+        let (generation, fenced): (i64, i64) = self.connection.query_row(
+            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(PrivacyStanding {
+            generation: as_u64(generation),
+            fenced: fenced != 0,
+        })
+    }
+
+    /// Returns when privacy mode was last turned off, in UTC milliseconds, or nought for a journal
+    /// that never was.
+    ///
+    /// A decision whose time is at or before it may have been made while privacy mode was on, and
+    /// privacy mode does not let what it decided be sent once it is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn lifted_at_ms(&self) -> Result<u64> {
+        let lifted: i64 = self.connection.query_row(
+            "SELECT lifted_at_ms FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(as_u64(lifted))
+    }
+
+    /// Decides every event taken under a generation before the one in force and not yet produced
+    /// from, and returns how many.
+    ///
+    /// Such an event holds a notice captured before a privacy boundary, and producing from it now
+    /// would give old content the generation that came after. Privacy mode decides these when it
+    /// fences; this is for one that step has not reached yet, so that one of them never stands
+    /// between a recovery pass and the events after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn cancel_stale_events(&mut self) -> Result<u64> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_events SET produced = 1, decision = ?1
+              WHERE produced = 0
+                AND privacy_generation < (SELECT generation FROM delivery_privacy WHERE id = 0)",
+            params![DECISION_CANCELLED],
+        )?;
+        Ok(changed as u64)
     }
 
     // ----- referenced encrypted objects --------------------------------------------------
@@ -2850,12 +3057,12 @@ impl DeliveryJournal {
         // without putting the notification back to work: an outbox row written here would be work
         // queued under a generation that has ended, and the record would stop counting as
         // outstanding while the gateway was still holding it.
-        let (generation, fenced): (i64, i64) = transaction.query_row(
-            "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        let generation: i64 = transaction.query_row(
+            "SELECT generation FROM delivery_privacy WHERE id = 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
-        let walked_past = fenced != 0 || as_u64(record_generation) != as_u64(generation);
+        let walked_past = as_u64(record_generation) != as_u64(generation);
         let (state, next, next_attempt_at_ms, detail) = if walked_past && !state.is_settled() {
             (
                 DeliveryState::OutcomeUnknown,
@@ -3344,6 +3551,89 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DeliveryR
     })())
 }
 
+/// The generation below which privacy mode's cleanup acts.
+///
+/// While the outbox is fenced it is the fence's generation: what is of it is an alert privacy mode
+/// let through, and everything before it is content the fence found. While it is not, nothing is
+/// let through and every generation is before it.
+fn generations_before_the_fence(connection: &Connection) -> Result<i64> {
+    let (generation, fenced): (i64, i64) = connection.query_row(
+        "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(if fenced != 0 { generation } else { i64::MAX })
+}
+
+/// Settles every record still waiting for an attempt under a generation before `before`, inside a
+/// transaction the caller owns, and returns how many were taken back.
+///
+/// A record nothing has sent is cancelled; one that has already left is moved to the outcome
+/// nobody knows, by the kind it was admitted for.
+fn cancel_waiting_in(
+    transaction: &rusqlite::Transaction<'_>,
+    before: i64,
+    now_ms: u64,
+) -> Result<u64> {
+    // Every record still waiting for an attempt, with the kind it was admitted for. What has left
+    // and can still be asked about is left in a state a reconciliation resolves; what has left and
+    // cannot is marked as the uncertainty it is; what never left is taken back. Each is settled the
+    // way any other settlement is, so each loses its request, its outbox row and any collapse
+    // window it can no longer fill.
+    let waiting: Vec<(String, i64, i64, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT notification_id, attempts, dispatched, destination_kind
+               FROM delivery_notifications
+              WHERE state IN ('admitted', 'retrying') AND privacy_generation < ?1
+              ORDER BY admitted_at_ms",
+        )?;
+        let rows = statement.query_map(params![before], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut waiting = Vec::new();
+        for row in rows {
+            waiting.push(row?);
+        }
+        waiting
+    };
+    let mut cancelled = 0_u64;
+    for (identifier, attempts, dispatched, kind) in waiting {
+        let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+            "a stored destination kind is not one this build writes",
+        ))?;
+        if dispatched == 0 {
+            settle_in(
+                transaction,
+                &identifier,
+                as_u64(attempts),
+                now_ms,
+                DeliveryState::Cancelled,
+                "privacy mode took this back before it was dispatched",
+            )?;
+            cancelled += 1;
+        } else {
+            settle_in(
+                transaction,
+                &identifier,
+                as_u64(attempts),
+                now_ms,
+                unresolved_for(kind),
+                "privacy mode stopped this after it had already left this host",
+            )?;
+        }
+    }
+    Ok(cancelled)
+}
+
+/// The host's own wall clock, in UTC milliseconds.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Writes one admitted record and its outbox row inside a transaction the caller owns.
 ///
 /// The fence and the generation are read **here**, inside that transaction, rather than by the
@@ -3364,6 +3654,61 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
             in_force: as_u64(generation),
         });
     }
+    insert_notification(transaction, record)
+}
+
+/// Writes one alert privacy mode lets through inside a transaction the caller owns: only while the
+/// journal is fenced at the generation the record names. [`check_alert`] has already decided that
+/// the record is one.
+fn admit_alert_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) -> Result<()> {
+    let (generation, fenced): (i64, i64) = transaction.query_row(
+        "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if fenced == 0 || record.privacy_generation != as_u64(generation) {
+        return Err(DeliveryError::LateResult {
+            produced_under: record.privacy_generation,
+            in_force: as_u64(generation),
+        });
+    }
+    insert_notification(transaction, record)
+}
+
+/// Decides whether one record is an alert privacy mode lets through at `generation`.
+///
+/// It is a notification to a paired device whose request carries no preview, or a record that
+/// carries no request at all because this host collapsed or refused it. A request is read back
+/// strictly, so one that holds anything a push request does not is not an alert, and a request
+/// with a preview is not one whatever else it holds.
+fn check_alert(record: &DeliveryRecord, generation: u64) -> Result<()> {
+    let refused = |what: &str| DeliveryError::NotAuthorised(format!("an alert {what}"));
+    if record.privacy_generation != generation {
+        return Err(refused("is admitted under the generation in force"));
+    }
+    if !matches!(
+        record.state,
+        DeliveryState::Admitted | DeliveryState::Collapsed | DeliveryState::Refused
+    ) {
+        return Err(refused("is not admitted, collapsed or refused"));
+    }
+    let Some(content) = &record.content else {
+        return Ok(());
+    };
+    let request: kr_protocol::push::PushDeliveryRequest = serde_json::from_slice(content)
+        .map_err(|_| refused("is a push request this build reads"))?;
+    if request.preview.as_ref().is_some() {
+        return Err(refused("carries no preview"));
+    }
+    Ok(())
+}
+
+/// Writes one notification record and its outbox row, whatever the state of privacy mode; what
+/// may be written when is decided by the callers.
+fn insert_notification(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &DeliveryRecord,
+) -> Result<()> {
     let (reason, into, count, next) = suppression_columns(record.suppression.as_ref());
     let written = transaction.execute(
         "INSERT INTO delivery_notifications
@@ -3428,30 +3773,40 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
 /// request, because neither will be presented again.
 ///
 /// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
-/// Brings a version 6 journal forward to version 7, in one transaction.
+/// Brings a version 6 or version 7 journal forward to version 8, in one transaction.
 ///
-/// Version 7 adds one column, the stamp of the stored credential an external destination sends
+/// Version 7 added one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
-/// credential, so every row gets none and every binding it computed is computed the same way. The
-/// version is read again inside the transaction, so two openers cannot both add the column.
-fn migrate_from_6(connection: &mut Connection) -> Result<()> {
+/// credential, so every row gets none and every binding it computed is computed the same way.
+/// Version 8 adds one column to the privacy row, the time privacy mode was last turned off. A
+/// journal that has never been through privacy mode has none, which reads as no time at all. The
+/// version is read again inside the transaction, so two openers cannot both add a column.
+fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version: i64 =
         transaction.query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
             row.get(0)
         })?;
-    if version == PREVIOUS_SCHEMA_VERSION {
+    if !(OLDEST_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version) {
+        return Err(DeliveryError::JournalUnreadable(
+            "the delivery journal changed schema version while it was being brought forward",
+        ));
+    }
+    if version == 6 {
         transaction
             .execute_batch("ALTER TABLE delivery_destinations ADD COLUMN credential_stamp TEXT;")?;
+    }
+    if version <= 7 {
+        transaction.execute_batch(
+            "ALTER TABLE delivery_privacy ADD COLUMN lifted_at_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if version < SCHEMA_VERSION {
         transaction.execute(
             "UPDATE delivery_schema SET version = ?1",
             params![SCHEMA_VERSION],
         )?;
-    } else if version != SCHEMA_VERSION {
-        return Err(DeliveryError::JournalUnreadable(
-            "the delivery journal changed schema version while it was being brought forward",
-        ));
     }
     transaction.commit()?;
     Ok(())
@@ -3788,7 +4143,8 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS delivery_privacy (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         generation INTEGER NOT NULL,
-        fenced INTEGER NOT NULL
+        fenced INTEGER NOT NULL,
+        lifted_at_ms INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS delivery_outbox_due ON delivery_outbox (due_at_ms);
     CREATE INDEX IF NOT EXISTS delivery_notifications_state

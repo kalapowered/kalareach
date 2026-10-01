@@ -27,12 +27,13 @@
 //! generation contract's `accepts_result` rule applied at the one place this crate publishes: a
 //! result from before the boundary belongs to work privacy mode cancelled.
 
-use kr_attention::engine::{Announcement, Text};
-use kr_protocol::attention::{AttentionLevel, AttentionRule};
+use kr_attention::engine::{Announcement, Engine, Item, Text};
+use kr_protocol::attention::{AttentionLevel, AttentionRouting, AttentionRule};
 use kr_protocol::grant::SessionSelector;
-use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
+use kr_protocol::ids::{DeviceId, EnvelopeId, EnvironmentId, GrantId, NotificationId, SessionId};
 use kr_protocol::push::{PushAlert, PushDeliveryRequest, PushPlatformHints, PushUrgency};
-use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
 use kr_worker::history_filter::{HistoryFilter, ViewerScope};
 
 use crate::budget::{Admission, Budget, collapse_id};
@@ -40,8 +41,8 @@ use crate::destination::{DeliveryRule, Destination, DestinationId, DestinationRe
 use crate::error::{DeliveryError, Result};
 use crate::external::{self, ContentLine, ExternalMessage};
 use crate::journal::{
-    DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource, StagedObject,
-    StoredBudget, TakenEvent,
+    DeliveryJournal, DeliveryRecord, DeliveryState, EventKey, EventSource, PrivateEntry,
+    StagedObject, StoredBudget, TakenEvent,
 };
 use crate::preview::{self, PreviewBody, PreviewTarget};
 use crate::push::{self, MAX_EXPIRY_AHEAD_MS};
@@ -80,6 +81,116 @@ pub struct Notice {
     pub collapse_group: String,
     /// When it stops being worth delivering, in UTC milliseconds.
     pub expires_at_ms: TimestampMs,
+    /// Who it is about, which decides which recipients may be told of it.
+    pub audience: Audience,
+}
+
+/// Who a notice is about.
+///
+/// What a recipient may be told is what its grant lets it see of the thing the notice is about, so
+/// the notice carries what the attention store knows of that: the sessions it was raised from, or
+/// the grant a workflow acts under, or nothing but the environment. It is decided the way the
+/// inbox decides what a caller may see of an item, so a device is never sent an alert about
+/// something its grant would not show it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Audience {
+    /// Raised from these sessions' records: a recipient whose grant carries `session.view` for
+    /// every one of them.
+    Sessions {
+        /// The sessions, never none.
+        sessions: Vec<SessionId>,
+        /// When the condition was first seen, in UTC milliseconds.
+        at_ms: u64,
+    },
+    /// A workflow or a causal chain: a recipient whose grant carries `automation.manage` and is the
+    /// grant the workflow acts under. A workflow whose grant the journal could not name is the
+    /// owner's alone, and no recipient's.
+    Automation {
+        /// The grant the workflow acts under, when it was named.
+        grant: Option<GrantId>,
+        /// When the condition was first seen, in UTC milliseconds.
+        at_ms: u64,
+    },
+    /// The environment itself: a recipient whose grant carries `host.manage`.
+    Environment {
+        /// When the condition was first seen, in UTC milliseconds.
+        at_ms: u64,
+    },
+}
+
+impl Audience {
+    /// When the condition the notice is about was first seen, in UTC milliseconds.
+    #[must_use]
+    pub const fn at_ms(&self) -> u64 {
+        match self {
+            Self::Sessions { at_ms, .. }
+            | Self::Automation { at_ms, .. }
+            | Self::Environment { at_ms } => *at_ms,
+        }
+    }
+
+    /// Whether a recipient with this authority may be told.
+    ///
+    /// Earlier history is opt-in: a grant reaches what was first seen at or after its own history
+    /// cursor, or at or after its own start when it has none. Past that, each kind of subject asks
+    /// for its own right.
+    #[must_use]
+    pub fn admits(&self, scope: &RecipientScope) -> bool {
+        if scope.history_from_ms > self.at_ms() {
+            return false;
+        }
+        match self {
+            Self::Sessions { sessions, .. } => {
+                scope.rights.contains(&ActionRight::SessionView)
+                    && sessions
+                        .iter()
+                        .all(|session| scope.sessions.admits(*session))
+            }
+            Self::Automation { grant, .. } => {
+                scope.rights.contains(&ActionRight::AutomationManage)
+                    && *grant == Some(scope.grant_id)
+            }
+            Self::Environment { .. } => scope.rights.contains(&ActionRight::HostManage),
+        }
+    }
+
+    /// The audience of one item of the attention store, or none when the item cannot be placed in
+    /// time: a reminder whose question is no longer held.
+    ///
+    /// A reminder is dated by the question it is about, never by the moment it fired: a question
+    /// asked before a grant's history began is not a future event for that grant because a
+    /// reminder about it is.
+    #[must_use]
+    pub fn of_item(engine: &Engine, item: &Item) -> Option<Self> {
+        let at_ms = if item.rule == AttentionRule::InputIdleReminder {
+            let record = item.text.record()?;
+            engine
+                .items()
+                .find(|other| {
+                    other.rule == AttentionRule::PendingInput && other.text.record() == Some(record)
+                })?
+                .first_seen_ms
+                .get()
+        } else {
+            item.first_seen_ms.get()
+        };
+        let mut sessions: Vec<SessionId> = [item.origin.session(), item.session_id]
+            .into_iter()
+            .flatten()
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        Some(if !sessions.is_empty() {
+            Self::Sessions { sessions, at_ms }
+        } else if item.automation.is_some() {
+            Self::Automation {
+                grant: item.grant,
+                at_ms,
+            }
+        } else {
+            Self::Environment { at_ms }
+        })
+    }
 }
 
 /// Everything this journal needs to produce from one taken event.
@@ -111,7 +222,7 @@ impl Notice {
     /// The collapse group is the session and the rule, so repeated attention about one thing
     /// replaces itself on the device rather than stacking.
     #[must_use]
-    pub fn from_announcement(announcement: &Announcement, now_ms: u64) -> Self {
+    pub fn from_announcement(announcement: &Announcement, audience: Audience, now_ms: u64) -> Self {
         let session = announcement.session_id;
         Self {
             event: EventKey::announcement(session, announcement.key.as_str(), announcement.number),
@@ -133,6 +244,39 @@ impl Notice {
             expires_at_ms: TimestampMs::new(
                 now_ms.saturating_add(DEFAULT_NOTIFICATION_LIFETIME_MS),
             ),
+            audience,
+        }
+    }
+
+    /// Builds the notice for one announcement taken while privacy mode is on.
+    ///
+    /// It holds nothing a session said and no words of the host's: the alert a pending question or
+    /// approval still owes while privacy mode is on is the generic alert and nothing else. What it
+    /// groups with on the device is the rule alone, under the generation: a collapse identifier
+    /// that named the session would let a provider tell this alert from the notifications about
+    /// the same session before privacy mode was turned on.
+    #[must_use]
+    pub fn alert_only(
+        announcement: &Announcement,
+        audience: Audience,
+        generation: u64,
+        now_ms: u64,
+    ) -> Self {
+        let session = announcement.session_id;
+        Self {
+            event: EventKey::announcement(session, announcement.key.as_str(), announcement.number),
+            alert: alert_for(announcement.rule),
+            urgency: urgency_for(announcement.level),
+            rule: announcement.rule.as_str().to_owned(),
+            summary: String::new(),
+            session_id: session,
+            environment_id: None,
+            observed_at_ms: TimestampMs::new(now_ms),
+            collapse_group: format!("private/{generation}/{}", announcement.rule.as_str()),
+            expires_at_ms: TimestampMs::new(
+                now_ms.saturating_add(DEFAULT_NOTIFICATION_LIFETIME_MS),
+            ),
+            audience,
         }
     }
 
@@ -236,6 +380,15 @@ pub struct RecipientScope {
     pub viewer: ViewerScope,
     /// Which sessions' content may be read.
     pub sessions: SessionSelector,
+    /// The rights the grant keeps once the host's policy and configuration have been applied.
+    pub rights: CanonicalSet<ActionRight>,
+    /// The grant the scope is read from.
+    pub grant_id: GrantId,
+    /// The device the grant was issued to.
+    pub recipient: DeviceId,
+    /// The earliest moment the grant reaches, in UTC milliseconds: its own history cursor when it
+    /// carries one, and otherwise its own start.
+    pub history_from_ms: u64,
 }
 
 /// What a destination's rule grants the recipient.
@@ -244,9 +397,17 @@ pub struct RecipientScope {
 pub trait RecipientAuthority: std::fmt::Debug {
     /// The scope one rule's grant gives its recipient.
     ///
-    /// `None` is a rule whose grant no longer exists, is not in force, or does not let its
-    /// recipient read session content, which admits nothing.
+    /// `None` is a rule whose grant no longer exists, is not in force, or that the host's policy
+    /// does not honour, which admits nothing.
     fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope>;
+
+    /// The scope a paired device's destination has now.
+    ///
+    /// The destination's rule names the grant, and the grant has to be the device's own: the
+    /// destination is named by the device's identifier, so a rule that names another device's
+    /// grant is a destination nobody decided to send to, and admits nothing. A device that is no
+    /// longer paired admits nothing either.
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope>;
 }
 
 /// A digest of the authority one notification was admitted under.
@@ -255,9 +416,10 @@ pub trait RecipientAuthority: std::fmt::Debug {
 /// has to be able to ask again and see whether the answer has changed. A digest is what makes that
 /// one comparison rather than a second copy of the grant in this journal.
 ///
-/// A push destination has no viewer scope: the recipient is the paired device and the content is
-/// sealed to its own key, so the rule is the whole of it. An external destination has both,
-/// because the grant decides which sessions' lines may be in the message at all.
+/// Both kinds of destination ask the grant: a paired device's content is sealed to its own key, and
+/// that is not the same as its grant admitting the notice, so what the grant lets its recipient see
+/// is part of what the notification was admitted under. A change to any of it is a change of
+/// authority and settles the notification as revoked rather than sending it.
 ///
 /// The scope is digested through its debug rendering, which is the only total view of it this
 /// crate has and is stable for a build: what matters is that two scopes that differ anywhere
@@ -273,8 +435,19 @@ pub fn authority_digest(rule: &DeliveryRule, scope: Option<&RecipientScope>) -> 
             .map_or_else(|| "-".to_owned(), |grant| grant.to_string())
     );
     match scope {
-        Some(RecipientScope { viewer, sessions }) => {
-            let _ = write!(input, "scope={viewer:?};sessions={sessions:?};");
+        Some(RecipientScope {
+            viewer,
+            sessions,
+            rights,
+            grant_id,
+            recipient,
+            history_from_ms,
+        }) => {
+            let _ = write!(
+                input,
+                "scope={viewer:?};sessions={sessions:?};rights={rights:?};grant={grant_id};\
+                 recipient={recipient};from={history_from_ms};"
+            );
         }
         None => input.push_str("scope=-;"),
     }
@@ -303,6 +476,146 @@ pub struct Produced {
     pub collapsed: usize,
     /// How many were refused, with the reason, for a person reading the journal.
     pub refused: Vec<(DestinationId, String)>,
+}
+
+/// What the daemon publishes of privacy mode: the generation in force and whether it is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivacyView {
+    /// The generation in force.
+    pub generation: u64,
+    /// Whether privacy mode is on.
+    pub private: bool,
+}
+
+/// What one take from the attention store did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Taken {
+    /// How many announcements were new to this journal.
+    pub taken: usize,
+    /// How many alerts were admitted while privacy mode was on.
+    pub alerts: usize,
+    /// How many announcements became an event with nothing produced from it.
+    pub dropped: usize,
+    /// Whether the journal and the published privacy state did not agree, or privacy mode moved
+    /// part of the way through, so that some or all of what the store offered is offered again.
+    pub skipped: bool,
+}
+
+impl Taken {
+    const fn skipped() -> Self {
+        Self {
+            taken: 0,
+            alerts: 0,
+            dropped: 0,
+            skipped: true,
+        }
+    }
+}
+
+/// What becomes of one announcement.
+enum Fate {
+    /// An event with no notice: nothing is produced from it.
+    Drop,
+    /// An event that holds this notice, which [`Producer::finish_pending`] produces from.
+    Produce(Notice),
+    /// An alert admitted while privacy mode is on.
+    Alert(Notice),
+}
+
+impl Fate {
+    /// Decides one announcement from the item it is about and the privacy state.
+    fn of(
+        engine: &Engine,
+        announcement: &Announcement,
+        privacy: PrivacyView,
+        lifted_at_ms: u64,
+        now_ms: u64,
+    ) -> Self {
+        let Some(item) = engine.item(&announcement.key) else {
+            return Self::Drop;
+        };
+        let Some(audience) = Audience::of_item(engine, item) else {
+            return Self::Drop;
+        };
+        if privacy.private {
+            return if matches!(
+                announcement.rule,
+                AttentionRule::PendingApproval
+                    | AttentionRule::PendingInput
+                    | AttentionRule::InputIdleReminder
+            ) {
+                Self::Alert(Notice::alert_only(
+                    announcement,
+                    audience,
+                    privacy.generation,
+                    now_ms,
+                ))
+            } else {
+                Self::Drop
+            };
+        }
+        // The store decided it at a time of its own. One decided at or before the moment privacy
+        // mode was last turned off may have been decided while it was on, and what was decided
+        // while it was on is never sent once it is off.
+        let decided_at_ms = item.last_notified_ms.map_or(0, |at| at.get());
+        if lifted_at_ms > 0 && decided_at_ms <= lifted_at_ms {
+            return Self::Drop;
+        }
+        if announcement.routing == AttentionRouting::LeaseHolder {
+            return Self::Drop;
+        }
+        Self::Produce(Notice::from_announcement(announcement, audience, now_ms))
+    }
+}
+
+/// An announcement taken as an event nothing is produced from.
+fn observed_announcement(announcement: &Announcement, now_ms: u64) -> TakenEvent {
+    observed(
+        EventKey::announcement(
+            announcement.session_id,
+            announcement.key.as_str(),
+            announcement.number,
+        ),
+        announcement.number,
+        announcement.session_id,
+        TimestampMs::new(now_ms),
+    )
+}
+
+/// What a notification carries of the notice it is built from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presentation {
+    /// The sealed preview, when the destination takes one.
+    Preview,
+    /// The generic alert and nothing sealed, whatever the destination takes.
+    AlertOnly,
+}
+
+/// The record of a notification this host refused to admit, with the reason.
+fn refused_record(
+    notice: &Notice,
+    destination: &DestinationRecord,
+    generation: u64,
+    now_ms: u64,
+    error: &DeliveryError,
+) -> DeliveryRecord {
+    DeliveryRecord {
+        notification_id: preview::fresh_notification_id(),
+        event: notice.event.clone(),
+        destination_id: destination.id.clone(),
+        state: DeliveryState::Refused,
+        privacy_generation: generation,
+        destination_digest: destination.binding_digest(),
+        authority_digest: String::new(),
+        content: None,
+        payload_bytes: 0,
+        expires_at_ms: notice.expires_at_ms,
+        admitted_at_ms: TimestampMs::new(now_ms),
+        attempts: 0,
+        suppression: None,
+        detail: Some(error.to_string()),
+        dispatched: false,
+    }
 }
 
 /// The delivery producer for one environment.
@@ -352,44 +665,182 @@ impl Producer {
     /// before the local transaction has settled nothing, so nothing is lost either way.
     ///
     /// `scope` names the store, because a cursor is a position in one store and nothing else.
+    /// `offer` is how the host holds back an announcement it is not ready to hand over, such as a
+    /// closing session's. `privacy` is what the daemon publishes of privacy mode, and the take is
+    /// made only while the journal stands where that says: a fence the journal has not reached yet,
+    /// or one it has not lifted, is a state this does not decide anything under, and nothing is
+    /// taken until the two agree.
+    ///
+    /// While privacy mode is off, an announcement becomes an event this journal holds the notice
+    /// of, and [`Producer::finish_pending`] produces from it. Two kinds become an event with no
+    /// notice: one decided before privacy mode was last turned off, which may have been decided
+    /// while it was on and is never sent once it is off, and one routed to a lease holder, which
+    /// is not a destination of this host. While privacy mode is on, a pending approval or question
+    /// still owes an alert, with nothing in it but the generic alert ([`Notice::alert_only`]),
+    /// and it is admitted in the transaction that takes it; every other announcement becomes an
+    /// event with no notice, and the fence's own rule that nothing carrying content is produced
+    /// stands.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::Source`] when the attention store cannot be read or settled, and
     /// [`DeliveryError::JournalUnavailable`] when this journal cannot be written.
+    #[allow(clippy::too_many_arguments)]
     pub fn take_from_attention(
         &mut self,
         attention: &mut kr_attention::Attention,
+        offer: &dyn Fn(&Item) -> bool,
+        authority: &dyn RecipientAuthority,
         scope: &str,
+        privacy: PrivacyView,
         now_ms: u64,
-    ) -> Result<Vec<Notice>> {
+    ) -> Result<Taken> {
         let consumer = EventSource::Attention.consumer(scope);
         self.journal.register_consumer(&consumer, now_ms)?;
+        let standing = self.journal.standing()?;
+        if standing.generation != privacy.generation || standing.fenced != privacy.private {
+            return Ok(Taken::skipped());
+        }
         let announcements = attention
-            .take_announcements(&|_| true)
+            .take_announcements(offer)
             .map_err(|error| DeliveryError::Source(error.to_string()))?;
         if announcements.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Taken::default());
         }
-        let mut notices = Vec::with_capacity(announcements.len());
-        let mut events = Vec::with_capacity(announcements.len());
+        let lifted_at_ms = self.journal.lifted_at_ms()?;
+        let fates: Vec<Fate> = {
+            let engine = attention
+                .engine()
+                .map_err(|error| DeliveryError::Source(error.to_string()))?;
+            announcements
+                .iter()
+                .map(|announcement| Fate::of(engine, announcement, privacy, lifted_at_ms, now_ms))
+                .collect()
+        };
+        let mut taken = Taken::default();
         let mut settled = Vec::with_capacity(announcements.len());
         let mut cursor = self
             .journal
             .consumer_cursor(&consumer)?
             .map_or(0, |held| held.cursor);
-        for announcement in &announcements {
-            let notice = Notice::from_announcement(announcement, now_ms);
-            events.push(notice.taken(announcement.number)?);
-            settled.push((announcement.key.clone(), announcement.number));
-            cursor = cursor.max(announcement.number);
-            notices.push(notice);
+        if privacy.private {
+            for (announcement, fate) in announcements.iter().zip(fates) {
+                let entry = match fate {
+                    Fate::Alert(notice) => {
+                        self.alert(&notice, announcement.number, authority, now_ms)?
+                    }
+                    Fate::Drop | Fate::Produce(_) => PrivateEntry {
+                        event: observed_announcement(announcement, now_ms),
+                        records: Vec::new(),
+                        spent: Vec::new(),
+                    },
+                };
+                let alerts = entry.records.len();
+                match self.journal.take_private(
+                    &consumer,
+                    &entry,
+                    announcement.number,
+                    privacy.generation,
+                ) {
+                    Ok(new) => {
+                        taken.taken += usize::from(new);
+                        taken.alerts += alerts;
+                        taken.dropped += usize::from(entry.records.is_empty());
+                    }
+                    // Privacy mode moved while this was being decided. What was taken stays
+                    // taken, and the rest is offered again.
+                    Err(DeliveryError::LateResult { .. }) => {
+                        taken.skipped = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+                settled.push((announcement.key.clone(), announcement.number));
+            }
+        } else {
+            let mut events = Vec::with_capacity(announcements.len());
+            for (announcement, fate) in announcements.iter().zip(fates) {
+                cursor = cursor.max(announcement.number);
+                match fate {
+                    Fate::Produce(notice) => events.push(notice.taken(announcement.number)?),
+                    Fate::Drop | Fate::Alert(_) => {
+                        taken.dropped += 1;
+                        events.push(observed_announcement(announcement, now_ms));
+                    }
+                }
+                settled.push((announcement.key.clone(), announcement.number));
+            }
+            match self
+                .journal
+                .take_events_under(&consumer, &events, cursor, privacy.generation)
+            {
+                Ok(new) => taken.taken += new,
+                Err(DeliveryError::Fenced | DeliveryError::LateResult { .. }) => {
+                    return Ok(Taken::skipped());
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.journal.take_events(&consumer, &events, cursor)?;
-        attention
-            .settle_announcements(&settled)
-            .map_err(|error| DeliveryError::Source(error.to_string()))?;
-        Ok(notices)
+        if !settled.is_empty() {
+            attention
+                .settle_announcements(&settled)
+                .map_err(|error| DeliveryError::Source(error.to_string()))?;
+        }
+        Ok(taken)
+    }
+
+    /// Builds the alert one pending question or approval owes while privacy mode is on: the one
+    /// event, and a notification with no preview to each paired device its grant lets be told.
+    fn alert(
+        &mut self,
+        notice: &Notice,
+        number: u64,
+        authority: &dyn RecipientAuthority,
+        now_ms: u64,
+    ) -> Result<PrivateEntry> {
+        let generation = self.journal.generation()?;
+        let mut records = Vec::new();
+        let mut spent = Vec::new();
+        for destination in self.journal.destinations()? {
+            if !destination.enabled || destination.as_push().is_none() {
+                continue;
+            }
+            match self.build_push(
+                notice,
+                &destination,
+                authority,
+                generation,
+                now_ms,
+                Presentation::AlertOnly,
+            ) {
+                Ok(Some((record, budget, _))) => {
+                    if let Some(budget) = budget {
+                        spent.push((destination.id.clone(), budget));
+                    }
+                    records.push(record);
+                }
+                Ok(None) => {}
+                Err(error) if error.is_transient() => return Err(error),
+                Err(error) => records.push(refused_record(
+                    notice,
+                    &destination,
+                    generation,
+                    now_ms,
+                    &error,
+                )),
+            }
+        }
+        Ok(PrivateEntry {
+            event: TakenEvent {
+                key: notice.event.clone(),
+                source_cursor: number,
+                session_id: notice.session_id,
+                recorded_at_ms: notice.observed_at_ms,
+                notice: Vec::new(),
+            },
+            records,
+            spent,
+        })
     }
 
     /// Takes one page of a worker's outbox, and tells the worker afterwards.
@@ -536,13 +987,23 @@ impl Producer {
                 continue;
             }
             let outcome = match &destination.destination {
-                Destination::Push(_) => self.build_push(notice, destination, generation, now_ms),
+                Destination::Push(_) => self.build_push(
+                    notice,
+                    destination,
+                    authority,
+                    generation,
+                    now_ms,
+                    Presentation::Preview,
+                ),
                 Destination::External(_) => self
                     .build_external(notice, destination, authority, lines, generation, now_ms)
-                    .map(|record| (record, None, None)),
+                    .map(|record| record.map(|record| (record, None, None))),
             };
             match outcome {
-                Ok((record, budget, staged)) => {
+                // A notice outside the recipient's audience is not one this destination wants, and
+                // is not a refusal: nothing is written for it.
+                Ok(None) => {}
+                Ok(Some((record, budget, staged))) => {
                     if record.state == DeliveryState::Collapsed {
                         produced.collapsed += 1;
                     } else {
@@ -560,27 +1021,16 @@ impl Producer {
                     return Err(error);
                 }
                 Err(error) => {
-                    let detail = error.to_string();
                     produced
                         .refused
-                        .push((destination.id.clone(), detail.clone()));
-                    records.push(DeliveryRecord {
-                        notification_id: preview::fresh_notification_id(),
-                        event: notice.event.clone(),
-                        destination_id: destination.id.clone(),
-                        state: DeliveryState::Refused,
-                        privacy_generation: generation,
-                        destination_digest: destination.binding_digest(),
-                        authority_digest: String::new(),
-                        content: None,
-                        payload_bytes: 0,
-                        expires_at_ms: notice.expires_at_ms,
-                        admitted_at_ms: TimestampMs::new(now_ms),
-                        attempts: 0,
-                        suppression: None,
-                        detail: Some(detail),
-                        dispatched: false,
-                    });
+                        .push((destination.id.clone(), error.to_string()));
+                    records.push(refused_record(
+                        notice,
+                        destination,
+                        generation,
+                        now_ms,
+                        &error,
+                    ));
                 }
             }
         }
@@ -620,6 +1070,13 @@ impl Producer {
         now_ms: u64,
     ) -> Result<Produced> {
         let mut total = Produced::default();
+        // Nothing is produced under the fence, and an event that was taken under a generation
+        // before the one in force is work privacy mode ended: it is decided here, so that one of
+        // them never stands between this walk and the events after it.
+        if self.journal.is_fenced()? {
+            return Ok(total);
+        }
+        self.journal.cancel_stale_events()?;
         let mut after = 0;
         loop {
             let page = self.journal.pending_events(after, MAX_PENDING_PER_PAGE)?;
@@ -680,13 +1137,16 @@ impl Producer {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_push(
         &mut self,
         notice: &Notice,
         destination: &DestinationRecord,
+        authority: &dyn RecipientAuthority,
         generation: u64,
         now_ms: u64,
-    ) -> Result<(DeliveryRecord, Option<StoredBudget>, Option<StagedObject>)> {
+        presentation: Presentation,
+    ) -> Result<Option<(DeliveryRecord, Option<StoredBudget>, Option<StagedObject>)>> {
         let push = destination
             .as_push()
             .ok_or_else(|| DeliveryError::NoDestination(destination.id.to_string()))?
@@ -694,8 +1154,17 @@ impl Producer {
         // Section 25's first half applies to a paired device too: a destination with no rule is a
         // destination nobody decided to send to.
         let rule = destination.require_rule()?;
+        // And so does the second: the device's own grant, as it stands now, has to admit the
+        // notice. A notice about something the grant would not show the device is not one this
+        // destination wants.
+        let scope = authority
+            .device_scope(destination)
+            .ok_or_else(|| DeliveryError::NotAuthorised(destination.id.to_string()))?;
+        if !notice.audience.admits(&scope) {
+            return Ok(None);
+        }
         let destination_digest = destination.binding_digest();
-        let authority_digest = authority_digest(rule, None);
+        let authority_digest = authority_digest(rule, Some(&scope));
 
         let notification_id = preview::fresh_notification_id();
         let mut budget = self
@@ -709,7 +1178,7 @@ impl Producer {
             Admission::Collapse { suppression } => {
                 // Nothing is sent, and the request is still retained: section 16's *the host
                 // retains every request and reports suppression locally* is this row.
-                return Ok((
+                return Ok(Some((
                     DeliveryRecord {
                         notification_id,
                         event: notice.event.clone(),
@@ -733,7 +1202,7 @@ impl Producer {
                     },
                     Some(budget.stored()),
                     None,
-                ));
+                )));
             }
             Admission::OpenUpdate {
                 update,
@@ -747,17 +1216,24 @@ impl Producer {
         } else {
             notice.alert
         };
-        let (request, staged) =
-            match self.build_request(notice, &push, &destination.id, identifier, alert, now_ms) {
-                Ok((request, staged)) => (request, staged),
-                Err(error) => {
-                    budget.release_collapse_window(&identifier);
-                    return Err(error);
-                }
-            };
+        let (request, staged) = match self.build_request(
+            notice,
+            &push,
+            &destination.id,
+            identifier,
+            alert,
+            presentation,
+            now_ms,
+        ) {
+            Ok((request, staged)) => (request, staged),
+            Err(error) => {
+                budget.release_collapse_window(&identifier);
+                return Err(error);
+            }
+        };
         let content = preview::encode_request(&request)?;
         let payload_bytes = preview::provider_payload_bytes(&request)?;
-        Ok((
+        Ok(Some((
             DeliveryRecord {
                 notification_id: identifier,
                 event: notice.event.clone(),
@@ -777,13 +1253,14 @@ impl Producer {
             },
             Some(budget.stored()),
             staged,
-        ))
+        )))
     }
 
     /// Builds the request, moving the excess into a referenced encrypted object if it does not fit.
     ///
     /// Section 16's remedy in order: build it, measure the built body, and if it is over the
     /// bound put the detail somewhere else and build again. Nothing estimates and nothing trims.
+    #[allow(clippy::too_many_arguments)]
     fn build_request(
         &mut self,
         notice: &Notice,
@@ -791,6 +1268,7 @@ impl Producer {
         destination_id: &DestinationId,
         notification_id: NotificationId,
         alert: PushAlert,
+        presentation: Presentation,
         now_ms: u64,
     ) -> Result<(PushDeliveryRequest, Option<StagedObject>)> {
         let collapse = collapse_id(&self.collapse_secret, &notice.collapse_group);
@@ -807,9 +1285,10 @@ impl Producer {
                 preview,
                 sender_record_id: push.sender_record_id,
             };
-        if !push.previews_enabled {
+        if !push.previews_enabled || presentation == Presentation::AlertOnly {
             // Section 16: disabling previews removes the recipient key from future notifications
-            // while the generic alert remains. There is no preview and no key here at all.
+            // while the generic alert remains. There is no preview and no key here at all. The
+            // alert a pending question or approval owes while privacy mode is on is the same.
             let request = skeleton(Nullable::null());
             preview::check_payload_bound(&request)?;
             return Ok((request, None));
@@ -917,7 +1396,7 @@ impl Producer {
         lines: &[ContentLine],
         generation: u64,
         now_ms: u64,
-    ) -> Result<DeliveryRecord> {
+    ) -> Result<Option<DeliveryRecord>> {
         let external_destination = destination
             .as_external()
             .ok_or_else(|| DeliveryError::NoDestination(destination.id.to_string()))?;
@@ -928,6 +1407,9 @@ impl Producer {
         let scope = authority
             .scope_for(rule)
             .ok_or_else(|| DeliveryError::NotAuthorised(destination.id.to_string()))?;
+        if !notice.audience.admits(&scope) {
+            return Ok(None);
+        }
         let destination_digest = destination.binding_digest();
         let authority_digest = authority_digest(rule, Some(&scope));
         let notification_id = preview::fresh_notification_id();
@@ -942,7 +1424,7 @@ impl Producer {
         let content = serde_json::to_vec(&message_json(&message))
             .map_err(|error| DeliveryError::Encoding(error.to_string()))?;
         let payload_bytes = content.len() as u64;
-        Ok(DeliveryRecord {
+        Ok(Some(DeliveryRecord {
             notification_id,
             event: notice.event.clone(),
             destination_id: destination.id.clone(),
@@ -958,7 +1440,7 @@ impl Producer {
             suppression: None,
             detail: None,
             dispatched: false,
-        })
+        }))
     }
 
     /// Returns whether a result produced under `generation` may be published.
