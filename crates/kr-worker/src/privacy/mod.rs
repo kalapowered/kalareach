@@ -37,10 +37,10 @@ use kr_protocol::scalars::TimestampMs;
 
 /// The generation privacy mode records.
 ///
-/// Nought is a host that has never enabled privacy mode, and each enabling advances it. Disabling
-/// does not: what a generation identifies is the boundary work was admitted on either side of,
-/// and reusing a number would make a late result from before the boundary indistinguishable from
-/// one produced after it.
+/// Nought is a host that has never enabled privacy mode, and each change of state advances it,
+/// turning it off as much as turning it on: what a generation identifies is the boundary work was
+/// admitted on either side of, and reusing a number would make a late result from before the
+/// boundary indistinguishable from one produced after it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrivacyGeneration(u64);
 
