@@ -398,33 +398,66 @@ impl Controller {
     /// Section 9 requires a live worker-held authority lease from the current controller generation
     /// and revision for remote dispatch. A locally authenticated caller is not remote dispatch and
     /// needs none, which is why the ingress decides rather than the method.
+    ///
+    /// A fence this host owes refuses the lease. The fence is asked after the lease is taken, and
+    /// not before: a debt is published without the revision moving, so the issuer still holds every
+    /// worker's acknowledgement of the revision in force and renews on it, and only this keeps a
+    /// lease from being handed out while the withdrawal is owed. It stays refused until the barrier
+    /// that retires the debt has had the issuer adopt the revision it advanced to, which
+    /// [`Self::withdraw`] orders before the debt is let go, and the worker has acknowledged that
+    /// revision. Nothing here stops a lease taken just before the debt was published: it dispatches
+    /// for what is left of its five seconds, which is the bound section 9 gives a lease, and its
+    /// lapse completes nothing, since a barrier completes only by a worker's acknowledgement or a
+    /// confirmed end. No renewal is stopped when a debt is published, because an acknowledgement of
+    /// the revision still in force would lift the stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseDenied::NotAcknowledged`] when the worker has not acknowledged the revision in
+    /// force, which an announcement to it can change, and [`LeaseDenied::Stopped`] for what one
+    /// cannot: a generation this daemon no longer holds, a fence it owes, or a revision that moved
+    /// while the lease was taken.
     pub(super) async fn dispatch_lease(
         &self,
         session_id: SessionId,
         actor: &kr_protocol::actor::ActorEnvelope,
-    ) -> Result<Option<kr_transport::clock::ContinuousInstant>> {
+    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, LeaseDenied> {
         if actor.ingress != kr_protocol::actor::ActorIngress::PairedDevice {
             return Ok(None);
         }
-        match self
+        let not_acknowledged = || {
+            LeaseDenied::NotAcknowledged(ControllerError::PermissionDenied {
+                detail: "the worker has not acknowledged this environment's authority revision, \
+                         so no remote action can be dispatched to it"
+                    .to_owned(),
+            })
+        };
+        let lease = match self
             .leases
             .renew(session_id, self.generation, &*self.clock)
-            .map_err(|error| ControllerError::supervision(error.to_string()))?
-        {
-            Ok(lease) => Ok(Some(lease.deadline)),
-            Err(LeaseRefusal::GenerationReplaced) => Err(ControllerError::PermissionDenied {
-                detail: "this daemon no longer holds the generation this lease was issued under"
-                    .to_owned(),
-            }),
-            Err(LeaseRefusal::RevisionNotAcknowledged | LeaseRefusal::NoLease) => {
-                Err(ControllerError::PermissionDenied {
-                    detail:
-                        "the worker has not acknowledged this environment's authority revision, \
-                             so no remote action can be dispatched to it"
-                            .to_owned(),
-                })
+            .map_err(|error| {
+                LeaseDenied::Stopped(ControllerError::supervision(error.to_string()))
+            })? {
+            Ok(lease) => lease,
+            Err(LeaseRefusal::GenerationReplaced) => {
+                return Err(LeaseDenied::Stopped(ControllerError::PermissionDenied {
+                    detail: "this daemon no longer holds the generation this lease was issued \
+                             under"
+                        .to_owned(),
+                }));
             }
+            Err(LeaseRefusal::RevisionNotAcknowledged | LeaseRefusal::NoLease) => {
+                return Err(not_acknowledged());
+            }
+        };
+        self.check_fence().map_err(LeaseDenied::Stopped)?;
+        // A barrier that advanced the revision after this lease was taken has left it a lease for
+        // the revision it replaced: no lease at all, which a worker's acknowledgement of the new
+        // revision gives.
+        if lease.authority_revision != self.leases.authority_revision() {
+            return Err(not_acknowledged());
         }
+        Ok(Some(lease.deadline))
     }
 
     /// Issues an action window for one authenticated connection.
@@ -733,6 +766,24 @@ impl Controller {
             .map_err(|refusal| ControllerError::WindowExpired {
                 detail: window_refusal_detail(refusal).to_owned(),
             })
+    }
+}
+
+/// Why a dispatch lease was not taken ([`Controller::dispatch_lease`]).
+#[derive(Debug)]
+pub(crate) enum LeaseDenied {
+    /// The worker has not acknowledged the authority revision in force. Asking it to is what
+    /// changes this, and the first remote dispatch to a worker is the usual case.
+    NotAcknowledged(ControllerError),
+    /// Nothing an announcement to the worker could change.
+    Stopped(ControllerError),
+}
+
+impl From<LeaseDenied> for ControllerError {
+    fn from(denied: LeaseDenied) -> Self {
+        match denied {
+            LeaseDenied::NotAcknowledged(error) | LeaseDenied::Stopped(error) => error,
+        }
     }
 }
 

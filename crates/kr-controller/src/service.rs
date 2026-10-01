@@ -79,7 +79,7 @@ pub use rendezvous::LAUNCH_IDENTITY_TIMEOUT;
 pub use routes::local_actor;
 pub use start::{BOOT_FILE, ControllerSetup, JOB_SWEEP_BOUND};
 
-use admission::{AdmittedConnection, remaining_deadline};
+use admission::{AdmittedConnection, LeaseDenied, remaining_deadline};
 use barrier::{Debts, Reach};
 use capabilities::DesktopReading;
 use create::PendingCreate;
@@ -324,6 +324,17 @@ pub struct Controller {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     local_writes_blocked: std::sync::atomic::AtomicUsize,
+    /// Where this host's own tests stop a forwarded mutation once its admission has been asked and
+    /// before it takes its lease, so that a debt can be published there. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    before_the_lease: ReadPause,
+    /// Where this host's own tests stop a barrier's first step once it has advanced the revision
+    /// and withdrawn the registrations, before the lease issuer adopts the revision. The pause
+    /// holds the thread, not the task: nothing the test asks from here awaits. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_leases_adopt: crate::attention::Pause,
     /// Where this host's own tests stop a retry that has found its retained answer, before the
     /// admission it arrived under is asked again, so that a withdrawal can land in between.
     /// Compiled away in every shipped build.

@@ -619,8 +619,10 @@ impl Controller {
     /// restriction, twice, or after an earlier barrier captured it. A row on disk that no change
     /// of this run holds is published only by a start, before anything is served. The revision
     /// advances once for all of them and they move to retiring; the connections admitted under what
-    /// they withdrew are deregistered in the same section. Then the lease issuer and the host policy
-    /// follow the revision, and the network connections that lost their registration are closed.
+    /// they withdrew are deregistered in the same section. The lease issuer adopts the revision in
+    /// that section too, before the debts are let go, so no lease is issued on the revision it
+    /// replaces while the withdrawal is owed ([`Self::dispatch_lease`]). Then the host policy
+    /// follows the revision, and the network connections that lost their registration are closed.
     ///
     /// With nothing captured it advances nothing and answers `None`.
     async fn withdraw(
@@ -668,6 +670,16 @@ impl Controller {
                     }
                 }
                 drop(admitted);
+                // The issuer adopts the revision while the debts are still published. A debt is
+                // published without the revision moving, so the issuer holds every worker's
+                // acknowledgement of the revision in force and renews on it, and only the fence
+                // keeps a lease from being handed out: let go of the debts first and a lease taken
+                // between the two is a lease for the revision this section has just replaced, with
+                // nothing left to refuse it. Adopted first, a lease is refused until the worker has
+                // acknowledged the new revision.
+                #[cfg(feature = "testing")]
+                self.before_the_leases_adopt.wait();
+                self.leases.revoke(revision);
                 let mut debts = self.debts();
                 for debt in captured.keys() {
                     debts.published.remove(debt);
@@ -679,7 +691,6 @@ impl Controller {
         let Some((revision, captured, host_wide)) = captured else {
             return Ok(None);
         };
-        self.leases.revoke(revision);
         // The host policy decides a paired device's request against the revision in force, so it
         // follows this one. A grant issued from now on carries it, and a policy left at the
         // previous revision would refuse that grant as claiming a revision this host never issued.

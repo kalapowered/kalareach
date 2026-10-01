@@ -69,7 +69,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
-use crate::service::{AdmittedConnection, Controller};
+use crate::service::{AdmittedConnection, Controller, LeaseDenied};
 use config::NetworkSettings;
 use devices::{DeviceDirectory, DeviceRecord};
 use dispatch::RemoteConnection;
@@ -1740,16 +1740,21 @@ impl Controller {
         // withdraws its connection's registration, and a mutation still on its way from that
         // connection must not extend the lease the worker holds.
         self.check_registration(&admitted)?;
+        #[cfg(feature = "testing")]
+        self.before_the_lease.wait().await;
         let lease: Option<ContinuousInstant> = match self.dispatch_lease(session_id, actor).await {
             Ok(lease) => lease,
             // A worker that has not installed the revision in force has no lease to renew. Asking
             // it once, here, is what lets a dispatch to a worker this daemon has not spoken to
             // about authority succeed rather than fail on a condition the daemon itself can meet.
-            Err(refused) => {
+            // Only that: a fence this host owes, or a generation it no longer holds, is not
+            // something an announcement changes, and starting one for it would have the worker
+            // told a revision the barrier has not finished.
+            Err(LeaseDenied::NotAcknowledged(_)) => {
                 self.acknowledge_worker_revision(session_id).await?;
-                let _ = refused;
                 self.dispatch_lease(session_id, actor).await?
             }
+            Err(stopped @ LeaseDenied::Stopped(_)) => return Err(stopped.into()),
         };
         // Taking the lease can wait for the worker to acknowledge the revision, and the mutation
         // waited for its link before that. The check every service asks from inside its work is
