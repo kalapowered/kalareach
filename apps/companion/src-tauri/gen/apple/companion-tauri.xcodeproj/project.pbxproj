@@ -23,6 +23,7 @@
 		261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		2649DEFDEEC785F1D317F0E7 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
 		27B4FE203288F26127E58B2C /* LaunchPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */; };
+		4125DFC0A80770C44B62F4F4 /* Placeholder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 970F2613512D8B1891D9E024 /* Placeholder.swift */; };
 		4885115428043D10878AD99B /* PreviewDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */; };
 		4E93831717B567BEBE15595F /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */; };
@@ -119,6 +120,7 @@
 		233EDCC125C890EB364292DC /* state.rs */ = {isa = PBXFileReference; path = state.rs; sourceTree = "<group>"; };
 		286BC5287B5926CF34F943B6 /* device.rs */ = {isa = PBXFileReference; path = device.rs; sourceTree = "<group>"; };
 		2A45B1371EDD793B4134FF79 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		2AAB471DF8105A26C4D3BA86 /* KalaReachUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KalaReachUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2C4D68F5B5A1CA28AA156354 /* LaunchHook.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LaunchHook.m; sourceTree = "<group>"; };
 		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
 		2F98D29B580DC36783990AB6 /* carrier.rs */ = {isa = PBXFileReference; path = carrier.rs; sourceTree = "<group>"; };
@@ -162,6 +164,7 @@
 		953403801C4BBC825A98C1E9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionProbe.swift; sourceTree = "<group>"; };
 		968DA075763493DABDC4ABBC /* worker.rs */ = {isa = PBXFileReference; path = worker.rs; sourceTree = "<group>"; };
+		970F2613512D8B1891D9E024 /* Placeholder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Placeholder.swift; sourceTree = "<group>"; };
 		9763735ADB959CD6F7877892 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		98E2790FBE7F41C2852A6A54 /* hosts.rs */ = {isa = PBXFileReference; path = hosts.rs; sourceTree = "<group>"; };
 		99611A8D0244C4941FABBE82 /* window.rs */ = {isa = PBXFileReference; path = window.rs; sourceTree = "<group>"; };
@@ -265,6 +268,15 @@
 			path = account;
 			sourceTree = "<group>";
 		};
+		365290B4F4420FF8E6EA8040 /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				970F2613512D8B1891D9E024 /* Placeholder.swift */,
+			);
+			name = UITests;
+			path = ../../../native/ios/UITests;
+			sourceTree = "<group>";
+		};
 		3B506588AC88ABCEFBB10E36 /* KalaReachApp */ = {
 			isa = PBXGroup;
 			children = (
@@ -305,6 +317,7 @@
 				45752446E12DEC199411BC9D /* companion-tauri_iOS.app */,
 				867641E9571FFF4D300F4601 /* KalaReachNativeTests.xctest */,
 				E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */,
+				2AAB471DF8105A26C4D3BA86 /* KalaReachUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -462,6 +475,7 @@
 				3BDBEB386023E2D63A29DDD6 /* Sources */,
 				90C70160FE2670F1CB0A8CCE /* src */,
 				A9A55303B287F5C61BAEEC6A /* Tests */,
+				365290B4F4420FF8E6EA8040 /* UITests */,
 				FCE3CC91FD2A97EE36BB262A /* Frameworks */,
 				5A54F39A1118D3FEAD667A9F /* Products */,
 			);
@@ -502,7 +516,7 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_DB9D2DA1-41C9-47A4-9AA1-CEECC7EB0B0C" /* x86_64 */ = {
+		"TEMP_CF635D2E-3870-40E6-8E36-CECA05E34472" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -554,6 +568,23 @@
 			productReference = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		ED1EC71A294516CFE1E1C0DE /* KalaReachUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 73A9B3439BF23C0F2546C07D /* Build configuration list for PBXNativeTarget "KalaReachUITests" */;
+			buildPhases = (
+				000CA5589491B66D2CF1F8D5 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KalaReachUITests;
+			packageProductDependencies = (
+			);
+			productName = KalaReachUITests;
+			productReference = 2AAB471DF8105A26C4D3BA86 /* KalaReachUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		F72D40A2DED4C3598444BD26 /* KalaReachNativeTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F1F4D89102687C7026A36134 /* Build configuration list for PBXNativeTarget "KalaReachNativeTests" */;
@@ -588,6 +619,9 @@
 					BD1EAF0048445C8E7F84FFB7 = {
 						DevelopmentTeam = L775WGST9V;
 					};
+					ED1EC71A294516CFE1E1C0DE = {
+						DevelopmentTeam = L775WGST9V;
+					};
 					F72D40A2DED4C3598444BD26 = {
 						DevelopmentTeam = L775WGST9V;
 					};
@@ -613,6 +647,7 @@
 			targets = (
 				BD1EAF0048445C8E7F84FFB7 /* KalaReachNotificationService */,
 				F72D40A2DED4C3598444BD26 /* KalaReachNativeTests */,
+				ED1EC71A294516CFE1E1C0DE /* KalaReachUITests */,
 				154621C0FD40E79EC835DB1C /* companion-tauri_iOS */,
 			);
 		};
@@ -675,6 +710,14 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		000CA5589491B66D2CF1F8D5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4125DFC0A80770C44B62F4F4 /* Placeholder.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		0A547776F6F5F89042441B44 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -762,14 +805,18 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
 				INFOPLIST_FILE = KalaReachNotificationService/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.notifications;
 				PRODUCT_NAME = KalaReachNotificationService;
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_EXTENSION_PROFILE)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -786,6 +833,8 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -799,8 +848,10 @@
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach;
 				PRODUCT_NAME = "KalaReach";
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_APP_PROFILE)";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -824,6 +875,27 @@
 			};
 			name = debug;
 		};
+		76D8116518BF77C1D7068024 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
+				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.uitests;
+				PRODUCT_NAME = KalaReachUITests;
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_RUNNER_PROFILE)";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = release;
+		};
 		8971E4B0800DAF17A6F48A09 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -834,6 +906,8 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -847,11 +921,34 @@
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach;
 				PRODUCT_NAME = "KalaReach";
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_APP_PROFILE)";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+		A04F03C63CEB688CB4A6BA14 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
+				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.uitests;
+				PRODUCT_NAME = KalaReachUITests;
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_RUNNER_PROFILE)";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = debug;
 		};
@@ -876,14 +973,18 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
+				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
 				INFOPLIST_FILE = KalaReachNotificationService/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach.notifications;
 				PRODUCT_NAME = KalaReachNotificationService;
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_EXTENSION_PROFILE)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -1039,6 +1140,15 @@
 			buildConfigurations = (
 				8971E4B0800DAF17A6F48A09 /* debug */,
 				4510642D975077113407FC62 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		73A9B3439BF23C0F2546C07D /* Build configuration list for PBXNativeTarget "KalaReachUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A04F03C63CEB688CB4A6BA14 /* debug */,
+				76D8116518BF77C1D7068024 /* release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = debug;
