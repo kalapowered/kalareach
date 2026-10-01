@@ -17,7 +17,7 @@
 //! | The handshake | [`HANDSHAKE_MS`] for `ready` |
 //! | A load | its own deadline, plus [`ANSWER_GRACE_MS`] |
 //! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`] |
-//! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is held to the same bound |
+//! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is then held to the same bound |
 //! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
 //! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job |
 //!
@@ -65,7 +65,10 @@ pub const ANSWER_GRACE_MS: u64 = 2_000;
 /// read it, and the job's own answer is then bounded by the job's deadline and the process's own
 /// watchdog, so a busy host that takes a moment to stop a job is not mistaken for a process that is
 /// not listening. A load and a check of a file lose nothing when the process is ended, so each is
-/// held to this bound for its own answer too.
+/// held to this bound for its own answer too. A process that said it had read the cancellation and
+/// then did not stop the load or the check is ended without a failure of inference
+/// ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
+/// ([`ProcessEnd::CancelUnanswered`]).
 pub const CANCEL_MS: u64 = 2_000;
 
 /// How often the process's resident set is read while it loads or runs a job.
@@ -170,6 +173,11 @@ pub enum Checked {
         /// How.
         why: ProcessEnd,
     },
+    /// The check was not sent: the process holds work or another check, and a check holds the
+    /// process's model thread, so one sent behind either would wait while its own deadline ran.
+    Refused,
+    /// The service had the process ended while the check was in it.
+    Unloaded,
 }
 
 /// A file to check, and what it is to be checked against: a file of one of the profiles the
@@ -389,11 +397,13 @@ impl Driver {
 
     /// Sends a check of a file to the process, starting the process when there is none.
     ///
-    /// One check is in the process at a time, and the host that asks for one is the host that
-    /// knows nothing else is running: a check holds the process's model thread, so a job sent
-    /// behind it would be waiting while its own deadline ran. The result comes back as
-    /// [`Report::Checked`] on a later turn. A check the process cannot be started for, or that
-    /// the process ends before answering, is reported as ended with the process.
+    /// A check holds the process's model thread, so one sent behind a load, a job or another check
+    /// would wait while its own deadline ran: it is not sent, and is reported as
+    /// [`Checked::Refused`]. A job or a load asked for while a check is in the process is the
+    /// host's to avoid, as a host that holds nothing without its files does. The result comes back
+    /// as [`Report::Checked`] on a later turn. A check the process cannot be started for counts as
+    /// a failure of inference, as any start that fails does, since the same executable runs the
+    /// model; one the process ends before answering is reported as ended with the process.
     ///
     /// # Errors
     ///
@@ -403,8 +413,12 @@ impl Driver {
         if self
             .process
             .as_ref()
-            .is_some_and(|running| running.check.is_some())
+            .is_some_and(|running| running.check.is_some() || running.work.is_some())
         {
+            reports.push(Report::Checked {
+                id: check.id,
+                checked: Checked::Refused,
+            });
             return Ok(reports);
         }
         if let Err(why) = self.start(now, &mut reports) {
@@ -444,7 +458,11 @@ impl Driver {
     }
 
     /// Tells the process to stop the check it is making, if it is making one. The process is
-    /// ended when it has not answered within [`CANCEL_MS`].
+    /// ended when it has not said it has read the cancellation within [`CANCEL_MS`], and when the
+    /// check has not stopped within [`CANCEL_MS`] of that.
+    ///
+    /// Asking again for a check already being stopped changes nothing: the bound runs from the
+    /// first ask.
     ///
     /// # Errors
     ///
@@ -454,6 +472,14 @@ impl Driver {
         let Some(id) = self.checking() else {
             return Ok(reports);
         };
+        if self
+            .process
+            .as_ref()
+            .and_then(|running| running.cancel)
+            .is_some_and(|cancel| cancel.id == id)
+        {
+            return Ok(reports);
+        }
         if self.send(&Request::Cancel { id: U64::new(id) }, now, &mut reports)?
             && let Some(running) = self.process.as_mut()
         {
@@ -467,8 +493,12 @@ impl Driver {
         Ok(reports)
     }
 
-    /// Lets go of the process without ending it or its input, as a daemon that was killed does:
-    /// what a test uses to have a process outlive the daemon that started it.
+    /// Lets go of the process without ending it or closing its input, as a daemon that hangs
+    /// does: what a test uses to have a process outlive the driver that started it.
+    ///
+    /// Nothing reads the process's answers any more, so it goes at its next write, which says the
+    /// daemon is gone; a daemon that was killed closes its end of the pipes, which ends the
+    /// process at once.
     #[cfg(feature = "testing")]
     pub fn abandon(mut self) {
         if let Some(running) = self.process.take() {
@@ -569,7 +599,7 @@ impl Driver {
                     }
                 }
                 Instruction::Unload { why } => {
-                    self.leave();
+                    self.leave(&mut reports);
                     reports.push(Report::Unloaded { why });
                 }
             }
@@ -873,15 +903,19 @@ impl Driver {
         let at = now.monotonic_ms();
         let why = if !running.ready && at >= running.hello_at_ms.saturating_add(HANDSHAKE_MS) {
             Some(ProcessEnd::SilentAtStart)
-        } else if running
+        } else if let Some(cancel) = running
             .cancel
-            .is_some_and(|cancel| cancel.timed() && at >= cancel.at_ms)
+            .filter(|cancel| cancel.timed() && at >= cancel.at_ms)
         {
-            Some(ProcessEnd::CancelUnanswered)
-        } else if running.work.is_some_and(|due| at >= due.at_ms)
-            || running.check.is_some_and(|due| at >= due.at_ms)
-        {
+            Some(if cancel.acknowledged {
+                ProcessEnd::StopOverdue
+            } else {
+                ProcessEnd::CancelUnanswered
+            })
+        } else if running.work.is_some_and(|due| at >= due.at_ms) {
             Some(ProcessEnd::PastDeadline)
+        } else if running.check.is_some_and(|due| at >= due.at_ms) {
+            Some(ProcessEnd::CheckOverdue)
         } else if running.work.is_some() && at >= running.next_sample_ms {
             running.next_sample_ms = at.saturating_add(SAMPLE_MS);
             let pid = running.child.id();
@@ -931,10 +965,16 @@ impl Driver {
 
     /// Ends the process on the service's word: closes its input, which it leaves on, and ends it
     /// outright when it has not left in time.
-    fn leave(&mut self) {
+    fn leave(&mut self, reports: &mut Vec<Report>) {
         let Some(mut running) = self.process.take() else {
             return;
         };
+        if let Some(due) = running.check {
+            reports.push(Report::Checked {
+                id: due.id,
+                checked: Checked::Unloaded,
+            });
+        }
         running.requests = None;
         let until = Instant::now() + LEAVE_WAIT;
         loop {
