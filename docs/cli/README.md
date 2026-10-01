@@ -946,10 +946,10 @@ kr doctor --bundle support.tar --include-content --exclude-session <id> --previe
 
 The second run composes the content again, and if its digest is the same as the one the first run
 printed it prints the content and writes it. If the digest is different it will abort (exit status
-1) without printing or writing anything, and a file already at the path stays as it was. To exclude
-a session use `--exclude-session`, which should be included in both invocations, because the digest
-covers what was left out. Invocations without either `--preview` or `--confirm-content` in
-non-terminal environments will fail with a usage error before the host is consulted.
+1) without printing the content or writing anything, and a file already at the path stays as it was.
+To exclude a session use `--exclude-session`, which should be included in both invocations, because
+the digest covers what was left out. Invocations without either `--preview` or `--confirm-content`
+in non-terminal environments will fail with a usage error before the host is consulted.
 
 When `--json` is provided and the export is not refused, the `content_digest`, `content_left_out`
 and `content_written` fields will be present in the output document. The `bundle` field will only be

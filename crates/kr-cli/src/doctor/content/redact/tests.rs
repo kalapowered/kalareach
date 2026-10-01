@@ -280,6 +280,40 @@ fn overlapping_credentials_are_replaced_as_one() {
     }
 }
 
+/// KR-REQ-29.04: a value is read as a shell reads a word: a quote in the middle of it, and a quote
+/// escaped inside it, keep the words after them in the value; a quote that never closes withholds the
+/// field.
+#[test]
+fn a_value_is_read_as_a_shell_word() {
+    for (text, expected) in [
+        (
+            format!("TOKEN=abc\"d {MARKER}\" next"),
+            "TOKEN=[redacted] next".to_owned(),
+        ),
+        (
+            format!("PASSWORD='it'\\''s {MARKER}' next"),
+            "PASSWORD=[redacted] next".to_owned(),
+        ),
+        (
+            format!("--secret a\\ b{MARKER} next"),
+            "--secret [redacted] next".to_owned(),
+        ),
+        (
+            format!("SECRET=\"a \\\" {MARKER}\" next"),
+            "SECRET=[redacted] next".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+    let unclosed = format!("TOKEN=abc\"d {MARKER}");
+    assert_eq!(
+        redacted(&unclosed),
+        format!("[withheld: {} characters]", unclosed.chars().count())
+    );
+}
+
 /// KR-REQ-29.04: an apostrophe is a valid character of URL user information, and a quote around the
 /// whole argument is not part of it: both forms lose the user information, and a URL with none keeps
 /// its text, quotes and all.
@@ -297,6 +331,11 @@ fn user_information_with_an_apostrophe_is_taken_out_inside_quotes() {
         (
             format!("\"https://user:{MARKER}@host:8443/x?y=z\""),
             "\"https://[redacted]@host:8443/x?y=z\"".to_owned(),
+        ),
+        // The form Windows proxies are written in: a backslash is part of the user information.
+        (
+            format!("http_proxy=http://CORP\\alice:{MARKER}@proxy:8080"),
+            "http_proxy=http://[redacted]@proxy:8080".to_owned(),
         ),
     ] {
         let said = redacted(&text);
