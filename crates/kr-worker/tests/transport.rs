@@ -5011,6 +5011,180 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
     drained.abort();
 }
 
+/// KR-REQ-11.35 and KR-REQ-11.37: the ledger refuses the settlement of a request the terminal made of
+/// its agent, whatever became of the bytes. The failure is not the writer's to swallow: it raises the
+/// fence the receipt path reads, the request stays as the store has it, recorded and not settled, and
+/// recovery commits the gap without claiming what the store never took.
+#[test]
+fn kr_req_11_37_a_ledger_refusing_the_settlement_of_a_client_request_raises_the_fence() {
+    for outcome in [
+        kr_worker::broker::ClientRequestOutcome::Transmitted,
+        kr_worker::broker::ClientRequestOutcome::Uncertain,
+        kr_worker::broker::ClientRequestOutcome::Unsent,
+    ] {
+        let mut store = common::SharedStore::open();
+        let (broker, connection) = broker_from(
+            Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+            rich(),
+        );
+        let admitted = broker
+            .admit_client_request(
+                connection,
+                br#"{"id":11,"method":"session/update","params":{}}"#,
+                None,
+                TimestampMs::new(2),
+            )
+            .expect("the request is admitted");
+        assert_eq!(
+            broker
+                .client_requests()
+                .expect("the records read")
+                .first()
+                .map(|intent| intent.outcome),
+            Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+            "the intent is recorded before its bytes"
+        );
+
+        broker
+            .refuse_ledger_writes(true)
+            .expect("the store is put in query-only mode");
+        broker
+            .client_request_settled(&admitted, outcome)
+            .expect("the writer is told nothing: the fence is where the failure goes");
+        assert!(
+            !store.journal.health().is_healthy(),
+            "{outcome:?}: the ledger's failure is the session's condition"
+        );
+        assert_eq!(
+            broker.mode(),
+            kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+        );
+        let held = broker.client_requests().expect("the records read");
+        assert_eq!(
+            held.first().map(|intent| intent.outcome),
+            Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+            "{outcome:?}: the store holds what it was told before it refused"
+        );
+
+        broker
+            .refuse_ledger_writes(false)
+            .expect("the store takes writes again");
+        store.recover_journal(30);
+        broker
+            .recover(TimestampMs::new(30))
+            .expect("the gap is committed");
+        assert_eq!(
+            broker
+                .client_requests()
+                .expect("the records read")
+                .first()
+                .map(|intent| intent.outcome),
+            Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+            "{outcome:?}: recovery does not claim a settlement the store never took"
+        );
+        assert!(
+            !store
+                .journal
+                .recovery_gaps()
+                .expect("the gaps read")
+                .is_empty(),
+            "{outcome:?}: the interval is on record"
+        );
+    }
+}
+
+/// KR-REQ-11.35 and KR-REQ-11.37: the same refusal at the point a writer meets it. The terminal's
+/// request is recorded and its bytes stop in a pipe nothing reads; the ledger then refuses writes,
+/// the upstream reads the request, and the writer's settlement of it fails. The failure raises the
+/// fence, the next request of the terminal's still goes through, and the first stays recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_37_a_settlement_the_writer_meets_a_refusing_ledger_on_raises_the_fence_and_the_writer_goes_on()
+ {
+    let mut store = common::SharedStore::open();
+    let (broker, connection) = broker_from(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+        rich(),
+    );
+    let (upstream_here, upstream_there) = tokio::io::duplex(8);
+    let (client_here, _client_there) = socket_pair();
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        connection,
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        tokio::io::split(client_here).1,
+        site(),
+        "agent-user",
+    );
+    let drained = tokio::spawn(writes);
+    owner
+        .from_client(
+            br#"{"id":11,"method":"session/update","params":{"from":"first"}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's request is carried");
+    let held = broker.client_requests().expect("the records read");
+    assert_eq!(
+        held.first().map(|intent| intent.outcome),
+        Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+        "recorded before its bytes went: the pipe has not taken them"
+    );
+
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    // The upstream reads it, and the writer's settlement of it is then refused.
+    let mut upstream = tokio::io::BufReader::new(upstream_there);
+    let first = next_line_from(&mut upstream).await;
+    assert!(first.contains("first"), "{first}");
+    let started = tokio::time::Instant::now();
+    while broker.mode() != kr_protocol::gateway::GatewayMode::NativeOnlyVolatile {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the fence",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !store.journal.health().is_healthy(),
+        "the ledger's failure is the session's condition"
+    );
+    assert_eq!(
+        broker
+            .client_requests()
+            .expect("the records read")
+            .first()
+            .map(|intent| intent.outcome),
+        Some(kr_worker::broker::ClientRequestOutcome::Recorded),
+        "the store holds the intent as it was, and the fence says the rest"
+    );
+
+    // The writer goes on: the terminal's next request reaches the upstream.
+    owner
+        .from_client(
+            br#"{"id":12,"method":"session/update","params":{"from":"second"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the next request is carried through the fence");
+    let second = next_line_from(&mut upstream).await;
+    assert!(second.contains("second"), "{second}");
+
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(30);
+    broker
+        .recover(TimestampMs::new(30))
+        .expect("the gap is committed");
+    drop(upstream);
+    owner.shutdown();
+    drop(owner);
+    drained.abort();
+}
+
 /// KR-REQ-11.30: a client request the table does classify is recorded and leaves rich mutations
 /// alone, and what became of its bytes is recorded too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
