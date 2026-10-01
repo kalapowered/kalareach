@@ -269,8 +269,9 @@ impl Controller {
     /// durable later asks here instead: the connection table stays held from the check to the end
     /// of `commit`, and revoking authority and withdrawing a connection both take that table, so
     /// a withdrawal is ordered wholly before the check or wholly after the commit. `commit` is
-    /// short, synchronous and awaits nothing, because the table is a synchronous lock that every
-    /// admission waits on.
+    /// synchronous and awaits nothing, because the table is a synchronous lock that every admission
+    /// waits on. It may be a store transaction, including its sync to disk, and holds nothing else
+    /// of this host's that a table holder takes.
     ///
     /// # Errors
     ///

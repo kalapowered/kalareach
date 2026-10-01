@@ -845,7 +845,17 @@ impl TransferService {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
         let row = upload_of(&store, params.transfer_id, actor)?;
-        self.check_live(&mut store, &row, "a chunk cannot be accepted")?;
+        // Read again, under the lock this mutation holds. The read before the lock keeps an
+        // ordinary repeat from reaching this far; this one is what makes the decision atomic with
+        // the write, so two copies that both saw nothing cannot both act.
+        match recorded_with(&store, action)? {
+            Recorded::Answered(answered) => return Ok(answered),
+            Recorded::Claimed | Recorded::Absent => {}
+        }
+        // From here the call writes: the host's question is asked now, under the lock and after the
+        // record that would have answered the call, and before the expiry `check_live` may write.
+        ask_admission(action)?;
+        self.check_live(&mut store, action, &row, "a chunk cannot be accepted")?;
         let layout = ChunkLayout::for_length(row.declared_byte_len);
         let expected_len = layout.length_of(index).ok_or_else(|| {
             TransferError::invalid(format!(
@@ -874,17 +884,6 @@ impl TransferService {
                 "chunk {index} does not match the digest it declares"
             )));
         }
-        // Read again, under the lock this mutation holds. The read before the lock keeps an
-        // ordinary repeat from reaching this far; this one is what makes the decision atomic with
-        // the write, so two copies that both saw nothing cannot both act.
-        match recorded_with(&store, action)? {
-            Recorded::Answered(answered) => return Ok(answered),
-            Recorded::Claimed | Recorded::Absent => {}
-        }
-        // From here the call writes: the host's question is asked now, under the lock and after the
-        // record that would have answered the call. An expiry the check above found is the host's
-        // own decision and not this action's, so it is written whatever the admission says.
-        ask_admission(action)?;
         let mut duplicate = false;
         if let Some(recorded) = store.chunk(params.transfer_id, index)? {
             if recorded.digest == digest && recorded.byte_len == params.chunk.byte_len {
@@ -1042,7 +1041,7 @@ impl TransferService {
             // The answers a record or a state gives are behind this; what follows can write, an
             // expiry first, so the host's question is asked under the lock before it.
             ask_admission(action)?;
-            self.check_live(&mut store, &row, "it cannot be finished")?;
+            self.check_live(&mut store, action, &row, "it cannot be finished")?;
             check_declaration(&row, params)?;
             let layout = ChunkLayout::for_length(row.declared_byte_len);
             let chunks = store.chunks(params.transfer_id)?;
@@ -2773,22 +2772,28 @@ impl TransferService {
     }
 
     /// Refuses an upload that cannot take more bytes, expiring it first when its time is up.
+    ///
+    /// The expiry is a write, so it is made under the admission `action` carries, which the caller
+    /// has asked already: a registration withdrawn since leaves the upload as it was.
     fn check_live(
         &self,
         store: &mut std::sync::MutexGuard<'_, Store>,
+        action: Option<&Action>,
         row: &UploadRow,
         detail: &str,
     ) -> Result<()> {
         let now = self.clock.now_ms();
         if row.state.accepts_chunks() && row.expires_at_ms.get() <= now.get() {
-            store.close_upload(
-                row.transfer_id,
-                UploadState::Expired,
-                Some("this upload was unfinished for longer than its expiry"),
-                now,
-                // An expiry is the host's own decision, not the caller's action.
-                None,
-            )?;
+            commit_admitted(action, || {
+                store.close_upload(
+                    row.transfer_id,
+                    UploadState::Expired,
+                    Some("this upload was unfinished for longer than its expiry"),
+                    now,
+                    // An expiry is the host's own decision, not the caller's action.
+                    None,
+                )
+            })?;
             // The row is marked for cleanup and its bytes stay charged. The next recovery or sweep
             // removes the payload and releases them; this call does not, because it holds the
             // journal's lock and the removal must not happen under it.
