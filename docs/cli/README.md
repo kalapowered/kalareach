@@ -746,7 +746,7 @@ it repairs nothing.
 kr doctor                          # each check's verdict, with evidence only where one did not pass
 kr doctor --verbose                # every check's evidence, including the checks that passed
 kr doctor --bundle support.tar     # write a redacted support bundle
-kr doctor --bundle support.tar --include-content   # add the content-bearing diagnostic export
+kr doctor --bundle support.tar --include-content   # add each session's shell, directory and closure, shown first
 ```
 
 The output opens with the environment, the execution context, the desktop and its capabilities and
@@ -862,19 +862,108 @@ a value to decide about it, so a lower-case scheme word, an unfamiliar token alp
 credential in the middle of an ordinary sentence are all gone for the same reason: the field they
 arrived in is one this host does not publish the text of.
 
-Nothing content-bearing is in it. `--include-content` adds a `content/` entry, and the command
-prints what that entry will hold, on the error stream, before it writes anything:
+By default no content is included in the bundle. Use `--include-content` to include a single content
+file, `content/sessions.json`. It contains a list of the identifier, shell, working directory, times
+and closure for each session the host lists, both live and closed. Its content will be printed in
+full before it is written to disk, and it will only be written if you approve of its content.
+
+#### What the export leaves out
+
+Private sessions are not exported. All sessions are private when this environment is in privacy mode
+(including those created after privacy mode was activated), and sessions are private until they have
+completed any cleanup requested by privacy mode, even when privacy mode is off (`kr privacy status`
+lists those sessions; one whose worker ended before it finished its cleanup stays on the list after
+privacy mode is turned off, because what it kept belongs to the archive). No sessions are private
+for any other reason. Turning privacy mode off starts new retention from that point, so a session
+that ran through a private interval and owes nothing now is exported, and so is one that was created
+while privacy mode was on and has finished its cleanup.
+
+The command reads the state of privacy mode, then reads the list of sessions, and then reads the
+state of privacy mode again. If privacy mode is on at either point, or if the generation number for
+privacy mode has changed in between those two reads, then no sessions will be exported. A message
+will be emitted to that effect, and you will have to run the command again. If the command fails to
+read privacy mode or the sessions it will fail without writing anything to disk. Note that a bundle
+with no sessions included is a valid bundle, so the command will exit as the diagnostics alone would
+have:
 
 ```text
---include-content adds the content-bearing diagnostic export:
-  content/sessions.json: every live and closed session (4 of them) with its shell command line,
-  working directory and title
-support bundle written to support.tar (4 software versions, 2 capability records, 13 checks,
-1 content-bearing entries)
+  content/sessions.json: the shell, working directory and closure of 0 sessions, redacted by session-content-1 and printed before it was written (digest 9f2c...); 2 sessions left out: privacy mode is on
 ```
 
-Giving the flag is the selection. Without it there is no content-bearing export and the manifest
-says so.
+The content preview, the manifest and the `content_left_out` key in the `--json` output will contain
+a count of the number of sessions omitted from the export and the reason they were omitted.
+
+#### What it shows and what it removes
+
+The content preview is written to the error stream, so `--json` keeps standard output for its
+document. The preview contains the text of the file which will be written, along with the digest of
+its content and of what was left out. It also contains a reminder of the filter's limit. Credentials
+are taken out first, according to the following rules (referred to as `session-content-1` in the
+file and in the manifest):
+
+- the value of an assignment whose name says credential (`TOKEN=...`, `--password=...`,
+  `?token=...`) will be replaced with `[redacted]`;
+- when an option with such a name is followed by a value without an equals sign (e.g. `--password
+  x`), that value will be replaced with `[redacted]`;
+- the user information of a URL (`https://user:secret@host/`) will be replaced with `[redacted]@`;
+- the value of your home directory when it occurs where a path starts will be replaced with
+  `[home]`.
+
+A name says credential when it contains the word password, passwd, passphrase, secret, token,
+credential, apikey, privatekey or bearer, or when one of its parts (split at any character that is
+not a letter or a digit, and at a change in letter case) is the word pass, auth, authorization, key
+or cookie. `PWD` would not be redacted but `tokenizer` would be. If the value of a field identified
+as a credential is quoted, the entire quoted string will be treated as the credential value. If the
+quote is not closed the entire field will be withheld and its length reported.
+
+A filter is not a guarantee that no secret remains, and this one never looks at a value. It does not
+filter positional secrets, path components, values to `-p` and `-u user:secret`, `Authorization`
+header values, connection string parts, and user names in paths (except for your home directory).
+Make sure to inspect the content in the preview before continuing. (Note that invisible terminal
+characters like text direction overrides and zero-width marks will be written as escapes, so the
+text on your screen is the text in the file.)
+
+#### Writing it
+
+When run from a terminal, this will print the above and ask for confirmation. Enter yes to proceed
+to writing the bundle. Enter a session id from the above to show the content again but exclude that
+session. Anything else or end of input will abort (exit status 1) and not write any file, except an
+identifier that is not in the content, which is asked about again. After entering yes, the host will
+be read again, and if the content’s digest is the same as above it will be written. If privacy mode
+went on while the command waited, nothing is written. This narrows the time between the last read
+and the file being written, and it cannot close it.
+
+When run anywhere but a terminal, run it twice. The first run, with `--preview`, prints the content
+and writes nothing. The second uses `--confirm-content` and the digest the first one printed:
+
+```sh
+kr doctor --bundle support.tar --include-content --preview
+kr doctor --bundle support.tar --include-content --confirm-content 9f2c...
+kr doctor --bundle support.tar --include-content --exclude-session <id> --preview
+```
+
+This will again compose the content, and if its digest is the same as above it will print it and
+write it. If the digest is different it will abort (exit status 1) without printing or writing
+anything, and a file already at the path stays as it was. To exclude a session use
+`--exclude-session`, which should be included in both invocations, because the digest covers what
+was left out. Invocations without either `--preview` or `--confirm-content` in non-terminal
+environments will fail with a usage error before the host is consulted.
+
+When `--json` is provided, the `content_digest`, `content_left_out` and `content_written` fields
+will be present in the output document. The `bundle` field will only be present if the bundle has
+been written. Refusing or declining the export operation results in a regular failure document
+without `bundle`.
+
+#### What it cannot do
+
+The bundle file will be present on your machine and nothing in it can be recalled. It’s possible to
+enable privacy mode after the last time the host has been read and before the preview is printed or
+the bundle is written to disk, and what was printed or written stays. The two reads and the look
+before the write narrow that window and do not close it, and a matching digest shows that the
+content is what was printed, not that anyone read it. Additionally, a program on your machine with
+access to the terminal could enter yes to the confirmation query. The content printed to the
+terminal is regular output and if you run this from a session on this host, it will be part of that
+session’s output and treated accordingly.
 
 ## `kr bridge`
 
