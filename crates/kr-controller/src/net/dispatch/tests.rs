@@ -2360,3 +2360,133 @@ async fn kr_req_23_34_a_close_answered_from_the_closure_record_is_the_daemons_ow
     assert_eq!(script.forwarded().len(), 0, "no worker was asked");
     world.serving.abort();
 }
+
+/// A device whose pairing grant carries `session.view` and no voice right, and a voice grant of its
+/// own that stands until `expires_at_ms` in UTC. Returns the device.
+fn paired_with_a_voice_grant_until(
+    controller: &crate::service::Controller,
+    byte: u8,
+    expires_at_ms: u64,
+) -> crate::service::net::devices::DeviceRecord {
+    use kr_protocol::rights::ActionRight;
+
+    let device = paired(controller, byte, |grant| {
+        grant.actions = [ActionRight::SessionView].into_iter().collect();
+    });
+    let voice_grant = kr_protocol::grant::Grant {
+        grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+        issuer_device_id: controller.sharing().host_device_id(),
+        actions: [ActionRight::VoiceUse, ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        expiry: kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(expires_at_ms),
+        },
+        ..device.grant.clone()
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: voice_grant,
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a live voice grant");
+    device
+}
+
+/// KR-REQ-09.09: a voice grant that ran out stays out when this host's wall clock is wound back,
+/// because the lapse is decided on the reading this host's floor holds and not on the raw clock.
+/// The control: the same grant is held while the clock has not reached its expiry, and the
+/// method that needs it is decided with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voice_grant_that_ran_out_does_not_come_back_when_the_wall_clock_is_wound_back() {
+    use std::sync::atomic::Ordering;
+
+    use kr_protocol::rights::ActionRight;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let controller = crate::service::net::tests::daemon_on(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired_with_a_voice_grant_until(&controller, 31, now + 60_000);
+    let connection = super::RemoteConnection::for_test(&controller, device);
+    let entry = Method::VoiceStart.entry();
+    let decides_with_voice = || {
+        connection
+            .check_grant(None, entry, false)
+            .map(|decision| {
+                decision
+                    .decided
+                    .permitted
+                    .rights
+                    .contains(&ActionRight::VoiceUse)
+            })
+            .map_err(|error| error.message)
+    };
+
+    assert_eq!(
+        decides_with_voice(),
+        Ok(true),
+        "the voice grant stands until it expires"
+    );
+
+    // Past its expiry: this host's reading raises the floor, and the grant is out.
+    wall.store(now + 120_000, Ordering::SeqCst);
+    let refused = decides_with_voice().expect_err("a voice grant that ran out holds nothing");
+    assert!(refused.contains("voice"), "{refused}");
+
+    // Wound back to before the expiry: the floor holds the reading, so the grant stays out.
+    wall.store(now + 10_000, Ordering::SeqCst);
+    let refused = decides_with_voice().expect_err("a clock wound back does not lend it a life");
+    assert!(refused.contains("voice"), "{refused}");
+}
+
+/// KR-REQ-09.09: while the floor an end of the voice grant was found on is not on record, the
+/// method that needs it is refused as the floor's own refusal, and not as a device that holds no
+/// voice grant: a daemon started in a new boot could decide the other way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voice_grant_whose_end_is_not_on_record_is_refused_as_unrecorded() {
+    use std::sync::atomic::Ordering;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let controller = crate::service::net::tests::daemon_on(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired_with_a_voice_grant_until(&controller, 32, now + 60_000);
+    let connection = super::RemoteConnection::for_test(&controller, device);
+    let entry = Method::VoiceStart.entry();
+    connection
+        .check_grant(None, entry, false)
+        .expect("the voice grant stands until it expires");
+
+    // The store takes no record of an expiry, as on a full disk.
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_expiry BEFORE UPDATE ON grants
+             WHEN NEW.expired_at_ms IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    wall.store(now + 120_000, Ordering::SeqCst);
+    let refused = connection
+        .check_grant(None, entry, false)
+        .expect_err("a lapse this host cannot record is not stated");
+    assert_eq!(
+        refused.message,
+        crate::grants::Refusal::FloorUnrecorded.detail(),
+        "{refused:?}"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_expiry;")
+        .expect("the fault is cleared");
+}
