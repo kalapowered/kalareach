@@ -116,7 +116,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
         Method::DescriptionSetup | Method::DescriptionConfigure | Method::DescriptionDownload => {
-            at(DESCRIBE, "The model")
+            at(DESCRIBE, "Setup")
         }
 
         Method::PairInvite | Method::PairFinish | Method::PairConfirm => {

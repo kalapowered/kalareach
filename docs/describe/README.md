@@ -77,6 +77,24 @@ wrong bytes leaves nothing behind and the next request fetches again. Replacing 
 unloads the old one first, and a result that comes back from the old profile revision is refused
 rather than shown.
 
+## The model's files
+
+The files of the selected profile are kept in `<state>/models/<profile>/<revision>/`, where the description process looks for them. A file named `held.json` in that directory says this host holds them: it names the profile, its revision, and each file with the size and digest it was checked against. At start the daemon takes the files as held when `held.json` is the selected profile's own and each file is there at the size the profile records. Without them nothing is loaded, every session shows its title from metadata, and describe reports `not_downloaded`. A new revision of a profile has a different directory, so the files of an older revision are never considered held for it.
+
+Files are not fetched until the owner asks, and a fetch needs no account. The daemon fetches files from the addresses the profile names, using the proxy the daemon was started with. It follows at most 5 redirects. It times out after 30 seconds if it cannot connect to a server, or after 60 seconds if it does not receive a chunk of the body. It refuses a file if its declared length exceeds the size the profile records or if it receives more bytes in the body than that size, and it refuses to begin when the disk has less room than the files need plus 256 MiB. Each file is written as `<file>.partial` and checked by the description process, which compares it with the size and digest in its own signed catalogue. The daemon never tells it what to accept. Once a file passes, it is renamed to `<file>`, and the marker is written once every file is in place. Description processes launched solely for a check do not load the model and exit after checking the file.
+
+If a fetch is cancelled or fails, the partial and every file of the profile it had already put in place are removed, so nothing of a profile is kept unless all of it is. Only one fetch can run at a time, and turning off descriptions cancels an in-progress fetch.
+
+The process checks each file again at every load. A file it finds changed ends the load as `assets`. That is no failure of inference: it starts no restart delay and counts toward no pause. The host marks the files as not held and removes the marker, and setup shows nothing fetched, so fetching again recovers it. Once the files are held, they are not fetched again.
+
+## Setup
+
+`description.setup` answers what descriptions offer on this host before anything is fetched. It says whether the host can run a model at all, whether the owner has enabled descriptions, the profile, its exact size in bytes, the addresses a fetch would reach, how a fetch is going, whether it can be cancelled, and what state inference is in and why it is paused. It never says a hosted account is needed, because none is. It is a read, served on the local socket and to a paired device whose grant carries host management.
+
+There are two writes that change the host, `description.configure` and `description.download`, and neither is served to a paired device. `description.configure` turns descriptions on or off and allows or forbids inference on battery. The settings are stored in the host's configuration document, and they apply at once. Turning descriptions off cancels any work in flight, including a fetch of the model's files. It also ends the description process. `description.download` starts a fetch of the selected profile's files or cancels the one that runs. Each answers with what setup shows afterwards, so a client sees the fetch running, or the failure that ended it, without asking again.
+
+`kr host descriptions` is the command line for all three. `kr doctor` says whether this host generates descriptions and, when it does not, what it is waiting for.
+
 ## The budgets
 
 Section 22's defaults, which are what a qualification is measured against:
@@ -306,6 +324,37 @@ The daemon starts the two threads that carry a process's frames before it starts
 thread the system will not create leaves no process behind; the load ends as failed, and the next
 start waits out the restart delay. Once the process is running, anything that fails on the way to
 the handshake kills it and collects it.
+
+## The host in the daemon
+
+The description service is owned by one of the threads in the control daemon. That thread also owns the process it drives and a store connection of its own. The rest of the daemon reaches that thread through a handle: the links to the workers hand it facts, the controller tells it when a session opens or closes, the owner's settings arrive as messages, and `session.describe` reads a snapshot the thread publishes after each turn. Nothing runs on a keystroke's path. A keystroke, a resize and a terminal query reach no fact, and facts reach the thread only as pages a worker chose to send.
+
+Each session has a link. The control daemon opens a connection to the session's worker for descriptions, checks the worker, and keeps one request held there. The request asks for the facts past the revision the daemon has read, and the worker holds it for up to five minutes until something changes. The request includes the latest privacy generation number that the worker reported, so a worker whose privacy mode moved answers at once and the daemon never waits on a generation it has not been told. A link that fails is made again after a delay. The delay is doubled each time, starting from half a second and increasing up to five minutes. A worker from an older build refuses the role and is asked again, quietly, until it is replaced.
+
+A page of facts is applied under privacy mode's admission at the generation it was captured under, and dropped when none admits it. A job is registered as in flight under the same admission. Either the job is sent before privacy mode is published, in which case the change finds it and cancels it, or the job is never sent. A result is published under the admission too. When privacy mode is enabled, the thread that enabled it raises the fence of each session and deletes the rows in the store at once. The memory the service holds, which is its queue, its contexts and the pages waiting for the host, is cleared by a purge the host answers within two seconds. A purge that takes longer is reported as unavailable, and privacy mode's change is not complete until it has finished. A host that does not run owes privacy mode nothing.
+
+The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
+
+The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
+
+## What a worker records
+
+A description is built from facts the session itself produced, and each session's worker keeps them in one small record. The record holds:
+
+- the last component of the directory the newest command ran in;
+- the repository that directory is inside, and its branch;
+- the program the newest command ran, and whether it succeeded or failed once it ended;
+- the last prompt an agent in the session was given;
+- the thread the agent selected;
+- the eight most recent events, newest first.
+
+Each field with text is truncated to 120 characters and stripped of control characters. Each time the record changes, its revision moves. The record also carries the privacy generation it was captured under.
+
+Keystrokes, application outputs and query answers are never recorded. The record is captured only in the places where the worker already decides that something happened: a command block the shell integration reported, a prompt the worker admitted, an observation an admitted bridge sent. Those hooks are not called from the input, resize or query paths. The command line, and consequently its arguments, is never recorded. The program's name comes from the shell's own resolution of the command: the Zsh and Bash packages ask the worker before each command a line starts, and when the shell's search found a file, the name is the last part of the command as it was typed. A word the shell did not resolve to a file, such as a token pasted at the prompt, names no program, and neither does a shell that does not ask. The first command of a line that the shell resolved names the program for the whole line.
+
+The repository is read from the nearest `.git` in the command's directory or above it. This is done on a thread of its own, so the hook that reported the command never waits for it. The walk stops after 64 directories, reads at most 4 KiB of `HEAD`, and opens only regular files, so a pipe named `.git` opens nothing. When a command ends, the worker reads the directory the shell is in from the operating system, which means a `cd` is described at the next prompt with nothing more typed.
+
+While privacy mode is on, nothing is captured. Enabling it clears the record in the same step as every other subsystem's fence, and turning it off starts an empty record under the new generation.
 
 ## Lifecycle and failure
 
