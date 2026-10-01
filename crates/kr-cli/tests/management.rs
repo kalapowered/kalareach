@@ -718,6 +718,27 @@ fn scripted_daemon(
     temp: &kr_ipc::testing::TempHost,
     script: Script,
 ) -> (Asked, tokio::task::JoinHandle<()>) {
+    serving(temp, script, None)
+}
+
+/// A scripted daemon that performs `method` as `script` says and then closes the connection
+/// without answering it, as a host does that stops between doing what it was asked and saying so.
+/// A refusal of `method` is still answered.
+fn scripted_daemon_that_hangs_up_after(
+    temp: &kr_ipc::testing::TempHost,
+    script: Script,
+    method: &'static str,
+) -> (Asked, tokio::task::JoinHandle<()>) {
+    serving(temp, script, Some(method))
+}
+
+/// The scripted daemon, which closes the connection instead of answering the one `hangs_up_after`
+/// names once `script` has performed it.
+fn serving(
+    temp: &kr_ipc::testing::TempHost,
+    script: Script,
+    hangs_up_after: Option<&'static str>,
+) -> (Asked, tokio::task::JoinHandle<()>) {
     let endpoint = temp
         .environment()
         .controller_endpoint()
@@ -782,7 +803,11 @@ fn scripted_daemon(
                     Ok(value) => Outcome::Ok(value),
                     Err(error) => Outcome::Error(error),
                 };
-                recorded.lock().expect("the record").push(method);
+                let performed = matches!(outcome, Outcome::Ok(_));
+                recorded.lock().expect("the record").push(method.clone());
+                if performed && hangs_up_after == Some(method.as_str()) {
+                    break;
+                }
                 let response = ControlFrame::Response(Response {
                     request_id,
                     outcome,
@@ -1397,6 +1422,80 @@ async fn an_owner_device_that_never_answers_ends_at_the_challenges_deadline_and_
             1,
             "{methods:?}"
         );
+        serving.abort();
+    }
+}
+
+/// KR-REQ-07.47: a host that performs a confirmed request and ends the connection before it
+/// answers leaves the outcome unknown: the terminal does not call it a host that is not
+/// configured or say that nothing was changed, it says that whether the request was performed is
+/// not known and to look at what the host lists before asking again, and it asks once more for
+/// nothing. The control is a host that answers the same request, which reports it done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_ends_after_a_confirmed_request_leaves_its_outcome_unknown() {
+    use kr_protocol::catalogue::CatalogueKind;
+    for effect in ["plugin.install", "catalogue.add"] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let root = temp.root().join("root.json");
+        std::fs::write(&root, br#"{"signed":"a root"}"#).expect("a root file");
+        let root = root.display().to_string();
+        let line = if effect == "plugin.install" {
+            install_line()
+        } else {
+            repo_add_line(&root, "https://repo.example/metadata/")
+        };
+        let device = |temp: &kr_ipc::testing::TempHost, seen: &Arc<Mutex<Seen>>| {
+            OwnerDevice {
+                effect,
+                refusals: Some(1),
+                expires_at_ms: kr_ipc::now_ms().get() + 600_000,
+                initial_bootstrap: false,
+                budgets: allowed(),
+                answer: if effect == "plugin.install" {
+                    installed(temp)
+                } else {
+                    added(CatalogueKind::Community)
+                },
+            }
+            .script(temp, Arc::clone(seen))
+        };
+
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (asked, serving) =
+            scripted_daemon_that_hangs_up_after(&temp, device(&temp, &seen), effect);
+        let (status, refused) = json(&temp, &line);
+        assert_eq!(status, Some(8), "{effect}: {refused}");
+        assert_eq!(refused["code"], "OUTCOME_UNKNOWN", "{effect}: {refused}");
+        let message = text(&refused["message"]);
+        assert!(message.contains("not known"), "{effect}: {message}");
+        assert!(
+            message.contains("look at what the host lists"),
+            "{effect}: {message}"
+        );
+        assert!(
+            !message.contains("Nothing was changed"),
+            "{effect}: a request the host may have performed is not reported as changing nothing: \
+             {message}"
+        );
+        let performed = seen.lock().expect("the record").effects.len();
+        assert_eq!(
+            performed, 2,
+            "{effect}: the refusal and the request the host performed, and no third"
+        );
+        let methods = asked.lock().expect("the record").clone();
+        assert_eq!(
+            methods.iter().filter(|name| *name == effect).count(),
+            2,
+            "{effect}: {methods:?}"
+        );
+        serving.abort();
+
+        // The control: a host that answers the same performed request reports it done.
+        let temp = kr_ipc::testing::TempHost::create();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (_asked, serving) = scripted_daemon(&temp, device(&temp, &seen));
+        let (status, done) = json(&temp, &line);
+        assert_eq!(status, Some(0), "{effect}: {done}");
         serving.abort();
     }
 }
