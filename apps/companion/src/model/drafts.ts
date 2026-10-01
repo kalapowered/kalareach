@@ -98,13 +98,23 @@ export function connectionLost(draft: Draft): Draft {
 /**
  * Offers a rebind against what the host now reports.
  *
- * A session that is gone orphans the draft. An application or binding revision that changed
- * conflicts it. Only an unchanged target rebinds, and even then the caller decides whether to do
- * it: this returns the state, it does not submit anything.
+ * Only a detached draft has an association to restore: a draft that is bound has not lost one, and
+ * a conflicted or an orphaned draft is the person's to settle, so what the host reports now changes
+ * none of the three. A session that is gone orphans the draft. An application or binding revision
+ * that changed conflicts it. A draft that holds nothing, or was written before this device knew
+ * which conversation the agent was in, has no conversation of its own to compare, so it goes with
+ * the one that is current, as it would have had it not been detached. Only an unchanged target
+ * rebinds, and even then the caller decides whether to do it: this returns the state, it does not
+ * submit anything.
  */
 export function rebind(draft: Draft, observed: DraftTarget | null, attachmentId: string): Draft {
+  if (draft.state !== 'detached') return draft
   if (!observed || observed.sessionId !== draft.target.sessionId) {
     return { ...draft, state: 'orphaned', attachmentId: null }
+  }
+  const empty = draft.text.length === 0 && draft.attachments.length === 0
+  if (empty || draft.target.applicationInstanceId === null) {
+    return { ...draft, target: observed, state: 'bound', attachmentId }
   }
   if (
     observed.applicationInstanceId !== draft.target.applicationInstanceId ||
