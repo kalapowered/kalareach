@@ -1335,10 +1335,10 @@ impl WorkerService {
                     let live_from = restoration.as_ref().map_or(0, |joined| joined.cursor);
                     // Whether the client has been sent the beginning of its stream: the restoration's
                     // bytes written whole or, for a projected join that has none, the first frame
-                    // the loop below wrote. The first frame a client is sent is what it takes for the
-                    // beginning of the stream, and an effect is never that frame, so while this is
-                    // false every effect owed is recorded rather than written. The gap notice does
-                    // not count, and a restoration that stopped part way leaves this false.
+                    // the loop below wrote. While this is false every effect owed is recorded rather
+                    // than written, because an effect is never the first frame of a stream and must
+                    // not follow part of a screen. The gap notice does not count, and a restoration
+                    // that stopped part way leaves this false.
                     let mut opened = false;
                     // The effect being written when a write failed, which is owed like the rest.
                     let mut failed: Option<Arc<kr_term::sideeffect::SideEffect>> = None;
@@ -7500,10 +7500,9 @@ async fn deliver_effect(
 ///
 /// Nothing is written when `opened` is false, that is when the client has not been sent the
 /// beginning of its stream, whether because only the gap notice reached it or because its
-/// restoration stopped part way: its first frame is the one a client takes for the beginning of a
-/// stream, and an effect is not that, so every effect is recorded instead. A delivery that is
-/// aborted where it stands, because its connection has ended or its registration was withdrawn,
-/// does not run this.
+/// restoration stopped part way: an effect is never the first frame of a stream and must not follow
+/// part of a screen, so every effect is recorded instead. A delivery that is aborted where it
+/// stands, because its connection has ended or its registration was withdrawn, does not run this.
 async fn settle_effects(
     outlet: &mut Outlet,
     stream_id: &StreamId,
@@ -8728,8 +8727,8 @@ mod tests {
     fn a_gap() -> kr_protocol::recovery::HistoryGap {
         kr_protocol::recovery::HistoryGap {
             cause: None,
-            from_cursor: kr_protocol::scalars::U64::new(0),
-            to_cursor: kr_protocol::scalars::U64::new(5),
+            from_cursor: kr_protocol::scalars::U64::new(1),
+            to_cursor: kr_protocol::scalars::U64::new(3),
         }
     }
 
@@ -8793,11 +8792,21 @@ mod tests {
                     panic!("an opening frame is a notification: {frame:?}");
                 };
                 assert_eq!(notification.event_type.as_str(), *event, "{what}");
+                assert_eq!(notification.stream_id, stream_id, "{what}");
                 assert_eq!(
                     notification.sequence.get(),
                     position as u64,
                     "frames are numbered as they are written: {what}"
                 );
+                if *event == "session.gap" {
+                    let reported: kr_protocol::recovery::HistoryGap =
+                        notification.payload.to_typed().expect("a gap");
+                    assert_eq!(
+                        (reported.from_cursor.get(), reported.to_cursor.get()),
+                        (1, 3),
+                        "the gap says what was lost, and not where the screen was taken: {what}"
+                    );
+                }
                 if *event == "session.output" {
                     let output: kr_protocol::recovery::OutputEvent =
                         notification.payload.to_typed().expect("an output event");
@@ -8815,6 +8824,111 @@ mod tests {
             .await;
             assert!(nothing.is_err(), "no other frame was written: {what}");
         }
+    }
+
+    /// A screen of `chunks` frames, each byte telling which frame it belongs to.
+    fn a_large_screen(chunks: usize) -> Vec<u8> {
+        (0..chunks)
+            .flat_map(|chunk| std::iter::repeat_n(b'a' + chunk as u8, MAX_OUTPUT_EVENT_BYTES))
+            .collect()
+    }
+
+    async fn read_output(
+        reader: &mut kr_ipc::framed::FrameReader,
+    ) -> (u64, kr_protocol::recovery::OutputEvent) {
+        let frame = reader
+            .read_message::<kr_protocol::envelope::ControlFrame>()
+            .await
+            .expect("a frame arrives");
+        let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
+            panic!("a frame of a screen is a notification: {frame:?}");
+        };
+        assert_eq!(notification.event_type.as_str(), "session.output");
+        (
+            notification.sequence.get(),
+            notification.payload.to_typed().expect("an output event"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_screen_of_several_frames_is_one_screen_at_one_cursor_whose_frames_follow_the_gap() {
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
+        let screen = a_large_screen(3);
+        let mut sequence = 0_u64;
+        let (sent, read) = tokio::join!(
+            super::open_delivery(
+                &mut outlet,
+                &stream_id,
+                &mut sequence,
+                joined(&screen, Some(a_gap())),
+            ),
+            async {
+                let gap = reader
+                    .read_message::<kr_protocol::envelope::ControlFrame>()
+                    .await
+                    .expect("the gap notice arrives");
+                assert!(matches!(
+                    gap,
+                    kr_protocol::envelope::ControlFrame::Notification(ref notification)
+                        if notification.event_type.as_str() == "session.gap"
+                ));
+                let mut read = Vec::new();
+                for _ in 0..3 {
+                    read.push(read_output(&mut reader).await);
+                }
+                read
+            }
+        );
+        assert_eq!(sent, Some(true), "every frame of the screen was written");
+        assert_eq!(sequence, 4);
+        for (position, (frame_sequence, output)) in read.iter().enumerate() {
+            assert_eq!(*frame_sequence, position as u64 + 1);
+            assert_eq!(
+                output.cursor.get(),
+                5,
+                "the frames are parts of one screen at one cursor, not consecutive spans of a stream"
+            );
+            assert_eq!(
+                output.bytes.as_slice(),
+                &screen[position * MAX_OUTPUT_EVENT_BYTES..][..MAX_OUTPUT_EVENT_BYTES]
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_screen_stopped_after_its_first_frame_has_not_been_sent_the_beginning_of_its_stream()
+    {
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let (_temp, _subscription, mut outlet, mut reader) = an_outlet().await;
+        // Four frames are more than a connection holds unread, so the delivery cannot finish before
+        // the peer has read and the withdrawal below has stopped it.
+        let screen = a_large_screen(4);
+        let withdrawn = Arc::clone(&outlet.withdrawn);
+        let mut sequence = 0_u64;
+        let (sent, first) = tokio::join!(
+            super::open_delivery(
+                &mut outlet,
+                &stream_id,
+                &mut sequence,
+                joined(&screen, None)
+            ),
+            async {
+                let first = read_output(&mut reader).await;
+                withdrawn.set();
+                first
+            }
+        );
+        assert_eq!(first.0, 0);
+        assert_eq!(
+            first.1.bytes.as_slice(),
+            &screen[..MAX_OUTPUT_EVENT_BYTES],
+            "the first frame of the screen reached the peer"
+        );
+        assert_eq!(
+            sent, None,
+            "and the delivery stopped part way, which is not the beginning of a stream"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

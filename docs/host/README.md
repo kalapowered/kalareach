@@ -1105,8 +1105,9 @@ member that can ring, copy, notify, download, launch or ask anything. A terminal
 when the history happened does not have the history happen to it.
 
 Asking for the screen again over the same connection replaces that connection's subscription at a
-frame boundary. A frame of the old stream already part way to the client is finished, nothing more
-of the old stream follows it, and then the new screen is sent.
+frame boundary. The old stream will finish sending the frame it is currently working on, but no
+further output will be written to it other than any enqueued side effects, which will be written or
+recorded as described below, after which the new screen will be sent.
 
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
 apply. What it leaves out is counted rather than assumed away — the saved cursor and keyboard
@@ -1138,12 +1139,12 @@ destination. Reasons for not delivering a side effect include: the lease has mov
 attachment; the attachment has no subscription; its stream has been told to begin again; its queue
 has no room; or a write to it failed. When a subscription is replaced by another, the former
 subscription writes the effects still queued on its stream, each whole, before it stops, and records
-the ones it cannot write. A subscription replaced before its client has been sent the beginning of
-its stream writes no side effects and records them all, because a client takes the first frame it is
-sent for that beginning. For a direct client the beginning is the whole first screen, so a gap
-notice, or part of the screen, does not count. For a projected client it is the first frame after
-any gap notice. A connection that ends, or an authority that is withdrawn, stops a delivery where it
-stands, and the effects still queued on its stream go with it.
+the ones it cannot write. A subscription replaced before its attachment has been sent the beginning
+of its stream writes no side effects and records them all. For a direct attachment the beginning is
+the whole first screen, so a gap notice, or part of the screen, does not count. For a projected
+attachment it is the first frame after any gap notice. A connection that ends, or an authority that
+is withdrawn, stops a delivery where it stands, and the effects still queued on its stream go with
+it.
 
 The host's own replies to the application's questions are measured on the session's continuous
 clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. Each
