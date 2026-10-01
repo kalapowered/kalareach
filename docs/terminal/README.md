@@ -1313,24 +1313,25 @@ Each run writes a record to `fixtures/terminal/physical/<terminal>-<version>.jso
 launcher's own reading of the application (its bundle, its version, its profile settings and the
 environment its window started programs with), the terminal's answers to the version query and the
 device attributes, and for every step the bytes, the terminal's position, the grid's and whether
-they agree. A record names programs and application bundles and holds no home directory, user name
-or session identifier: the programs the window descends from appear by name alone, a home directory
-is written as `~`, and the session variable is recorded as set or unset. A test holds each record to
-the corpus and to the grid as it is now, so a change to either has to arrive with a new record.
+they agree. A record names programs and application bundles and holds no home directory or session
+identifier: the programs the window descends from appear by name alone, a home directory that begins
+a path is written as `~`, and `STY`, `TMUX` and `TMUX_PANE` are recorded as set or unset. A test
+holds each record to the corpus and to the grid as it is now, so a change to either has to arrive
+with a new record.
 
 Two terminals were measured on macOS 26.6 (`arm64`), each in a window it opened for a script the
 test made, with no Apple Event sent:
 
 | Terminal | Version | Window | Steps | Agree | Differ | Silent |
 | --- | --- | --- | --- | --- | --- | --- |
-| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 116 | 20 | 0 |
-| iTerm2 | 3.7.1 | 179 by 37 | 136 | 123 | 13 | 0 |
+| Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 115 | 21 | 0 |
+| iTerm2 | 3.7.1 | 179 by 37 | 136 | 122 | 14 | 0 |
 
 Every step where either terminal differs is in the table. Each cell shows where the grid put the
 cursor, and, in bold, where the terminal did, as row and column; `agrees` means the two match. In
 the bytes, `a×columns` is the letter `a` written once for each column of the window, and `<columns>`
 and `<rows>` are the window's size. A difference is a finding, not a fault in either side. The grid
-changes only where it left its own edge, as in the two steps described below the table.
+changes only where it left its own edge, as in the step described below the table.
 
 | Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 37 |
 | --- | --- | --- | --- |
@@ -1347,6 +1348,7 @@ changes only where it left its own edge, as in the two steps described below the
 | `margins.left-and-right-margins-clamp` | `\e[?69h\e[5;20s\e[1;7H\e[99C` | 1;20 / **1;80** | agrees |
 | `margins.return-goes-to-the-left-margin` | `\e[?69h\e[5;20s\e[1;9H\r` | 1;5 / **1;1** | agrees |
 | `wide.wide-character-one-cell-from-the-edge` | `a×(columns-1)\u{3042}` | agrees | 1;179 / **2;3** |
+| `wide.wide-character-two-cells-from-the-edge` | `a×(columns-2)\u{3042}` | 1;79 / **1;80** | 1;178 / **1;179** |
 | `combining.at-the-start-of-a-line` | `\u{0301}` | agrees | 1;1 / **1;2** |
 | `combining.devanagari-conjunct` | `\u{0915}\u{094D}\u{0937}\u{093F}` | 1;3 / **1;4** | 1;3 / **1;4** |
 | `combining.zero-width-space` | `a\u{200B}b` | 1;3 / **1;4** | 1;3 / **1;4** |
@@ -1368,22 +1370,21 @@ still leave a different screen. Two steps that ask whether a pending wrap surviv
 (`autowrap.pending-survives-erase-line` and `autowrap.pending-survives-save-and-restore`) end with a
 character written afterwards, so the cursor shows where that character went.
 
-On two steps the grid followed both terminals. An absolute column past the right edge in `CSI H`,
+On one step the grid followed both terminals. An absolute column past the right edge in `CSI H`,
 `CSI f` or `CSI G` left the grid's cursor one column beyond the last, where both terminals stop on
-the last column. A wide character that ends exactly at the last column was reported one column short
-of the last, where both answer the last. In both of these cases the grid was changed to match the
-terminals: it now holds the cursor on the last column in the first case and reports the last column
-in the second. The records above were measured with both changes (`addressing.clamps-to-the-corner`
-and `wide.wide-character-two-cells-from-the-edge` agree in both). The second change corrects the
-report and not the library's own column, so a line feed or a backspace sent straight after such a
-character still acts from the character's first cell, and no step measures that. A wide character
-that starts on the last column is a separate case, described below, and stays as it was.
+the last column. The grid now holds the cursor on the last column. The records above were measured
+with that change (`addressing.clamps-to-the-corner` agrees in both). A wide character that starts on
+the last column is a separate case, described below, and stays as it was.
 
-On other steps both terminals answer alike and the grid differs. A cursor-left after a full row
-moves the grid's cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A
-zero-width space and a Devanagari conjunct take a cell more in both than the grid's width model
-gives them. Here the two terminals agree with each other and the grid is the one apart. Which of
-them is right is a question for the profile, and the records do not decide it.
+On other steps both terminals answer alike and the grid differs. A wide character that ends exactly
+at the last column leaves the grid's cursor one column short of the last, where both terminals
+answer the last (`wide.wide-character-two-cells-from-the-edge`). The pinned terminal library leaves
+the cursor on the character's first cell there, and the grid reports the library's column. A
+cursor-left after a full row moves the grid's cursor and neither terminal's, and neither restores a
+pending wrap with `ESC 8`. A zero-width space and a Devanagari conjunct take a cell more in both
+than the grid's width model gives them. Here the two terminals agree with each other and the grid is
+the one apart. Which of them is right is a question for the profile, and the records do not decide
+it.
 
 Terminal.app alone differs on the save and restore forms `CSI s`, `CSI u` and mode 1048, on left and
 right margins (mode 69), on cursor movement inside a scroll region, on reverse index at the top of
