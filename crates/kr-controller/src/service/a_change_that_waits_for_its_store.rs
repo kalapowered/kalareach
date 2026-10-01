@@ -89,6 +89,25 @@ impl WorkerSupervisor for Recording {
     }
 }
 
+/// A supervisor that cannot say what it started: a process may be running, and it reports `pid`.
+#[derive(Debug)]
+struct Uncertain {
+    pid: Option<u32>,
+}
+
+impl WorkerSupervisor for Uncertain {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        LaunchOutcome::Uncertain {
+            detail: "this test's supervisor cannot say what it started".to_owned(),
+            pid: self.pid,
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that cannot say what it started"
+    }
+}
+
 /// A deadline that nothing in these tests reaches, unless a test moves its clock past it.
 const STANDING: Duration = Duration::from_secs(60);
 
@@ -1133,4 +1152,58 @@ async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of(
     expected.sort_unstable();
     assert_eq!(owing, expected);
     assert_eq!(obligations_on_disk(&temp), 3);
+}
+
+/// KR-REQ-24.28: a create whose supervisor cannot say what it started leaves its reservation
+/// spawned, and what the launch owes depends on whether a claim can still come. With no process
+/// reported, no launcher is recorded and no claim can be accepted, so the tick forgets the session
+/// and its obligation; with the launcher's process reported and running, the launcher is recorded
+/// and a worker may still claim, so the session stays owed and holds privacy mode on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unless_its_launcher_runs()
+ {
+    for (pid, forgotten_by_the_tick) in [(None, true), (Some(std::process::id()), false)] {
+        let (temp, controller, _clock) =
+            daemon_starting(move |_| Box::new(Uncertain { pid })).await;
+        controller
+            .privacy
+            .enable(&[], kr_ipc::now_ms(), &|write| write())
+            .expect("privacy mode is turned on");
+        let (actor_id, carried) = admitted(&controller).await;
+        controller
+            .session_create(&actor_id, &create_request(temp.environment_id()), carried)
+            .await
+            .expect_err("a create that cannot say what it started fails");
+        let spawned = controller
+            .registry
+            .lock()
+            .await
+            .reservations_in(LaunchPhase::Spawned)
+            .expect("a read");
+        assert_eq!(spawned.len(), 1, "{pid:?}: the reservation stays spawned");
+        assert_eq!(
+            spawned[0].launcher_identity.is_some(),
+            pid.is_some(),
+            "{pid:?}: a launcher is recorded when a process was reported"
+        );
+        let session_id = spawned[0].session_id;
+        if forgotten_by_the_tick {
+            forgotten(&controller, &[session_id]).await;
+            assert_eq!(obligations_on_disk(&temp), 0);
+        } else {
+            tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
+            assert_eq!(
+                obligations_on_disk(&temp),
+                1,
+                "{pid:?}: a worker may still claim, so the session stays owed"
+            );
+            controller
+                .privacy
+                .disable(
+                    kr_ipc::now_ms(),
+                    &|write: &mut dyn FnMut() -> crate::error::Result<()>| write(),
+                )
+                .expect_err("and holds privacy mode on");
+        }
+    }
 }
