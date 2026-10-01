@@ -504,10 +504,9 @@ async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
         {
             let _ = tokio::time::timeout(
                 Duration::from_secs(60),
-                handover_step_of(
+                handover_stop_of(
                     tree.environment_id(),
                     &mut client,
-                    HandoverStep::Stop,
                     answer.attempt.0,
                     &target,
                 ),
@@ -1715,14 +1714,18 @@ async fn handover_step(
     handover_step_of(host.tree.environment_id(), client, step, attempt, target).await
 }
 
-/// Sends one step of the handover to the daemon of `environment` on `client`.
-async fn handover_step_of(
+/// Sends one step of the handover to the daemon of `environment` on `client`, and returns what came
+/// back: the daemon's answer, or the failure of the call itself.
+async fn handover_call_of(
     environment: kr_protocol::ids::EnvironmentId,
     client: &mut LocalClient,
     step: HandoverStep,
     attempt: Option<Uuid>,
     target: &ReleaseName,
-) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+) -> Result<
+    Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>,
+    kr_ipc::IpcError,
+> {
     client
         .mutate(
             Method::HostUpdateHandover,
@@ -1735,7 +1738,41 @@ async fn handover_step_of(
             },
         )
         .await
+}
+
+/// Sends one step of the handover to the daemon of `environment` on `client`, for a step whose
+/// answer always reaches the caller: a daemon that refuses a step, or takes any step but a stop,
+/// goes on serving and writes its answer.
+async fn handover_step_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    handover_call_of(environment, client, step, attempt, target)
+        .await
         .expect("the call reaches the daemon")
+}
+
+/// Tells the daemon of `environment` to stop under `attempt`, and returns its refusal when it
+/// refused.
+///
+/// A daemon that takes a stop ends, and may end before it has written its answer, so an answer
+/// that does not come because the connection ended is not a refusal: the daemon's end is what says
+/// the stop was taken, and the caller waits for that and for how it ended. A refusal is an answer,
+/// and the daemon that gives one serves on. Any other failure of the call is returned as it is.
+async fn handover_stop_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<Option<kr_protocol::error::ProtocolError>, kr_ipc::IpcError> {
+    match handover_call_of(environment, client, HandoverStep::Stop, attempt, target).await {
+        Ok(answer) => Ok(answer.err()),
+        Err(kr_ipc::IpcError::PeerClosed | kr_ipc::IpcError::TruncatedFrame { .. }) => Ok(None),
+        Err(other) => Err(other),
+    }
 }
 
 /// KR-REQ-26.09: a daemon an update prepared, and may have told to stop, is taken back for the
@@ -1855,8 +1892,9 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
 
 /// KR-REQ-26.09: a daemon whose working directory was removed cannot say how it was started, and a
 /// `prepare` finds that out before it has changed anything: it is refused and the gate stays open.
-/// A `resume` and a `stop` are taken all the same, and answer, since what they answer is not what a
-/// daemon is started from: a step that answers an error is a step that was not taken.
+/// A `resume` and a `stop` are taken all the same, and are not refused, since what they answer is not
+/// what a daemon is started from: a step that answers an error is a step that was not taken. A daemon
+/// that takes a stop ends, and may end before its answer is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_that_cannot_say_how_it_was_started_is_refused_before_its_gate_closes() {
     use kr_protocol::error::ErrorCode;
@@ -1938,18 +1976,33 @@ async fn a_daemon_that_cannot_say_how_it_was_started_is_refused_before_its_gate_
         .0
         .expect("it answers the attempt it began");
     std::fs::remove_dir(&directory).expect("the daemon's directory is removed");
-    handover_step(&host, &mut client, HandoverStep::Stop, Some(attempt), &two)
+    // The stop is taken, and the daemon ends, which may be before it has written its answer: what
+    // it must not do is refuse the stop, and that it ends is what shows the stop was taken.
+    let refused = handover_stop_of(host.tree.environment_id(), &mut client, Some(attempt), &two)
         .await
-        .expect("a stop is taken and answers");
+        .expect("the stop call failed only because the daemon ended");
+    assert!(
+        refused.is_none(),
+        "a stop is taken, not refused: {refused:?}"
+    );
     let daemon = host
         .daemons
         .last_mut()
         .expect("the daemon this test started");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while matches!(daemon.try_wait(), Ok(None)) {
+    let status = loop {
+        if let Some(status) = daemon.try_wait().expect("the daemon's end is read") {
+            break status;
+        }
         assert!(Instant::now() < deadline, "the daemon did not stop");
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
+    // A daemon that stops as it is told ends in success: one that was lost to a crash before it
+    // answered is not a stop that was taken.
+    assert!(
+        status.success(),
+        "the daemon ended by a stop, not by a failure: {status:?}"
+    );
 }
 
 /// KR-REQ-26.08: a daemon that starts after an update's first look, in an environment the update
