@@ -899,8 +899,8 @@ reason.
 The content preview is written to the error stream, so `--json` keeps standard output for its
 document. It includes the text of the file as it will be written, with a digest of that text and of
 how many sessions were left out for each reason (the digest does not name the sessions left out),
-and a reminder of the filter's limit. The filter removes credentials first, according to the rules
-below, which it names `session-content-1` in the file and in the manifest. This filter will:
+and a reminder of the filter's limit. The filter removes credentials according to the rules below,
+which it names `session-content-1` in the file and in the manifest. This filter will:
 
 - replace the value of assignments whose names appear to be credentials (e.g. `TOKEN=...`,
   `--password=...`, `?token=...`) with `[redacted]`;
@@ -914,7 +914,8 @@ below, which it names `session-content-1` in the file and in the manifest. This 
 - replace the value of the environment variable that indicates your home directory (the `HOME`
   environment variable, or `USERPROFILE` on Windows) in paths that start with it, unless this value
   is empty, a root, not an absolute path, or doesn't contain any letters or digits (it will be
-  replaced by `[home]`).
+  replaced by `[home]`). Where a home directory overlaps a credential, the whole region they cover
+  is replaced.
 
 A name is considered to be made of ASCII letters, digits, `_`, `.` and `-`. A name is considered to
 refer to a credential if, ignoring the punctuation and the case of letters, it contains the words
@@ -943,13 +944,13 @@ text by its value. It has no rule for positional secrets, plain path components,
 `-u user:secret`, values of an `Authorization` header, connection string components, passwords that
 include non-escaped `/`, `?` or `#` in URLs, options that start with only one `-` such as
 `-password`, a quoted option name, `--user u:secret`, a quote character that is part of a secret, a
-value in `$'...'` quoting, a value with a command substitution, backticks or `${...}` in it, or user
-names included in paths (except your home directory); a secret in one of these forms stays unless
-another rule happens to match it, as one named `Password=...` in a connection string would be.
-Please look over the content in the preview and make sure there is nothing you don't want to share
-before continuing. Note that some invisible characters, such as text direction overrides and
-zero-width characters, will be written as escapes, so that what you see on the screen is what is in
-the file.
+value in `$'...'` quoting, a value with a command substitution, backticks, `${...}` or a
+parenthesised array in it, or user names included in paths (except your home directory); a secret in
+one of these forms stays unless another rule happens to match it, as one named `Password=...` in a
+connection string would be. Please look over the content in the preview and make sure there is
+nothing you don't want to share before continuing. Note that some invisible characters, such as text
+direction overrides and zero-width characters, will be written as escapes, so that what you see on
+the screen is what is in the file.
 
 #### Writing it
 
