@@ -463,6 +463,22 @@ that writes nothing:
   back, and when a replacement keeps its protection: one with an access-control list, one in a
   directory that would give its replacement one, and one another user owns are refused.
 
+Every file the recipe installs is JSON this host can read, whatever its name says. Every command in
+one is the forwarder, in a form this host reads: its name alone, with the application and the
+surface as the two arguments in a list, or one line of its name, the application and the surface,
+separated by single spaces. An object that holds a command carries only a type, a name, the command,
+its arguments and a time limit, so that nothing beside the command can run it in another place or
+environment.
+
+Every configuration key the recipe adds is one this host names for the application, with the one
+value that enables what the release installed. For Claude Code that is `enabledPlugins.<name>` in
+`settings.json`, set to `true`. A key that would make the application run a program, such as a
+status line, an API key helper or a credential refresh, is not on the list, so no value a bridge
+adds can hold a command.
+
+This host does not read what else a registration file asks the application to do. The owner's
+confirmation of the publisher's statement is the only control on that.
+
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
 restores the document exactly. The replacement has exactly the permission bits of the document it
