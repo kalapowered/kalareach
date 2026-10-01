@@ -23,6 +23,7 @@ struct Hooks {
     catalogue: Catalogue,
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
+    abandon: bool,
 }
 
 static PLACED: Mutex<BTreeMap<PathBuf, Hooks>> = Mutex::new(BTreeMap::new());
@@ -37,7 +38,8 @@ pub struct Placed {
 
 /// Places the description process at `program`, told `environment`, choosing from `catalogue`,
 /// under the daemon whose state directory is `state_dir`, with `conditions` for the host to read.
-/// The hooks go when the returned value is dropped.
+/// With `abandon` the process is left running when the daemon's host stops. The hooks go when the
+/// returned value is dropped.
 #[must_use]
 pub fn place(
     state_dir: &Path,
@@ -45,6 +47,7 @@ pub fn place(
     environment: Vec<(OsString, OsString)>,
     catalogue: Catalogue,
     conditions: HostConditions,
+    abandon: bool,
 ) -> Placed {
     let key = canonical(state_dir);
     let skew_ms = Arc::new(AtomicU64::new(0));
@@ -60,6 +63,7 @@ pub fn place(
                 catalogue,
                 skew_ms: Arc::clone(&skew_ms),
                 conditions: Arc::clone(&conditions),
+                abandon,
             },
         );
     Placed {
@@ -110,5 +114,6 @@ pub(crate) fn placement_for(state_dir: &Path) -> Option<Placement> {
         catalogue: hooks.catalogue,
         clock: Clock::skewed(hooks.skew_ms),
         conditions: Some(hooks.conditions),
+        abandon: hooks.abandon,
     })
 }
