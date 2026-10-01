@@ -903,10 +903,9 @@ qualification may not do.
 5. The daemon sends the launch specification over that private channel: the create request with the
    creator's environment variables, taken from memory, its own public key, its generation and the
    privacy state in force.
-6. The worker creates the pseudo-terminal, applies the privacy state, launches the root shell, binds
-   its endpoint and reports itself ready. The daemon records the worker's public key inside the same
-   transaction that marks
-   the session live, then publishes the descriptor.
+6. The worker binds its endpoint, creates the pseudo-terminal, applies the privacy state, launches
+   the root shell and reports itself ready. The daemon records the worker's public key inside the
+   same transaction that marks the session live, then publishes the descriptor.
 
 The create token is the request's action identifier. A retry with the same payload resolves to the
 same reservation; the same token with a different payload is refused rather than becoming a second
@@ -2316,12 +2315,12 @@ flush; it does not forbid grouping these with each other. **This build commits e
 own**, which is its own policy rather than something the section requires.
 
 They are not the only writes a caller waits for, either. Turning privacy mode on waits for the
-generation to be recorded, and a closure waits for its own record, because in both cases the
-answer would otherwise claim something the store had not yet taken.
-Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
-event from waiting for an fsync, and this host goes further with the first two: a keystroke and an
-output byte write no durable row at all. The live parser is in worker memory and the retained
-output is a bounded indexed spool.
+generation to be recorded, a create made while privacy mode is on waits for its session's obligation
+to be recorded, and a closure waits for its own record, because in each case the answer would
+otherwise claim something the store had not yet taken. Section 24 forbids a per-keystroke,
+per-output-byte or ordinary prompt and command telemetry event from waiting for an fsync, and this
+host goes further with the first two: a keystroke and an output byte write no durable row at all.
+The live parser is in worker memory and the retained output is a bounded indexed spool.
 
 Grouping is the transaction. A receipt transition writes three rows - the receipt, its event and
 its outbox record - in one transaction, so three rows share one flush and either all three are
@@ -2825,9 +2824,10 @@ gone.
 
 Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
 obligation before it asks for the worker. That write waits for whatever holds the record, a change
-of privacy mode among it, and if the obligation cannot be written the create starts nothing. When
-the worker's claim is accepted, it is given a launch specification that includes the generation in
-force and whether privacy mode is on. The worker writes the generation into its journal and turns
+of privacy mode among it, and if the obligation cannot be written the create starts nothing. A
+create whose deadline passes, or whose authority is withdrawn, while it waits starts nothing either.
+When the worker's claim is accepted, it is given a launch specification that includes the generation
+in force and whether privacy mode is on. The worker writes the generation into its journal and turns
 off output retention before launching the shell. If it can't write the generation, it doesn't start.
 When the tick's first notice reaches the worker, it already has the generation, and the attention
 store joins at that notice. If privacy mode has changed after the specification was read, the worker
@@ -2850,8 +2850,9 @@ reported yet is one this host has not reached, and it holds turning privacy mode
 worker answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the
 next generation is recorded first, the backup fence is released under it, the delivery fence is
 lifted, and each live session is told until it answers. When a launch never handed a worker its
-launch specification, the registry shows it. In other words, it failed, or was fenced, before any
-worker claimed it, or its launcher ended without claiming it. Since no shell ran, there's nothing to
+launch specification, this host can tell. In other words, it failed, or was fenced, before any
+worker claimed it, its launcher ended without claiming it, or its create returned without having
+recorded a launcher, which no claim can be accepted without. Since no shell ran, there's nothing to
 retain. The obligation is deleted from the record and the session is not reported as ended.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
@@ -3028,8 +3029,9 @@ what it removes is exactly the thing a person cannot check for themselves.
   A worker that was never recorded is told nothing after its launch specification, and nothing
   records a closure for it, not even a restart of the daemon, so for that session the refusal is for
   good. A worker that was recorded remains in the directory, and is told its generation, until the
-  daemon's next start; at that start it is left out of the directory and is in the same situation as
-  a worker that was never recorded.
+  daemon's next start; at that start it is left out of the directory and, unless the host has
+  rebooted, which closes every recorded worker, is in the same situation as a worker that was never
+  recorded.
 
 * **A worker that claims its reservation and then fails keeps its obligation.** A worker that
   reports it could not start after it claimed its reservation, or that ended before it said its
