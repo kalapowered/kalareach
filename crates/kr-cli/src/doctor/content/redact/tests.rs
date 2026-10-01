@@ -335,15 +335,55 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
             format!("tool \"--password={MARKER}\" next"),
             "tool \"--password=[redacted]\" next".to_owned(),
         ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+    // The shell's two ways of writing an apostrophe inside single quotes, and a value of a
+    // credential name whose argument opened before an apostrophe in a path.
+    for (text, expected) in [
         (
-            format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
-            "sh -c \"A=1 SECRET=[redacted]\" tail".to_owned(),
+            format!("env 'TOKEN=it'\\''s {MARKER}' cmd"),
+            "env 'TOKEN=[redacted]' cmd".to_owned(),
+        ),
+        (
+            format!("env 'TOKEN=it'\"'\"'s {MARKER}' cmd"),
+            "env 'TOKEN=[redacted]' cmd".to_owned(),
+        ),
+        // An apostrophe in a path, balanced by a later one, is two quotes around text that is not
+        // an assignment; the credential after it is read as before.
+        (
+            format!("/Users/Tom's Tools/o'neil/run TOKEN='abc {MARKER} def'"),
+            "/Users/Tom's Tools/o'neil/run TOKEN=[redacted]".to_owned(),
+        ),
+        (
+            format!("/Users/Tom's Tools/o'neil/run --password 'abc {MARKER}'"),
+            "/Users/Tom's Tools/o'neil/run --password [redacted]".to_owned(),
+        ),
+        (
+            format!("-e \"PASSWORD=\"{MARKER} img"),
+            "-e \"PASSWORD=[redacted] img".to_owned(),
         ),
     ] {
         let said = redacted(&text);
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
+    // An apostrophe nothing closes, with a credential name after it: where the value ends cannot be
+    // told, so the field is withheld. Without a credential name it is untouched.
+    for text in [
+        format!("/Users/Tom's Tools/run TOKEN='abc {MARKER} def'"),
+        format!("/Users/Tom's Tools/run --password 'abc {MARKER}'"),
+        format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y"),
+    ] {
+        assert_eq!(
+            redacted(&text),
+            format!("[withheld: {} characters]", text.chars().count()),
+            "{text}"
+        );
+    }
+    assert_eq!(redacted("/Users/Tom's Tools/run"), "/Users/Tom's Tools/run");
     // A quote that is never closed around the assignment withholds the field.
     let unclosed = format!("run -e \"PASSWORD=two {MARKER}");
     assert_eq!(
@@ -357,6 +397,14 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
 #[test]
 fn a_no_break_space_does_not_end_a_value() {
     let text = format!("TOKEN=a\u{a0}{MARKER} next");
+    assert_eq!(redacted(&text), "TOKEN=[redacted] next");
+}
+
+/// KR-REQ-29.04: only the space, tab and newline a shell splits on end a value: a carriage return
+/// is a character of its word, so what follows it is still the value.
+#[test]
+fn a_carriage_return_does_not_end_a_value() {
+    let text = format!("TOKEN=abc\r{MARKER} next");
     assert_eq!(redacted(&text), "TOKEN=[redacted] next");
 }
 
@@ -488,6 +536,15 @@ fn windows_paths_the_home_directory_can_sit_in() {
         ),
         "c:\\users\\\u{c9}milie\\x"
     );
+    // The two lower-case sigmas are one letter to the file system, and so is the Kelvin sign and
+    // `k`: a match under either folding is a match.
+    for (text, home) in [
+        ("c:\\users\\\u{3c2}\\work", "C:\\Users\\\u{3a3}"),
+        ("c:\\users\\\u{3c3}\\work", "C:\\Users\\\u{3a3}"),
+        ("c:\\users\\k\\work", "C:\\Users\\\u{212a}"),
+    ] {
+        assert_eq!(field(text, Some(home), WINDOWS), "[home]\\work", "{text}");
+    }
 }
 
 /// KR-REQ-29.04: hostile text never panics a rule: every cut falls on a character boundary and
