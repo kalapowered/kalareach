@@ -51,10 +51,13 @@ function showsEveryLabel(bar: HTMLElement): boolean {
  * The first form in which the bar shows every label as the text is set, or the last, where a label
  * can only end in an ellipsis. Each form is tried in turn, with every label in its bold weight, and
  * the bar is left as it was found, so the answer never depends on the form the bar is in or on the
- * tab the person is on, and nothing is drawn in between.
+ * tab the person is on, and nothing is drawn in between. Only widths are read, so the bar keeps its
+ * height while the forms are tried: a form that is shorter would give the screen above it more room
+ * for a moment, and a list the person had scrolled to its end would be left where that room put it.
  */
 function formThatFits(bar: HTMLElement): Form {
   const found = bar.getAttribute('data-form')
+  bar.style.blockSize = `${bar.getBoundingClientRect().height}px`
   bar.setAttribute('data-measuring', '')
   try {
     for (const form of FORMS) {
@@ -64,6 +67,7 @@ function formThatFits(bar: HTMLElement): Form {
     return 'column'
   } finally {
     bar.removeAttribute('data-measuring')
+    bar.style.removeProperty('block-size')
     if (found === null) bar.removeAttribute('data-form')
     else bar.setAttribute('data-form', found)
   }
