@@ -4817,7 +4817,7 @@ mod tests {
                     .engine()
                     .expect("the store is this owner's")
                     .items()
-                    .map(|item| offer(item))
+                    .map(offer)
                     .collect::<Vec<_>>()
             })
             .expect("the store is taken");
@@ -4888,7 +4888,7 @@ mod tests {
                     .engine()
                     .expect("the store is this owner's")
                     .items()
-                    .map(|item| offer(item))
+                    .map(offer)
                     .collect::<Vec<_>>()
             })
             .expect("the store is taken");
