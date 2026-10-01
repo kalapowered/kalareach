@@ -195,10 +195,10 @@ fn profile_fixture_is_current() {
     );
 }
 
-/// The terminal reference names each behaviour the library record says constrains direct mode, and
-/// counts them as the record does.
+/// The terminal reference lists as many behaviours that constrain direct mode as the library
+/// record names, and says how many in words.
 #[test]
-fn the_reference_lists_every_direct_mode_constraint() {
+fn the_reference_lists_as_many_direct_mode_constraints_as_the_library_record_names() {
     let path = fixtures_dir()
         .join("..")
         .join("..")
@@ -227,13 +227,24 @@ fn the_reference_lists_every_direct_mode_constraint() {
         bullets, constraints,
         "the reference lists {bullets} behaviours and the library record names {constraints}"
     );
-    let count = ["No", "One", "Two", "Three", "Four", "Five", "Six"][constraints];
+    let words = [
+        "no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    ];
+    let count = words
+        .get(constraints)
+        .unwrap_or_else(|| panic!("name {constraints} in words in this test"));
+    let introduction = section
+        .iter()
+        .take_while(|line| !line.starts_with("- "))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     assert!(
-        section
-            .join("\n")
-            .contains(&format!("{count} behaviours differ")),
-        "the reference does not say that {} behaviours differ",
-        count.to_lowercase()
+        introduction
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == *count),
+        "the introduction does not say that there are {count}: {introduction:?}"
     );
 }
 
