@@ -55,9 +55,8 @@ export const ASSOCIATED_DOMAINS = ['applinks:reach.kala.to', 'webcredentials:rea
 /** The code namespace the Android sources keep: it names classes, never the application. */
 const KEPT_NAMESPACE = 'to.kala.reach.companion'
 
-/** The names an earlier identifier gave this application, as dotted names and their JNI form. */
+/** The names an earlier identifier gave this application. */
 const RETIRED_NAMES = [KEPT_NAMESPACE, 'to.kala.companion']
-const RETIRED_JNI = RETIRED_NAMES.map((name) => name.replaceAll('.', '_'))
 
 /** The Apple team the application used to be filed under. */
 const RETIRED_TEAMS = ['JT6GW3W9W6']
@@ -90,21 +89,91 @@ export function declared(root = ROOT) {
 
 // -- names an earlier identifier left ------------------------------------------------------------
 
+/** The bytes a Java or Kotlin name is made of: letters, digits, underscore, dollar and dot. */
+const isNameByte = (byte) =>
+  (byte >= 0x30 && byte <= 0x39) ||
+  (byte >= 0x41 && byte <= 0x5a) ||
+  (byte >= 0x61 && byte <= 0x7a) ||
+  byte === 0x5f ||
+  byte === 0x24 ||
+  byte === 0x2e
+
+/** The same without the dot: what may not follow a name for it to be that name and not a longer word. */
+const isWordByte = (byte) => byte !== 0x2e && isNameByte(byte)
+
+/** The longest name a token is read to, so that one long run of name characters costs no more than its length. */
+const TOKEN_REACH = 200
+
 /**
- * The dotted names in `text` that belong to an earlier identifier, whole: `content://` followed by
- * `to.kala.reach.companion.share` answers `to.kala.reach.companion.share`. A name that only begins
- * like one (`to.kala.reach.companionship`) is not one.
+ * The whole dotted names in `bytes` that contain a name of an earlier identifier, each read out to
+ * the name it sits in: `content://` followed by `to.kala.reach.companion.share` answers
+ * `to.kala.reach.companion.share`. A name that only begins like one (`to.kala.reach.companionship`)
+ * is not one. Linear in the length of `bytes`.
  */
-export function retiredTokens(text) {
-  return text.match(/[\w$.]*to\.kala\.(?:reach\.)?companion(?![\w$])[\w$.]*/g) ?? []
+function retiredNamesIn(bytes) {
+  const found = new Set()
+  for (const name of RETIRED_NAMES) {
+    const wanted = Buffer.from(name)
+    for (let at = bytes.indexOf(wanted); at !== -1; at = bytes.indexOf(wanted, at + 1)) {
+      let to = at + wanted.length
+      if (to < bytes.length && isWordByte(bytes[to])) continue
+      let from = at
+      while (from > 0 && at - from < TOKEN_REACH && isNameByte(bytes[from - 1])) from -= 1
+      while (to < bytes.length && to - at < TOKEN_REACH && isNameByte(bytes[to])) to += 1
+      found.add(bytes.toString('latin1', from, to))
+    }
+  }
+  return [...found]
 }
 
-/** The earlier names, teams and JNI spellings a file's bytes contain, as UTF-8 or UTF-16. */
-function retiredInBytes(bytes, { jni = false } = {}) {
-  const needles = [...RETIRED_NAMES, ...RETIRED_TEAMS, ...(jni ? RETIRED_JNI : [])]
-  return needles.filter(
-    (name) => bytes.includes(name) || bytes.includes(Buffer.from(name, 'utf16le'))
-  )
+/** The names of an earlier identifier in a string. */
+export function retiredTokens(text) {
+  return retiredNamesIn(Buffer.from(text, 'utf8'))
+}
+
+/**
+ * Whether a name is a class of the kept namespace that the application defines: the one thing under
+ * an earlier identifier that is correct. A class under the identifier before the namespace was kept
+ * is not, whatever defines it.
+ */
+const isKeptClass = (name, classes) => name.startsWith(`${KEPT_NAMESPACE}.`) && classes.has(name)
+
+/**
+ * The JNI spellings of an earlier identifier. A native method is exported under its class's name
+ * with the dots as underscores, so `to_kala_reach_companion_` followed by a capital is a class
+ * directly in the namespace, which is where the glue generated for an earlier identifier sat. A
+ * lower-case letter is a package of the kept namespace, and a native method of the code kept there.
+ */
+function retiredJni(bytes) {
+  const found = []
+  if (bytes.includes('to_kala_companion')) found.push('to_kala_companion')
+  const needle = Buffer.from(`${KEPT_NAMESPACE.replaceAll('.', '_')}_`)
+  for (let at = bytes.indexOf(needle); at !== -1; at = bytes.indexOf(needle, at + 1)) {
+    const next = bytes[at + needle.length]
+    if (next >= 0x41 && next <= 0x5a) {
+      const end = Math.min(bytes.length, at + needle.length + 40)
+      let to = at + needle.length
+      while (to < end && isWordByte(bytes[to])) to += 1
+      found.push(bytes.toString('latin1', at, to))
+      break
+    }
+  }
+  return found
+}
+
+/**
+ * The names, teams and JNI spellings of an earlier identifier that a file's bytes contain, as UTF-8
+ * or UTF-16. `classes` are the classes the application defines, which a name of the kept namespace
+ * may be.
+ */
+function retiredInBytes(bytes, { classes = new Set(), jni = false } = {}) {
+  const found = retiredNamesIn(bytes).filter((name) => !isKeptClass(name, classes))
+  for (const team of RETIRED_TEAMS) if (bytes.includes(team)) found.push(team)
+  for (const name of [...RETIRED_NAMES, ...RETIRED_TEAMS]) {
+    if (bytes.includes(Buffer.from(name, 'utf16le'))) found.push(`${name} (as UTF-16)`)
+  }
+  if (jni) found.push(...retiredJni(bytes))
+  return found
 }
 
 // -- iOS -----------------------------------------------------------------------------------------
@@ -136,12 +205,12 @@ function entitlementsOfImage(image) {
     if (at + 8 > image.length) throw new Error('a Mach-O load command runs past the image')
     const command = image.readUInt32LE(at)
     const size = image.readUInt32LE(at + 4)
-    if (size < 8) throw new Error('a Mach-O load command has no size')
+    if (size < 8 || at + size > image.length) {
+      throw new Error('a Mach-O load command runs past the image')
+    }
     if (command === LC_SEGMENT_64) {
       const sections = image.readUInt32LE(at + 64)
-      if (at + 72 + sections * 80 > image.length) {
-        throw new Error('a Mach-O segment runs past the image')
-      }
+      if (72 + sections * 80 > size) throw new Error('a Mach-O segment runs past its command')
       for (let section = 0; section < sections; section += 1) {
         const header = at + 72 + section * 80
         const name = image.subarray(header, header + 16).toString('latin1').replace(/\0+$/, '')
@@ -201,6 +270,11 @@ export function entitlementsOf(path) {
     images = [entitlementsOfImage(file)]
   }
   if (images.every((image) => image === null)) {
+    // `codesign` reports one architecture of a fat executable, so a signature is read only where
+    // there is one image to read it for.
+    if (images.length > 1) {
+      throw new Error('a fat executable carries no entitlements of its own and its signature is read for one architecture only')
+    }
     const sealed = signedEntitlements(path)
     if (sealed) return [sealed]
   }
@@ -342,12 +416,11 @@ function dump(apk, ...arguments_) {
 }
 
 /**
- * The names a manifest gives itself that must follow the package: every provider authority and
- * every permission it defines. Read from `aapt2 dump xmltree`, which prints each element and then
- * its attributes.
+ * Every attribute of every element of a manifest, as `[element, attribute, value]`, from
+ * `aapt2 dump xmltree`, which prints each element and then its attributes.
  */
-export function ownNames(tree) {
-  const names = []
+export function attributesFromTree(tree) {
+  const values = []
   let element = null
   for (const line of tree.split('\n')) {
     const started = /^\s*E: (\S+)/.exec(line)
@@ -355,22 +428,17 @@ export function ownNames(tree) {
       element = started[1]
       continue
     }
-    const attribute = /^\s*A: \S*?:?(\w+)\([^)]*\)="([^"]*)"/.exec(line)
-    if (!attribute) continue
-    if (element === 'provider' && attribute[1] === 'authorities') {
-      names.push(['provider authority', attribute[2]])
-    } else if (element === 'permission' && attribute[1] === 'name') {
-      names.push(['permission', attribute[2]])
-    }
+    const attribute = /^\s*A: (?:\S*?:)?([\w.-]+)(?:\([^)]*\))?="([^"]*)"/.exec(line)
+    if (attribute && element) values.push([element, attribute[1], attribute[2]])
   }
-  return names
+  return values
 }
 
 /** What an APK's manifest says, from `aapt2 dump badging` and `aapt2 dump xmltree`. */
 export function factsFromAapt(badging, tree) {
   return {
     package: /^package: name='([^']*)'/m.exec(badging)?.[1],
-    names: ownNames(tree)
+    values: attributesFromTree(tree)
   }
 }
 
@@ -384,10 +452,16 @@ function protoFields(bytes) {
       if (at >= bytes.length) throw new Error('a protocol-buffer value runs past its message')
       const byte = bytes[at]
       at += 1
+      // The tenth byte of a number carries one bit; any more is not a 64-bit number.
+      if (shift === 63 && (byte & 0x7e) !== 0) throw new Error('a protocol-buffer number is too large')
       value += (byte & 0x7f) * 2 ** shift
       if ((byte & 0x80) === 0) return value
     }
     throw new Error('a protocol-buffer number is longer than ten bytes')
+  }
+  const skip = (length) => {
+    if (at + length > bytes.length) throw new Error('a protocol-buffer field runs past its message')
+    at += length
   }
   while (at < bytes.length) {
     const tag = varint()
@@ -397,13 +471,11 @@ function protoFields(bytes) {
       fields.push({ number, value: varint() })
     } else if (type === 2) {
       const length = varint()
-      if (at + length > bytes.length) {
-        throw new Error('a protocol-buffer field runs past its message')
-      }
-      fields.push({ number, value: bytes.subarray(at, at + length) })
-      at += length
+      const start = at
+      skip(length)
+      fields.push({ number, value: bytes.subarray(start, start + length) })
     } else if (type === 1 || type === 5) {
-      at += type === 1 ? 8 : 4
+      skip(type === 1 ? 8 : 4)
     } else {
       throw new Error(`a protocol-buffer field has wire type ${type}`)
     }
@@ -413,15 +485,15 @@ function protoFields(bytes) {
 
 /** An element of a bundle's manifest: `XmlElement`'s name, attributes and child elements. */
 function protoElement(bytes) {
-  const element = { name: '', attributes: {}, children: [] }
+  const element = { name: '', attributes: [], children: [] }
   for (const field of protoFields(bytes)) {
     if (field.number === 3) {
       element.name = field.value.toString('utf8')
     } else if (field.number === 4) {
       const attribute = protoFields(field.value)
       const text = (number) =>
-        attribute.find((each) => each.number === number)?.value?.toString('utf8')
-      element.attributes[text(2) ?? ''] = text(3) ?? ''
+        attribute.find((each) => each.number === number)?.value?.toString('utf8') ?? ''
+      element.attributes.push([text(2), text(3)])
     } else if (field.number === 5) {
       const child = protoFields(field.value).find((each) => each.number === 1)
       if (child) element.children.push(protoElement(child.value))
@@ -435,17 +507,13 @@ export function factsFromProto(bytes) {
   const root = protoFields(bytes).find((each) => each.number === 1)
   if (!root) throw new Error('the bundle manifest holds no element')
   const manifest = protoElement(root.value)
-  const names = []
+  const values = []
   const walk = (element) => {
-    if (element.name === 'provider' && 'authorities' in element.attributes) {
-      names.push(['provider authority', element.attributes.authorities])
-    } else if (element.name === 'permission' && 'name' in element.attributes) {
-      names.push(['permission', element.attributes.name])
-    }
+    for (const [name, value] of element.attributes) values.push([element.name, name, value])
     element.children.forEach(walk)
   }
   walk(manifest)
-  return { package: manifest.attributes.package, names }
+  return { package: manifest.attributes.find(([name]) => name === 'package')?.[1], values }
 }
 
 /** The manifest of a packaged application: an APK's through `aapt2`, a bundle's from its archive. */
@@ -463,37 +531,60 @@ function manifestFacts(path) {
 }
 
 /**
- * What is wrong with a manifest. Every name it gives itself follows the package: a provider
- * authority or a permission under the retired namespace is a name that did not.
+ * What is wrong with a manifest.
+ *
+ * The package is the identifier. Every authority a provider declares, each of them when it lists
+ * several, and every permission the manifest defines follows the identifier. And no attribute of
+ * any element holds a name of an earlier identifier unless it is a class of the kept namespace that
+ * the application defines, which is what the manifest's own components are.
  */
-export function problemsInManifest(facts, want) {
+export function problemsInManifest(facts, want, classes = new Set()) {
   const problems = []
   if (facts.package !== want.identifier) {
     problems.push(`the manifest's package is ${facts.package}, not ${want.identifier}`)
   }
   let authorities = 0
-  for (const [kind, name] of facts.names) {
-    if (kind === 'provider authority') authorities += 1
-    if (!name.startsWith(`${want.identifier}.`) || retiredTokens(name).length > 0) {
-      problems.push(`the manifest's ${kind} ${name} does not follow ${want.identifier}`)
+  for (const [element, attribute, value] of facts.values) {
+    const own =
+      (element === 'provider' && attribute === 'authorities') ||
+      (element === 'permission' && attribute === 'name')
+    if (own) {
+      for (const name of value.split(';')) {
+        if (element === 'provider') authorities += 1
+        if (!name.startsWith(`${want.identifier}.`) || retiredTokens(name).length > 0) {
+          problems.push(`the manifest's ${element} ${attribute} ${name} does not follow ${want.identifier}`)
+        }
+      }
+      continue
+    }
+    for (const token of retiredTokens(value)) {
+      if (!isKeptClass(token, classes)) {
+        problems.push(`the manifest's ${element} ${attribute} holds ${token}, which is not a class`)
+      }
     }
   }
   if (authorities === 0) problems.push('the manifest declares no provider authority')
   return problems
 }
 
-/**
- * What is wrong with the strings of an application's dex files, taken together: a dotted name of
- * an earlier identifier that is not a class one of them defines. A class in another dex file than
- * the string that names it is still a class the application defines.
- */
-export function problemsInDex(dexFiles) {
+/** The classes the application's dex files define, taken together. */
+function definedAcross(dexFiles) {
   const classes = new Set()
   for (const dex of dexFiles) for (const name of definedClasses(dex)) classes.add(name)
+  return classes
+}
+
+/**
+ * What is wrong with the strings of an application's dex files, taken together: a dotted name of
+ * an earlier identifier that is not a class of the kept namespace one of them defines. A class in
+ * another dex file than the string that names it is still a class the application defines.
+ */
+export function problemsInDex(dexFiles) {
+  const classes = definedAcross(dexFiles)
   const stale = new Set()
   for (const dex of dexFiles) {
     for (const text of definedStrings(dex)) {
-      for (const token of retiredTokens(text)) if (!classes.has(token)) stale.add(token)
+      for (const token of retiredTokens(text)) if (!isKeptClass(token, classes)) stale.add(token)
     }
   }
   return [...stale].sort().map((name) => `the application's code carries the name ${name}`)
@@ -501,18 +592,20 @@ export function problemsInDex(dexFiles) {
 
 /**
  * What is wrong with everything in a package that is neither code nor manifest: the assets, the
- * resources and the native libraries, where an earlier identifier may sit as text or as a JNI name.
- * The manifest is read for its structure and the dex files for their strings, and a bundle's build
- * metadata and signature files name classes of the kept namespace legitimately.
+ * resources, the native libraries and the files of its own that a build keeps under `META-INF`,
+ * where an earlier identifier may sit as text or as a JNI name. A class of the kept namespace the
+ * application defines may be named. The manifest is read for its structure and the dex files for
+ * their strings; a bundle's build metadata is a map of class names, and a signature names nothing.
  */
-export function problemsInFiles(path) {
+export function problemsInFiles(path, classes) {
   return withArchive(path, (all, read) => {
     const problems = []
     for (const member of all) {
       if (member.name.endsWith('/')) continue
       if (/\.dex$/.test(member.name) || /(^|\/)AndroidManifest\.xml$/.test(member.name)) continue
-      if (/^(META-INF|BUNDLE-METADATA)\//.test(member.name)) continue
-      const names = retiredInBytes(read(member), { jni: true })
+      if (/^BUNDLE-METADATA\//.test(member.name)) continue
+      if (/(^|\/)META-INF\/(MANIFEST\.MF|[^/]+\.(SF|RSA|EC|DSA))$/.test(member.name)) continue
+      const names = retiredInBytes(read(member), { classes, jni: true })
       if (names.length > 0) problems.push(`${member.name} carries ${names.join(' and ')}`)
     }
     return problems
@@ -521,10 +614,12 @@ export function problemsInFiles(path) {
 
 /** Checks one packaged Android application. Answers what is wrong with it. */
 export function problemsInPackage(path, want = declared()) {
+  const dexFiles = applicationDex(path)
+  const classes = definedAcross(dexFiles)
   return [
-    ...problemsInManifest(manifestFacts(path), want),
-    ...problemsInDex(applicationDex(path)),
-    ...problemsInFiles(path)
+    ...problemsInManifest(manifestFacts(path), want, classes),
+    ...problemsInDex(dexFiles),
+    ...problemsInFiles(path, classes)
   ]
 }
 

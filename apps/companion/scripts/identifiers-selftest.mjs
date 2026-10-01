@@ -16,17 +16,17 @@
 // status says so.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { dex, uleb, zip } from './archive-fixtures.mjs'
 import {
   aapt2In,
+  attributesFromTree,
   declared,
   entitlementsOf,
   factsFromAapt,
-  ownNames,
   problemsInBundle,
   problemsInDex,
   problemsInManifest,
@@ -155,6 +155,13 @@ heldProblems(
   [`the name ${WORKER}`]
 )
 heldProblems(
+  'a class defined under the identifier before the namespace was kept is still refused',
+  problemsInDex([
+    dex({ defined: ['to.kala.companion.MainActivity'], constants: ['to.kala.companion.MainActivity'] })
+  ]),
+  ['the name to.kala.companion.MainActivity']
+)
+heldProblems(
   'a sentence that names a defined class is not a stale name',
   problemsInDex([dex({ defined: [WORKER], constants: [`failed: ${WORKER} was not found`] })]),
   []
@@ -162,35 +169,77 @@ heldProblems(
 
 // -- the manifest of an application ----------------------------------------------------------------
 
+const values = (...each) => each
 const GOOD = {
   package: 'to.kala.reach',
-  names: [
-    ['permission', 'to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'],
-    ['provider authority', 'to.kala.reach.fileprovider']
-  ]
+  values: values(
+    ['manifest', 'package', 'to.kala.reach'],
+    ['permission', 'name', 'to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'],
+    ['provider', 'authorities', 'to.kala.reach.fileprovider'],
+    ['service', 'name', WORKER]
+  )
 }
-heldProblems('a manifest whose package and names follow the identifier is whole', problemsInManifest(GOOD, WANT), [])
+const KNOWN = new Set([WORKER])
+const without = (element, attribute) =>
+  GOOD.values.filter(([each, name]) => each !== element || name !== attribute)
+const withValue = (...added) => ({ ...GOOD, values: [...GOOD.values, ...added] })
+
+heldProblems(
+  'a manifest whose package and names follow the identifier is whole',
+  problemsInManifest(GOOD, WANT, KNOWN),
+  []
+)
+heldProblems(
+  'a component the manifest names must be a class the application defines',
+  problemsInManifest(GOOD, WANT),
+  [`holds ${WORKER}, which is not a class`]
+)
 heldProblems(
   'a manifest filed under another package is refused',
-  problemsInManifest({ ...GOOD, package: 'to.kala.reach.companion' }, WANT),
-  ["package is to.kala.reach.companion, not to.kala.reach"]
+  problemsInManifest({ ...GOOD, package: 'to.kala.reach.companion' }, WANT, KNOWN),
+  ['package is to.kala.reach.companion, not to.kala.reach']
 )
 heldProblems(
   'a provider authority under the kept namespace is refused',
   problemsInManifest(
-    { ...GOOD, names: [['provider authority', 'to.kala.reach.companion.fileprovider']] },
-    WANT
+    { ...GOOD, values: [...without('provider', 'authorities'), ['provider', 'authorities', 'to.kala.reach.companion.fileprovider']] },
+    WANT,
+    KNOWN
   ),
-  ['provider authority to.kala.reach.companion.fileprovider does not follow to.kala.reach']
+  ['provider authorities to.kala.reach.companion.fileprovider does not follow to.kala.reach']
+)
+heldProblems(
+  'a second authority after a semicolon is held to the identifier too',
+  problemsInManifest(
+    withValue(['provider', 'authorities', 'to.kala.reach.files;com.example.files']),
+    WANT,
+    KNOWN
+  ),
+  ['provider authorities com.example.files does not follow to.kala.reach']
 )
 heldProblems(
   'a permission under another application is refused',
-  problemsInManifest({ ...GOOD, names: [...GOOD.names, ['permission', 'to.kala.other.READ']] }, WANT),
-  ['permission to.kala.other.READ does not follow to.kala.reach']
+  problemsInManifest(withValue(['permission', 'name', 'to.kala.other.READ']), WANT, KNOWN),
+  ['permission name to.kala.other.READ does not follow to.kala.reach']
+)
+heldProblems(
+  'a name of the kept namespace in any other attribute is refused unless it is a class',
+  problemsInManifest(
+    withValue(
+      ['meta-data', 'value', 'to.kala.reach.companion.push.Alerts'],
+      ['action', 'name', 'to.kala.reach.companion.voice.START']
+    ),
+    WANT,
+    KNOWN
+  ),
+  [
+    'meta-data value holds to.kala.reach.companion.push.Alerts, which is not a class',
+    'action name holds to.kala.reach.companion.voice.START, which is not a class'
+  ]
 )
 heldProblems(
   'a manifest with no provider authority is refused rather than passed',
-  problemsInManifest({ package: 'to.kala.reach', names: [] }, WANT),
+  problemsInManifest({ package: 'to.kala.reach', values: without('provider', 'authorities') }, WANT, KNOWN),
   ['declares no provider authority']
 )
 
@@ -199,26 +248,27 @@ const TREE = `
       A: package="to.kala.reach" (Raw: "to.kala.reach")
       E: permission (line=56)
         A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" (Raw: "x")
-      E: uses-permission (line=60)
-        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "x")
       E: application (line=62)
         E: provider (line=125)
-          A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.core.content.FileProvider" (Raw: "x")
           A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="to.kala.reach.fileprovider" (Raw: "x")
+          A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
         E: service (line=130)
-          A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.companion.push.KalaReachMessagingService" (Raw: "x")
+          A: http://schemas.android.com/apk/res/android:name(0x01010003)="to.kala.reach.companion.push.PreviewWorker" (Raw: "x")
 `
 held(
-  'a manifest dump gives up its package, its provider authorities and the permissions it defines',
-  JSON.stringify(GOOD),
-  JSON.stringify(
-    factsFromAapt("package: name='to.kala.reach' versionCode='1000' versionName='0.1.0'\n", TREE)
-  )
+  'a manifest dump gives up the package and every attribute of every element, in order',
+  JSON.stringify([
+    ['manifest', 'package', 'to.kala.reach'],
+    ['permission', 'name', 'to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'],
+    ['provider', 'authorities', 'to.kala.reach.fileprovider'],
+    ['service', 'name', WORKER]
+  ]),
+  JSON.stringify(attributesFromTree(TREE))
 )
 held(
-  'no other name of a manifest is taken for one it gives itself',
-  JSON.stringify(GOOD.names),
-  JSON.stringify(ownNames(TREE))
+  'the package comes from the badging line',
+  'to.kala.reach',
+  String(factsFromAapt("package: name='to.kala.reach' versionCode='1000'\n", TREE).package)
 )
 
 // -- the tool that reads an APK --------------------------------------------------------------------
@@ -262,10 +312,17 @@ function xmlNode(name, attributes = {}, children = []) {
 }
 
 /** The manifest of a bundle, in the form a bundle keeps it in. */
-function manifestOfBundle({ identifier = 'to.kala.reach', authority = 'to.kala.reach.fileprovider' } = {}) {
+function manifestOfBundle({
+  identifier = 'to.kala.reach',
+  authority = 'to.kala.reach.fileprovider',
+  service = WORKER
+} = {}) {
   return xmlNode('manifest', { package: identifier }, [
     xmlNode('permission', { name: 'to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' }),
-    xmlNode('application', {}, [xmlNode('provider', { authorities: authority })])
+    xmlNode('application', {}, [
+      xmlNode('provider', { authorities: authority }),
+      xmlNode('service', { name: service })
+    ])
   ])
 }
 
@@ -276,11 +333,18 @@ function packagedBundle(name, change = {}) {
   writeFileSync(
     path,
     zip([
-      { name: 'base/manifest/AndroidManifest.xml', bytes: option('manifest', manifestOfBundle()) },
+      ...(Object.hasOwn(change, 'noManifest')
+        ? []
+        : [{ name: 'base/manifest/AndroidManifest.xml', bytes: option('manifest', manifestOfBundle()) }]),
       { name: 'base/dex/classes.dex', bytes: dex({ defined: [WORKER] }) },
       { name: 'base/dex/classes2.dex', bytes: dex({ constants: option('constants', []) }) },
       { name: 'base/assets/index.js', bytes: Buffer.from(option('page', 'console.log("hello")')) },
       { name: 'base/lib/arm64-v8a/libapp.so', bytes: Buffer.from(option('library', 'ELF')) },
+      {
+        name: 'base/root/META-INF/services/example.Loader',
+        bytes: Buffer.from(option('services', `${WORKER}\n`))
+      },
+      { name: 'base/root/META-INF/CERT.RSA', bytes: Buffer.from('to.kala.companion signed') },
       {
         name: 'BUNDLE-METADATA/map/proguard.map',
         bytes: Buffer.from(`${WORKER} -> a.b:`)
@@ -311,7 +375,7 @@ expectBundle(
 expectBundle(
   'a bundle whose provider authority is under the kept namespace is refused',
   { manifest: manifestOfBundle({ authority: 'to.kala.reach.companion.fileprovider' }) },
-  ['provider authority to.kala.reach.companion.fileprovider does not follow']
+  ['provider authorities to.kala.reach.companion.fileprovider does not follow']
 )
 expectBundle(
   'a name an earlier identifier left in a second dex file is refused',
@@ -334,9 +398,49 @@ expectBundle(
   ['base/assets/index.js carries JT6GW3W9W6']
 )
 expectBundle(
-  'a bundle with no manifest is refused rather than passed',
+  'a bundle whose manifest names a component no dex file defines is refused',
+  { manifest: manifestOfBundle({ service: 'to.kala.reach.companion.push.Missing' }) },
+  ['service name holds to.kala.reach.companion.push.Missing, which is not a class']
+)
+expectBundle(
+  'a bundle whose manifest is empty is refused rather than passed',
   { manifest: Buffer.alloc(0) },
   ['the bundle manifest holds no element']
+)
+expectBundle(
+  'a bundle with no manifest is refused rather than passed',
+  { noManifest: true },
+  ['the bundle holds no base/manifest/AndroidManifest.xml']
+)
+expectBundle(
+  'a manifest cut short in a fixed-width field is refused rather than read as far as it goes',
+  { manifest: Buffer.concat([manifestOfBundle(), Buffer.from([0x09, 0x01])]) },
+  ['a protocol-buffer field runs past its message']
+)
+expectBundle(
+  'a protocol-buffer number that does not fit in 64 bits is refused',
+  { manifest: Buffer.from([0x08, ...Array(9).fill(0xff), 0x7f]) },
+  ['a protocol-buffer number is too large']
+)
+expectBundle(
+  'a native method of a class in a package of the kept namespace is not a stale name',
+  { library: 'Java_to_kala_reach_companion_push_Bridge_start' },
+  []
+)
+expectBundle(
+  'a service file that names a class the application defines is not a stale name',
+  { services: `${WORKER}\n` },
+  []
+)
+expectBundle(
+  'a service file that names another class of the kept namespace is refused',
+  { services: 'to.kala.reach.companion.push.Gone\n' },
+  ['base/root/META-INF/services/example.Loader carries to.kala.reach.companion.push.Gone']
+)
+expectBundle(
+  'a name that only begins like the kept namespace is not a stale name in a file',
+  { page: 'to.kala.reach.companionship' },
+  []
 )
 
 // -- an iOS application bundle ---------------------------------------------------------------------
@@ -606,16 +710,42 @@ if (hasPlutil) {
     'refused: a fat executable image runs past the file',
     entitlementsFrom('fat-short', truncated.subarray(0, 4100))
   )
+  const long = image({ 'application-identifier': PRIVATE })
+  long.writeUInt32LE(0xfffffff0, 32 + 4)
+  held(
+    'a load command whose size runs past the image is refused although its section fits',
+    'refused: a Mach-O load command runs past the image',
+    entitlementsFrom('command-long', long)
+  )
+  const crowded = image({ 'application-identifier': PRIVATE })
+  crowded.writeUInt32LE(40, 32 + 64)
+  held(
+    'a segment that counts more sections than its command holds is refused',
+    'refused: a Mach-O segment runs past its command',
+    entitlementsFrom('segment-crowded', crowded)
+  )
+  const unsigned = image(null)
+  held(
+    'an executable that is unsigned and carries no entitlements has none, not a refusal',
+    'null',
+    entitlementsFrom('plain', unsigned).replace('[null]', 'null')
+  )
+  held(
+    'a fat executable with no entitlements of its own is not read through one architecture',
+    'refused: a fat executable carries no entitlements of its own and its signature is read for one architecture only',
+    entitlementsFrom('fat-plain', fat(image(null), image(null)))
+  )
 } else {
-  notRun += 2
-  console.log('not run  two cases of malformed fat executables (plutil is not available)')
+  notRun += 5
+  console.log('not run  five cases of malformed executables (plutil is not available)')
 }
 
 if (hasPlutil && hasCodesign) {
   // A signed build keeps its entitlements in the signature and has no copy in the executable. The
   // executable here is a system tool copied and signed ad hoc with entitlements of its own.
   const signed = join(work, 'signed-tool')
-  copyFileSync('/usr/bin/true', signed)
+  const [native] = spawnSync('lipo', ['-archs', '/usr/bin/true'], { encoding: 'utf8' }).stdout.split(' ')
+  spawnSync('lipo', ['/usr/bin/true', '-thin', native.trim(), '-output', signed])
   const list = join(work, 'signed.entitlements')
   writeFileSync(list, plist({ 'keychain-access-groups': [PRIVATE, SHARED] }))
   const signing = spawnSync('codesign', ['--force', '--sign', '-', '--entitlements', list, signed], {

@@ -746,27 +746,37 @@ fn the_application_identifier_is_the_one_the_website_associates_on_every_platfor
     );
 }
 
-/// Every file of the application that the repository tracks, as a path relative to it.
+/// Every file of the application that the repository holds, as a path relative to it.
 ///
 /// What a build leaves beside them (generated projects, caches, symbolic links to libraries) is
-/// not what ships, and reading it would make this test depend on what happened to be built here.
-fn tracked_files(application: &Path) -> Vec<String> {
+/// not what ships, and reading it would make this test depend on what happened to be built here. A
+/// file that is new and not yet staged is listed as well, so a local run reads what a commit will.
+fn repository_files(application: &Path) -> Vec<String> {
     let listed = std::process::Command::new("git")
-        .args(["ls-files", "-z"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(application)
         .output()
-        .expect("git can list the application's tracked files");
+        .expect("git can list the application's files");
     assert!(
         listed.status.success(),
-        "git could not list the application's tracked files: {}",
+        "git could not list the application's files: {}",
         String::from_utf8_lossy(&listed.stderr)
     );
-    listed
+    let mut names: Vec<String> = listed
         .stdout
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
-        .map(|name| String::from_utf8(name.to_vec()).expect("a tracked file has a UTF-8 name"))
-        .collect()
+        .map(|name| String::from_utf8(name.to_vec()).expect("a file has a UTF-8 name"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The dotted name a line holds at `at`, up to the first character a name cannot hold.
@@ -778,11 +788,12 @@ fn dotted_name_at(line: &str, at: usize) -> &str {
     &rest[..end]
 }
 
-/// Whether a dotted name under the kept namespace names a class or a package: its segments after
-/// the namespace are package names in lower case and then either a class in capitals or nothing
-/// (a trailing dot makes it a package prefix). `to.kala.reach.companion.fileprovider` and
-/// `to.kala.reach.companion.share` are names a build would file state under, not classes.
-fn names_a_class_or_package(name: &str, namespace: &str) -> bool {
+/// Whether a dotted name under the namespace is a class: package names in lower case, if any, and
+/// then a class name that starts with a capital and has a lower-case letter in it, which is what
+/// tells `PreviewWorker` from a constant such as `START`. With `or_package`, a trailing dot makes
+/// it the prefix of a package. `to.kala.reach.companion.fileprovider` and
+/// `to.kala.reach.companion.permission.READ` are names a build would file state under, not classes.
+fn names_a_class(name: &str, namespace: &str, or_package: bool) -> bool {
     let Some(rest) = name
         .strip_prefix(namespace)
         .and_then(|rest| rest.strip_prefix('.'))
@@ -792,27 +803,107 @@ fn names_a_class_or_package(name: &str, namespace: &str) -> bool {
     let mut segments: Vec<&str> = rest.split('.').collect();
     let last = segments.pop().unwrap_or("");
     let package = |segment: &str| segment.chars().next().is_some_and(char::is_lowercase);
-    !segments.is_empty()
-        && segments.iter().all(|segment| package(segment))
-        && (last.is_empty() || last.chars().next().is_some_and(char::is_uppercase))
+    let class =
+        last.chars().next().is_some_and(char::is_uppercase) && last.chars().any(char::is_lowercase);
+    segments.iter().all(|segment| package(segment))
+        && (class || (or_package && last.is_empty() && !segments.is_empty()))
+}
+
+const KEPT_NAMESPACE: &str = "to.kala.reach.companion";
+const MANIFEST: &str = "src-tauri/gen/android/app/src/main/AndroidManifest.xml";
+/// The packaging check's scripts, which name the classes the packaged application must carry.
+const NAMES_CLASSES: [&str; 2] = [
+    "scripts/android-classes.mjs",
+    "scripts/android-classes-selftest.mjs",
+];
+
+/// Whether a line of `file` may hold the Kotlin and Java namespace the application keeps: where it
+/// names a package or a class, which is a `package` or `import` line, the manifest's component
+/// classes, and the class and package names the packaging check lists. A name under the namespace
+/// anywhere else, a notification channel or an authority or a permission or a store, is a name that
+/// should have followed the application identifier.
+fn may_hold_the_namespace(file: &str, line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with(&format!("package {KEPT_NAMESPACE}"))
+        || trimmed.starts_with(&format!("import {KEPT_NAMESPACE}"))
+    {
+        return true;
+    }
+    line.match_indices(KEPT_NAMESPACE).all(|(at, _)| {
+        let name = dotted_name_at(line, at);
+        if file == MANIFEST {
+            // A component's name, on a line that holds nothing else.
+            trimmed.starts_with("android:name=\"") && names_a_class(name, KEPT_NAMESPACE, false)
+        } else {
+            NAMES_CLASSES.contains(&file) && names_a_class(name, KEPT_NAMESPACE, true)
+        }
+    })
+}
+
+#[test]
+fn the_namespace_is_held_only_where_it_names_a_class_or_a_package() {
+    let component =
+        "            android:name=\"to.kala.reach.companion.push.KalaReachMessagingService\"";
+    assert!(may_hold_the_namespace(MANIFEST, component));
+    assert!(may_hold_the_namespace(
+        MANIFEST,
+        "            android:name=\"to.kala.reach.companion.Bridge\""
+    ));
+    // A permission, an authority, a store and a channel are filed under the identifier.
+    for refused in [
+        "android:name=\"to.kala.reach.companion.permission.READ\"",
+        "android:authorities=\"to.kala.reach.companion.push.Share\"",
+        "android:authorities=\"to.kala.reach.companion.fileprovider\"",
+        "<meta-data android:value=\"to.kala.reach.companion.push.Alerts\" />",
+        "android:name=\"to.kala.reach.companion.voice.START\"",
+    ] {
+        assert!(!may_hold_the_namespace(MANIFEST, refused), "{refused}");
+    }
+    let script = "  'to.kala.reach.companion.push.PreviewWorker'";
+    assert!(may_hold_the_namespace(
+        "scripts/android-classes.mjs",
+        script
+    ));
+    assert!(may_hold_the_namespace(
+        "scripts/android-classes.mjs",
+        "const HAND_WRITTEN = ['to.kala.reach.companion.push.', 'to.kala.reach.companion.mobile.']"
+    ));
+    assert!(!may_hold_the_namespace(
+        "scripts/android-classes.mjs",
+        "'to.kala.reach.companion.push'"
+    ));
+    // Anywhere else only a package or an import line holds it.
+    assert!(!may_hold_the_namespace(
+        "native/x/Alerts.kt",
+        "const val X = \"to.kala.reach.companion.push\""
+    ));
+    assert!(may_hold_the_namespace(
+        "native/x/Alerts.kt",
+        "import to.kala.reach.companion.mobile.Sealer"
+    ));
+    assert!(!names_a_class(
+        "to.kala.reach.companion",
+        KEPT_NAMESPACE,
+        true
+    ));
+    assert!(names_a_class(
+        "to.kala.reach.companion.push.",
+        KEPT_NAMESPACE,
+        true
+    ));
+    assert!(!names_a_class(
+        "to.kala.reach.companion.push.",
+        KEPT_NAMESPACE,
+        false
+    ));
 }
 
 /// The names an earlier identifier and an earlier Apple team gave the application are gone.
 ///
-/// The Kotlin and Java package `to.kala.reach.companion` stays: it is a code namespace, the
-/// manifest and the packaging check name classes by it, and renaming it would only move files. So
-/// it may appear where it names a package or a class: a `package` or `import` line, and a class or
-/// package name in the manifest and in the packaging check's class names. A name under it anywhere
-/// else, a notification channel or an authority or a store, is a name that should have followed the
-/// application identifier.
+/// The Kotlin and Java package `to.kala.reach.companion` stays, and `may_hold_the_namespace` says
+/// where it may appear.
 #[test]
 fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
-    const KEPT_NAMESPACE: &str = "to.kala.reach.companion";
-    const NAMES_CLASSES: [&str; 3] = [
-        "src-tauri/gen/android/app/src/main/AndroidManifest.xml",
-        "scripts/android-classes.mjs",
-        "scripts/android-classes-selftest.mjs",
-    ];
     // These name the retired spellings in order to refuse them.
     const REFUSES_THEM: [&str; 3] = [
         "src-tauri/tests/boundary.rs",
@@ -823,10 +914,10 @@ fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
         .parent()
         .expect("the crate sits inside the application's directory")
         .to_owned();
-    let files = tracked_files(&application);
+    let files = repository_files(&application);
     assert!(
         files.len() > 100,
-        "the application's tracked files were listed: {}",
+        "the application's files were listed: {}",
         files.len()
     );
     let mut stale = Vec::new();
@@ -835,30 +926,22 @@ fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
             continue;
         }
         let path = application.join(&relative);
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|error| panic!("{} could not be read: {error}", path.display()));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // Listed and deleted, and the deletion not yet staged.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("{} could not be read: {error}", path.display()),
+        };
         // A file that is not text (an image, a font) names no identifier a person wrote.
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
         for (number, line) in text.lines().enumerate() {
-            let place = format!("{relative}:{}: {}", number + 1, line.trim());
-            if line.contains("to.kala.companion") || line.contains("JT6GW3W9W6") {
-                stale.push(place);
-                continue;
-            }
-            let trimmed = line.trim_start();
-            if trimmed.starts_with(&format!("package {KEPT_NAMESPACE}"))
-                || trimmed.starts_with(&format!("import {KEPT_NAMESPACE}"))
-            {
-                continue;
-            }
-            let all_name_classes = line.match_indices(KEPT_NAMESPACE).all(|(at, _)| {
-                NAMES_CLASSES.contains(&relative.as_str())
-                    && names_a_class_or_package(dotted_name_at(line, at), KEPT_NAMESPACE)
-            });
-            if line.contains(KEPT_NAMESPACE) && !all_name_classes {
-                stale.push(place);
+            let retired = line.contains("to.kala.companion") || line.contains("JT6GW3W9W6");
+            let misplaced =
+                line.contains(KEPT_NAMESPACE) && !may_hold_the_namespace(&relative, line);
+            if retired || misplaced {
+                stale.push(format!("{relative}:{}: {}", number + 1, line.trim()));
             }
         }
     }
