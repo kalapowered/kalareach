@@ -148,10 +148,12 @@ jobs:
       # version the archive carries and the commit it came from; a tag that names either of them
       # wrongly stops the run here rather than producing an archive nobody can place.
       #
-      # This is also where the executables this release carries are settled. The four below are
-      # built one step each, and the workspace is asked what binaries those three crates declare: a
+      # This is also where the executables this release carries are settled. The five below are
+      # built one step each, and the workspace is asked what binaries those four crates declare: a
       # binary added to one of them fails this step by name until it is built and staged too, rather
-      # than being left out of the release quietly.
+      # than being left out of the release quietly. Two binaries those crates declare are not part of
+      # a release and are named here as such: the stub the description tests start in place of the
+      # model, and the benchmark that measures the model against real weights.
       - name: What this release is
         id: release
         run: |
@@ -167,15 +169,17 @@ jobs:
           }
           $short = $commit.Substring(0, 12)
 
+          $notShipped = @('kr-stub-inference', 'kr-describe-bench')
           $declared = @(
             $metadata.packages |
-              Where-Object { $_.name -in @('kr-cli', 'kr-worker', 'kr-controller') } |
+              Where-Object { $_.name -in @('kr-cli', 'kr-worker', 'kr-controller', 'kr-describe-model') } |
               ForEach-Object { $_.targets } |
               Where-Object { $_.kind -contains 'bin' } |
               ForEach-Object { $_.name } |
+              Where-Object { $_ -notin $notShipped } |
               Sort-Object
           )
-          $built = @('kr', 'kr-attach-guard', 'kr-controller', 'kr-worker')
+          $built = @('kr', 'kr-attach-guard', 'kr-controller', 'kr-describe-inference', 'kr-worker')
           if (($declared -join ',') -ne ($built -join ',')) {
             throw (
               "The crates this release builds declare [$($declared -join ', ')] and this workflow " +
@@ -209,6 +213,9 @@ jobs:
 
       - name: Build the controller
         run: cargo build --locked --release -p kr-controller --bin kr-controller
+
+      - name: Build the description process
+        run: cargo build --locked --release -p kr-describe-model --bin kr-describe-inference
 
       # Two directories, because an archive carries two kinds of file and they are not held to the
       # same thing. Everything under `staging` is signed and verified, and the signing step is
@@ -247,7 +254,7 @@ jobs:
           }
 
           $target = Join-Path $env:GITHUB_WORKSPACE 'target\release'
-          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe')) {
+          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe')) {
             Copy-Into -Root $staging -Relative $executable -From (Join-Path $target $executable)
           }
 
@@ -268,6 +275,23 @@ jobs:
           Write-Host 'data:'
           Get-ChildItem -LiteralPath $data -File -Recurse -Force |
             ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($data.Length).TrimStart('\')) }
+
+      # Each executable in the layout the archive will carry is started once, from where it is
+      # staged, and asked its version. The description process is found beside the worker, so an
+      # archive whose layout lost it, or whose build cannot start here, stops this run before
+      # anything is signed.
+      - name: Start each staged executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'staging'
+          foreach ($executable in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe', 'kr-describe-inference.exe')) {
+            $path = Join-Path $staging $executable
+            $said = & $path --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "$executable exited with $LASTEXITCODE when it was asked its version."
+            }
+            Write-Host "$executable said: $said"
+          }
 
       # The token exchange. `client-id`, `tenant-id` and `subscription-id` are repository variables
       # because all three are public identifiers; none of them is a secret and none of them would be
