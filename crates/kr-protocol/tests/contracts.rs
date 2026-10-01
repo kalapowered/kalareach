@@ -1332,19 +1332,21 @@ fn resource_states_are_typed_results_and_never_error_codes() {
     );
     assert!(!CapabilityState::PermissionRequired.is_available());
 
-    let pending = RevocationBarrier {
-        authority_revision: AuthorityRevision::new(4),
-        workers: vec![WorkerBarrier {
+    let pending = RevocationBarrier::new(
+        AuthorityRevision::new(4),
+        vec![WorkerBarrier {
             session_id: SessionId::new(uuid("b4a1bc38-157d-4e84-bf52-1137b15b462b")),
             state: BarrierState::Pending,
             acknowledged_revision: Nullable::null(),
             rejected_actions: Vec::new(),
+            rejected_actions_total: U64::new(0),
             possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
             omitted_actions: U64::new(0),
             names_pending: U64::new(0),
             detail: "the worker has not acknowledged".to_owned(),
         }],
-    };
+    );
     assert!(!pending.holds());
     let wire = kr_cbor::to_canonical_vec(&pending).expect("cbor");
     assert_eq!(

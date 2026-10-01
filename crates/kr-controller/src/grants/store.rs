@@ -373,6 +373,7 @@ impl GrantDirectory {
             )
             .map_err(ControllerError::registry)?;
         migrate_receipts(&connection)?;
+        migrate_revocation_answers(&connection)?;
         migrate_grants(&connection)?;
         migrate_policy(&connection)?;
         migrate_fence_debt(&connection)?;
@@ -2224,6 +2225,141 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Brings the answers stored for earlier revocations to the shape this build reads, once.
+///
+/// An earlier build kept a revocation's answer whole: every grant it withdrew, every worker, and
+/// every action name each worker held, with no total beside any list. Such an answer was larger
+/// than one control frame can carry when the revocation was large, and a caller asking again was
+/// given it back and could not decode it. This build cuts an answer to what a frame carries and
+/// says how many each list held. A stored answer in the earlier shape is cut the same way and
+/// written in this build's shape, its totals counted from the lists it held, so it is read back
+/// as an answer made now would be; a row that is not a revocation's answer in the earlier shape is
+/// left as it is. The rewritten row keeps its claim and its time.
+///
+/// One immediate transaction, so two processes opening one store change a row once, and a row
+/// already in this build's shape is not touched, so a second open writes nothing.
+///
+/// Remove this upgrade, with [`EarlierRevocationResult`], once no supported upgrade starts from a
+/// build that stored a revocation's answer without totals.
+fn migrate_revocation_answers(connection: &Connection) -> Result<()> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    // A revocation's answer names its grants under `revoked_grants`, and this build's answer also
+    // names `revoked_grants_total`: only rows that carry the first and not the second can be in the
+    // earlier shape. The decode below decides.
+    let candidates: Vec<(String, Vec<u8>, Vec<u8>)> = transaction
+        .prepare(
+            "SELECT actor_id, action_id, result FROM authority_receipts
+              WHERE result IS NOT NULL
+                AND instr(result, CAST('revoked_grants' AS BLOB)) > 0
+                AND instr(result, CAST('revoked_grants_total' AS BLOB)) = 0",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    let mut rewritten = 0_usize;
+    for (actor_id, action_id, stored) in candidates {
+        // Bounded by the row's own length: an answer an earlier build wrote may be larger than a
+        // message's limits, and is read whole here to be cut.
+        let limits = kr_cbor::Limits {
+            max_message_len: stored.len(),
+            max_items: stored.len(),
+            max_collection_len: stored.len(),
+            ..kr_cbor::Limits::DEFAULT
+        };
+        let Ok(earlier) =
+            kr_cbor::from_canonical_slice::<EarlierRevocationResult>(&stored, &limits)
+        else {
+            continue;
+        };
+        let cut = earlier.cut();
+        let encoded = kr_cbor::to_canonical_vec(&cut)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE authority_receipts SET result = ?3 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id, encoded],
+            )
+            .map_err(ControllerError::registry)?;
+        rewritten += 1;
+    }
+    if rewritten > 0 {
+        eprintln!(
+            "kr-controller: {rewritten} stored revocation answer{} cut to what one answer carries",
+            if rewritten == 1 { " was" } else { "s were" }
+        );
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
+/// A revocation's answer as earlier builds stored it: every list whole and no totals. It lives
+/// inside the upgrade and nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierRevocationResult {
+    authority_revision: kr_protocol::ids::AuthorityRevision,
+    revoked_grants: Vec<GrantId>,
+    barrier: EarlierRevocationBarrier,
+}
+
+/// The barrier inside an earlier answer.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierRevocationBarrier {
+    authority_revision: kr_protocol::ids::AuthorityRevision,
+    workers: Vec<EarlierWorkerBarrier>,
+}
+
+/// One worker's half of an earlier answer.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierWorkerBarrier {
+    session_id: SessionId,
+    state: kr_protocol::action::BarrierState,
+    acknowledged_revision: Nullable<kr_protocol::ids::AuthorityRevision>,
+    rejected_actions: Vec<kr_protocol::action::FencedAction>,
+    possibly_executed: Vec<kr_protocol::action::PossiblyExecutedAction>,
+    omitted_actions: kr_protocol::scalars::U64,
+    names_pending: kr_protocol::scalars::U64,
+    detail: String,
+}
+
+impl EarlierRevocationResult {
+    /// This answer in this build's shape: each total counted from the list it was beside, and
+    /// every list cut to what one answer carries.
+    fn cut(self) -> kr_protocol::sharing::RevocationResult {
+        use kr_protocol::action::{RevocationBarrier, WorkerBarrier};
+        use kr_protocol::scalars::U64;
+
+        let workers = self
+            .barrier
+            .workers
+            .into_iter()
+            .map(|worker| WorkerBarrier {
+                session_id: worker.session_id,
+                state: worker.state,
+                acknowledged_revision: worker.acknowledged_revision,
+                rejected_actions_total: U64::new(worker.rejected_actions.len() as u64),
+                rejected_actions: worker.rejected_actions,
+                possibly_executed_total: U64::new(worker.possibly_executed.len() as u64),
+                possibly_executed: worker.possibly_executed,
+                omitted_actions: worker.omitted_actions,
+                names_pending: worker.names_pending,
+                detail: worker.detail,
+            })
+            .collect();
+        kr_protocol::sharing::RevocationResult::bounded(
+            self.authority_revision,
+            self.revoked_grants,
+            RevocationBarrier::new(self.barrier.authority_revision, workers),
+        )
+    }
+}
+
 /// Adds the stored grants' expiry tombstone to a `grants` table an earlier build created without
 /// it. Every row gains an empty tombstone: no earlier build recorded a stored grant's end, and
 /// each is decided again from its expiry the first time anything asks in this boot.
@@ -2698,6 +2834,154 @@ mod tests {
         assert!(
             GrantDirectory::open(&path).is_err(),
             "a row that is neither shape refuses the open"
+        );
+    }
+
+    /// Raw rows in the receipts table, as an earlier build wrote them.
+    fn write_raw_receipt(path: &Path, action: u8, result: &[u8]) {
+        Connection::open(path)
+            .expect("the store opens")
+            .execute(
+                "INSERT INTO authority_receipts
+                     (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms)
+                 VALUES ('local:501', ?1, ?2, 1000, ?3, 2000)",
+                params![[action; 16].as_slice(), [action; 32].as_slice(), result],
+            )
+            .expect("the row is written");
+    }
+
+    fn raw_receipt(path: &Path, action: u8) -> (Vec<u8>, i64, Vec<u8>) {
+        Connection::open(path)
+            .expect("the store opens")
+            .query_row(
+                "SELECT result, recorded_at_ms, payload_digest FROM authority_receipts
+                  WHERE action_id = ?1",
+                params![[action; 16].as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the row reads")
+    }
+
+    /// A revocation's answer in the shape an earlier build stored: every list whole.
+    fn earlier_answer(grants: usize, names: usize) -> EarlierRevocationResult {
+        use kr_protocol::action::{BarrierState, FencedAction, PossiblyExecutedAction};
+        use kr_protocol::ids::ActorId;
+        use kr_protocol::scalars::U64;
+
+        let actor = ActorId::new("device:phone").expect("a principal");
+        EarlierRevocationResult {
+            authority_revision: AuthorityRevision::new(9),
+            revoked_grants: (0..grants as u128)
+                .map(|index| GrantId::new(Uuid::from_bytes((0x1000 + index).to_be_bytes())))
+                .collect(),
+            barrier: EarlierRevocationBarrier {
+                authority_revision: AuthorityRevision::new(9),
+                workers: vec![EarlierWorkerBarrier {
+                    session_id: SessionId::new(Uuid::from_bytes([0x44; 16])),
+                    state: BarrierState::Acknowledged,
+                    acknowledged_revision: Nullable::some(AuthorityRevision::new(9)),
+                    rejected_actions: (0..names as u128)
+                        .map(|index| FencedAction {
+                            actor_id: actor.clone(),
+                            action_id: ActionId::new(Uuid::from_bytes(
+                                (0x3000 + index).to_be_bytes(),
+                            )),
+                        })
+                        .collect(),
+                    possibly_executed: (0..names as u128)
+                        .map(|index| PossiblyExecutedAction {
+                            action_id: ActionId::new(Uuid::from_bytes(
+                                (0x3000 + index).to_be_bytes(),
+                            )),
+                            actor_id: actor.clone(),
+                            method: kr_protocol::method::Method::AgentApprovalRespond.into(),
+                            state: kr_protocol::receipt::ReceiptState::Unknown,
+                        })
+                        .collect(),
+                    omitted_actions: U64::new(0),
+                    names_pending: U64::new(0),
+                    detail: "the worker fenced it".to_owned(),
+                }],
+            },
+        }
+    }
+
+    /// KR-REQ-09.12: a revocation's answer stored by an earlier build, larger than one frame
+    /// carries, is cut and counted once when the store opens. Its claim and its time are as they
+    /// were, a row that is not such an answer is as it was, and a second open writes nothing.
+    #[test]
+    fn an_answer_an_earlier_build_stored_is_cut_and_counted_once_when_the_store_opens() {
+        use kr_protocol::sharing::RevocationResult;
+
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store is created"));
+
+        let grants = kr_cbor::Limits::DEFAULT.max_collection_len + 5;
+        let earlier = kr_cbor::to_canonical_vec(&earlier_answer(grants, 5_000))
+            .expect("the earlier shape encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<RevocationResult>(&earlier, &kr_cbor::Limits::DEFAULT)
+                .is_err(),
+            "this build's reader refuses what the earlier build stored"
+        );
+        write_raw_receipt(&path, 1, &earlier);
+        // A result that is not a revocation's answer, one in this build's shape, and an answer
+        // that is small.
+        let other = kr_cbor::to_canonical_vec(&std::collections::BTreeMap::from([(
+            "revoked_grants_note",
+            "not an answer",
+        )]))
+        .expect("a map encodes");
+        write_raw_receipt(&path, 2, &other);
+        let current = kr_cbor::to_canonical_vec(&earlier_answer(2, 1).cut()).expect("encodes");
+        write_raw_receipt(&path, 3, &current);
+        let small = kr_cbor::to_canonical_vec(&earlier_answer(3, 2)).expect("encodes");
+        write_raw_receipt(&path, 4, &small);
+
+        drop(GrantDirectory::open(&path).expect("the store opens and upgrades the row"));
+
+        let (cut, recorded_at, digest) = raw_receipt(&path, 1);
+        assert_ne!(cut, earlier, "the stored answer was rewritten");
+        let read: RevocationResult = kr_cbor::from_canonical_slice(&cut, &kr_cbor::Limits::DEFAULT)
+            .expect("this build's reader reads it, inside the decoder's limits");
+        assert_eq!(read.revoked_grants_total.get(), grants as u64);
+        assert!(read.revoked_grants.len() < grants);
+        assert_eq!(read.authority_revision, AuthorityRevision::new(9));
+        assert_eq!(read.barrier.workers_total.get(), 1);
+        let worker = &read.barrier.workers[0];
+        assert_eq!(worker.rejected_actions_total.get(), 5_000);
+        assert_eq!(worker.possibly_executed_total.get(), 5_000);
+        assert_eq!(worker.detail, "the worker fenced it");
+        assert!(read.fits_a_frame());
+        assert_eq!(
+            recorded_at, 2000,
+            "the time the answer was recorded is kept"
+        );
+        assert_eq!(digest, [1_u8; 32].to_vec(), "and the claim it answers");
+
+        assert_eq!(
+            raw_receipt(&path, 2).0,
+            other,
+            "another result is left as it is"
+        );
+        assert_eq!(
+            raw_receipt(&path, 3).0,
+            current,
+            "so is one in this build's shape"
+        );
+        let small_read: RevocationResult =
+            kr_cbor::from_canonical_slice(&raw_receipt(&path, 4).0, &kr_cbor::Limits::DEFAULT)
+                .expect("a small answer is read in this build's shape");
+        assert_eq!(small_read.revoked_grants.len(), 3);
+        assert_eq!(small_read.revoked_grants_total.get(), 3);
+
+        let written = raw_receipt(&path, 1).0;
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!(
+            raw_receipt(&path, 1).0,
+            written,
+            "a second open writes nothing"
         );
     }
 }

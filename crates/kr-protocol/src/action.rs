@@ -461,13 +461,20 @@ pub struct WorkerBarrier {
     pub state: BarrierState,
     /// The revision the worker has installed, when it has installed one.
     pub acknowledged_revision: Nullable<AuthorityRevision>,
-    /// The undispatched intents the fence rejected.
+    /// The undispatched intents the fence rejected, in identity order (actor, then action), cut to
+    /// what one answer carries. `rejected_actions_total` says how many there were.
     pub rejected_actions: Vec<FencedAction>,
-    /// The actions whose dispatch transition had already won the serial race.
+    /// How many undispatched intents the fence rejected, counted before the list above was cut.
+    pub rejected_actions_total: U64,
+    /// The actions whose dispatch transition had already won the serial race, in identity order
+    /// (action, then actor), cut to what one answer carries. `possibly_executed_total` says how
+    /// many there were.
     ///
     /// Each one's receipt state says how much is known about what it did; the list is
     /// not only the uncertain ones.
     pub possibly_executed: Vec<PossiblyExecutedAction>,
+    /// How many actions had already won the serial race, counted before the list above was cut.
+    pub possibly_executed_total: U64,
     /// How many affected actions the worker could hold no name for.
     ///
     /// Nought in every ordinary case, because the names are kept in the worker's journal and
@@ -493,11 +500,28 @@ pub struct WorkerBarrier {
 pub struct RevocationBarrier {
     /// The revision being installed.
     pub authority_revision: AuthorityRevision,
-    /// One entry per affected worker.
+    /// One entry per affected worker, in session order, cut to what one answer carries.
+    ///
+    /// A cut keeps every worker whose barrier has not held before any that has, and at least one
+    /// of them whenever there is one, so a reader finds the barrier held on the cut list exactly
+    /// when it holds on the whole. `workers_total` says how many there were.
     pub workers: Vec<WorkerBarrier>,
+    /// How many workers were affected, counted before the list above was cut.
+    pub workers_total: U64,
 }
 
 impl RevocationBarrier {
+    /// A barrier over `workers`, whole: its total is how many there are.
+    #[must_use]
+    pub fn new(authority_revision: AuthorityRevision, workers: Vec<WorkerBarrier>) -> Self {
+        let workers_total = U64::new(workers.len() as u64);
+        Self {
+            authority_revision,
+            workers,
+            workers_total,
+        }
+    }
+
     /// Returns true when every worker's barrier holds.
     #[must_use]
     pub fn holds(&self) -> bool {
@@ -1276,18 +1300,20 @@ mod tests {
             state,
             acknowledged_revision: Nullable::null(),
             rejected_actions: Vec::new(),
+            rejected_actions_total: U64::new(0),
             possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
             omitted_actions: U64::new(0),
             names_pending: U64::new(0),
             detail: String::new(),
         };
-        let mut barrier = RevocationBarrier {
-            authority_revision: AuthorityRevision::new(4),
-            workers: vec![
+        let mut barrier = RevocationBarrier::new(
+            AuthorityRevision::new(4),
+            vec![
                 worker(1, BarrierState::Acknowledged),
                 worker(2, BarrierState::Ended),
             ],
-        };
+        );
         assert!(barrier.holds());
         assert!(barrier.pending().is_empty());
         barrier.workers.push(worker(3, BarrierState::Pending));
@@ -1297,9 +1323,9 @@ mod tests {
 
     #[test]
     fn a_barrier_names_every_action_it_could_not_take_back() {
-        let barrier = RevocationBarrier {
-            authority_revision: AuthorityRevision::new(4),
-            workers: vec![WorkerBarrier {
+        let barrier = RevocationBarrier::new(
+            AuthorityRevision::new(4),
+            vec![WorkerBarrier {
                 session_id: SessionId::new(Uuid::from_bytes([1; 16])),
                 state: BarrierState::Acknowledged,
                 acknowledged_revision: Nullable::some(AuthorityRevision::new(4)),
@@ -1307,17 +1333,19 @@ mod tests {
                     actor_id: ActorId::new("device:phone").expect("a principal"),
                     action_id: action(1),
                 }],
+                rejected_actions_total: U64::new(1),
                 possibly_executed: vec![PossiblyExecutedAction {
                     action_id: action(2),
                     actor_id: ActorId::new("device:phone").expect("a principal"),
                     method: Method::AgentApprovalRespond.into(),
                     state: ReceiptState::Unknown,
                 }],
+                possibly_executed_total: U64::new(1),
                 omitted_actions: U64::new(0),
                 names_pending: U64::new(0),
                 detail: String::new(),
             }],
-        };
+        );
         assert!(
             barrier.holds(),
             "the barrier holds and still names the action"

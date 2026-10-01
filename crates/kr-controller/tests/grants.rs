@@ -9,6 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants`, `a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew`, `a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `a_claimed_revocation_writes_what_it_withdrew_beside_its_claim`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.12 | `a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled` |
 //! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
@@ -3466,13 +3467,14 @@ async fn a_revocation_whose_record_was_never_written_is_answered_from_the_rows_a
     );
 }
 
-/// KR-REQ-09.08 and 10.45: a revocation that withdrew more grants than one message's collection
-/// bound, and ended before its fence, still has its withdrawal read back whole, and its retry
-/// settles the fence it owes.
+/// KR-REQ-09.08, 09.12 and 10.45: a revocation that withdrew more grants than one message's
+/// collection bound, and ended before its fence, still has its withdrawal read back whole, its
+/// retry settles the fence it owes, and the caller is given an answer it can decode.
 ///
-/// The attempt stops with the daemon that made it, and the next start raises that fence; the answer
-/// a retry would carry names more grants than one control frame may hold, which the caller's
-/// decoder refuses whatever produced it. What is asserted is the record and the fence, raised once.
+/// The attempt stops with the daemon that made it, and the next start raises that fence. The
+/// answer names the first of the grants in identity order, as many as one collection holds, and
+/// says how many there were: a frame that named them all would be one the caller's decoder
+/// refuses, so the revocation would have taken effect and its caller never been told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled() {
     let host = Serving::start().await;
@@ -3552,7 +3554,29 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
     let host = host.restart().await;
     let controller = &host.controller;
     let mut client = host.client().await;
-    let _ = client.repeat(&mutation).await;
+    let answered: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("an answer the caller's decoder reads");
+    assert_eq!(
+        answered.revoked_grants_total.get(),
+        children as u64 + 1,
+        "the answer says how many grants the revocation withdrew"
+    );
+    assert!(
+        answered.revoked_grants.len() <= kr_cbor::Limits::DEFAULT.max_collection_len,
+        "and names as many as one collection holds"
+    );
+    let first = GrantId::new(Uuid::from_bytes(0x1000_u128.to_be_bytes()));
+    assert!(
+        answered.revoked_grants.contains(&first)
+            && !answered.revoked_grants.contains(&parent.grant_id),
+        "from the front of the identity order: the parent's identity sorts after every child's"
+    );
+    assert!(answered.fits_a_frame());
     assert_eq!(
         controller.policy().authority_revision().get(),
         before.get() + 1,
