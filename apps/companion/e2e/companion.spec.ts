@@ -3058,7 +3058,7 @@ test.describe('pairing', () => {
             notice:
               "This package installs a native bridge: code in the application's own directory that runs with the application's permissions, outside the plugin sandbox. The publisher's own statement of what it does follows.",
             statement:
-              'Installs three registration files under your own Claude Code directory, where they apply to every project and every later session.',
+              'Installs three registration files under /Users/someone/.claude/skills/kalareach-channels/hooks/hooks-with-a-long-name-and-no-break.json, where they apply  to every project  and every later session.',
             expires_at_ms: Date.now() + 120_000,
             checkable: true
           }
@@ -3070,6 +3070,13 @@ test.describe('pairing', () => {
     await expect(rows.nth(0).getByTestId('confirmation-facts')).toContainText('Metadata at')
     await expect(rows.nth(1).getByTestId('confirmation-notice')).toContainText('outside the plugin sandbox')
     await expect(rows.nth(1).getByTestId('confirmation-statement')).toContainText('The publisher says')
+    // The publisher's words keep every space they were written with.
+    const written = await rows.nth(1).locator('blockquote').evaluate((element) => ({
+      shown: (element as HTMLElement).innerText,
+      kept: element.textContent
+    }))
+    expect(written.shown).toBe(written.kept)
+    expect(written.shown).toContain('apply  to every project  and')
     await still(page, 'owner-confirmations-11.42-wide')
     await rows.nth(1).screenshot({
       path: shot(`owner-install-11.42-wide-${test.info().project.name}`),
