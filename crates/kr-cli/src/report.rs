@@ -86,7 +86,10 @@ pub fn show_preview(preview: &Preview) -> Result<(), CliError> {
 /// # Errors
 ///
 /// Returns an error when a line cannot be written or the writer cannot be flushed.
-pub fn write_preview(writer: &mut impl std::io::Write, preview: &Preview) -> Result<(), CliError> {
+pub(crate) fn write_preview(
+    writer: &mut impl std::io::Write,
+    preview: &Preview,
+) -> Result<(), CliError> {
     let unwritten = |error: std::io::Error| {
         CliError::Terminal(shown!(
             "the content could not be shown, so nothing was written: {}",

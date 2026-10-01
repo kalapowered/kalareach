@@ -172,7 +172,7 @@ impl Why {
 }
 
 /// One session the host listed, and the reason it is left out when it is.
-pub(crate) struct Listed {
+struct Listed {
     summary: SessionSummary,
     why: Option<Why>,
 }
@@ -180,7 +180,7 @@ pub(crate) struct Listed {
 kr_client::debug_as_name!(Listed);
 
 /// What the host said, after the privacy rule has been applied to each session.
-pub(crate) struct Reading {
+struct Reading {
     listed: Vec<Listed>,
 }
 
@@ -189,7 +189,7 @@ kr_client::debug_as_name!(Reading);
 impl Reading {
     /// Whether the host listed this session.
     #[must_use]
-    pub(crate) fn knows(&self, session_id: SessionId) -> bool {
+    fn knows(&self, session_id: SessionId) -> bool {
         self.listed
             .iter()
             .any(|listed| listed.summary.session_id == session_id)
@@ -201,7 +201,7 @@ impl Reading {
 /// # Errors
 ///
 /// Returns the failure of whichever read failed. Nothing is exported from a reading that failed.
-pub(crate) async fn read(host: &mut impl Host, environment_id: EnvironmentId) -> Result<Reading> {
+async fn read(host: &mut impl Host, environment_id: EnvironmentId) -> Result<Reading> {
     let before = host.privacy().await?;
     let sessions = host.sessions(environment_id).await?;
     let after = host.privacy().await?;
@@ -212,7 +212,7 @@ pub(crate) async fn read(host: &mut impl Host, environment_id: EnvironmentId) ->
 
 /// Applies the privacy rule to `sessions`, which were read between `before` and `after`.
 #[must_use]
-pub(crate) fn select(
+fn select(
     before: &PrivacyReport,
     sessions: Vec<SessionSummary>,
     after: &PrivacyReport,
@@ -590,7 +590,7 @@ impl Approved {
 /// # Errors
 ///
 /// Returns an error when the content cannot be serialised or summed up.
-pub(crate) fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -> Result<Composed> {
+fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -> Result<Composed> {
     let mut left_out: BTreeMap<Why, u64> = BTreeMap::new();
     let mut records = Vec::new();
     let mut kept = Vec::new();
@@ -635,10 +635,11 @@ pub(crate) fn compose(reading: &Reading, exclude: &[SessionId], rules: &Rules) -
     })
 }
 
-/// Writes every character that would change what a terminal shows, or show nothing, as an escape, so
-/// the text on the screen is the text in the file. serde_json writes the control characters below
-/// U+0020 as escapes already; it writes these as themselves, and they are only ever inside a string.
-/// A character outside the basic plane is written as the surrogate pair JSON spells it with.
+/// Writes every character that would change what a terminal shows, or show nothing, as an escape,
+/// so the text on the screen is the text in the file. serde_json writes the control characters
+/// below U+0020 as escapes already; it writes these as themselves, and they are only ever inside a
+/// string. A character outside the basic plane is written as the surrogate pair JSON spells it
+/// with.
 fn visible(text: &str) -> String {
     use std::fmt::Write as _;
 
@@ -656,12 +657,12 @@ fn visible(text: &str) -> String {
     out
 }
 
-/// Whether a character can hide or reorder text on a terminal: delete and the C1 controls, the line
-/// and paragraph separators, the Arabic number signs, and every default-ignorable code point (the
-/// soft hyphen, the combining grapheme joiner, the Arabic letter mark, the Hangul and Khmer fillers,
-/// the Mongolian selectors, the zero-width and directional marks and overrides, the invisible
-/// operators, the variation selectors, the byte order mark, the interlinear and musical format
-/// characters and the tag characters).
+/// Whether a character can hide or reorder text on a terminal: delete and the C1 controls, the
+/// line and paragraph separators, the Arabic number signs, and every default-ignorable code point
+/// (the soft hyphen, the combining grapheme joiner, the Arabic letter mark, the Hangul and Khmer
+/// fillers, the Mongolian selectors, the zero-width and directional marks and overrides, the
+/// invisible operators, the variation selectors, the byte order mark, the interlinear and musical
+/// format characters and the tag characters).
 const fn hides(character: char) -> bool {
     matches!(
         character,
@@ -792,7 +793,7 @@ pub async fn export(
 
 /// [`export`] with its two ways of reaching the person given: the crate's own tests hold what was
 /// printed and asked, and make each fail.
-pub(crate) async fn export_with(
+async fn export_with(
     host: &mut impl Host,
     environment_id: EnvironmentId,
     decision: Decision,
@@ -915,11 +916,18 @@ pub fn ask_at_terminal(question: &Shown) -> Result<Option<String>> {
         .lock()
         .take(4096)
         .read_line(&mut line)
-        .map_err(|error| {
-            CliError::Terminal(shown!(
+        .or_else(|error| match error.kind() {
+            // Text that is not UTF-8 is not yes and not a session's identifier: a decline, said
+            // as one, not a failure of the terminal.
+            std::io::ErrorKind::InvalidData => {
+                line.clear();
+                line.push('?');
+                Ok(1)
+            }
+            _ => Err(CliError::Terminal(shown!(
                 "your answer could not be read: {}",
                 Shown::io(&error)
-            ))
+            ))),
         })?;
     Ok((read > 0).then_some(line))
 }

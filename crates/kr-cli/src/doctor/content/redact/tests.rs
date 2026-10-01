@@ -314,6 +314,81 @@ fn a_value_is_read_as_a_shell_word() {
     );
 }
 
+/// KR-REQ-29.04: a whole assignment inside quotes, the form `docker -e`, `env` and `--build-arg`
+/// take, is one value to its closing quote, which stays; without a space it is the same.
+#[test]
+fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
+    for (text, expected) in [
+        (
+            format!("docker run -e \"PASSWORD=two {MARKER}\" img"),
+            "docker run -e \"PASSWORD=[redacted]\" img".to_owned(),
+        ),
+        (
+            format!("env 'TOKEN=a {MARKER}' cmd"),
+            "env 'TOKEN=[redacted]' cmd".to_owned(),
+        ),
+        (
+            format!("tool \"--password=a {MARKER}\" next"),
+            "tool \"--password=[redacted]\" next".to_owned(),
+        ),
+        (
+            format!("tool \"--password={MARKER}\" next"),
+            "tool \"--password=[redacted]\" next".to_owned(),
+        ),
+        (
+            format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
+            "sh -c \"A=1 SECRET=[redacted]\" tail".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
+    // A quote that is never closed around the assignment withholds the field.
+    let unclosed = format!("run -e \"PASSWORD=two {MARKER}");
+    assert_eq!(
+        redacted(&unclosed),
+        format!("[withheld: {} characters]", unclosed.chars().count())
+    );
+}
+
+/// KR-REQ-29.04: a no-break space is a character of its word, as it is to a shell: a value that
+/// holds one is replaced to the end of the word.
+#[test]
+fn a_no_break_space_does_not_end_a_value() {
+    let text = format!("TOKEN=a\u{a0}{MARKER} next");
+    assert_eq!(redacted(&text), "TOKEN=[redacted] next");
+}
+
+/// KR-REQ-29.04: the merge of overlapping spans, on spans made by hand, because a shell-word reading
+/// makes the scanners' own spans nest: a later span that ends inside, at, or after the end of an
+/// earlier one, spans that only touch, and spans in any order.
+#[test]
+fn spans_are_merged_whatever_their_order_and_overlap() {
+    let text = "0123456789abcdefghij";
+    let span = |start, end, with| Span { start, end, with };
+    for (spans, expected) in [
+        (vec![span(2, 6, "A")], "01A6789abcdefghij"),
+        (vec![span(2, 6, "A"), span(4, 9, "B")], "01A9abcdefghij"),
+        (vec![span(4, 9, "B"), span(2, 6, "A")], "01A9abcdefghij"),
+        (vec![span(2, 8, "A"), span(4, 6, "B")], "01A89abcdefghij"),
+        (vec![span(2, 6, "A"), span(2, 6, "B")], "01A6789abcdefghij"),
+        (vec![span(2, 6, "A"), span(6, 9, "B")], "01AB9abcdefghij"),
+        (
+            vec![span(0, 3, "A"), span(10, 12, "B")],
+            "A3456789Bcdefghij",
+        ),
+        (
+            vec![span(2, 4, "A"), span(3, 12, "B"), span(11, 15, "C")],
+            "01Afghij",
+        ),
+        (Vec::new(), text),
+    ] {
+        let count = spans.len();
+        assert_eq!(replace_spans(text, spans), expected, "{count} spans");
+    }
+}
+
 /// KR-REQ-29.04: an apostrophe is a valid character of URL user information, and a quote around the
 /// whole argument is not part of it: both forms lose the user information, and a URL with none keeps
 /// its text, quotes and all.
