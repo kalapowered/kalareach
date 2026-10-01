@@ -4808,9 +4808,9 @@ mod tests {
         drop(held);
     }
 
-    /// What the offer says of the one item a session's pending approval is, with the session in the
-    /// state each argument names.
-    fn offered_for(module: &AttentionModule, expected: &[(&str, bool)]) {
+    /// What the offer says of the one item the store holds, with the session in the state `label`
+    /// names.
+    fn offered_for(module: &AttentionModule, label: &str, expected: bool) {
         let offered = module
             .take_for_delivery(|store, offer| {
                 store
@@ -4821,77 +4821,66 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .expect("the store is taken");
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0], expected[0].1, "{}", expected[0].0);
+        assert_eq!(offered.len(), 1, "{label}: the store holds the one item");
+        assert_eq!(offered[0], expected, "{label}");
     }
 
     /// The delivery consumer is offered an announcement only while the store reads its session or
     /// has finished reading it: one about a session being closed, or neither read nor finished, ends
     /// with the session's own journal, so it is held back until the store lets it go. A session
     /// closed over a worker the host could not account for is held back after it is finished too.
-    /// The control: an item of the environment itself is always offered.
+    /// Each state is set against the one before it that lets the item through, so each held-back
+    /// answer is that state's own. The control: an item of the environment itself is always
+    /// offered.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_offer_holds_back_a_session_that_is_being_closed_and_one_that_is_not_read() {
         let temp = kr_ipc::testing::TempHost::create();
         let module = module(&temp);
         let session_id = SessionId::new(kr_ipc::new_uuid());
-        let approval = |cursor: kr_attention::EventCursor| {
+        // A failed command, which is an item that outlives its session, unlike a pending approval.
+        let failed = |cursor: kr_attention::EventCursor| {
             SourceEvent::new(
                 cursor,
                 TimestampMs::new(kr_ipc::now_ms().get()),
-                EventKind::ApprovalRequested {
-                    request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
-                        .expect("an identifier"),
+                EventKind::CommandCompleted {
                     session_id,
-                    summary: String::new(),
+                    command: "make".to_owned(),
+                    exit_code: 2,
                 },
             )
         };
         module
-            .observe(&[approval(kr_attention::EventCursor::in_session(
+            .observe(&[failed(kr_attention::EventCursor::in_session(
                 session_id,
                 AttentionSource::Receipts,
                 1,
             ))])
-            .expect("the store records the approval");
+            .expect("the store records the failure");
 
-        offered_for(&module, &[("neither read nor finished", false)]);
+        offered_for(&module, "neither read nor finished", false);
+
+        let _worker = linked(&temp, 1, &module, session_id).await;
+        offered_for(&module, "read", true);
         module.origins().closing.insert(session_id);
-        offered_for(&module, &[("being closed", false)]);
+        offered_for(&module, "being closed", false);
         module.origins().closing.remove(&session_id);
+        offered_for(&module, "read again", true);
+
+        module.origins().links.remove(&session_id);
         module.finalise(session_id).expect("the session ends");
-        // Finishing ends the live approval; the item may leave with it.
-        let held = module
-            .take_for_delivery(|store, _| store.engine().map(|engine| engine.items().count()).ok())
-            .expect("the store is taken");
-        if held == Some(1) {
-            offered_for(&module, &[("finished", true)]);
-            module.origins().unaccounted.insert(session_id);
-            offered_for(
-                &module,
-                &[("closed over a worker nobody accounts for", false)],
-            );
-        }
+        offered_for(&module, "finished", true);
+        module.origins().unaccounted.insert(session_id);
+        offered_for(&module, "closed over a worker nobody accounts for", false);
 
         // The control: the environment's own item is not about any session.
         let temp = kr_ipc::testing::TempHost::create();
         let module = self::module(&temp);
         module
-            .observe(&[approval(kr_attention::EventCursor::new(
+            .observe(&[failed(kr_attention::EventCursor::new(
                 AttentionSource::Receipts,
                 1,
             ))])
-            .expect("the store records the approval");
-        let offered = module
-            .take_for_delivery(|store, offer| {
-                store
-                    .engine()
-                    .expect("the store is this owner's")
-                    .items()
-                    .map(offer)
-                    .collect::<Vec<_>>()
-            })
-            .expect("the store is taken");
-        assert_eq!(offered, vec![true]);
+            .expect("the store records the failure");
+        offered_for(&module, "an item of the environment", true);
     }
 }
