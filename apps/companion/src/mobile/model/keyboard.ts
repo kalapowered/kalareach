@@ -5,46 +5,41 @@
  * the session is laid out whole above it. Where the room above the keyboard cannot hold the
  * session's rows and its chrome (larger text, a phone on its side), the session is taller than the
  * room it has and the page scrolls; the platform's own scroll to the field is undone when the shell
- * goes with the visual viewport, so nothing else brings the field into view. The scrolling areas
- * that hold it are scrolled here by what the field is off its place by, the nearest first, by
- * setting their position and never by asking the field to scroll into view, which would pan the
- * visual viewport again and have the shell follow it.
+ * goes with the visual viewport, so nothing else brings the field into view. The shell's scrolling
+ * area is scrolled here by what the field is off its place by, by setting its position and never
+ * by asking the field to scroll into view, which would pan the visual viewport again and have the
+ * shell follow it. The composer's own scrolling is left alone: scrolling it would only move the
+ * field up inside a box that clips it.
  */
 
 /** How far, in pixels, a field may lie from its place before it is moved. */
 const TOLERANCE = 0.5
 
-/** Where each area was before it was first moved, so it can be put back when the keyboard goes. */
-export type Positions = Map<HTMLElement, number>
-
-/** Whether an element scrolls up and down by itself. */
-function scrollsVertically(element: HTMLElement): boolean {
-  const { overflowY } = getComputedStyle(element)
-  return (overflowY === 'auto' || overflowY === 'scroll') && element.scrollHeight > element.clientHeight
+/** Where an area was before it was first moved, so it can be put back when the keyboard goes. */
+export interface Position {
+  area: HTMLElement | null
+  top: number
 }
 
 /**
- * Scrolls the areas that hold `field` until its bottom edge is at `visibleBottom`, as far as they
- * scroll either way, and says how far it still is from there: above zero while it lies under the
- * keyboard, below zero while there is a gap between it and the keyboard that no scrolling closes.
+ * Scrolls `area` until `field`'s bottom edge is at `visibleBottom`, as far as it scrolls either
+ * way, and says how far the field still is from there: above zero while it lies under the keyboard,
+ * below zero while there is a gap between it and the keyboard that no scrolling closes.
  */
-export function restOn(field: HTMLElement, visibleBottom: number, shell: HTMLElement, moved: Positions): number {
+export function restOn(field: HTMLElement, visibleBottom: number, area: HTMLElement, moved: Position): number {
   let off = field.getBoundingClientRect().bottom - visibleBottom
-  for (
-    let area: HTMLElement | null = field.parentElement;
-    area !== null && Math.abs(off) > TOLERANCE;
-    area = area === shell ? null : area.parentElement
-  ) {
-    if (!scrollsVertically(area)) continue
-    if (!moved.has(area)) moved.set(area, area.scrollTop)
-    area.scrollTop += off
-    off = field.getBoundingClientRect().bottom - visibleBottom
+  if (Math.abs(off) <= TOLERANCE) return off
+  if (moved.area !== area) {
+    moved.area = area
+    moved.top = area.scrollTop
   }
+  area.scrollTop += off
+  off = field.getBoundingClientRect().bottom - visibleBottom
   return off
 }
 
-/** Puts every area moved by `restOn` back where it was. */
-export function putBack(moved: Positions): void {
-  for (const [area, top] of moved) area.scrollTop = top
-  moved.clear()
+/** Puts the area moved by `restOn` back where it was. */
+export function putBack(moved: Position): void {
+  if (moved.area !== null) moved.area.scrollTop = moved.top
+  moved.area = null
 }
