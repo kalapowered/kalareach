@@ -378,7 +378,7 @@ impl Guards {
         }
         // The part's own are the processes beneath the run's recorded ones, the sessions' root shells
         // and the agent's registered processes, whether or not a launch has registered its agent yet.
-        let mut roots: Vec<u32> = run
+        let identities: Vec<ProcessStartIdentity> = run
             .owned()
             .into_iter()
             .map(|owned| owned.identity)
@@ -389,10 +389,29 @@ impl Guards {
                     .map(|agents| agents.clone())
                     .unwrap_or_default(),
             )
-            .filter_map(|identity| u32::try_from(identity.pid.get()).ok())
             .collect();
+        // A number names the process the run recorded only while that process, by its start, still
+        // runs: a number an ended process left may name another, whose children are not the part's.
+        // A root whose state cannot be established is a reason to put nothing back.
+        let mut roots: Vec<u32> = Vec::new();
+        let mut unknown = false;
+        for identity in &identities {
+            match process_state(identity) {
+                ProcessState::Running => {
+                    if let Ok(pid) = u32::try_from(identity.pid.get()) {
+                        roots.push(pid);
+                    }
+                }
+                ProcessState::Ended => {}
+                ProcessState::Unknown { .. } => unknown = true,
+            }
+        }
         roots.sort_unstable();
         roots.dedup();
+        if unknown {
+            self.other_writer
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let other = match agent_processes_outside(&self.agent_names, &roots) {
             Ok(others) => !others.is_empty(),
             Err(_) => true,
@@ -1029,6 +1048,9 @@ struct Searched {
     other_writer: bool,
     /// The prompts the agent's own record holds, by who made them, or why they could not be counted.
     wire: Result<confine::WirePrompts, String>,
+    /// Every string searched for, kept in memory only: the part's result is held against them
+    /// before it is written.
+    values: Vec<String>,
 }
 
 /// Before a confined part's cleanup, once what it started has ended where it has: the strings of the
@@ -1162,6 +1184,7 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
                 .load(std::sync::atomic::Ordering::SeqCst)
         }),
         wire: confine::wire_prompts(&bucket),
+        values,
     })
 }
 
@@ -1207,11 +1230,12 @@ fn confine_close(
     let file_history = data
         .join("file-history")
         .join(confine::workdir_key(&folder));
-    let file_history_removed = usize::from(file_history.exists());
-    if ended && file_history.exists() {
+    let file_history_existed = file_history.exists();
+    if ended && file_history_existed {
         let _ =
             std::fs::remove_dir_all(&file_history).or_else(|_| std::fs::remove_file(&file_history));
     }
+    let file_history_removed = usize::from(file_history_existed && !file_history.exists());
     if file_history.exists() {
         stop.push((
             "run_data_left",
@@ -1412,6 +1436,8 @@ fn confine_close(
             "other_writer_seen": searched.other_writer,
             "subagent_started": searched.subagent.is_some(),
             "turns": turns,
+            "new_sessions": NEW_SESSIONS.load(std::sync::atomic::Ordering::SeqCst),
+            "fresh_screen_ms": FRESH_MS.lock().map(|measured| measured.clone()).unwrap_or_default(),
             "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
         }),
         stop,
@@ -1435,6 +1461,13 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// What each launch of a confined agent showed before its first turn, by booleans and counts, for
 /// the part's evidence: one test runs in a process, so this is the part's.
 static ZERO_TURN: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+
+/// How long each fresh screen read before a submission took, in milliseconds, as measured at the
+/// composer before any turn: the time a submission's two checks add to the part's own steps.
+static FRESH_MS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// How many fresh conversations the part started after its checks.
+static NEW_SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The digits a line of the agent's screen shows after `prefix`, as a status: `kr-zt-3-1007` after
 /// `kr-zt-3-` is 7. The typed line itself shows `$((1000+$?))` there, never digits.
@@ -2035,6 +2068,10 @@ fn staged(
     let searched = login
         .as_ref()
         .and_then(|login| confine_scan(login, guards.as_ref(), &root));
+    let secret_values: Vec<String> = searched
+        .as_ref()
+        .map(|searched| searched.values.clone())
+        .unwrap_or_default();
     let removable: Vec<PathBuf> = login
         .as_ref()
         .map(|login| {
@@ -2419,7 +2456,7 @@ fn staged(
                     )
                     .with_failures(&failures),
                 };
-                outcome.append(&inputs.result);
+                outcome.without(&secret_values).append(&inputs.result);
             }
             std::panic::resume_unwind(panic)
         }
@@ -2457,6 +2494,9 @@ fn staged(
         outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
             .with_failures(&[Failure::KeyScanIncomplete]);
     }
+    // The result is held against every string searched for before it is written, and the message
+    // of the failure is the one that is kept.
+    let outcome = outcome.without(&secret_values);
     let failed = (outcome.outcome == "failed").then(|| outcome.reason.clone().unwrap_or_default());
     outcome.append(&inputs.result);
     if let Some(reason) = failed {
@@ -3326,6 +3366,16 @@ impl Logged {
                 "the agent starts a fresh conversation",
             );
             let _ = logged.wait_idle(stage, "the composer is back after the fresh conversation");
+            NEW_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // What the two fresh screen reads of a submission cost, measured here where no turn can be
+        // affected: three reads, each from opening a new attachment to its drawn screen.
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            logged.no_dialog_now(stage, "in the measurement before any turn");
+            if let Ok(mut measured) = FRESH_MS.lock() {
+                measured.push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
         }
         guards_hold(stage);
         assert!(
@@ -3408,17 +3458,18 @@ impl Logged {
     fn submit_with(&mut self, stage: &Stage<'_, '_>, text: &str, what: &str, key: &str) {
         guards_hold(stage);
         let login = stage.login.expect("a part with a login");
+        // A dialog the agent raised before this takes a typed digit as a choice, and the key that
+        // submits picks the choice shown first, which may approve a command or change the agent's
+        // mode: a fresh screen is read before the text is typed, which is before the turn is charged
+        // (nothing has gone to the agent yet), and again before the key goes, and a dialog on either
+        // is refused and fails the part.
+        self.no_dialog_now(stage, "before the part typed a prompt");
         let _ = login
             .ledger
             .charge(self.part, what)
             .unwrap_or_else(|why| panic!("{why}"));
         stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         self.turns += 1;
-        // A dialog the agent raised before this takes a typed digit as a choice, and the key that
-        // submits picks the choice shown first, which may approve a command or change the agent's
-        // mode: a fresh screen is read before the text is typed and again before the key goes, and a
-        // dialog on either is refused and fails the part.
-        self.no_dialog_now(stage, "before the part typed a prompt");
         self.type_text(stage, text);
         // Keys that arrive together can be read as one paste, whose line end is text and not a
         // submission, so the submission follows on its own.

@@ -404,6 +404,15 @@ pub fn secret_values(text: &str) -> Vec<String> {
     found
 }
 
+/// What is said of a configuration that does not parse: where, and nothing of what is there, since
+/// the parser's own message quotes the line, which can be a key's.
+fn not_toml(error: &toml_edit::TomlError) -> String {
+    format!(
+        "the configuration is not TOML (near byte {})",
+        error.span().map_or(0, |span| span.start)
+    )
+}
+
 /// The strings of every key a TOML configuration holds, at any depth: each string of 16 characters
 /// or more under a key named `api_key`, `token` or `secret`, or ending in `_key`, `_token` or
 /// `_secret`, such as the key a third party's provider is given. They are searched for, never
@@ -451,7 +460,7 @@ pub fn config_secrets(text: &str) -> Result<Vec<String>, String> {
     }
     let document = text
         .parse::<DocumentMut>()
-        .map_err(|error| format!("the configuration is not TOML: {error}"))?;
+        .map_err(|error| not_toml(&error))?;
     let mut found = Vec::new();
     for (name, item) in document.iter() {
         walk(item, name, &mut found);
@@ -614,9 +623,7 @@ const RULE_KEYS: [&str; 4] = ["decision", "scope", "pattern", "reason"];
 ///
 /// Returns that the configuration is not TOML.
 pub fn settings_of(text: &str) -> Result<Settings, String> {
-    let document: DocumentMut = text
-        .parse()
-        .map_err(|error| format!("the configuration is not TOML: {error}"))?;
+    let document: DocumentMut = text.parse().map_err(|error| not_toml(&error))?;
     let mut settings = Settings::default();
     for (key, item) in document.iter() {
         if MODE_KEYS.contains(&key) {
@@ -1007,6 +1014,13 @@ mod tests {
             Some("the configuration allows a built-in tool without asking")
         );
         assert!(settings_of("not = [toml").is_err());
+        // The message of a configuration that does not parse names no line of it.
+        let message =
+            settings_of("api_key = 'sk-0123456789abcdef0123' oops").expect_err("not TOML");
+        assert!(!message.contains("sk-0123456789abcdef0123"), "{message}");
+        let message =
+            config_secrets("api_key = 'sk-0123456789abcdef0123' oops").expect_err("not TOML");
+        assert!(!message.contains("sk-0123456789abcdef0123"), "{message}");
     }
 
     #[test]
