@@ -178,11 +178,23 @@ def npm_pack(source, destination):
     return os.path.join(destination, listing[0]["filename"])
 
 
+def published_package(document):
+    """Returns the package record of an `npm publish --json` answer.
+
+    npm 10 prints the record itself; npm 11 prints it under the package's own name. Either way what
+    comes back names the package and its version, or it is empty and the caller refuses.
+    """
+    if isinstance(document, dict) and "name" not in document and len(document) == 1:
+        (inner,) = document.values()
+        if isinstance(inner, dict):
+            return inner
+    return document if isinstance(document, dict) else {}
+
+
 def dry_run_publish(archive):
     """Asks npm whether it would publish the archive, which needs no login."""
     output = run(["npm", "publish", os.path.abspath(archive), "--dry-run", "--json"])
-    published = json.loads(output)
-    return published
+    return published_package(json.loads(output))
 
 
 def load_problems(archive_path, source):
@@ -250,6 +262,14 @@ def self_test():
                 failures.append(f"{label}: expected a pass, got {problems}")
         elif not any(wanted in problem for problem in problems):
             failures.append(f"{label}: expected a refusal naming {wanted!r}, got {problems}")
+
+    # The two shapes of npm's dry-run answer, and one that names no package.
+    record = {"id": "@kalareach/plugin-sdk@0.50.0", "name": "@kalareach/plugin-sdk", "version": "0.50.0"}
+    for label, document in (("npm 10's answer", record), ("npm 11's answer", {record["name"]: record})):
+        if published_package(document).get("name") != record["name"]:
+            failures.append(f"{label} was not read as the package record")
+    if published_package({"error": {"code": "E401"}}).get("name") is not None:
+        failures.append("an answer that names no package was read as one")
 
     with tempfile.TemporaryDirectory(prefix="kalareach-npm-self-") as scratch:
         pnpm_dir = os.path.join(scratch, "pnpm")
