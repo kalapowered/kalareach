@@ -4330,7 +4330,12 @@ mod tests {
         journal.fence(1).expect("a fence");
         assert!(
             matches!(
-                journal.take_private(&consumer(), &entry, 1, 2),
+                journal.take_private(
+                    &consumer(),
+                    &private_entry(1, 2, Some(alert_request(1))),
+                    1,
+                    2
+                ),
                 Err(DeliveryError::LateResult { .. })
             ),
             "not at a generation the journal is not at"
@@ -4615,16 +4620,17 @@ mod tests {
         );
     }
 
-    /// A host that stopped between the fence and the cleanup comes back with a pending event from
-    /// the generation the fence ended. The generation on the event is what refuses it.
+    /// A host whose generation moved on without the fence's cleanup having reached a pending event
+    /// comes back with an event from the generation that ended. The generation on the event is what
+    /// refuses it. (Where the fence did stand, lifting it decides every such event itself, so
+    /// there is nothing left to refuse: [`lifting_the_fence_takes_back_the_alerts_and_records_when`].)
     #[test]
     fn a_notice_from_a_generation_that_has_passed_is_refused_at_production() {
         let mut journal = journal();
         journal
             .take_events(&consumer(), &[taken(1, 1)], 1)
             .expect("a page");
-        journal.fence(1).expect("a fence");
-        journal.lift_fence(1).expect("the fence lifts");
+        journal.lift_fence(1).expect("the generation moves on");
         let error = journal
             .produce(&event(1), &[], &[], &[])
             .expect_err("an old notice is not produced under a new generation");
