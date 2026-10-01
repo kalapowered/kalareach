@@ -26,13 +26,14 @@
 //! and a quote open at its end, an apostrophe in a path that nothing closed: every quote after it
 //! reads the other way, and where a value ends cannot be told.
 //!
-//! Where a value ends is read from the quote state the text has where it starts, reading the text
-//! from its start as a shell does. Without a quote open, the value is a word. In a quote that an
-//! argument opened (one that starts the text, or follows whitespace or the `=` of an assignment),
-//! such as `"PASSWORD=two words"` or the script of `sh -c`, it runs to the quote that closes the
-//! argument. In a quote that opened anywhere else, an apostrophe in `/Users/Tom's x`, the text
-//! that follows reads the other way round and where a value ends cannot be told: the field is
-//! withheld. So no value is cut short by a quote read the wrong way.
+//! A quote in a field also decides where a value ends, and a quote can be a character of a path as
+//! well as a quote: the apostrophe of `/Users/Tom's x`, the apostrophe of `Rock 'n Roll`. Reading
+//! the text from its start as a shell does cannot tell the two apart, and each reading puts the
+//! end of a value in a different place. So a value is read as a word, from where it starts, and
+//! only where no reading can put a quote around it: the quote that would have to open before it and
+//! the quote that would have to close after it are both needed, so a field with a quote before a
+//! credential's value and a quote at or after it is withheld. A quoted argument that holds a
+//! credential (`-e "PASSWORD=two words"`, the script of `sh -c`) is such a field.
 //!
 //! # What a name says
 //!
@@ -49,7 +50,8 @@
 //! It does not find a credential by its value. A secret that is a positional word, a plain path
 //! component, the value of `-p` or `-u user:password`, the text of a `-H "Authorization: ..."`, a
 //! part of a connection string whose name is not on the list, a password with an unescaped `/`, `?`
-//! or `#` in a URL, or a name nobody listed stays in the text. So does a user name anywhere in a
+//! or `#` in a URL, a quote character inside a quoted value (`TOKEN='it's'`), a value in `$'...'`
+//! quoting, or a name nobody listed stays in the text. So does a user name anywhere in a
 //! path but the home directory's. The preview shows everything that will be written, and a person
 //! can leave a session out.
 
@@ -174,7 +176,7 @@ fn credentials(text: &str) -> Option<String> {
     // A quote that is open at the end of the text, an apostrophe in a path that nothing closed,
     // turns every quote after it the other way, so where a credential's value ends cannot be told:
     // with a credential name and a value in the text, the field is withheld.
-    if !named.is_empty() && open_quote_at(text, text.len()).is_some() {
+    if !named.is_empty() && ends_in_a_quote(text) {
         return None;
     }
     let mut spans = named;
@@ -332,44 +334,31 @@ fn step(
     false
 }
 
-/// The quote that is open at `position` and the offset where it opened, reading the text from its
-/// start as a shell reads it.
-fn open_quote_at(text: &str, position: usize) -> Option<(char, usize)> {
+/// Whether a quote is still open at the end of the text, reading it from its start as a shell does.
+fn ends_in_a_quote(text: &str) -> bool {
     let mut open = None;
-    let mut opened = 0;
-    let mut characters = text[..position].char_indices();
-    while let Some((offset, character)) = characters.next() {
-        let before = open;
+    let mut characters = text.char_indices();
+    while let Some((_, character)) = characters.next() {
         step(&mut open, character, &mut characters);
-        if before.is_none() && open.is_some() {
-            opened = offset;
-        }
     }
-    open.map(|quote| (quote, opened))
+    open.is_some()
 }
 
-/// Whether the quote at `offset` opens an argument: it starts the text, follows whitespace, or
-/// follows the `=` of an assignment (`FOO="a b"`). A quote anywhere else is a character of the
-/// word it is in, such as the apostrophe of `Tom's`: what it opens is not an argument.
-fn opens_an_argument(text: &str, offset: usize) -> bool {
-    text[..offset]
-        .chars()
-        .next_back()
-        .is_none_or(|before| matches!(before, ' ' | '\t' | '\n' | '='))
+/// Whether the text holds a quote character, of either kind, whether or not it is escaped or inside
+/// the other kind: any of them can be a quote or a character of a name, and none is told apart.
+fn has_quote(text: &str) -> bool {
+    text.contains(['\'', '"'])
 }
 
-/// Where the value that starts at `start` ends, read from the quote state the text has there: a
-/// word where no quote is open ([`value_end`]), the rest of the argument where an argument's quote
-/// is ([`value_end_in`]), and `None` where a quote that no argument opened is, because the text
-/// after it reads the other way round and nothing says where the value ends.
+/// Where the value that starts at `start` ends: as a word read from `start` ([`value_end`]), or
+/// `None`, which withholds the field, when a quote could surround the value: one before `start`
+/// that opens, and one at or after it that closes. Where either is missing no quote can enclose the
+/// value, and the word is the whole of it.
 fn value_end_from(text: &str, start: usize) -> Option<usize> {
-    match open_quote_at(text, start) {
-        None => value_end(text, start),
-        Some((quote, opened)) if opens_an_argument(text, opened) => {
-            value_end_in(text, start, quote)
-        }
-        Some(_) => None,
+    if has_quote(&text[..start]) && has_quote(&text[start..]) {
+        return None;
     }
+    value_end(text, start)
 }
 
 /// Where a value that starts at `start` ends, read as a shell reads a word: at the first whitespace
@@ -379,30 +368,6 @@ fn value_end(text: &str, start: usize) -> Option<usize> {
     let mut quote = None;
     let mut characters = text[start..].char_indices();
     while let Some((offset, character)) = characters.next() {
-        if step(&mut quote, character, &mut characters) {
-            return Some(start + offset);
-        }
-    }
-    quote.is_none().then_some(text.len())
-}
-
-/// Where a value that starts at `start` ends when it sits in an argument that `outer` opened: at
-/// the `outer` quote that closes the argument, which stays in the text, so the whole argument is
-/// the value. A quote of that kind closes the argument only when whitespace or the end of the text
-/// follows it: in `'TOKEN=it'\''s here'` the first one is part of how the shell spells an
-/// apostrophe. The argument also ends at whitespace outside every quote once its own quote has
-/// closed in the middle of it (`"PASSWORD="secret`), or at the end of the text when none is open.
-/// `None` when a quote is still open at the end of the text.
-fn value_end_in(text: &str, start: usize, outer: char) -> Option<usize> {
-    let mut quote = Some(outer);
-    let mut characters = text[start..].char_indices();
-    while let Some((offset, character)) = characters.next() {
-        if quote == Some(outer) && character == outer {
-            let after = text[start + offset + character.len_utf8()..].chars().next();
-            if after.is_none_or(|next| matches!(next, ' ' | '\t' | '\n')) {
-                return Some(start + offset);
-            }
-        }
         if step(&mut quote, character, &mut characters) {
             return Some(start + offset);
         }
