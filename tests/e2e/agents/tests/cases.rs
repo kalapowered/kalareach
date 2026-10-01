@@ -27,7 +27,7 @@ use kr_e2e_agents::account::{
     reported_rewrites, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
-    Account, AccountHome, Action, Build, Inputs, Launch, quote, with_dates,
+    Account, AccountHome, Action, Build, Confinement, Inputs, Launch, quote, with_dates,
 };
 use kr_e2e_agents::confine::{self, Layout, Setup};
 use kr_e2e_agents::conversation::answers;
@@ -1020,6 +1020,27 @@ fn confine_holds(stage: &Stage<'_, '_>) {
     );
 }
 
+/// How many requests for a conversation's title the agent made during the part, as far as it shows
+/// them: the lines its log gained that name a failed request, and the run's conversations whose
+/// own record says their title came from a request. Each is a request to the agent's model that no
+/// submission of the part made. Read before the run's sessions are removed.
+fn confine_titles(
+    confinement: &Confinement,
+    setup: &Setup,
+    data: &Path,
+    bucket: &Path,
+) -> Result<u64, String> {
+    let titles = &confinement.title_requests;
+    let in_log = confine::count_marks(data, &titles.logs, &titles.log_mark)?;
+    let generated = confine::titled_conversations(
+        bucket,
+        &titles.state_file,
+        &titles.state_key,
+        &titles.state_value,
+    )?;
+    Ok(in_log.saturating_sub(setup.log_titles_before) + generated)
+}
+
 /// What a confined part's search found, made before anything of the run is cleaned up: the strings
 /// of the login's files in the run's directory and in what the agent wrote of the run into the
 /// person's data directory, and whether the agent started a subagent.
@@ -1048,6 +1069,9 @@ struct Searched {
     other_writer: bool,
     /// The prompts the agent's own record holds, by who made them, or why they could not be counted.
     wire: Result<confine::WirePrompts, String>,
+    /// How many requests for a conversation's title the agent made, as its log and the run's
+    /// conversations show them, or why they could not be counted.
+    titles: Result<u64, String>,
     /// Every string searched for, kept in memory only: the part's result is held against them
     /// before it is written.
     values: Vec<String>,
@@ -1184,6 +1208,7 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
                 .load(std::sync::atomic::Ordering::SeqCst)
         }),
         wire: confine::wire_prompts(&bucket),
+        titles: confine_titles(confinement, setup, &data, &bucket),
         values,
     })
 }
@@ -1380,6 +1405,44 @@ fn confine_close(
             json!({ "charged": charged })
         }
     };
+    // A request for a conversation's title is a request to the agent's model that no submission
+    // of the part made: each is charged as a turn, beyond the limit where need be.
+    let titles = match &searched.titles {
+        Ok(count) => {
+            if *count > 0 {
+                let said = login
+                    .ledger
+                    .charge_found(
+                        part,
+                        "a request for a conversation's title that the agent made",
+                        *count,
+                    )
+                    .map_or_else(
+                        |why| {
+                            stop.push((
+                                "uncharged_turns",
+                                format!("the requests for a title could not be charged: {why}"),
+                            ));
+                            "not charged".to_owned()
+                        },
+                        |total| format!("the ledger now says {total} spent"),
+                    );
+                eprintln!(
+                    "the agent made {count} request(s) for a conversation's title, charged as turns ({said})"
+                );
+            }
+            *count
+        }
+        Err(why) => {
+            stop.push((
+                "uncharged_turns",
+                format!("the agent's requests for a title could not be counted: {why}"),
+            ));
+            0
+        }
+    };
+    let mut turns = turns;
+    turns["titles"] = json!(titles);
     if let Some(why) = &searched.subagent {
         stop.push((
             "subagent_started",
@@ -1428,6 +1491,7 @@ fn confine_close(
                 "by_host": by_host,
             },
             "unasked_tools": confinement.unasked_tools,
+            "residuals": confinement.residuals,
             "settings": { "rules": setup.settings.rules, "allow_built_in": setup.settings.allow_built_in, "mode_manual": !setup.settings.mode_not_manual && setup.settings.unlisted == 0, "loads_more": setup.settings.loads_more, "unlisted": setup.settings.unlisted },
             "servers_switched_off": setup.servers.len(),
             "left_in_data": { "trust_records_removed": trust_removed, "trust_records_left": trust_left, "sessions_bucket_existed": bucket_existed, "sessions_bucket_left": bucket_left, "file_history_removed": file_history_removed },
@@ -1437,6 +1501,7 @@ fn confine_close(
             "subagent_started": searched.subagent.is_some(),
             "turns": turns,
             "new_sessions": NEW_SESSIONS.load(std::sync::atomic::Ordering::SeqCst),
+            "resumed_launches": RESUMED_LAUNCHES.load(std::sync::atomic::Ordering::SeqCst),
             "fresh_screen_ms": FRESH_MS.lock().map(|measured| measured.clone()).unwrap_or_default(),
             "zero_turn": ZERO_TURN.lock().map(|zero| zero.clone()).unwrap_or_default(),
         }),
@@ -1468,6 +1533,10 @@ static FRESH_MS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// How many fresh conversations the part started after its checks.
 static NEW_SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many launches of a confined agent resumed a saved conversation and so ran no checks of their
+/// own: those of the part's first launch, which showed the same profile, cover them.
+static RESUMED_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The digits a line of the agent's screen shows after `prefix`, as a status: `kr-zt-3-1007` after
 /// `kr-zt-3-` is 7. The typed line itself shows `$((1000+$?))` there, never digits.
@@ -1633,6 +1702,32 @@ fn confine_checks(stage: &Stage<'_, '_>, logged: &mut Logged) {
     } else {
         None
     };
+    // The keys the parts use at the composer go through the device's keyboard as any other: a
+    // digit typed on its own is text, and Ctrl-U clears what was typed. (The approval keys and
+    // Ctrl-S act on a dialog and a queued prompt, which only a turn makes.)
+    let probe = format!("kr-zk-{token}");
+    logged.type_text(stage, &probe);
+    logged.type_text(stage, "1");
+    let typed = logged
+        .wait_for(
+            stage,
+            &format!("{probe}1"),
+            "the composer shows what was typed, a digit last",
+        )
+        .iter()
+        .any(|row| row.contains(&format!("{probe}1")));
+    logged.type_text(stage, &account.clear);
+    let mut cleared = false;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        if !fresh_rows(stage, &logged.agent.session)
+            .iter()
+            .any(|row| row.contains(&probe))
+        {
+            cleared = true;
+            break;
+        }
+    }
     let refused = proxy.counts().refused() > refused_before;
     let tunnelled = proxy.counts().allowed() > tunnels_before;
     let processes: Vec<u32> = logged
@@ -1666,6 +1761,7 @@ fn confine_checks(stage: &Stage<'_, '_>, logged: &mut Logged) {
         "person_copy_cannot_run": exec_denied,
         "connections_only_to_the_proxy": only_the_proxy,
         "connections_seen": connections.as_ref().map_or(0, Vec::len),
+        "device_keys_reach_the_composer": typed && cleared,
     });
     if let Ok(mut zero) = ZERO_TURN.lock() {
         zero.push(result.clone());
@@ -1848,6 +1944,7 @@ fn staged(
                 &confinement.data,
                 &confinement.provider,
                 &confinement.servers,
+                &confinement.title_requests,
             )
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
             account.guarded.extend(setup.other_logins.iter().cloned());
@@ -3347,11 +3444,24 @@ impl Logged {
                 rows.join("\n")
             );
         }
-        confine_checks(stage, &mut logged);
+        // A launch that resumes a saved conversation runs none of the checks: an earlier launch of
+        // the part showed the same sandbox, proxy and files, and a shell line typed now would go
+        // into the conversation the part resumes.
+        let resumes = !extra.is_empty();
+        if resumes {
+            if stage
+                .login
+                .is_some_and(|login| login.account.confinement.is_some())
+            {
+                RESUMED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        } else {
+            confine_checks(stage, &mut logged);
+        }
         // The checks' shell lines are in the agent's record of its first conversation, and would go
         // to its model with the first prompt: a launch that does not resume one starts a fresh
-        // conversation for the part's own turns. (A launch that resumes one has put them in it.)
-        if extra.is_empty()
+        // conversation for the part's own turns.
+        if !resumes
             && let Some(new_session) = stage
                 .login
                 .and_then(|login| login.account.confinement.as_ref())
