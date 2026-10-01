@@ -85,6 +85,7 @@ impl Controller {
             clock: placed.clock,
             privacy: self.privacy.state(),
             conditions: placed.conditions,
+            abandon: placed.abandon,
         };
         let started =
             tokio::task::spawn_blocking(move || crate::describe::host::DescribeHost::start(setup))
@@ -172,6 +173,7 @@ impl Controller {
                 .unwrap_or_else(|_| unreachable!("this build ships profiles it can run")),
             clock: crate::describe::host::Clock::default(),
             conditions: None,
+            abandon: false,
         }
     }
 

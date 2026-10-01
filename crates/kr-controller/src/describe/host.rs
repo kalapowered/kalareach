@@ -103,6 +103,9 @@ pub(crate) struct Snapshot {
     pub figures: Figures,
     /// What setup offers, as the service reads it.
     pub setup: Option<kr_describe::service::SetupState>,
+    /// When this host started, on the wall clock: a description produced before it is from an
+    /// earlier daemon, whose context revisions say nothing about this one's.
+    pub started_wall_ms: u64,
 }
 
 /// What the host has done, counted, for this crate's own tests and for the doctor.
@@ -122,6 +125,8 @@ pub struct Figures {
     pub restarts: u64,
     /// How many sessions the host tracks.
     pub sessions: usize,
+    /// Whether a load is in the process.
+    pub loading: bool,
 }
 
 /// What one session's description stands at.
@@ -168,6 +173,9 @@ pub(crate) struct Setup {
     pub privacy: PrivacyState,
     /// Conditions a test holds, in place of reading the host's own.
     pub conditions: Option<Arc<Mutex<HostConditions>>>,
+    /// Whether the process is left running when the host stops, as a daemon that hung would leave
+    /// it. Only this crate's tests ask for it.
+    pub abandon: bool,
 }
 
 /// What the rest of the daemon holds of the host.
@@ -211,7 +219,9 @@ impl DescribeHost {
             clock,
             privacy,
             conditions,
+            abandon,
         } = setup;
+        let started_wall_ms = clock.now().wall_ms().get();
         let store = DescriptionStore::open(&state_dir).map_err(ControllerError::registry)?;
         let handles = Handles::default();
         let mut service = DescriptionService::sharing(
@@ -270,6 +280,8 @@ impl DescribeHost {
                         clock,
                         conditions,
                         last_event: BTreeMap::new(),
+                        started_wall_ms,
+                        abandon,
                     }
                     .run();
                     shared.running.store(false, Ordering::Release);
@@ -473,6 +485,10 @@ struct Thread {
     conditions: Option<Arc<Mutex<HostConditions>>>,
     /// The newest event cursor taken from each session's facts.
     last_event: BTreeMap<SessionId, u64>,
+    /// When this thread started, on the wall clock.
+    started_wall_ms: u64,
+    /// Whether the process is left running when this thread ends.
+    abandon: bool,
 }
 
 impl Thread {
@@ -488,7 +504,14 @@ impl Thread {
             let wait = self.next_wait(now);
             self.driver.wait(wait);
         }
-        // The process goes with the host: the driver ends it when it is dropped.
+        // The process goes with the host: the driver ends it when it is dropped, unless a test
+        // asked for it to outlive this daemon.
+        #[cfg(feature = "testing")]
+        if self.abandon {
+            self.driver.abandon();
+        }
+        #[cfg(not(feature = "testing"))]
+        let _ = self.abandon;
     }
 
     fn conditions(&self) -> HostConditions {
@@ -664,6 +687,7 @@ impl Thread {
             pid: self.driver.pid(),
             restarts: service.inference_restarts(),
             sessions: service.live_sessions(),
+            loading: service.is_loading(),
         };
         let snapshot = Snapshot {
             state: Some(state),
@@ -672,6 +696,7 @@ impl Thread {
             sessions,
             figures,
             setup: Some(setup),
+            started_wall_ms: self.started_wall_ms,
         };
         *self
             .shared
@@ -846,4 +871,195 @@ fn read_conditions_until_stopped(shared: &Arc<Shared>) {
 /// Where the host keeps what the process downloads: `<state>/models`.
 pub(crate) fn models_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("models")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::privacy::Published;
+    use kr_describe::profile::catalogue::Catalogue;
+    use kr_describe::resource::ResourceSettings;
+    use kr_protocol::describe::{DescriptionFacts, DescriptionFactsPage};
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::scalars::{Nullable, U64, Uuid};
+
+    fn session() -> SessionId {
+        SessionId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    /// A host thread over a service that is never asked to start a process, in `state`.
+    fn thread(state: Published) -> (tempfile::TempDir, Thread) {
+        let directory = tempfile::tempdir().expect("a directory on the internal disk");
+        let privacy = PrivacyState::at(state);
+        let handles = Handles::default();
+        let service = DescriptionService::sharing(
+            HostPlacement {
+                environment: kr_describe::environment::ExecutionEnvironment::new(
+                    EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                    kr_describe::environment::EnvironmentKind::Native,
+                ),
+                data_access: None,
+                target: kr_describe::environment::build_target().to_owned(),
+            },
+            Catalogue::builtin().expect("this build ships profiles it can run"),
+            MetGates::default(),
+            ResourceSettings::default(),
+            DescriptionStore::in_memory().expect("a store in memory"),
+            handles.clone(),
+        );
+        let driver = Driver::new(
+            service,
+            Launch {
+                program: directory.path().join("never-started"),
+                arguments: Vec::new(),
+                working_directory: directory.path().to_path_buf(),
+                environment: Vec::new(),
+                models: directory.path().join("models"),
+            },
+            "kr-test/0".to_owned(),
+        );
+        let (tell, inbox) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            inbox: Mutex::new(tell),
+            waker: driver.waker(),
+            handles,
+            known: Mutex::new(BTreeSet::new()),
+            slots: Mutex::new(BTreeMap::new()),
+            snapshot: RwLock::new(Snapshot::default()),
+            purges_owed: AtomicU64::new(0),
+            running: AtomicBool::new(true),
+        });
+        let mut thread = Thread {
+            shared,
+            driver,
+            inbox,
+            privacy,
+            clock: Clock::default(),
+            conditions: None,
+            last_event: BTreeMap::new(),
+            started_wall_ms: 0,
+            abandon: false,
+        };
+        thread.driver.service_mut().session_opened(
+            session(),
+            SessionEpoch::V1,
+            ContextBinding::new("display-1/epoch-1"),
+        );
+        (directory, thread)
+    }
+
+    /// A page of one session's facts, captured under `generation`.
+    fn page(generation: u64) -> DescriptionFactsPage {
+        DescriptionFactsPage {
+            request_id: RequestId::new(1),
+            session_id: session(),
+            privacy_generation: Nullable::some(U64::new(generation)),
+            private: false,
+            facts: Nullable::some(DescriptionFacts {
+                revision: U64::new(1),
+                generation: U64::new(generation),
+                directory: Nullable::some("kalareach".to_owned()),
+                repository: Nullable::null(),
+                application: Nullable::some("cargo".to_owned()),
+                completion: Nullable::null(),
+                intent: Nullable::null(),
+                thread: Nullable::null(),
+                events: Vec::new(),
+            }),
+        }
+    }
+
+    fn pending(thread: &Thread) -> bool {
+        thread.driver.service().settle_due_ms().is_some()
+    }
+
+    fn state(generation: u64, private: bool) -> Published {
+        Published {
+            generation: PrivacyGeneration::new(generation),
+            private,
+        }
+    }
+
+    /// A page is applied under privacy mode's admission at the generation it was captured under:
+    /// it is taken while privacy mode is off at that generation, and refused while it is on and
+    /// when the generation in force is another. The control is the first case, which is taken.
+    #[test]
+    fn a_page_is_applied_only_under_an_admission_at_its_own_generation() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let (_directory, mut taken) = thread(state(0, false));
+        taken.apply(session(), &page(0), now);
+        assert!(pending(&taken), "off, and the page is of that generation");
+
+        let (_directory, mut private) = thread(state(1, true));
+        private.apply(session(), &page(1), now);
+        private.apply(session(), &page(0), now);
+        assert!(!pending(&private), "privacy mode is on");
+
+        let (_directory, mut behind) = thread(state(2, false));
+        behind.apply(session(), &page(1), now);
+        assert!(!pending(&behind), "the generation in force is another");
+    }
+
+    /// A session's fence is lowered at the first page admitted at a newer non-private generation
+    /// than the one it was raised at, with the generation set first; a fence raised at the
+    /// generation of the page, or later, is left up. The control is a fence that is not up, whose
+    /// session takes the page as any other.
+    #[test]
+    fn a_fence_is_lowered_only_at_a_page_of_a_newer_generation_than_it_was_raised_at() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let (_directory, mut lowered) = thread(state(2, false));
+        lowered
+            .shared
+            .handles
+            .fence
+            .raise(session(), PrivacyGeneration::new(1));
+        lowered.apply(session(), &page(2), now);
+        assert!(
+            !lowered.shared.handles.fence.is_fenced(&session()),
+            "the fence went down"
+        );
+        assert_eq!(
+            lowered.driver.service().privacy_generation(&session()),
+            PrivacyGeneration::new(2),
+            "and the session is stamped with the generation in force"
+        );
+        assert!(pending(&lowered));
+
+        let (_directory, mut held) = thread(state(2, false));
+        held.shared
+            .handles
+            .fence
+            .raise(session(), PrivacyGeneration::new(2));
+        held.apply(session(), &page(2), now);
+        assert!(
+            held.shared.handles.fence.is_fenced(&session()),
+            "raised at this generation: not lowered by a page of it"
+        );
+        assert!(!pending(&held));
+    }
+
+    /// A publication runs inside the admission and only while a result produced under its
+    /// generation is admitted: it runs while privacy mode is off at that generation, and does not
+    /// run at all while privacy mode is on or when the generation in force is another.
+    #[test]
+    fn a_publication_runs_only_while_its_generation_is_admitted() {
+        let ran = |state: Published, generation: u64| {
+            let gate = Admission {
+                privacy: PrivacyState::at(state),
+            };
+            let mut ran = false;
+            let outcome = gate.hold(PrivacyGeneration::new(generation), &mut || {
+                ran = true;
+                Ok(PublishGate::Allowed)
+            });
+            (ran, outcome.is_some())
+        };
+        assert_eq!(ran(state(3, false), 3), (true, true));
+        assert_eq!(ran(state(3, true), 3), (false, false), "privacy mode is on");
+        assert_eq!(
+            ran(state(4, false), 3),
+            (false, false),
+            "another generation"
+        );
+    }
 }

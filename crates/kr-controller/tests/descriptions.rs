@@ -303,6 +303,8 @@ struct Setup {
     sessions: usize,
     /// What the host reads of its own machine.
     conditions: HostConditions,
+    /// Whether the process is left running when the daemon's host stops.
+    abandon: bool,
 }
 
 impl Setup {
@@ -311,6 +313,7 @@ impl Setup {
             script: Script::default(),
             sessions: 1,
             conditions: roomy(),
+            abandon: false,
         }
     }
 }
@@ -378,6 +381,7 @@ impl Environment {
             ],
             signed.catalogue(),
             setup.conditions,
+            setup.abandon,
         );
         let mut workers = Vec::new();
         for display in 1..=setup.sessions as u64 {
@@ -483,6 +487,50 @@ impl Environment {
                     .starts_with(STARTED_PREFIX)
             })
             .count()
+    }
+
+    /// How many models stubs have loaded, as they marked it.
+    fn loaded(&self) -> usize {
+        std::fs::read_dir(&self.runtime_dir)
+            .expect("the runtime directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(kr_describe::testing::LOADED_PREFIX)
+            })
+            .count()
+    }
+
+    /// Stops the daemon and starts another on the same tree, which finds the workers still running.
+    async fn restart(self) -> Self {
+        let Self {
+            host,
+            workers,
+            placed,
+            runtime_dir,
+        } = self;
+        let host = host.restart().await;
+        let environment = Self {
+            host,
+            workers,
+            placed,
+            runtime_dir,
+        };
+        for worker in &environment.workers {
+            environment.until_adopted(worker.session_id).await;
+        }
+        environment
+    }
+
+    /// Whether a process is running, as the operating system says.
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// Whether a stub has begun a piece of work of this kind.
@@ -1094,5 +1142,114 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
         environment.figures().started >= 2 && environment.figures().jobs.published >= 2
     })
     .await;
+    environment.stop().await;
+}
+
+/// KR-REQ-22.03: across a daemon replacement while the old description process still lives, a
+/// session described before it is shown as stale at once, and described again after it; the new
+/// process loads nothing until the old one has gone, so there is never a second mapping, and when
+/// the old one goes the new one loads and describes. The control is the load marks: one while the
+/// old process lives, two after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_has_gone() {
+    let environment = Environment::start(Setup {
+        script: Script {
+            mark_loads: true,
+            ..Script::default()
+        },
+        abandon: true,
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    let before = environment
+        .describe_until("the first description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(before.freshness, DescriptionFreshness::Current);
+    let old = environment.figures().pid.expect("the old process runs");
+    assert_eq!(environment.loaded(), 1);
+
+    let environment = environment.restart().await;
+    assert!(
+        Environment::alive(old),
+        "the old process outlives its daemon"
+    );
+    // From before the replacement: shown, and stale, at once.
+    let carried = environment.describe(session_id).await;
+    assert_eq!(carried.source, LabelSource::Generated);
+    assert_eq!(carried.freshness, DescriptionFreshness::Stale);
+
+    // The new daemon reads the worker's facts and asks for a load, and the load waits for the old
+    // process's lock: nothing is mapped twice while it lives.
+    until("the new process asked to load", || {
+        let figures = environment.figures();
+        figures.loading && figures.started == 1
+    })
+    .await;
+    assert!(Environment::alive(old));
+    assert_eq!(
+        environment.loaded(),
+        1,
+        "no second mapping while the old process lives"
+    );
+    assert_eq!(environment.figures().jobs.published, 0);
+    // The description from before is still shown as it was, and still stale: a revision the new
+    // daemon settled may be the number the old one's was produced at, which says nothing here.
+    let waiting = environment.describe(session_id).await;
+    assert_eq!(waiting.source, LabelSource::Generated);
+    assert_eq!(
+        waiting.freshness,
+        DescriptionFreshness::Stale,
+        "a description from an earlier daemon is stale until a newer one replaces it"
+    );
+
+    // The old process goes, and the new one loads and describes.
+    let ended = std::process::Command::new("/bin/kill")
+        .args(["-TERM", &old.to_string()])
+        .status()
+        .expect("the old process is signalled");
+    assert!(ended.success());
+    until("the new process describing", || {
+        environment.figures().jobs.published >= 1
+    })
+    .await;
+    assert_eq!(environment.loaded(), 2);
+    let after = environment.describe(session_id).await;
+    assert_eq!(after.source, LabelSource::Generated);
+    assert_eq!(after.freshness, DescriptionFreshness::Current);
+    environment.stop().await;
+}
+
+/// KR-REQ-24.11: a load in flight when privacy mode is enabled is cancelled, and privacy mode's
+/// change is not complete until it has answered; nothing is loaded for a session captured before.
+/// The control is the same load left alone, which the stub holds until it is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
+    let environment = Environment::start(Setup {
+        script: Script {
+            load_until_cancelled: true,
+            ..Script::default()
+        },
+        ..Setup::new()
+    })
+    .await;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    until("a load in the process", || {
+        environment.began("load") && environment.figures().loading
+    })
+    .await;
+    assert!(
+        environment.figures().loading,
+        "left alone, the load goes on"
+    );
+
+    let report = environment.privacy(true).await;
+    assert!(report.enabled);
+    environment.until_privacy_settled().await;
+    until("the load cancelled", || !environment.figures().loading).await;
+    assert_eq!(environment.figures().jobs.published, 0);
     environment.stop().await;
 }
