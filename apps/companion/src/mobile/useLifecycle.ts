@@ -42,6 +42,11 @@ export interface Lifecycle {
   readonly state: DurableState
   /** What the last resumption was, for the banner and for the tests. */
   readonly resumption: Resumption
+  /**
+   * How many resumptions this run has declared. A suspension that follows another is the same kind
+   * of resumption, so what it was cannot say that one happened; this can.
+   */
+  readonly resumed: number
   /** The banner to show, or null. */
   readonly banner: RecoveryBanner | null
   readonly setDrafts: (change: (drafts: readonly Draft[]) => readonly Draft[]) => void
@@ -82,6 +87,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
       ? EMPTY_DURABLE_STATE
       : restored
   })
+  const [resumed, setResumed] = useState(0)
   const [dismissed, setDismissed] = useState(false)
   const [durable, setDurable] = useState(true)
 
@@ -111,6 +117,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   const resume = useCallback(
     (next: Resumption) => {
       setResumption(next)
+      setResumed((count) => count + 1)
       setDismissed(false)
       setState((current) => onResume(next, current, store))
     },
@@ -163,6 +170,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   return {
     state,
     resumption,
+    resumed,
     banner,
     setDrafts,
     setSubmissions,
