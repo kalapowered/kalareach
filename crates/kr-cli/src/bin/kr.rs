@@ -1454,6 +1454,9 @@ async fn new_in_enrolled(
     let presented = match presentation {
         Presentation::Attach => {
             let session = &created.result.session;
+            // The attachment takes responsibility for what was typed, and reports what it could
+            // not deliver, as a create on this host does.
+            let owed = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
             kr_cli::bridge::session::attach(
                 &enrolment,
                 kr_cli::attach::Attaching {
@@ -1467,7 +1470,7 @@ async fn new_in_enrolled(
                     follow_live: false,
                     typed_before: typed_while_asking,
                 },
-                kr_cli::session::UndeliveredTyping::new(0),
+                owed,
             )
             .await
             .map(|(outcome, _)| Some(outcome))
