@@ -893,7 +893,7 @@ impl TerminalEngine {
                 kr_term::sideeffect::SideEffectDestination::Attachment { .. } => {
                     if let Some(rendered) = crate::render::side_effect(&effect.kind) {
                         filtered.effects.push(crate::output::OwedEffect {
-                            effect: effect.clone(),
+                            effect: std::sync::Arc::new(effect.clone()),
                             bytes: std::sync::Arc::new(rendered),
                         });
                     }
