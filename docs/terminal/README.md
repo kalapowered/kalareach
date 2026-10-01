@@ -235,17 +235,19 @@ single string. Reading that string back by clustering it again would undo the cu
 revision has a compact row record where its cells are whenever clustering would not give them back.
 A row therefore keeps the cells it was given, on screen and in the scrollback alike.
 
-The width functions are in their own crate, `kr-width`, over the pinned library's cell crate, which
-holds the width function and its tables. `kr-term` uses them for the grid and re-exports them, and a
-client that paints a screen it was sent uses them directly. The library's terminal-state crates
-depend on a terminal-mode crate that has no target for Apple's mobile systems, and its cell crate
-does not, so a phone measures text with the tables the terminal engine measures with, and places a
-run of mixed widths at the columns a desktop does. A test holds `kr-width` to
-`wezterm_term::grapheme_column_width`: every scalar, the rows of `fixtures/terminal/width.json` and
-a generated corpus of sequences must come out the same, and a run's width is the sum of its scalars'
-widths, because the function itself caps a cluster at two.
+The width functions are in a separate crate, `kr-width`, over the pinned library's cell crate. This
+is because it contains the width function and the tables it uses. It is used by `kr-term` for its
+grid and re-exported from there, and it is used directly by a client that paints the screen it was
+sent. The crates in the library that hold terminal state depend on a terminal-mode crate that does
+not have a target for Apple's mobile systems, but the cell crate does. This allows measuring text on
+a phone with the same tables the terminal engine uses, so it will put a run of mixed-width
+characters in the same columns on a phone as on a desktop. A test holds `kr-width` to
+`wezterm_term::grapheme_column_width`: for each scalar, for each row of
+`fixtures/terminal/width.json` and for a generated corpus of sequences, the two functions must come
+out the same. A run's width is the sum of its scalars' widths, because the function itself caps a
+cluster at two.
 
-Below U+0300 `is_zero_width` does not look scalars up in the table, since almost nothing there is
+Below U+0300 `is_zero_width` does not look scalars up in the table, because almost nothing there is
 zero width. The exceptions are the C0 and C1 controls, which never reach it, and U+00AD, which the
 table gives no cells and which `is_zero_width` reports as having one.
 
@@ -706,10 +708,12 @@ resize, or a buffer switch or full reset that brings a window above the live pag
 screen. The answer to `attachment.viewport` names the revision the report left, and the reset and
 the snapshot of every screen name the revision of the window they are drawn for.
 
-The answer also names the presentation the report left the attachment in and, when that is a
-viewport, the reason: the first condition that keeps the attachment off the session's own stream, in
-the order the summaries list them. It is null for an attachment shown the stream. A report that
-moves an attachment between the two changes the presentation and the reason together, so a view
+The answer also names the presentation in which the report left the attachment (this may be a
+viewport if the attachment is not shown the session's own stream). It also names the reason the
+attachment is not shown the session's own stream, which is only given when the presentation is a
+viewport: the first reason, in the order the summaries list them, that keeps the attachment off the
+session's own stream, or null if the attachment is shown the stream. A report that moves an
+attachment between the two presentations changes the presentation and the reason together, so a view
 shows what its last report produced without asking for the attachment's summary again.
 
 A report that moved the window has its screen queued before its answer is written. One that changed
@@ -1108,61 +1112,70 @@ support either.
 
 ### The compiled file
 
-`terminfo::compiled` writes the same data as the binary file a terminfo library loads.
-`kr-term-fixtures --terminfo <directory>` writes it into a directory in the layout a library reads,
-and the fixture file carries the bytes, so a change to any capability changes the fixture in the
-same commit.
+`terminfo::compiled` writes the same data as the binary file that a terminfo library loads.
+`kr-term-fixtures --terminfo <directory>` writes it into a directory in the layout a terminfo
+library expects. The fixture file carries the bytes, so a change to any capability changes the
+fixture in the same commit.
 
-The file is the legacy format: a header, the names line, the predefined boolean, number and string
-tables, and after them an extended section for the capabilities a library does not predefine (`Tc`,
-`RGB`, `BE`, `BD`, `PS`, `PE`, the modified-key strings and the rest). A library that predates the
-extended section stops at the size the header gives. Numbers are 16 bits wide, so no value can be
-above 32767, and the compiler refuses one that is. That is why `pairs` is 32767 here where a recent
-stock entry says 65536, which needs the 32-bit format that ncurses before 6.1 cannot read. The
-entry is stored under two directory names, `x/xterm-256color` and `78/xterm-256color`, because a
-library names the directory after the first letter or, when it is built for a case-insensitive file
-system, after that letter's code in hex, and macOS's own does the second.
+The file is the legacy format, meaning that it has a header, a names line, and tables for the
+predefined boolean, number and string capabilities, followed by an extended section for the
+capabilities a library does not predefine (`Tc`, `RGB`, `BE`, `BD`, `PS`, `PE`, the modified-key
+strings and the rest). A library that predates the extended section stops at the size the header
+gives. The format ends at 4096 bytes: the pinned entry takes about 3,500, and the compiler refuses a
+larger one rather than write a file an older library cuts short. In addition, all numbers in this
+format are 16 bits wide, so no value can be above 32767, and the compiler refuses one that is. This
+is why, for instance, `pairs` is 32767 here when a recent stock entry says 65536, which needs the
+32-bit format that ncurses before 6.1 cannot read. The entry is stored under two directory names,
+`x/xterm-256color` and `78/xterm-256color`, because a library names the directory after the first
+letter or, when it is built for a case-insensitive file system, after that letter's code in hex, and
+macOS's own library does the second.
 
 The bytes are checked against the host's own tools, not only against this crate's reader. On macOS
-(the system's ncurses 6.0 and Homebrew's 6.6) and on Linux (ncurses 6.6), `infocmp -x -A` reads
-back every boolean, number and string the data holds, and `tput` reads the same values by name.
-`tic -x`, given the source `infocmp` prints for the entry, writes the same bytes. Every string equals
-the answer to the XTGETTCAP query for the same name, and a capability edited in one place fails all
+(the system's ncurses 6.0 and Homebrew's 6.6) and on Linux (ncurses 6.6), `infocmp -x -A` reads back
+every boolean, number and string the data holds, and `tput` reads the same values by name. `tic -x`,
+given the source `infocmp` prints for the entry, writes the same bytes. Every string equals the
+answer to the XTGETTCAP query for the same name, and a capability edited in one place fails all
 three comparisons.
 
 ### Selecting it
 
-A worker writes the database into `terminfo/<digest>` inside its state directory when it starts a
-session's shell, where the digest names the compiled bytes. A directory is therefore never rewritten
-with other contents: a worker of a build whose data differs writes a directory of its own, and a
-session an older build started keeps reading the database its own engine answers capability
-queries from. A directory that already holds the current bytes is left alone, and a file is
-replaced whole, so workers of several sessions can write at once and none reads a partial file. The
-session's `TERMINFO` names that directory.
+When a session's shell is started, the worker writes the database to `terminfo/<digest>` in its
+state directory, where the digest names the compiled bytes. This means that a worker of a build
+whose data differs never rewrites another build's directory: it writes one of its own, and a session
+an older build started keeps reading the database its own engine answers capability queries from. A
+directory that already holds the current bytes is left alone, and a file is replaced whole, so
+workers of several sessions can write at once and none reads a partial file. The session's
+`TERMINFO` names that directory.
+
+This means that if you run `tic` in a session it writes into the same directory, because `tic`
+writes where `TERMINFO` points. To add an entry for yourself you should compile it with `tic -o
+"$HOME/.terminfo"`, since the library finds it there after the private directory. A file `tic`
+writes into the private directory stays for the sessions of the same build, and a recompiled
+`xterm-256color` there is replaced with the pinned file the next time a session starts.
 
 The library reads `TERMINFO` first, then `$HOME/.terminfo`, then each entry of `TERMINFO_DIRS`, then
-its compiled-in directories. The private database comes first, so it answers `xterm-256color`. A
+its compiled-in directories. Since the private database comes first, it answers `xterm-256color`. A
 creator's own `TERMINFO` and `TERMINFO_DIRS` are neither dropped nor obeyed: the creator's
 `TERMINFO` goes at the front of `TERMINFO_DIRS`, which keeps its place in the search after
 `$HOME/.terminfo`, and both values are reported as an override. A creator's directory still serves
 the terminal names the private database has no entry for.
 
 The worker writes one line to its own log for each session: the private directory and what it kept
-of the creator's, for example `terminfo: private database <directory>; the creator's
-TERMINFO=<path> follow it`. A worker that cannot write the database says why on the same line, and
-the creator's variables stay exactly as the creator set them, so that session reads whatever
-database its creator's search and its host provide, which may not be a stock one. A Windows host has
-no terminfo library for a shell to consult, so nothing is written or set there.
+of the creator's, for example `terminfo: private database <directory>; the creator's TERMINFO=<path>
+follow it`. A worker that cannot write the database says why on the same line, and the creator's
+variables stay exactly as the creator set them, so that session reads whatever database its
+creator's search and its host provide, which may not be a stock one. A Windows host has no terminfo
+library for a shell to consult, so nothing is written or set there.
 
 ### Multiplexers inside a session
 
-A multiplexer started in a session reads the private database for its outer terminal. With tmux 3.6
-on Linux and 3.7 on macOS, every capability tmux lists for the outer terminal that the database also
-has is the database's value, except the ones tmux sets by its own rule whatever the database says:
-the cursor style (`Se`, `Ss`), the underline styles (`Smulx`) and the colour forms (`setrgbf`,
-`setrgbb`). tmux reads `Tc` and `RGB` from the database, gives the applications inside it its own
-terminal name, keeps `TERMINFO` pointing at the private directory, and leaves the outer session's
-`TERM` and `TERMINFO` as they were.
+A multiplexer started inside a session reads the private database for the outer terminal. With tmux
+3.6 on Linux and 3.7 on macOS, every capability tmux lists for the outer terminal that the database
+also has takes the database's value. The exceptions are the ones tmux sets by its own rule whatever
+the database says: the cursor style (`Se`, `Ss`), the underline styles (`Smulx`) and the colour
+forms (`setrgbf`, `setrgbb`). tmux reads `Tc` and `RGB` from the database. It gives the applications
+inside it its own terminal name, `TERMINFO` still points to the private directory, and it leaves
+`TERM` and `TERMINFO` in the outer session unchanged.
 
 tmux also writes DEC private modes 2031 and 7727 to any terminal whose name begins with `xterm`. The
 profile has no class for either, so the engine consumes them and counts them as unclassified
@@ -1171,28 +1184,27 @@ database advertises.
 
 ### SSH into an unmanaged host
 
-`ssh` forwards `TERM` and not `TERMINFO`, so a shell on a host that is not a KalaReach environment
-reads that host's stock `xterm-256color`. That is the baseline, and a private KalaReach terminal
-name is not assumed to exist there. A remote KalaReach environment supplies its own qualified
-database.
+`ssh` only passes the `TERM` name, not `TERMINFO`, so a shell on a host that is not a KalaReach
+environment reads that host's own stock `xterm-256color`. That is the baseline, and a private
+KalaReach terminal name is not assumed to exist there. A remote KalaReach environment supplies its
+own qualified database.
 
-What the two share: an application writes the same sequence for every output capability the private
-database has and a stock one has. What a stock database lacks depends on its release:
+What the two share is that an application writes the same sequence for every output capability that
+the private database has and a stock one has. What a stock database lacks depends on its release. It
+lacks `Tc` and `RGB`, the truecolour flags, on every release checked. On ncurses 6.6 it also lacks
+`Smulx` (styled underlines) and `setrgbf` and `setrgbb` (colour forms), and on macOS's system
+database, which is older, it also lacks `BE`, `BD`, `PS`, `PE` (bracketed paste) and `smxx` and
+`rmxx` (strike-through).
 
-- `Tc` and `RGB`, the truecolour flags, on every release checked;
-- `Smulx` (styled underlines) and `setrgbf` and `setrgbb` (colour forms) on ncurses 6.6, and on
-  macOS's system database, which is older, also `BE`, `BD`, `PS`, `PE` (bracketed paste) and `smxx`
-  and `rmxx` (strike-through).
+A stock 6.6 entry also names keypad and mouse capabilities that the private database leaves out,
+such as `ka1`, `kpADD` and `XM`, and a boolean `XF` for focus events. Nothing in the profile depends
+on them.
 
-A stock 6.6 entry also names keypad and mouse capabilities the private database leaves out, such as
-`ka1`, `kpADD` and `XM`, and a boolean `XF` for focus events. Nothing in the profile depends on
-them.
-
-Other differences are deliberate: the reset strings `is2` and `rs2` leave DEC modes 3 and 4
-alone, the device-attributes report `u8` states the reply the broker sends, and the printer, memory
-lock and `Setulc` capabilities are absent because the profile has no class for them. The cursor
-style reset `Se`, the alternate screen pair `smcup` and `rmcup`, and the full reset `rs1` are what
-an earlier stock release had. A test compares the two databases on the host running it, so a stock
+Other differences are deliberate: the reset strings `is2` and `rs2` leave DEC modes 3 and 4 alone,
+the device-attributes report `u8` states the reply the broker sends, and the printer, memory lock
+and `Setulc` capabilities are absent because the profile has no class for them. The cursor style
+reset `Se`, the alternate screen pair `smcup` and `rmcup`, and the full reset `rs1` are what an
+earlier stock release had. A test compares the two databases on the host running it, so a stock
 release that adds a difference fails there and has to be answered here.
 
 ## Probes
@@ -1285,23 +1297,26 @@ interesting part.
 
 Direct mode hands a physical terminal the session's own bytes, so it holds only where the terminal
 puts its cursor where the canonical grid does. `kr-term-probe` measures that. It runs in the window
-it is started in, and for each of 136 steps it writes a full reset, the step's bytes, a cursor
-position report and a request for primary device attributes, and compares the answer with the
-cursor a canonical grid of the same size holds after the same bytes. The steps cover cursor addressing, delayed wrap at the last column, scroll
-regions and left and right margins, tabs, backspace at the edges, wide characters, combining marks,
-emoji sequences, ambiguous-width characters, the alternate screen and the control characters that
-move the cursor. Each answer is read up to the reply to primary device attributes, which every
-terminal gives last, so a terminal that ignores the position report is recorded as silent and not
-taken for one that answers wrongly. A read is bounded to ten seconds and 64 KiB. When the reply to
-primary device attributes does not arrive, the run stops at that step and says so in the record,
-because an answer still on its way would be taken for the next step's.
+it is started in. For each of the 136 steps, it writes a full reset, the bytes for the step, a
+request for the cursor position and a request for the primary device attributes. The answer is then
+compared with the cursor a canonical grid of the same size holds after the same bytes. The steps
+involve cursor addressing, delayed wrap at the last column, scroll regions and left and right
+margins, tabs, backspace at the edges, wide characters, combining marks, emoji sequences,
+ambiguous-width characters, the alternate screen and the control characters that move the cursor.
+Each answer is read until the reply to the primary device attributes (that is always the last
+reply), so a terminal that ignores the position report is recorded as silent and not taken for one
+that answers wrongly. A read is bounded to ten seconds and 64 KiB. If the reply to the primary
+device attributes does not arrive, the run stops at that step and says so in the record, because an
+answer still on its way would be taken for the next step's.
 
-Each run writes a record to `fixtures/terminal/physical/<terminal>-<version>.json`: the launcher's
-own reading of the application (its bundle, its version, its profile settings and the environment
-its window started programs with), the terminal's answers to the version query and the device
-attributes, and for every step the bytes, the terminal's position, the grid's and whether they
-agree. A test holds each record to the corpus and to the grid as it is now, so a change to either
-has to arrive with a new record.
+Each run writes a record to `fixtures/terminal/physical/<terminal>-<version>.json`. It holds the
+launcher's own reading of the application (its bundle, its version, its profile settings and the
+environment its window started programs with), the terminal's answers to the version query and the
+device attributes, and for every step the bytes, the terminal's position, the grid's and whether
+they agree. A record names programs and application bundles and holds no home directory, user name
+or session identifier: the programs the window descends from appear by name alone, a home directory
+is written as `~`, and the session variable is recorded as set or unset. A test holds each record to
+the corpus and to the grid as it is now, so a change to either has to arrive with a new record.
 
 Two terminals were measured on macOS 26.6 (`arm64`), each in a window it opened for a script the
 test made, with no Apple Event sent:
@@ -1311,82 +1326,84 @@ test made, with no Apple Event sent:
 | Terminal.app | 2.15 (470.2) | 80 by 24 | 136 | 116 | 20 | 0 |
 | iTerm2 | 3.7.1 | 179 by 37 | 136 | 123 | 13 | 0 |
 
-The table lists every step on which either terminal differs. A cell gives the grid's position, then
-the terminal's in bold, as row and column; `agrees` means the two match. A difference is a finding,
-not a fault in either side. The grid changes only where it left its own edge, as in the two steps
-described below the table.
+Every step where either terminal differs is in the table. Each cell shows where the grid put the
+cursor, and, in bold, where the terminal did, as row and column; `agrees` means the two match. In
+the bytes, `a×columns` is the letter `a` written once for each column of the window, and `<columns>`
+and `<rows>` are the window's size. A difference is a finding, not a fault in either side. The grid
+changes only where it left its own edge, as in the two steps described below the table.
 
 | Step | Bytes after a reset | Terminal.app 2.15, 80 by 24 | iTerm2 3.7.1, 179 by 37 |
 | --- | --- | --- | --- |
 | `addressing.save-and-restore-csi` | `\e[5;6H\e[s\e[1;1H\e[u` | 5;6 / **1;1** | agrees |
-| `autowrap.pending-then-left` | `a×80\e[D` | 1;79 / **1;80** | 1;178 / **1;179** |
-| `autowrap.pending-survives-erase-line` | `a×80\e[Kb` | 2;2 / **1;80** | agrees |
-| `autowrap.pending-survives-save-and-restore` | `a×80\e7\e[H\e8x` | 2;2 / **1;80** | 2;2 / **1;179** |
-| `autowrap.last-row-scrolls` | `\e[24;1Ha×81` | 24;2 / **24;80** | agrees |
-| `autowrap.insert-mode-at-the-edge` | `\e[4h\e[1;80Hxy` | 2;2 / **1;80** | agrees |
+| `autowrap.pending-then-left` | `a×columns\e[D` | 1;79 / **1;80** | 1;178 / **1;179** |
+| `autowrap.pending-survives-erase-line` | `a×columns\e[Kb` | 2;2 / **1;80** | agrees |
+| `autowrap.pending-survives-save-and-restore` | `a×columns\e7\e[H\e8x` | 2;2 / **1;80** | 2;2 / **1;179** |
+| `autowrap.last-row-scrolls` | `\e[<rows>;1Ha×(columns+1)` | 24;2 / **24;80** | agrees |
+| `autowrap.insert-mode-at-the-edge` | `\e[4h\e[1;<columns>Hxy` | 2;2 / **1;80** | agrees |
 | `margins.reverse-index-at-the-top-of-the-screen` | `\e[5;10r\e[1;3H\eM` | 1;3 / **24;3** | agrees |
 | `margins.down-stops-at-the-bottom-margin` | `\e[5;10r\e[6;3H\e[99B` | 10;3 / **24;3** | agrees |
 | `margins.up-stops-at-the-top-margin` | `\e[5;10r\e[8;3H\e[99A` | 5;3 / **1;3** | agrees |
 | `margins.left-and-right-margins-wrap` | `\e[?69h\e[5;20s\e[1;5H01234567890123456789x` | 2;10 / **1;26** | agrees |
 | `margins.left-and-right-margins-clamp` | `\e[?69h\e[5;20s\e[1;7H\e[99C` | 1;20 / **1;80** | agrees |
 | `margins.return-goes-to-the-left-margin` | `\e[?69h\e[5;20s\e[1;9H\r` | 1;5 / **1;1** | agrees |
-| `wide.wide-character-one-cell-from-the-edge` | `a×79\u3042` | agrees | 1;179 / **2;3** |
-| `combining.at-the-start-of-a-line` | `\u0301` | agrees | 1;1 / **1;2** |
-| `combining.devanagari-conjunct` | `\u0915\u094D\u0937\u093F` | 1;3 / **1;4** | 1;3 / **1;4** |
-| `combining.zero-width-space` | `a\u200Bb` | 1;3 / **1;4** | 1;3 / **1;4** |
-| `combining.zero-width-joiner-between-latin` | `a\u200Db` | 1;3 / **1;4** | agrees |
-| `combining.soft-hyphen` | `a\u00ADb` | 1;3 / **1;4** | agrees |
-| `emoji.text-default-with-emoji-selector` | `\u2764\uFE0F` | agrees | 1;2 / **1;3** |
-| `emoji.keycap-sequence` | `1\uFE0F\u20E3` | 1;2 / **1;3** | agrees |
-| `emoji.regional-indicator-pair` | `\u1F1FA\u1F1F8` | agrees | 1;3 / **1;5** |
-| `emoji.two-flags-back-to-back` | `\u1F1FA\u1F1F8\u1F1EC\u1F1E7` | agrees | 1;5 / **1;9** |
-| `emoji.joined-family` | `\u1F468\u200D\u1F469\u200D\u1F467` | 1;7 / **1;9** | 1;7 / **1;3** |
-| `emoji.joined-family-then-ascii` | `\u1F468\u200D\u1F469\u200D\u1F467a` | 1;8 / **1;10** | 1;8 / **1;4** |
-| `emoji.emoji-one-cell-from-the-edge` | `a×79\u1F600` | agrees | 1;179 / **2;3** |
+| `wide.wide-character-one-cell-from-the-edge` | `a×(columns-1)\u{3042}` | agrees | 1;179 / **2;3** |
+| `combining.at-the-start-of-a-line` | `\u{0301}` | agrees | 1;1 / **1;2** |
+| `combining.devanagari-conjunct` | `\u{0915}\u{094D}\u{0937}\u{093F}` | 1;3 / **1;4** | 1;3 / **1;4** |
+| `combining.zero-width-space` | `a\u{200B}b` | 1;3 / **1;4** | 1;3 / **1;4** |
+| `combining.zero-width-joiner-between-latin` | `a\u{200D}b` | 1;3 / **1;4** | agrees |
+| `combining.soft-hyphen` | `a\u{00AD}b` | 1;3 / **1;4** | agrees |
+| `emoji.text-default-with-emoji-selector` | `\u{2764}\u{FE0F}` | agrees | 1;2 / **1;3** |
+| `emoji.keycap-sequence` | `1\u{FE0F}\u{20E3}` | 1;2 / **1;3** | agrees |
+| `emoji.regional-indicator-pair` | `\u{1F1FA}\u{1F1F8}` | agrees | 1;3 / **1;5** |
+| `emoji.two-flags-back-to-back` | `\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}` | agrees | 1;5 / **1;9** |
+| `emoji.joined-family` | `\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}` | 1;7 / **1;9** | 1;7 / **1;3** |
+| `emoji.joined-family-then-ascii` | `\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}a` | 1;8 / **1;10** | 1;8 / **1;4** |
+| `emoji.emoji-one-cell-from-the-edge` | `a×(columns-1)\u{1F600}` | agrees | 1;179 / **2;3** |
 | `alternate-screen.save-and-restore-by-mode` | `\e[5;6H\e[?1048h\e[1;1H\e[?1048l` | 5;6 / **1;1** | agrees |
 | `controls.line-feed-mode-adds-a-return` | `\e[20habc\n` | agrees | 2;1 / **2;4** |
 
-The cursor report is the only thing measured. It does not show whether a wrap is pending at the
-cursor, what is on the screen, or how a region scrolled; a step that leaves the cursor in the same
-place can still leave a different screen. Two steps that ask whether a pending wrap
-survives an operation (`autowrap.pending-survives-erase-line` and
-`autowrap.pending-survives-save-and-restore`) end with a character written afterwards, so the cursor
-shows where that character went.
+Only the cursor report was measured. It does not show whether a wrap is pending at the cursor, what
+is on the screen, or how a region scrolled, and a step that leaves the cursor in the same place can
+still leave a different screen. Two steps that ask whether a pending wrap survives an operation
+(`autowrap.pending-survives-erase-line` and `autowrap.pending-survives-save-and-restore`) end with a
+character written afterwards, so the cursor shows where that character went.
 
-What the records show:
+On two steps the grid followed both terminals. An absolute column past the right edge in `CSI H`,
+`CSI f` or `CSI G` left the grid's cursor one column beyond the last, where both terminals stop on
+the last column. A wide character that ends exactly at the last column was reported one column short
+of the last, where both answer the last. In both of these cases the grid was changed to match the
+terminals: it now holds the cursor on the last column in the first case and reports the last column
+in the second. The records above were measured with both changes (`addressing.clamps-to-the-corner`
+and `wide.wide-character-two-cells-from-the-edge` agree in both). The second change corrects the
+report and not the library's own column, so a line feed or a backspace sent straight after such a
+character still acts from the character's first cell, and no step measures that. A wide character
+that starts on the last column is a separate case, described below, and stays as it was.
 
-- **Both terminals answer alike and the grid differs.** A cursor-left after a full row moves the
-  grid's cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A
-  zero-width space and a Devanagari conjunct take a cell more in both than the grid's width model
-  gives them. In these the two terminals agree with each other and the grid is the one apart; which
-  of them is right is a question for the profile, not something the records decide.
-- **The grid followed both terminals on two steps.** An absolute column past the right edge (in
-  `CSI H`, `CSI f`, `CSI G` or ``CSI ` ``) left the grid's cursor one column beyond the last, where
-  both terminals stop on the last column, and a wide character that ends exactly at the last column
-  left it one column short of the last, where both answer the last. The grid now holds the cursor on
-  the last column in both, and the records above were measured with that change
-  (`addressing.clamps-to-the-corner` and `wide.wide-character-two-cells-from-the-edge` agree in
-  both). A wide character that starts on the last column is the separate case below, and stays
-  as it was.
-- **Terminal.app alone differs on** the save and restore forms `CSI s`, `CSI u` and mode 1048, on
-  left and right margins (mode 69), on cursor movement inside a scroll region, on reverse index at
-  the top of the screen when a region is set, on a wrap on the last row and in insert mode, on
-  erase in line while a wrap is pending (it clears the pending wrap, so the next character lands on
-  the last column and the grid's goes to the next row), on the zero-width joiner, the soft hyphen
-  and the keycap sequence.
-- **iTerm2 alone differs on** a wide character or an emoji one column from the edge, which it wraps
-  as xterm does where the grid and Terminal.app leave it on the last column; on a combining mark at
-  the start of a line, which it gives a cell of its own; on the emoji presentation selector, which
-  makes U+2764 two cells; on regional-indicator pairs and flags, which it draws four cells wide
-  where the grid and Terminal.app draw two; on a joined family, which it draws as one cluster of
-  two cells where the grid gives six and Terminal.app eight; and on line-feed mode, which it does
-  not apply.
+On other steps both terminals answer alike and the grid differs. A cursor-left after a full row
+moves the grid's cursor and neither terminal's, and neither restores a pending wrap with `ESC 8`. A
+zero-width space and a Devanagari conjunct take a cell more in both than the grid's width model
+gives them. Here the two terminals agree with each other and the grid is the one apart. Which of
+them is right is a question for the profile, and the records do not decide it.
+
+Terminal.app alone differs on the save and restore forms `CSI s`, `CSI u` and mode 1048, on left and
+right margins (mode 69), on cursor movement inside a scroll region, on reverse index at the top of
+the screen when a region is set, on a wrap on the last row and in insert mode, on the zero-width
+joiner, the soft hyphen and the keycap sequence, and on erase in line while a wrap is pending. There
+it clears the pending wrap, so the next character lands on the last column and the grid's goes to
+the next row.
+
+iTerm2 alone differs on a wide character or an emoji one column from the edge, which it wraps as
+xterm does where the grid and Terminal.app leave it on the last column. At the start of a line it
+gives a combining mark a cell of its own. It also differs on the emoji presentation selector, which
+makes U+2764 two cells. It draws regional-indicator pairs and flags four cells wide where the grid
+and Terminal.app draw two. It draws a joined family as one cluster of two cells where the grid gives
+six and Terminal.app eight. And it does not apply line-feed mode.
 
 The remainder of the matrix in section 27 (Ghostty, WezTerm, VS Code's terminal, a VTE terminal and
-Windows Terminal) has not been measured here. `QUALIFIED_TERMINALS` stays a list of `TERM` names
-the client reports: a `TERM` names an entry, not a build or a configuration, and these records show
-that two builds that both report `xterm-256color` disagree with each other and with the grid on
-rules a direct attachment depends on.
+Windows Terminal) has not been measured here. `QUALIFIED_TERMINALS` stays a list of `TERM` names the
+client reports: a `TERM` names an entry, not a build or a configuration, and these records show that
+two builds that both report `xterm-256color` disagree with each other and with the grid on rules a
+direct attachment depends on.
 
 ## Fixtures
 
