@@ -35,6 +35,7 @@ import {
 } from './identifiers.mjs'
 
 const work = mkdtempSync(join(tmpdir(), 'kr-identifiers-'))
+let fixtures = 0
 let failures = 0
 let notRun = 0
 
@@ -121,11 +122,13 @@ for (const [what, text, expected] of [
   ['the identifier an earlier build declared is found', 'to.kala.companion', ['to.kala.companion']],
   ['a name that follows the identifier is not found', 'to.kala.reach.push', []],
   ['the application identifier itself is not found', 'to.kala.reach', []],
-  ['a name that only begins like the kept namespace is not found', 'to.kala.reach.companionship', []],
-  // Java reads `to.kala.reach.companion_preferences` as a name under `to.kala.reach`, so it is no
-  // name under the earlier namespace.
-  ['a name that continues with an underscore is not found', 'to.kala.reach.companion_preferences', []],
-  ['a name that continues with a dollar is not found', 'to.kala.reach.companion$Inner', []]
+  // Bytes do not say where a string ends, so a name that only begins like an earlier one is
+  // reported too, whatever follows it, and fails closed.
+  ['a name that continues with letters is found', 'to.kala.reach.companionship', ['to.kala.reach.companionship']],
+  ['a name that continues with an underscore is found', 'to.kala.reach.companion_preferences', ['to.kala.reach.companion_preferences']],
+  ['a name that continues with a digit is found', 'to.kala.companion2', ['to.kala.companion2']],
+  ['a name that continues with a dollar is found', 'to.kala.reach.companion$Inner', ['to.kala.reach.companion$Inner']],
+  ['a name is found even with a letter before it', 'xto.kala.companion', ['to.kala.companion']]
 ]) {
   held(what, JSON.stringify(expected), JSON.stringify(retiredTokens(text)))
 }
@@ -286,6 +289,17 @@ held(
   JSON.stringify([['meta-data', 'value', '{"id":"to.kala.reach.companion.old"}']]),
   JSON.stringify(attributesFromTree(QUOTED))
 )
+const RAW_INSIDE = `
+    E: manifest (line=2)
+      E: application (line=62)
+        E: meta-data (line=70)
+          A: http://schemas.android.com/apk/res/android:value(0x01010024)="before" (Raw: to.kala.reach.companion.old)" (Raw: "before" (Raw: to.kala.reach.companion.old)")\r
+`
+held(
+  'a value that holds the text the dump prints after it is read whole, in a dump with CRLF line ends',
+  JSON.stringify([['meta-data', 'value', 'before" (Raw: to.kala.reach.companion.old)']]),
+  JSON.stringify(attributesFromTree(RAW_INSIDE))
+)
 heldProblems(
   'a name of an earlier identifier inside such a value is found',
   problemsInManifest(
@@ -388,7 +402,7 @@ function packagedBundle(name, change = {}) {
 
 /** What a bundle must be told it is wrong about: every fragment, and nothing when none. */
 function expectBundle(what, change, fragments) {
-  const path = packagedBundle(what.replaceAll(/\W+/g, '-').slice(0, 40), change)
+  const path = packagedBundle(`${(fixtures += 1)}-${what.replaceAll(/\W+/g, '-').slice(0, 30)}`, change)
   let problems
   try {
     problems = problemsInPackage(path, WANT)
@@ -485,14 +499,29 @@ expectBundle(
   []
 )
 expectBundle(
-  'a name that only begins like the kept namespace is not a stale name as UTF-16 text',
+  'a name that only begins like the kept namespace is a stale name as UTF-16 text',
   { page: Buffer.from('to.kala.reach.companionship', 'utf16le') },
-  []
+  ['base/assets/index.js carries to.kala.reach.companionship (as UTF-16)']
 )
 expectBundle(
-  'a name that only begins like the kept namespace is not a stale name in a file',
+  'a name that only begins like the kept namespace is a stale name in a file',
   { page: 'to.kala.reach.companionship' },
-  []
+  ['base/assets/index.js carries to.kala.reach.companionship']
+)
+expectBundle(
+  'an earlier name run into the next string by a letter, as literals sit in a library, is found',
+  { library: 'KalaReach0.1.0to.kala.companionindex.html' },
+  ['base/lib/arm64-v8a/libapp.so carries to.kala.companionindex.html']
+)
+expectBundle(
+  'an earlier name followed by a protocol-buffer tag that is a letter is found',
+  { page: Buffer.concat([Buffer.from('to.kala.companion'), Buffer.from([0x32, 0x04])]) },
+  ['base/assets/index.js carries to.kala.companion2']
+)
+expectBundle(
+  'an earlier name run into a length byte that is a letter is found whole from its first character',
+  { page: Buffer.concat([Buffer.from([0x36]), Buffer.from('to.kala.reach.companion.push.Gone')]) },
+  ['base/assets/index.js carries to.kala.reach.companion.push.Gone']
 )
 
 // -- an iOS application bundle ---------------------------------------------------------------------
@@ -593,7 +622,10 @@ function bundle(name, change = {}) {
           'application-identifier': PRIVATE,
           'aps-environment': 'development',
           'com.apple.developer.associated-domains': option('domains', DOMAINS),
-          'keychain-access-groups': option('groups', [PRIVATE, SHARED])
+          'keychain-access-groups': option('groups', [PRIVATE, SHARED]),
+          ...(Object.hasOwn(change, 'team')
+            ? { 'com.apple.developer.team-identifier': change.team }
+            : {})
         },
         option('appTail', '')
       )
@@ -631,7 +663,7 @@ function expectApp(what, change, fragments) {
   }
   let problems
   try {
-    problems = problemsInBundle(bundle(what.replaceAll(/\W+/g, '-').slice(0, 40), change), WANT)
+    problems = problemsInBundle(bundle(`${(fixtures += 1)}-${what.replaceAll(/\W+/g, '-').slice(0, 30)}`, change), WANT)
   } catch (failure) {
     problems = [`refused: ${failure.message}`]
   }
@@ -699,6 +731,12 @@ expectApp(
   { domains: ['webcredentials:reach.kala.to'] },
   ['associated domains: found ["webcredentials:reach.kala.to"]']
 )
+expectApp(
+  'a signed application whose team entitlement is another team is refused',
+  { team: 'AAAAAAAAAA' },
+  ["the application's com.apple.developer.team-identifier entitlement: found AAAAAAAAAA, expected L775WGST9V"]
+)
+expectApp('a signed application whose team entitlement is the one team is whole', { team: TEAM }, [])
 expectApp(
   'an application whose executable carries no entitlements is refused',
   { appExecutable: image(null) },
@@ -793,7 +831,12 @@ if (hasPlutil && hasCodesign) {
   // A signed build keeps its entitlements in the signature and has no copy in the executable. The
   // executable here is a system tool copied and signed ad hoc with entitlements of its own.
   const signed = join(work, 'signed-tool')
-  const archs = spawnSync('lipo', ['-archs', '/usr/bin/true'], { encoding: 'utf8' }).stdout.trim()
+  const listed = spawnSync('lipo', ['-archs', '/usr/bin/true'], { encoding: 'utf8' })
+  if (listed.status !== 0) {
+    failures += 1
+    console.error(`FAIL  the fixture executable's architectures could not be listed: ${listed.stderr}`)
+  }
+  const archs = (listed.stdout ?? '').trim()
   const thin =
     archs.includes(' ')
       ? spawnSync('lipo', ['/usr/bin/true', '-thin', archs.split(' ').at(-1), '-output', signed], {
