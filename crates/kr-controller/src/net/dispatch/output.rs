@@ -55,10 +55,10 @@ pub struct RemoteOutput {
     sink: Box<dyn FrameSink>,
     /// The authority this connection writes under, read inside the turn.
     ///
-    /// The latch above is what a *device* revocation sets. An authority revision the daemon
-    /// advances for another reason withdraws the registration without touching this connection, so
-    /// the registration itself is read here as well: either way, no frame begins on a connection
-    /// whose authority has gone.
+    /// The latch above is set by whatever removes the registration, in the same critical section,
+    /// so a frame that begins after a withdrawal finds it. The authority is read here as well, for
+    /// the grant's own expiry and for a registration this connection never held: either way, no
+    /// frame begins on a connection whose authority has gone.
     pub(super) authority: Arc<Authorisation>,
 }
 
@@ -381,9 +381,9 @@ impl RemoteOutput {
     ///   in the same poll as each attempt to hand bytes over, so no byte goes under authority that
     ///   went while the frame waited. An abandoned frame leaves the stream in pieces, which is
     ///   exactly right for a connection being fenced: the connection is closed with it.
-    /// * The registration cannot be read from a poll, so it is read here, by every request, and by
-    ///   the watch below. A revocation that withdraws one closes the connection itself, which is
-    ///   what stops a frame that is already waiting.
+    /// * The registration cannot be read from a poll, so what removes it sets the latch the poll
+    ///   reads, and the watch below reads it as well. A revocation that withdraws one closes the
+    ///   connection itself, which is what stops a frame that is already waiting.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
         self.write(frame, &[], None).await == Written::Sent
     }
