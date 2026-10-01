@@ -1969,22 +1969,19 @@ async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks
     };
     let admission =
         |carried| super::voice_actions::VoiceAdmission::new(Arc::clone(&controller), carried);
-    let not_this = || ControllerError::InvalidArgument("not the refusal".to_owned());
 
-    // A fence owed after the admission: nothing is written, and the fence is what the caller
-    // is told.
+    // A fence owed after the admission: nothing is written, and the refusal the seam answers with
+    // is the fence's own, under its own code.
     let fenced = admission(live_admission(&controller, connection_id));
     controller.hold_fence(true);
     let refused = authority
         .issue(&plan, &fenced)
         .expect_err("the fence stops the write");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
-    let told = fenced.refused_or(not_this());
     assert!(
-        matches!(told, ControllerError::PermissionDenied { .. }),
-        "{told:?}"
+        refused.to_string().contains("could not be raised"),
+        "{refused}"
     );
-    assert!(told.to_string().contains("could not be raised"), "{told}");
     assert!(
         held(plan.recipient_device_id).is_empty(),
         "no voice grant was written"
@@ -2003,10 +2000,9 @@ async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks
     // grant stays as it was.
     controller.hold_fence(true);
     let withdrawing = admission(live_admission(&controller, connection_id));
-    authority
+    let told = authority
         .revoke(written.grant_id, 5, &withdrawing)
         .expect_err("the fence stops the withdrawal");
-    let told = withdrawing.refused_or(not_this());
     assert!(told.to_string().contains("could not be raised"), "{told}");
     assert!(
         held(plan.recipient_device_id)
@@ -2022,16 +2018,12 @@ async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks
     controller.deregister(connection_id);
     let deregistered = admission(carried);
     let other = voice_plan(&controller);
-    authority
+    let told = authority
         .issue(&other, &deregistered)
         .expect_err("a withdrawn registration stops the write");
-    let told = deregistered.refused_or(not_this());
-    assert!(
-        matches!(told, ControllerError::PermissionDenied { .. }),
-        "{told:?}"
-    );
+    assert_eq!(told.code(), ErrorCode::PermissionDenied, "{told}");
     assert_eq!(
-        told.to_string(),
+        told.to_protocol_error().message,
         crate::authority::AdmissionLapse::Deregistered.to_string()
     );
     assert!(
@@ -2188,7 +2180,7 @@ struct AskedUnderTheStoreLock {
 }
 
 impl kr_voice::Admission for AskedUnderTheStoreLock {
-    fn still_admitted(&self) -> bool {
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
         let other = rusqlite::Connection::open(&self.database).expect("opens the store's database");
         other
             .busy_timeout(Duration::ZERO)
@@ -2260,15 +2252,10 @@ async fn the_voice_grant_seam_asks_its_admission_while_the_store_holds_its_write
     controller.hold_fence(true);
     let fenced = probe(live_admission(&controller, connection_id));
     let other = voice_plan(&controller);
-    authority
+    let told = authority
         .issue(&other, &fenced)
         .expect_err("the fence stops the write");
     assert_eq!(asked(&fenced), vec![true]);
-    let told = fenced
-        .admission
-        .refused_or(ControllerError::InvalidArgument(
-            "not the refusal".to_owned(),
-        ));
     assert!(told.to_string().contains("could not be raised"), "{told}");
     assert!(
         controller

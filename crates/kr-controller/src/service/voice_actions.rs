@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
@@ -243,8 +243,7 @@ impl Controller {
                     wall_clock_ms(),
                     &admission,
                 )
-                .await
-                .map_err(|error| admission.refused_or(error));
+                .await;
         }
         // What this host already holds about this action, if anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict, and one whose
@@ -275,8 +274,7 @@ impl Controller {
                 wall_clock_ms(),
                 &admission,
             )
-            .await
-            .map_err(|error| admission.refused_or(error));
+            .await;
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.
         self.settle_claim(&hold, &outcome)?;
@@ -445,15 +443,11 @@ impl Controller {
 /// would let a change that waited write while a fence is owed, or after the authority it was
 /// admitted under was replaced.
 ///
-/// The coordinator's seam answers only yes or no, so the refusal the check gave is kept here. That
-/// refusal is what the caller is told, the same one the project service and the workflow journal
-/// give, rather than the coordinator's own words for a window that ran out.
+/// The refusal the check gave is what the seam answers with, so it is what the coordinator and the
+/// store carry back to the caller, the same one the project service and the workflow journal give.
 pub(super) struct VoiceAdmission {
     controller: Arc<Controller>,
     carried: crate::authority::AdmittedMutation,
-    /// The first refusal the check gave. The coordinator and the store stop at the first answer
-    /// that is no, so this is what stopped the change.
-    refusal: std::sync::Mutex<Option<ControllerError>>,
 }
 
 impl VoiceAdmission {
@@ -464,23 +458,12 @@ impl VoiceAdmission {
         Self {
             controller,
             carried,
-            refusal: std::sync::Mutex::new(None),
         }
     }
 
     /// Asks the check, and answers with its own refusal.
     fn check(&self) -> Result<()> {
         self.controller.check_registration(&self.carried)
-    }
-
-    /// What a voice change that failed reaches its caller as: the refusal this admission gave,
-    /// when it gave one, and otherwise the error the change failed with.
-    pub(super) fn refused_or(&self, error: ControllerError) -> ControllerError {
-        self.refusal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .unwrap_or(error)
     }
 }
 
@@ -494,19 +477,7 @@ impl std::fmt::Debug for VoiceAdmission {
 }
 
 impl kr_voice::Admission for VoiceAdmission {
-    fn still_admitted(&self) -> bool {
-        match self.check() {
-            Ok(()) => true,
-            Err(refusal) => {
-                let mut kept = self
-                    .refusal
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if kept.is_none() {
-                    *kept = Some(refusal);
-                }
-                false
-            }
-        }
+    fn still_admitted(&self) -> std::result::Result<(), ProtocolError> {
+        self.check().map_err(|refusal| refusal.to_protocol_error())
     }
 }

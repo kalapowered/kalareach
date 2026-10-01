@@ -907,19 +907,15 @@ impl Coordinator {
         })
     }
 
-    /// Refuses a change whose admitted lifetime ran out before it reached its write.
+    /// Refuses a change whose admission no longer stands before it reaches its write, with the
+    /// refusal the host gave.
     ///
     /// Section 9 gives every mutation a deadline the host accepted it under, and an effect that
-    /// happens after it is an effect nobody is holding a window for any more. The reading is this
-    /// host's own clock at the moment of the check.
+    /// happens after it is an effect nobody is holding a window for any more. What stops one is
+    /// the host's to say: a fence it owes, a registration it has replaced or a deadline that has
+    /// passed on its own clock, each under its own code and in its own words.
     fn still_admitted(admission: &dyn Admission) -> Result<()> {
-        if !admission.still_admitted() {
-            return Err(VoiceError::Host(kr_protocol::error::ProtocolError::new(
-                kr_protocol::error::ErrorCode::PermissionDenied,
-                "the deadline this action was admitted under passed before it could run".to_owned(),
-            )));
-        }
-        Ok(())
+        admission.still_admitted().map_err(VoiceError::Host)
     }
 
     /// Closes the replayed calls this host deferred, now that nothing may be about to bind them.
