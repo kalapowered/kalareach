@@ -113,4 +113,60 @@ struct ProbeReport {
         facts.keys.sorted().map { "\($0)=\(facts[$0] ?? "")" }.joined(separator: "\n")
     }
 }
+
+/// What a keychain answer means for a count and a sweep.
+///
+/// An empty group and a group that could not be read both find nothing, and only the first is a
+/// clean baseline: a refusal counted as zero would let a sweep that deleted nothing say it left
+/// nothing. So only an answer that found items, or said there are none, is a count.
+enum KeychainAnswer {
+    /// A count, or why there is none.
+    enum Count: Equatable {
+        case found(Int)
+        case failed(OSStatus)
+    }
+
+    static func counted(status: OSStatus, found: Int) -> Count {
+        switch status {
+        case errSecSuccess: return .found(found)
+        case errSecItemNotFound: return .found(0)
+        default: return .failed(status)
+        }
+    }
+
+    /// Whether a delete left nothing of what it was asked to remove.
+    static func deleteLeftNothing(status: OSStatus) -> Bool {
+        status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    /// The two groups a check looks at, or nil when either is not named: a count of one group says
+    /// nothing about the other.
+    static func groupsToCount(shared: String?, private own: String?) -> [String]? {
+        guard let shared, let own else { return nil }
+        return [shared, own]
+    }
+}
+
+/// Sorts the notifications an application was delivered by the send a check is reading.
+///
+/// A notification from an earlier send can arrive late and carry valid fields of its own, so one
+/// counts only when it carries the nonce this send was made with.
+enum DeliveredMarks {
+    static func sort(
+        _ userInfos: [[AnyHashable: Any]],
+        nonce: String?
+    ) -> (matching: [[AnyHashable: Any]], otherMarked: Int) {
+        var matching: [[AnyHashable: Any]] = []
+        var other = 0
+        for info in userInfos {
+            guard let marked = info["kr_probe_nonce"] as? String else { continue }
+            if let nonce, marked == nonce {
+                matching.append(info)
+            } else {
+                other += 1
+            }
+        }
+        return (matching, other)
+    }
+}
 #endif
