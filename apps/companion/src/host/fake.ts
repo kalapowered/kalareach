@@ -2678,7 +2678,7 @@ const SETTINGS_PANES: readonly SettingsPane[] = [
 /** The identity this host reports for the application asking. */
 function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
   return {
-    application_id: 'to.kala.companion',
+    application_id: 'to.kala.reach',
     application_version: '0.1.0',
     executable: stable
       ? '/Applications/KalaReach.app/Contents/MacOS/kalareach-companion'

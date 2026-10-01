@@ -108,7 +108,7 @@ class KalaReachMessagingService : FirebaseMessagingService() {
 
     companion object {
         /** Where the token is kept for the application to read. */
-        const val TOKEN_STORE = "to.kala.reach.companion.push"
+        const val TOKEN_STORE = "to.kala.reach.push"
         const val TOKEN_KEY = "registration_token"
         const val TOKEN_AT_KEY = "registration_token_at_ms"
 
@@ -118,7 +118,7 @@ class KalaReachMessagingService : FirebaseMessagingService() {
         /** Set by the gateway when answering needs the host. */
         const val NEEDS_HOST_KEY = "needs_host"
 
-        private const val CHANNEL = "to.kala.reach.companion.attention"
+        private const val CHANNEL = "to.kala.reach.attention"
         private const val CHANNEL_LABEL = "KalaReach"
     }
 }

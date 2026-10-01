@@ -567,8 +567,8 @@ mod tests {
 
     #[test]
     fn the_report_always_says_what_it_did_not_establish() {
-        let identity = read("to.kala.companion", "0.1.0", None);
-        assert_eq!(identity.application_id, "to.kala.companion");
+        let identity = read("to.kala.reach", "0.1.0", None);
+        assert_eq!(identity.application_id, "to.kala.reach");
         assert!(identity.unverified.contains("cannot tell you a permission"));
         assert!(
             identity.unverified.contains("perform the operation"),
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn the_helper_is_the_host_this_application_is_in_contact_with() {
         let identity = read(
-            "to.kala.companion",
+            "to.kala.reach",
             "0.1.0",
             Some(("build-7".to_owned(), "env-1".to_owned())),
         );

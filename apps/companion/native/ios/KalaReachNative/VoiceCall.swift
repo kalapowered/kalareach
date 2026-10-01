@@ -116,7 +116,7 @@ public final class VoiceCall: NSObject {
         // Off until the control turns it on. The offer describes a track, and a described track
         // carries nothing until the control lets it.
         microphone.isEnabled = false
-        queue = DispatchQueue(label: "to.kala.reach.companion.voice-call")
+        queue = DispatchQueue(label: "to.kala.reach.voice-call")
         self.observer = observer
         super.init()
         // Before the control exists: building it sets every switch off, and a call that does not

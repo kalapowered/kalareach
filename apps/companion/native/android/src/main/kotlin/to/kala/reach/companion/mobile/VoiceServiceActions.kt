@@ -11,16 +11,16 @@ package to.kala.reach.companion.mobile
  */
 object VoiceServiceActions {
     /** Enter the foreground for a call the host permitted. */
-    const val START = "to.kala.reach.companion.voice.START"
+    const val START = "to.kala.reach.voice.START"
 
     /** End the call. Reachable from the notification while the screen is locked. */
-    const val STOP = "to.kala.reach.companion.voice.STOP"
+    const val STOP = "to.kala.reach.voice.STOP"
 
     /** Mute or unmute the person's own microphone, from the notification. */
-    const val TOGGLE_MUTE = "to.kala.reach.companion.voice.TOGGLE_MUTE"
+    const val TOGGLE_MUTE = "to.kala.reach.voice.TOGGLE_MUTE"
 
     /** Show on the notification what the microphone is doing now. */
-    const val CAPTURE = "to.kala.reach.companion.voice.CAPTURE"
+    const val CAPTURE = "to.kala.reach.voice.CAPTURE"
 
     /** What the service does. */
     enum class Act {
