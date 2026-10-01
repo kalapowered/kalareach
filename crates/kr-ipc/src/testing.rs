@@ -6,11 +6,23 @@
 //! process umask instead of owner-only, and a path long enough that `bind` fails for a reason that
 //! has nothing to do with the test.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use kr_protocol::ids::EnvironmentId;
 
 use crate::paths::{EnvironmentPaths, HostPaths};
+
+/// A loopback address that nothing answers at, whatever else is running beside a test.
+///
+/// A test that needs a connection refused cannot take the port it frees: another test in the same
+/// binary, or another program, can be given that port before the test connects to it, and then
+/// something answers. This address is not one a program is handed. The ports a program is given
+/// when it asks for any free port begin far above port 1 unless the machine is set up to hand
+/// out port 1, so nothing listens here unless a program was put here on purpose, and a connection
+/// is refused. A machine where that does not hold fails `nothing_answers_at_the_unanswered_address`
+/// in this crate, which names the address.
+pub const UNANSWERED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
 
 /// A host tree that removes itself when it is dropped.
 #[derive(Debug)]
@@ -258,6 +270,38 @@ pub fn place_and_start_once(
             Err(error) => panic!(
                 "the first start of the program placed at {} could not be waited for: {error}",
                 destination.display()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    use super::UNANSWERED;
+
+    /// How long the connection is given to end: a watchdog, never a claim. A closed port refuses
+    /// at once on Linux and macOS, and on Windows after the system's own retries, about two
+    /// seconds.
+    const WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// The address the tests name as unanswered refuses a connection. A machine that answers there
+    /// fails this test, which names the address. A test that relies on the address can then fail
+    /// with a less clear message, or pass for the wrong reason.
+    #[test]
+    fn nothing_answers_at_the_unanswered_address() {
+        match TcpStream::connect_timeout(&UNANSWERED, WATCHDOG) {
+            Ok(_) => panic!(
+                "something answers at {UNANSWERED}, so a test that connects there to be refused \
+                 proves nothing on this machine"
+            ),
+            Err(refused) => assert_eq!(
+                refused.kind(),
+                ErrorKind::ConnectionRefused,
+                "the connection to {UNANSWERED} was not refused: {refused:?}"
             ),
         }
     }

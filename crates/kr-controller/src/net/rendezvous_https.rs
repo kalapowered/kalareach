@@ -434,6 +434,7 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::{SinkExt, StreamExt};
+    use kr_ipc::testing::UNANSWERED;
     use kr_protocol::ids::AttemptId;
     use kr_protocol::invitation::RendezvousMessage;
     use kr_protocol::rendezvous::{
@@ -736,12 +737,9 @@ mod tests {
     /// pairing step calls on its blocking thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_service_nobody_answers_for_is_unavailable() {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .await
-            .expect("a loopback port");
-        let port = listener.local_addr().expect("an address").port();
-        drop(listener);
-        let origin = RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin");
+        // An address nothing answers at: a port this test freed could be handed to another test
+        // before the connection is made, and that test's server would answer.
+        let origin = RendezvousOrigin::new(format!("https://{UNANSWERED}")).expect("an origin");
         let rendezvous = HttpsRendezvous::new(None).expect("a client");
         let released = tokio::task::spawn_blocking(move || {
             rendezvous.release_locator(

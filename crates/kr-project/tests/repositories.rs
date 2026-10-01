@@ -1788,10 +1788,9 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
     // What the profile still guarantees is that no credential of the user's is used: the helper
     // list is empty and no prompt can be answered.
     let fixture = Fixture::with_brokers(support::broker_without_a_credential_helper());
-    // A port nothing is listening on, so the attempt ends at once and nothing leaves this machine.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-    let port = closed.local_addr().expect("its address").port();
-    drop(closed);
+    // An address nothing answers at, so the attempt ends at once and nothing leaves this machine.
+    // A port this test freed could be handed to another test before Git connects to it.
+    let unanswered = kr_ipc::testing::UNANSWERED;
     let refusal = fixture
         .service()
         .project_clone(
@@ -1807,7 +1806,7 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
                     remote: RemoteSpecification {
                         remote_name: "origin".to_owned(),
                         transport: RemoteTransport::Https,
-                        url: format!("https://127.0.0.1:{port}/repository.git"),
+                        url: format!("https://{unanswered}/repository.git"),
                         provider: String::new(),
                         credential_broker: "os-secret-store".to_owned(),
                     },
@@ -1815,7 +1814,7 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
             },
             Some(&action("project.clone", 41)),
         )
-        .expect_err("nothing is listening at that port, so the attempt fails");
+        .expect_err("nothing answers at that address, so the attempt fails");
     assert_eq!(
         refusal.code(),
         ErrorCode::UpstreamUnavailable,
