@@ -500,10 +500,7 @@ impl NetworkHost {
         let mut admitted = controller.admitted_table();
         admitted.insert(
             session.connection_id,
-            AdmittedConnection {
-                actor_id: record.principal(),
-                admitted_revision,
-            },
+            AdmittedConnection::new(record.principal(), admitted_revision),
         );
         drop(admitted);
         drop(registry);
@@ -3690,10 +3687,7 @@ pub(crate) mod tests {
         for connection_id in [lost, kept] {
             controller.admitted_table().insert(
                 connection_id,
-                crate::service::AdmittedConnection {
-                    actor_id: principal(),
-                    admitted_revision: revision,
-                },
+                crate::service::AdmittedConnection::new(principal(), revision),
             );
         }
         // A worker whose control path acknowledged that revision, so a lease to it renews.
