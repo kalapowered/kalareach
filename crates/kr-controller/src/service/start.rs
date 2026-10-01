@@ -421,6 +421,10 @@ impl Controller {
             after_the_claim: ReadPause::default(),
             #[cfg(feature = "testing")]
             after_the_retained_lookup: ReadPause::default(),
+            #[cfg(feature = "testing")]
+            local_pace: std::sync::Mutex::new(super::local::LocalPace::default()),
+            #[cfg(feature = "testing")]
+            local_writes_blocked: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_the_record: ReadPause::default(),
             #[cfg(test)]
