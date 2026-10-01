@@ -40,14 +40,14 @@ use kr_protocol::ids::{
     SessionId,
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs, Uuid};
-use kr_protocol::session::{ClosureRecord, DisplayNumber, SessionState};
+use kr_protocol::session::{ClosureRecord, DisplayNumber, SessionCreateParams, SessionState};
 use kr_protocol::worker::ReservationId;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -582,23 +582,31 @@ impl Registry {
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
+                self.migrate_6_to_7()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
+                self.migrate_6_to_7()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
+                self.migrate_6_to_7()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
                 self.migrate_5_to_6()?;
+                self.migrate_6_to_7()?;
             }
-            Some(5) => self.migrate_5_to_6()?,
+            Some(5) => {
+                self.migrate_5_to_6()?;
+                self.migrate_6_to_7()?;
+            }
+            Some(6) => self.migrate_6_to_7()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -765,6 +773,96 @@ impl Registry {
         statements.push_str("UPDATE schema_version SET version = 6; COMMIT;");
         self.connection
             .execute_batch(&statements)
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 6 to 7: a reservation's recorded create request no longer holds the environment its
+    /// creator sent.
+    ///
+    /// An earlier build wrote the whole request, the creator's environment variables included,
+    /// into each reservation, and a reservation outlives its session. Every recorded request comes
+    /// forward with its variables emptied: the rest of it is what the session was asked to be, and
+    /// is read as before. A request in the shape a build before the launch profile recorded is
+    /// rewritten in this build's shape, and a record that is neither shape cannot be shown to hold
+    /// no variables and becomes none.
+    ///
+    /// The old bytes outlive an update of the row, in free pages and in the write-ahead log, so the
+    /// rewrite is followed by `VACUUM`, which builds the file again from the rows it holds, and by
+    /// a truncating checkpoint, which empties the log. Only then does the version move, so a run
+    /// that stops part way is made again from the start; the step is idempotent. A `VACUUM` that
+    /// cannot finish stops the daemon's start with the cause and what to do about it: keeping the
+    /// variables on disk is the worse outcome.
+    ///
+    /// The file is shared with the grant and device stores, which open after this registry and
+    /// are rewritten by `VACUUM` with it; no table in it relies on an implicit row number, which
+    /// `VACUUM` may change.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_6_to_7(&self) -> Result<()> {
+        self.migrate_6_to_7_compacting(|connection| connection.execute_batch("VACUUM"))
+    }
+
+    /// The step of [`Self::migrate_6_to_7`], with the compaction it runs after the rewrite given.
+    fn migrate_6_to_7_compacting(
+        &self,
+        compact: impl FnOnce(&Connection) -> rusqlite::Result<()>,
+    ) -> Result<()> {
+        // The identifiers alone are read up front: a record holds the creator's whole environment,
+        // and a registry that has recorded many creates should not hold them all in memory at once.
+        let recorded: Vec<Vec<u8>> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT reservation_id FROM reservations WHERE create_intent IS NOT NULL")
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map([], |row| row.get(0))
+                .map_err(ControllerError::registry)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(ControllerError::registry)?
+        };
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(ControllerError::registry)?;
+        for reservation_id in recorded {
+            let intent: Vec<u8> = transaction
+                .query_row(
+                    "SELECT create_intent FROM reservations WHERE reservation_id = ?1",
+                    params![reservation_id],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            let emptied = match without_environment(&intent) {
+                Emptied::Unchanged => continue,
+                Emptied::Rewritten(bytes) => Some(bytes),
+                Emptied::Unreadable => None,
+            };
+            transaction
+                .execute(
+                    "UPDATE reservations SET create_intent = ?2 WHERE reservation_id = ?1",
+                    params![reservation_id, emptied],
+                )
+                .map_err(ControllerError::registry)?;
+        }
+        transaction.commit().map_err(ControllerError::registry)?;
+        compact(&self.connection).map_err(not_compacted)?;
+        let blocked: i64 = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(not_compacted)?;
+        if blocked != 0 {
+            return Err(ControllerError::RegistryUnavailable {
+                detail: "this registry's recorded create requests were rewritten without the \
+                         environment their creators sent, but its write-ahead log still holds the \
+                         old copies: it could not be taken in while another connection uses the \
+                         registry. Stop whatever else has it open, then start the daemon again"
+                    .to_owned(),
+            });
+        }
+        self.connection
+            .execute("UPDATE schema_version SET version = 7", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -2229,6 +2327,94 @@ fn state_from(text: &str) -> Result<SessionState> {
         .ok_or_else(|| ControllerError::registry("a stored session state is not known"))
 }
 
+/// What a recorded create request comes to once the creator's environment is taken out of it.
+enum Emptied {
+    /// It held none, in this build's shape.
+    Unchanged,
+    /// The request as this build records one, with no environment.
+    Rewritten(Vec<u8>),
+    /// It is in no shape this build reads, so nothing says it holds no environment.
+    Unreadable,
+}
+
+/// A create request as a build before the launch profile recorded it, which is read once, by the
+/// migration that empties its environment, and never again.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierCreate {
+    environment_id: EnvironmentId,
+    presentation: kr_protocol::session::Presentation,
+    shell: kr_protocol::scalars::Nullable<String>,
+    shell_mode: kr_protocol::session::ShellMode,
+    cwd: kr_protocol::scalars::Nullable<String>,
+    dimensions: kr_protocol::scalars::Nullable<kr_protocol::session::Dimensions>,
+    worker_profile: WorkerProfile,
+    environment_snapshot: Vec<kr_protocol::session::EnvironmentVariable>,
+    palette: kr_protocol::scalars::Nullable<kr_protocol::session::PaletteRequest>,
+}
+
+impl From<EarlierCreate> for SessionCreateParams {
+    /// Gives the launch profile and the terminal selection the defaults that session was created
+    /// with.
+    fn from(earlier: EarlierCreate) -> Self {
+        Self {
+            environment_id: earlier.environment_id,
+            presentation: earlier.presentation,
+            shell: earlier.shell,
+            shell_mode: earlier.shell_mode,
+            cwd: earlier.cwd,
+            dimensions: earlier.dimensions,
+            worker_profile: earlier.worker_profile,
+            environment_snapshot: earlier.environment_snapshot,
+            palette: earlier.palette,
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+}
+
+/// Takes the creator's environment out of a recorded create request.
+fn without_environment(intent: &[u8]) -> Emptied {
+    let limits = kr_cbor::Limits::DEFAULT;
+    let (mut create, current) =
+        match kr_cbor::from_canonical_slice::<SessionCreateParams>(intent, &limits) {
+            Ok(create) => (create, true),
+            Err(_) => match kr_cbor::from_canonical_slice::<EarlierCreate>(intent, &limits) {
+                Ok(earlier) => (earlier.into(), false),
+                Err(_) => return Emptied::Unreadable,
+            },
+        };
+    if current && create.environment_snapshot.is_empty() {
+        return Emptied::Unchanged;
+    }
+    create.environment_snapshot.clear();
+    kr_cbor::to_canonical_vec(&create).map_or(Emptied::Unreadable, Emptied::Rewritten)
+}
+
+/// The error a compaction that did not finish ends the start with: what happened and what to do.
+fn not_compacted(error: rusqlite::Error) -> ControllerError {
+    let cause = match &error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DiskFull =>
+        {
+            "there is no room for it. Free space in the directory that holds the registry and in \
+             the directory SQLite keeps temporary files in (on Unix, the first of SQLITE_TMPDIR, \
+             TMPDIR, /var/tmp, /usr/tmp, /tmp and the working directory that it can write to; on \
+             Windows, the directory that TMP, TEMP or USERPROFILE names, otherwise the Windows \
+             directory), each up to the size of the registry file"
+                .to_owned()
+        }
+        other => format!("SQLite said: {other}"),
+    };
+    ControllerError::RegistryUnavailable {
+        detail: format!(
+            "this registry's recorded create requests were rewritten without the environment \
+             their creators sent, but the registry could not be compacted to remove the old \
+             copies: {cause}. Then start the daemon again"
+        ),
+    }
+}
+
 fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
     <[u8; 16]>::try_from(bytes)
         .map(Uuid::from_bytes)
@@ -2597,6 +2783,317 @@ mod tests {
         assert_eq!(launcher(&registry, 3), finer(1003));
         assert_eq!(worker(&registry, 1), finer(1001));
         assert_eq!(stated(&registry, 3), "windows_process_start_seconds");
+    }
+
+    /// A create request as this build records one, naming `value` in the creator's environment.
+    fn create_naming(value: &str) -> SessionCreateParams {
+        SessionCreateParams {
+            environment_id: environment(),
+            presentation: kr_protocol::session::Presentation::Terminal,
+            shell: kr_protocol::scalars::Nullable::some("zsh".to_owned()),
+            shell_mode: kr_protocol::session::ShellMode::Managed,
+            cwd: kr_protocol::scalars::Nullable::some("/work".to_owned()),
+            dimensions: kr_protocol::scalars::Nullable::null(),
+            worker_profile: WorkerProfile::DesktopBound,
+            environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
+                name: "SECRET_NAME".to_owned(),
+                value: value.to_owned(),
+            }],
+            palette: kr_protocol::scalars::Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// The same request in the shape a build before the launch profile recorded.
+    fn earlier_create_naming(value: &str) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Earlier {
+            environment_id: EnvironmentId,
+            presentation: kr_protocol::session::Presentation,
+            shell: kr_protocol::scalars::Nullable<String>,
+            shell_mode: kr_protocol::session::ShellMode,
+            cwd: kr_protocol::scalars::Nullable<String>,
+            dimensions: kr_protocol::scalars::Nullable<kr_protocol::session::Dimensions>,
+            worker_profile: WorkerProfile,
+            environment_snapshot: Vec<kr_protocol::session::EnvironmentVariable>,
+            palette: kr_protocol::scalars::Nullable<kr_protocol::session::PaletteRequest>,
+        }
+        let current = create_naming(value);
+        kr_cbor::to_canonical_vec(&Earlier {
+            environment_id: current.environment_id,
+            presentation: current.presentation,
+            shell: current.shell,
+            shell_mode: current.shell_mode,
+            cwd: current.cwd,
+            dimensions: current.dimensions,
+            worker_profile: current.worker_profile,
+            environment_snapshot: current.environment_snapshot,
+            palette: current.palette,
+        })
+        .expect("encodes")
+    }
+
+    /// Writes a registry as the build before this one left it, schema version 6, with a
+    /// reservation recording each of `intents` (none for a reservation an older schema made
+    /// without one), each moved through two phases so that the row is written more than once.
+    fn registry_at_version_6(path: &std::path::Path, intents: &[Option<Vec<u8>>]) {
+        let mut registry = opened(path, kernel);
+        for intent in intents {
+            let admission = registry
+                .reserve(
+                    &ActorId::new("local:501").expect("an actor"),
+                    kr_ipc::new_uuid(),
+                    Digest256::from_bytes([3; 32]),
+                    intent.as_deref().unwrap_or_default(),
+                    TimestampMs::new(100),
+                )
+                .expect("reserves");
+            let id = admission.reservation.reservation_id;
+            registry.set_phase(id, LaunchPhase::Spawned).expect("moves");
+            registry.set_phase(id, LaunchPhase::Failed).expect("moves");
+            if intent.is_none() {
+                registry
+                    .connection
+                    .execute(
+                        "UPDATE reservations SET create_intent = NULL WHERE reservation_id = ?1",
+                        params![id.get().as_bytes().as_slice()],
+                    )
+                    .expect("clears it");
+            }
+        }
+        registry
+            .connection
+            .execute("UPDATE schema_version SET version = 6", [])
+            .expect("labels it as the build before did");
+    }
+
+    /// Everything in the registry's file and the files beside it, as bytes.
+    fn bytes_of(path: &std::path::Path) -> Vec<u8> {
+        let mut all = std::fs::read(path).expect("the registry's file is read");
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            match std::fs::read(std::path::PathBuf::from(name)) {
+                Ok(bytes) => all.extend(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("the registry's {suffix} file could not be read: {error}"),
+            }
+        }
+        all
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    fn recorded_intents(registry: &Registry) -> Vec<Option<Vec<u8>>> {
+        let mut statement = registry
+            .connection
+            .prepare("SELECT create_intent FROM reservations ORDER BY display_number")
+            .expect("prepares");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("reads")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collects")
+    }
+
+    fn version(registry: &Registry) -> i64 {
+        registry
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version")
+    }
+
+    /// A registry the build before this one wrote opens at the current version with every recorded
+    /// request emptied of the creator's environment and still a create request, and none of the
+    /// old bytes are in the file, its write-ahead log or its shared-memory file.
+    #[test]
+    fn a_version_6_registry_comes_forward_without_the_environments_it_recorded() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let none_in_it = {
+            let mut create = create_naming("unused");
+            create.environment_snapshot.clear();
+            kr_cbor::to_canonical_vec(&create).expect("encodes")
+        };
+        registry_at_version_6(
+            &path,
+            &[
+                Some(kr_cbor::to_canonical_vec(&create_naming("first-secret")).expect("encodes")),
+                Some(earlier_create_naming("second-secret")),
+                Some(b"third-secret is in no shape".to_vec()),
+                Some(none_in_it.clone()),
+                None,
+            ],
+        );
+        let before = bytes_of(&path);
+        for secret in ["first-secret", "second-secret", "third-secret"] {
+            assert!(contains(&before, secret), "{secret} starts in the file");
+        }
+
+        let registry = opened(&path, kernel);
+        assert_eq!(version(&registry), SCHEMA_VERSION);
+        let intents = recorded_intents(&registry);
+        let emptied = |bytes: &Option<Vec<u8>>| {
+            kr_cbor::from_canonical_slice::<SessionCreateParams>(
+                bytes.as_deref().expect("a record"),
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("still reads as a create request")
+        };
+        for index in [0, 1] {
+            let create = emptied(&intents[index]);
+            assert!(create.environment_snapshot.is_empty());
+            assert_eq!(create.worker_profile, WorkerProfile::DesktopBound);
+            assert_eq!(
+                create.cwd,
+                kr_protocol::scalars::Nullable::some("/work".to_owned())
+            );
+        }
+        assert_eq!(
+            intents[2], None,
+            "a record in no shape cannot be shown to hold nothing, so it is none"
+        );
+        assert_eq!(
+            intents[3].as_deref(),
+            Some(none_in_it.as_slice()),
+            "one that held no variables is as it was"
+        );
+        assert_eq!(intents[4], None, "and none stays none");
+        // While the registry is open, with its log in use: the file has been rebuilt and the log
+        // emptied, so the old copies are in neither. Closing the last connection would checkpoint
+        // and remove the log, and say nothing about a daemon that keeps the registry open.
+        let open = bytes_of(&path);
+        for secret in [
+            "first-secret",
+            "second-secret",
+            "third-secret",
+            "SECRET_NAME",
+        ] {
+            assert!(
+                !contains(&open, secret),
+                "{secret} is in the file or the log of a registry that is open"
+            );
+        }
+        // And the log was truncated rather than only checkpointed: after a truncating checkpoint it
+        // holds the one write that moved the version, where a checkpoint that keeps the log's
+        // frames leaves a frame for each page the compaction wrote.
+        let log_length = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::fs::metadata(std::path::PathBuf::from(name)).map_or(0, |about| about.len())
+        };
+        assert!(
+            log_length("-wal") < log_length(""),
+            "the log of a registry that is open is shorter than its file"
+        );
+        drop(registry);
+
+        let after = bytes_of(&path);
+        for secret in [
+            "first-secret",
+            "second-secret",
+            "third-secret",
+            "SECRET_NAME",
+        ] {
+            assert!(
+                !contains(&after, secret),
+                "{secret} is still in the registry's file, its log or its shared memory"
+            );
+        }
+
+        // Opened again, nothing moves: the step is idempotent.
+        let again = opened(&path, kernel);
+        assert_eq!(version(&again), SCHEMA_VERSION);
+        assert_eq!(recorded_intents(&again), intents);
+    }
+
+    /// A compaction that fails stops the open with what happened and what to do, leaves the
+    /// version where it was and the requests already emptied, and the next open finishes the step.
+    #[test]
+    fn a_compaction_that_fails_stops_the_open_and_the_next_open_finishes_it() {
+        for (failure, wanted) in [
+            (
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                "Free space in the directory that holds the registry",
+            ),
+            (
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                "SQLite said",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("registry.sqlite3");
+            registry_at_version_6(
+                &path,
+                &[Some(
+                    kr_cbor::to_canonical_vec(&create_naming("kept-secret")).expect("encodes"),
+                )],
+            );
+            let stopped = Registry {
+                connection: Connection::open(&path).expect("opens"),
+                environment_id: environment(),
+                current_process: kernel,
+            };
+            let error = stopped
+                .migrate_6_to_7_compacting(|_| Err(rusqlite::Error::SqliteFailure(failure, None)))
+                .expect_err("a compaction that fails stops the open");
+            let said = error.to_string();
+            assert!(said.contains(wanted), "{said}");
+            assert!(
+                said.contains("start the daemon again"),
+                "the error names what to do: {said}"
+            );
+            assert_eq!(version(&stopped), 6, "the version stays where it was");
+            assert!(
+                matches!(&recorded_intents(&stopped)[0], Some(bytes)
+                    if kr_cbor::from_canonical_slice::<SessionCreateParams>(
+                        bytes, &kr_cbor::Limits::DEFAULT
+                    ).is_ok_and(|create| create.environment_snapshot.is_empty())),
+                "the requests were emptied before the compaction was tried"
+            );
+            drop(stopped);
+
+            let finished = opened(&path, kernel);
+            assert_eq!(version(&finished), SCHEMA_VERSION);
+            drop(finished);
+            assert!(!contains(&bytes_of(&path), "kept-secret"));
+        }
+    }
+
+    /// A write-ahead log that cannot be emptied, because another connection is reading from it,
+    /// stops the open too: the old copies would still be in it.
+    #[test]
+    fn a_log_that_cannot_be_emptied_stops_the_open() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        registry_at_version_6(
+            &path,
+            &[Some(
+                kr_cbor::to_canonical_vec(&create_naming("logged-secret")).expect("encodes"),
+            )],
+        );
+        // Another connection reading from the log as it stands keeps the rewrite's frames in it.
+        let reader = Connection::open(&path).expect("opens");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM reservations;")
+            .expect("starts reading");
+        let stopped = Registry {
+            connection: Connection::open(&path).expect("opens"),
+            environment_id: environment(),
+            current_process: kernel,
+        };
+        let error = stopped
+            .migrate_6_to_7_compacting(|_| Ok(()))
+            .expect_err("a log that cannot be emptied stops the open");
+        let said = error.to_string();
+        assert!(said.contains("write-ahead log"), "{said}");
+        assert!(said.contains("start the daemon again"), "{said}");
+        assert_eq!(version(&stopped), 6);
     }
 
     /// A kernel that will not describe any process.

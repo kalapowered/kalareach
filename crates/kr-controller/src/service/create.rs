@@ -6,7 +6,7 @@ use std::sync::Arc;
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
-use kr_protocol::ids::{ActorId, EnvironmentId, SessionId};
+use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{EnvironmentVariable, SessionCreateParams, SessionCreateResult};
 use kr_protocol::worker::{ReservationId, WorkerReady};
@@ -619,66 +619,14 @@ pub(super) fn qualified_package(root: Option<&Path>, requested: Option<&str>) ->
 
 /// Reads the create request a reservation recorded.
 ///
-/// A reservation outlives the request that made it: its row is written before the worker starts
-/// and is still there while the session is live, so a daemon that was replaced part-way through an
-/// upgrade reads rows an earlier build wrote. A row recorded before this build's launch profile and
-/// terminal selection existed is read through [`RecordedCreate`] and given the defaults those two
-/// fields have, which is exactly what that session was created with.
-///
-/// Remove `RecordedCreate` and this fallback once no reservation recorded before the launch
-/// profile existed can still be in a registry. A reservation row outlives the session it made, so
-/// that is a migration or a retention boundary rather than a restart: the condition is met when
-/// the registry has been rewritten forward, or when retention has removed every row written before
-/// the field existed.
+/// What a reservation records is what the session was asked to be, without the environment its
+/// creator sent: that is held in memory for the launch and written nowhere, so the list of
+/// variables in a recorded request is always empty and says nothing about the creator.
 ///
 /// # Errors
 ///
-/// Returns the decoding failure when the record is neither shape.
+/// Returns the decoding failure when the record is not a create request.
 pub(super) fn recorded_create(recorded: &[u8]) -> std::result::Result<SessionCreateParams, String> {
-    match kr_cbor::from_canonical_slice::<SessionCreateParams>(recorded, &kr_cbor::Limits::DEFAULT)
-    {
-        Ok(create) => Ok(create),
-        Err(error) => match kr_cbor::from_canonical_slice::<RecordedCreate>(
-            recorded,
-            &kr_cbor::Limits::DEFAULT,
-        ) {
-            Ok(legacy) => Ok(legacy.into()),
-            // The row is neither shape, so it is reported as the record this build cannot read
-            // rather than as a legacy row.
-            Err(_) => Err(error.to_string()),
-        },
-    }
-}
-
-/// A create request as a build before the launch profile recorded it.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct RecordedCreate {
-    pub(super) environment_id: EnvironmentId,
-    pub(super) presentation: kr_protocol::session::Presentation,
-    pub(super) shell: Nullable<String>,
-    pub(super) shell_mode: kr_protocol::session::ShellMode,
-    pub(super) cwd: Nullable<String>,
-    pub(super) dimensions: Nullable<kr_protocol::session::Dimensions>,
-    pub(super) worker_profile: WorkerProfile,
-    pub(super) environment_snapshot: Vec<kr_protocol::session::EnvironmentVariable>,
-    pub(super) palette: Nullable<kr_protocol::session::PaletteRequest>,
-}
-
-impl From<RecordedCreate> for SessionCreateParams {
-    fn from(recorded: RecordedCreate) -> Self {
-        Self {
-            environment_id: recorded.environment_id,
-            presentation: recorded.presentation,
-            shell: recorded.shell,
-            shell_mode: recorded.shell_mode,
-            cwd: recorded.cwd,
-            dimensions: recorded.dimensions,
-            worker_profile: recorded.worker_profile,
-            environment_snapshot: recorded.environment_snapshot,
-            palette: recorded.palette,
-            launch_profile: kr_protocol::session::LaunchProfile::default(),
-            terminal: Nullable::null(),
-        }
-    }
+    kr_cbor::from_canonical_slice::<SessionCreateParams>(recorded, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| error.to_string())
 }
