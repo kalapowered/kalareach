@@ -18,7 +18,8 @@ final class PreviewDecisionTests: XCTestCase {
     private func previewText(
         expiresAtMilliseconds: UInt64? = nil,
         recipientKeyID: Data? = nil,
-        nonceLength: Int = previewNonceLength
+        nonceLength: Int = previewNonceLength,
+        routing overrides: [String: Any] = [:]
     ) -> String {
         let envelope: [String: Any] = [
             "nonce": base64URL(Data(repeating: 0x01, count: nonceLength)),
@@ -31,7 +32,7 @@ final class PreviewDecisionTests: XCTestCase {
                 "payload_type": "notification_preview",
                 "size_bucket_bytes": "1024",
                 "thread_id": NSNull(),
-            ] as [String: Any],
+            ].merging(overrides) { _, replacement in replacement },
         ]
         let data = try! JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
         return String(decoding: data, as: UTF8.self)
@@ -160,6 +161,34 @@ final class PreviewDecisionTests: XCTestCase {
             let decision = decider(keys: ProvidingKeys())
                 .decide(userInfo: ["preview": text], nowMilliseconds: now)
             XCTAssertEqual(decision, .generic(.malformedPreview), "preview text \(text)")
+        }
+    }
+
+    func testACounterThatIsNotADecimalStringIsNeverInterpreted() {
+        // The gateway sends every counter as a decimal string, so anything else under these two
+        // fields is not what it sent: a number, a boolean, a sign, a fraction or a padded string.
+        let notDecimalStrings: [Any] = [1_763_000_060_000, true, -1, "-1", "+5", "1.5", " 5", "5 ", "", "0x10"]
+        for field in ["expires_at_ms", "size_bucket_bytes"] {
+            for value in notDecimalStrings {
+                let text = previewText(routing: [field: value])
+                XCTAssertThrowsError(
+                    try PreviewEnvelope.parse(userInfo: ["preview": text]),
+                    "\(field) as \(value)"
+                ) { error in
+                    XCTAssertEqual(error as? PreviewParseFailure, .malformed(field), "\(field) as \(value)")
+                }
+            }
+        }
+    }
+
+    func testAPreviewThatIsNotAnObjectNamesItselfAsTheMalformedField() {
+        for sent in [Any]() + ["not json", "[]", "7", 7, NSNull()] as [Any] {
+            XCTAssertThrowsError(try PreviewEnvelope.parse(userInfo: ["preview": sent]), "\(sent)") { error in
+                XCTAssertEqual(error as? PreviewParseFailure, .malformed("preview"), "\(sent)")
+            }
+        }
+        XCTAssertThrowsError(try PreviewEnvelope.parse(userInfo: [:])) { error in
+            XCTAssertEqual(error as? PreviewParseFailure, .absent)
         }
     }
 

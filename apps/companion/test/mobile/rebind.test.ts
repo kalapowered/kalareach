@@ -62,16 +62,67 @@ describe('reading where each detached draft now stands (KR-ACC-012)', () => {
     const { port, controls } = host
     const before = await conversationOf(host, SESSION_MAIN)
     controls.records.moveBinding(SESSION_MAIN)
+    const after = await conversationOf(host, SESSION_MAIN)
+    expect(after.binding).not.toBe(before.binding)
     const [seen] = await observeTargets(port, [
       detached('d-1', SESSION_MAIN, before.instance, before.binding)
     ])
-    expect(seen?.target?.agentBindingRevision).not.toBe(before.binding)
+    expect(seen?.target).toEqual({
+      sessionId: SESSION_MAIN,
+      applicationInstanceId: after.instance,
+      agentBindingRevision: after.binding
+    })
   })
 
   it('reports a session the host does not know as gone, and only that', async () => {
     const { port } = fakeHost()
     const [seen] = await observeTargets(port, [detached('d-1', GONE, 'app-1', '4')])
     expect(seen).toMatchObject({ draftId: 'd-1', target: null })
+  })
+
+  it('reports a session the host holds only as closed as gone, though its worker is not there to ask', async () => {
+    const { port } = fakeHost()
+    // What a controller answers for a closed session: its record, with the state closed. Its
+    // worker has stopped, so the read of the agents is refused as for a session that never was.
+    const closed: HostPort = {
+      ...port,
+      sessionRead: async (params) => {
+        const read = await port.sessionRead(params)
+        return { ...read, session: { ...read.session, state: 'closed' } }
+      },
+      sessionAgents: () =>
+        Promise.reject({ code: 'UNKNOWN_SESSION', message: 'No worker holds that session.', user_action: 'none' })
+    }
+    const [seen] = await observeTargets(closed, [detached('d-1', SESSION_MAIN, 'app-1', '4')])
+    expect(seen).toMatchObject({ draftId: 'd-1', target: null })
+  })
+
+  it('says nothing about a draft when the agents of its session cannot be read, or their binding', async () => {
+    const { port } = fakeHost()
+    const refused = { code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' }
+    const noAgents: HostPort = { ...port, sessionAgents: () => Promise.reject(refused) }
+    const noBinding: HostPort = { ...port, agentCapabilities: () => Promise.reject(refused) }
+    const draft = detached('d-1', SESSION_MAIN, 'app-1', '4')
+    expect(await observeTargets(noAgents, [draft])).toEqual([])
+    expect(await observeTargets(noBinding, [draft])).toEqual([])
+  })
+
+  it('asks the host once about a session however many drafts wait on it', async () => {
+    const { port } = fakeHost()
+    const reads: string[] = []
+    const counting: HostPort = {
+      ...port,
+      sessionRead: (params) => {
+        reads.push((params as { session_id?: string }).session_id ?? '')
+        return port.sessionRead(params)
+      }
+    }
+    const seen = await observeTargets(counting, [
+      detached('d-1', SESSION_MAIN, null, null),
+      detached('d-2', SESSION_MAIN, null, null)
+    ])
+    expect(reads).toEqual([SESSION_MAIN])
+    expect(seen.map((each) => each.draftId)).toEqual(['d-1', 'd-2'])
   })
 
   it('says nothing about a draft whose read failed for any other reason, so it stays detached', async () => {
