@@ -2,10 +2,10 @@
   "probe": "kr-term-probe/1",
   "launcher": {
     "ancestors": [
-      "/bin/bash",
+      "bash",
       "-zsh",
       "login",
-      "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+      "Terminal"
     ],
     "application": "Terminal",
     "build": "470.2",

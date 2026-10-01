@@ -2,10 +2,10 @@
   "probe": "kr-term-probe/1",
   "launcher": {
     "ancestors": [
-      "/bin/bash",
+      "bash",
       "-zsh",
-      "/usr/bin/login",
-      "~/Library/Application Support/iTerm2/iTermServer-3.6.11"
+      "login",
+      "iTermServer-3.6.11"
     ],
     "application": "iTerm2",
     "build": "3.7.1",
