@@ -1841,7 +1841,9 @@ fn limits_of(
 /// installation stays. What needs no index is decided first, so a package left out by the owner or
 /// by the list loses its registration whatever state the index is in; what does need it, the
 /// revocation and the signed builds, is read once, and where the index cannot be read nothing is
-/// known to stand, so the registration is not kept on its account.
+/// known to stand, so the registration is not kept on its account. The package is judged last: one
+/// that is not whole here is not read, and its registration is left as it is only while nothing
+/// above says it must go.
 fn wanted_bridge(
     catalogue: &Catalogue,
     environment_id: EnvironmentId,
@@ -1861,6 +1863,24 @@ fn wanted_bridge(
     {
         return Ok(WantedBridge::Nothing);
     }
+    // The current generation of the installation's origin: whether it revoked this release, and
+    // which version an executable is from the signed builds it names for this host's platform. With
+    // none, the recipe's version requirement refuses the recipe rather than guessing. It is read
+    // before the package is, so a package that is not whole here never decides what a revocation,
+    // or an index that cannot be read, has already decided.
+    let entry = match catalogue.release_entry(&installation) {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!(
+                "kr-controller: the index that says whether {plugin_id} is revoked could not be \
+                 read, so its native bridge is not kept: {error}"
+            );
+            return Ok(WantedBridge::Nothing);
+        }
+    };
+    if catalogue.standing(&installation, entry.as_ref()).is_some() {
+        return Ok(WantedBridge::Nothing);
+    }
     let store = catalogue.store_of(&installation);
     let package = match store.check_package(
         installation.package_digest,
@@ -1875,22 +1895,6 @@ fn wanted_bridge(
     let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
         return Ok(WantedBridge::Nothing);
     };
-    // The current generation of the installation's origin: whether it revoked this release, and
-    // which version an executable is from the signed builds it names for this host's platform. With
-    // none, the recipe's version requirement refuses the recipe rather than guessing.
-    let entry = match catalogue.release_entry(&installation) {
-        Ok(entry) => entry,
-        Err(error) => {
-            eprintln!(
-                "kr-controller: the index that says whether {plugin_id} is revoked could not be \
-                 read, so its native bridge is not kept: {error}"
-            );
-            return Ok(WantedBridge::Nothing);
-        }
-    };
-    if catalogue.standing(&installation, entry.as_ref()).is_some() {
-        return Ok(WantedBridge::Nothing);
-    }
     let host = kr_plugin_catalogue::this_host();
     let qualified = match (host.os, host.architecture, entry.as_ref()) {
         (Some(os), Some(architecture), Some(entry)) => entry
