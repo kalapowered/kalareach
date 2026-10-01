@@ -2637,6 +2637,33 @@ mod tests {
         assert_eq!(recorded_session(&environment).expect("gone"), None);
     }
 
+    /// Whether a child that says whether it has a console has said it yet, and what: the line the
+    /// child writes, which is not the line its test harness writes first. That one names the test,
+    /// `a_child_that_says_whether_it_has_a_console`, and ends in the dots a result follows.
+    fn console_said(written: &str) -> Option<bool> {
+        if written.contains("console true") {
+            Some(true)
+        } else if written.contains("console false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The control of the console test's wait: a log that holds only the harness's header for the
+    /// helper has not been answered, and the child's line, wherever the harness puts it, has.
+    #[test]
+    fn a_harness_header_naming_the_console_test_is_not_a_child_saying_it_has_one() {
+        let header = "\nrunning 1 test\ntest starter::tests::windows::a_child_that_says_whether_it_has_a_console ... ";
+        assert_eq!(console_said(header), None);
+        assert_eq!(console_said(&format!("{header}console true\n")), Some(true));
+        assert_eq!(
+            console_said(&format!("{header}console false\n")),
+            Some(false)
+        );
+        assert_eq!(console_said(""), None);
+    }
+
     #[cfg(windows)]
     mod windows {
         use std::io::{BufRead as _, Write as _};
@@ -3250,12 +3277,16 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(60);
             let said = loop {
                 let written = std::fs::read_to_string(&log).unwrap_or_default();
-                if written.contains("console ") || Instant::now() > deadline {
+                if super::console_said(&written).is_some() || Instant::now() > deadline {
                     break written;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             };
-            assert!(said.contains("console true"), "the child said: {said:?}");
+            assert_eq!(
+                super::console_said(&said),
+                Some(true),
+                "the child said: {said:?}"
+            );
         }
 
         /// The daemon log is taken only as a regular file whose list grants no account this host
