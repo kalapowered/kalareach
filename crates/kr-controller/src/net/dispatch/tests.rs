@@ -2100,3 +2100,107 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .is_none()
     );
 }
+
+/// KR-REQ-23.34: an `action.read` that names an action only is about the session the daemon
+/// recorded the action's route to, which is the subject the read is decided over and the authority
+/// its answer is written under. One that names a session is about that session, and one for an
+/// action this host holds no route for is about none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_34_an_action_read_by_identifier_is_about_the_session_its_route_names() {
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 65));
+    let read =
+        |action_id: ActionId, session_id: Option<SessionId>| kr_protocol::envelope::Request {
+            request_id: RequestId::new(5),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id,
+            })
+            .expect("encodes"),
+        };
+    let close = fake::close_request(world.environment_id, world.session_id);
+    assert_eq!(
+        connection.receipt_session(&read(close.action_id, None)),
+        None,
+        "an action this host holds no route for is about no session"
+    );
+    assert!(
+        connection
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    assert_eq!(
+        connection.receipt_session(&read(close.action_id, None)),
+        Some(world.session_id),
+        "the route names the session the action was performed on"
+    );
+    let other = SessionId::new(kr_ipc::new_uuid());
+    assert_eq!(
+        connection.receipt_session(&read(close.action_id, Some(other))),
+        Some(other),
+        "a read that names a session is about it"
+    );
+}
+
+/// KR-REQ-23.34: a device that may not read a session's receipts is refused its retry of an action
+/// other than a close, and nothing reaches the worker: only a close is made for a caller that may
+/// not read what it produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_caller_that_may_not_view()
+ {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 66, |grant| {
+            grant.actions = [ActionRight::AgentPrompt].into_iter().collect();
+        }),
+    );
+    let prompt = device_mutation(
+        &world,
+        &connection,
+        Method::AgentPromptSubmit,
+        52,
+        ParamsValue::empty(),
+    );
+    assert!(
+        connection
+            .claim_route(&prompt, Some(world.session_id))
+            .is_ok(),
+        "the route of the prompt is on record"
+    );
+    script.kept_without_a_result(
+        prompt.action_id,
+        Method::AgentPromptSubmit,
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "the agent said the prompt quoted /home/person/secret-notes",
+        ),
+    );
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt)))
+        .await
+        .expect("the retry is answered");
+    let error = error_of(answered.frame());
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{error}"
+    );
+    assert!(!error.message.contains("secret-notes"), "{error}");
+    assert_eq!(script.forwarded().len(), 0, "nothing reached the worker");
+    world.serving.abort();
+}
