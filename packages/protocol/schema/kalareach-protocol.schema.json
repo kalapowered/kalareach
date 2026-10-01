@@ -34901,7 +34901,7 @@
         },
         "privacy": {
           "$ref": "#/$defs/PrivacyLaunch",
-          "description": "The environment's privacy state when this worker was launched.\n\nThe worker applies it before it starts its shell. A session created while privacy mode is\non therefore retains nothing from its first byte, and does not wait for the daemon's next\nnotice to learn that it is private."
+          "description": "The environment's privacy state when this worker was launched.\n\nThe worker applies it before it starts its shell. A session created while privacy mode is\non therefore keeps none of its output in the history it retains, from its first byte, and\ndoes not wait for the daemon's next notice to learn that it is private."
         },
         "release": {
           "description": "The release string the session reports as its terminal program version.",

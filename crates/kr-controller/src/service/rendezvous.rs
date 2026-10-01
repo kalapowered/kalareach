@@ -301,8 +301,9 @@ impl Controller {
         // late as it can be before the specification is built. It is read on a thread that may
         // block: a change of privacy mode holds the state's write side while it waits for the
         // exchanges already admitted. A worker applies it before it starts its shell, and a change
-        // after this reaches it as the daemon's notice, which its session's obligation, recorded
-        // before this worker was launched, keeps the daemon repeating until it is answered.
+        // after this reaches it as the daemon's notice, which the session's obligation, recorded
+        // when the worker was asked for if privacy mode was on then and when it was turned on
+        // otherwise, keeps the daemon repeating until it is answered.
         let privacy = self.privacy.state();
         let launched_under = tokio::task::spawn_blocking(move || privacy.now())
             .await
