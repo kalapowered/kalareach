@@ -4446,10 +4446,19 @@ async fn an_admitted_package_carries_the_builds_named_for_this_hosts_platform() 
         .installation(environment(), &plugin())
         .expect("readable")
         .expect("installed");
+    let host = this_host();
+    let entry = catalogue
+        .release_entry(&installation)
+        .expect("readable")
+        .expect("the release's entry");
     assert_eq!(
-        catalogue
-            .builds(&installation, &this_host())
-            .expect("readable"),
+        entry
+            .builds_for(
+                host.os.expect("an os"),
+                host.architecture.expect("an architecture")
+            )
+            .cloned()
+            .collect::<Vec<_>>(),
         *builds
     );
 }
