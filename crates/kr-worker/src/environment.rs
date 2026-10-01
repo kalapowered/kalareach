@@ -7,9 +7,11 @@
 //! worker, so a caller cannot smuggle one in through its own environment.
 //!
 //! The terminal identity is `xterm-256color`, and the database that names it is the worker's own:
-//! [`materialise_terminfo`] writes the pinned entry into the worker's state directory and `build`
+//! `materialise_terminfo` writes the pinned entry into the worker's state directory and `build`
 //! points the session's terminfo library at it. A creator's own database directories are kept
-//! behind it and reported, so they still serve every other terminal name.
+//! behind it and reported, so they still serve every other terminal name. A Windows build has no
+//! `materialise_terminfo`, since a Windows host reads no terminfo database, and its sessions are
+//! given no private directory.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
