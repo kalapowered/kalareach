@@ -18,6 +18,10 @@
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
 	<string>0.1.0</string>
+	<key>FirebaseAppDelegateProxyEnabled</key>
+	<false/>
+	<key>FirebaseMessagingAutoInitEnabled</key>
+	<false/>
 	<key>KRPrivateKeychainGroup</key>
 	<string>$(AppIdentifierPrefix)to.kala.reach</string>
 	<key>KRSharedKeychainGroup</key>
