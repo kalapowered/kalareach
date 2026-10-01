@@ -781,6 +781,7 @@ pub fn catalogue_list_result(value: &CatalogueListResult) -> Document {
                 .map(catalogue_summary)
                 .collect::<Vec<_>>(),
         )
+        .with("enrolment_budgets", closed(&value.enrolment_budgets))
         .with("ok", true)
 }
 
