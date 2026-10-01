@@ -172,8 +172,8 @@ try {
   process.exit(1)
 }
 // The same packages are read for the application identifier: the package the manifest declares,
-// the names it derives from it and the names an earlier identifier left in the code. Both checks
-// run, so one failing does not hide the other.
+// every name it gives itself, and the names an earlier identifier left in the code, the assets and
+// the native libraries. Both checks run, so one failing does not hide the other.
 const hasClasses = verify(packages)
 const hasIdentifier = report(packages, problemsInPackage)
 process.exit(hasClasses && hasIdentifier ? 0 : 1)
