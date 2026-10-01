@@ -2121,7 +2121,8 @@ test.describe("the phone's tab bar", () => {
                   width: box.width,
                   height: box.height,
                   cut: label.scrollWidth - label.clientWidth,
-                  short: word.getBoundingClientRect().width - label.getBoundingClientRect().width
+                  short: word.getBoundingClientRect().width - label.getBoundingClientRect().width,
+                  wordLeft: word.getBoundingClientRect().left - box.left
                 }
               })
             }
@@ -2147,19 +2148,50 @@ test.describe("the phone's tab bar", () => {
             for (const key of ['left', 'top', 'width', 'height'] as const) {
               expect.soft(each[key], `${where}: tab ${at + 1}'s ${key}`).toBeCloseTo(resting.tabs[at]?.[key] ?? -1, 0)
             }
+            // Beside its glyph a word starts where it started, whichever tab is the current one.
+            if (resting.form !== null) {
+              expect
+                .soft(each.wordLeft, `${where}: tab ${at + 1}'s word starts in place`)
+                .toBeCloseTo(resting.tabs[at]?.wordLeft ?? -1, 0)
+            }
           }
         }
+        // While the bar decides its form every label is set in the weight of the current tab's.
+        const weights = await page.evaluate(() => {
+          const bar = document.querySelector('.m-tabbar') as HTMLElement
+          const current = bar.querySelector('.m-tab[aria-current="page"] .m-tab-label') as HTMLElement
+          const labels = Array.from(bar.querySelectorAll<HTMLElement>('.m-tab-label'))
+          const weight = getComputedStyle(current).fontWeight
+          bar.setAttribute('data-measuring', '')
+          const measured = labels.map((label) => getComputedStyle(label).fontWeight)
+          bar.removeAttribute('data-measuring')
+          return { weight, measured }
+        })
+        expect(weights.measured, 'every label is in the current tab\'s weight while the bar measures').toEqual(
+          weights.measured.map(() => weights.weight)
+        )
+        const list = page.locator('.m-main')
         for (const [index, name] of ['Attention', 'Sessions', 'Hosts', 'Account', 'Attention'].entries()) {
           const at = index % 4
           await tabs.nth(at).click()
           await expect(tabs.nth(at)).toHaveAttribute('aria-current', 'page')
           await settle()
           await holds(`on ${name} after the press`)
+          // A person at the end of a list stays there while the bar measures again.
+          const end = await list.evaluate((element) => {
+            element.scrollTop = element.scrollHeight
+            return element.scrollTop
+          })
+          if (seen.scale === '200%' && at === 0) expect.soft(end, 'the list has an end to scroll to').toBeGreaterThan(0)
           await page.setViewportSize({ width: seen.width + 1, height: seen.height })
           await settle()
           await page.setViewportSize({ width: seen.width, height: seen.height })
           await settle()
           await holds(`on ${name} after the screen changed width`)
+          // Within a pixel's rounding: what the bar's measuring did was to move it by the bar's height.
+          expect
+            .soft(Math.abs((await list.evaluate((element) => element.scrollTop)) - end), `${name}: the list stays at its end`)
+            .toBeLessThanOrEqual(1.5)
         }
         // The widest count a badge shows, 99+, stays clear of its own label.
         const badge = page.locator('.m-tab-badge')
