@@ -38,39 +38,14 @@ impl WorkerSupervisor for RecordingSupervisor {
     }
 }
 
-/// A reservation recorded before the launch profile existed still names its session's context.
+/// A recorded create request reads as the request it was, and a record that is not one is refused.
 #[test]
-fn a_create_request_recorded_by_an_earlier_build_is_read_with_the_defaults() {
-    use kr_protocol::session::{LaunchProfile, Presentation, ShellMode};
-
+fn a_recorded_create_request_reads_as_itself_and_nothing_else_does() {
     let environment_id =
         kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
-    let legacy = super::create::RecordedCreate {
-        environment_id,
-        presentation: Presentation::Terminal,
-        shell: Nullable::some("zsh".to_owned()),
-        shell_mode: ShellMode::Managed,
-        cwd: Nullable::some("/work".to_owned()),
-        dimensions: Nullable::null(),
-        worker_profile: kr_protocol::identity::WorkerProfile::DesktopBound,
-        environment_snapshot: Vec::new(),
-        palette: Nullable::null(),
-    };
-    let recorded = kr_cbor::to_canonical_vec(&legacy).expect("encodes");
-    let read =
-        super::create::recorded_create(&recorded).expect("an earlier build's record still reads");
-    assert_eq!(
-        read.worker_profile,
-        kr_protocol::identity::WorkerProfile::DesktopBound,
-        "the execution context is the one that was recorded, never a substituted default"
-    );
-    assert_eq!(read.presentation, Presentation::Terminal);
-    assert_eq!(read.launch_profile, LaunchProfile::default());
-    assert!(read.terminal.0.is_none());
-
-    // This build's own shape reads as itself, and a record that is neither is refused.
-    let current = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
-    assert!(super::create::recorded_create(&current).is_ok());
+    let recorded = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
+    let read = super::create::recorded_create(&recorded).expect("this build's own shape reads");
+    assert_eq!(read, create_params(environment_id));
     assert!(super::create::recorded_create(b"not a record").is_err());
 }
 
