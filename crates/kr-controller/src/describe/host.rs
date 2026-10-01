@@ -66,6 +66,11 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// How often the host's conditions are read, off the host's own thread.
 const CONDITIONS_EVERY: Duration = Duration::from_secs(10);
 
+/// How old a reading of the host's conditions may be before it says nothing: the policy admits no
+/// load on an older one, and a reader that stops answering leaves every signal unqualified rather
+/// than leaving the last answer in force.
+const CONDITIONS_MAX_AGE_MS: u64 = 60_000;
+
 /// What the daemon says to the host.
 #[derive(Debug)]
 enum Message {
@@ -127,6 +132,11 @@ pub struct Figures {
     pub sessions: usize,
     /// Whether a load is in the process.
     pub loading: bool,
+    /// Whether every publication is held under privacy mode's admission.
+    pub gated: bool,
+    /// The host's own clock as its last turn read it, in milliseconds: a turn that began after a
+    /// moment reads a time at or past it.
+    pub read_at_ms: u64,
 }
 
 /// What one session's description stands at.
@@ -199,6 +209,16 @@ struct Shared {
     /// How many purges were posted and not yet done.
     purges_owed: AtomicU64,
     running: AtomicBool,
+    /// The newest reading of the host's own conditions, and when it was taken.
+    reading: Mutex<Option<Taken>>,
+}
+
+/// One reading of the host's own conditions.
+#[derive(Clone, Copy, Debug)]
+struct Taken {
+    /// When it was taken, on the continuous clock.
+    at_ms: u64,
+    conditions: HostConditions,
 }
 
 impl DescribeHost {
@@ -253,14 +273,23 @@ impl DescribeHost {
             snapshot: RwLock::new(Snapshot::default()),
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            reading: Mutex::new(None),
         });
         // The conditions are read on a thread of their own: a platform reading can spawn a program,
         // and nothing here waits on one.
         if conditions.is_none() {
             let reader = Arc::clone(&shared);
+            let clock = clock.clone();
             std::thread::Builder::new()
                 .name("describe-conditions".to_owned())
-                .spawn(move || read_conditions_until_stopped(&reader))
+                .spawn(move || {
+                    read_conditions_until_stopped(
+                        &reader,
+                        &clock,
+                        &kr_describe::resource::platform::read_conditions,
+                        CONDITIONS_EVERY,
+                    );
+                })
                 .map_err(|error| {
                     ControllerError::registry(format!(
                         "the description host's reader of conditions could not start: {error}"
@@ -272,8 +301,11 @@ impl DescribeHost {
             std::thread::Builder::new()
                 .name("describe-host".to_owned())
                 .spawn(move || {
+                    // Cleared however the thread ends, a panic included: a host that is gone owes
+                    // privacy mode nothing, and says it is not running.
+                    let _exit = Exit(Arc::clone(&shared));
                     Thread {
-                        shared: Arc::clone(&shared),
+                        shared,
                         driver,
                         inbox,
                         privacy,
@@ -284,8 +316,6 @@ impl DescribeHost {
                         abandon,
                     }
                     .run();
-                    shared.running.store(false, Ordering::Release);
-                    shared.purges_owed.store(0, Ordering::Release);
                 })
                 .map_err(|error| {
                     ControllerError::registry(format!(
@@ -458,6 +488,16 @@ impl Drop for DescribeHost {
     }
 }
 
+/// What the host's thread leaves behind when it ends, by returning or by unwinding.
+struct Exit(Arc<Shared>);
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+        self.0.purges_owed.store(0, Ordering::Release);
+    }
+}
+
 /// Publishes a description under privacy mode's admission: the write runs while a publication
 /// produced under `generation` is admitted, and does not run at all when none is.
 struct Admission {
@@ -517,7 +557,7 @@ impl Thread {
     fn conditions(&self) -> HostConditions {
         match &self.conditions {
             Some(held) => *held.lock().unwrap_or_else(PoisonError::into_inner),
-            None => latest_conditions(&self.shared),
+            None => latest_conditions(&self.shared, self.clock.now().monotonic_ms()),
         }
     }
 
@@ -661,12 +701,7 @@ impl Thread {
         let mut sessions = BTreeMap::new();
         for session_id in service.live_session_ids() {
             let standing = service.standing(&session_id, now);
-            let freshness = match service.freshness(&session_id, now) {
-                Ok(Some(Freshness::Current)) => DescriptionFreshness::Current,
-                Ok(Some(Freshness::Delayed { .. })) => DescriptionFreshness::Delayed,
-                Ok(Some(Freshness::Stale { .. })) => DescriptionFreshness::Stale,
-                Ok(None) | Err(_) => DescriptionFreshness::None,
-            };
+            let freshness = freshness_of(service.freshness(&session_id, now));
             sessions.insert(
                 session_id,
                 SessionStanding {
@@ -688,6 +723,8 @@ impl Thread {
             restarts: service.inference_restarts(),
             sessions: service.live_sessions(),
             loading: service.is_loading(),
+            gated: service.publication_gated(),
+            read_at_ms: now.monotonic_ms(),
         };
         let snapshot = Snapshot {
             state: Some(state),
@@ -719,6 +756,11 @@ impl Thread {
 }
 
 /// Puts one session's facts into the service as the signals and events they are.
+///
+/// The record is the whole of what the worker holds, so each fact is applied as it stands, and a
+/// fact the worker no longer has is cleared here as well: a completion cleared when a command
+/// starts and a thread cleared when it ends are changes, and nothing of either is left behind to
+/// describe the session.
 fn capture(
     service: &mut DescriptionService,
     session_id: SessionId,
@@ -744,29 +786,29 @@ fn capture(
             now,
         );
     }
-    if let Some(application) = facts.application.0.clone() {
-        let _ = service.observe(
-            &session_id,
-            ContextSignal::ForegroundApplication(application),
-            now,
-        );
-    }
-    if let Some(thread) = facts.thread.0.clone() {
-        let _ = service.observe(&session_id, ContextSignal::SelectedThread(thread), now);
-    }
+    let _ = service.observe(
+        &session_id,
+        ContextSignal::ForegroundApplication(facts.application.0.clone()),
+        now,
+    );
+    let _ = service.observe(
+        &session_id,
+        ContextSignal::SelectedThread(facts.thread.0.clone()),
+        now,
+    );
     if let Some(intent) = facts.intent.0.clone() {
         let _ = service.observe(&session_id, ContextSignal::TaskIntent(intent), now);
     }
-    if let Some(completion) = facts.completion.0 {
-        let _ = service.observe(
-            &session_id,
-            ContextSignal::Completion(match completion {
-                DescriptionCompletion::Succeeded => kr_describe::context::Completion::Succeeded,
-                DescriptionCompletion::Failed => kr_describe::context::Completion::Failed,
-            }),
-            now,
-        );
-    }
+    // After the intent, which a new task clears the completion of: what the record says is the
+    // completion is what stands.
+    let _ = service.observe(
+        &session_id,
+        ContextSignal::Completion(facts.completion.0.map(|completion| match completion {
+            DescriptionCompletion::Succeeded => kr_describe::context::Completion::Succeeded,
+            DescriptionCompletion::Failed => kr_describe::context::Completion::Failed,
+        })),
+        now,
+    );
     // Oldest first, and only the ones not taken before.
     let taken = last_event.get(&session_id).copied();
     for event in facts.events.iter().rev() {
@@ -798,9 +840,21 @@ fn capture(
                     },
                     summary,
                 },
+                now,
             );
         }
         last_event.insert(session_id, cursor);
+    }
+}
+
+/// Maps how current a description is onto the protocol's word for it: none when there is no
+/// description to be current or the store could not say.
+fn freshness_of(freshness: kr_describe::Result<Option<Freshness>>) -> DescriptionFreshness {
+    match freshness {
+        Ok(Some(Freshness::Current)) => DescriptionFreshness::Current,
+        Ok(Some(Freshness::Delayed { .. })) => DescriptionFreshness::Delayed,
+        Ok(Some(Freshness::Stale { .. })) => DescriptionFreshness::Stale,
+        Ok(None) | Err(_) => DescriptionFreshness::None,
     }
 }
 
@@ -818,54 +872,55 @@ const fn pause_of(reason: PauseReason) -> DescriptionPause {
     }
 }
 
-/// The host's own conditions, read by [`read_conditions_until_stopped`] and held for the thread.
-static LATEST: Mutex<BTreeMap<usize, HostConditions>> = Mutex::new(BTreeMap::new());
-
-fn key_of(shared: &Arc<Shared>) -> usize {
-    Arc::as_ptr(shared) as usize
-}
-
-fn latest_conditions(shared: &Arc<Shared>) -> HostConditions {
-    LATEST
+/// The newest reading of the host's own conditions, when it is less than
+/// [`CONDITIONS_MAX_AGE_MS`] old at `now_ms`, and every signal unqualified when it is not or when
+/// none has been read: which the policy treats as a pause.
+fn latest_conditions(shared: &Shared, now_ms: u64) -> HostConditions {
+    let taken = *shared
+        .reading
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key_of(shared))
-        .copied()
-        .unwrap_or_else(|| {
-            // Nothing read yet: every signal is unqualified, which the policy treats as a pause.
-            let unread = Signal::Unqualified {
-                why: "the host's conditions have not been read yet",
-            };
-            HostConditions {
-                physical_memory_bytes: unread,
-                available_memory_bytes: unread,
-                power: Signal::Unqualified {
-                    why: "the host's conditions have not been read yet",
-                },
-                thermal: Signal::Unqualified {
-                    why: "the host's conditions have not been read yet",
-                },
-            }
-        })
+        .unwrap_or_else(PoisonError::into_inner);
+    match taken {
+        Some(taken) if now_ms.saturating_sub(taken.at_ms) < CONDITIONS_MAX_AGE_MS => {
+            taken.conditions
+        }
+        Some(_) => unqualified("the host's conditions were last read over a minute ago"),
+        None => unqualified("the host's conditions have not been read yet"),
+    }
 }
 
-fn read_conditions_until_stopped(shared: &Arc<Shared>) {
+fn unqualified(why: &'static str) -> HostConditions {
+    HostConditions {
+        physical_memory_bytes: Signal::Unqualified { why },
+        available_memory_bytes: Signal::Unqualified { why },
+        power: Signal::Unqualified { why },
+        thermal: Signal::Unqualified { why },
+    }
+}
+
+/// Reads the host's conditions with `read` every [`CONDITIONS_EVERY`] until the host stops, and
+/// stamps each reading with the time it was taken.
+fn read_conditions_until_stopped(
+    shared: &Shared,
+    clock: &Clock,
+    read: &dyn Fn() -> HostConditions,
+    every: Duration,
+) {
     while shared.running.load(Ordering::Acquire) {
-        let reading = kr_describe::resource::platform::read_conditions();
-        LATEST
+        let conditions = read();
+        *shared
+            .reading
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key_of(shared), reading);
+            .unwrap_or_else(PoisonError::into_inner) = Some(Taken {
+            at_ms: clock.now().monotonic_ms(),
+            conditions,
+        });
         shared.waker.wake();
-        let until = std::time::Instant::now() + CONDITIONS_EVERY;
+        let until = std::time::Instant::now() + every;
         while shared.running.load(Ordering::Acquire) && std::time::Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(250).min(every));
         }
     }
-    LATEST
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&key_of(shared));
 }
 
 /// Where the host keeps what the process downloads: `<state>/models`.
@@ -928,13 +983,14 @@ mod tests {
             snapshot: RwLock::new(Snapshot::default()),
             purges_owed: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            reading: Mutex::new(None),
         });
         let mut thread = Thread {
             shared,
             driver,
             inbox,
             privacy,
-            clock: Clock::default(),
+            clock: Clock::skewed(Arc::new(AtomicU64::new(0))),
             conditions: None,
             last_event: BTreeMap::new(),
             started_wall_ms: 0,
@@ -967,6 +1023,33 @@ mod tests {
                 events: Vec::new(),
             }),
         }
+    }
+
+    /// A page of one session's facts, captured under `generation`, as `edit` leaves it.
+    fn page_with(
+        generation: u64,
+        revision: u64,
+        edit: impl FnOnce(&mut DescriptionFacts),
+    ) -> DescriptionFactsPage {
+        let mut page = page(generation);
+        let facts = page.facts.0.as_mut().expect("a page with facts");
+        facts.revision = U64::new(revision);
+        edit(facts);
+        page
+    }
+
+    /// Takes a session's waiting changes into a queued job, once the debounce has passed, and says
+    /// whether it made one.
+    fn settled(thread: &mut Thread, at_ms: u64) -> bool {
+        thread
+            .driver
+            .service_mut()
+            .settle(
+                &session(),
+                Priority::Ordinary,
+                Reading::new(at_ms, 1_700_000_000_000 + at_ms),
+            )
+            .is_some()
     }
 
     fn pending(thread: &Thread) -> bool {
@@ -1036,6 +1119,321 @@ mod tests {
             "raised at this generation: not lowered by a page of it"
         );
         assert!(!pending(&held));
+    }
+
+    /// A page is the whole of what the worker holds, so a fact it no longer has is cleared here
+    /// too: a completion cleared when a command starts and a thread cleared when it ends are
+    /// changes, and a record that says the same again is not. Nothing of a fact that is gone is
+    /// left to describe the session.
+    #[test]
+    fn a_page_is_applied_whole_and_a_fact_the_worker_no_longer_has_is_cleared() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let (_directory, mut host) = thread(state(0, false));
+        host.apply(
+            session(),
+            &page_with(0, 1, |facts| {
+                facts.completion = Nullable::some(DescriptionCompletion::Succeeded);
+                facts.thread = Nullable::some("review".to_owned());
+            }),
+            now,
+        );
+        assert!(settled(&mut host, 10_000), "the first record makes a job");
+        assert!(!pending(&host), "and leaves nothing waiting");
+
+        // The same facts again, under a newer revision: nothing changed.
+        host.apply(
+            session(),
+            &page_with(0, 2, |facts| {
+                facts.completion = Nullable::some(DescriptionCompletion::Succeeded);
+                facts.thread = Nullable::some("review".to_owned());
+            }),
+            Reading::new(11_000, 1_700_000_011_000),
+        );
+        assert!(!pending(&host), "the control: a record that says the same");
+
+        // A command started: the completion is gone. The agent's thread ended: so is the thread.
+        host.apply(
+            session(),
+            &page_with(0, 3, |facts| {
+                facts.thread = Nullable::some("review".to_owned());
+            }),
+            Reading::new(12_000, 1_700_000_012_000),
+        );
+        assert!(pending(&host), "a cleared completion is a change");
+        assert!(settled(&mut host, 20_000));
+        host.apply(
+            session(),
+            &page_with(0, 4, |_| {}),
+            Reading::new(21_000, 1_700_000_021_000),
+        );
+        assert!(pending(&host), "a cleared thread is a change");
+    }
+
+    /// A new event is a change of its own: a command with the same program in the same directory
+    /// still starts the debounce, and the same event seen again does not.
+    #[test]
+    fn a_new_event_alone_starts_the_debounce_and_the_same_event_again_does_not() {
+        let event = |cursor: u64| kr_protocol::describe::DescriptionEvent {
+            cursor: U64::new(cursor),
+            kind: DescriptionEventKind::CommandAccepted,
+            summary: "cargo".to_owned(),
+        };
+        let (_directory, mut host) = thread(state(0, false));
+        host.apply(
+            session(),
+            &page_with(0, 1, |facts| facts.events = vec![event(0)]),
+            Reading::new(1_000, 1_700_000_001_000),
+        );
+        assert!(settled(&mut host, 10_000));
+        assert!(!pending(&host));
+
+        host.apply(
+            session(),
+            &page_with(0, 2, |facts| facts.events = vec![event(0)]),
+            Reading::new(11_000, 1_700_000_011_000),
+        );
+        assert!(!pending(&host), "the control: an event taken before");
+
+        host.apply(
+            session(),
+            &page_with(0, 3, |facts| facts.events = vec![event(1), event(0)]),
+            Reading::new(12_000, 1_700_000_012_000),
+        );
+        assert!(pending(&host), "an event that is new is a change");
+    }
+
+    /// Each way a description can stand is the word the client is shown: current, delayed while a
+    /// newer job waits at the same revision, stale when the session has moved on, and none when
+    /// there is no description or the store could not say.
+    #[test]
+    fn each_standing_of_a_description_is_the_word_a_client_is_shown() {
+        use kr_describe::context::ContextRevision;
+
+        assert_eq!(
+            freshness_of(Ok(Some(Freshness::Current))),
+            DescriptionFreshness::Current
+        );
+        assert_eq!(
+            freshness_of(Ok(Some(Freshness::Delayed {
+                queued_age_ms: 70_000
+            }))),
+            DescriptionFreshness::Delayed
+        );
+        assert_eq!(
+            freshness_of(Ok(Some(Freshness::Stale {
+                produced_at: ContextRevision::new(1),
+                current: ContextRevision::new(2),
+            }))),
+            DescriptionFreshness::Stale
+        );
+        assert_eq!(freshness_of(Ok(None)), DescriptionFreshness::None);
+        assert_eq!(
+            freshness_of(Err(kr_describe::DescribeError::Store {
+                detail: "the store is closed".to_owned()
+            })),
+            DescriptionFreshness::None
+        );
+    }
+
+    /// A reading of the host's conditions serves while it is under a minute old and says nothing
+    /// after: a reader that stalls after a good reading leaves every signal unqualified once the
+    /// reading is old, where the policy pauses, and does not leave the last answer in force. The
+    /// control is the same reading, a moment after it was taken.
+    #[test]
+    fn a_reading_over_a_minute_old_is_not_used_and_a_reader_that_stalls_leaves_none_in_force() {
+        use kr_describe::budget::GIB;
+        use kr_describe::resource::{PowerSource, ThermalState};
+
+        let (_directory, host) = thread(state(0, false));
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let roomy = || {
+            HostConditions::measured(
+                16 * GIB,
+                12 * GIB,
+                PowerSource::Mains,
+                ThermalState::Nominal,
+            )
+        };
+        /// Stops the reader when the test ends, by returning or by failing, so the scope can end.
+        struct Stop<'a>(&'a Shared, std::sync::mpsc::Sender<()>);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.running.store(false, Ordering::Release);
+                let _ = self.1.send(());
+            }
+        }
+        std::thread::scope(|scope| {
+            let _stop = Stop(&host.shared, release);
+            scope.spawn(|| {
+                read_conditions_until_stopped(
+                    &host.shared,
+                    &host.clock,
+                    &|| {
+                        // The first reading is good; the next one stalls until it is released.
+                        if started.fetch_add(1, Ordering::AcqRel) > 0 {
+                            let _ = held.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                        }
+                        roomy()
+                    },
+                    Duration::from_millis(1),
+                );
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while started.load(Ordering::Acquire) < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "waited for the reader to begin the reading that stalls"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(host.conditions(), roomy(), "just taken, so it is used");
+
+            host.clock.skew_ms.fetch_add(61_000, Ordering::AcqRel);
+            let old = host.conditions();
+            assert_ne!(old, roomy(), "over a minute old, so it is not used");
+            assert!(
+                matches!(old.power, Signal::Unqualified { .. })
+                    && matches!(old.available_memory_bytes, Signal::Unqualified { .. }),
+                "every signal is unqualified: {old:?}"
+            );
+        });
+    }
+
+    /// A purge the host's thread does not answer within its bound is unavailable, and stays owed
+    /// until the thread has made it, which it does when it turns; one it answers is done and owes
+    /// nothing; and a host whose thread is gone owes none, so privacy mode is never kept waiting
+    /// for a purge nobody will make.
+    #[test]
+    fn a_purge_is_owed_until_the_host_has_made_it_and_a_host_that_is_gone_owes_nothing() {
+        let (_directory, host) = thread(state(0, false));
+        let handle = DescribeHost {
+            shared: Arc::clone(&host.shared),
+            thread: Mutex::new(None),
+        };
+        assert!(
+            handle.purge().is_err(),
+            "nobody is making the purge, so it is not done in time"
+        );
+        assert_eq!(handle.outstanding(), 1, "and it is still owed");
+
+        // The control: the same purge, with the host's thread turning.
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let mut host = host;
+        std::thread::scope(|scope| {
+            let purging = scope.spawn(|| handle.purge());
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while handle.outstanding() < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "waited for the second purge to be posted"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            host.take_messages(now);
+            assert_eq!(
+                purging.join().expect("the purge returns"),
+                Ok(()),
+                "made, so done"
+            );
+        });
+        assert_eq!(
+            handle.outstanding(),
+            0,
+            "the thread made the late purge as well, and nothing is owed"
+        );
+
+        handle.shared.running.store(false, Ordering::Release);
+        assert_eq!(handle.purge(), Ok(()), "a host that is gone owes nothing");
+        assert_eq!(handle.outstanding(), 0);
+    }
+
+    /// A page waiting in its slot when privacy mode is enabled is never applied: the purge the
+    /// enabling asks for empties the slots as well as the queue. The control is a page left alone,
+    /// which the host's next turn takes.
+    #[test]
+    fn a_page_waiting_in_its_slot_is_forgotten_by_the_purge_and_one_left_alone_is_taken() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        for purged in [false, true] {
+            let (_directory, mut host) = thread(state(0, false));
+            let handle = DescribeHost {
+                shared: Arc::clone(&host.shared),
+                thread: Mutex::new(None),
+            };
+            handle.page(session(), Box::new(page(0)));
+            if purged {
+                std::thread::scope(|scope| {
+                    let purging = scope.spawn(|| handle.purge());
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while handle.outstanding() == 0 {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "waited for the purge to be posted"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    host.take_messages(now);
+                    purging
+                        .join()
+                        .expect("the purge returns")
+                        .expect("the host made it");
+                });
+            }
+            host.take_pages(now);
+            assert_eq!(
+                pending(&host),
+                !purged,
+                "a page is taken unless the purge emptied its slot (purged: {purged})"
+            );
+        }
+    }
+
+    /// What the host's thread leaves behind is cleared when it ends by unwinding as well as by
+    /// returning: a host that panicked is not running, and owes privacy mode no purge.
+    #[test]
+    fn a_host_thread_that_panics_is_not_left_running_or_owing_a_purge() {
+        let (_directory, host) = thread(state(0, false));
+        host.shared.purges_owed.store(3, Ordering::Release);
+        let shared = Arc::clone(&host.shared);
+        let ended = std::thread::spawn(move || {
+            let _exit = Exit(shared);
+            panic!("the host's thread fails");
+        })
+        .join();
+        assert!(ended.is_err(), "the thread panicked");
+        assert!(!host.shared.running.load(Ordering::Acquire));
+        assert_eq!(host.shared.purges_owed.load(Ordering::Acquire), 0);
+    }
+
+    /// A session opened while privacy mode is on is fenced from the start at the generation in
+    /// force, so nothing of it is captured or described; one opened while it is off is not. The
+    /// control is the second.
+    #[test]
+    fn a_session_opened_while_privacy_mode_is_on_is_fenced_from_the_start() {
+        let now = Reading::new(1_000, 1_700_000_000_000);
+        let other = SessionId::new(Uuid::from_bytes([8; 16]));
+        for (private, fenced) in [(true, true), (false, false)] {
+            let (_directory, mut host) = thread(state(4, private));
+            host.shared
+                .inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send(Message::Opened {
+                    session_id: other,
+                    epoch: SessionEpoch::V1,
+                    binding: ContextBinding::new("display-2/epoch-1"),
+                })
+                .expect("the host is listening");
+            host.take_messages(now);
+            assert_eq!(host.shared.handles.fence.is_fenced(&other), fenced);
+            if fenced {
+                assert_eq!(
+                    host.shared.handles.fence.generation(&other),
+                    Some(PrivacyGeneration::new(4))
+                );
+            }
+        }
     }
 
     /// A publication runs inside the admission and only while a result produced under its

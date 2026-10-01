@@ -126,8 +126,9 @@ pub struct Script {
     /// directory when a load succeeds, holding the identifier of the profile it loaded.
     pub mark_loads: bool,
     /// Whether the process leaves a file named [`BEGAN_PREFIX`], the kind of work and its
-    /// identifier in its runtime directory when its model thread begins a load, a job or a check:
-    /// what a test waits for before it cancels work it means to be in the middle of.
+    /// identifier in its runtime directory when its model thread begins a load, a job or a check,
+    /// and, as `lock-held`, when it finds another process holding the environment's lock: what a
+    /// test waits for before it cancels work it means to be in the middle of.
     pub mark_work: bool,
     /// How long a job takes, in milliseconds.
     pub generate_ms: u64,
@@ -137,6 +138,9 @@ pub struct Script {
     pub ignore_token_ms: u64,
     /// The peak resident set a job reports, in bytes, in place of the process's own.
     pub peak_rss_bytes: Option<u64>,
+    /// Whether a job answers with its result even when it was cancelled while it ran, as a model
+    /// that does not look at its token would.
+    pub produce_when_cancelled: bool,
     /// Whether a job ends because the process passed the memory ceiling.
     pub memory_ceiling: bool,
     /// What a job's answer looks like.
@@ -232,6 +236,7 @@ impl Script {
         flag("mark-loads", self.mark_loads);
         flag("mark-work", self.mark_work);
         flag("generate-until-cancelled", self.generate_until_cancelled);
+        flag("produce-when-cancelled", self.produce_when_cancelled);
         flag("memory-ceiling", self.memory_ceiling);
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
@@ -292,6 +297,7 @@ impl Script {
                 "mark-loads" => script.mark_loads = true,
                 "mark-work" => script.mark_work = true,
                 "generate-until-cancelled" => script.generate_until_cancelled = true,
+                "produce-when-cancelled" => script.produce_when_cancelled = true,
                 "memory-ceiling" => script.memory_ceiling = true,
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
@@ -396,6 +402,10 @@ fn wait(spin: bool, duration: Option<Duration>, token: &Cancellation, deadline: 
 }
 
 impl Model for StubModel {
+    fn lock_held(&mut self) {
+        self.began("lock-held");
+    }
+
     fn load(&mut self, work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
         self.began("load");
         if self.script.load_ignore_token_ms > 0 {
@@ -442,6 +452,7 @@ impl Model for StubModel {
             .then(|| Duration::from_millis(self.script.generate_ms));
         match wait(self.script.spin, duration, token, deadline) {
             Waited::Done => {}
+            Waited::Cancelled if self.script.produce_when_cancelled => {}
             Waited::Cancelled => {
                 return Generating::Ended {
                     why: JobEnd::Cancelled,

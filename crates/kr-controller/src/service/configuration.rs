@@ -458,7 +458,25 @@ impl Controller {
         self: &Arc<Self>,
         change: &kr_protocol::hostinfo::configuration::Change,
     ) -> Result<crate::config::Applied> {
-        let edit = crate::config::apply(&self.paths, change, self.hard_limits())?;
+        self.apply_configuration_standing(change, &|write| write())
+            .await
+    }
+
+    /// [`Self::apply_configuration`] for a change made under an admission: `standing` runs the
+    /// write once everything the change waited for is behind it, and refuses it when the
+    /// admission no longer stands ([`crate::config::apply_standing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_configuration`], and the admission's refusal, in which case nothing was
+    /// written.
+    pub(crate) async fn apply_configuration_standing(
+        self: &Arc<Self>,
+        change: &kr_protocol::hostinfo::configuration::Change,
+        standing: crate::config::Standing<'_>,
+    ) -> Result<crate::config::Applied> {
+        let edit =
+            crate::config::apply_standing(&self.paths, change, self.hard_limits(), standing)?;
         // Inside the edit lock, and through the one path every other revision takes: what this
         // daemon does with a document it wrote is what it does with a document somebody else
         // wrote. Holding the lock across it is what keeps the effects and the write together, so
@@ -519,5 +537,164 @@ impl Controller {
         crate::config::HardLimits {
             sessions_per_environment: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kr_ipc::peer::PeerIdentity;
+    use kr_protocol::describe::DescriptionConfigureParams;
+    use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::ids::{ActionId, ActionWindowId, ConnectionId, RequestId};
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{DurationMs, Nullable};
+
+    use crate::authority::AdmittedMutation;
+    use crate::error::ControllerError;
+    use crate::service::Controller;
+    use crate::service::a_floor_owed_its_record::daemon;
+
+    /// A request to turn descriptions off.
+    fn turn_off(controller: &Controller) -> MutationRequest {
+        MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::DescriptionConfigure.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(controller.paths.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("local:test").expect("a window"),
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&DescriptionConfigureParams {
+                enabled: Nullable::some(false),
+                on_battery: Nullable::null(),
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// A connection the daemon has admitted, and the admission a setting change carries from it,
+    /// good for `deadline_in`.
+    async fn admission(
+        controller: &Controller,
+        deadline_in: Option<Duration>,
+    ) -> (ConnectionId, AdmittedMutation) {
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        controller
+            .admit_connection(
+                connection_id,
+                &kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+                &PeerIdentity {
+                    uid: kr_ipc::paths::current_uid(),
+                    gid: 0,
+                    pid: None,
+                },
+            )
+            .await
+            .expect("the connection is registered");
+        let admitted_revision = controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered");
+        let deadline = deadline_in.map(|within| {
+            controller
+                .clock
+                .now()
+                .checked_add(within)
+                .expect("a deadline")
+        });
+        (
+            connection_id,
+            AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline,
+            },
+        )
+    }
+
+    /// KR-REQ-22.01: a description setting is written only while the admission it was accepted
+    /// under still stands at the write. The admission is asked once the edit is ready and its
+    /// waits are behind it, and the registration is held until the document is written: a
+    /// registration withdrawn, or a window spent, between the first admission and the write
+    /// refuses it with the document untouched. The control is an admission that stands, whose
+    /// write is made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_description_setting_is_written_only_while_its_admission_stands_at_the_write() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        assert!(controller.description_settings().enabled, "on by default");
+
+        // Control: an admission that stands, at the write as before it.
+        let (_standing, carried) = admission(&controller, Some(Duration::from_secs(60))).await;
+        controller
+            .description_write(
+                Method::DescriptionConfigure,
+                &turn_off(&controller),
+                carried,
+            )
+            .await
+            .expect("the setting is written");
+        assert!(!controller.description_settings().enabled);
+        controller
+            .apply_configuration(
+                &kr_protocol::hostinfo::configuration::Change::Descriptions {
+                    enabled: Some(true),
+                    on_battery: None,
+                },
+            )
+            .await
+            .expect("the setting is put back");
+        assert!(controller.description_settings().enabled);
+
+        // The registration is withdrawn after the change was admitted and before its write: the
+        // write is the one place that can see it.
+        let (connection_id, carried) = admission(&controller, Some(Duration::from_secs(60))).await;
+        let (arrived, release) = controller.descriptions().pauses.before_configuration.arm();
+        let writing = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                controller
+                    .description_write(
+                        Method::DescriptionConfigure,
+                        &turn_off(&controller),
+                        carried,
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("the wait ends")
+            .expect("the change reached its write");
+        controller.deregister(connection_id);
+        release.send(()).expect("the change goes on");
+        let refused = writing.await.expect("the change ends");
+        assert!(
+            matches!(refused, Err(ControllerError::PermissionDenied { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            controller.description_settings().enabled,
+            "nothing was written for a registration that was gone"
+        );
+
+        // A window that is spent by the write refuses it as freshness.
+        let (_spent, carried) = admission(&controller, Some(Duration::ZERO)).await;
+        let expired = controller
+            .description_write(
+                Method::DescriptionConfigure,
+                &turn_off(&controller),
+                carried,
+            )
+            .await;
+        assert!(
+            matches!(expired, Err(ControllerError::WindowExpired { .. })),
+            "{expired:?}"
+        );
+        assert!(controller.description_settings().enabled);
     }
 }
