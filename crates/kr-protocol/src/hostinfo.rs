@@ -1641,6 +1641,12 @@ pub mod configuration {
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
         /// No environment variable reaches it.
         pub startup: StartupSelection,
+        /// The two settings an owner has for session descriptions.
+        ///
+        /// Applied as soon as they are written: turning descriptions off stops the work in flight
+        /// and ends the description process, and no restart is needed for either. No environment
+        /// variable reaches them.
+        pub descriptions: DescriptionsSelection,
     }
 
     impl Default for ConfigurationDocument {
@@ -1660,6 +1666,7 @@ pub mod configuration {
                 network: NetworkSelection::default(),
                 voice: VoiceSelection::default(),
                 startup: StartupSelection::default(),
+                descriptions: DescriptionsSelection::default(),
             }
         }
     }
@@ -2148,6 +2155,44 @@ pub mod configuration {
         #[must_use]
         pub fn controller(&self) -> Option<ControllerStartup> {
             self.controller.0
+        }
+    }
+
+    /// The two settings an owner has for session descriptions, each absent unless this document
+    /// chooses it.
+    ///
+    /// Section 22 turns descriptions on by default and inference on battery off by default, so an
+    /// absent setting reads as that default and a document that says nothing changes nothing.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct DescriptionsSelection {
+        /// Whether descriptions are on.
+        pub enabled: Nullable<bool>,
+        /// Whether inference may run while the host is on battery.
+        pub on_battery: Nullable<bool>,
+    }
+
+    impl Default for DescriptionsSelection {
+        /// Nothing chosen, which is what an absent section reads as.
+        fn default() -> Self {
+            Self {
+                enabled: Nullable::null(),
+                on_battery: Nullable::null(),
+            }
+        }
+    }
+
+    impl DescriptionsSelection {
+        /// Whether descriptions are on, when this document chooses it.
+        #[must_use]
+        pub fn enabled(&self) -> Option<bool> {
+            self.enabled.0
+        }
+
+        /// Whether inference may run on battery, when this document chooses it.
+        #[must_use]
+        pub fn on_battery(&self) -> Option<bool> {
+            self.on_battery.0
         }
     }
 
@@ -2809,6 +2854,14 @@ pub mod configuration {
             /// Whether its integration is on.
             enabled: bool,
         },
+        /// Set either or both of the owner's settings for descriptions. A setting left `None` is
+        /// left as the document has it.
+        Descriptions {
+            /// Whether descriptions are on.
+            enabled: Option<bool>,
+            /// Whether inference may run while the host is on battery.
+            on_battery: Option<bool>,
+        },
     }
 
     impl Change {
@@ -2823,6 +2876,7 @@ pub mod configuration {
                 Self::Enrolment(_) => "enrolment",
                 Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
                 Self::CommandIntegration { .. } => COMMAND_INTEGRATIONS.key,
+                Self::Descriptions { .. } => "descriptions",
             }
         }
 
@@ -2833,7 +2887,8 @@ pub mod configuration {
                 Self::SleepInhibition(_)
                 | Self::SessionLimit(_)
                 | Self::GrantRights(_)
-                | Self::Enrolment(_) => ValueEffect::Immediately,
+                | Self::Enrolment(_)
+                | Self::Descriptions { .. } => ValueEffect::Immediately,
                 Self::WorkerProfile(_) | Self::CommandIntegration { .. } => {
                     ValueEffect::NewSessionsOnly
                 }
@@ -3002,6 +3057,24 @@ pub mod configuration {
             }
             Change::ControllerStartup(startup) => {
                 document.startup.controller = Nullable(*startup);
+            }
+            Change::Descriptions {
+                enabled,
+                on_battery,
+            } => {
+                // An edit that names no setting would only advance the revision, so it is refused
+                // rather than counted as a change.
+                if enabled.is_none() && on_battery.is_none() {
+                    return Err(EditRefused::Invalid(vec![Sentence::new().stated(
+                        "an edit of the descriptions section has to name at least one setting",
+                    )]));
+                }
+                if let Some(enabled) = enabled {
+                    document.descriptions.enabled = Nullable::some(*enabled);
+                }
+                if let Some(on_battery) = on_battery {
+                    document.descriptions.on_battery = Nullable::some(*on_battery);
+                }
             }
             Change::CommandIntegration { plugin_id, enabled } => {
                 // One package at a time, in the host's own list, which stays sorted and names each
@@ -8094,6 +8167,70 @@ mod tests {
             standalone.document.startup.controller(),
             Some(ControllerStartup::Standalone)
         );
+    }
+
+    /// KR-REQ-22.01, KR-REQ-26.13: the two settings an owner has for descriptions are absent until
+    /// a validated edit chooses them, apply at once, owe no fence and invalidate no evidence, and an
+    /// edit changes only the setting it names. An edit that names neither is refused, a document
+    /// that spells a setting as anything but a switch is a document this build does not rewrite,
+    /// and a clean document still reads as before.
+    #[test]
+    fn the_descriptions_section_holds_the_owners_two_settings_and_an_edit_changes_only_its_own() {
+        use configuration::ValueEffect;
+
+        let empty = ConfigurationDocument::empty();
+        assert_eq!(empty.descriptions.enabled(), None);
+        assert_eq!(empty.descriptions.on_battery(), None);
+
+        let battery = Change::Descriptions {
+            enabled: None,
+            on_battery: Some(true),
+        };
+        assert_eq!(battery.key(), "descriptions");
+        assert_eq!(battery.effect(), ValueEffect::Immediately);
+        let first =
+            configuration::edit(&configuration::load(None), &battery).expect("a validated edit");
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.document.descriptions.enabled(), None);
+        assert_eq!(first.document.descriptions.on_battery(), Some(true));
+        let reread = configuration::load(Some(first.contents.as_bytes()));
+        assert_eq!(reread.status.state, DocumentState::Loaded);
+        assert_eq!(reread.document.as_ref(), Some(&first.document));
+
+        // Naming the other setting leaves the first as it was.
+        let off = Change::Descriptions {
+            enabled: Some(false),
+            on_battery: None,
+        };
+        let second = configuration::edit(&reread, &off).expect("a validated edit");
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.document.descriptions.enabled(), Some(false));
+        assert_eq!(second.document.descriptions.on_battery(), Some(true));
+        assert_eq!(
+            configuration::owed(reread.document.as_ref(), Some(&second.document)),
+            configuration::Owed::default(),
+            "a setting that changes what runs fences nothing and invalidates nothing"
+        );
+
+        // An edit that names nothing changes nothing, so it is refused rather than counted.
+        let nothing = Change::Descriptions {
+            enabled: None,
+            on_battery: None,
+        };
+        assert!(matches!(
+            configuration::edit(&reread, &nothing),
+            Err(configuration::EditRefused::Invalid(_))
+        ));
+
+        // A setting that is not a switch is a document this build does not rewrite.
+        let spelled = configuration::load(Some(
+            br#"{"version": 1, "revision": 2, "descriptions": {"enabled": "yes"}}"#,
+        ));
+        assert_eq!(spelled.status.state, DocumentState::Invalid);
+        assert!(matches!(
+            configuration::edit(&spelled, &off),
+            Err(configuration::EditRefused::NotOurs(_))
+        ));
     }
 
     /// The wire words a report names are exactly the ones the enumerations spell.

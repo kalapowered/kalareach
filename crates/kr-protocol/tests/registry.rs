@@ -418,6 +418,51 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 22 offers descriptions at host setup with their size, a cancel and a disable, and
+    // section 23 names no method that does. This build adds one read and two writes in the
+    // host-and-environment group, each asking for host management: what is offered and what it
+    // costs is read where the owner is (the local socket, or a paired device whose grant carries
+    // host management), while the two changes - the settings and the fetch - are made at the host
+    // itself and never over a paired device, as privacy mode's switch is.
+    let descriptions = [
+        ("description.setup", EffectClass::Read),
+        ("description.configure", EffectClass::Write),
+        ("description.download", EffectClass::Write),
+    ];
+    for (name, effect) in descriptions {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} is a host and environment method"
+        );
+        let ingress: &[ActorIngress] = if effect == EffectClass::Read {
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice]
+        } else {
+            &[ActorIngress::LocalIpc]
+        };
+        assert_eq!(
+            entry.ingress, ingress,
+            "{name} is served where its effect says"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+    // A paired device is refused the two that change the host, by the registry itself.
+    for name in ["description.configure", "description.download"] {
+        assert_eq!(
+            decide(name, MethodVersion::V1, ActorIngress::PairedDevice),
+            AuthorityDecision::Denied(DenialReason::ForbiddenIngress {
+                ingress: ActorIngress::PairedDevice
+            }),
+            "{name} is not served to a paired device"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -576,6 +621,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + delivery.len()
             + privacy.len()
             + updates.len()
+            + descriptions.len()
             + policy.len()
             + voice.len()
             + owner.len()
