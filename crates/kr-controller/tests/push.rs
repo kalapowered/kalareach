@@ -6508,3 +6508,193 @@ fn a_notice_is_told_only_to_a_device_whose_grant_reaches_what_it_is_about() {
     assert_eq!(told(&host, environment.clone()), (1, 0, 1));
     assert_eq!(told(&view, environment), (0, 0, 0));
 }
+
+// ----- The environment's attention store feeds delivery ------------------------------------------
+
+/// A pending approval in session `session`, recorded now in the environment's own source, which
+/// the daemon's own reads of that source certify and the store then announces.
+fn pending_approval_in(session_id: SessionId, request: &str) -> kr_attention::SourceEvent {
+    kr_attention::SourceEvent::new(
+        kr_attention::EventCursor::new(kr_protocol::attention::AttentionSource::Receipts, 1),
+        TimestampMs::new(kr_ipc::now_ms().get()),
+        kr_attention::EventKind::ApprovalRequested {
+            request_id: kr_protocol::ids::ApprovalRequestId::new(request).expect("an identifier"),
+            session_id,
+            summary: "write /etc/hosts".to_owned(),
+        },
+    )
+}
+
+/// One paired device and its destination, under a grant that carries `session.view` over
+/// `sessions`, with the credential its authorisation is delivered under held by the daemon.
+fn pair_phone(
+    controller: &Controller,
+    byte: u8,
+    sessions: SessionSelector,
+) -> (DeviceId, PushSenderRecordId) {
+    let device_id = DeviceId::new(uuid(byte));
+    let grant = Grant {
+        grant_id: GrantId::new(uuid(byte.wrapping_add(100))),
+        actions: [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        session_selector: sessions,
+        ..dummy_grant(device_id)
+    };
+    let preview = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let now = kr_ipc::now_ms().get();
+    controller
+        .devices()
+        .commit(&DeviceRecord {
+            device_id,
+            endpoint_id: EndpointKey::from_bytes([byte; 32]),
+            device_key_revision: DeviceKeyRevision::new(1),
+            authorisation: AuthorisationKey::from_bytes([byte; 32]),
+            stored_envelope: None,
+            device_name: DeviceName::new("phone").expect("a name"),
+            platform: DevicePlatform::Ios,
+            grant: grant.clone(),
+            paired_at_ms: TimestampMs::new(now - 10_000),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: Some(*preview.public()),
+        })
+        .expect("a device record");
+    let sender = PushSenderRecordId::new(uuid(byte.wrapping_add(50)));
+    controller
+        .delivery()
+        .configure(&DestinationRecord {
+            id: DestinationId::new(device_id.to_string()).expect("an identifier"),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(uuid(byte.wrapping_add(80))),
+                sender_record_id: sender,
+                preview_keys: PreviewKeys::only(*preview.public(), 1),
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: Some(grant.grant_id),
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(now),
+        })
+        .expect("a destination");
+    controller
+        .delivery_runtime()
+        .credentials()
+        .hold(PushDeliveryCredential {
+            sender_record_id: sender,
+            ..current_credential(now)
+        });
+    (device_id, sender)
+}
+
+/// Waits, on a condition and nothing else, until `holds`.
+async fn until_holds(what: &str, mut holds: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !holds() {
+        assert!(std::time::Instant::now() < deadline, "{what} never held");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// The authorisations the gateway was asked to deliver for, once each notification it took.
+fn delivered_to(gateway: &DeliveringGateway) -> Vec<PushSenderRecordId> {
+    gateway
+        .asked()
+        .into_iter()
+        .filter(|asked| asked.url.ends_with("/api/push/deliver"))
+        .map(|asked| {
+            serde_json::from_slice::<PushDeliveryRequest>(&asked.body)
+                .expect("a delivery request")
+                .sender_record_id
+        })
+        .collect()
+}
+
+/// KR-REQ-16.12, KR-REQ-16.13, KR-REQ-18.01: a pending approval raised in the environment's
+/// attention store is delivered by the running daemon, with nothing calling a pass, to every paired
+/// device whose grant reaches its session and to no other. What the gateway is given in the clear
+/// is the generic alert and nothing the approval said, and the same item is not delivered twice.
+/// The control: a device whose grant selects another session is told nothing, and no record is
+/// written for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_raised_in_the_attention_store_is_delivered_to_each_device_its_grant_reaches() {
+    let (_temp, controller) = start_controller().await;
+    let session_id = SessionId::new(uuid(60));
+    let (_, first) = pair_phone(&controller, 10, SessionSelector::Any);
+    let (_, second) = pair_phone(
+        &controller,
+        11,
+        SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+    );
+    let (_, elsewhere) = pair_phone(
+        &controller,
+        12,
+        SessionSelector::These {
+            session_ids: [SessionId::new(uuid(61))].into_iter().collect(),
+        },
+    );
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, "req-write-hosts")])
+        .expect("the store records the approval");
+    until_holds("both devices being told", || {
+        delivered_to(&gateway).len() >= 2
+    })
+    .await;
+    // The item is settled with the store once the journal holds it, and is never offered again.
+    until_holds("the store being settled with", || {
+        controller
+            .attention()
+            .take_for_delivery(|store, _| store.awaiting_delivery().ok())
+            .ok()
+            .flatten()
+            == Some(0)
+    })
+    .await;
+
+    let told = delivered_to(&gateway);
+    assert_eq!(told.len(), 2, "one notification for each device: {told:?}");
+    assert!(told.contains(&first) && told.contains(&second));
+    assert!(
+        !told.contains(&elsewhere),
+        "a grant over another session is told nothing"
+    );
+    let rows = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
+        .expect("a read");
+    assert_eq!(rows, 2, "and no record is written for it");
+
+    // What is in the clear: the alert, and nothing of the approval or its session.
+    for asked in gateway
+        .asked()
+        .into_iter()
+        .filter(|asked| asked.url.ends_with("/api/push/deliver"))
+    {
+        let text = String::from_utf8_lossy(&asked.body).into_owned();
+        let request: PushDeliveryRequest =
+            serde_json::from_slice(&asked.body).expect("a delivery request");
+        assert_eq!(request.hints.alert, PushAlert::ApprovalWaiting);
+        for private in [
+            "req-write-hosts",
+            "write /etc/hosts",
+            &session_id.to_string(),
+        ] {
+            assert!(
+                !text.contains(private),
+                "the request holds {private}: {text}"
+            );
+        }
+    }
+}
