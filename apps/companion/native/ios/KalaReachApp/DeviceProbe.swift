@@ -209,17 +209,19 @@ enum DeviceProbe {
         waitForToken(tries: 0, nonce: nonce, facts: facts, fetching: false)
     }
 
-    /// Set once the check has reported, so that a late answer or a timeout cannot report again.
-    private static var pushReported = false
+    /// Lets the check report once, so that a late answer or a timeout cannot report after it.
+    private static var pushReport = OneReport()
 
-    private static func reportPush(_ facts: [String: String]) {
-        guard !pushReported else { return }
-        pushReported = true
+    /// Reports the check's result, once, running `before` first when this is the one report: what a
+    /// report leaves behind (a file a later step reads) is left only by the report that counts.
+    private static func reportPush(_ facts: [String: String], before: (() -> Void)? = nil) {
+        guard pushReport.claim() else { return }
+        before?()
         finish(.push, facts)
     }
 
     private static func waitForToken(tries: Int, nonce: String, facts: [String: String], fetching: Bool) {
-        guard !pushReported else { return }
+        guard !pushReport.claimed else { return }
         var facts = facts
         var fetching = fetching
         let registration = PushRegistration.shared
@@ -228,9 +230,9 @@ enum DeviceProbe {
             reportPush(facts)
             return
         }
-        // Only the person's own answer starts this: the launch has registered for a token already,
-        // and that says nothing about the permission.
-        if registration.permission == .granted, case .registered = registration.state, !fetching {
+        // Only once Firebase has the APNs token, which is once the person has agreed: the launch has
+        // registered for a token already, and that says nothing about the permission.
+        if registration.tokenHandedToFirebase, !fetching {
             fetching = true
             facts["permission"] = "granted"
             // Agreed, so Firebase may make a registration token on its own from now on. The one this
@@ -253,11 +255,12 @@ enum DeviceProbe {
                         "group": PreviewKeyLocation.resolvedPrivateGroup() ?? "",
                         "fcm_token": token,
                     ]
-                    if let data = try? JSONSerialization.data(withJSONObject: file) {
-                        try? data.write(to: container().appendingPathComponent("probe-push.json"))
-                    }
                     facts["token"] = "ready"
-                    reportPush(facts)
+                    reportPush(facts) {
+                        if let data = try? JSONSerialization.data(withJSONObject: file) {
+                            try? data.write(to: container().appendingPathComponent("probe-push.json"))
+                        }
+                    }
                 }
             }
         }
