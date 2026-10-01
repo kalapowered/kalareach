@@ -382,8 +382,85 @@ pub fn wire_prompts(bucket: &Path) -> Result<WirePrompts, String> {
     Ok(counts)
 }
 
-/// The strings of at least sixteen characters a JSON document holds, at any depth: what a login
-/// file keeps of its tokens. They are searched for, never printed.
+/// How many lines of the agent's log files hold `mark`, a missing file counting none: the log of the
+/// requests the agent made for a conversation's title that failed, which it writes by this word.
+///
+/// # Errors
+///
+/// Returns why a file that is there could not be read: the count is then not known.
+pub fn count_marks(data: &Path, logs: &[String], mark: &str) -> Result<u64, String> {
+    let mut count = 0;
+    for relative in logs {
+        let bytes = match std::fs::read(data.join(relative)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "the agent's log {relative} cannot be read: {error}"
+                ));
+            }
+        };
+        count += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| line.contains(mark))
+            .count() as u64;
+    }
+    Ok(count)
+}
+
+/// How many conversations of `bucket`, the run's directory of sessions, have a `file` that holds
+/// the member `key` with the string `value` at any depth: the conversations the agent has titled by
+/// a request to its provider, which it records and does not log. A bucket that is not there holds
+/// none, and a session with no such file yet is not counted.
+///
+/// # Errors
+///
+/// Returns why a directory or a file could not be read, or is not JSON: the count is then not known.
+pub fn titled_conversations(
+    bucket: &Path,
+    file: &str,
+    key: &str,
+    value: &str,
+) -> Result<u64, String> {
+    fn holds(document: &Value, key: &str, value: &str) -> bool {
+        match document {
+            Value::Object(members) => members.iter().any(|(name, item)| {
+                (name == key && item.as_str() == Some(value)) || holds(item, key, value)
+            }),
+            Value::Array(items) => items.iter().any(|item| holds(item, key, value)),
+            _ => false,
+        }
+    }
+    let sessions = match std::fs::read_dir(bucket) {
+        Ok(sessions) => sessions,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("the run's sessions cannot be listed: {error}")),
+    };
+    let mut count = 0;
+    for session in sessions {
+        let session =
+            session.map_err(|error| format!("the run's sessions cannot be listed: {error}"))?;
+        let bytes = match std::fs::read(session.path().join(file)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("a conversation's {file} cannot be read: {error}")),
+        };
+        let document: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("a conversation's {file} is not JSON"))?;
+        if holds(&document, key, value) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// How many characters a string of a login's files has at least to be searched for: shorter ones
+/// (a type, a scope, a name) are not secrets and would match ordinary text. A result that held one
+/// is cleared of it by [`crate::outcome::Outcome::without`], whose fixed words are all shorter.
+pub const SECRET_LENGTH: usize = 16;
+
+/// The strings of at least [`SECRET_LENGTH`] characters a JSON document holds, at any depth: what a
+/// login file keeps of its tokens. They are searched for, never printed.
 #[must_use]
 pub fn secret_values(text: &str) -> Vec<String> {
     let Ok(document) = serde_json::from_str::<Value>(text) else {
@@ -393,7 +470,9 @@ pub fn secret_values(text: &str) -> Vec<String> {
     let mut pending = vec![&document];
     while let Some(value) = pending.pop() {
         match value {
-            Value::String(string) if string.chars().count() >= 16 => found.push(string.clone()),
+            Value::String(string) if string.chars().count() >= SECRET_LENGTH => {
+                found.push(string.clone());
+            }
             Value::Array(items) => pending.extend(items),
             Value::Object(members) => pending.extend(members.values()),
             _ => {}
@@ -413,8 +492,8 @@ fn not_toml(error: &toml_edit::TomlError) -> String {
     )
 }
 
-/// The strings of every key a TOML configuration holds, at any depth: each string of 16 characters
-/// or more under a key named `api_key`, `token` or `secret`, or ending in `_key`, `_token` or
+/// The strings of every key a TOML configuration holds, at any depth: each string of
+/// [`SECRET_LENGTH`] characters or more under a key named `api_key`, `token` or `secret`, or ending in `_key`, `_token` or
 /// `_secret`, such as the key a third party's provider is given. They are searched for, never
 /// printed.
 ///
@@ -429,7 +508,7 @@ pub fn config_secrets(text: &str) -> Result<Vec<String>, String> {
                 .any(|end| key.ends_with(end));
         match item {
             Item::Value(toml_edit::Value::String(string)) => {
-                if named && string.value().chars().count() >= 16 {
+                if named && string.value().chars().count() >= SECRET_LENGTH {
                     found.push(string.value().clone());
                 }
             }
@@ -706,6 +785,9 @@ pub struct Setup {
     /// The credentials files of every other slot, and the files of the OAuth directory, relative to
     /// the person's home: none may change.
     pub other_logins: Vec<String>,
+    /// How many lines of the agent's log named a failed request for a title before the part: those
+    /// the part's own requests add to are counted after it.
+    pub log_titles_before: u64,
 }
 
 impl Setup {
@@ -719,6 +801,7 @@ impl Setup {
         data: &str,
         provider: &str,
         servers: &crate::build::ProjectServers,
+        titles: &crate::build::TitleRequests,
     ) -> Result<Self, String> {
         let directory = person.join(data);
         let read = |relative: &str| {
@@ -760,6 +843,7 @@ impl Setup {
             servers: names,
             secrets,
             other_logins,
+            log_titles_before: count_marks(&directory, &titles.logs, &titles.log_mark)?,
         })
     }
 }
@@ -1314,6 +1398,67 @@ mod tests {
             login_strings(&data)
                 .expect("read again")
                 .contains(&"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_requests_for_a_title_are_the_log_lines_that_name_one_and_the_conversations_titled() {
+        let data = std::env::temp_dir().join(format!("kr-confine-title-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(data.join("logs")).expect("logs");
+        let logs = ["logs/a.log".to_owned(), "logs/a.log.1".to_owned()];
+        // No log yet counts none.
+        assert_eq!(count_marks(&data, &logs, "chat_title"), Ok(0));
+        std::fs::write(
+            data.join("logs/a.log"),
+            "info start\ndebug chat_title request failed: HTTP 500\ninfo chat_titled is not it\n",
+        )
+        .expect("write");
+        std::fs::write(
+            data.join("logs/a.log.1"),
+            "debug chat_title request unavailable: x\ndebug chat_title request failed: y\n",
+        )
+        .expect("write");
+        assert_eq!(
+            count_marks(&data, &logs, "chat_title"),
+            Ok(4),
+            "each line that holds the mark, in every file of the log"
+        );
+        // A log that cannot be read is a count that is not known.
+        std::fs::remove_file(data.join("logs/a.log.1")).expect("remove");
+        std::fs::create_dir(data.join("logs/a.log.1")).expect("a directory is no log");
+        assert!(count_marks(&data, &logs, "chat_title").is_err());
+        let bucket = data.join("sessions/wd_x_0");
+        for (name, state) in [
+            (
+                "session_a",
+                "{\"id\": 1, \"meta\": {\"titleKind\": \"generated\", \"title\": \"t\"}}",
+            ),
+            ("session_b", "{\"titleKind\": \"replaceable\"}"),
+            ("session_c", "{\"titleKind\":\"generated\"}"),
+        ] {
+            std::fs::create_dir_all(bucket.join(name)).expect("session");
+            std::fs::write(bucket.join(name).join("state.json"), state).expect("state");
+        }
+        std::fs::create_dir_all(bucket.join("session_d")).expect("a session with no state yet");
+        assert_eq!(
+            titled_conversations(&bucket, "state.json", "titleKind", "generated"),
+            Ok(2)
+        );
+        assert_eq!(
+            titled_conversations(
+                &data.join("sessions/none"),
+                "state.json",
+                "titleKind",
+                "generated"
+            ),
+            Ok(0),
+            "a bucket that is not there holds none"
+        );
+        std::fs::write(bucket.join("session_d/state.json"), "{ oops").expect("state");
+        assert!(
+            titled_conversations(&bucket, "state.json", "titleKind", "generated").is_err(),
+            "a state that is not JSON is a count that is not known"
         );
         let _ = std::fs::remove_dir_all(&data);
     }
