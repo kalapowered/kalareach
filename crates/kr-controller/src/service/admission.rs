@@ -45,10 +45,7 @@ impl Controller {
         let mut admitted = self.admitted_table();
         admitted.insert(
             connection_id,
-            AdmittedConnection {
-                actor_id: actor_id.clone(),
-                admitted_revision,
-            },
+            AdmittedConnection::new(actor_id.clone(), admitted_revision),
         );
         drop(admitted);
         drop(registry);
@@ -369,6 +366,31 @@ impl Controller {
     /// Withdraws one connection's registration.
     pub(super) fn deregister(&self, connection_id: ConnectionId) {
         self.admitted_table().remove(&connection_id);
+    }
+
+    /// Ties the latch of a connection's write boundary to its registration, so that the
+    /// registration going sets it ([`AdmittedConnection`]).
+    ///
+    /// Done once, when the boundary is built and before anything can be sent on it. A registration
+    /// already gone sets the latch at once: the connection was withdrawn before its boundary
+    /// existed. The table is held across the attachment, and a registration is removed under the
+    /// same lock, so the latch is set either here or by the removal, never by neither.
+    pub(crate) fn latch_registration(
+        &self,
+        connection_id: ConnectionId,
+        latch: &Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut admitted = self.admitted_table();
+        match admitted.get_mut(&connection_id) {
+            Some(registration) => {
+                debug_assert!(
+                    registration.latch.is_none(),
+                    "a registration holds the latch of one write boundary"
+                );
+                registration.latch = Some(Arc::clone(latch));
+            }
+            None => latch.store(true, std::sync::atomic::Ordering::Release),
+        }
     }
 
     /// Takes the dispatch lease a remote-origin mutation needs, and returns its deadline.
@@ -721,12 +743,42 @@ impl Controller {
 /// revocable for the life of the session. A read or a subscription on a connection that was
 /// authorised a moment before authority was withdrawn is fenced here; section 9's dispatch barrier
 /// covers a worker's dispatch and does not cover this.
-#[derive(Clone, Debug)]
+///
+/// A registration that goes, whichever way it goes, takes the write latch of the connection it
+/// admitted with it ([`Controller::latch_registration`]): the latch is set by the registration
+/// being dropped, in the critical section that removed it, so no frame begins on a connection
+/// whose authority has gone, and no path that removes a registration can forget to say so.
+#[derive(Debug)]
 pub(super) struct AdmittedConnection {
     /// The principal the daemon assigned to the operating-system caller.
     pub(super) actor_id: ActorId,
     /// The authority revision in force when the connection was registered.
     pub(super) admitted_revision: kr_protocol::ids::AuthorityRevision,
+    /// The latch of the write boundary this registration lets write, when it has one.
+    latch: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl AdmittedConnection {
+    /// A registration of `actor_id`, admitted under `admitted_revision`, with no write boundary
+    /// tied to it yet.
+    pub(super) const fn new(
+        actor_id: ActorId,
+        admitted_revision: kr_protocol::ids::AuthorityRevision,
+    ) -> Self {
+        Self {
+            actor_id,
+            admitted_revision,
+            latch: None,
+        }
+    }
+}
+
+impl Drop for AdmittedConnection {
+    fn drop(&mut self) {
+        if let Some(latch) = &self.latch {
+            latch.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Returns the accepted deadline on the machine's own continuous clock, bounded by any lease.

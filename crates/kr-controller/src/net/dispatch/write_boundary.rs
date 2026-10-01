@@ -117,13 +117,23 @@ impl FrameSink for Arc<HeldStream> {
 
 /// A registered connection's write boundary, writing to `stream`.
 fn output(controller: &Arc<Controller>, stream: &Arc<HeldStream>) -> RemoteOutput {
+    output_for(
+        controller,
+        stream,
+        ActorId::new("device:test").expect("a principal"),
+    )
+}
+
+/// The write boundary of a connection registered for `actor_id`, writing to `stream`.
+fn output_for(
+    controller: &Arc<Controller>,
+    stream: &Arc<HeldStream>,
+    actor_id: ActorId,
+) -> RemoteOutput {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     controller.admitted_table().insert(
         connection_id,
-        crate::service::AdmittedConnection {
-            actor_id: ActorId::new("device:test").expect("a principal"),
-            admitted_revision: controller.policy().authority_revision(),
-        },
+        crate::service::AdmittedConnection::new(actor_id, controller.policy().authority_revision()),
     );
     RemoteOutput::writing_to(
         Box::new(Arc::clone(stream)),
@@ -1959,4 +1969,123 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_ref
         }
         drop(controller);
     }
+}
+
+/// Waits until `output` has a write queued behind the one holding its turn, and fails the test when
+/// it has not within [`WAIT_BOUND`].
+async fn queued(output: &RemoteOutput, writes: usize) {
+    tokio::time::timeout(WAIT_BOUND, async {
+        while output.writes_queued() < writes {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{writes} writes did not queue for the turn within {WAIT_BOUND:?}"));
+}
+
+/// KR-REQ-09.12: a frame that waits for its turn is not sent once the registration behind it has
+/// been withdrawn, whatever the connection's own latch had been told. The frame has passed every
+/// check it makes before it waits; the turn is held, so no write is running and no poll of the
+/// authority is, and the withdrawal removes the registration before the turn comes free. The
+/// control: the same frame under a registration that stands is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_waiting_for_its_turn_is_not_sent_once_its_registration_is_withdrawn() {
+    for withdrawn in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        stream.writer.add_permits(1);
+        let output = Arc::new(output(&controller, &stream));
+
+        let turn = output.hold_the_turn().await;
+        let writing = tokio::spawn({
+            let output = Arc::clone(&output);
+            async move { output.write(&batch(), &[], None).await }
+        });
+        queued(&output, 1).await;
+        if withdrawn {
+            controller
+                .revoke_authority()
+                .await
+                .expect("the revocation is raised");
+        }
+        drop(turn);
+
+        let written = writing.await.expect("the write ends");
+        if withdrawn {
+            assert_eq!(
+                written,
+                Written::Withdrawn,
+                "nothing goes after a withdrawal"
+            );
+            assert!(stream.reached().is_empty(), "not a byte of it went");
+            assert!(stream.closed(), "and the connection is closed with it");
+        } else {
+            assert_eq!(
+                written,
+                Written::Sent,
+                "under a registration that stands it goes"
+            );
+            assert_eq!(stream.reached(), vec![Reached::Whole]);
+        }
+    }
+}
+
+/// KR-REQ-09.12: a revocation of one device withdraws that device's registrations and leaves every
+/// other connection's standing, so what a frame waiting for its turn is refused by is its own
+/// connection's registration and nobody else's: the survivor's frame is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_revocation_stops_its_own_frames_and_not_another_devices() {
+    use crate::service::Reach;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+    let revoked_device = DeviceId::new(kr_ipc::new_uuid());
+    let kept_device = DeviceId::new(kr_ipc::new_uuid());
+    let revoked_stream = HeldStream::new(false);
+    let kept_stream = HeldStream::new(false);
+    revoked_stream.writer.add_permits(1);
+    kept_stream.writer.add_permits(1);
+    let revoked = Arc::new(output_for(
+        &controller,
+        &revoked_stream,
+        kr_transport::listener::device_principal(&revoked_device),
+    ));
+    let kept = Arc::new(output_for(
+        &controller,
+        &kept_stream,
+        kr_transport::listener::device_principal(&kept_device),
+    ));
+
+    let revoked_turn = revoked.hold_the_turn().await;
+    let kept_turn = kept.hold_the_turn().await;
+    let revoked_write = tokio::spawn({
+        let output = Arc::clone(&revoked);
+        async move { output.write(&batch(), &[], None).await }
+    });
+    let kept_write = tokio::spawn({
+        let output = Arc::clone(&kept);
+        async move { output.write(&batch(), &[], None).await }
+    });
+    queued(&revoked, 1).await;
+    queued(&kept, 1).await;
+
+    let debt = controller
+        .owe_debt("the revocation of a device", Reach::Device(revoked_device))
+        .expect("the debt is written");
+    let own = controller.publish_debts(&[(debt, Reach::Device(revoked_device))]);
+    controller
+        .barrier(own)
+        .await
+        .expect("the barrier is raised");
+    drop(revoked_turn);
+    drop(kept_turn);
+
+    assert_eq!(
+        revoked_write.await.expect("the write ends"),
+        Written::Withdrawn
+    );
+    assert!(revoked_stream.reached().is_empty());
+    assert_eq!(kept_write.await.expect("the write ends"), Written::Sent);
+    assert_eq!(kept_stream.reached(), vec![Reached::Whole]);
 }
