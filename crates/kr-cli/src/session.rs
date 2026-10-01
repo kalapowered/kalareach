@@ -8,10 +8,11 @@
 
 use std::sync::Arc;
 
+use crate::attach::Attaching;
+use crate::bridge::link::Link;
 use kr_client::error::refusal;
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_ipc::client::LocalClient;
 use kr_protocol::attachment::ViewportPosition;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
@@ -1009,9 +1010,40 @@ impl Drop for UndeliveredTyping {
 /// Returns the host's refusal, a terminal failure, or the failure the attachment ended with.
 pub async fn run(
     descriptor: &WorkerDescriptor,
-    mut owed: UndeliveredTyping,
+    owed: UndeliveredTyping,
     options: AttachOptions,
 ) -> Result<(AttachOutcome, SessionId)> {
+    run_over(
+        Attaching::from(descriptor),
+        || crate::resolve::open_worker(descriptor, crate::build_id()),
+        owed,
+        options,
+    )
+    .await
+}
+
+/// Attaches this terminal to a session reached through `open`, and drives it until the
+/// attachment ends.
+///
+/// `open` is called once, after this terminal has been asked what it is and before the session is
+/// asked for anything. It makes the connection to the session's worker: a local socket for a
+/// session on this host, a bridge for a session in another environment. The connection is ended
+/// after the terminal is its own again, which is when anything it has to say can be said.
+///
+/// # Errors
+///
+/// Returns the host's refusal, a terminal failure, or the failure the attachment ended with.
+pub async fn run_over<L, Open, Opening>(
+    attaching: Attaching,
+    open: Open,
+    mut owed: UndeliveredTyping,
+    options: AttachOptions,
+) -> Result<(AttachOutcome, SessionId)>
+where
+    L: Link,
+    Open: FnOnce() -> Opening,
+    Opening: std::future::Future<Output = Result<L>>,
+{
     let terminal = ControllingTerminal::open()?;
     let size = terminal.size()?;
     let dimensions = Dimensions::new(u64::from(size.columns), u64::from(size.rows));
@@ -1072,16 +1104,22 @@ pub async fn run(
     // clear a person's mouse reporting on the way out of a failure that never touched it.
     guard.learn_modes(&modes);
 
-    let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
+    let mut client = match open().await {
+        Ok(client) => client,
+        Err(error) => {
+            // Nothing has begun forwarding, so the terminal's modes are put back, as they are when
+            // the probe fails, and the refusal is said once the terminal is the person's again.
+            let _ = terminal.restore(&saved, None, &modes);
+            guard.release();
+            return Err(error);
+        }
+    };
     // A worker outlives an upgrade, so it can be of a build whose screens this one cannot read.
     // Its answer to the hello says which, and that is settled before the session is asked for
     // anything: nothing is attached, no size is claimed and no lease is taken. Nothing has begun
     // forwarding either, so the terminal's modes are put back, as they are when the probe fails,
     // and the refusal is said once the terminal is the person's again.
-    if let Err(refusal) = crate::attach::check_build(
-        client.acknowledgement().build.as_ref(),
-        descriptor.display_number,
-    ) {
+    if let Err(refusal) = crate::attach::check_build(client.build(), attaching.display_number) {
         let _ = terminal.restore(&saved, None, &modes);
         guard.release();
         return Err(refusal);
@@ -1091,14 +1129,14 @@ pub async fn run(
     // exactly what a lone attachment does not need. `--take-geometry` goes further and takes the
     // claim from whoever holds it.
     let attachment: Attachment =
-        crate::attach::attach(&mut client, descriptor, dimensions, true, !options.no_probe).await?;
+        crate::attach::attach(&mut client, &attaching, dimensions, true, !options.no_probe).await?;
     // The transfer's own answer is what the loop starts from. Starting from the attach result
     // instead would leave it quoting an epoch the transfer has already moved, and believing
     // somebody else still owns the size it has just taken.
     let geometry = if options.take_geometry {
         crate::attach::take_geometry(
             &mut client,
-            descriptor,
+            &attaching,
             attachment.attachment_id,
             attachment.result.geometry.epoch,
         )
@@ -1124,7 +1162,7 @@ pub async fn run(
     // clipboard write, a bell, a query whose answer would arrive at the wrong moment.
     crate::attach::subscribe(
         &mut client,
-        descriptor.session_id,
+        attaching.session_id,
         attachment.attachment_id,
         Some(attachment.result.output_cursor.get()),
     )
@@ -1175,7 +1213,7 @@ pub async fn run(
         crate::render::ProjectedDisplay::with_keyboard(epoch.is_some(), keyboard.kitty.is_some());
     let outcome = drive(
         &mut client,
-        descriptor,
+        &attaching,
         &mut owed,
         [options.typed_before, probe.typed].concat(),
         Attached {
@@ -1231,7 +1269,9 @@ pub async fn run(
             detail
         ));
     }
-    Ok((outcome, descriptor.session_id))
+    // The connection ends here, with the terminal back and nothing on the screen to damage.
+    client.finish().await;
+    Ok((outcome, attaching.session_id))
 }
 
 /// What the attach established, which the loop then keeps up to date.
@@ -1282,8 +1322,8 @@ fn resizes_in_flight(
     reason = "one attachment is its client, its session, its terminal and everything it started with"
 )]
 async fn drive(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     owed: &mut UndeliveredTyping,
     typed_during_the_probe: Vec<u8>,
     attached: Attached,
@@ -1296,7 +1336,7 @@ async fn drive(
 ) -> AttachOutcome {
     use std::io::Write as _;
 
-    let session_id = descriptor.session_id;
+    let session_id = attaching.session_id;
     let attachment_id = attached.attachment_id;
     // `None` where this terminal may not type. What it types is then dropped rather than sent:
     // the host has already refused it the lease, so every keystroke would be one refused request,
@@ -1389,7 +1429,7 @@ async fn drive(
             };
             if !send_geometry(
                 client,
-                descriptor,
+                attaching,
                 request_id,
                 Method::AttachmentViewport,
                 &params,
@@ -1516,7 +1556,7 @@ async fn drive(
                                 window.recovering();
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
-                                if !resubscribe(client, descriptor, request_id, attachment_id).await
+                                if !resubscribe(client, attaching, request_id, attachment_id).await
                                 {
                                     return AttachOutcome::Disconnected;
                                 }
@@ -1572,7 +1612,7 @@ async fn drive(
                                 window.recovering();
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
-                                if !resubscribe(client, descriptor, request_id, attachment_id).await
+                                if !resubscribe(client, attaching, request_id, attachment_id).await
                                 {
                                     return AttachOutcome::Disconnected;
                                 }
@@ -1596,7 +1636,7 @@ async fn drive(
                             window.recovering();
                             let request_id = kr_protocol::ids::RequestId::new(next_request);
                             next_request += 1;
-                            if !resubscribe(client, descriptor, request_id, attachment_id).await {
+                            if !resubscribe(client, attaching, request_id, attachment_id).await {
                                 return AttachOutcome::Disconnected;
                             }
                             outstanding.insert(request_id, Outstanding::Resubscribe);
@@ -1719,7 +1759,7 @@ async fn drive(
                                     };
                                     if !send_geometry(
                                         client,
-                                        descriptor,
+                                        attaching,
                                         request_id,
                                         Method::TerminalResize,
                                         &params,
@@ -1810,7 +1850,7 @@ async fn drive(
                 };
                 if !send_geometry(
                     client,
-                    descriptor,
+                    attaching,
                     request_id,
                     Method::TerminalResize,
                     &params,
@@ -1982,15 +2022,15 @@ async fn drive(
 /// A resynchronisation marker says the view is no longer continuous; this is how the view is made
 /// continuous again. The screen arrives as ordinary output on the same stream.
 async fn resubscribe(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     request_id: kr_protocol::ids::RequestId,
     attachment_id: kr_protocol::ids::AttachmentId,
 ) -> bool {
     let mut streams = kr_protocol::scalars::CanonicalSet::new();
     streams.insert(kr_protocol::recovery::EventStream::Output);
     let params = kr_protocol::recovery::EventsSubscribeParams {
-        session_id: descriptor.session_id,
+        session_id: attaching.session_id,
         attachment_id,
         streams,
         from_cursor: kr_protocol::scalars::Nullable::null(),
@@ -2004,11 +2044,7 @@ async fn resubscribe(
         method_version: kr_protocol::method::MethodVersion::V1,
         params,
     };
-    client
-        .writer()
-        .write_message(&ControlFrame::Request(request))
-        .await
-        .is_ok()
+    client.send(ControlFrame::Request(request)).await.is_ok()
 }
 
 /// Writes one batch of terminal input on this loop's own connection.
@@ -2016,7 +2052,7 @@ async fn resubscribe(
 /// Returns whether it reached the socket. Its answer comes back through the loop, like every other
 /// answer on this connection.
 async fn send_input(
-    client: &mut LocalClient,
+    client: &mut impl Link,
     request_id: kr_protocol::ids::RequestId,
     session_id: SessionId,
     attachment_id: kr_protocol::ids::AttachmentId,
@@ -2035,8 +2071,7 @@ async fn send_input(
         return false;
     };
     client
-        .writer()
-        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+        .send(ControlFrame::Request(kr_protocol::envelope::Request {
             request_id,
             method: Method::InputWrite.into(),
             method_version: kr_protocol::method::MethodVersion::V1,
@@ -2051,8 +2086,8 @@ async fn send_input(
 /// Returns whether it reached the socket. The answer comes back through the loop, like every other
 /// answer on this connection.
 async fn send_geometry<T: serde::Serialize + ?Sized>(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
+    client: &mut impl Link,
+    attaching: &Attaching,
     request_id: kr_protocol::ids::RequestId,
     method: Method,
     params: &T,
@@ -2066,17 +2101,16 @@ async fn send_geometry<T: serde::Serialize + ?Sized>(
         method_version: kr_protocol::method::MethodVersion::V1,
         action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
         grant_id: kr_protocol::scalars::Nullable::null(),
-        target: crate::attach::target(descriptor),
+        target: attaching.target(),
         expected: kr_protocol::envelope::ParamsValue::empty(),
-        action_window_id: client.action_window().action_window_id.clone(),
+        action_window_id: client.action_window_id(),
         requested_ttl_ms: kr_protocol::scalars::DurationMs::new(
             kr_protocol::limits::DEFAULT_MUTATION_TTL.get(),
         ),
         params,
     };
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(ControlFrame::Mutation(Box::new(mutation)))
         .await
         .is_ok()
 }

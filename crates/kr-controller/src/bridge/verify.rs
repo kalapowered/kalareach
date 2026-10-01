@@ -49,6 +49,9 @@ pub async fn through_bridge(
         origin_environment_id,
         build_id,
         BridgeTarget::Controller,
+        // A refresh looks at what is running. Starting a destination's daemon is for create and
+        // attach, which say so themselves.
+        false,
     )?;
     let mut invocation = opening.launch().await?;
     let answer = invocation

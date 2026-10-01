@@ -508,6 +508,7 @@ fn a_network_actor_is_refused_a_bridge_before_a_process_exists() {
             EnvironmentId::new(Uuid::from_bytes([9; 16])),
             build(),
             BridgeTarget::Controller,
+            false,
         );
         if ingress == ActorIngress::LocalIpc {
             let opening = outcome.expect("a local invocation opens a bridge");
@@ -797,6 +798,13 @@ fn answered_as(environment_id: EnvironmentId) -> Vec<BridgeFrame> {
     vec![
         BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
             protocol_version: PROTOCOL_VERSION,
+            build: Some(kr_protocol::local::LocalBuild::this(
+                kr_protocol::ids::BuildId::new("kr/0.1.0").expect("a build"),
+            )),
+            base: kr_protocol::identity::DestinationBase {
+                home: "/home/kala".to_owned(),
+                variables: Vec::new(),
+            },
             environment_id,
             os_user: "kala".to_owned(),
             role: LocalRole::Controller,
