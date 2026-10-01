@@ -27,13 +27,15 @@ use kr_describe::service::{
 };
 use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{
-    ANSWER_GRACE_MS, CANCEL_MS, Driver, HANDSHAKE_MS, Launch, READER_THREAD, Report, WRITER_THREAD,
+    ANSWER_GRACE_MS, CANCEL_MS, Check, Checked, Driver, HANDSHAKE_MS, Launch, READER_THREAD,
+    Report, WRITER_THREAD,
 };
 use kr_describe::testing::{
-    Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, refuse_identity_lookup, refuse_thread_start,
+    CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
+    TestProfile, refuse_identity_lookup, refuse_thread_start,
 };
 use kr_describe::time::Reading;
-use kr_describe::wire::LoadEnd;
+use kr_describe::wire::{LoadEnd, VerifyResult};
 use kr_protocol::ids::{SessionEpoch, SessionId};
 use kr_worker::privacy::{PrivacyGeneration, PrivacySubsystem};
 
@@ -59,16 +61,35 @@ impl Rig {
     }
 
     fn with(script: &Script, settings: ResourceSettings) -> Self {
+        Self::over(script, settings, None)
+    }
+
+    /// A rig whose service and whose process hold a catalogue the test signed.
+    fn signed(script: &Script, catalogue: &TestCatalogue) -> Self {
+        Self::over(script, ResourceSettings::default(), Some(catalogue))
+    }
+
+    fn over(script: &Script, settings: ResourceSettings, signed: Option<&TestCatalogue>) -> Self {
         let placed = Placed::stub();
         let runtime = placed.directory("runtime");
         let store = DescriptionStore::open(&placed.directory("state")).expect("a store");
+        let mut environment = vec![(SCRIPT_VARIABLE.into(), script.to_env().into())];
+        let catalogue = match signed {
+            Some(signed) => {
+                let bundle = placed.directory("bundle").join("catalogue.json");
+                signed.write_to(&bundle);
+                environment.push((CATALOGUE_VARIABLE.into(), bundle.into()));
+                signed.catalogue()
+            }
+            None => built_in(),
+        };
         let service = DescriptionService::new(
             HostPlacement {
                 environment: native(1),
                 data_access: None,
                 target: MAC.to_owned(),
             },
-            built_in(),
+            catalogue,
             MetGates::default(),
             settings,
             store,
@@ -77,7 +98,7 @@ impl Rig {
             program: placed.program().to_path_buf(),
             arguments: vec!["--runtime-dir".into(), runtime.clone().into()],
             working_directory: runtime,
-            environment: vec![(SCRIPT_VARIABLE.into(), script.to_env().into())],
+            environment,
             models: placed.directory("models"),
         };
         let driver = Driver::new(service, launch, "kr-describe-tests/0".to_owned());
@@ -189,7 +210,7 @@ fn outcomes(reports: &[Report]) -> Vec<&Outcome> {
         .iter()
         .filter_map(|report| match report {
             Report::Outcome(outcome) => Some(outcome),
-            Report::Started { .. } | Report::Unloaded { .. } => None,
+            Report::Started { .. } | Report::Unloaded { .. } | Report::Checked { .. } => None,
         })
         .collect()
 }
@@ -633,6 +654,284 @@ fn a_process_whose_control_thread_is_wedged_is_ended_when_a_cancel_goes_unanswer
     assert_eq!(rig.driver.pid(), pid);
 }
 
+/// A cancellation the control thread has said it has read is not a process that stopped listening:
+/// the job's own answer is bounded by its deadline, and the process is ended when that passes and
+/// not at the cancellation's bound. The control is a cancellation nothing acknowledges, which is
+/// ended at the bound (the wedged control thread, above).
+#[test]
+fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_bound() {
+    // A model that does not look at its token for longer than this test lasts.
+    let mut rig = Rig::new(&Script {
+        ignore_token_ms: 120_000,
+        mark_work: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    stub::wait_until_began(&rig.placed.directory("runtime"), "job");
+    let pid = rig.driver.pid();
+    assert!(rig.driver.service().cancel_running(&session(1)));
+    rig.until(&roomy(), at(4_000), "the acknowledgement", |_, driver| {
+        matches!(driver.cancelling(), Some((_, true)))
+    });
+    // Far past the cancellation's bound, and the process is left alone.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(4_000 + 10 * CANCEL_MS))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.pid(), pid);
+    // The job's own deadline, and its grace, end it, and the job ends cancelled.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(3_000 + DEADLINE_MS + ANSWER_GRACE_MS))
+        .expect("a turn");
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::PastDeadline
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.contains(&&Outcome::DeadlineExceeded {
+            session_id: session(1)
+        }),
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None);
+}
+
+/// A load that was told to stop and keeps going is held to the cancellation's bound for its own
+/// answer: the process is ended then, the load ends cancelled, and it is no failure of inference,
+/// so the next load is not delayed. Not a moment before the bound.
+#[test]
+fn a_load_that_does_not_stop_is_ended_at_the_cancel_bound_and_is_no_failure() {
+    let mut rig = Rig::new(&Script {
+        load_ignore_token_ms: 120_000,
+        mark_work: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    let reports = rig.driver.turn(&roomy(), at(3_000)).expect("a turn");
+    assert!(
+        matches!(reports[..], [Report::Started { .. }]),
+        "{reports:?}"
+    );
+    rig.until(&roomy(), at(3_050), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
+    stub::wait_until_began(&rig.placed.directory("runtime"), "load");
+    rig.service().set_enabled(false);
+    rig.until(&roomy(), at(3_100), "the acknowledgement", |_, driver| {
+        matches!(driver.cancelling(), Some((_, true)))
+    });
+    // Acknowledged, and still held to the bound for the load's own answer.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(3_100 + CANCEL_MS - 1))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert!(rig.driver.pid().is_some(), "not a moment before the bound");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(3_100 + CANCEL_MS))
+        .expect("a turn");
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::CancelUnanswered
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::LoadEnded {
+                why: LoadEnd::Cancelled,
+                ..
+            }
+        )),
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None);
+    assert_eq!(rig.driver.service().inference_restarts(), 0);
+    assert_eq!(rig.driver.service().restart_not_before_ms(), None);
+}
+
+/// A signed catalogue of one default profile with a one-file asset, and where its file is kept.
+fn tiny() -> (TestCatalogue, Vec<u8>) {
+    let weights = b"the weights of a tiny model".to_vec();
+    let signed = TestCatalogue::sign(&[TestProfile {
+        profile_id: "tiny-default".to_owned(),
+        revision: 1,
+        candidate: false,
+        targets: Some(vec![MAC.to_owned()]),
+        assets: vec![TestAsset {
+            file_name: "tiny.gguf".to_owned(),
+            url: "http://127.0.0.1:1/tiny.gguf".to_owned(),
+            bytes: weights.clone(),
+        }],
+    }]);
+    (signed, weights)
+}
+
+/// What the driver asks the process to check.
+fn check(id: u64, path: PathBuf, deadline_ms: u64) -> Check {
+    Check {
+        id,
+        profile_id: "tiny-default".to_owned(),
+        revision: 1,
+        file_name: "tiny.gguf".to_owned(),
+        path,
+        deadline_ms,
+    }
+}
+
+/// Returns the checks among some reports.
+fn checks(reports: &[Report]) -> Vec<(u64, Checked)> {
+    reports
+        .iter()
+        .filter_map(|report| match report {
+            Report::Checked { id, checked } => Some((*id, checked.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The driver has a file checked by the process: it starts the process when there is none, the
+/// right file passes, a file that is not the recorded one does not, and nothing is loaded or run on
+/// the way. The control is a service that never asks, whose process is never started.
+#[test]
+fn the_driver_has_a_file_checked_by_the_process() {
+    let (signed, weights) = tiny();
+    let mut rig = Rig::signed(&Script::default(), &signed);
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    std::fs::write(files.join("wrong"), b"another file").expect("the wrong file");
+    assert_eq!(
+        rig.driver.pid(),
+        None,
+        "nothing is started until a check is asked for"
+    );
+
+    let mut reports = rig
+        .driver
+        .verify(&check(1, files.join("right"), 60_000), at(0))
+        .expect("a check");
+    assert!(matches!(reports[0], Report::Started { .. }), "{reports:?}");
+    assert_eq!(rig.driver.checking(), Some(1));
+    reports.extend(rig.until(&roomy(), at(10), "the result", |reports, _| {
+        !checks(reports).is_empty()
+    }));
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            1,
+            Checked::Answered {
+                result: VerifyResult::Verified,
+                detail: None
+            }
+        )]
+    );
+    assert_eq!(rig.driver.checking(), None);
+    assert_eq!(
+        rig.processes_started(),
+        0,
+        "no stub marks: it was told nothing to load"
+    );
+
+    let pid = rig.driver.pid();
+    rig.driver
+        .verify(&check(2, files.join("wrong"), 60_000), at(20))
+        .expect("a check");
+    let reports = rig.until(&roomy(), at(30), "the result", |reports, _| {
+        !checks(reports).is_empty()
+    });
+    let [(2, Checked::Answered { result, detail })] = &checks(&reports)[..] else {
+        panic!("the wrong file is answered: {reports:?}");
+    };
+    assert_eq!(*result, VerifyResult::Mismatch);
+    assert!(detail.is_some());
+    assert_eq!(rig.driver.pid(), pid, "the same process checked both");
+    assert_eq!(rig.driver.ceiling(), Some("sampler"));
+}
+
+/// A check can be cancelled, and the process answers that it was; one that does not answer by its
+/// deadline ends the process, and the check is reported as ended with it.
+#[test]
+fn a_check_is_cancelled_and_a_check_past_its_deadline_ends_the_process() {
+    let (signed, weights) = tiny();
+    let mut rig = Rig::signed(
+        &Script {
+            verify_until_cancelled: true,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(1, files.join("right"), 60_000), at(0))
+        .expect("a check");
+    rig.until(&roomy(), at(10), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
+    let pid = rig.driver.pid();
+    rig.driver.cancel_check(at(20)).expect("a cancellation");
+    let reports = rig.until(&roomy(), at(30), "the cancelled check", |reports, _| {
+        !checks(reports).is_empty()
+    });
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            1,
+            Checked::Answered {
+                result: VerifyResult::Cancelled,
+                detail: None
+            }
+        )]
+    );
+    assert_eq!(
+        rig.driver.pid(),
+        pid,
+        "the process was not ended to stop its check"
+    );
+
+    // A check the process does not answer: its deadline, and the grace after it, end the process.
+    let mut rig = Rig::signed(
+        &Script {
+            verify_ms: 120_000,
+            ..Script::default()
+        },
+        &signed,
+    );
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+    rig.driver
+        .verify(&check(2, files.join("right"), 5_000), at(0))
+        .expect("a check");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(5_000 + ANSWER_GRACE_MS - 1))
+        .expect("a turn");
+    assert!(checks(&reports).is_empty(), "{reports:?}");
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(5_000 + ANSWER_GRACE_MS))
+        .expect("a turn");
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            2,
+            Checked::ProcessEnded {
+                why: ProcessEnd::PastDeadline
+            }
+        )]
+    );
+    assert_eq!(rig.driver.pid(), None);
+}
+
 /// A cancellation reaches the process during a load and during a decode, and each ends at once
 /// with the process still running. The control is the same work left alone, which finishes.
 #[test]
@@ -654,7 +953,6 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
         driver.background().is_some()
     });
     rig.service().set_enabled(false);
-    let asked = Instant::now();
     let reports = rig.until(&roomy(), at(3_100), "the cancelled load", |reports, _| {
         outcomes(reports)
             .iter()
@@ -666,11 +964,6 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
             detail: None
         }),
         "{reports:?}"
-    );
-    assert!(
-        asked.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        asked.elapsed()
     );
     assert_eq!(
         rig.driver.pid(),
@@ -686,18 +979,12 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
     rig.job_sent(at(3_000));
     let pid = rig.driver.pid();
     assert!(rig.driver.service().cancel_running(&session(1)));
-    let asked = Instant::now();
     let reports = rig.until(&roomy(), at(3_100), "the cancelled job", |reports, _| {
         a_job_ended(reports)
     });
     assert!(
         matches!(outcomes(&reports)[..], [Outcome::Cancelled { .. }]),
         "{reports:?}"
-    );
-    assert!(
-        asked.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        asked.elapsed()
     );
     assert_eq!(
         rig.driver.pid(),

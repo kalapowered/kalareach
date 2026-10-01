@@ -46,8 +46,8 @@ use crate::priority::{Applied, Cancellation, background_current_thread};
 use crate::profile::catalogue::Catalogue;
 use crate::profile::{Asset, ModelProfile, SamplerSettings};
 use crate::wire::{
-    Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, WIRE_VERSION,
-    WireError, read_message, write_message,
+    Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
+    WIRE_VERSION, WireError, read_message, write_message,
 };
 
 /// The longest the control thread may spend on one request before the process ends itself.
@@ -55,6 +55,9 @@ pub const CONTROL_BOUND_MS: u64 = 2_000;
 
 /// How far past its deadline a load or a job may run before the process ends itself.
 pub const OVERDUE_GRACE_MS: u64 = 2_000;
+
+/// How this process's memory ceiling is enforced: by the daemon's own reading of its resident set.
+pub const CEILING_MECHANISM: &str = "sampler";
 
 /// The file in the runtime directory whose lock one description process holds.
 pub const LOCK_FILE: &str = "describe-inference.lock";
@@ -85,6 +88,31 @@ pub trait Model: Send + 'static {
 
     /// Runs one job on the loaded model, before the deadline and unless the token is cancelled.
     fn generate(&mut self, job: &Job<'_>, token: &Cancellation, deadline: Instant) -> Generating;
+
+    /// Checks one file against the size and digest its asset records, before the deadline and
+    /// unless the token is cancelled. It needs no loaded model, and a process that has none can
+    /// do it.
+    fn verify(
+        &mut self,
+        asset: &Asset,
+        path: &Path,
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> Verifying;
+}
+
+/// What checking a file did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verifying {
+    /// The file is the one the asset records.
+    Verified,
+    /// The check ended some other way, and why.
+    Ended {
+        /// How.
+        result: VerifyResult,
+        /// What went wrong, when something did.
+        detail: Option<String>,
+    },
 }
 
 /// What a model is asked to load: a profile from the process's own catalogue, and where each of
@@ -336,6 +364,7 @@ pub fn run<M: Model>(
                     target: build_target().to_owned(),
                     identity: Nullable(kr_ipc::identity::current_process_start_identity().ok()),
                     background: Background::from(background),
+                    ceiling: CEILING_MECHANISM.to_owned(),
                 });
             }
             Ok(Some(Request::Load {
@@ -398,7 +427,46 @@ pub fn run<M: Model>(
                     });
                 }
             }
-            Ok(Some(Request::Cancel { id })) => shared.cancel(id.get()),
+            Ok(Some(Request::Verify {
+                id,
+                profile_id,
+                revision,
+                file_name,
+                path,
+                deadline_ms,
+            })) => {
+                let id = id.get();
+                let due = Instant::now() + Duration::from_millis(deadline_ms.get());
+                let token = shared.token_for(id);
+                let check = Work::Verify {
+                    id,
+                    profile_id,
+                    revision: revision.get(),
+                    file_name,
+                    path: PathBuf::from(path),
+                    due,
+                    token,
+                };
+                if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+                    work.try_send(check)
+                {
+                    shared.forget(id);
+                    shared.answer(&Answer::Verified {
+                        id: U64::new(id),
+                        result: VerifyResult::Refused,
+                        detail: Nullable::some("too much work is waiting".to_owned()),
+                    });
+                }
+            }
+            // The acknowledgement is the control thread's own, written before the work stops: it
+            // says this thread is reading, which is the condition the daemon waits for. It is
+            // sent only for work still in hand, so a cancellation that crosses the work's answer
+            // is not acknowledged after it.
+            Ok(Some(Request::Cancel { id })) => {
+                if shared.cancel(id.get()) {
+                    shared.answer(&Answer::Cancelling { id });
+                }
+            }
             // The input ended, or failed, which on a pipe the daemon holds is the same thing: the
             // daemon is not going to send anything more.
             Ok(None) | Err(WireError::Io(_)) => return shared.end(Exit::Ended),
@@ -474,7 +542,8 @@ impl Shared {
             .remove(&id);
     }
 
-    fn cancel(&self, id: u64) {
+    /// Cancels the work with this identifier, and says whether there was any in hand.
+    fn cancel(&self, id: u64) -> bool {
         if let Some(token) = self
             .tokens
             .lock()
@@ -482,6 +551,9 @@ impl Shared {
             .get(&id)
         {
             token.cancel();
+            true
+        } else {
+            false
         }
     }
 
@@ -522,6 +594,15 @@ enum Work {
         limits: JobLimits,
         due: Instant,
         ceiling_bytes: u64,
+        token: Cancellation,
+    },
+    Verify {
+        id: u64,
+        profile_id: String,
+        revision: u64,
+        file_name: String,
+        path: PathBuf,
+        due: Instant,
         token: Cancellation,
     },
 }
@@ -616,8 +697,10 @@ fn model_thread<M: Model>(
                         }
                     }
                 };
-                shared.answer(&answer);
+                // Forgotten before it is answered, so a cancellation read after the answer is seen
+                // finds nothing in hand and is acknowledged by nothing.
                 shared.forget(id);
+                shared.answer(&answer);
                 shared.work_due.store(0, Ordering::Release);
             }
             Work::Generate {
@@ -656,6 +739,8 @@ fn model_thread<M: Model>(
                         due,
                     ),
                 };
+                // Forgotten before it is answered, as a load is.
+                shared.forget(id);
                 shared.answer(&match answer {
                     Generating::Produced {
                         bytes,
@@ -673,11 +758,69 @@ fn model_thread<M: Model>(
                         detail: Nullable(detail),
                     },
                 });
+                shared.work_due.store(0, Ordering::Release);
+            }
+            Work::Verify {
+                id,
+                profile_id,
+                revision,
+                file_name,
+                path,
+                due,
+                token,
+            } => {
+                shared.work_due.store(
+                    shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
+                    Ordering::Release,
+                );
+                let ended = |result: VerifyResult, detail: Option<String>| Answer::Verified {
+                    id: U64::new(id),
+                    result,
+                    detail: Nullable(detail),
+                };
+                let answer = if token.is_cancelled() {
+                    ended(VerifyResult::Cancelled, None)
+                } else {
+                    match asset_of(catalogue, &profile_id, revision, &file_name) {
+                        Err(detail) => ended(VerifyResult::Refused, Some(detail)),
+                        Ok(asset) => match model.verify(&asset, &path, &token, due) {
+                            Verifying::Verified => ended(VerifyResult::Verified, None),
+                            Verifying::Ended { result, detail } => ended(result, detail),
+                        },
+                    }
+                };
+                // Forgotten before it is answered, so a cancellation read after the answer is seen
+                // finds nothing in hand and is acknowledged by nothing.
                 shared.forget(id);
+                shared.answer(&answer);
                 shared.work_due.store(0, Ordering::Release);
             }
         }
     }
+}
+
+/// Finds one of a profile's files in this build's catalogue, by name.
+fn asset_of(
+    catalogue: &Catalogue,
+    profile_id: &str,
+    revision: u64,
+    file_name: &str,
+) -> Result<Asset, String> {
+    let Some(profile) = catalogue.profile(profile_id) else {
+        return Err(format!("this build ships no profile called {profile_id}"));
+    };
+    if profile.revision().get() != revision {
+        return Err(format!(
+            "this build ships {profile_id} at revision {}, and revision {revision} was asked for",
+            profile.revision().get()
+        ));
+    }
+    profile
+        .assets()
+        .iter()
+        .find(|asset| asset.file_name == file_name)
+        .cloned()
+        .ok_or_else(|| format!("{profile_id} records no file called {file_name}"))
 }
 
 /// Finds a load's profile in this build's catalogue, and each of its files among the paths sent.
