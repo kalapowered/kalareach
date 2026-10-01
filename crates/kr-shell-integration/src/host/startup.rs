@@ -1152,6 +1152,16 @@ fn resolved_as_far_as_it_exists(path: &Path) -> std::io::Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 found.pop();
+                // Back out of a directory that is not there is back on one that may be: what
+                // follows is resolved again from here.
+                match std::fs::canonicalize(&found) {
+                    Ok(real) => {
+                        found = real;
+                        missing = false;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(error) => return Err(error),
+                }
             }
             Component::Normal(name) if !missing => {
                 found.push(name);
@@ -1801,6 +1811,14 @@ mod tests {
             lock_name(&linked.join("not-there/../.zshrc")).expect("a name"),
             by_real,
             "a missing directory and its `..` changed the file's lock"
+        );
+        // A link met after a missing directory is followed when the `..` has gone back out of it.
+        let alias = root.path().join("alias-to-dotfiles");
+        std::os::unix::fs::symlink(&real, &alias).expect("links the directory");
+        assert_eq!(
+            lock_name(&root.path().join("missing/../alias-to-dotfiles/.zshrc")).expect("a name"),
+            by_real,
+            "a link after a missing directory and its `..` was not followed"
         );
         // And a different file is a different lock.
         assert_ne!(lock_name(&real.join(".bashrc")).expect("a name"), by_real);
