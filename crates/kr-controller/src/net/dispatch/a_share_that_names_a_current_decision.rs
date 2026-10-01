@@ -1644,7 +1644,7 @@ async fn kr_req_10_51_a_share_abandoned_with_the_link_gives_up_the_link_and_the_
 async fn kr_req_10_51_a_share_that_stops_waiting_for_the_link_leaves_the_link_and_the_lease() {
     let named = approval(0xe9, 1_000);
     let (world, holding) = world(holding_approval(&named), holds_question_reads()).await;
-    let held_elsewhere = world
+    let mut held_elsewhere = world
         .controller
         .worker_client_of(world.session_id)
         .await
@@ -1681,7 +1681,7 @@ async fn kr_req_10_51_a_share_that_stops_waiting_for_the_link_leaves_the_link_an
     );
     assert_eq!(waited.code, ErrorCode::ResourceUnavailable, "{waited:?}");
     assert!(
-        held_elsewhere.is_some(),
+        held_elsewhere.holds_the_connection(),
         "the other operation keeps its link"
     );
     assert!(!world.controller.leases.is_fenced(world.session_id));
@@ -1690,6 +1690,8 @@ async fn kr_req_10_51_a_share_that_stops_waiting_for_the_link_leaves_the_link_an
         holding.lock().expect("held").asked.is_empty(),
         "the worker was asked nothing"
     );
+    // The other operation's work ended whole, so its link goes back as it came.
+    held_elsewhere.give_back();
     drop(held_elsewhere);
 
     // The next share is served over the link the other operation opened.

@@ -268,11 +268,11 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
         ),
         "the proxy refuses a voice right: {refused:?}"
     );
-    let mut client = controller
+    let mut held = controller
         .worker_client(&world.worker)
         .await
         .expect("the daemon's own link");
-    let link = client.as_mut().expect("the connection is open");
+    let link = held.client();
     let local = link
         .forward(
             &fake::close_request(world.environment_id, world.session_id),
@@ -308,7 +308,8 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             "a frame carrying voice.use is not encoded, however it is built and sent"
         );
     }
-    drop(client);
+    held.give_back();
+    drop(held);
     assert_eq!(
         recorded
             .lock()
@@ -1685,9 +1686,9 @@ async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
             .worker_client(&world.worker)
             .await
             .expect("the daemon's own link");
-        let link = client.as_mut().expect("the connection is open");
         let rights: CanonicalSet<ActionRight> = [ActionRight::SessionClose].into_iter().collect();
-        let answered = link
+        let answered = client
+            .client()
             .forward(
                 &fake::close_request(world.environment_id, world.session_id),
                 &world.actor,

@@ -1,12 +1,13 @@
 //! The workers this daemon knows: the directory, the one connection to each, a read from one.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use kr_ipc::client::LocalClient;
 use kr_protocol::ids::SessionId;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionSummary};
+use kr_transport::lease::WorkerBinding;
 
 use crate::directory::{KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
@@ -27,6 +28,85 @@ pub(super) const UNACCOUNTED_WORKER: &str = "unaccounted_worker";
 /// way to make it complete is an acknowledgement or a confirmed ending, so the wait has a bound and
 /// the report goes out without it.
 pub(super) const WORKER_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This daemon's link to one worker, taken out of its slot for the work its holder does over it.
+///
+/// The link goes back into the slot only when that work ended whole ([`Self::give_back`]), which is
+/// when no answer is still on its way over it and the worker's control path is as it was. Dropped
+/// any other way, because opening it failed, an exchange over it failed or ran out of time, or the
+/// future that held it was abandoned part way, it is closed instead, and the worker's lease stops
+/// renewing with it: an answer may still be on its way, the next caller would read it as its own,
+/// and the control path the lease rests on is not one this daemon can vouch for. That is done while
+/// the slot is still held, so the next caller finds the path given up already.
+///
+/// It is the path in force when the link was taken that is given up. A path bound since, by an
+/// announcement of an authority revision that waited for the slot, is not this link's to lose; one
+/// bound before, by an announcement that queued for the slot behind this link's holder, is given up
+/// with it, and that announcement's acknowledgement is then refused, so the worker stays pending
+/// until the next one.
+///
+/// A wait for the slot that runs out holds nothing and so gives nothing up: it is not a failure of
+/// the link, only of the wait. The daemon is held only weakly, so a daemon let go while a link is
+/// out is not kept alive by it.
+pub(crate) struct WorkerLink {
+    daemon: Weak<Controller>,
+    session_id: SessionId,
+    /// The control path the worker was on when the slot was taken.
+    binding: WorkerBinding,
+    /// The link, out of the slot. It is declared before `slot`, so it is closed before the slot is
+    /// released.
+    client: Option<LocalClient>,
+    /// Whether the link went back whole, or was never put at risk.
+    returned: bool,
+    /// The slot, held from taking the link until the link is dropped.
+    slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+}
+
+impl WorkerLink {
+    /// The link, for the exchange. It was opened when the slot was empty.
+    pub(crate) fn client(&mut self) -> &mut LocalClient {
+        self.client.as_mut().expect("the link is out of its slot")
+    }
+
+    /// Whether this link still holds the connection it was taken with, which is so until it goes
+    /// back into the slot.
+    #[cfg(test)]
+    pub(crate) const fn holds_the_connection(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Puts the link back into the slot, because the work it was taken for ended whole: an
+    /// answer, including a refusal, that was read to its end. The slot stays held, so what the
+    /// holder still has to do in order, such as recording what the worker said, is done before the
+    /// next caller has the link; and the link is no longer at risk, so a holder dropped from here
+    /// gives nothing up.
+    pub(crate) fn give_back(&mut self) {
+        *self.slot = self.client.take();
+        self.returned = true;
+    }
+}
+
+impl Drop for WorkerLink {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        if let Some(daemon) = self.daemon.upgrade() {
+            daemon.leases.stop_renewal(self.session_id, self.binding);
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkerLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerLink")
+            .field("session_id", &self.session_id)
+            .field("binding", &self.binding)
+            .field("returned", &self.returned)
+            .finish_non_exhaustive()
+    }
+}
 
 impl Controller {
     /// Records that a worker's control path was lost, wherever the loss was noticed.
@@ -87,7 +167,7 @@ impl Controller {
         patience: Option<std::time::Duration>,
     ) -> Result<SessionReadResult> {
         let deadline = patience.map(|patience| tokio::time::Instant::now() + patience);
-        let mut held = match deadline {
+        let mut link = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, self.worker_client(worker))
                 .await
                 .map_err(|_| {
@@ -95,18 +175,16 @@ impl Controller {
                 })??,
             None => self.worker_client(worker).await?,
         };
-        let client = held.as_mut().expect("the connection is open");
         let params = SessionReadParams {
             session_id: worker.descriptor.session_id,
         };
-        let asked = client.request(Method::SessionRead, &params);
+        let asked = link.client().request(Method::SessionRead, &params);
         let result = match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, asked).await {
                 Ok(result) => result,
+                // The request was abandoned, so this connection has an answer nobody will read.
+                // The link goes with it, not back to the slot: the next call opens a new one.
                 Err(_) => {
-                    // The request was abandoned, so this connection has an answer nobody will
-                    // read. It ends here; the next call opens a new one.
-                    *held = None;
                     return Err(ControllerError::supervision(
                         "the worker did not answer in time",
                     ));
@@ -114,54 +192,59 @@ impl Controller {
             },
             None => asked.await,
         };
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                // A transport failure ends this connection. The next call opens a new one and
-                // presents the generation again rather than writing into a socket that is gone,
-                // and renewal stops with the path rather than outliving it.
-                *held = None;
-                self.lost_control_path(worker.descriptor.session_id);
-                return Err(error.into());
-            }
-        };
+        // A transport failure ends this connection. The next call opens a new one and presents the
+        // generation again rather than writing into a socket that is gone, and renewal stops with
+        // the path rather than outliving it: the link is dropped, which does both. An answer
+        // that is a refusal is a whole exchange, and the link goes back.
+        let result = result?;
+        link.give_back();
         let read = match result {
             Ok(value) => reported_read(&value)
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
             Err(error) => return Err(ControllerError::InvalidArgument(error.to_string())),
         };
         // Kept for the moment this worker can no longer be asked (`Directory::ending`), while the
-        // link is still held: every exchange with this worker runs over it in turn, so what the
+        // slot is still held: every exchange with this worker runs over it in turn, so what the
         // worker said is kept in the order it said it.
         self.directory
             .lock()
             .await
             .heard(worker.descriptor.session_id, &read.session);
-        drop(held);
+        drop(link);
         Ok(read)
     }
 
     /// Returns this daemon's one connection to a worker, opening it if there is none.
     ///
-    /// The guard is held for the whole call, so two operations against one worker run in order
-    /// rather than racing each other's authority.
-    pub(super) async fn worker_client(
-        &self,
-        worker: &KnownWorker,
-    ) -> Result<tokio::sync::OwnedMutexGuard<Option<LocalClient>>> {
-        let link = {
+    /// The slot is held for as long as the link is, so two operations against one worker run in
+    /// order rather than racing each other's authority. A wait for the slot is the caller's to
+    /// bound, and one that runs out gives up nothing ([`WorkerLink`]); a link that cannot be opened
+    /// is a failure of the path, and the worker's lease stops renewing with it.
+    pub(super) async fn worker_client(&self, worker: &KnownWorker) -> Result<WorkerLink> {
+        let slot = {
             let mut connections = self.connections.lock().await;
             Arc::clone(
                 connections
                     .entry(worker.descriptor.session_id)
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
             )
-        };
-        let mut held = link.lock_owned().await;
-        if held.is_none() {
-            *held = Some(self.open_worker(worker).await?);
         }
-        Ok(held)
+        .lock_owned()
+        .await;
+        let session_id = worker.descriptor.session_id;
+        let mut slot = slot;
+        let mut link = WorkerLink {
+            daemon: self.me.clone(),
+            session_id,
+            binding: self.leases.binding(session_id),
+            client: slot.take(),
+            returned: false,
+            slot,
+        };
+        if link.client.is_none() {
+            link.client = Some(self.open_worker(worker).await?);
+        }
+        Ok(link)
     }
 
     /// Returns this daemon's one connection to the worker of one session.
@@ -169,10 +252,7 @@ impl Controller {
     /// The directory is what says where that worker is. A session the directory does not list has
     /// no connection to open, which is a worker this daemon has not reached rather than an error
     /// about the session.
-    pub(super) async fn worker_client_of(
-        &self,
-        session_id: SessionId,
-    ) -> Result<tokio::sync::OwnedMutexGuard<Option<LocalClient>>> {
+    pub(super) async fn worker_client_of(&self, session_id: SessionId) -> Result<WorkerLink> {
         let worker = self.directory.lock().await.get(session_id).cloned();
         let worker = worker.ok_or_else(|| ControllerError::UnknownSession {
             session: session_id.to_string(),

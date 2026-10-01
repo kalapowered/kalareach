@@ -773,6 +773,10 @@ mod the_fence_at_every_effect;
 #[cfg(test)]
 mod a_peer_that_stops_reading;
 
+/// This daemon's link to a worker, given up whenever what it carried did not end whole.
+#[cfg(test)]
+mod a_link_that_is_not_given_back;
+
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
 #[cfg(test)]

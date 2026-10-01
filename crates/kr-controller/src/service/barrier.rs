@@ -317,15 +317,14 @@ impl Controller {
             let binding = self.leases.bind(session_id);
             let outcome = {
                 match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await {
-                    Ok(Ok(mut held)) => {
-                        let client = held.as_mut().expect("the connection is open");
+                    Ok(Ok(mut link)) => {
                         // Bounded, because a worker that will not answer must not stop the
                         // revocation from reporting `pending` for it, and must not stop the
                         // announcement reaching the workers after it. Section 9 makes waiting the
                         // opposite of completion.
                         let answered = tokio::time::timeout(
                             WORKER_EXCHANGE,
-                            client.announce_revision(
+                            link.client().announce_revision(
                                 kr_protocol::worker::AuthorityRevisionNotice {
                                     environment_id: self.paths.environment_id(),
                                     revision,
@@ -335,20 +334,20 @@ impl Controller {
                         )
                         .await;
                         match answered {
-                            Ok(Ok(ack)) => Some(ack),
-                            Ok(Err(_)) | Err(_) => {
-                                // An exchange that failed or ran out leaves a client whose stream
-                                // position nothing knows, so it is retired rather than returned.
-                                *held = None;
-                                self.leases.stop_renewal(session_id, binding);
-                                None
+                            Ok(Ok(ack)) => {
+                                link.give_back();
+                                Some(ack)
                             }
+                            // An exchange that failed or ran out leaves a client whose stream
+                            // position nothing knows, so the link is closed rather than returned,
+                            // and the path it was on is given up with it as it goes out of scope.
+                            Ok(Err(_)) | Err(_) => None,
                         }
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        self.leases.stop_renewal(session_id, binding);
-                        None
-                    }
+                    // The wait for the link ran out: another operation holds it, and what that
+                    // operation does with it is its own to answer for, so nothing is given up
+                    // here. A link that could not be opened has given up its own path.
+                    Ok(Err(_)) | Err(_) => None,
                 }
             };
             match outcome {
@@ -465,23 +464,22 @@ impl Controller {
                 evidence_from: from,
             };
             let answered = {
-                let Ok(Ok(mut held)) =
+                // A wait for the link that runs out is not a loss of the path: another operation
+                // holds it. A link that could not be opened has given up its own path.
+                let Ok(Ok(mut link)) =
                     tokio::time::timeout(WORKER_EXCHANGE, self.worker_client_of(session_id)).await
                 else {
-                    self.lost_control_path(session_id);
                     return;
                 };
-                let Some(client) = held.as_mut() else {
-                    return;
-                };
-                match tokio::time::timeout(WORKER_EXCHANGE, client.announce_revision(notice)).await
+                match tokio::time::timeout(WORKER_EXCHANGE, link.client().announce_revision(notice))
+                    .await
                 {
-                    Ok(Ok(ack)) => Some(ack),
-                    Ok(Err(_)) | Err(_) => {
-                        *held = None;
-                        self.lost_control_path(session_id);
-                        None
+                    Ok(Ok(ack)) => {
+                        link.give_back();
+                        Some(ack)
                     }
+                    // Closed with its path given up as the link goes out of scope.
+                    Ok(Err(_)) | Err(_) => None,
                 }
             };
             let Some(ack) = answered else {
