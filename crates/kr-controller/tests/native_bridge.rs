@@ -759,6 +759,14 @@ fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
             r#"{"command": "other-command"}"#,
         ),
         ("enabledPlugins.a.b", "true"),
+        // A plugin the recipe did not install, a key without the suffix that names the source,
+        // a value that is the text "true" or has anything beside it.
+        ("enabledPlugins.another-plugin@skills-dir", "true"),
+        ("enabledPlugins.kalareach-channels", "true"),
+        ("enabledPlugins.kalareach-channels@other", "true"),
+        ("enabledPlugins.kalareach-channels@skills-dir", r#""true""#),
+        ("enabledPlugins.kalareach-channels@skills-dir", " true"),
+        ("enabledPlugins.Kalareach-Channels@skills-dir", "true"),
         ("enabledPlugins.", "true"),
         ("enabledPlugins.bad name", "true"),
         ("permissions.allow", r#"["Bash(*)"]"#),
@@ -783,14 +791,10 @@ fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
     // The same key in another document is not the one this host names.
     let site = Site::new();
     let before = site.tree();
-    let mut recipe = serde_json::to_value(recipe_adding_key(
-        "enabledPlugins.another-plugin@skills-dir",
-        "true",
-    ))
-    .expect("the recipe encodes");
+    let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
     for list in ["install", "remove"] {
         for step in recipe[list].as_array_mut().expect("steps") {
-            if step["key"] == "enabledPlugins.another-plugin@skills-dir" {
+            if step["file"] == "settings.json" {
                 step["file"] = serde_json::json!("settings.local.json");
             }
         }
@@ -809,9 +813,129 @@ fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
+    // The control: the recipe itself, which installs one registration and enables that one.
+    let site = Site::new();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+}
+
+/// The recipe of release 0.3.0 with its registration under `directory` and the key that enables
+/// it named for the same: the one set of names a recipe may use for itself.
+#[cfg(unix)]
+fn recipe_named(directory: &str) -> NativeBridge {
+    let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            for member in ["destination", "key"] {
+                if let Some(text) = step[member].as_str() {
+                    step[member] = serde_json::json!(text.replace("kalareach-channels", directory));
+                }
+            }
+        }
+    }
+    serde_json::from_value(recipe).expect("a recipe")
+}
+
+/// A native bridge installs the registration files its application reads from one directory of
+/// its own and nothing else: a settings document (which a recipe could make hold a helper command
+/// no key table sees), a file in another directory or in more than one, one that is nested deeper,
+/// a name in another case, and a name the table does not list are refused before anything is
+/// written, and the key that enables a registration names the directory the files are in. The
+/// control is the same recipe under another name, which is applied.
+#[cfg(unix)]
+#[test]
+fn a_file_a_bridge_installs_outside_the_registration_this_host_names_is_refused() {
+    let helper: &[u8] = br#"{"apiKeyHelper": "other-command"}"#;
+    let destinations = [
+        "settings.json",
+        "Settings.json",
+        "settings.local.json",
+        "skills/kalareach-channels/settings.json",
+        "skills/kalareach-channels/helper.json",
+        "skills/kalareach-channels/.MCP.json",
+        "skills/kalareach-channels/hooks/hooks.JSON",
+        "skills/kalareach-channels/hooks/extra/hooks.json",
+        "Skills/kalareach-channels/hooks/hooks.json",
+        "skills/Kalareach-Channels/hooks/hooks.json",
+        "skills/kalareach.channels/hooks/hooks.json",
+        "skills/hooks/hooks.json",
+        "plugins/kalareach-channels/hooks/hooks.json",
+    ];
+    for destination in destinations {
+        let site = Site::new();
+        let before = site.tree();
+        std::fs::write(site.package("a").join("bridge/hooks.json"), helper).expect("changes it");
+        let digest = PayloadDigest::of(helper).to_string();
+        let mut recipe =
+            serde_json::to_value(recipe_with_hooks(&digest)).expect("the recipe encodes");
+        for list in ["install", "remove"] {
+            for step in recipe[list].as_array_mut().expect("steps") {
+                if step["destination"] == HOOKS_PATH {
+                    step["destination"] = serde_json::json!(destination);
+                }
+            }
+        }
+        let target = BridgeTarget {
+            recipe: serde_json::from_value(recipe).expect("a recipe"),
+            ..site.release()
+        };
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+        let reason = refused(&settled);
+        assert!(
+            reason.contains("does not permit a native bridge"),
+            "{destination}: {reason}"
+        );
+        assert_eq!(site.tree(), before, "{destination}: nothing was written");
+    }
+    // Two directories, and a key for a directory the files are not in.
+    let site = Site::new();
+    let before = site.tree();
+    let mut split = serde_json::to_value(recipe()).expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        for step in split[list].as_array_mut().expect("steps") {
+            if step["destination"] == SERVERS_PATH {
+                step["destination"] = serde_json::json!("skills/other/.mcp.json");
+            }
+        }
+    }
+    let target = BridgeTarget {
+        recipe: serde_json::from_value(split).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("more than one directory"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+    // A key that comes first in the recipe is held to the files that follow it.
+    let site = Site::new();
+    let mut reordered = serde_json::to_value(recipe()).expect("the recipe encodes");
+    let steps = reordered["install"].as_array_mut().expect("steps");
+    let key = steps.pop().expect("the key step");
+    steps.insert(0, key);
+    let target = BridgeTarget {
+        recipe: serde_json::from_value(reordered).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "{settled:?}");
+    // The control: the whole recipe under another name.
     let site = Site::new();
     let target = BridgeTarget {
-        recipe: recipe_adding_key("enabledPlugins.another-plugin@skills-dir", "true"),
+        recipe: recipe_named("another-name"),
         ..site.release()
     };
     let settled = site
@@ -823,9 +947,9 @@ fn a_configuration_key_the_host_does_not_permit_a_bridge_to_add_is_refused() {
 
 /// A file a recipe installs is JSON this host can read, whatever its name says, or the recipe is
 /// refused: an application that reads it more leniently, or runs it as a script, would act on
-/// bytes this host never checked. A script, a name in other case, a comment, a trailing comma, text
-/// that is not JSON, a document nested deeper than this host reads and an empty file are each
-/// refused, and nothing is written. The control is the same file as JSON.
+/// bytes this host never checked. A script, a comment, a trailing comma, text that is not JSON, a
+/// document nested deeper than this host reads and an empty file are each refused, and nothing is
+/// written. The control is the same file as JSON.
 #[cfg(unix)]
 #[test]
 fn a_file_a_recipe_installs_that_is_not_json_this_host_can_read_is_refused() {
@@ -861,36 +985,6 @@ fn a_file_a_recipe_installs_that_is_not_json_this_host_can_read_is_refused() {
         );
         assert_eq!(site.tree(), before, "nothing was written");
     }
-    // A name in other case is no way round it: the content decides.
-    let site = Site::new();
-    let script: &[u8] = b"#!/bin/sh\nother-command\n";
-    std::fs::write(site.package("a").join("bridge/hooks.json"), script).expect("changes it");
-    let mut recipe =
-        serde_json::to_value(recipe_with_hooks(&PayloadDigest::of(script).to_string()))
-            .expect("the recipe encodes");
-    for list in ["install", "remove"] {
-        for step in recipe[list].as_array_mut().expect("steps") {
-            if step["destination"] == HOOKS_PATH {
-                step["destination"] =
-                    serde_json::json!("skills/kalareach-channels/hooks/HOOKS.JSON");
-            }
-        }
-    }
-    let before = site.tree();
-    let target = BridgeTarget {
-        recipe: serde_json::from_value(recipe).expect("a recipe"),
-        ..site.release()
-    };
-    let settled = site
-        .bridges()
-        .reconcile(&plugin(), Some(&target))
-        .expect("reconciles");
-    assert!(
-        refused(&settled).contains("cannot be read as JSON"),
-        "{settled:?}"
-    );
-    assert_eq!(site.tree(), before, "nothing was written");
-
     let site = Site::new();
     let json: &[u8] = b"{\"hooks\": {}}";
     std::fs::write(site.package("a").join("bridge/hooks.json"), json).expect("changes it");
@@ -2522,36 +2616,6 @@ fn an_object_at_a_former_temporary_name_does_not_hide_what_was_published() {
         checked += 1;
     }
     assert_eq!(checked, 2);
-}
-
-/// A settings document the key would create is held to the size this host reads back, as one it
-/// edits is: a recipe key that would make it larger is refused before anything is written. The
-/// value a bridge adds is `true`, so the size is the key's.
-#[cfg(unix)]
-#[test]
-fn a_settings_document_the_key_would_create_past_the_limit_is_refused() {
-    let site = Site::with_settings(None);
-    let before = site.tree();
-    let long = format!("enabledPlugins.{}", "a".repeat(1 << 20));
-    let mut target = site.release();
-    for step in &mut target.recipe.install {
-        if let kr_plugin_sdk::plugin::BridgeStep::AddConfigurationKey { key, .. } = step {
-            key.clone_from(&long);
-        }
-    }
-    for removal in &mut target.recipe.remove {
-        if let kr_plugin_sdk::plugin::BridgeRemoval::RemoveConfigurationKey { key, .. } = removal {
-            key.clone_from(&long);
-        }
-    }
-
-    let settled = site
-        .bridges()
-        .reconcile(&plugin(), Some(&target))
-        .expect("reconciles");
-
-    assert!(refused(&settled).contains("larger than"), "{settled:?}");
-    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// A staged write that fails takes back the file it made, and never a file somebody put at its
