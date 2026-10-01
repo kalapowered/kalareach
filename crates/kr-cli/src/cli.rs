@@ -1136,10 +1136,13 @@ pub struct NewArguments {
     /// own default is used when neither is given.
     #[command(flatten)]
     pub execution: Execution,
-    /// The environment to create in.
+    /// The environment to create in: one of this host's own, by identifier, or an enrolled WSL
+    /// distribution or container, by label or identifier. Creating in an enrolled environment
+    /// starts it, and its control daemon, when it is stopped.
     #[arg(long)]
     pub environment: Option<String>,
-    /// The working directory the root shell starts in.
+    /// The working directory the root shell starts in. In an enrolled environment it is a path
+    /// there, and the user's home there is used when it is absent.
     #[arg(long)]
     pub cwd: Option<String>,
     /// The shell to launch. The environment's configured default is used when this is absent.
@@ -1221,7 +1224,9 @@ pub struct AttachArguments {
     /// scrolled back with Shift and Page Up stays where it was put.
     #[arg(long)]
     pub follow_live: bool,
-    /// The environment, when a display number is ambiguous.
+    /// The environment, when a display number is ambiguous: one of this host's own, by identifier,
+    /// or an enrolled WSL distribution or container, by label or identifier, which attaching
+    /// starts when it is stopped.
     #[arg(long)]
     pub environment: Option<String>,
 }
