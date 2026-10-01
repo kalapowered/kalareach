@@ -143,6 +143,10 @@ pub struct DeliveryModule {
     /// ([`crate::privacy::EnvironmentPrivacy::open`]); until something does, it is generation 0 with
     /// privacy mode off, which is what an environment that never turned privacy mode on is.
     privacy: crate::privacy::PrivacyState,
+    /// Where this host's own tests stop a key registration before it asks its admission, and
+    /// again once the journal has taken it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    key_write: [crate::attention::Pause; 2],
 }
 
 /// What storing one destination's credential did.
@@ -191,7 +195,33 @@ impl DeliveryModule {
             producer: Mutex::new(producer),
             secrets,
             privacy: crate::privacy::PrivacyState::default(),
+            #[cfg(feature = "testing")]
+            key_write: Default::default(),
         })
+    }
+
+    /// Stops the next key registration before it asks its admission. Returns the end that says it
+    /// has arrived and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_key_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.key_write[0].arm()
+    }
+
+    /// Stops the next key registration once the journal has taken it, before the device directory
+    /// is completed.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_key_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.key_write[1].arm()
     }
 
     /// Returns the privacy state this module's exchanges are admitted under, for the environment's
@@ -368,10 +398,14 @@ impl DeliveryModule {
                 .max()
                 .map(TimestampMs::new);
             push.preview_keys = push.preview_keys.rotated(key, revision, outstanding);
+            #[cfg(feature = "testing")]
+            self.key_write[0].wait();
             admitted()?;
             journal
                 .configure_destination(&record)
                 .map_err(unavailable)?;
+            #[cfg(feature = "testing")]
+            self.key_write[1].wait();
             Ok(true)
         })
     }

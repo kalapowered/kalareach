@@ -1289,3 +1289,371 @@ pub(super) fn declaration_answer(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use kr_delivery::destination::{
+        DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
+    };
+    use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{
+        ActionId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision, GrantId,
+        InstallationId, PushSenderRecordId,
+    };
+    use kr_protocol::pairing::{DeviceName, DevicePlatform};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{
+        AuthorisationKey, CanonicalSet, EndpointKey, Nullable, TimestampMs, Uuid,
+    };
+
+    use crate::authority::AdmittedMutation;
+    use crate::service::admission::AdmittedConnection;
+    use crate::service::net::devices::DeviceRecord;
+    use crate::service::net::tests::{daemon_on, manual_clocks};
+    use crate::service::{Controller, WallClock};
+
+    fn uuid(byte: u8) -> Uuid {
+        Uuid::from_bytes([byte; 16])
+    }
+
+    /// The device the registrations here are for, its destination in the delivery journal and the
+    /// clocks the daemon decides on.
+    struct Host {
+        _temp: kr_ipc::testing::TempHost,
+        controller: Arc<Controller>,
+        continuous: kr_transport::clock::ManualClock,
+        wall: Arc<std::sync::atomic::AtomicU64>,
+        device_id: DeviceId,
+        record: DeviceRecord,
+    }
+
+    impl Host {
+        /// A daemon on clocks this test moves by hand, with one paired device whose grant ends as
+        /// `expiry` says and whose first preview key is registered in both stores, or only in the
+        /// device directory when `destination` is false.
+        async fn start(expiry: GrantExpiry, destination: bool) -> Self {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (continuous, wall, clocks) = manual_clocks();
+            let controller = daemon_on(&temp, clocks).await;
+            let device_id = DeviceId::new(uuid(10));
+            let initial = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+            let record = DeviceRecord {
+                device_id,
+                endpoint_id: EndpointKey::from_bytes([1; 32]),
+                device_key_revision: DeviceKeyRevision::new(1),
+                authorisation: AuthorisationKey::from_bytes([2; 32]),
+                stored_envelope: None,
+                device_name: DeviceName::new("phone").expect("a name"),
+                platform: DevicePlatform::Ios,
+                grant: Grant {
+                    grant_id: GrantId::new(uuid(100)),
+                    parent_grant_id: Nullable::null(),
+                    issuer_device_id: DeviceId::new(uuid(101)),
+                    recipient_device_id: device_id,
+                    authority_revision: AuthorityRevision::new(1),
+                    environment_selector: EnvironmentSelector::Any,
+                    session_selector: SessionSelector::Any,
+                    actions: [ActionRight::SessionView].into_iter().collect(),
+                    history: HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: false,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    expiry,
+                    organisation: Nullable::null(),
+                },
+                paired_at_ms: TimestampMs::new(wall.load(Ordering::SeqCst)),
+                revoked_at_ms: None,
+                expired_at_ms: None,
+                committed_invitation_id: None,
+                notification_preview: Some(*initial.public()),
+            };
+            controller.devices().commit(&record).expect("a device");
+            // The grant's anchor in this boot, as the device's connection took it.
+            controller
+                .lifetimes()
+                .paired(&record)
+                .expect("the grant is anchored");
+            if destination {
+                controller
+                    .delivery()
+                    .configure(&DestinationRecord {
+                        id: DestinationId::new(device_id.to_string()).expect("an identifier"),
+                        destination: Destination::Push(Box::new(PushDestination {
+                            installation_id: InstallationId::new(uuid(20)),
+                            sender_record_id: PushSenderRecordId::new(uuid(30)),
+                            preview_keys: PreviewKeys::only(*initial.public(), 1),
+                            previews_enabled: true,
+                            mailbox_key: None,
+                        })),
+                        rule: Some(DeliveryRule {
+                            name: "anything that wants a person".to_owned(),
+                            grant_id: Some(record.grant.grant_id),
+                        }),
+                        enabled: true,
+                        configured_at_ms: TimestampMs::new(wall.load(Ordering::SeqCst)),
+                    })
+                    .expect("a destination");
+            }
+            Self {
+                _temp: temp,
+                controller,
+                continuous,
+                wall,
+                device_id,
+                record,
+            }
+        }
+
+        /// An admission that stands now and ends `lifetime` from now on the continuous clock, on a
+        /// connection this daemon holds a registration for.
+        fn admission(&self, lifetime: Duration) -> AdmittedMutation {
+            let connection_id = ConnectionId::new(uuid(77));
+            let revision = self.controller.policy().authority_revision();
+            self.controller.admitted_table().insert(
+                connection_id,
+                AdmittedConnection {
+                    actor_id: kr_transport::listener::device_principal(&self.device_id),
+                    admitted_revision: revision,
+                },
+            );
+            AdmittedMutation {
+                connection_id,
+                admitted_revision: revision,
+                deadline: self.controller.continuous_now().checked_add(lifetime),
+            }
+        }
+
+        fn registration(
+            &self,
+            action: u8,
+            key: kr_protocol::scalars::NotificationPreviewKey,
+        ) -> MutationRequest {
+            MutationRequest {
+                action_id: ActionId::new(uuid(action)),
+                request_id: kr_protocol::ids::RequestId::new(u64::from(action)),
+                method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                grant_id: Nullable::null(),
+                target: ActionTarget::environment(self.controller.paths().environment_id()),
+                expected: ParamsValue::empty(),
+                action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                    .expect("a window"),
+                requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+                params: ParamsValue::from_typed(
+                    &kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+                        device_id: self.device_id,
+                        notification_preview: key,
+                        revision: DeviceKeyRevision::new(2),
+                    },
+                )
+                .expect("params"),
+            }
+        }
+
+        /// The revision each store holds for the device: the directory's, and the journal's when it
+        /// holds a destination for it.
+        fn revisions(&self) -> (u64, Option<u64>) {
+            let directory = self
+                .controller
+                .devices()
+                .record_for_device(self.device_id)
+                .expect("a read")
+                .expect("the device")
+                .device_key_revision
+                .get();
+            let journal = self
+                .controller
+                .delivery()
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .destination(
+                            &DestinationId::new(self.device_id.to_string()).expect("an identifier"),
+                        )
+                        .expect("a read")
+                        .and_then(|destination| {
+                            destination.as_push().map(|push| push.preview_keys.revision)
+                        }))
+                })
+                .expect("a read");
+            (directory, journal)
+        }
+    }
+
+    /// Runs one key registration to the point it is stopped at, with `moves` done to the clocks
+    /// while it waits there, and returns what it ended as.
+    async fn registered_while(
+        host: &Host,
+        pause: fn(
+            &crate::push::DeliveryModule,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ),
+        lifetime: Duration,
+        moves: impl FnOnce(&Host),
+    ) -> crate::error::Result<ParamsValue> {
+        let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+        let admission = host.admission(lifetime);
+        let mutation = host.registration(0x71, *rotated.public());
+        let (arrived, go) = pause(host.controller.delivery());
+        let controller = Arc::clone(&host.controller);
+        let actor = kr_transport::listener::device_principal(&host.device_id);
+        let effect = tokio::spawn(async move {
+            controller
+                .preview_key_update_action(&actor, &mutation, admission)
+                .await
+        });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("the wait ends")
+            .expect("the effect reached the point it is held at");
+        moves(host);
+        go.send(()).expect("the effect is waiting");
+        effect.await.expect("the effect ends")
+    }
+
+    fn before(
+        delivery: &crate::push::DeliveryModule,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        delivery.pause_before_key_write()
+    }
+
+    fn after(
+        delivery: &crate::push::DeliveryModule,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        delivery.pause_after_key_write()
+    }
+
+    /// KR-REQ-16.11, D-309: a key registration is checked against the admission it carries where it
+    /// is written, after it has waited. Its deadline passes on the continuous clock while it is
+    /// held before its writes, and both stores are left as they were with the refusal an expired
+    /// admission gets; the control, with the deadline still ahead, registers in both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_registration_whose_deadline_passes_while_it_waits_is_refused_at_its_write() {
+        for lapses in [false, true] {
+            let host = Host::start(GrantExpiry::Never, true).await;
+            let outcome = registered_while(&host, before, Duration::from_secs(10), |host| {
+                if lapses {
+                    host.continuous.advance(Duration::from_secs(11));
+                }
+            })
+            .await;
+            if lapses {
+                let error = outcome.expect_err("an expired admission writes nothing");
+                assert!(
+                    matches!(error, crate::error::ControllerError::WindowExpired { .. }),
+                    "{error}"
+                );
+                assert_eq!(host.revisions(), (1, Some(1)), "neither store moved");
+            } else {
+                outcome.expect("the control registers");
+                assert_eq!(host.revisions(), (2, Some(2)));
+            }
+        }
+    }
+
+    /// The device's own grant is decided on both clocks at the write: UTC passes the grant's expiry
+    /// while the continuous clock and the admission's deadline are still ahead, and the registration
+    /// is refused with both stores as they were. The control: UTC short of the expiry registers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_registration_whose_devices_grant_ends_in_utc_while_it_waits_is_refused() {
+        for lapses in [false, true] {
+            let now = kr_ipc::now_ms().get();
+            let host = Host::start(
+                GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(now + 3_600_000),
+                },
+                true,
+            )
+            .await;
+            let outcome = registered_while(&host, before, Duration::from_secs(600), |host| {
+                if lapses {
+                    host.wall
+                        .store(now + 3_600_001, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await;
+            if lapses {
+                let error = outcome.expect_err("a grant that has run out writes nothing");
+                assert!(
+                    matches!(
+                        error,
+                        crate::error::ControllerError::PermissionDenied { .. }
+                    ),
+                    "{error}"
+                );
+                assert_eq!(host.revisions(), (1, Some(1)));
+            } else {
+                outcome.expect("the control registers");
+                assert_eq!(host.revisions(), (2, Some(2)));
+            }
+        }
+    }
+
+    /// A registration the journal has taken is finished in the directory whatever has happened to
+    /// the admission since: it is not answered as refused when it took effect. The deadline passes
+    /// between the two writes and both stores end holding the registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_registration_the_journal_took_is_completed_after_its_deadline_passes() {
+        let host = Host::start(GrantExpiry::Never, true).await;
+        registered_while(&host, after, Duration::from_secs(10), |host| {
+            host.continuous.advance(Duration::from_secs(11));
+        })
+        .await
+        .expect("a registration the journal took is finished");
+        assert_eq!(host.revisions(), (2, Some(2)));
+    }
+
+    /// With no destination in the journal the directory's own write is the only one, and it asks
+    /// the admission inside its transaction: an expired deadline writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_registration_with_no_destination_asks_its_admission_in_the_directorys_write() {
+        let host = Host::start(GrantExpiry::Never, false).await;
+        let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+        let admission = host.admission(Duration::from_secs(10));
+        host.continuous.advance(Duration::from_secs(11));
+        let actor = kr_transport::listener::device_principal(&host.device_id);
+        let error = host
+            .controller
+            .preview_key_update_action(
+                &actor,
+                &host.registration(0x72, *rotated.public()),
+                admission,
+            )
+            .await
+            .expect_err("an expired admission writes nothing");
+        assert!(
+            matches!(error, crate::error::ControllerError::WindowExpired { .. }),
+            "{error}"
+        );
+        assert_eq!(host.revisions(), (1, None));
+        // The control, on a fresh admission.
+        let admission = host.admission(Duration::from_secs(10));
+        host.controller
+            .preview_key_update_action(
+                &actor,
+                &host.registration(0x73, *rotated.public()),
+                admission,
+            )
+            .await
+            .expect("a standing admission registers");
+        assert_eq!(host.revisions(), (2, None));
+        let _ = (&host.record, WallClock::system());
+    }
+}
