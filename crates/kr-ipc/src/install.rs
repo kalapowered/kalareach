@@ -35,11 +35,12 @@
 //! Each host executable of a store takes a shared lock on its release's `release.json` when it
 //! starts ([`this_process`]) and keeps it until it exits; the kernel lets go of it however the
 //! process ends. A release is removed only by whoever takes an exclusive lock on that same file
-//! ([`Store::retire`]), which no running process of the release lets happen, and it is renamed out
-//! of `versions/` while that lock is held, before anything is deleted. A process that opened the
-//! manifest just as its release was being removed still gets its shared lock once the remover lets
-//! go, so after locking it checks that `versions/<release>/release.json` is still the very file it
-//! locked, and refuses to run when it is not.
+//! (`Store::retire`, which a Windows build does not have, since it keeps no store), which no
+//! running process of the release lets happen, and it is renamed out of `versions/` while that lock
+//! is held, before anything is deleted. A process that opened the manifest just as its release was
+//! being removed still gets its shared lock once the remover lets go, so after locking it checks
+//! that `versions/<release>/release.json` is still the very file it locked, and refuses to run when
+//! it is not.
 //!
 //! A process that starts another from its own release holds the release for it until the other
 //! has a hold of its own: the control daemon's hold covers the workers it launches, and an update

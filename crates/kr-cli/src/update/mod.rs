@@ -9,8 +9,8 @@
 //!
 //! 1. The update lock is taken, so one update runs at a time and `current` stays as it is, and
 //!    this `kr` is checked to be the current release's under it. An update an earlier run left
-//!    part way is settled first, by what `current` actually names ([`recover`]).
-//! 2. The release is staged and checked ([`release`]): signed by the release keys the current
+//!    part way is settled first, by what `current` actually names (`recover`).
+//! 2. The release is staged and checked (`release`): signed by the release keys the current
 //!    release's channel root names, every file as listed, for this system, newer than the current
 //!    release.
 //! 3. Every worker the store's environments describe is asked what it is, and nothing is stopped
@@ -25,7 +25,7 @@
 //!    told to stop, in turn. The first that answers that it does not stop ends the telling: the
 //!    daemons not yet told resume, and those told are waited for to have gone, up to thirty
 //!    seconds from the last telling, before anything is started again. Every environment's lock is
-//!    held, and every record of every registry is classed ([`inventory::classify`]). Anything
+//!    held, and every record of every registry is classed (`inventory::classify`). Anything
 //!    that holds the update restarts the daemons it stopped, from the release still current, and
 //!    the update waits.
 //! 6. `current` is switched in one rename, the locks are let go, each daemon is started as it was
