@@ -379,7 +379,9 @@ impl Controller {
             // spawned: it keeps its slot until something settles what happened to that process.
             LaunchOutcome::Uncertain { detail, pid } => {
                 // Before the launcher's identity is recorded: a claim waits for that identity, so
-                // none can take the variables of a create that has stopped waiting.
+                // none can take the variables of a create that has stopped waiting. A reservation
+                // that is spawned, with no create waiting for it, is refused every claim, which
+                // privacy mode's tick relies on to forget its session.
                 hold.end_wait().await;
                 let launched =
                     pid.and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok());

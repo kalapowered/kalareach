@@ -933,19 +933,36 @@ pub(super) struct Launches {
 /// its reservation yet.
 ///
 /// A launch never started when its reservation records no claim and cannot get one. A claim, which
-/// is what hands a worker its launch specification, needs a reservation that is spawned and comes
-/// from the launcher's own process, so a reservation that failed or was fenced before a claim, or
-/// is spawned with a launcher that has since ended, never will. The registry is read once to find
-/// the launches that might qualify, the launchers are asked about, and the registry is read again
-/// under its guard before one is believed: a claim that committed in between is one a worker ran
-/// from. A registry that cannot be read says nothing about any of them, and none is over.
+/// is what hands a worker its launch specification, needs a reservation that is spawned, a launcher
+/// identity recorded for it, and the launcher's own process on the other end. So a reservation that
+/// failed or was fenced before a claim never will get one, nor will one that is spawned with a
+/// launcher that has since ended, nor one that is spawned and recorded no launcher when the create
+/// that spawned it has returned: only the create records a launcher. The registry is read once to
+/// find the launches that might qualify, the launchers are asked about and the creates in progress
+/// are listed, and the registry is read again under its guard before one is believed: a claim that
+/// committed in between is one a worker ran from. A registry that cannot be read says nothing
+/// about any of them, and none is over.
 pub(super) async fn launches_over(controller: &Controller, unreached: &[SessionId]) -> Launches {
+    launches_between(controller, unreached, async {}).await
+}
+
+/// [`launches_over`], with `between` run after the launchers have been asked about and before the
+/// registry is read again. The daemon passes nothing; a test passes the claim it wants to commit
+/// there.
+pub(super) async fn launches_between(
+    controller: &Controller,
+    unreached: &[SessionId],
+    between: impl std::future::Future<Output = ()>,
+) -> Launches {
     if unreached.is_empty() {
         return Launches::default();
     }
     let mut launches = Launches::default();
-    // Launches whose launcher might have ended without ever claiming, with the launcher.
+    // Launches whose launcher might have ended without ever claiming, with the launcher, and
+    // launches that recorded no launcher at all, with the reservation a create would be pending
+    // under.
     let mut launchers = Vec::new();
+    let mut unlaunched = Vec::new();
     {
         let registry = controller.registry.lock().await;
         for session_id in unreached {
@@ -957,11 +974,10 @@ pub(super) async fn launches_over(controller: &Controller, unreached: &[SessionI
                     (LaunchPhase::Failed | LaunchPhase::Fenced, None) => {
                         launches.never_started.push(*session_id);
                     }
-                    (LaunchPhase::Spawned, None) => {
-                        if let Some(launcher) = reservation.launcher_identity {
-                            launchers.push((*session_id, launcher));
-                        }
-                    }
+                    (LaunchPhase::Spawned, None) => match reservation.launcher_identity {
+                        Some(launcher) => launchers.push((*session_id, launcher)),
+                        None => unlaunched.push((*session_id, reservation.reservation_id)),
+                    },
                     _ => {}
                 },
                 Err(_) => return Launches::default(),
@@ -980,24 +996,44 @@ pub(super) async fn launches_over(controller: &Controller, unreached: &[SessionI
             ended_launchers.push(session_id);
         }
     }
+    // A create that is still running has not finished recording its launcher, so a spawned
+    // reservation it holds is not one that recorded none. The creates are listed before the
+    // registry is read again: one that finished since then recorded its launcher first, and the
+    // second read sees it.
+    let creating: std::collections::BTreeSet<_> =
+        controller.pending.lock().await.keys().copied().collect();
+    let create_ended: Vec<SessionId> = unlaunched
+        .into_iter()
+        .filter(|(_, reservation_id)| !creating.contains(reservation_id))
+        .map(|(session_id, _)| session_id)
+        .collect();
+    between.await;
     if !ended_launchers.is_empty() {
         launches
             .never_started
-            .extend(still_unclaimed(controller, &ended_launchers).await);
+            .extend(still_unclaimed(controller, &ended_launchers, true).await);
+    }
+    if !create_ended.is_empty() {
+        launches
+            .never_started
+            .extend(still_unclaimed(controller, &create_ended, false).await);
     }
     launches
 }
 
-/// The sessions among `sessions` whose reservation is still spawned and unclaimed, read now under
-/// the registry's guard.
+/// The sessions among `sessions` whose reservation is still spawned and unclaimed, and whose
+/// launcher is recorded exactly when `launcher_recorded` says so, read now under the registry's
+/// guard.
 ///
 /// A claim takes the same guard and moves the reservation out of `spawned`, so a reservation found
-/// here cannot be claimed by the time the caller acts on the answer's being true of a launcher that
-/// has ended. A reservation claimed since the caller last looked, or one the registry cannot be
-/// read for, is not among them: a worker may have run.
+/// here has not been claimed at this moment. One claimed since the caller last looked, one that
+/// recorded a launcher since, and one the registry cannot be read for are not among them: a worker
+/// may have run, or may yet. A claim that commits after this read was admitted for a process that
+/// has since ended, or for none, and so gives a shell to nobody.
 pub(super) async fn still_unclaimed(
     controller: &Controller,
     sessions: &[SessionId],
+    launcher_recorded: bool,
 ) -> Vec<SessionId> {
     let registry = controller.registry.lock().await;
     sessions
@@ -1009,6 +1045,7 @@ pub(super) async fn still_unclaimed(
                 Ok(Some(reservation))
                     if reservation.phase == LaunchPhase::Spawned
                         && reservation.claimed_key.is_none()
+                        && reservation.launcher_identity.is_some() == launcher_recorded
             )
         })
         .collect()

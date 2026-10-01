@@ -495,6 +495,64 @@ async fn claimed(controller: &Controller, token: u8, then: Option<LaunchPhase>) 
     session_id
 }
 
+/// Records that a create is still running for a reserved session, as the daemon does from before
+/// its reservation moves to `spawned` until the create returns.
+async fn creating(controller: &Controller, session_id: SessionId) {
+    let reservation_id = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    let (ready, _answer) = tokio::sync::oneshot::channel();
+    controller
+        .pending
+        .lock()
+        .await
+        .insert(reservation_id, super::create::PendingCreate { ready });
+}
+
+/// Records that the create of a reserved session has returned.
+async fn created(controller: &Controller, session_id: SessionId) {
+    let reservation_id = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    controller.pending.lock().await.remove(&reservation_id);
+}
+
+/// Has a worker claim the reservation of an already reserved, spawned session.
+async fn claim_now(controller: &Controller, session_id: SessionId) {
+    let mut registry = controller.registry.lock().await;
+    let reservation_id = registry
+        .reservation_for_session(session_id)
+        .expect("a read")
+        .expect("the reservation")
+        .reservation_id;
+    registry
+        .claim_rendezvous(
+            reservation_id,
+            kr_protocol::scalars::AuthorisationKey::from_bytes([9; 32]),
+        )
+        .expect("the claim is consumed");
+}
+
+/// This process, as the launcher of a launch that is still running.
+fn running_launcher() -> kr_protocol::identity::ProcessStartIdentity {
+    kr_ipc::identity::current_process_start_identity().expect("this process")
+}
+
+/// A launcher that has ended.
+fn ended_launcher() -> kr_protocol::identity::ProcessStartIdentity {
+    kr_ipc::identity::ended_process_identity(4_000_000)
+}
+
 /// Records that the launcher of a reserved session is the process `identity`.
 async fn launched_by(
     controller: &Controller,
@@ -528,9 +586,10 @@ async fn recorded_as(controller: &Controller, session_id: SessionId, phase: Laun
 /// KR-REQ-24.28: what the registry shows of a session's launch decides what became of it. A
 /// reservation that was claimed and then failed or closed, and a session the registry holds nothing
 /// for, are over: a worker ran, or may have, and what it retained is the archive's. A launch that
-/// failed or was fenced before any worker claimed it, or whose launcher has ended without claiming,
-/// never handed out a specification, so no shell ran: it is forgotten. Every other phase is a worker
-/// that may be starting or running, and its session is neither.
+/// failed or was fenced before any worker claimed it, whose launcher has ended without claiming, or
+/// that recorded no launcher when its create returned, never handed out a specification, so no
+/// shell ran: it is forgotten. Every other phase is a worker that may be starting or running, and
+/// its session is neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     let (_temp, controller, _clock) = daemon().await;
@@ -543,7 +602,8 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
         token
     };
     // A reservation in a phase no worker has claimed it in: only a launch that cannot be claimed
-    // any more never started.
+    // any more never started. A spawned reservation whose create is still running has recorded no
+    // launcher yet, and is not one that recorded none.
     for (phase, over) in [
         (LaunchPhase::Reserved, false),
         (LaunchPhase::Spawned, false),
@@ -554,6 +614,9 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
         (LaunchPhase::Closed, false),
     ] {
         let session_id = reserved(&controller, next(), phase).await;
+        if phase == LaunchPhase::Spawned {
+            creating(&controller, session_id).await;
+        }
         asked.push(session_id);
         if over {
             never_started.push(session_id);
@@ -577,24 +640,20 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     ended.extend([after_a_claim_failed, after_a_claim_closed]);
 
     // A launch whose launcher has ended without claiming can never be claimed: a claim comes from
-    // the launcher's own process. One whose launcher is running, or that nobody has recorded one
-    // for, still can.
+    // the launcher's own process. One whose launcher is running still can.
     let gone = reserved(&controller, next(), LaunchPhase::Spawned).await;
-    launched_by(
-        &controller,
-        gone,
-        &kr_ipc::identity::ended_process_identity(4_000_000),
-    )
-    .await;
+    launched_by(&controller, gone, &ended_launcher()).await;
     let running = reserved(&controller, next(), LaunchPhase::Spawned).await;
-    launched_by(
-        &controller,
-        running,
-        &kr_ipc::identity::current_process_start_identity().expect("this process"),
-    )
-    .await;
+    launched_by(&controller, running, &running_launcher()).await;
     asked.extend([gone, running]);
     never_started.push(gone);
+
+    // A launch that recorded no launcher can never be claimed either, once its create has returned:
+    // only the create records one, and a claim is refused without one. A create that is still
+    // running may yet record it.
+    let uncertain = reserved(&controller, next(), LaunchPhase::Spawned).await;
+    asked.push(uncertain);
+    never_started.push(uncertain);
 
     // A session the registry holds nothing for is over too: no launch can come of it.
     let unknown = SessionId::new(kr_ipc::new_uuid());
@@ -613,6 +672,46 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
         none.ended.is_empty() && none.never_started.is_empty(),
         "nothing asked, nothing over"
     );
+}
+
+/// KR-REQ-24.28: a claim, or a launcher, that arrives between the daemon asking about a launch and
+/// reading it again makes it one a worker ran from, or may yet: the registry is read again before
+/// a launch is believed never to have started. The controls are the same launches with nothing
+/// arriving, which are never started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_changes_between_the_two_looks_is_not_taken_for_never_started() {
+    let (_temp, controller, _clock) = daemon().await;
+    // The launcher has ended, and a claim commits after it was found so.
+    let claimed_after_the_launcher = reserved(&controller, 1, LaunchPhase::Spawned).await;
+    launched_by(&controller, claimed_after_the_launcher, &ended_launcher()).await;
+    // No launcher was recorded when its create returned, and one is recorded after.
+    let launcher_after_the_create = reserved(&controller, 2, LaunchPhase::Spawned).await;
+    // The same, claimed.
+    let claimed_after_the_create = reserved(&controller, 3, LaunchPhase::Spawned).await;
+    // Controls: nothing arrives.
+    let control_launcher = reserved(&controller, 4, LaunchPhase::Spawned).await;
+    launched_by(&controller, control_launcher, &ended_launcher()).await;
+    let control_create = reserved(&controller, 5, LaunchPhase::Spawned).await;
+    let asked = [
+        claimed_after_the_launcher,
+        launcher_after_the_create,
+        claimed_after_the_create,
+        control_launcher,
+        control_create,
+    ];
+
+    let launches = super::start::launches_between(&controller, &asked, async {
+        claim_now(&controller, claimed_after_the_launcher).await;
+        launched_by(&controller, launcher_after_the_create, &running_launcher()).await;
+        claim_now(&controller, claimed_after_the_create).await;
+    })
+    .await;
+    assert!(launches.ended.is_empty(), "{:?}", launches.ended);
+    let mut expected = vec![control_launcher, control_create];
+    expected.sort_unstable();
+    let mut found = launches.never_started;
+    found.sort_unstable();
+    assert_eq!(found, expected, "only the launches nothing arrived for");
 }
 
 /// Whether privacy mode's record reports the session's worker as ended.
@@ -653,29 +752,37 @@ async fn ended(controller: &Controller, sessions: &[SessionId]) {
 /// reservation was fenced after a claim. Through every pass of the tick each may still have a
 /// worker, so turning privacy mode off is refused; it stays refused while one of them is left, and
 /// once the registry records that the first launch failed the next pass takes it for ended, and
-/// once it records the second as closed, privacy mode is turned off. A third, launched and failed
-/// before any worker claimed it, ran no shell: it is forgotten with its obligation, durably, and
-/// never reported as ended with the archive named.
+/// once it records the second as closed, privacy mode is turned off. A third, failed before any
+/// worker claimed it, and a fourth, whose create returned without recording a launcher, ran no
+/// shell: each is forgotten with its obligation, durably, and never reported as ended with the
+/// archive named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over() {
     let (temp, controller, _clock) = daemon().await;
     let claim = claimed(&controller, 1, None).await;
     let fenced = claimed(&controller, 2, Some(LaunchPhase::Fenced)).await;
-    let unstarted = reserved(&controller, 3, LaunchPhase::Spawned).await;
+    let unstarted = reserved(&controller, 3, LaunchPhase::Reserved).await;
+    // A launch whose create is still running, and has recorded no launcher yet.
+    let uncertain = reserved(&controller, 4, LaunchPhase::Spawned).await;
+    creating(&controller, uncertain).await;
     let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
     controller
         .privacy
-        .enable(&[claim, fenced, unstarted], kr_ipc::now_ms(), &standing)
+        .enable(
+            &[claim, fenced, unstarted, uncertain],
+            kr_ipc::now_ms(),
+            &standing,
+        )
         .expect("privacy mode is turned on");
 
-    // The tick passes over all three, more than once; none that may still have a worker is taken
+    // The tick passes over all four, more than once; none that may still have a worker is taken
     // for ended, so turning privacy mode off is refused.
     tokio::time::sleep(super::start::PRIVACY_TICK * 3).await;
     let refused = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
         .expect_err("a launch that may still produce a worker holds privacy mode on");
-    for session_id in [claim, fenced, unstarted] {
+    for session_id in [claim, fenced, unstarted, uncertain] {
         assert!(
             refused.to_string().contains(&session_id.to_string()),
             "the refusal names the session: {refused}"
@@ -687,6 +794,14 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
     recorded_as(&controller, unstarted, LaunchPhase::Failed).await;
     forgotten(&controller, &[unstarted]).await;
     assert!(!is_ended(&controller, unstarted));
+    assert_eq!(obligations_on_disk(&temp), 3, "the others are still owed");
+
+    // The fourth is spawned, and its create returns without having recorded a launcher, as one that
+    // could not say what it started does: no claim can be accepted for it any more, and it is
+    // forgotten the same way.
+    created(&controller, uncertain).await;
+    forgotten(&controller, &[uncertain]).await;
+    assert!(!is_ended(&controller, uncertain));
     assert_eq!(
         obligations_on_disk(&temp),
         2,
@@ -979,44 +1094,25 @@ async fn a_create_whose_obligation_cannot_be_written_starts_nothing() {
     );
 }
 
-/// KR-REQ-24.28: a claim that commits after the launcher was found to have ended makes the launch
-/// one a worker ran from, so the registry is read again before a launch is believed never to have
-/// started. The control is the same reservation, unclaimed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_launch_claimed_after_its_launcher_was_found_ended_is_not_taken_for_never_started() {
-    let (_temp, controller, _clock) = daemon().await;
-    let unclaimed = reserved(&controller, 1, LaunchPhase::Spawned).await;
-    let claim = claimed(&controller, 2, None).await;
-    let both = [unclaimed, claim];
-    assert_eq!(
-        super::start::still_unclaimed(&controller, &both).await,
-        vec![unclaimed],
-        "only the reservation nobody claimed"
-    );
-    // A reservation that moved on since, whatever it moved to, is not one of them either.
-    recorded_as(&controller, unclaimed, LaunchPhase::Fenced).await;
-    assert!(
-        super::start::still_unclaimed(&controller, &both)
-            .await
-            .is_empty()
-    );
-}
-
 /// KR-REQ-24.28: turning privacy mode on after a restart finds a launch whose worker was handed a
 /// specification before it, which this daemon's own record of launches no longer holds and whose
 /// worker has no journal or worker row yet: the registry says a worker may be running there, so
-/// the session owes its cleanup. A reservation no worker can come of, and one not yet launched,
-/// owe nothing.
+/// the session owes its cleanup. A reservation no worker can come of, one fenced before any worker
+/// claimed it, and one not yet launched, owe nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_turned_on_obliges_every_launch_a_worker_may_still_come_of() {
     let (temp, controller, _clock) = daemon().await;
     let environment_id = temp.environment_id();
+    // Its launcher is running, so a claim may still come.
     let spawned = reserved(&controller, 1, LaunchPhase::Spawned).await;
+    launched_by(&controller, spawned, &running_launcher()).await;
     let claim = claimed(&controller, 2, None).await;
     let fenced = claimed(&controller, 3, Some(LaunchPhase::Fenced)).await;
     let _reserved = reserved(&controller, 4, LaunchPhase::Reserved).await;
     let _failed = reserved(&controller, 5, LaunchPhase::Failed).await;
     let _closed = reserved(&controller, 6, LaunchPhase::Closed).await;
+    // Fenced before any worker claimed it: nobody was handed a specification.
+    let _fenced_before_a_claim = reserved(&controller, 7, LaunchPhase::Fenced).await;
 
     let (_actor, carried) = admitted(&controller).await;
     let report = controller
