@@ -670,7 +670,9 @@ fn tmux_strings_and_flags(info: &str) -> String {
 
 /// A private `sshd`, run as the current user on a loopback port with a host key and an authorised
 /// key made for this test, and stopped when it is dropped. It touches neither the account's
-/// `authorized_keys` nor the host's own `sshd`.
+/// `authorized_keys` nor the host's own `sshd`, and it runs none of the account's `~/.ssh/rc`. The
+/// remote command still runs under the account's own login shell, which reads that shell's startup
+/// files as any login does.
 struct Sshd {
     child: std::process::Child,
     port: u16,
@@ -721,7 +723,14 @@ impl Sshd {
             .arg("-p")
             .arg(port.to_string())
             .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
-            .args(["-o", "UsePAM=no", "-o", "StrictModes=no"])
+            .args([
+                "-o",
+                "UsePAM=no",
+                "-o",
+                "StrictModes=no",
+                "-o",
+                "PermitUserRC=no",
+            ])
             .arg("-o")
             .arg(format!("AuthorizedKeysFile={}", authorised.display()))
             .args(["-o", "PasswordAuthentication=no"])
@@ -806,4 +815,43 @@ async fn a_remote_shell_over_ssh_keeps_the_stock_database() {
         "the remote shell reads a database of its own host: {remote_file}"
     );
     assert_eq!(value_of(&seen, "remote_colors="), "256");
+}
+
+/// `tic` writes where `TERMINFO` points, so a `tic` run inside a managed session writes into the
+/// private directory, and `tic -o` names another place for an entry that is a person's own. The
+/// reference says both, so a change in either has to change the reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn tic_inside_a_managed_session_writes_where_terminfo_points() {
+    let Some(tic) = program("tic", "KR_REQUIRE_MULTIPLEXERS") else {
+        return;
+    };
+    let state = Scratch::new();
+    let (directory, environment) = private_environment(&state);
+    let own = Scratch::new();
+    std::fs::write(
+        own.0.join("mine.src"),
+        "kr-mine|a terminal of the person's own,\n\tam, cols#80, lines#24,\n",
+    )
+    .expect("a source entry");
+    let script = format!(
+        "cd {own}\n\
+         {tic} -x mine.src 2>&1\n\
+         echo \"private=$(ls {private}/*/kr-mine 2>/dev/null | wc -l | tr -d ' ')\"\n\
+         {tic} -x -o {own}/elsewhere mine.src 2>&1\n\
+         echo \"elsewhere=$(ls {own}/elsewhere/*/kr-mine 2>/dev/null | wc -l | tr -d ' ')\"",
+        own = own.0.display(),
+        tic = tic.display(),
+        private = directory.display()
+    );
+    let shown = run(&script, &environment).await;
+    assert_eq!(
+        line_starting(&shown, "private="),
+        "private=1",
+        "tic wrote the entry into the private directory: {shown:?}"
+    );
+    assert_eq!(
+        line_starting(&shown, "elsewhere="),
+        "elsewhere=1",
+        "tic -o wrote it where it was told to: {shown:?}"
+    );
 }
