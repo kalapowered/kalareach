@@ -75,11 +75,24 @@ struct Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // A session this test left open would keep its worker and its shell running.
+        // A session this test left open would keep its worker and its shell running, so each is
+        // closed and its descriptor, which its worker removes as it ends, is waited for before the
+        // tree it lives in goes. Nothing here asserts: this runs while a failure may be unwinding.
         let created =
             std::mem::take(&mut *self.created.lock().unwrap_or_else(PoisonError::into_inner));
         for session in created {
-            let _ = self.kr(&["close", &session]);
+            let closed = self.kr(&["close", &session]);
+            if !closed.status.success() {
+                eprintln!("session {session} could not be closed when the test ended");
+                continue;
+            }
+            if let Ok(session_id) = session.parse::<kr_protocol::ids::SessionId>() {
+                let descriptor = self.temp.environment().descriptor_file(session_id);
+                let started = Instant::now();
+                while descriptor.exists() && started.elapsed() < LIVENESS_DEADLINE {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
         }
         for task in &self.serving {
             task.abort();
@@ -193,7 +206,13 @@ impl Host {
 
     /// Creates a session with no terminal of its own, and returns its identifier.
     fn create(&self) -> String {
-        let work = self.work.display().to_string();
+        self.create_in(&self.work)
+    }
+
+    /// Creates a session whose working directory is `directory`, which is made if it is not there.
+    fn create_in(&self, directory: &Path) -> String {
+        std::fs::create_dir_all(directory).expect("a directory on the internal disk");
+        let directory = directory.display().to_string();
         let created = self.kr_json(&[
             "new",
             "--invisible",
@@ -203,7 +222,7 @@ impl Host {
             "--startup",
             "interactive",
             "--cwd",
-            &work,
+            &directory,
         ]);
         let session = created["session_id"]
             .as_str()
@@ -296,7 +315,8 @@ impl Host {
     }
 
     /// Writes a bundle with the content export to `name` in this host's tree, and returns what
-    /// the command did.
+    /// the command did. The command is run with `--json`, so its one document is on standard output
+    /// and what it said of the export is on the error stream.
     fn bundle(&self, name: &str) -> Bundle {
         let path = self.temp.root().join(name);
         let output = self.kr(&[
@@ -304,6 +324,7 @@ impl Host {
             "--bundle",
             path.to_str().expect("a path"),
             "--include-content",
+            "--json",
         ]);
         Bundle { path, output }
     }
@@ -357,6 +378,17 @@ struct Bundle {
 }
 
 impl Bundle {
+    /// The document the command printed on standard output.
+    fn document(&self) -> Value {
+        serde_json::from_slice(&self.output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "kr doctor printed no document ({error}): {}{}",
+                String::from_utf8_lossy(&self.output.stdout),
+                self.said()
+            )
+        })
+    }
+
     /// What the command said on the error stream.
     fn said(&self) -> String {
         String::from_utf8_lossy(&self.output.stderr).into_owned()
@@ -410,6 +442,11 @@ impl Bundle {
     }
 }
 
+/// What the bundle document says was left out of the content export: each reason and its count.
+fn left_out(bundle: &Bundle) -> Value {
+    bundle.document()["bundle"]["content_left_out"].clone()
+}
+
 /// KR-REQ-29.04: with privacy mode off and never turned on, the content export holds every session
 /// of the environment, live or closed: nothing is left out where nothing is private.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -430,6 +467,9 @@ async fn privacy_mode_never_enabled_leaves_no_session_out_of_the_content_export(
         "nothing is said to be left out: {}",
         bundle.said()
     );
+    let document = bundle.document();
+    assert_eq!(document["bundle"]["content_entries"], 1, "{document}");
+    assert_eq!(left_out(&bundle), serde_json::json!([]), "{document}");
 }
 
 /// KR-REQ-26.44: without `--include-content` the bundle carries no content entry, whatever the
@@ -449,13 +489,15 @@ async fn a_bundle_asked_for_without_content_carries_no_content_entry() {
 }
 
 /// KR-REQ-29.04: with privacy mode on and two sessions live, the content export names neither, and
-/// the preview and the manifest say why; the command still writes the bundle and exits as the
-/// diagnostics alone would have. The control is the same host with privacy mode never enabled:
-/// there both are in.
+/// the preview, the manifest and the bundle document say why; the command still writes the bundle
+/// and exits as the diagnostics alone would have. The control is the same host with privacy mode
+/// never enabled: there both are in, and a directory name planted in one session's working
+/// directory is in the content; with privacy mode on it is in no entry of the bundle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_on_leaves_every_session_out_of_the_content_export() {
+    const MARKER: &str = "cwd-marker-4c1e";
     let host = Host::start().await;
-    let first = host.create();
+    let first = host.create_in(&host.work.join(MARKER));
     let second = host.create();
 
     // The control: privacy mode is off, and both are in.
@@ -465,6 +507,12 @@ async fn privacy_mode_on_leaves_every_session_out_of_the_content_export() {
     let mut both = vec![first.clone(), second.clone()];
     both.sort();
     assert_eq!(listed, both, "{}", control.said());
+    assert!(
+        control
+            .entry("content/sessions.json")
+            .is_some_and(|content| content.contains(MARKER)),
+        "the planted directory is in the control's content"
+    );
 
     host.privacy_on(&[&first, &second]);
     let diagnostics = host.kr(&["doctor"]);
@@ -476,9 +524,11 @@ async fn privacy_mode_on_leaves_every_session_out_of_the_content_export() {
         "no session is named: {}",
         private.said()
     );
-    let content = private.entry("content/sessions.json").expect("the entry");
-    for session in [&first, &second] {
-        assert!(!content.contains(session.as_str()), "{content}");
+    for (name, bytes) in private.entries() {
+        let text = String::from_utf8_lossy(&bytes);
+        for planted in [first.as_str(), second.as_str(), MARKER] {
+            assert!(!text.contains(planted), "{planted} is in {name}: {text}");
+        }
     }
     assert!(
         private
@@ -487,11 +537,23 @@ async fn privacy_mode_on_leaves_every_session_out_of_the_content_export() {
         "the preview says why: {}",
         private.said()
     );
+    assert!(
+        !private.said().contains(MARKER),
+        "and names nothing of them: {}",
+        private.said()
+    );
     let manifest = private.entry("manifest.json").expect("a manifest");
     assert!(
         manifest.contains("2 sessions left out: privacy mode is on"),
         "the manifest says why: {manifest}"
     );
+    assert_eq!(
+        left_out(&private),
+        serde_json::json!([{"reason": "privacy_mode_on", "sessions": 2}]),
+        "{}",
+        private.document()
+    );
+    assert_eq!(private.document()["bundle"]["content_entries"], 1);
     assert_eq!(
         private.output.status.code(),
         diagnostics.status.code(),
@@ -512,15 +574,23 @@ async fn a_session_whose_worker_had_ended_stays_out_after_privacy_mode_is_off() 
     let through = host.create();
 
     host.privacy_on(&[&through]);
+    // The daemon takes a session whose worker has gone for ended on its own pass, so wait for it
+    // to say so; it keeps saying so for good, which is what the test needs.
+    let owes = |report: &Value| {
+        report["sessions"].as_array().is_some_and(|owing| {
+            owing.iter().any(|owed| {
+                owed["session_id"].as_str() == Some(ended.as_str())
+                    && owed["standing"]["state"] == "worker_ended"
+            })
+        })
+    };
+    host.privacy_until("the closed session's cleanup owed for good", owes);
+    host.privacy_off();
     let report = host.kr_json(&["privacy", "status"]);
     assert!(
-        report["sessions"].as_array().is_some_and(|owing| owing
-            .iter()
-            .any(|owed| owed["session_id"].as_str() == Some(ended.as_str())
-                && owed["standing"]["state"] == "worker_ended")),
-        "the closed session owes its cleanup for good: {report}"
+        owes(&report),
+        "it outlasts turning privacy mode off: {report}"
     );
-    host.privacy_off();
     let since = host.create();
 
     let bundle = host.bundle("after.tar");
@@ -532,10 +602,17 @@ async fn a_session_whose_worker_had_ended_stays_out_after_privacy_mode_is_off() 
     assert!(
         bundle
             .said()
-            .contains("1 session left out: it still owes the cleanup privacy mode asked for"),
+            .contains("1 session left out: privacy cleanup is still owed"),
         "{}",
         bundle.said()
     );
+    assert_eq!(
+        left_out(&bundle),
+        serde_json::json!([{"reason": "owes_privacy_cleanup", "sessions": 1}]),
+        "{}",
+        bundle.document()
+    );
+    assert_eq!(bundle.document()["bundle"]["content_entries"], 1);
 }
 
 /// Reads the content export through a connection that does `at_the_hold` between the session read
