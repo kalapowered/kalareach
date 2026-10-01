@@ -2965,6 +2965,295 @@ mod tests {
         assert!(!environment.admits(&scope(&view, 0)));
     }
 
+    /// Holds the write lock of one store's file from a second connection, until it is dropped, so
+    /// that a write to that file waits and fails the way a store that is briefly unavailable does.
+    struct Locked(rusqlite::Connection);
+
+    impl Locked {
+        fn of(path: &std::path::Path) -> Self {
+            let connection = rusqlite::Connection::open(path).expect("a second connection");
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the write lock is taken");
+            Self(connection)
+        }
+    }
+
+    /// The journal and the store, both in files, so that a second process can be told apart from
+    /// this one: what is reopened is read back from the disk.
+    struct Files {
+        directory: tempfile::TempDir,
+    }
+
+    impl Files {
+        fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().expect("a directory"),
+            }
+        }
+
+        fn journal(&self) -> std::path::PathBuf {
+            self.directory.path().join("delivery.sqlite3")
+        }
+
+        fn store(&self) -> std::path::PathBuf {
+            self.directory.path().join("attention.sqlite3")
+        }
+
+        fn producer(&self) -> Producer {
+            Producer::new(
+                DeliveryJournal::open(self.journal()).expect("a journal"),
+                NotificationPreviewKeyPair::generate().expect("a keypair"),
+                kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            )
+            .expect("a producer")
+        }
+
+        fn attention(&self) -> Attention {
+            Attention::open(
+                self.store(),
+                reading(0, NOON),
+                &Claimant::new(
+                    ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+                    &unknown,
+                ),
+            )
+            .expect("a file-backed store")
+        }
+    }
+
+    /// A host that stopped after it committed the event and before it told the store holds the
+    /// event and is offered the announcement again when it starts: the event key absorbs it, so one
+    /// announcement is one event and one notification however many times it is offered. The
+    /// control: told in the other order, the announcement would be gone from the store and the
+    /// event never taken, and nothing would send it.
+    #[test]
+    fn a_stop_between_the_journals_commit_and_the_settlement_gives_no_duplicate() {
+        let files = Files::new();
+        let phones = {
+            let mut producer = files.producer();
+            two_phones(&mut producer)
+        };
+        {
+            let mut attention = files.attention();
+            raise_approval(&mut attention, 1, NOON, "req-1");
+        }
+        {
+            // The store cannot be written, so the settlement fails after the journal took the
+            // event.
+            let mut producer = files.producer();
+            let mut attention = files.attention();
+            let _locked = Locked::of(&files.store());
+            let error = producer
+                .take_from_attention(
+                    &mut attention,
+                    &|_| true,
+                    &Everything(BTreeSet::new()),
+                    SCOPE,
+                    NORMAL,
+                    1_000,
+                )
+                .expect_err("the store cannot be settled");
+            assert!(matches!(error, DeliveryError::Source(_)), "{error:?}");
+            assert_eq!(
+                producer.journal().pending_count().expect("a count"),
+                1,
+                "the journal holds the event"
+            );
+            assert_eq!(attention.awaiting_delivery().expect("a count"), 1);
+        }
+        // The next start: the announcement is offered again, and absorbed.
+        let mut producer = files.producer();
+        let mut attention = files.attention();
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 1);
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(taken.taken, 0, "the event was already taken");
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(
+            produced.admitted, 2,
+            "one notification for each phone, once"
+        );
+        let again = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(again, Taken::default());
+        assert_eq!(
+            producer.journal().deliveries().expect("a read").len(),
+            2,
+            "and nothing was produced twice"
+        );
+    }
+
+    /// A host that stopped before it committed the event loses nothing: the store still holds the
+    /// announcement, and the next start takes it.
+    #[test]
+    fn a_stop_before_the_journals_commit_loses_nothing() {
+        let files = Files::new();
+        let phones = {
+            let mut producer = files.producer();
+            two_phones(&mut producer)
+        };
+        {
+            let mut attention = files.attention();
+            raise_approval(&mut attention, 1, NOON, "req-1");
+        }
+        {
+            // The journal cannot be written, so the commit fails with the announcement read and
+            // nothing settled.
+            let mut producer = files.producer();
+            let mut attention = files.attention();
+            let _locked = Locked::of(&files.journal());
+            let error = producer
+                .take_from_attention(
+                    &mut attention,
+                    &|_| true,
+                    &Everything(BTreeSet::new()),
+                    SCOPE,
+                    NORMAL,
+                    1_000,
+                )
+                .expect_err("the journal cannot be written");
+            assert!(
+                matches!(error, DeliveryError::JournalUnavailable(_)),
+                "{error:?}"
+            );
+            assert_eq!(attention.awaiting_delivery().expect("a count"), 1);
+        }
+        let mut producer = files.producer();
+        let mut attention = files.attention();
+        assert_eq!(producer.journal().pending_count().expect("a count"), 0);
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 1);
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(taken.taken, 1);
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(produced.admitted, 2);
+    }
+
+    /// An announcement about a session the host is closing is held back by the offer, and offered
+    /// again once the host lets it go; the control is one the offer lets through.
+    #[test]
+    fn an_announcement_the_offer_holds_back_stays_with_the_store() {
+        let mut producer = producer();
+        two_phones(&mut producer);
+        let mut attention = store();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+        let taken = producer
+            .take_from_attention(
+                &mut attention,
+                &|item| item.origin.session() != Some(session(1)),
+                &Everything(BTreeSet::new()),
+                SCOPE,
+                NORMAL,
+                1_000,
+            )
+            .expect("a take");
+        assert_eq!(taken, Taken::default());
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 1);
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(taken.taken, 1);
+    }
+
+    /// An announcement routed to a lease holder is not a destination of this host: it is taken and
+    /// settled with nothing produced from it.
+    #[test]
+    fn a_lease_holders_announcement_is_settled_with_nothing_produced() {
+        let mut producer = producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = store();
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::HostEvents, 5),
+                    TimestampMs::new(NOON),
+                    EventKind::ApplicationNotice {
+                        session_id: session(1),
+                        notice: kr_attention::event::ApplicationNotice {
+                            id: None,
+                            title: None,
+                            body: "build finished".to_owned(),
+                            lease_held: true,
+                            fingerprint: Some(kr_attention::event::Fingerprint::from_bytes(
+                                [3; 32],
+                            )),
+                        },
+                    },
+                ),
+                reading(0, NOON),
+            )
+            .expect("the store records the notice");
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+        assert_eq!((taken.taken, taken.dropped), (1, 1));
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("production");
+        assert_eq!(produced, Produced::default());
+    }
+
+    /// An event the journal took and could not produce from is produced from on the next walk
+    /// without a restart: the walk reads the journal's own notice, not the store, which the take
+    /// has already settled with.
+    #[test]
+    fn a_failed_production_is_finished_by_the_next_walk() {
+        let files = Files::new();
+        let mut producer = files.producer();
+        let phones = two_phones(&mut producer);
+        let mut attention = files.attention();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+        take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
+        {
+            // The journal cannot be written when the walk produces, which is after the store was
+            // settled with.
+            let _locked = Locked::of(&files.journal());
+            assert!(
+                producer
+                    .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+                    .is_err(),
+                "the production fails"
+            );
+        }
+        assert_eq!(producer.journal().pending_count().expect("a count"), 1);
+        let produced = producer
+            .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+            .expect("the next walk");
+        assert_eq!(produced.admitted, 2, "finished with no restart");
+        assert_eq!(producer.journal().pending_count().expect("a count"), 0);
+    }
+
     #[test]
     fn every_attention_rule_maps_to_one_of_the_six_alerts() {
         for rule in [

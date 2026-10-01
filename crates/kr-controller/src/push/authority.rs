@@ -120,6 +120,12 @@ impl GrantedRecipients {
         self
     }
 
+    /// The lifetimes this answers on, and through them the directory of paired devices it reads.
+    #[must_use]
+    pub const fn lifetimes(&self) -> &Arc<GrantLifetimes> {
+        &self.lifetimes
+    }
+
     /// Answers on clocks of the caller's choosing, with anchors of its own, which is how a test
     /// holds a grant's expiry still: `continuous`, the clock a grant's anchor and a membership
     /// lease's continuous deadline are compared on, and `clock`, the wall clock.

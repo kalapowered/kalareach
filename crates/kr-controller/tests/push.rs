@@ -5976,3 +5976,535 @@ fn a_gateway_that_repeats_the_bearer_leaves_it_out_of_the_journal_and_the_log() 
         }
     }
 }
+
+// ----- A paired device's standing, asked at the effect ------------------------------------------
+
+/// What a test needs to give a paired device a grant and to move the clocks that decide it.
+struct Paired {
+    recipients: Arc<kr_controller::push::authority::GrantedRecipients>,
+    wall: Arc<std::sync::atomic::AtomicU64>,
+    continuous: kr_transport::clock::ManualClock,
+    device_id: DeviceId,
+    grant_id: GrantId,
+}
+
+impl Paired {
+    /// A host with a paired device whose grant carries `rights` and ends at `NOW + 60 s`, and a
+    /// stand-in for the grant store that holds nothing: the grant is the device's own.
+    fn with(rights: &[kr_protocol::rights::ActionRight]) -> Self {
+        Self::at(
+            rights,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(NOW + 60_000),
+            },
+            None,
+        )
+    }
+
+    /// As [`Self::with`], under the rights ceiling the host's configuration holds.
+    fn under(
+        rights: &[kr_protocol::rights::ActionRight],
+        ceiling: &[kr_protocol::rights::ActionRight],
+    ) -> Self {
+        Self::at(
+            rights,
+            GrantExpiry::Never,
+            Some(Arc::new(Mutex::new(Some(
+                ceiling.iter().copied().collect(),
+            )))),
+        )
+    }
+
+    fn at(
+        rights: &[kr_protocol::rights::ActionRight],
+        expiry: GrantExpiry,
+        ceiling: Option<Arc<Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>>>,
+    ) -> Self {
+        let device_id = DeviceId::new(uuid(10));
+        Self::from_grant(
+            Grant {
+                grant_id: GrantId::new(uuid(100)),
+                actions: rights.iter().copied().collect(),
+                expiry,
+                ..dummy_grant(device_id)
+            },
+            ceiling,
+        )
+    }
+
+    /// A host with a paired device holding `grant`, which is issued to the device named by it.
+    fn from_grant(
+        grant: Grant,
+        ceiling: Option<Arc<Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>>>,
+    ) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let host = DeviceId::new(uuid(1));
+        let sharing = Arc::new(
+            kr_controller::sharing::SharingService::in_memory(host).expect("a grant store"),
+        );
+        let policy = Arc::new(Mutex::new(kr_controller::grants::HostPolicy::personal(
+            AuthorityRevision::new(1),
+        )));
+        let wall = Arc::new(AtomicU64::new(NOW));
+        let continuous = kr_transport::clock::ManualClock::new();
+        let recipients = kr_controller::push::authority::GrantedRecipients::at(
+            sharing,
+            policy,
+            kr_protocol::ids::EnvironmentId::new(uuid(70)),
+            Arc::new(continuous.clone()),
+            {
+                let wall = Arc::clone(&wall);
+                move || wall.load(Ordering::SeqCst)
+            },
+        );
+        let recipients = Arc::new(match ceiling {
+            Some(ceiling) => recipients.with_ceiling(ceiling),
+            None => recipients,
+        });
+        let paired = Self {
+            recipients,
+            wall,
+            continuous,
+            device_id: grant.recipient_device_id,
+            grant_id: grant.grant_id,
+        };
+        paired.pair(grant);
+        paired
+    }
+
+    /// Commits the device's record with `grant`, paired a second before the test's time.
+    fn pair(&self, grant: Grant) {
+        self.recipients
+            .lifetimes()
+            .devices()
+            .commit(&DeviceRecord {
+                device_id: self.device_id,
+                endpoint_id: EndpointKey::from_bytes([1; 32]),
+                device_key_revision: DeviceKeyRevision::new(1),
+                authorisation: AuthorisationKey::from_bytes([2; 32]),
+                stored_envelope: None,
+                device_name: DeviceName::new("phone").expect("a name"),
+                platform: DevicePlatform::Ios,
+                grant,
+                paired_at_ms: TimestampMs::new(NOW - 1_000),
+                revoked_at_ms: None,
+                expired_at_ms: None,
+                committed_invitation_id: None,
+                notification_preview: None,
+            })
+            .expect("a device record");
+    }
+
+    /// The device's destination, named by its identifier, under a rule that names its grant.
+    fn destination(&self, environment: &Environment) -> DestinationRecord {
+        DestinationRecord {
+            id: DestinationId::new(self.device_id.to_string()).expect("an identifier"),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: Some(self.grant_id),
+            }),
+            ..push_destination(environment, true)
+        }
+    }
+
+    fn move_to(&self, wall_ms: u64, continuous: std::time::Duration) {
+        self.wall
+            .store(wall_ms, std::sync::atomic::Ordering::SeqCst);
+        self.continuous.advance(continuous);
+    }
+}
+
+/// Credentials inside their renewal window, whose renewal waits on the gateway for as long as the
+/// test says: it runs `during` before it answers.
+struct SlowRenewal<F: Fn() + Send + Sync> {
+    held: PushDeliveryCredential,
+    renewed: PushDeliveryCredential,
+    during: F,
+}
+
+impl<F: Fn() + Send + Sync> std::fmt::Debug for SlowRenewal<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SlowRenewal")
+    }
+}
+
+impl<F: Fn() + Send + Sync> SenderCredentials for SlowRenewal<F> {
+    fn current(&self, _sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
+        Some(self.held.clone())
+    }
+
+    fn renew(
+        &self,
+        _held: &PushDeliveryCredential,
+    ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
+        (self.during)();
+        Ok(self.renewed.clone())
+    }
+}
+
+/// Produces one notification for `destination` under `authority`, from a notice about the one
+/// session, and returns its identifier.
+fn produce_under(
+    environment: &Environment,
+    authority: &dyn RecipientAuthority,
+    destination: &DestinationRecord,
+    notice: &Notice,
+) -> kr_delivery::producer::Produced {
+    environment
+        .module
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                .expect("a page");
+            Ok(producer
+                .produce(
+                    notice,
+                    std::slice::from_ref(destination),
+                    authority,
+                    &[],
+                    NOW,
+                )
+                .expect("a decision"))
+        })
+        .expect("the producer")
+}
+
+/// One pass over everything due, at `NOW`, under `authority` and `credentials`.
+fn pass_under(
+    environment: &Environment,
+    authority: &dyn RecipientAuthority,
+    credentials: &dyn SenderCredentials,
+) -> GatewayDouble {
+    let gateway = GatewayDouble::queued();
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            credentials,
+            &ExternalDouble::answering(Vec::new()),
+            authority,
+            &at(NOW),
+        )
+        .expect("a pass");
+    gateway
+}
+
+fn one_record(environment: &Environment) -> kr_delivery::journal::DeliveryRecord {
+    environment
+        .module
+        .with(|producer| Ok(producer.journal().deliveries().expect("a read").remove(0)))
+        .expect("a read")
+}
+
+/// KR-REQ-16.12, D-309: a notification to a paired device is decided against the device's own
+/// grant at the moment it is presented. It is claimed while the grant holds, its credential is
+/// renewed, which waits on the gateway, and the grant's deadline passes during that wait, in UTC or
+/// on the continuous clock: nothing is presented, and the record says the authority is gone. The
+/// control: with the deadline still ahead when the renewal ends, it is presented.
+#[test]
+fn a_notification_is_not_presented_to_a_device_whose_grant_ran_out_while_the_credential_renewed() {
+    use kr_protocol::rights::ActionRight;
+
+    for (name, wall_ms, continuous) in [
+        ("held", NOW, std::time::Duration::ZERO),
+        ("in UTC", NOW + 61_000, std::time::Duration::ZERO),
+        (
+            "on the continuous clock",
+            NOW,
+            std::time::Duration::from_secs(61),
+        ),
+    ] {
+        let environment = environment();
+        let paired = Paired::with(&[ActionRight::SessionView]);
+        let destination = paired.destination(&environment);
+        environment
+            .module
+            .configure(&destination)
+            .expect("a destination");
+        produce_under(
+            &environment,
+            paired.recipients.as_ref(),
+            &destination,
+            &notice(1, "an approval is waiting"),
+        );
+        assert_eq!(
+            one_record(&environment).state,
+            DeliveryState::Admitted,
+            "{name}: admitted while the grant held"
+        );
+        let credentials = SlowRenewal {
+            held: credential(NOW + 2 * 24 * 60 * 60 * 1000),
+            renewed: credential(NOW + 30 * 24 * 60 * 60 * 1000),
+            during: || paired.move_to(wall_ms, continuous),
+        };
+        let gateway = pass_under(&environment, paired.recipients.as_ref(), &credentials);
+        if name == "held" {
+            assert_eq!(gateway.sent().len(), 1, "the control: presented");
+            assert_eq!(one_record(&environment).state, DeliveryState::Accepted);
+        } else {
+            assert!(gateway.sent().is_empty(), "{name}: nothing was presented");
+            let record = one_record(&environment);
+            assert_eq!(record.state, DeliveryState::Revoked, "{name}");
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("authority")),
+                "{name}: {:?}",
+                record.detail
+            );
+        }
+    }
+}
+
+/// A device that is unpaired between the claim and the presentation is sent nothing, and so is one
+/// whose grant lost the right the notification needs; a rule that names another device's grant
+/// admits nothing at all, and neither does a grant the host's configuration has narrowed to
+/// nothing a notification can ask for. The controls: the same device under its own grant, paired
+/// and unnarrowed, is presented to.
+#[test]
+fn a_notification_is_presented_only_to_the_device_its_grant_names_while_it_is_paired() {
+    use kr_protocol::rights::ActionRight;
+
+    // Unpaired while the credential renews.
+    let environment = environment();
+    let paired = Paired::with(&[ActionRight::SessionView]);
+    let destination = paired.destination(&environment);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    produce_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &destination,
+        &notice(1, "an approval is waiting"),
+    );
+    let credentials = SlowRenewal {
+        held: credential(NOW + 2 * 24 * 60 * 60 * 1000),
+        renewed: credential(NOW + 30 * 24 * 60 * 60 * 1000),
+        during: || {
+            paired
+                .recipients
+                .lifetimes()
+                .devices()
+                .revoke(paired.device_id, TimestampMs::new(NOW))
+                .expect("a revocation");
+        },
+    };
+    let gateway = pass_under(&environment, paired.recipients.as_ref(), &credentials);
+    assert!(
+        gateway.sent().is_empty(),
+        "an unpaired device is sent nothing"
+    );
+    assert_eq!(one_record(&environment).state, DeliveryState::Revoked);
+
+    // A rule naming another device's grant: the destination is the phone's, the grant is not.
+    let environment = environment();
+    let paired = Paired::with(&[ActionRight::SessionView]);
+    let other = Grant {
+        grant_id: GrantId::new(uuid(101)),
+        actions: [ActionRight::SessionView].into_iter().collect(),
+        ..dummy_grant(DeviceId::new(uuid(11)))
+    };
+    paired
+        .recipients
+        .lifetimes()
+        .devices()
+        .commit(&DeviceRecord {
+            device_id: DeviceId::new(uuid(11)),
+            endpoint_id: EndpointKey::from_bytes([3; 32]),
+            authorisation: AuthorisationKey::from_bytes([4; 32]),
+            grant: other,
+            paired_at_ms: TimestampMs::new(NOW - 1_000),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: None,
+            stored_envelope: None,
+            device_key_revision: DeviceKeyRevision::new(1),
+            device_name: DeviceName::new("tablet").expect("a name"),
+            platform: DevicePlatform::Ios,
+        })
+        .expect("another device");
+    let mut destination = paired.destination(&environment);
+    destination.rule = Some(DeliveryRule {
+        name: "anything that wants a person".to_owned(),
+        grant_id: Some(GrantId::new(uuid(101))),
+    });
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let produced = produce_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &destination,
+        &notice(1, "an approval is waiting"),
+    );
+    assert_eq!(produced.admitted, 0);
+    assert_eq!(
+        produced.refused.len(),
+        1,
+        "the rule names a grant that is not the device's"
+    );
+    assert_eq!(one_record(&environment).state, DeliveryState::Refused);
+
+    // A configured ceiling that leaves the device's grant nothing a notification asks for.
+    let environment = environment();
+    let paired = Paired::under(&[ActionRight::SessionView], &[ActionRight::FilesRead]);
+    let destination = paired.destination(&environment);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let produced = produce_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &destination,
+        &notice(1, "an approval is waiting"),
+    );
+    assert_eq!(produced.admitted, 0);
+    assert_eq!(produced.refused.len(), 1, "the ceiling took the right away");
+
+    // The control: the device, paired, under its own grant, with a ceiling that leaves the right.
+    let environment = environment();
+    let paired = Paired::under(&[ActionRight::SessionView], &[ActionRight::SessionView]);
+    let destination = paired.destination(&environment);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let produced = produce_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &destination,
+        &notice(1, "an approval is waiting"),
+    );
+    assert_eq!(produced.admitted, 1);
+    let gateway = pass_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &held(NOW + 30 * 24 * 60 * 60 * 1000),
+    );
+    assert_eq!(gateway.sent().len(), 1);
+}
+
+/// A notice about `audience`, produced under `paired`'s authority, and what became of it.
+fn told(paired: &Paired, audience: Audience) -> (usize, usize, usize) {
+    let environment = environment();
+    let destination = paired.destination(&environment);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let produced = produce_under(
+        &environment,
+        paired.recipients.as_ref(),
+        &destination,
+        &Notice {
+            audience,
+            ..notice(1, "something wants a person")
+        },
+    );
+    let rows = environment
+        .module
+        .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
+        .expect("a read");
+    (produced.admitted, produced.refused.len(), rows)
+}
+
+/// KR-REQ-16.12, section 10: a notice is told only to a device whose own grant reaches what it is
+/// about, as the inbox decides what a device may see of an item: a session's notice needs
+/// `session.view` over that session, a workflow's needs `automation.manage` and is the grant the
+/// workflow acts under, the environment's needs `host.manage`; and earlier history is opt-in, so
+/// a grant reaches what was first seen at or after its history cursor, or at or after its own
+/// start when it carries none. A notice a device is not told writes no record at all: it is not a
+/// refusal. Each control is the same notice to a grant that does reach it.
+#[test]
+fn a_notice_is_told_only_to_a_device_whose_grant_reaches_what_it_is_about() {
+    use kr_protocol::rights::ActionRight::{AutomationManage, HostManage, SessionView};
+
+    let sessions = |ids: &[u8]| Audience::Sessions {
+        sessions: ids.iter().map(|byte| SessionId::new(uuid(*byte))).collect(),
+        at_ms: NOW,
+    };
+    let view = Paired::at(&[SessionView], GrantExpiry::Never, None);
+    // The session's right and the session: the control, then a session the grant does not select.
+    assert_eq!(told(&view, sessions(&[1])), (1, 0, 1));
+    let selected = Paired::from_grant(
+        Grant {
+            session_selector: SessionSelector::These {
+                session_ids: [SessionId::new(uuid(2))].into_iter().collect(),
+            },
+            actions: [SessionView].into_iter().collect(),
+            grant_id: GrantId::new(uuid(100)),
+            ..dummy_grant(DeviceId::new(uuid(10)))
+        },
+        None,
+    );
+    assert_eq!(told(&selected, sessions(&[1])), (0, 0, 0));
+    assert_eq!(told(&selected, sessions(&[2])), (1, 0, 1));
+    assert_eq!(
+        told(&selected, sessions(&[1, 2])),
+        (0, 0, 0),
+        "every session the notice is about has to be one the grant selects"
+    );
+
+    // History: a notice first seen before the grant began is earlier history, which a grant with
+    // no cursor does not reach; a cursor before it reaches it; the grant's own start is reached.
+    let before_the_grant = Audience::Sessions {
+        sessions: vec![session()],
+        at_ms: NOW - 5_000,
+    };
+    assert_eq!(told(&view, before_the_grant.clone()), (0, 0, 0));
+    let with_cursor = Paired::from_grant(
+        Grant {
+            history: HistoryScope {
+                lower_bound_ms: Nullable::some(TimestampMs::new(NOW - 10_000)),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            actions: [SessionView].into_iter().collect(),
+            grant_id: GrantId::new(uuid(100)),
+            ..dummy_grant(DeviceId::new(uuid(10)))
+        },
+        None,
+    );
+    assert_eq!(told(&with_cursor, before_the_grant), (1, 0, 1));
+    let at_its_start = Audience::Sessions {
+        sessions: vec![session()],
+        at_ms: NOW - 1_000,
+    };
+    assert_eq!(told(&view, at_its_start), (1, 0, 1));
+
+    // A workflow: the right, and the grant it acts under.
+    let workflow = |grant: Option<GrantId>| Audience::Automation { grant, at_ms: NOW };
+    let manager = Paired::at(&[SessionView, AutomationManage], GrantExpiry::Never, None);
+    assert_eq!(told(&manager, workflow(Some(manager.grant_id))), (1, 0, 1));
+    assert_eq!(
+        told(&manager, workflow(Some(GrantId::new(uuid(55))))),
+        (0, 0, 0),
+        "a workflow acting under another grant is not this device's"
+    );
+    assert_eq!(
+        told(&manager, workflow(None)),
+        (0, 0, 0),
+        "nor is one whose grant is unnamed"
+    );
+    assert_eq!(
+        told(&view, workflow(Some(view.grant_id))),
+        (0, 0, 0),
+        "session.view is not automation.manage"
+    );
+
+    // The environment: host.manage.
+    let host = Paired::at(&[SessionView, HostManage], GrantExpiry::Never, None);
+    let environment = Audience::Environment { at_ms: NOW };
+    assert_eq!(told(&host, environment.clone()), (1, 0, 1));
+    assert_eq!(told(&view, environment), (0, 0, 0));
+}
