@@ -38,10 +38,10 @@ settingGroups:
       PRODUCT_NAME: KalaReach
       PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach
   # Who signs a build, and with what, is the signer's choice and not this project's. Each value is
-  # read from a build setting that is undefined until whoever builds defines it (in `Local.xcconfig`
-  # or in the environment), and then means what it did before: automatic signing with the iPhone
-  # Developer identity, no named profile and no extra flags. It applies to a device build only, so
-  # a simulator build is unchanged.
+  # read from a build setting that is undefined until whoever builds defines it (in `Local.xcconfig`,
+  # which `Build.xcconfig` reads, or on the command line of `xcodebuild`), and then means what it
+  # did before: automatic signing with the iPhone Developer identity, no named profile and no extra
+  # flags. It applies to a device build only, so a simulator build is unchanged.
   signing:
     base:
       "CODE_SIGN_STYLE[sdk=iphoneos*]": $(KR_SIGN_STYLE:default=Automatic)
