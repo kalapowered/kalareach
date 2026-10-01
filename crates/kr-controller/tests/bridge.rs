@@ -890,6 +890,22 @@ exit 2
     )
 }
 
+/// The text of the stand-in for `ssh`: it records the argument vector it was run with, answers with
+/// the frames the test wrote for it, and reads whatever it is sent to its end, as a login on the
+/// other side whose helper answers an opening and waits to be ended would.
+fn ssh_stand_in(fixture: &Path) -> String {
+    let fixture = fixture.to_str().expect("a temporary path is text");
+    format!(
+        r##"#!/bin/sh
+fixture='{fixture}'
+line="$(printf '%s\t' "$@")"
+printf '%s\n' "$line" >>"$fixture/ssh-invocations"
+cat "$fixture/ssh.answer"
+exec cat >/dev/null
+"##
+    )
+}
+
 /// This build's control daemon, started as the program a person runs, with the stand-in for
 /// `wsl.exe` first on its path.
 ///
@@ -915,6 +931,9 @@ impl FixtureDaemon {
         let text = fixture.join("wsl.exe.text");
         std::fs::write(&text, stand_in(&fixture)).expect("the stand-in's text");
         kr_ipc::testing::place_program(&text, &bin.join("wsl.exe"));
+        let ssh_text = fixture.join("ssh.text");
+        std::fs::write(&ssh_text, ssh_stand_in(&fixture)).expect("the ssh stand-in's text");
+        kr_ipc::testing::place_program(&ssh_text, &bin.join("ssh"));
         let program = tree.root().join("kr-controller");
         kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
 
@@ -1003,6 +1022,31 @@ impl FixtureDaemon {
             bytes,
         )
         .expect("the answer is written");
+    }
+
+    /// Sets the frames the next ssh login answers with.
+    fn answer_ssh(&self, frames: &[BridgeFrame]) {
+        let codec = FrameCodec::new(StreamKind::Control);
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(codec.encode_message(frame).expect("a bridge frame encodes"));
+        }
+        std::fs::write(self.fixture.join("ssh.answer"), bytes).expect("the answer is written");
+    }
+
+    /// Every argument vector the ssh stand-in was started with, in order.
+    fn ssh_invocations(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.fixture.join("ssh-invocations"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                line.strip_suffix('\t')
+                    .unwrap_or(line)
+                    .split('\t')
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect()
     }
 
     /// Holds the next bridge to `helper` open once its helper has started.
@@ -1650,4 +1694,227 @@ async fn an_origin_that_is_not_a_local_peer_is_refused_at_the_hello() {
         })) => assert_eq!(error.code, ErrorCode::PermissionDenied, "{error}"),
         other => panic!("a worker's hello that declares an origin is refused: {other:?}"),
     }
+}
+
+fn ssh_record(environment_id: EnvironmentId) -> EnvironmentEnrolment {
+    EnvironmentEnrolment {
+        environment_id,
+        access: EnvironmentAccess::SshHost,
+        label: "build-host".to_owned(),
+        target: "build.example".to_owned(),
+        os_user: "kala".to_owned(),
+        helper_path: "/usr/local/bin/kr".to_owned(),
+        clipboard_destination: Nullable::null(),
+        approved_at_ms: TimestampMs::new(0),
+    }
+}
+
+/// What the helper over ssh says when it is `environment_id` and runs as `user`.
+fn ssh_answer(environment_id: EnvironmentId, user: &str) -> Vec<BridgeFrame> {
+    let mut frames = answered_as(environment_id);
+    if let Some(BridgeFrame::HelloAck(acknowledgement)) = frames.first_mut() {
+        user.clone_into(&mut acknowledgement.os_user);
+    }
+    frames
+}
+
+/// KR-REQ-25.26: an SSH host registers its identity and its scoped channel from its own helper, over
+/// ssh and only to be asked who it is. The ssh the daemon runs is the argument vector the product
+/// builds, and nothing but the helper's answer is read: no request crosses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_host_registers_its_identity_and_channel_from_its_helper() {
+    let daemon = FixtureDaemon::start();
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x41; 16]));
+    let record = enrol_as(&mut client, host, ssh_record(environment_id)).await;
+    let before = inventory(&mut client).await.rows;
+    assert!(
+        !before[0].readiness.channel_scoped,
+        "an enrolled host has registered nothing until its helper has answered"
+    );
+
+    daemon.answer_ssh(&ssh_answer(environment_id, "kala"));
+    let refreshed = refresh_as(&mut client, host, environment_id).await;
+    let verification = refreshed
+        .verification
+        .as_ref()
+        .expect("the helper over ssh answered");
+    assert_eq!(verification.environment_id, environment_id);
+    assert_eq!(verification.os_user, "kala");
+    assert!(!refreshed.started, "asking who a host is starts nothing");
+    assert!(
+        refreshed.connection.contains("no request crosses ssh"),
+        "{}",
+        refreshed.connection
+    );
+    assert!(
+        refreshed.row.readiness.channel_scoped,
+        "the answer registers the channel for the approved record: {:?}",
+        refreshed.row.readiness
+    );
+    assert_eq!(refreshed.row.enrolment, record);
+    assert!(
+        inventory(&mut client).await.rows[0]
+            .readiness
+            .channel_scoped,
+        "and the listing, which asks nobody, still says so"
+    );
+
+    // The one ssh the daemon ran is the vector the product builds, and nothing else was run: no
+    // platform listing, no start, no second login.
+    let expected: Vec<String> = [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "PermitLocalCommand=no",
+        "-l",
+        "kala",
+        "--",
+        "build.example",
+        "/usr/local/bin/kr",
+        "bridge",
+        "--stdio",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    assert_eq!(daemon.ssh_invocations(), [expected]);
+    assert!(
+        daemon.invocations().is_empty(),
+        "{:?}",
+        daemon.invocations()
+    );
+}
+
+/// KR-REQ-25.26: an answer that is not the record's registers nothing, and takes back what an
+/// earlier answer had registered: another user, another environment, or this host's own, which is
+/// what a socket forwarded from here is answered by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_answer_that_is_not_the_records_registers_nothing() {
+    let daemon = FixtureDaemon::start();
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x42; 16]));
+    enrol_as(&mut client, host, ssh_record(environment_id)).await;
+
+    daemon.answer_ssh(&ssh_answer(environment_id, "kala"));
+    assert!(
+        refresh_as(&mut client, host, environment_id)
+            .await
+            .row
+            .readiness
+            .channel_scoped,
+        "the control: the record's own answer registers"
+    );
+    for (what, frames, said) in [
+        (
+            "another user",
+            ssh_answer(environment_id, "root"),
+            "ran as root",
+        ),
+        (
+            "another environment",
+            ssh_answer(EnvironmentId::new(Uuid::from_bytes([0x43; 16])), "kala"),
+            "enrolment names environment",
+        ),
+        (
+            "this host's own environment",
+            ssh_answer(host, "kala"),
+            "this host's own environment",
+        ),
+    ] {
+        daemon.answer_ssh(&frames);
+        let refreshed = refresh_as(&mut client, host, environment_id).await;
+        assert!(refreshed.verification.as_ref().is_none(), "{what}");
+        assert!(
+            !refreshed.row.readiness.channel_scoped,
+            "{what}: what an earlier answer registered is taken back"
+        );
+        assert!(
+            refreshed.connection.contains(said),
+            "{what}: {}",
+            refreshed.connection
+        );
+        // And the record's own answer registers again, so each case starts from the same place.
+        daemon.answer_ssh(&ssh_answer(environment_id, "kala"));
+        assert!(
+            refresh_as(&mut client, host, environment_id)
+                .await
+                .row
+                .readiness
+                .channel_scoped,
+            "{what}: the next honest answer registers"
+        );
+    }
+}
+
+/// KR-REQ-25.26: the remote login's shell reads what follows the host, so an SSH enrolment refuses
+/// every value a shell would, before anything is run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_enrolment_refuses_what_a_remote_shell_would_read() {
+    let daemon = FixtureDaemon::start();
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x44; 16]));
+    for (what, change) in [
+        (
+            "a user in the target",
+            Box::new(|record: &mut EnvironmentEnrolment| {
+                "root@build.example".clone_into(&mut record.target)
+            }) as Box<dyn Fn(&mut EnvironmentEnrolment)>,
+        ),
+        (
+            "a target that is an option",
+            Box::new(|record| "-oProxyCommand=x".clone_into(&mut record.target)),
+        ),
+        (
+            "a target with a space",
+            Box::new(|record| "build.example -x".clone_into(&mut record.target)),
+        ),
+        (
+            "a helper path with a space",
+            Box::new(|record| "/opt/my tools/kr".clone_into(&mut record.helper_path)),
+        ),
+        (
+            "a helper path with a shell character",
+            Box::new(|record| "/opt/kr;id".clone_into(&mut record.helper_path)),
+        ),
+        (
+            "a user that is an option",
+            Box::new(|record| "-oProxyCommand=x".clone_into(&mut record.os_user)),
+        ),
+    ] {
+        let mut record = ssh_record(environment_id);
+        change(&mut record);
+        let refused = client
+            .mutate(
+                Method::EnvironmentEnrol,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host),
+                &EnvironmentEnrolParams { enrolment: record },
+            )
+            .await
+            .expect("the daemon answers")
+            .expect_err(what);
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "{what}: {refused}"
+        );
+    }
+    assert!(inventory(&mut client).await.rows.is_empty());
+    assert!(daemon.ssh_invocations().is_empty());
 }

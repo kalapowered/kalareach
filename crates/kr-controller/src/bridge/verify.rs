@@ -83,6 +83,39 @@ pub async fn through_bridge(
     }
 }
 
+/// Registers an SSH host's identity: its helper says which environment and which user it is, and
+/// nothing else crosses.
+///
+/// The record decides what the answer has to be. Nothing here asks the host to do anything for a
+/// request: ssh carries the opening, the helper acknowledges it, and the helper is ended.
+///
+/// # Errors
+///
+/// Returns the [`Refusal`] naming what stopped it, including an answer that is not the record's.
+pub async fn through_identity_probe(
+    actor: &ActorEnvelope,
+    already_bridged: bool,
+    enrolment: &EnvironmentEnrolment,
+    origin_environment_id: EnvironmentId,
+    build_id: BuildId,
+) -> Result<BridgeVerification, Refusal> {
+    let acknowledgement = invoke::identify(
+        actor,
+        already_bridged,
+        enrolment,
+        origin_environment_id,
+        build_id,
+    )
+    .await?;
+    Ok(BridgeVerification {
+        environment_id: acknowledgement.environment_id,
+        os_user: acknowledgement.os_user,
+        role: acknowledgement.role,
+        protocol_version: acknowledgement.protocol_version,
+        max_frame_len: acknowledgement.max_frame_len,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

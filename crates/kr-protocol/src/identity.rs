@@ -278,6 +278,12 @@ pub enum EnrolmentError {
     HelperPathNotAbsolute,
     /// A container target is a reusable name rather than a container identifier.
     ContainerTargetNotIdentifier,
+    /// An SSH destination is not a plain host name or address.
+    SshTargetNotPlain,
+    /// An SSH user is not a plain account name.
+    SshUserNotPlain,
+    /// An SSH helper path is not a plain absolute path.
+    SshHelperPathNotPlain,
 }
 
 impl core::fmt::Display for EnrolmentError {
@@ -296,6 +302,19 @@ impl core::fmt::Display for EnrolmentError {
             Self::ContainerTargetNotIdentifier => formatter.write_str(
                 "a container enrolment requires the container identifier, never a reusable \
                  container name",
+            ),
+            Self::SshTargetNotPlain => formatter.write_str(
+                "an SSH enrolment names a host by a plain name or address: letters, digits, dots, \
+                 colons, underscores and hyphens, not beginning with a hyphen, with no user in it",
+            ),
+            Self::SshUserNotPlain => formatter.write_str(
+                "an SSH enrolment names the account by a plain name: letters, digits, dots, \
+                 underscores and hyphens, not beginning with a hyphen",
+            ),
+            Self::SshHelperPathNotPlain => formatter.write_str(
+                "an SSH enrolment names the helper by a plain absolute path: letters, digits, \
+                 dots, underscores, hyphens and slashes, because the remote login's shell reads \
+                 whatever else it holds",
             ),
         }
     }
@@ -370,6 +389,35 @@ pub fn validate_destination(
     }
     if access == EnvironmentAccess::Container && !is_container_identifier(target) {
         return Err(EnrolmentError::ContainerTargetNotIdentifier);
+    }
+    if access == EnvironmentAccess::SshHost {
+        // The login's shell reads what follows the host on the remote side, joined with spaces, so
+        // anything a shell would read is refused here and nothing needs quoting later. The user
+        // comes from its own option and never from the target.
+        let plain = |character: char, extra: &[char]| {
+            character.is_ascii_alphanumeric() || extra.contains(&character)
+        };
+        if !target
+            .chars()
+            .all(|character| plain(character, &['.', ':', '_', '-']))
+            || target.starts_with('-')
+        {
+            return Err(EnrolmentError::SshTargetNotPlain);
+        }
+        if !os_user
+            .chars()
+            .all(|character| plain(character, &['.', '_', '-']))
+            || os_user.starts_with('-')
+        {
+            return Err(EnrolmentError::SshUserNotPlain);
+        }
+        if !helper_path.starts_with('/')
+            || !helper_path
+                .chars()
+                .all(|character| plain(character, &['.', '_', '-', '/']))
+        {
+            return Err(EnrolmentError::SshHelperPathNotPlain);
+        }
     }
     Ok(())
 }
