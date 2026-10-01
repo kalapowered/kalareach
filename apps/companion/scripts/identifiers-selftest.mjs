@@ -16,7 +16,7 @@
 // status says so.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -121,10 +121,21 @@ for (const [what, text, expected] of [
   ['the identifier an earlier build declared is found', 'to.kala.companion', ['to.kala.companion']],
   ['a name that follows the identifier is not found', 'to.kala.reach.push', []],
   ['the application identifier itself is not found', 'to.kala.reach', []],
-  ['a name that only begins like the kept namespace is not found', 'to.kala.reach.companionship', []]
+  ['a name that only begins like the kept namespace is not found', 'to.kala.reach.companionship', []],
+  // Java reads `to.kala.reach.companion_preferences` as a name under `to.kala.reach`, so it is no
+  // name under the earlier namespace.
+  ['a name that continues with an underscore is not found', 'to.kala.reach.companion_preferences', []],
+  ['a name that continues with a dollar is not found', 'to.kala.reach.companion$Inner', []]
 ]) {
   held(what, JSON.stringify(expected), JSON.stringify(retiredTokens(text)))
 }
+
+const cut = retiredTokens(`to.kala.companion.${'a'.repeat(3000)}`)
+held(
+  'a name cut off at the reach is marked, so that it is never taken for a class that is defined',
+  'true',
+  String(cut.length === 1 && cut[0].endsWith('\u2026'))
+)
 
 // -- the dex files of an application ---------------------------------------------------------------
 
@@ -156,9 +167,7 @@ heldProblems(
 )
 heldProblems(
   'a class defined under the identifier before the namespace was kept is still refused',
-  problemsInDex([
-    dex({ defined: ['to.kala.companion.MainActivity'], constants: ['to.kala.companion.MainActivity'] })
-  ]),
+  problemsInDex([dex({ defined: ['to.kala.companion.MainActivity'] })]),
   ['the name to.kala.companion.MainActivity']
 )
 heldProblems(
@@ -265,6 +274,27 @@ held(
   ]),
   JSON.stringify(attributesFromTree(TREE))
 )
+const QUOTED = `
+    E: manifest (line=2)
+      E: application (line=62)
+        E: meta-data (line=70)
+          A: http://schemas.android.com/apk/res/android:value(0x01010024)="{"id":"to.kala.reach.companion.old"}" (Raw: "{"id":"to.kala.reach.companion.old"}")
+          A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
+`
+held(
+  'a value that holds quotes of its own is read whole',
+  JSON.stringify([['meta-data', 'value', '{"id":"to.kala.reach.companion.old"}']]),
+  JSON.stringify(attributesFromTree(QUOTED))
+)
+heldProblems(
+  'a name of an earlier identifier inside such a value is found',
+  problemsInManifest(
+    { package: 'to.kala.reach', values: [...GOOD.values, ...attributesFromTree(QUOTED)] },
+    WANT,
+    KNOWN
+  ),
+  ['meta-data value holds to.kala.reach.companion.old, which is not a class']
+)
 held(
   'the package comes from the badging line',
   'to.kala.reach',
@@ -315,9 +345,11 @@ function xmlNode(name, attributes = {}, children = []) {
 function manifestOfBundle({
   identifier = 'to.kala.reach',
   authority = 'to.kala.reach.fileprovider',
-  service = WORKER
+  service = WORKER,
+  metadata = null
 } = {}) {
   return xmlNode('manifest', { package: identifier }, [
+    ...(metadata === null ? [] : [xmlNode('meta-data', { value: metadata })]),
     xmlNode('permission', { name: 'to.kala.reach.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' }),
     xmlNode('application', {}, [
       xmlNode('provider', { authorities: authority }),
@@ -403,6 +435,11 @@ expectBundle(
   ['service name holds to.kala.reach.companion.push.Missing, which is not a class']
 )
 expectBundle(
+  'a name of an earlier identifier inside a value that holds quotes is found in a bundle manifest',
+  { manifest: manifestOfBundle({ metadata: '{"id":"to.kala.reach.companion.old"}' }) },
+  ['meta-data value holds to.kala.reach.companion.old, which is not a class']
+)
+expectBundle(
   'a bundle whose manifest is empty is refused rather than passed',
   { manifest: Buffer.alloc(0) },
   ['the bundle manifest holds no element']
@@ -436,6 +473,21 @@ expectBundle(
   'a service file that names another class of the kept namespace is refused',
   { services: 'to.kala.reach.companion.push.Gone\n' },
   ['base/root/META-INF/services/example.Loader carries to.kala.reach.companion.push.Gone']
+)
+expectBundle(
+  'the identifier before the namespace was kept is found in a file as UTF-16 text',
+  { page: Buffer.from('to.kala.companion', 'utf16le') },
+  ['base/assets/index.js carries to.kala.companion (as UTF-16)']
+)
+expectBundle(
+  'a class the application defines is not a stale name in a file as UTF-16 text either',
+  { page: Buffer.from(WORKER, 'utf16le') },
+  []
+)
+expectBundle(
+  'a name that only begins like the kept namespace is not a stale name as UTF-16 text',
+  { page: Buffer.from('to.kala.reach.companionship', 'utf16le') },
+  []
 )
 expectBundle(
   'a name that only begins like the kept namespace is not a stale name in a file',
@@ -698,7 +750,7 @@ function entitlementsFrom(name, bytes) {
   return answer(() => JSON.stringify(entitlementsOf(path)))
 }
 
-if (hasPlutil) {
+{
   held(
     'a fat executable that lists no image is refused rather than read as having nothing to say',
     'refused: a fat executable lists no image',
@@ -735,17 +787,24 @@ if (hasPlutil) {
     'refused: a fat executable carries no entitlements of its own and its signature is read for one architecture only',
     entitlementsFrom('fat-plain', fat(image(null), image(null)))
   )
-} else {
-  notRun += 5
-  console.log('not run  five cases of malformed executables (plutil is not available)')
 }
 
 if (hasPlutil && hasCodesign) {
   // A signed build keeps its entitlements in the signature and has no copy in the executable. The
   // executable here is a system tool copied and signed ad hoc with entitlements of its own.
   const signed = join(work, 'signed-tool')
-  const [native] = spawnSync('lipo', ['-archs', '/usr/bin/true'], { encoding: 'utf8' }).stdout.split(' ')
-  spawnSync('lipo', ['/usr/bin/true', '-thin', native.trim(), '-output', signed])
+  const archs = spawnSync('lipo', ['-archs', '/usr/bin/true'], { encoding: 'utf8' }).stdout.trim()
+  const thin =
+    archs.includes(' ')
+      ? spawnSync('lipo', ['/usr/bin/true', '-thin', archs.split(' ').at(-1), '-output', signed], {
+          encoding: 'utf8'
+        })
+      : { status: 0, stderr: '' }
+  if (!archs.includes(' ')) copyFileSync('/usr/bin/true', signed)
+  if (thin.status !== 0) {
+    failures += 1
+    console.error(`FAIL  the fixture executable could not be made thin: ${thin.stderr}`)
+  }
   const list = join(work, 'signed.entitlements')
   writeFileSync(list, plist({ 'keychain-access-groups': [PRIVATE, SHARED] }))
   const signing = spawnSync('codesign', ['--force', '--sign', '-', '--entitlements', list, signed], {
