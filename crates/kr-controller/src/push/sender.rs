@@ -575,25 +575,41 @@ mod tests {
         assert_ne!(nonces[0], nonces[1], "each request carries a fresh nonce");
     }
 
+    /// A refused renewal names the status and, when the gateway's code is one this host knows, the
+    /// code. Nothing else the gateway said is repeated: not its message, and not a code this host
+    /// does not know, which can be anything the gateway chose to put there.
     #[test]
-    fn a_refused_renewal_says_why() {
+    fn a_refused_renewal_names_its_code_and_never_the_gateways_words() {
+        const WORDS: &str = "There is no such authorisation.";
         let host = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key");
         let held = credential(9, now() + 2 * 24 * 60 * 60 * 1000);
-        let recorder = Arc::new(Recorder::default());
-        *recorder.answers.lock().expect("not poisoned") = vec![(
-            403,
-            serde_json::json!({
-                "ok": false,
-                "error": { "code": "FORBIDDEN", "message": "There is no such authorisation." },
-            }),
-        )];
-        let runtime = runtime();
-        let refused = senders(&recorder, &host, &runtime)
-            .renew(&held)
-            .expect_err("no renewal");
+        let refusal = |code: &str| {
+            let recorder = Arc::new(Recorder::default());
+            *recorder.answers.lock().expect("not poisoned") = vec![(
+                403,
+                serde_json::json!({
+                    "ok": false,
+                    "error": { "code": code, "message": WORDS },
+                }),
+            )];
+            let runtime = runtime();
+            senders(&recorder, &host, &runtime)
+                .renew(&held)
+                .expect_err("no renewal")
+        };
+
+        let known = refusal("FORBIDDEN");
         assert!(
-            refused.contains("There is no such authorisation."),
-            "{refused}"
+            known.contains("403") && known.contains("FORBIDDEN"),
+            "{known}"
+        );
+        assert!(!known.contains(WORDS), "{known}");
+
+        let unknown = refusal("a-code-nobody-should-see");
+        assert!(unknown.contains("403"), "{unknown}");
+        assert!(
+            !unknown.contains("a-code-nobody-should-see") && !unknown.contains(WORDS),
+            "{unknown}"
         );
     }
 
