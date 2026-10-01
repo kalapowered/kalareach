@@ -142,6 +142,18 @@ fn a_value_the_format_cannot_hold_is_refused() {
         description.compile(),
         Err(CompileError::TooLarge { .. })
     ));
+
+    // The legacy format ends at 4096 bytes. The pinned entry fits, and an entry that grew past it
+    // is refused rather than written for a library that would cut it short.
+    assert!(terminfo::compiled().expect("compiles").len() <= 4_096);
+    let mut description = Description::pinned();
+    description
+        .strings
+        .insert("Zz".to_owned(), "a".repeat(1_000));
+    assert!(matches!(
+        description.compile(),
+        Err(CompileError::TooLarge { .. })
+    ));
 }
 
 /// The same description compiles to the same bytes, whatever order its capabilities were added in.
@@ -527,7 +539,8 @@ mod tools {
         found
     }
 
-    /// Every comparison the brief names, for one reader and one database directory.
+    /// Every comparison between the compiled entry and the data it came from, for one reader and one
+    /// database directory.
     fn compare(infocmp: &Path, root: &Path, description: &Description) -> Comparison {
         let read = read_with(infocmp, root);
         Comparison {
