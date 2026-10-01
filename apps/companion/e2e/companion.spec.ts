@@ -2177,21 +2177,32 @@ test.describe("the phone's tab bar", () => {
           await expect(tabs.nth(at)).toHaveAttribute('aria-current', 'page')
           await settle()
           await holds(`on ${name} after the press`)
-          // A person at the end of a list stays there while the bar measures again.
+          // A person at the end of a list stays there while the bar measures again. The bar is made
+          // to measure by a pixel's change of its own width, which leaves the page above it alone.
           const end = await list.evaluate((element) => {
             element.scrollTop = element.scrollHeight
             return element.scrollTop
           })
           if (seen.scale === '200%' && at === 0) expect.soft(end, 'the list has an end to scroll to').toBeGreaterThan(0)
+          await page.evaluate(() => {
+            ;(document.querySelector('.m-tabbar') as HTMLElement).style.paddingLeft = '1px'
+          })
+          await settle()
+          await page.evaluate(() => {
+            ;(document.querySelector('.m-tabbar') as HTMLElement).style.removeProperty('padding-left')
+          })
+          await settle()
+          await holds(`on ${name} after the bar's width changed`)
+          // Within a pixel's rounding: what the bar's measuring did was to move it by the bar's height.
+          expect
+            .soft(Math.abs((await list.evaluate((element) => element.scrollTop)) - end), `${name}: the list stays at its end`)
+            .toBeLessThanOrEqual(1.5)
+          // And by a pixel's change of the screen's width, which also lays the page above it out again.
           await page.setViewportSize({ width: seen.width + 1, height: seen.height })
           await settle()
           await page.setViewportSize({ width: seen.width, height: seen.height })
           await settle()
           await holds(`on ${name} after the screen changed width`)
-          // Within a pixel's rounding: what the bar's measuring did was to move it by the bar's height.
-          expect
-            .soft(Math.abs((await list.evaluate((element) => element.scrollTop)) - end), `${name}: the list stays at its end`)
-            .toBeLessThanOrEqual(1.5)
         }
         // The widest count a badge shows, 99+, stays clear of its own label.
         const badge = page.locator('.m-tab-badge')
