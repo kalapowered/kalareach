@@ -1459,15 +1459,20 @@ pub struct LaunchFailure {
 /// `palette` is where the session's colours come from, and it is applied between opening the
 /// session and launching its shell. That is the only moment it can be applied: section 8 fixes the
 /// palette at creation, and the first byte the shell writes is already a screen somebody could be
-/// looking at.
+/// looking at. `privacy` is the state the launch specification carries, and it is applied at the
+/// same moment for the same reason: output a session prints before it knows privacy mode is on is
+/// output it would retain ([`Session::take_launch_privacy`]).
 ///
 /// # Errors
 ///
 /// Returns the launch failure. A session whose shell never started is already recorded as closed
 /// with `root_launch_failed`, so a failed creation leaves a record rather than a stuck `creating`.
+/// One that could not take the privacy state it was launched under never started its shell, and
+/// leaves its journal and no closure record.
 pub fn start_or_record(
     config: crate::session::SessionConfig,
     palette: crate::snapshot::PaletteChoice,
+    privacy: kr_protocol::worker::PrivacyLaunch,
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
 ) -> std::result::Result<Arc<SessionRuntime>, Box<LaunchFailure>> {
     let mut session = match Session::open(config) {
@@ -1480,6 +1485,13 @@ pub fn start_or_record(
         }
     };
     if let Err(error) = session.set_initial_palette(palette) {
+        return Err(Box::new(LaunchFailure {
+            error,
+            closure: session.closure().cloned(),
+        }));
+    }
+    // The privacy state the specification carries, before the shell can print its first byte.
+    if let Err(error) = session.take_launch_privacy(&privacy) {
         return Err(Box::new(LaunchFailure {
             error,
             closure: session.closure().cloned(),

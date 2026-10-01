@@ -3866,6 +3866,36 @@ impl Session {
         Ok(enabling)
     }
 
+    /// Applies the privacy state this session is launched under, before its shell starts.
+    ///
+    /// A session created while privacy mode is on is told so in its launch specification, and this
+    /// is where it takes it: the generation is recorded and retention is fenced before the shell
+    /// can print anything, so nothing the shell prints is ever retained and the session does not
+    /// wait for the daemon's next notice to be private. The daemon still tells it the generation,
+    /// which finds it already holding it ([`Self::enable_privacy`]); what that notice adds is the
+    /// attention store's part, which has nothing to fence before the session is served.
+    ///
+    /// A launch that says privacy mode is off needs nothing here. A session starts retaining from
+    /// its first byte, and the generation a later change gives it arrives with the daemon's notice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when privacy mode is on and its generation
+    /// cannot be recorded, and [`WorkerError::PreconditionFailed`] for a launch that says it is on
+    /// at the generation of an environment that has never turned it on. Either way nothing has
+    /// been fenced, and the shell is not started: a privacy mode this host cannot write down is
+    /// one it must not claim to be in.
+    pub fn take_launch_privacy(
+        &mut self,
+        launched: &kr_protocol::worker::PrivacyLaunch,
+    ) -> Result<()> {
+        if !launched.enabled {
+            return Ok(());
+        }
+        let generation = crate::privacy::PrivacyGeneration::new(launched.generation.get());
+        self.enable_privacy(generation, &mut []).map(|_| ())
+    }
+
     /// Asks whether privacy mode's cleanup has finished.
     ///
     /// Two halves, and completion needs both. The session's own cleanup is local and synchronous,

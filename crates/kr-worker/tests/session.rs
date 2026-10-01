@@ -2086,6 +2086,10 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
         let runtime = kr_worker::runtime::start_or_record(
             config,
             choice,
+            kr_protocol::worker::PrivacyLaunch {
+                generation: kr_protocol::scalars::U64::ZERO,
+                enabled: false,
+            },
             std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
         )
         .expect("the session launches");
