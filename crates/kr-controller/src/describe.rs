@@ -27,7 +27,7 @@
 //!   so a session's closure and a daemon's restart leave it where it is.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kr_describe::budget::Budgets;
 use kr_describe::metadata::{LabelSource, SessionFacts, Title, deterministic_title};
@@ -44,6 +44,14 @@ use kr_worker::privacy::{
 
 use crate::error::{ControllerError, Result};
 use crate::privacy::{Admitted, PrivacyState, Published};
+
+#[cfg(feature = "testing")]
+pub mod hooks;
+pub(crate) mod host;
+mod link;
+
+#[cfg(feature = "testing")]
+pub use host::Figures;
 
 /// How far back a caller's authority reaches into one session's history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +84,12 @@ impl HistoryReach {
 #[derive(Debug)]
 pub struct DescribeModule {
     store: Mutex<DescriptionStore>,
+    /// The thread that runs the description service, once the daemon has started it. Until then,
+    /// and in a module opened on its own, nothing is generated and every session is shown as it was
+    /// before: a pin, or its deterministic title.
+    host: OnceLock<Arc<host::DescribeHost>>,
+    /// The tasks that read each session's facts from its worker.
+    links: link::Links,
     /// Where this crate's own tests stop a read.
     #[cfg(test)]
     pub(crate) pauses: Pauses,
@@ -111,18 +125,194 @@ impl DescribeModule {
             store: Mutex::new(
                 DescriptionStore::open(state_dir).map_err(ControllerError::registry)?,
             ),
+            host: OnceLock::new(),
+            links: link::Links::default(),
             #[cfg(test)]
             pauses: Pauses::default(),
         })
     }
 
-    /// The store, held: everything that reads or writes it takes this first.
+    /// Returns the host that runs the description service, once it has been started.
+    pub(crate) fn host(&self) -> Option<&Arc<host::DescribeHost>> {
+        self.host.get()
+    }
+
+    /// What the host has done, for this crate's own tests: none when no host runs.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn figures(&self) -> Option<host::Figures> {
+        self.host().map(|host| host.snapshot().figures)
+    }
+
+    /// Wakes the host, for this crate's own tests that change what it reads.
+    #[cfg(feature = "testing")]
+    pub fn wake(&self) {
+        self.wake_host();
+    }
+
+    /// What setup shows: the host's own account of it, or that this host generates nothing.
+    pub(crate) fn setup(
+        &self,
+        settings: kr_describe::resource::ResourceSettings,
+    ) -> kr_protocol::describe::DescriptionSetup {
+        let on_battery = settings.on_battery;
+        use kr_describe::service::DownloadProgress;
+        use kr_protocol::describe::DescriptionDownload;
+
+        let published = self
+            .host()
+            .filter(|host| host.runs())
+            .map(|host| host.snapshot());
+        let Some((snapshot, setup)) = published
+            .as_ref()
+            .and_then(|snapshot| snapshot.setup.as_ref().map(|setup| (snapshot, setup)))
+        else {
+            return kr_protocol::describe::DescriptionSetup {
+                offered: false,
+                enabled: false,
+                on_battery,
+                profile_id: Nullable::null(),
+                asset_bytes: U64::new(0),
+                sources: Vec::new(),
+                download: DescriptionDownload::NotStarted,
+                fetched_bytes: U64::new(0),
+                failure: Nullable::null(),
+                can_cancel: false,
+                can_disable: true,
+                needs_hosted_account: false,
+                unavailable: Nullable::some(
+                    "this host's daemon is not generating descriptions".to_owned(),
+                ),
+                state: DescriptionState::ResourcePaused,
+                paused: Nullable::some(DescriptionPause::NoModelHere),
+            };
+        };
+        let (download, fetched_bytes, failure) = match &setup.progress {
+            DownloadProgress::NotStarted => (DescriptionDownload::NotStarted, 0, None),
+            DownloadProgress::Running { fetched_bytes, .. } => {
+                (DescriptionDownload::Running, *fetched_bytes, None)
+            }
+            DownloadProgress::Verified => (DescriptionDownload::Verified, setup.asset_bytes, None),
+            DownloadProgress::Cancelled => (DescriptionDownload::Cancelled, 0, None),
+            DownloadProgress::Failed { why } => (DescriptionDownload::Failed, 0, Some(why.clone())),
+        };
+        kr_protocol::describe::DescriptionSetup {
+            offered: setup.offered,
+            enabled: settings.enabled,
+            on_battery,
+            profile_id: Nullable(setup.profile_id.clone()),
+            asset_bytes: U64::new(setup.asset_bytes),
+            sources: setup.sources.clone(),
+            download,
+            fetched_bytes: U64::new(fetched_bytes),
+            failure: Nullable(failure),
+            can_cancel: setup.can_cancel,
+            can_disable: setup.can_disable,
+            needs_hosted_account: setup.needs_hosted_account,
+            unavailable: Nullable(setup.unavailable.clone()),
+            state: snapshot.state.unwrap_or(DescriptionState::ResourcePaused),
+            paused: Nullable(snapshot.paused),
+        }
+    }
+
+    /// What the diagnostics say of descriptions: whether this host generates them, and what it is
+    /// waiting for when it is not.
+    pub(crate) fn doctor_check(
+        &self,
+        settings: &kr_describe::resource::ResourceSettings,
+    ) -> kr_protocol::hostinfo::DoctorCheck {
+        use kr_protocol::hostinfo::export::Sentence;
+        use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
+
+        let published = self
+            .host()
+            .filter(|host| host.runs())
+            .map(|host| host.snapshot());
+        let (status, detail, fix): (_, _, Option<&str>) = match published {
+            None => (
+                DoctorStatus::NotApplicable,
+                Sentence::new().stated("this daemon is not generating session descriptions"),
+                None,
+            ),
+            Some(_) if !settings.enabled => (
+                DoctorStatus::NotApplicable,
+                Sentence::new().stated("descriptions are off; every session shows its title from metadata"),
+                Some("kr host descriptions --on turns them on."),
+            ),
+            Some(snapshot) => match snapshot.paused {
+                Some(DescriptionPause::NotDownloaded) => (
+                    DoctorStatus::Warning,
+                    Sentence::new().stated("the model's files are not on this host, so titles come from metadata"),
+                    Some("kr host descriptions --download fetches them; the size is shown first."),
+                ),
+                Some(DescriptionPause::InferenceFailed) => (
+                    DoctorStatus::Warning,
+                    Sentence::new().stated("the description process failed three times running and is left alone for a while"),
+                    Some("Titles come from metadata meanwhile; the process is tried again by itself."),
+                ),
+                Some(pause) => (
+                    DoctorStatus::Ok,
+                    Sentence::new()
+                        .stated("inference is paused for ")
+                        .stated(pause_word(pause))
+                        .stated(" and resumes by itself"),
+                    None,
+                ),
+                None => (
+                    DoctorStatus::Ok,
+                    Sentence::new()
+                        .stated("generating descriptions; ")
+                        .number(snapshot.figures.jobs.published)
+                        .stated(" published since this daemon started"),
+                    None,
+                ),
+            },
+        };
+        DoctorCheck::new(
+            "descriptions",
+            "Session descriptions are generated on this host, or say why not",
+            status,
+            detail,
+            fix,
+        )
+    }
+
+    /// Records the host the daemon started, once. Says whether it was the first.
+    pub(crate) fn set_host(&self, host: Arc<host::DescribeHost>) -> std::result::Result<(), ()> {
+        self.host.set(host).map_err(drop)
+    }
+
+    /// Starts reading one session's facts at its worker, for the host given.
+    pub(crate) fn watch_links(
+        &self,
+        controller: std::sync::Weak<crate::service::Controller>,
+        host: &Arc<host::DescribeHost>,
+        worker: crate::directory::KnownWorker,
+    ) {
+        self.links.watch(controller, host, worker);
+    }
+
+    /// Stops reading one session's facts.
+    pub(crate) fn stop_links(&self, session_id: SessionId) {
+        self.links.stop(session_id);
+    }
+
+    /// Wakes the host, when there is one: something it reads has changed.
+    pub(crate) fn wake_host(&self) {
+        if let Some(host) = self.host() {
+            host.wake();
+        }
+    }
+
+    /// The store, held: everything that reads or writes it on this module's connection takes this
+    /// first.
     ///
     /// A rename writes to it under an admission while holding the connection table, so a write
-    /// that waits on the file's own lock waits with every other admission behind it. Only this
-    /// daemon opens the file, behind this lock, so nothing contends for it; a second process that
-    /// wrote to it would need the record's shape, taking its write lock before the admission and
-    /// writing inside it.
+    /// that waits on the file's own lock waits with every other admission behind it. The
+    /// description host writes through a connection of its own to the same file, under privacy
+    /// mode's admission at the generation of what it publishes, and the store's removals take the
+    /// write lock before they read, so a writer waits on the file's lock rather than failing and
+    /// what a removal read is what it removes.
     pub(crate) fn store(&self) -> MutexGuard<'_, DescriptionStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -156,17 +346,37 @@ impl DescribeModule {
             self.shown(&store, session_id, facts, reach, reading.published())?
         };
         let generated = shown.generated.as_ref();
+        // What the host last published, when it runs. Without one this daemon tracks no context
+        // revision and runs no model, so it cannot say that a description it holds is current: it
+        // says the conservative thing rather than implying current text.
+        let published = self
+            .host()
+            .filter(|host| host.runs())
+            .map(|host| host.snapshot());
+        let standing = published
+            .as_ref()
+            .and_then(|snapshot| snapshot.sessions.get(&session_id).copied());
+        let (state, paused, cadence_ms) = match &published {
+            Some(snapshot) => (
+                snapshot.state.unwrap_or(DescriptionState::ResourcePaused),
+                snapshot.paused,
+                snapshot.cadence_ms,
+            ),
+            None => (
+                DescriptionState::ResourcePaused,
+                Some(DescriptionPause::NoModelHere),
+                Budgets::DEFAULTS.session_cooldown_ms,
+            ),
+        };
         Ok(SessionDescribeResult {
             session_id,
             title: shown.title.as_str().to_owned(),
             source: protocol_source(shown.source),
             activity_text: Nullable(generated.map(|record| record.activity.as_str().to_owned())),
-            // This daemon tracks no context revision, so it cannot say that a description it holds
-            // is current. It says the conservative thing rather than implying current text.
-            freshness: if generated.is_some() {
-                DescriptionFreshness::Stale
-            } else {
-                DescriptionFreshness::None
+            freshness: match (generated.is_some(), standing) {
+                (true, Some(standing)) => standing.freshness,
+                (true, None) => DescriptionFreshness::Stale,
+                (false, _) => DescriptionFreshness::None,
             },
             provenance: Nullable(generated.map(|record| DescriptionProvenance {
                 profile_id: record.profile_id.clone(),
@@ -176,13 +386,17 @@ impl DescribeModule {
                 source_cursor_to: U64::new(record.cursor.to),
                 produced_at_ms: TimestampMs::new(record.produced_at_ms),
             })),
-            queued_age_ms: Nullable::null(),
+            queued_age_ms: Nullable(
+                standing
+                    .and_then(|standing| standing.queued_age_ms)
+                    .map(U64::new),
+            ),
             last_success_ms: Nullable(
                 generated.map(|record| TimestampMs::new(record.produced_at_ms)),
             ),
-            cadence_ms: U64::new(Budgets::DEFAULTS.session_cooldown_ms),
-            state: DescriptionState::ResourcePaused,
-            paused: Nullable::some(DescriptionPause::NoModelHere),
+            cadence_ms: U64::new(cadence_ms),
+            state,
+            paused: Nullable(paused),
         })
     }
 
@@ -331,6 +545,72 @@ pub fn facts_of(summary: &kr_protocol::session::SessionSummary) -> SessionFacts 
 }
 
 impl crate::service::Controller {
+    /// The session names and descriptions module, for this crate's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn descriptions(&self) -> &Arc<DescribeModule> {
+        &self.descriptions
+    }
+
+    /// Performs `description.configure` or `description.download` under the admission it carries,
+    /// and answers what setup shows afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns the configuration's refusal, [`ControllerError::WindowExpired`] for an action that
+    /// carries no freshness, and [`ControllerError::InvalidArgument`] for what this daemon does not
+    /// serve.
+    pub(crate) async fn description_write(
+        self: &std::sync::Arc<Self>,
+        method: kr_protocol::method::Method,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        use kr_protocol::method::Method;
+
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not change a description setting"
+                    .to_owned(),
+            });
+        }
+        match method {
+            Method::DescriptionConfigure => {
+                let params: kr_protocol::describe::DescriptionConfigureParams = mutation
+                    .params
+                    .to_typed()
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                self.apply_configuration(
+                    &kr_protocol::hostinfo::configuration::Change::Descriptions {
+                        enabled: params.enabled.0,
+                        on_battery: params.on_battery.0,
+                    },
+                )
+                .await?;
+                self.description_setup()
+            }
+            _ => Err(ControllerError::InvalidArgument(format!(
+                "{} is not a mutation this daemon serves",
+                method.as_str()
+            ))),
+        }
+    }
+
+    /// Answers `description.setup`: what descriptions offer on this host, and what it costs, from
+    /// what the description host last published. A host that runs none says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the answer cannot be encoded.
+    pub(crate) fn description_setup(&self) -> Result<kr_protocol::envelope::ParamsValue> {
+        // The settings are the document's, which the answer to a change that was just made must
+        // already show; everything else is what the host last published.
+        let answer = self.descriptions.setup(self.description_settings());
+        kr_protocol::envelope::ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
     /// Answers `session.describe` for one session, from its summary, to a caller whose history
     /// reaches `reach` into it, under the environment's privacy state as it stands now.
     ///
@@ -413,6 +693,41 @@ impl crate::service::Controller {
     }
 }
 
+/// Whether this module answers a method: the owner's two writes for descriptions. `description.setup`
+/// is a read, served with the daemon's other reads.
+#[must_use]
+pub const fn serves(method: kr_protocol::method::Method) -> bool {
+    matches!(
+        method,
+        kr_protocol::method::Method::DescriptionConfigure
+            | kr_protocol::method::Method::DescriptionDownload
+    )
+}
+
+/// The word a pause is reported under.
+const fn pause_word(pause: DescriptionPause) -> &'static str {
+    match pause {
+        DescriptionPause::MemoryReserve => "the memory reserve",
+        DescriptionPause::MemoryPressure => "memory pressure",
+        DescriptionPause::Thermal => "heat",
+        DescriptionPause::Battery => "battery power",
+        DescriptionPause::SignalUnqualified => "a reading this host cannot take",
+        DescriptionPause::Disabled => "the owner's setting",
+        DescriptionPause::NoModelHere => "this environment, which runs no model",
+        DescriptionPause::NotDownloaded => "the model's files",
+        DescriptionPause::InferenceFailed => "repeated failures",
+    }
+}
+
+/// Where the description process is and what the host reads, as the daemon places them.
+pub(crate) struct Placement {
+    pub(crate) program: std::path::PathBuf,
+    pub(crate) environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub(crate) catalogue: kr_describe::profile::catalogue::Catalogue,
+    pub(crate) clock: host::Clock,
+    pub(crate) conditions: Option<Arc<Mutex<kr_describe::resource::HostConditions>>>,
+}
+
 /// Maps where a title came from onto the protocol's word for it.
 const fn protocol_source(source: LabelSource) -> kr_protocol::describe::LabelSource {
     match source {
@@ -438,17 +753,25 @@ impl PrivacySubsystem for DescriptionsPrivacy<'_> {
         "descriptions"
     }
 
-    fn fence(
-        &mut self,
-        _generation: PrivacyGeneration,
-    ) -> std::result::Result<Fenced, Unavailable> {
-        Ok(Fenced::default())
+    fn fence(&mut self, generation: PrivacyGeneration) -> std::result::Result<Fenced, Unavailable> {
+        // Every tracked session is fenced at once, and the job running for each is cancelled; a
+        // module with no host has nothing running to stop.
+        let cancelled = self
+            .module
+            .host()
+            .filter(|host| host.runs())
+            .map_or(0, |host| host.fence(generation));
+        Ok(Fenced {
+            queues: u64::from(self.module.host().is_some()),
+            items: cancelled,
+        })
     }
 
     fn cancel_undispatched(
         &mut self,
         _generation: PrivacyGeneration,
     ) -> std::result::Result<Cancelled, Unavailable> {
+        // The queue is the host's memory, forgotten with the rest of it in `remove_retained`.
         Ok(Cancelled::default())
     }
 
@@ -456,7 +779,12 @@ impl PrivacySubsystem for DescriptionsPrivacy<'_> {
         &mut self,
         _generation: PrivacyGeneration,
     ) -> std::result::Result<Removed, Unavailable> {
-        self.module
+        // The rows go at once, through the module's own store. What the host holds in memory, its
+        // queue and its contexts, goes with a purge it is asked to make and has a bound to make
+        // it in; a host that has not finished is not a removal that has, and the caller asks
+        // again.
+        let removed = self
+            .module
             .store()
             .remove_generated()
             .map(|removed| Removed {
@@ -467,11 +795,15 @@ impl PrivacySubsystem for DescriptionsPrivacy<'_> {
                 Unavailable::new(format!(
                     "generated descriptions could not be removed: {error}"
                 ))
-            })
+            })?;
+        if let Some(host) = self.module.host() {
+            host.purge()?;
+        }
+        Ok(removed)
     }
 
     fn outstanding(&self) -> std::result::Result<u64, Unavailable> {
-        Ok(0)
+        Ok(self.module.host().map_or(0, |host| host.outstanding()))
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {

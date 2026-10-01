@@ -62,7 +62,8 @@ impl Controller {
             .lock()
             .await
             .insert(worker.clone(), described);
-        self.attention.watch(self.attention_reach(), worker);
+        self.attention.watch(self.attention_reach(), worker.clone());
+        self.describe_worker(&worker);
         self.admissions_due();
     }
 

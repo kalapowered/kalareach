@@ -12,6 +12,14 @@ publish.workspace = true
 name = "kr-controller"
 path = "src/bin/kr-controller.rs"
 
+# The description process with no model, which this crate's own tests start in place of
+# `kr-describe-inference`. It is built only with the `testing` feature and is not part of any
+# release: no installation names it.
+[[bin]]
+name = "kr-stub-inference"
+path = "src/bin/kr-stub-inference.rs"
+required-features = ["testing"]
+
 [dependencies]
 # Each time bound on authority is published whole through one atomic pointer, which the write
 # boundary reads inside a poll.
@@ -65,8 +73,10 @@ url.workspace = true
 
 [features]
 # The pause the host's own tests use to stand between an attention action's admission and its
-# store write. It compiles to nothing without this feature, and no shipped build enables it.
-testing = []
+# store write, the hooks that place the description process, its clock and the conditions it reads,
+# and the stub that stands in for the description process. It compiles to nothing without this
+# feature, and no shipped build enables it.
+testing = ["kr-describe/testing"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
