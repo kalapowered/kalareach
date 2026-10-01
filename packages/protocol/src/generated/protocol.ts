@@ -6873,8 +6873,8 @@ export interface FrameId {
  * The environment's privacy state when this worker was launched.
  *
  * The worker applies it before it starts its shell. A session created while privacy mode is
- * on therefore retains nothing from its first byte, and does not wait for the daemon's next
- * notice to learn that it is private.
+ * on therefore keeps none of its output in the history it retains, from its first byte, and
+ * does not wait for the daemon's next notice to learn that it is private.
  */
 export interface PrivacyLaunch {
   /**

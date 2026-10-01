@@ -326,8 +326,8 @@ pub struct WorkerLaunchSpec {
     /// The environment's privacy state when this worker was launched.
     ///
     /// The worker applies it before it starts its shell. A session created while privacy mode is
-    /// on therefore retains nothing from its first byte, and does not wait for the daemon's next
-    /// notice to learn that it is private.
+    /// on therefore keeps none of its output in the history it retains, from its first byte, and
+    /// does not wait for the daemon's next notice to learn that it is private.
     pub privacy: PrivacyLaunch,
 }
 
@@ -682,6 +682,33 @@ mod tests {
         assert!(
             without.to_typed::<WorkerLaunchSpec>().is_err(),
             "on the wire too"
+        );
+        let CanonicalValue::Map(map) = encoded(&private) else {
+            panic!("a specification is a map");
+        };
+        let entries: Vec<_> = map
+            .into_entries()
+            .into_iter()
+            .map(|(name, value)| match (name.as_str(), value) {
+                ("privacy", CanonicalValue::Map(inner)) => {
+                    let mut members = inner.into_entries();
+                    members.push(("reason".to_owned(), CanonicalValue::text("because")));
+                    (
+                        name,
+                        CanonicalValue::Map(
+                            kr_cbor::CanonicalMap::from_entries(members).expect("the members"),
+                        ),
+                    )
+                }
+                (_, value) => (name, value),
+            })
+            .collect();
+        let more = ParamsValue::new(CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries(entries).expect("the members"),
+        ));
+        assert!(
+            more.to_typed::<WorkerLaunchSpec>().is_err(),
+            "and one that says more than a worker reads, on the wire too"
         );
 
         // Privacy mode off at a later generation is as much a state as on, and travels the same.

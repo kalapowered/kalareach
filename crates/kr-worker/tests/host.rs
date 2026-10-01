@@ -1093,12 +1093,14 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     daemon.stop().await;
 }
 
-/// KR-REQ-24.27: a worker created while privacy mode is on holds the generation before the daemon
-/// has recorded it as running, and so before the daemon could first tell it anything: the worker
-/// read the state from its launch specification and wrote it to its journal ahead of its shell.
+/// KR-REQ-24.27: through a real daemon and a real worker process, a worker created while privacy
+/// mode is on reads the state from its launch specification and holds it in its journal by the
+/// time the daemon publishes it, which is after its ready report and before the daemon's tick can
+/// find it to tell it anything.
 ///
 /// The journal says when it recorded the state and the worker's descriptor says when the daemon
-/// published the worker, which is after the ready report. The control is a worker created with
+/// published the worker. That the state is held before the shell prints is proved where there is no
+/// tick to compete with, in the worker's own privacy tests. The control is a worker created with
 /// privacy mode off, whose journal says the initial generation, off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
