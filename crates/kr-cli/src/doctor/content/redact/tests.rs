@@ -464,43 +464,74 @@ fn a_quote_in_the_home_directory_is_a_quote_before_the_credential() {
     );
 }
 
-/// KR-REQ-29.04: a credential whose value starts in the home directory does not cut the home in two:
-/// which spans are replaced is read in the text with the home replaced, so no part of a home that
-/// holds a space, or a credential, stays in the text.
+/// KR-REQ-29.04: the home directory and the credentials are found in one text, as it was written,
+/// and where they overlap the region they cover together is replaced whole: a credential's value
+/// that starts inside a home with a space in it, or a home that holds an assignment or an option,
+/// leaves no part of the home in the text, and a quote in the home is read as a quote of the field.
 #[test]
-fn a_credential_value_that_starts_in_the_home_directory_leaves_no_part_of_it() {
+fn a_home_directory_and_a_credential_that_overlap_are_replaced_whole() {
     for (home, paths, text, expected) in [
+        // A value that starts inside a home with a space in it.
         (
             "/home/john smith",
             UNIX,
-            format!("TOKEN=/home/john smith/{MARKER}"),
-            "TOKEN=[redacted]",
+            "TOKEN=/home/john smith/x".to_owned(),
+            "TOKEN=[redacted]/x",
         ),
         (
             "C:\\Users\\John Smith",
             WINDOWS,
-            format!("tool --auth-sock C:\\Users\\John Smith\\.ssh\\{MARKER}"),
-            "tool --auth-sock [redacted]",
+            "tool --auth-sock C:\\Users\\John Smith\\.ssh\\agent".to_owned(),
+            "tool --auth-sock [redacted]\\.ssh\\agent",
         ),
         (
             "C:\\Users\\John Smith",
             WINDOWS,
-            format!("--token C:\\Users\\John Smith\\{MARKER}"),
-            "--token [redacted]",
+            "--token C:\\Users\\John Smith\\x".to_owned(),
+            "--token [redacted]\\x",
         ),
-        // A home that holds an assignment: the home is replaced whole.
+        // A home that holds an assignment, with a value that runs past it.
         (
             "/Users/Alice TOKEN=x",
             UNIX,
             "/Users/Alice TOKEN=x/work".to_owned(),
-            "[home]/work",
+            "[redacted]",
+        ),
+        // A home that holds an option: the option's own value is replaced and the home is one.
+        (
+            "/Users/Alice --token",
+            UNIX,
+            format!("tool /Users/Alice --token {MARKER}"),
+            "tool [home] [redacted]",
+        ),
+        // A home with a credential's value that holds it: the value is the credential.
+        (
+            "/home/tom",
+            UNIX,
+            "--password /home/tom/work".to_owned(),
+            "--password [redacted]",
         ),
     ] {
         let said = field(&text, Some(home), paths);
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
-        assert!(!said.contains("Smith") && !said.contains("Alice"), "{said}");
+        assert!(!said.contains("Smith") && !said.contains("smith"), "{said}");
+        assert!(!said.contains("Alice") || said.contains("[home]"), "{said}");
     }
+    // A home with a quote in it, inside a credential's value: the value is read as written, so the
+    // quote the home holds closes with the next one and the value runs to it.
+    for text in [
+        format!("TOKEN=/home/o'neil/a /home/o'neil/{MARKER}"),
+        format!("TOKEN=/home/o'neil/a {MARKER}\\' tail"),
+    ] {
+        let said = field(&text, Some("/home/o'neil"), UNIX);
+        assert!(!said.contains(MARKER), "{text} -> {said}");
+        assert!(!said.contains("neil"), "{text} -> {said}");
+    }
+    let windows = format!("--password C:\\Users\\O'Brien\\a {MARKER}\\'");
+    let said = field(&windows, Some("C:\\Users\\O'Brien"), WINDOWS);
+    assert!(!said.contains(MARKER), "{windows} -> {said}");
+    assert!(!said.contains("Brien"), "{windows} -> {said}");
 }
 
 /// Where the word that holds the value starting at `start` ends when each quote character before
@@ -647,6 +678,65 @@ fn no_reading_of_the_quotes_before_a_value_leaves_it_in_the_text() {
         leaks.len(),
         &leaks[..leaks.len().min(5)]
     );
+}
+
+/// KR-REQ-29.04: a home directory never exposes what the credential rules hide. For texts built
+/// from quotes, spaces, backslashes, credential names, a planted marker and the home directories
+/// below, which hold a space, a quote, an assignment, an option and a backslash, a text whose
+/// marker the rules hide without a home is hidden with each of the homes.
+#[test]
+fn a_home_directory_never_exposes_what_the_credential_rules_hide() {
+    const HOMES: [(&str, Paths); 7] = [
+        ("/home/tom", UNIX),
+        ("/home/john smith", UNIX),
+        ("/home/o'neil", UNIX),
+        ("/home/a\"b", UNIX),
+        ("/Users/Alice TOKEN=x", UNIX),
+        ("/Users/Alice --token", UNIX),
+        ("C:\\Users\\O'Brien Smith", WINDOWS),
+    ];
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move |bound: usize| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(seed >> 33).unwrap_or(0) % bound
+    };
+    let pieces: Vec<String> = [
+        "a", " ", " ", "'", "\"", "\\", "=", "TOKEN=", "--token ", "x/", "o'neil", "/",
+    ]
+    .iter()
+    .map(|piece| (*piece).to_owned())
+    .chain(HOMES.iter().map(|(home, _)| (*home).to_owned()))
+    .collect();
+    let mut compared = 0_u64;
+    for _ in 0..120_000 {
+        let length = 3 + next(8);
+        let mut parts: Vec<&str> = (0..length)
+            .map(|_| pieces[next(pieces.len())].as_str())
+            .collect();
+        let credential = if next(2) == 0 { "TOKEN=" } else { "--token " };
+        parts.insert(next(parts.len() + 1), credential);
+        let at = parts
+            .iter()
+            .position(|part| *part == credential)
+            .unwrap_or(0);
+        parts.insert(at + 1 + next(parts.len() - at), MARKER);
+        let text = parts.concat();
+        let bare = field(&text, None, UNIX);
+        if bare.contains(MARKER) {
+            continue;
+        }
+        for (home, paths) in HOMES {
+            compared += 1;
+            let said = field(&text, Some(home), paths);
+            assert!(
+                !said.contains(MARKER),
+                "{text:?} with the home {home:?}: {said:?} (without a home: {bare:?})"
+            );
+        }
+    }
+    assert!(compared > 40_000, "the check compared {compared} outputs");
 }
 
 /// KR-REQ-29.04: a no-break space is a character of its word, as it is to a shell: a value that
