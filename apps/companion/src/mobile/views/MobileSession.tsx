@@ -488,7 +488,10 @@ export function MobileSession({
       ) {
         let more = parseFloat(element.style.getPropertyValue('--lift-more')) || 0
         for (let pass = 0; pass < 4; pass += 1) {
-          const off = restOn(typing, edge - covered, scroller, moved)
+          // The keyboard's top edge, or the foot of the scrolling area when the keyboard is shorter
+          // than what lies under it (a suggestion bar over the tab bar): the field is not taken
+          // below what the area shows.
+          const off = restOn(typing, Math.min(edge - covered, scroller.getBoundingClientRect().bottom), scroller, moved)
           if (Math.abs(off) <= 0.5 || (off < 0 && more === 0)) break
           more = Math.max(0, more + off)
           element.style.setProperty('--lift-more', `${more}px`)
@@ -514,7 +517,8 @@ export function MobileSession({
     document.addEventListener('focusin', onResize)
     return () => {
       window.clearTimeout(settleTimer)
-      // The shell's scrolling area outlives the session: it is left where the destination expects it.
+      // The shell's scrolling area outlives the session: what this session scrolled it by is undone, so the
+      // next view does not open on it.
       putBack(moved)
       resized?.disconnect()
       written.disconnect()
