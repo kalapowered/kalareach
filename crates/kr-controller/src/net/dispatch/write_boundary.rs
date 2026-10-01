@@ -1426,13 +1426,32 @@ async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to
         // The acceptance as a worker that added a member to it later would write it, and as it
         // goes to a device that may not read the session: the same, without the description.
         let written_by_a_newer_worker = |answer: &kr_protocol::session::SessionCloseResult| {
-            let kr_cbor::CanonicalValue::Map(mut members) =
+            let kr_cbor::CanonicalValue::Map(members) =
                 kr_protocol::envelope::ParamsValue::from_typed(answer)
                     .expect("encodes")
                     .into_value()
             else {
                 panic!("an acceptance is a map");
             };
+            // A later worker may add a member to the session's summary as well.
+            let entries = members
+                .into_entries()
+                .into_iter()
+                .map(|(name, held)| match held {
+                    kr_cbor::CanonicalValue::Map(mut summary) if name == "session" => {
+                        summary
+                            .insert(
+                                "added_later".to_owned(),
+                                kr_cbor::CanonicalValue::text("as written"),
+                            )
+                            .expect("a member the summary does not have");
+                        (name, kr_cbor::CanonicalValue::Map(summary))
+                    }
+                    held => (name, held),
+                })
+                .collect();
+            let mut members = kr_cbor::CanonicalMap::from_sorted_entries(entries)
+                .expect("the members were sorted");
             members
                 .insert(
                     "added_later".to_owned(),
@@ -1455,6 +1474,15 @@ async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to
                 .to_typed::<kr_protocol::session::SessionCloseResult>()
                 .is_err(),
             "this build cannot decode it"
+        );
+        assert!(
+            whole
+                .get("session")
+                .is_some_and(|summary| kr_cbor::from_canonical_value::<
+                    kr_protocol::session::SessionSummary,
+                >(summary)
+                .is_err()),
+            "and cannot decode the summary inside it either"
         );
         let answer = ControlFrame::Response(kr_protocol::envelope::Response {
             request_id: kr_protocol::ids::RequestId::new(1),
