@@ -681,6 +681,60 @@ impl GrantDirectory {
         self.after_effect(issued, ran_out.get())
     }
 
+    /// Writes a grant in place of the one it replaces, withdrawing that one and everything
+    /// delegated from it, in one transaction.
+    ///
+    /// The replaced grant's subtree is read, `still_admitted` asked, the subtree withdrawn and the
+    /// new grant written, all under one hold of the store. A write of the new grant that fails
+    /// takes the withdrawal back with it, so nothing is left where the person had a grant and now
+    /// has none, and a call running under the grant it replaced is not left running under a grant
+    /// that is gone.
+    ///
+    /// What the withdrawal found it must fence is returned with it, and the debt it wrote is the
+    /// caller's to publish once the transaction has committed ([`GrantRevocation::debt`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::issue`] and [`Self::revoke`], and nothing is changed when any of them is
+    /// returned.
+    pub fn replace(
+        &self,
+        replaced: Option<GrantId>,
+        now_ms: u64,
+        record: &GrantRecord,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<GrantRevocation>> {
+        let encoded = kr_cbor::to_canonical_vec(&record.grant)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let parent_anchor = self.parent_anchor_before_effect(record)?;
+        let ran_out = std::cell::Cell::new(None);
+        let replaced_in_one = self.in_transaction(|connection| {
+            // Read first, then asked, then written, as a revocation is: the check is the last
+            // thing before the first write.
+            let subtree = replaced
+                .map(|grant_id| Self::subtree_to_revoke(connection, grant_id))
+                .transpose()?;
+            check_parent(connection, record, |parent, expiry, at| {
+                self.passed_at_effect(parent, expiry, at, parent_anchor, &ran_out)
+            })?;
+            still_admitted()?;
+            let revocation = match (replaced, subtree) {
+                (Some(grant_id), Some(subtree)) => Some(Self::revoke_subtree(
+                    connection,
+                    grant_id,
+                    &subtree,
+                    now_ms,
+                    &mut None,
+                    &format!("the replacement of grant {grant_id}"),
+                )?),
+                _ => None,
+            };
+            write_grant(connection, record, &encoded)?;
+            Ok(revocation)
+        });
+        self.after_effect(replaced_in_one, ran_out.get())
+    }
+
     /// Returns one grant's record, revoked or not.
     ///
     /// # Errors

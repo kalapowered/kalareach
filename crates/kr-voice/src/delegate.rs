@@ -421,12 +421,24 @@ impl Coordinator {
             // has to be the last thing before it does.
             Self::still_admitted(admission)?;
             let mut ending: Vec<Ending> = Vec::new();
-            if let Some(replaced) = replaced.as_ref() {
-                // The one this replaces goes first. A second standing grant beside the first would
-                // leave the old scope authorising calls nobody can see in the new statement, and
-                // the store's cascade is what ends the calls running under it.
-                self.authority
-                    .revoke(replaced.grant_id, now_ms, admission)?;
+            // The replacement is one change in the authority store: the one it replaces goes and
+            // the new one is written together, or neither happens. A second standing grant beside
+            // the first would leave the old scope authorising calls nobody can see in the new
+            // statement, and the store's cascade is what ends the calls running under it. Written
+            // in two parts, a failure of the second would leave the person with no grant at all
+            // and their calls with no authority to stop.
+            let written = match replaced.as_ref() {
+                Some(replaced) => {
+                    self.authority
+                        .replace(replaced.grant_id, &planned.plan, now_ms, admission)
+                }
+                None => self.authority.issue(&planned.plan, admission),
+            };
+            // The calls under the grant that was replaced are stopped only once it was: a
+            // replacement that failed left them their authority and their grant.
+            if written.is_ok()
+                && let Some(replaced) = replaced.as_ref()
+            {
                 for ended in state.sessions.stop_under(replaced.grant_id) {
                     state.ledger.forget_session(ended.voice_session_id);
                     if let Some(call_id) = ended.call_id {
@@ -437,11 +449,7 @@ impl Coordinator {
                     }
                 }
             }
-            // The write is kept rather than returned: its failure must not skip what follows. The
-            // revocation has already happened by here, so a call it withdrew is a call nobody can
-            // stop any more, and leaving it metering because the replacement could not be written
-            // would be the worst of both.
-            (self.authority.issue(&planned.plan, admission), ending)
+            (written, ending)
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline. Each is
