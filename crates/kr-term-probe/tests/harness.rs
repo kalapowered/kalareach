@@ -416,3 +416,46 @@ fn a_record_keeps_no_home_directory_and_no_user_name() {
         serde_json::Value::Null
     );
 }
+
+/// The home directory is written as `~` only where it is a whole path or begins one, and the
+/// session variables keep nothing but whether they were set.
+#[test]
+fn only_a_whole_home_path_becomes_a_tilde_and_session_variables_keep_no_value() {
+    let launcher = serde_json::json!({
+        "environment": {
+            "STY": "1234.pts-0.host",
+            "TMUX": "/private/tmp/tmux-501/default,4321,0",
+            "TMUX_PANE": "%3",
+            "TERM": "xterm-256color",
+            "TERMINFO": null
+        },
+        "paths": [
+            "/Users/jo",
+            "/Users/jo/.terminfo",
+            "/Users/joanne/.terminfo",
+            "/opt:/Users/jo/bin:/usr/bin",
+            "a/Users/jo/b",
+            "/Users/jo/a /Users/jo"
+        ]
+    });
+    let kept = kr_term_probe::report::keep_private(launcher, Some("/Users/jo"));
+    assert_eq!(
+        kept["paths"],
+        serde_json::json!([
+            "~",
+            "~/.terminfo",
+            "/Users/joanne/.terminfo",
+            "/opt:~/bin:/usr/bin",
+            "a/Users/jo/b",
+            "~/a ~"
+        ])
+    );
+    assert_eq!(kept["environment"]["STY"], "set");
+    assert_eq!(kept["environment"]["TMUX"], "set");
+    assert_eq!(kept["environment"]["TMUX_PANE"], "set");
+    assert_eq!(kept["environment"]["TERM"], "xterm-256color");
+    assert!(
+        kept["environment"]["TERMINFO"].is_null(),
+        "an unset variable stays unset"
+    );
+}

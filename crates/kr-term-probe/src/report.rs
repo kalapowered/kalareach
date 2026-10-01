@@ -54,13 +54,18 @@ impl Summary {
     }
 }
 
+/// The environment variables whose values name a process, a terminal device, a host or a socket
+/// path, and so are recorded as `"set"` or left unset.
+const SESSION_VARIABLES: [&str; 3] = ["STY", "TMUX", "TMUX_PANE"];
+
 /// The launcher's facts with what identifies the account taken out, so a record can be kept in a
 /// repository.
 ///
-/// A record names programs and application bundles. It does not name a home directory, a user or a
-/// session. The programs the window descends from are written as their names alone, and the home
-/// directory, where one is written, becomes `~`. An application's own directory, such as
-/// `/Applications/iTerm.app`, stays: every installation of that application has it.
+/// A record names programs and application bundles. It does not name a home directory or a
+/// session. The programs the window descends from are written as their names alone, the home
+/// directory, where a path begins with it, becomes `~`, and the session variables
+/// (`STY`, `TMUX`, `TMUX_PANE`) are recorded as `"set"` or unset. An application's own directory,
+/// such as `/Applications/iTerm.app`, stays: every installation of that application has it.
 #[must_use]
 pub fn keep_private(mut launcher: serde_json::Value, home: Option<&str>) -> serde_json::Value {
     if let Some(ancestors) = launcher
@@ -70,6 +75,18 @@ pub fn keep_private(mut launcher: serde_json::Value, home: Option<&str>) -> serd
         for ancestor in ancestors {
             if let Some(path) = ancestor.as_str() {
                 *ancestor = serde_json::Value::String(program_name(path).to_owned());
+            }
+        }
+    }
+    if let Some(variables) = launcher
+        .get_mut("environment")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for name in SESSION_VARIABLES {
+            if let Some(value) = variables.get_mut(name)
+                && value.as_str().is_some()
+            {
+                *value = serde_json::Value::String("set".to_owned());
             }
         }
     }
@@ -85,11 +102,12 @@ fn program_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// Writes `home` as `~` wherever it is a whole path or the start of one: at the start of the
+/// text or after a `:` or a space, and before a `/`, a `:`, a space or the end of the text. A
+/// longer name that only begins with it (`/Users/joanne` for `/Users/jo`) is left as it is.
 fn write_home_as_tilde(value: &mut serde_json::Value, home: &str) {
     match value {
-        serde_json::Value::String(text) if text.contains(home) => {
-            *text = text.replace(home, "~");
-        }
+        serde_json::Value::String(text) => *text = home_as_tilde(text, home),
         serde_json::Value::Array(items) => {
             for item in items {
                 write_home_as_tilde(item, home);
@@ -102,6 +120,27 @@ fn write_home_as_tilde(value: &mut serde_json::Value, home: &str) {
         }
         _ => {}
     }
+}
+
+fn home_as_tilde(text: &str, home: &str) -> String {
+    let before_ok = |at: usize| at == 0 || matches!(text.as_bytes()[at - 1], b':' | b' ');
+    let after_ok =
+        |at: usize| at == text.len() || matches!(text.as_bytes()[at], b'/' | b':' | b' ');
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    while let Some(found) = text[from..].find(home) {
+        let start = from + found;
+        let end = start + home.len();
+        out.push_str(&text[from..start]);
+        out.push_str(if before_ok(start) && after_ok(end) {
+            "~"
+        } else {
+            home
+        });
+        from = end;
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 impl Report {
