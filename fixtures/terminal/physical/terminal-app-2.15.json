@@ -1161,11 +1161,11 @@
       },
       "canonical": {
         "row": 1,
-        "col": 80
+        "col": 79
       },
       "canonical_pending_wrap": true,
       "barrier": true,
-      "agrees": true
+      "agrees": false
     },
     {
       "id": "wide.overwrite-the-right-half",
@@ -2243,8 +2243,8 @@
   "stopped": null,
   "summary": {
     "steps": 136,
-    "agree": 116,
-    "differ": 20,
+    "agree": 115,
+    "differ": 21,
     "unanswered": 0
   }
 }

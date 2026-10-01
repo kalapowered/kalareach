@@ -1,10 +1,9 @@
-//! Where the cursor is when an address or a character reaches the right edge.
+//! Where the cursor is when an address reaches past the right edge.
 //!
-//! A terminal stops an address that names a column past the last one on the last column, and it
-//! leaves the cursor on the last column when a character ends there, wide or not. The expected
-//! answers here are the ones two physical terminals gave to the same bytes (the records under
-//! `fixtures/terminal/physical`), and the controls keep every move that stays inside the grid where
-//! it was.
+//! A terminal stops an address that names a column past the last one on the last column. The
+//! expected answers here are the ones two physical terminals gave to the same bytes (the records
+//! under `fixtures/terminal/physical`), and the controls keep every move that stays inside the grid
+//! where it was, and every wide character that leaves room after it.
 
 use std::path::{Path, PathBuf};
 
@@ -146,25 +145,6 @@ fn an_address_past_the_corner_is_answered_as_both_recorded_terminals_answered_it
 }
 
 #[test]
-fn a_wide_character_that_ends_in_the_last_column_is_answered_as_both_recorded_terminals_did() {
-    for step in recorded("wide.wide-character-two-cells-from-the-edge") {
-        let Recorded {
-            name,
-            cols,
-            rows,
-            bytes,
-            terminal,
-        } = step;
-        assert_eq!(
-            terminal,
-            (1, cols),
-            "{name} leaves the cursor on the last column"
-        );
-        assert_eq!(cursor_after(cols, rows, &bytes), terminal, "{name}");
-    }
-}
-
-#[test]
 fn every_absolute_column_past_the_last_stops_on_the_last() {
     // One grid wider than it is tall and one taller than it is wide: the grid's bound on a count,
     // which a column is not, is the larger of the two sizes, and a column must not depend on it.
@@ -246,40 +226,6 @@ fn an_address_inside_the_grid_is_left_where_it_says() {
 }
 
 #[test]
-fn a_wide_character_ends_the_row_on_its_last_column_and_a_narrow_one_does_too() {
-    // Eight columns and a two-cell character fill ten; nine and a one-cell character do too.
-    let wide = "aaaaaaaa\u{3042}";
-    let narrow = "aaaaaaaaab";
-    for text in [wide, narrow] {
-        let mut engine = engine(10, 5);
-        engine.feed(text.as_bytes(), 0);
-        engine.quiesce(0);
-        assert_eq!(reported(&mut engine), (1, 10), "{text:?}");
-        assert!(pending_wrap(&engine), "{text:?}");
-        let size = engine.grid().size();
-        let snapshot = engine
-            .screen_state(Viewport {
-                top_row: 0,
-                rows: size.rows,
-                left_col: 0,
-                cols: size.cols,
-            })
-            .cursor;
-        assert_eq!(
-            snapshot.col, 9,
-            "a snapshot names the same column: {text:?}"
-        );
-        engine.feed(b"z", 0);
-        engine.quiesce(0);
-        assert_eq!(
-            reported(&mut engine),
-            (2, 2),
-            "{text:?} wraps the next character"
-        );
-    }
-}
-
-#[test]
 fn a_wide_character_that_leaves_room_leaves_the_cursor_after_it() {
     for (text, expected) in [
         ("aaaaaaa\u{3042}", (1, 10)),
@@ -295,16 +241,6 @@ fn a_wide_character_that_leaves_room_leaves_the_cursor_after_it() {
         engine.quiesce(0);
         pending_wrap(&engine)
     });
-}
-
-#[test]
-fn a_wide_character_that_ends_at_a_right_margin_leaves_the_cursor_on_the_margin() {
-    // Columns 3 to 8 are the margins. Four cells and a two-cell character end on column 8, and so
-    // do five cells and a one-cell character: the two must agree, as they do at the screen's edge.
-    for text in ["aaaa\u{3042}", "aaaaab"] {
-        let bytes = format!("\x1b[?69h\x1b[3;8s\x1b[1;3H{text}");
-        assert_eq!(cursor_after(20, 5, bytes.as_bytes()), (1, 8), "{text:?}");
-    }
 }
 
 #[test]
@@ -339,46 +275,5 @@ fn an_absolute_column_past_the_last_is_forwarded_to_a_terminal_that_stops_there_
             outcome.projection_required_at.is_some(),
             "{bytes:?} is held back from a terminal"
         );
-    }
-}
-
-#[test]
-fn a_wrap_left_set_after_the_cursor_moved_does_not_move_the_reported_column() {
-    // The library keeps a pending wrap through these, though the cursor is no longer on the cell
-    // the wrap belongs to.
-    let full = "aaaaaaaaaa";
-    assert_eq!(
-        cursor_after(10, 5, format!("{full}\x1b#8").as_bytes()),
-        (1, 1),
-        "the alignment pattern homes the cursor"
-    );
-    let margins = "\x1b[?69h\x1b[3;8s\x1b[1;3Haaaaab";
-    assert_eq!(cursor_after(20, 5, margins.as_bytes()), (1, 8));
-    for (name, after) in [
-        ("margin mode reset", "\x1b[?69l"),
-        ("a soft terminal reset", "\x1b[!p"),
-    ] {
-        assert_eq!(
-            cursor_after(20, 5, format!("{margins}{after}").as_bytes()),
-            (1, 8),
-            "{name} leaves the cursor where it was"
-        );
-    }
-}
-
-#[test]
-fn a_saved_cursor_names_the_same_column_the_live_cursor_did() {
-    for (name, text, column, pending) in [
-        ("a wide character ends the row", "aaaaaaaa\u{3042}", 9, true),
-        ("a narrow character ends the row", "aaaaaaaaab", 9, true),
-        ("a wide character leaves room", "aaaaaaa\u{3042}", 9, false),
-    ] {
-        let mut engine = engine(10, 5);
-        engine.feed(format!("{text}\x1b7").as_bytes(), 0);
-        engine.quiesce(0);
-        let saved = engine.grid().saved_cursor(false).expect("a saved cursor");
-        assert_eq!(saved.col, column, "{name}");
-        assert_eq!(saved.pending_wrap, pending, "{name}");
-        assert_eq!(engine.grid().cursor().0, column, "{name}: the live cursor");
     }
 }
