@@ -1114,11 +1114,13 @@ negotiation of the buffer that is not showing, the virtual title stack, soft-wra
 right-hand side of a row wider than the window, and a pending wrap on a row outside that window —
 and `Session::restoration_losses` is the count.
 
-The buffer that is not showing is painted by entering it through mode 1049, which clears it, and
-leaving it, which keeps it, before anything else is installed: leaving restores the cursor and turns
-line-feed/new-line mode off on some terminals, so a mode installed first would be undone. Mode 47 is
-not one the profile tracks, so a restoration never asks a terminal for it. What the switches save is
-what the session has saved: nothing, when it has no saved cursor.
+The hidden buffer (the one that is not showing) is painted, and that has to be done before anything
+else is installed. Entering through mode 1049 clears the buffer. So this paints the rows after
+entering 1049 and before leaving 1049 (which retains what was painted). Leaving 1049 restores the
+cursor and (on some terminals) turns line-feed/new-line mode off. (A mode installed first would be
+undone.) Mode 47 is not one the profile tracks, and a restoration never asks a terminal for it. What
+the switches save is what the session has saved. If the session has no saved cursor, nothing is
+saved.
 
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
@@ -1126,17 +1128,19 @@ the input lease has no destination, so it becomes a durable host event in the wo
 rather than being shown to whoever happens to be watching.
 
 A side effect that has a destination is delivered whole, never trimmed as if it were a span of the
-stream, and ahead of any request to begin again that the same output makes of that attachment: the
-byte that ends a clipboard write can also be the byte that lets a held terminal take the stream. One
-that cannot be delivered is a host event in the same way: the lease has since moved, the attachment
-has no subscription, its stream has been told to begin again, or its queue has no room. A
-subscription that another replaces writes the effects already queued on it before it stops.
+stream. It is also delivered ahead of any request to begin again that the same output makes of that
+attachment, because the byte that ends a clipboard write can also be the byte that lets a held
+terminal take the stream. If a side effect with a destination cannot be delivered (because the lease
+has since moved, the attachment has no subscription, its stream has been told to begin again, or its
+queue has no room) it is treated the same as a side effect with no destination and recorded as a
+host event. If a subscription is replaced by another, any queued side effects on the subscription
+will be written prior to the subscription being stopped.
 
 The host's own replies to the application's questions are measured on the session's continuous
-clock: a reply waits behind the person's open bracketed paste and is dropped after two seconds, one
-read writes at most 4 KiB of replies and the rest wait for a later read inside the same two seconds,
-and at most 256 questions a second are answered. A step of the wall clock neither drops a reply early
-nor holds one longer.
+clock. A reply waits behind the person's open bracketed paste and is dropped after two seconds. One
+read writes at most 4 KiB of replies, and the rest wait for a later read within the same two
+seconds. A host can answer at most 256 questions in one second, wall clock stepping does not make
+replies drop sooner or wait longer.
 
 ## Windows
 
