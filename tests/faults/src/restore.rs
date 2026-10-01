@@ -281,6 +281,8 @@ struct Client {
     /// The last check this client stays for.
     until: usize,
     stream: Option<OutputStream>,
+    /// The size of the terminal this client draws into: its own.
+    size: (u16, u16),
     /// The terminal a direct client draws into.
     terminal: Option<Terminal>,
     /// The command's painter, for a direct client shown a projection.
@@ -308,6 +310,12 @@ impl Client {
         for sequence in forbidden_in_a_restoration(bytes) {
             self.restoring.push(format!(
                 "{what} carries {sequence}, which a restoration never sends"
+            ));
+        }
+        for found in outside_the_profile(bytes, self.size.0, self.size.1) {
+            self.restoring.push(format!(
+                "{what} is read by a terminal of the profile as {found}, which a restoration \
+                 never asks of one"
             ));
         }
         let Some(terminal) = self.terminal.as_mut() else {
@@ -476,7 +484,16 @@ pub fn outside_the_profile(bytes: &[u8], columns: u16, rows: u16) -> Vec<String>
     let fed = engine.feed(bytes, 0);
     let settled = engine.quiesce(0);
     let mut found = Vec::new();
+    if !engine.at_ground() {
+        found.push("a sequence left unfinished".to_owned());
+    }
     for outcome in [&fed, &settled] {
+        found.extend(
+            outcome
+                .refusals
+                .iter()
+                .map(|refusal| format!("a refused side effect ({refusal:?})")),
+        );
         found.extend(
             outcome
                 .side_effects
@@ -727,6 +744,7 @@ impl Stage {
         }
         let mut client = Client {
             form,
+            size: (columns, rows),
             attachment,
             attached_at: point,
             until,
@@ -807,12 +825,6 @@ impl Stage {
             Strategy::ReversedSwitch => with_the_switches_reversed(&joined.bytes),
             Strategy::Product | Strategy::RawFromOffset => joined.bytes,
         };
-        for sequence in outside_the_profile(&bytes, self.columns, self.rows) {
-            client.restoring.push(format!(
-                "the restoration is read by a terminal of the profile as {sequence}, which a \
-                 restoration never asks of one"
-            ));
-        }
         client.draw(&bytes, "the restoration");
         client.served = Served::Stream;
         // The restored screen, checked before anything later is drawn on it. When the session
@@ -869,11 +881,24 @@ impl Stage {
                         client.live(&bytes, cursor);
                     }
                 }
-                // An effect is valid for either form of client: it is the one thing a terminal of
-                // another size is also sent, when it holds the lease. A client that took the stream
-                // directly performs it on its terminal, which is what the account follows.
+                // An effect is for the client holding the lease. In this harness only a direct
+                // client takes it, so a terminal of another size that is sent one was sent what is
+                // owed to somebody else; a direct client performs it on its terminal, which is what
+                // the account follows.
                 OutputDelivery::Effect(owed) => {
-                    if client.form == Form::Direct && self.strategy != Strategy::RawFromOffset {
+                    if client.form == Form::Projected {
+                        let at = self.fed;
+                        self.fail(
+                            Property::LiveEffect,
+                            client,
+                            at,
+                            format!(
+                                "a terminal of another size, which holds no lease, was sent a \
+                                 side effect ({:?})",
+                                owed.effect.kind
+                            ),
+                        );
+                    } else if self.strategy != Strategy::RawFromOffset {
                         client.live(&owed.bytes, owed.effect.at);
                     }
                 }
@@ -1437,6 +1462,16 @@ mod tests {
                 .any(|failure| failure.contains("out of the order")),
             "the reversal fails too: {found:?}"
         );
+    }
+
+    #[test]
+    fn a_restoration_that_ends_inside_a_sequence_is_found() {
+        assert!(
+            outside_the_profile(b"\x1b[?25h\x1b[", 20, 3)
+                .iter()
+                .any(|found| found.contains("unfinished")),
+        );
+        assert!(outside_the_profile(b"\x1b[?25h", 20, 3).is_empty());
     }
 
     #[test]

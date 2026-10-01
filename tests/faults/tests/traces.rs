@@ -592,7 +592,9 @@ fn a_reply_held_behind_a_lone_escape_is_written_when_the_escape_is_released() {
     {{ "do": "take_input", "expect": [ {{ "batch": "lease_changed" }} ] }},
     {{ "do": "output", "text": "\u001b[6n" }},
     {{ "do": "take_input", "expect": [] }},
-    {{ "do": "advance", "ms": 100 }},
+    {{ "do": "advance", "ms": 24 }},
+    {{ "do": "take_input", "expect": [] }},
+    {{ "do": "advance", "ms": 1 }},
     {{ "do": "take_input", "expect": [
       {{ "batch": "input", "client": "a", "text": "\u001b", "paste": [] }},
       {}
