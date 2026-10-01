@@ -300,9 +300,15 @@ async fn the_commands_install_report_and_remove_the_skill_at_both_scopes() {
         }
     }
     let configuration = json_document(&setup.home.join(".claude.json"));
+    // The daemon names the `kr` beside it from the image the system reports for it, and macOS
+    // reports `/private/var/...` for a program run from `/var/...`: the same file, so the test
+    // resolves the path it made before it compares.
     assert_eq!(
         configuration["mcpServers"]["kalareach"]["command"],
-        setup.kr.display().to_string(),
+        std::fs::canonicalize(&setup.kr)
+            .expect("the copied kr is there")
+            .display()
+            .to_string(),
         "the entry runs the kr beside the daemon"
     );
     assert_eq!(

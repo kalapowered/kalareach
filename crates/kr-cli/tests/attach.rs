@@ -930,6 +930,23 @@ fn stack_operations(bytes: &[u8]) -> usize {
     seen
 }
 
+/// A program started from the command binaries is named by the kernel with the path it was started
+/// through, resolved: macOS reaches the per-user temporary directory through `/var`, a link to
+/// `/private/var`, and reports `/private/var/...` for a program run from `/var/...`. The restoration
+/// guard a command starts is named by that form, so these tests find it by comparing the command
+/// line the system lists with the paths this suite made, and that holds only where those paths are
+/// already the resolved ones.
+#[test]
+fn the_command_binaries_are_named_in_the_form_the_kernel_reports_for_a_program_run_from_them() {
+    for program in [kr(), kr_attach_guard()] {
+        assert_eq!(
+            std::fs::canonicalize(&program).expect("the program is there"),
+            program,
+            "a path with a link in it is not the form a command names the programs beside it by"
+        );
+    }
+}
+
 /// KR-REQ-08.84: the outer terminal's input, mouse, cursor visibility and keyboard modes come
 /// back after the attach process is killed outright, because the guard is holding them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

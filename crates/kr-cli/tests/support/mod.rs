@@ -27,10 +27,21 @@ const PREFIX: &str = "kalareach-command-tests-";
 /// copied binaries left behind by every run of every one of these suites is what filled a build
 /// machine's temporary filesystem, and a directory nobody owns any more is nobody's to remove.
 /// What owns this one is the process that made it, for exactly as long as it is running.
+///
+/// On Unix the directory is named once, with every link in it resolved, because a test compares
+/// these paths with what the system says about a process started from them. macOS reaches the
+/// per-user temporary directory through `/var`, a link to `/private/var`, and names a program run
+/// from `/var/...` as `/private/var/...` in the image the program reads about itself. A command
+/// builds the path of a program it starts beside itself from that image, so the process it starts
+/// is listed under the resolved form, never with the link left in. On Windows a program reads its
+/// image as it always has, so the directory stays as the system gave it.
 pub fn command_binaries() -> &'static Path {
     static COPIED: OnceLock<PathBuf> = OnceLock::new();
     COPIED.get_or_init(|| {
         let temporary = std::env::temp_dir();
+        #[cfg(unix)]
+        let temporary = std::fs::canonicalize(&temporary)
+            .expect("the temporary directory is there and resolves");
         let root = temporary.join(this_runs_name());
         std::fs::create_dir(&root).expect("a directory of this run's own for the command binaries");
         take_it_away_when_this_run_ends(&root);
