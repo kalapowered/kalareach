@@ -590,6 +590,18 @@ fn owns_separator(block: &str) -> bool {
     block.lines().any(|line| line == SEPARATOR_NOTE)
 }
 
+/// Whether a profile that is signed may be checked.
+///
+/// A signed profile is refused whenever the entry would change it. One that already holds the entry
+/// exactly is not changed, and is checked as it stands, for where its entry is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Signed {
+    /// A signed profile is refused: the entry would change it.
+    Refused,
+    /// A signed profile is checked: the entry is already in it and nothing changes.
+    Unchanged,
+}
+
 /// The line a signed PowerShell script's signature block begins with. The script that refuses a
 /// signed profile reads the same text.
 const SIGNATURE_BEGIN: &str = "# SIG # Begin signature block";
@@ -701,12 +713,14 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
         |(before, _block, after)| format!("{before}{after}"),
     );
     // A signed profile cannot change without losing its signature. One that already holds exactly
-    // this entry needs no change, which is not a refusal.
+    // this entry needs no change, which is not a refusal: but that the text is the same proves
+    // nothing about where the entry sits, so the entry is held to the order it is anywhere else.
     if !matches!(placement, Placement::End)
         && existing.contains(SIGNATURE_BEGIN)
-        && let Some((before, after)) = &stripped
+        && let Some((before, _block, after)) = &stripped
         && format!("{before}{body}{after}") == existing
     {
+        checked(&theirs, existing, placement, Signed::Unchanged)?;
         return Ok((Change::Unchanged, existing.to_owned()));
     }
     let rebuilt = match placement {
@@ -730,7 +744,7 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
         }
         Placement::Last { .. } => {
             let rebuilt = appended(&theirs, body);
-            checked(&theirs, &rebuilt, placement)?;
+            checked(&theirs, &rebuilt, placement, Signed::Refused)?;
             rebuilt
         }
     };
@@ -783,13 +797,13 @@ fn after_the_prologue(
     } else {
         format!("{mark}{head}{body}{rest}")
     };
-    checked(theirs, &rebuilt, placement)?;
+    checked(theirs, &rebuilt, placement, Signed::Refused)?;
     Ok((rebuilt, at))
 }
 
 /// Refuses an entry PowerShell would not read as part of the profile it was added to.
-fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
-    match entry_refused(old, new, placement)? {
+fn checked(old: &str, new: &str, placement: &Placement, signed: Signed) -> std::io::Result<()> {
+    match entry_refused(old, new, placement, signed)? {
         None => Ok(()),
         Some(why) => Err(cannot_take_the_entry(&why)),
     }
@@ -804,9 +818,9 @@ fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
 /// one mark off it and the question could not see the second.
 macro_rules! unsafe_profile {
     () => {
-        "function Unsafe($text) { \
+        "function Unsafe($text, $signedOk) { \
             if ($text -match \"`r(?!`n)\") { return 'it has a line end that is a carriage return alone' }; \
-            if ($text.Contains('# SIG # Begin signature block')) { return 'it is signed, and any change to it breaks its signature' }; \
+            if (-not $signedOk -and $text.Contains('# SIG # Begin signature block')) { return 'it is signed, and any change to it breaks its signature' }; \
             $null \
         }; "
     };
@@ -842,7 +856,7 @@ const PLACE_SCRIPT: &str = concat!(
     "$ErrorActionPreference = 'Stop'; ",
     unsafe_profile!(),
     "$text = [System.IO.File]::ReadAllText($env:KR_PROFILE_TEXT, (New-Object System.Text.UTF8Encoding $false)); \
-     $why = Unsafe $text; \
+     $why = Unsafe $text $false; \
      if ($null -ne $why) { [Console]::Out.Write('kr-refused ' + $why); return }; \
      $tokens = $null; $errors = $null; \
      $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors); \
@@ -889,7 +903,8 @@ const VERIFY_SCRIPT: &str = concat!(
      function Refuse($why) { [Console]::Out.Write('kr-refused ' + $why) }; \
      function Same($a, $b) { [string]::Equals([string]$a, [string]$b, [System.StringComparison]::Ordinal) }; \
      $oldText = Read 'KR_PROFILE_OLD'; $newText = Read 'KR_PROFILE_NEW'; $order = Read 'KR_ORDER'; \
-     $why = Unsafe $oldText; \
+     $signedOk = ((Read 'KR_SIGNED_OK') -ceq 'yes'); \
+     $why = Unsafe $oldText $signedOk; \
      if ($null -ne $why) { Refuse $why; return }; \
      $old = Parse $oldText; $new = Parse $newText; \
      $had = @{}; foreach ($id in $old.Errors) { $had[$id] = 1 + [int]$had[$id] }; \
@@ -976,7 +991,12 @@ fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
 }
 
 /// Returns why an entry would not sit in a profile as whole statements, or nothing when it would.
-fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<String>> {
+fn entry_refused(
+    old: &str,
+    new: &str,
+    placement: &Placement,
+    signed: Signed,
+) -> std::io::Result<Option<String>> {
     let Some(shell) = placement.shell() else {
         return Ok(None);
     };
@@ -997,6 +1017,14 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
             ("KR_BEGIN", markers.0),
             ("KR_END", markers.1),
             ("KR_ORDER", order),
+            (
+                "KR_SIGNED_OK",
+                if signed == Signed::Unchanged {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
         ],
         PLACEMENT_DEADLINE,
     )
@@ -2933,7 +2961,7 @@ mod tests {
             ),
         ] {
             let _ = body;
-            let said = entry_refused(old.as_str(), new.as_str(), placement)
+            let said = entry_refused(old.as_str(), new.as_str(), placement, Signed::Refused)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!(
                 said.is_some(),
@@ -3084,6 +3112,60 @@ mod tests {
                 .to_string()
                 .contains("it is signed")
         );
+
+        // An entry that is exactly there but in the wrong place is not left alone: that it is the
+        // same text proves nothing about where it sits. A statement before the entry that opens the
+        // bridge runs before the bridge, and one after the entry that checks the reader runs after
+        // its check; neither is made right by a signature, and neither is moved.
+        let signature = "# SIG # Begin signature block\n# MIIx\n# SIG # End signature block\n";
+        let check_body = entry(
+            &StartupTarget {
+                placement: at_the_last(),
+                ..for_shell(ShellKind::PowerShell)
+            },
+            Path::new("/opt/kr/entry"),
+            false,
+        )
+        .expect("text");
+        let last = at_the_last();
+        for (name, theirs, body, placement, why) in [
+            (
+                "a prompt before the load entry",
+                format!("Read-Host 'name'\n{body}{signature}"),
+                &body,
+                &target.placement,
+                "before the entry",
+            ),
+            (
+                "a statement after the check entry",
+                format!("{check_body}Read-Host 'name'\n{signature}"),
+                &check_body,
+                &last,
+                "after the entry",
+            ),
+        ] {
+            let path = root.path().join(format!("{}.ps1", name.replace(' ', "-")));
+            std::fs::write(&path, &theirs).expect("writes");
+            for refused in [
+                install(&path, body, placement).expect_err(name),
+                plan(&path, body, placement).expect_err(name),
+            ] {
+                assert!(
+                    refused.to_string().contains(why),
+                    "{name}: the refusal says which way: {refused}"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
+        }
+        // And the control for those: the check entry last in a signed profile is left alone.
+        let path = root.path().join("signed-check-last.ps1");
+        let theirs = format!("Read-Host 'name'\n{check_body}{signature}");
+        std::fs::write(&path, &theirs).expect("writes");
+        assert_eq!(
+            install(&path, &check_body, &last).expect("in place"),
+            Change::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
     }
 
     /// KR-REQ-07.23: whether a file holds an entry is asked of the markers of the entry in question:
