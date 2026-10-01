@@ -370,6 +370,49 @@ fn an_assignment_inside_quotes_is_replaced_to_its_closing_quote() {
         assert_eq!(said, expected, "{text}");
         assert!(!said.contains(MARKER), "{said}");
     }
+    // Quotes inside the script of `sh -c`, escaped and of the other kind, and quotes that stray
+    // apostrophes in a path balance among themselves: the value runs to the quote that closes the
+    // argument it is in, so nothing of it is left.
+    for (text, expected) in [
+        (
+            format!("sh -c \"A=1 SECRET=a\\\" {MARKER} B=2\" tail"),
+            "sh -c \"A=1 SECRET=[redacted]\" tail".to_owned(),
+        ),
+        (
+            format!("sh -c \"export SECRET=\\\"two {MARKER}\\\"\""),
+            "sh -c \"export SECRET=[redacted]\"".to_owned(),
+        ),
+        (
+            format!("sh -c \"env 'TOKEN=a {MARKER}' cmd\" tail"),
+            "sh -c \"env 'TOKEN=[redacted]\" tail".to_owned(),
+        ),
+        (
+            format!("sh -c \"tool --password \\\"a {MARKER}\\\"\" tail"),
+            "sh -c \"tool --password [redacted]\" tail".to_owned(),
+        ),
+        (
+            format!("/Users/Tom's x \"PASSWORD=a {MARKER}\" y/o'neil"),
+            "/Users/Tom's x \"PASSWORD=[redacted]".to_owned(),
+        ),
+        // The argument's own quote closes in the middle of it and the text ends there.
+        (
+            format!("-e \"PASSWORD=\"{MARKER}"),
+            "-e \"PASSWORD=[redacted]".to_owned(),
+        ),
+        (
+            format!("env 'TOKEN=a'{MARKER}"),
+            "env 'TOKEN=[redacted]".to_owned(),
+        ),
+        // An escaped quote is not an opening one: the value is the quoted word after it.
+        (
+            format!("\\\"TOKEN=\"abc {MARKER}\""),
+            "\\\"TOKEN=[redacted]".to_owned(),
+        ),
+    ] {
+        let said = redacted(&text);
+        assert_eq!(said, expected, "{text}");
+        assert!(!said.contains(MARKER), "{said}");
+    }
     // An apostrophe nothing closes, with a credential name after it: where the value ends cannot be
     // told, so the field is withheld. Without a credential name it is untouched.
     for text in [
