@@ -1080,15 +1080,18 @@ fn shown_value(
         ResultContent::SessionDescription => {
             let shows = view
                 && member(value, DESCRIPTION_MEMBER).is_some_and(|session| {
-                    // The session's own start dates its description. A description this build
+                    // The session's own start dates its description, and it is read from the
+                    // member as the worker wrote it: a summary from a worker built after this
+                    // one may carry members this build does not know. A description this build
                     // cannot read the start of is not one it can show.
-                    kr_cbor::from_canonical_value::<kr_protocol::session::SessionSummary>(session)
-                        .is_ok_and(|summary| {
-                            crate::describe::HistoryReach::of_grant(
-                                history.lower_bound_ms.0,
-                                Some(summary.created_at_ms),
-                            ) == crate::describe::HistoryReach::WholeSession
-                        })
+                    let started = session
+                        .as_map()
+                        .and_then(|summary| summary.get("created_at_ms"))
+                        .and_then(kr_cbor::CanonicalValue::as_integer)
+                        .and_then(kr_cbor::Integer::as_u64)
+                        .map(kr_protocol::scalars::TimestampMs::new);
+                    crate::describe::HistoryReach::of_grant(history.lower_bound_ms.0, started)
+                        == crate::describe::HistoryReach::WholeSession
                 });
             if shows || member(value, DESCRIPTION_MEMBER).is_none() {
                 return None;

@@ -1651,6 +1651,57 @@ async fn kr_req_10_49_a_mutation_carries_the_devices_scope_only_to_a_worker_that
             holds.then(|| connection.device.grant.history.clone()),
             "a worker that holds results to a scope is sent it, and no other is: {holds}"
         );
+        // On the wire the member is absent for a worker that does not state the capability, not
+        // null: a null member is one an earlier worker's closed frame refuses all the same.
+        assert_eq!(
+            script.forwarded_with_history(),
+            vec![holds],
+            "the bytes the proxy wrote carry a history member only for a capable worker: {holds}"
+        );
+        world.serving.abort();
+    }
+}
+
+/// KR-REQ-10.49: the daemon's own link to a worker, the one a close made at the local door and a
+/// supervised action go through, carries no history scope on the wire whatever the worker states:
+/// it acts as the owner, whom no scope bounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for holds in [true, false] {
+        let script = Scripted::new();
+        if !holds {
+            script.built_before_results_were_held_to_scopes();
+        }
+        let world = scripted::scripted(&script).await;
+        let mut client = world
+            .controller
+            .worker_client(&world.worker)
+            .await
+            .expect("the daemon's own link");
+        let link = client.as_mut().expect("the connection is open");
+        let rights: CanonicalSet<ActionRight> = [ActionRight::SessionClose].into_iter().collect();
+        let answered = link
+            .forward(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                &rights,
+                kr_protocol::scalars::U64::new(u64::MAX),
+            )
+            .await
+            .expect("the worker answers the daemon's own close");
+        assert!(answered.is_ok(), "the close is accepted: {answered:?}");
+        drop(client);
+        assert_eq!(script.forwarded().len(), 1, "{holds}");
+        assert_eq!(
+            script.forwarded_with_history(),
+            vec![false],
+            "no history member reaches the worker, stated capability or not: {holds}"
+        );
         world.serving.abort();
     }
 }
@@ -2088,6 +2139,22 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .read_of_retained(method, &refused, &empty)
             .expect_err("a device that no longer holds the right is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
+
+        // Whatever session the record's target names, which an owner confirmation is not
+        // admitted with now but a record kept before that may carry: a device that may view
+        // that session and no longer manages the host is not shown its challenge.
+        let named = on_the_session(&nothing_to_manage, method);
+        assert!(named.target.session_id.is_present());
+        let denied = nothing_to_manage
+            .read_of_retained(method, &named, &empty)
+            .expect_err("the session its target names does not decide it");
+        assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
+        let named = on_the_session(&owner, method);
+        let read = owner
+            .read_of_retained(method, &named, &empty)
+            .expect("a device that may manage the host is shown its challenge")
+            .expect("under the read of the challenges");
+        assert_eq!(read.shown_as, method);
     }
 
     // An answer about the environment stays under the decision its own right gave.
@@ -2099,6 +2166,52 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .expect("no read is asked of it")
             .is_none()
     );
+}
+
+/// KR-REQ-23.34: an owner confirmation acts on this host and names no session at a paired door, as
+/// it names none at the local one, so a request that names one is refused before it is decided
+/// and cannot be kept with a target its retried answer would be decided over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_34_an_owner_confirmation_names_no_session_at_a_paired_door() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 66, |grant| {
+            grant.actions = [ActionRight::HostManage, ActionRight::SessionView]
+                .into_iter()
+                .collect();
+        }),
+    );
+    for method in [
+        Method::OwnerConfirmationRequest,
+        Method::OwnerConfirmationComplete,
+    ] {
+        let named = device_mutation(&world, &connection, method, 72, ParamsValue::empty());
+        assert!(named.target.session_id.is_present());
+        let answered = connection
+            .answer(ControlFrame::Mutation(Box::new(named)))
+            .await
+            .expect("answered");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) = answered.frame()
+        else {
+            panic!("{method:?} with a session in its target is refused: {answered:?}");
+        };
+        assert_eq!(
+            error.code,
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "{method:?}: {error}"
+        );
+        assert!(error.message.contains("names no session"), "{error}");
+    }
 }
 
 /// KR-REQ-23.34: an `action.read` that names an action only is about the session the daemon

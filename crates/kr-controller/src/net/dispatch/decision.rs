@@ -374,6 +374,14 @@ impl RemoteConnection {
                     "a create allocates the session it is for, so it names none",
                 ));
             }
+            // Pairing and owner confirmation act on this host rather than on a session, as they
+            // do at the local door, so the target names none.
+            (Some(_), None) if super::super::methods::serves(entry.method) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{} acts on this host and names no session", entry.name),
+                ));
+            }
             _ => {}
         }
         // The caller states the grant it is acting under. It may only be the one this device holds:

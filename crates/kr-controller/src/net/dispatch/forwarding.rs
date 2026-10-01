@@ -335,7 +335,8 @@ impl RemoteConnection {
     /// An owner confirmation's answer is a challenge. Its entry names only the owner's ceremony,
     /// which the confirmation service checks on a first request and cannot be asked again here, so
     /// it is decided under the right to read the challenges an owner can still answer, which is what
-    /// `owner.confirmation.pending` requires.
+    /// `owner.confirmation.pending` requires. It acts on this host and names no session, and is
+    /// decided so whatever its record's target says.
     ///
     /// Every other answer is about the environment, and what decides it is the right the mutation
     /// itself required, which the decision it was admitted under goes on checking where the answer
@@ -350,6 +351,14 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         retained: &ControlFrame,
     ) -> std::result::Result<Option<Asked>, ProtocolError> {
+        if matches!(
+            method,
+            Method::OwnerConfirmationRequest | Method::OwnerConfirmationComplete
+        ) {
+            return self
+                .ask(None, Method::OwnerConfirmationPending.entry(), false)
+                .map(|read| Some(read.answering(method)));
+        }
         let subject = mutation
             .target
             .session_id
@@ -358,14 +367,6 @@ impl RemoteConnection {
             .or_else(|| super::routes::answered_session(retained));
         if subject.is_some() {
             return self.may_read_receipts(subject, method).map(Some);
-        }
-        if matches!(
-            method,
-            Method::OwnerConfirmationRequest | Method::OwnerConfirmationComplete
-        ) {
-            return self
-                .ask(None, Method::OwnerConfirmationPending.entry(), false)
-                .map(|read| Some(read.answering(method)));
         }
         Ok(None)
     }
