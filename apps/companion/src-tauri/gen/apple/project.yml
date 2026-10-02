@@ -2,7 +2,7 @@ name: companion-tauri
 options:
   bundleIdPrefix: to.kala.reach
   deploymentTarget:
-    iOS: 14.0
+    iOS: 17.0
 fileGroups: [../../src]
 # Native WebRTC, as a prebuilt binary framework. Section 15 paragraph 2 requires native WebRTC and
 # native platform audio to own capture and playback, so the application links the framework itself
