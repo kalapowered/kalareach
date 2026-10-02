@@ -1240,6 +1240,91 @@ mod tests {
         );
     }
 
+    /// An organisation's lease that removes `files.read` from a grant that carries it leaves a
+    /// scope whose viewer reads no file, as its rights say: what the recipient may read is what it
+    /// may do, after the policy, and not what the grant held before it. (A lease that removed
+    /// `session.view` would leave nothing a notification can ask for, since no role carries
+    /// `automation.manage` or `host.manage`, and the grant would be admitted for nothing.)
+    #[test]
+    fn a_lease_that_removes_files_read_leaves_a_viewer_that_reads_no_file() {
+        use crate::grants::organisation::LeasePresentation;
+        use crate::grants::organisation::testing::TestOrganisation;
+        use crate::service::net::devices::ObservedUtc;
+        use kr_transport::clock::ContinuousClock as _;
+
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        let policy = personal();
+        let continuous = kr_transport::clock::ManualClock::new();
+        let organisation = TestOrganisation::new(0x31, NOW - 60 * 60 * 1_000);
+        let reading = ObservedUtc {
+            now: kr_protocol::scalars::TimestampMs::new(NOW),
+            behind_ms: 0,
+        };
+        let key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a device key");
+        {
+            let mut held = policy.lock().expect("not poisoned");
+            let verified = held
+                .verify_enrolment(&organisation.authority(NOW), Some(&reading))
+                .expect("the chain verifies");
+            held.enrol(verified).expect("the host enrols");
+            let before = held.clone();
+            let lease = organisation.lease(
+                &kr_protocol::ids::AccountId::new("ada").expect("an account"),
+                *key.public(),
+                NOW,
+                &[ActionRight::SessionView],
+            );
+            held.install_lease(LeasePresentation {
+                lease: &lease,
+                device_id: DeviceId::new(uuid(2)),
+                proven_key: key.public(),
+                reading: Some(reading),
+                now: continuous.now(),
+                generation: kr_protocol::ids::ControllerGeneration::new(1),
+            })
+            .expect("the lease installs");
+            held.publish_unanchored(&before);
+        }
+        let held_rights = [ActionRight::SessionView, ActionRight::FilesRead];
+        let organisational = Grant {
+            organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                organisation_id: organisation.organisation_id,
+                policy_revision: AuthorityRevision::new(1),
+            }),
+            ..grant(45, SessionSelector::Any, &held_rights)
+        };
+        issued(&sharing, organisational, true);
+        let recipients = GrantedRecipients::at(
+            Arc::clone(&sharing),
+            policy,
+            environment(),
+            Arc::new(continuous),
+            || NOW,
+        );
+
+        let scope = recipients
+            .scope_for(&rule(Some(45)))
+            .expect("admitted, for what the lease leaves");
+        assert_eq!(
+            scope.rights,
+            [ActionRight::SessionView].into_iter().collect()
+        );
+        assert_eq!(
+            scope.viewer,
+            ViewerScope::from_grant(&grant(
+                45,
+                SessionSelector::Any,
+                &[ActionRight::SessionView]
+            )),
+            "the viewer reads through the rights the lease leaves, which keep no files.read"
+        );
+        assert_ne!(
+            scope.viewer,
+            ViewerScope::from_grant(&grant(45, SessionSelector::Any, &held_rights)),
+            "and not through the ones the grant held"
+        );
+    }
+
     /// A grant of the grant store issued to a device is only as good as the device's own pairing,
     /// and the pairing's grant is decided on both clocks as the device's own connection would
     /// decide it: one that has run out in UTC, or on the continuous clock, or that cannot be proved
