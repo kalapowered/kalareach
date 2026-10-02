@@ -183,6 +183,50 @@ impl Controller {
         encode(&kr_protocol::identity::EnvironmentInventoryResult { rows })
     }
 
+    /// Claims one action of this daemon's own, performs it, and keeps what it came to under the
+    /// claim before answering, so that a retry is answered from that record.
+    ///
+    /// The action is the actor's and the identifier together, and the payload decides whether a
+    /// second request is the same action or a reused identifier. Only the attempt that wrote the
+    /// claim performs: another attempt is answered from what the claim holds, and one that meets a
+    /// claim still running is told so.
+    pub(super) async fn claimed_action(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        perform: impl std::future::Future<Output = Result<ParamsValue>>,
+    ) -> kr_protocol::envelope::ControlFrame {
+        let claimed = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+            .and_then(|digest| {
+                self.sharing.grants().claim_action(
+                    actor_id,
+                    mutation.action_id,
+                    &digest,
+                    kr_ipc::now_ms().get(),
+                )
+            });
+        match claimed {
+            Ok(crate::grants::ActionClaim::Claimed { hold }) => {
+                let outcome = perform.await;
+                let kept = self.settle_claim(&hold, &outcome);
+                drop(hold);
+                super::respond(mutation.request_id, kept.and(outcome))
+            }
+            Ok(crate::grants::ActionClaim::Recorded(_)) => self
+                .retained_authority_answer(actor_id, mutation)
+                .await
+                .unwrap_or_else(|| {
+                    super::error_reply(
+                        mutation.request_id,
+                        ErrorCode::ResourceUnavailable,
+                        "another attempt under this action identifier has not finished",
+                    )
+                }),
+            Err(error) => super::respond(mutation.request_id, Err(error)),
+        }
+    }
+
     /// Answers the three mutations that change this host's enrolled environments.
     ///
     /// Only a refresh reaches the platform, and only when the request asked it to start the
