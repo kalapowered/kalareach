@@ -1028,6 +1028,56 @@ async fn a_daemon_with_no_usable_record_answers_a_retry_of_an_unfinished_step_wi
     host.stop().await;
 }
 
+/// KR-REQ-03.07: a retry whose receipt cannot be looked up is an outcome nobody knows, and is not
+/// refused: nothing says the earlier attempt wrote nothing. A took its step; the host's record of
+/// its actions then cannot be read; A's retry is `OUTCOME_UNKNOWN` with no path, and once the record
+/// can be read it is answered from its receipt, the step not performed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_whose_receipt_cannot_be_looked_up_is_an_outcome_nobody_knows() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let a = composed_join(&host, &mut client, some_group(0xab), &minted).await;
+    let answered: MachineStepResult = typed(
+        &client
+            .repeat(&a)
+            .await
+            .expect("reaches the daemon")
+            .expect("joins"),
+    );
+
+    let rename = |from: &str, to: &str| {
+        let connection =
+            rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        connection
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))
+            .expect("renames the table");
+    };
+    rename("authority_receipts", "authority_receipts_aside");
+    let unknown = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the receipts cannot be read");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+    rename("authority_receipts_aside", "authority_receipts");
+
+    let again = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect("is answered from its receipt once it can be read");
+    assert_eq!(typed::<MachineStepResult>(&again), answered);
+    assert_eq!(group_of(&mut client).await, answered.machine);
+
+    drop(client);
+    host.stop().await;
+}
+
 /// KR-REQ-03.07: a step that wrote the record and could not confirm that its directory survives a
 /// crash is an outcome nobody knows, at either door, and its answer names no path: a paired device
 /// is given it. The record shows the change, so asking again under the same action is answered from

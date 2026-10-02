@@ -538,7 +538,7 @@ impl Controller {
                         .await
                 }
                 Ok(Some(record)) => self.machine_recorded(record),
-                Err(error) => Err(error),
+                Err(error) => Err(receipts_unreadable(error)),
             };
         Some(respond(mutation.request_id, answer))
     }
@@ -592,7 +592,8 @@ impl Controller {
         match self
             .sharing
             .grants()
-            .recorded_action(actor_id, action_id, digest)?
+            .recorded_action(actor_id, action_id, digest)
+            .map_err(receipts_unreadable)?
         {
             Some(crate::grants::ActionRecord::Unfinished) | None if unreadable => {
                 Err(ControllerError::Uncertain {
@@ -936,6 +937,28 @@ fn result_of(
     MachineStepResult {
         environment_id,
         machine: reported(record),
+    }
+}
+
+/// The answer to a retry whose receipt cannot be looked up: the host's own record of its actions
+/// cannot be read, so whether an earlier attempt at the action took the step is not known, and no
+/// refusal is given for it.
+///
+/// A lookup that fails says nothing about the action. The step is neither refused, which a caller
+/// would take for a step that changed nothing, nor performed again: asking again under the same
+/// action is answered once the receipts can be read. A reused identifier is still `ID_CONFLICT`.
+fn receipts_unreadable(error: ControllerError) -> ControllerError {
+    match error {
+        ControllerError::Storage { .. } | ControllerError::RegistryUnavailable { .. } => {
+            eprintln!("kr-controller: a machine group step's receipt cannot be looked up: {error}");
+            ControllerError::Uncertain {
+                detail: "this host's record of its actions cannot be read now, so whether an \
+                         earlier attempt at this action took the step is not known; asking again \
+                         under the same action says what it did once the record can be read"
+                    .to_owned(),
+            }
+        }
+        other => other,
     }
 }
 

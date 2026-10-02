@@ -82,6 +82,11 @@ impl Controller {
                 sessions.describe(session);
             }
         }
+        for session in self.unresolved_sessions(&settled).await? {
+            sessions.describe_unless_described(session);
+        }
+        // The closed sessions last: a session whose closure was recorded while this list was being
+        // made is described from its closure, whatever the passes before it said of it.
         if params.include_closed {
             let mut closed = Vec::new();
             let registry = self.registry.lock().await;
@@ -96,9 +101,6 @@ impl Controller {
                 // word on it.
                 sessions.describe(self.closed_session(&closure, display_number).await);
             }
-        }
-        for session in self.unresolved_sessions(&settled).await? {
-            sessions.describe_unless_described(session);
         }
         encode(&SessionListResult {
             sessions: sessions.into_sorted(),
@@ -561,17 +563,18 @@ mod tests {
 
     /// A session a worker described and whose closure was recorded after it is listed once, as the
     /// closure has it; a description from the registry's rows never replaces another; and the list
-    /// is in display order.
+    /// is in display order, not in the order of the identifiers, which here run the other way.
     #[test]
     fn a_session_is_listed_once_however_the_passes_describe_it() {
         let mut listed = Listed::default();
-        listed.describe(summary(2, 2, SessionState::Live));
-        listed.describe(summary(1, 1, SessionState::Live));
-        // The closure of session 2 is recorded after its worker described it.
-        listed.describe(summary(2, 2, SessionState::Closed));
-        // The registry's rows describe session 1 as creating, and a session no worker described.
-        listed.describe_unless_described(summary(1, 1, SessionState::Creating));
-        listed.describe_unless_described(summary(3, 3, SessionState::Creating));
+        listed.describe(summary(3, 2, SessionState::Live));
+        listed.describe(summary(2, 1, SessionState::Live));
+        // The closure of the session numbered 2 is recorded after its worker described it.
+        listed.describe(summary(3, 2, SessionState::Closed));
+        // The registry's rows describe the session numbered 1 as creating, and a session no worker
+        // described.
+        listed.describe_unless_described(summary(2, 1, SessionState::Creating));
+        listed.describe_unless_described(summary(1, 3, SessionState::Creating));
 
         let sessions = listed.into_sorted();
         assert_eq!(
