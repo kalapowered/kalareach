@@ -55,6 +55,8 @@ pub(super) struct Scripted {
     reads: AtomicUsize,
     /// Whether it refuses to describe its session.
     refusing: AtomicBool,
+    /// Whether it keeps its connection open and answers no read.
+    muted: AtomicBool,
     /// The read it goes at, once a test has set one.
     end: std::sync::Mutex<Option<End>>,
     /// Tells the endpoint to stop accepting.
@@ -102,6 +104,7 @@ impl Scripted {
             created_at_ms: kr_ipc::now_ms(),
             reads: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
             end: std::sync::Mutex::new(None),
             going: Notify::new(),
             gone: Notify::new(),
@@ -352,6 +355,11 @@ impl Scripted {
         self.refusing.store(refusing, Ordering::Release);
     }
 
+    /// Has this worker keep its connection open and answer no read, or answer again.
+    fn mute_reads(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Release);
+    }
+
     /// How many reads have reached this worker.
     fn reads(&self) -> usize {
         self.reads.load(Ordering::Acquire)
@@ -505,7 +513,9 @@ fn serve_scripted(
                                 script.gone.notified().await;
                                 return;
                             }
-                            if script.refusing.load(Ordering::Acquire) {
+                            if script.muted.load(Ordering::Acquire) {
+                                Vec::new()
+                            } else if script.refusing.load(Ordering::Acquire) {
                                 vec![ControlFrame::Response(Response {
                                     request_id: request.request_id,
                                     outcome: Outcome::Error(ProtocolError::new(
@@ -1553,7 +1563,7 @@ async fn a_later_live_answer_does_not_take_back_what_an_acceptance_described() {
 /// KR-REQ-23.34: a worker recorded from a late report that accepts no close is still read from
 /// itself, and once it stops answering nothing this daemon holds says its session is ending: its
 /// report and its last answer both say it is live, so the read is refused as one to try again and
-/// a list leaves the session out.
+/// a list gives the session as the registry holds it, live, because the session has not closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_recorded_from_a_late_report_that_goes_without_a_close_is_refused_for_now() {
     let script = Scripted::new();
@@ -1568,7 +1578,10 @@ async fn a_worker_recorded_from_a_late_report_that_goes_without_a_close_is_refus
         .await
         .expect_err("nothing this daemon holds says the session is ending");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
-    assert_eq!(list(&world, false).await, Vec::new());
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Live)]
+    );
     world.serving.abort();
 }
 
@@ -1672,4 +1685,181 @@ async fn a_daemon_that_starts_does_not_reach_a_worker_whose_reservation_is_fence
         }
         world.serving.abort();
     }
+}
+
+/// Lists the sessions through the daemon, as a client's `session.list` does, with each session's
+/// whole description.
+async fn described(world: &Silent, include_closed: bool) -> Vec<SessionSummary> {
+    let listed: SessionListResult = world
+        .controller
+        .session_list(
+            &ParamsValue::from_typed(&SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed,
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("the daemon lists its sessions")
+        .to_typed()
+        .expect("decodes");
+    listed.sessions
+}
+
+/// Records one more create in the registry, as it stands before a worker has reported: reserved,
+/// asking for the shell and the directory given.
+async fn reserved(world: &Silent, shell: Option<&str>, cwd: &str) -> crate::registry::Reservation {
+    let intent = kr_cbor::to_canonical_vec(&kr_protocol::session::SessionCreateParams {
+        environment_id: world.environment_id,
+        presentation: kr_protocol::session::Presentation::Invisible,
+        shell: shell.map_or_else(Nullable::null, |shell| Nullable::some(shell.to_owned())),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        cwd: Nullable::some(cwd.to_owned()),
+        dimensions: Nullable::some(Dimensions::new(90, 20)),
+        worker_profile: WorkerProfile::HeadlessUser,
+        environment_snapshot: Vec::new(),
+        palette: Nullable::null(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
+    })
+    .expect("encodes");
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .reserve(
+            &kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([0x5f; 32]),
+            &intent,
+            kr_ipc::now_ms(),
+        )
+        .expect("reserves")
+        .reservation
+}
+
+/// A session whose worker cannot answer a read is still a session this daemon holds, and a list is
+/// every session it holds that has not closed. The worker that refuses to describe its session is
+/// listed from the registry's own record of it, live; and the list agrees with what `host.info`
+/// counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_worker_cannot_answer_is_still_listed() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Live)]
+    );
+
+    script.refuse_reads(true);
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Live)],
+        "a worker that does not describe its session is still its session's"
+    );
+    assert_eq!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .occupancy()
+            .expect("counts"),
+        1,
+        "and the list agrees with what host.info counts"
+    );
+    world.serving.abort();
+}
+
+/// A worker that is connected and answers nothing does not hold the list: the list is answered
+/// once the worker has had one exchange, and its session is listed from the registry's record. The
+/// test decides by whether the list is answered at all; the bound is generous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_is_connected_and_silent_does_not_hold_the_list() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    script.mute_reads(true);
+    let listed = tokio::time::timeout(Duration::from_secs(120), list(&world, false))
+        .await
+        .expect("the list is answered although a worker is silent");
+    assert_eq!(listed, vec![(world.session_id, SessionState::Live)]);
+    world.serving.abort();
+}
+
+/// A session whose worker says it is closed is not listed as live because its closure is not
+/// recorded yet: the worker decided it, and the list does not decide it again from the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_its_worker_says_is_closed_is_not_listed_as_live() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    script.set(SessionState::Closed);
+    assert!(
+        list(&world, false).await.is_empty(),
+        "a closed session is listed only where closed sessions were asked for"
+    );
+    assert_eq!(
+        list(&world, true).await,
+        vec![(world.session_id, SessionState::Closed)]
+    );
+    world.serving.abort();
+}
+
+/// A create no worker has reported for, and a reservation this host fenced, are sessions the
+/// registry holds, so they are listed: creating, with what the create asked for, and closing. The
+/// list holds every session `host.info` counts, and a reservation that failed or closed none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_no_worker_has_reported_for_is_listed_as_creating() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    let asked = reserved(&world, Some("/bin/zsh"), "/work/asked").await;
+    let fenced = reserved(&world, None, "/work/fenced").await;
+    let failed = reserved(&world, None, "/work/failed").await;
+    {
+        let mut registry = world.controller.registry.lock().await;
+        registry
+            .fence(fenced.reservation_id)
+            .expect("fences the reservation");
+        registry
+            .set_phase(failed.reservation_id, LaunchPhase::Failed)
+            .expect("fails the reservation");
+    }
+
+    let sessions = described(&world, false).await;
+    let by_id = |session_id| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+    };
+    let creating = by_id(asked.session_id).expect("a create no worker has reported for is listed");
+    assert_eq!(creating.state, SessionState::Creating);
+    assert_eq!(creating.display_number, asked.display_number);
+    assert_eq!(creating.shell_path, "/bin/zsh");
+    assert_eq!(creating.cwd, "/work/asked");
+    assert_eq!(creating.dimensions, Dimensions::new(90, 20));
+    assert_eq!(creating.created_at_ms, asked.created_at_ms);
+    assert!(creating.closure.0.is_none());
+    let closing = by_id(fenced.session_id).expect("a fenced reservation is listed");
+    assert_eq!(closing.state, SessionState::Closing);
+    assert_eq!(
+        closing.shell_path, "",
+        "a shell the create left to the host is not known here"
+    );
+    assert!(
+        by_id(failed.session_id).is_none(),
+        "a launch confirmed not to have produced a worker holds nothing"
+    );
+    assert!(by_id(world.session_id).is_some());
+    assert_eq!(
+        sessions.len() as u64,
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .occupancy()
+            .expect("counts"),
+        "the list holds exactly what host.info counts as live or creating"
+    );
+    world.serving.abort();
 }
