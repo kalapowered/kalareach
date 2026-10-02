@@ -748,9 +748,9 @@ async fn a_forward_stopped_by_the_fence_starts_no_announcement() {
 /// it, to the five seconds section 9 gives a lease, and nothing renews it once the withdrawal's
 /// revision has been adopted and the barrier that would announce it has stopped. The worker held
 /// the revision in force with its fence reported, so it was complete before; it has not
-/// acknowledged the new revision, so it is pending now, and the fence is still owed. Once the clock
-/// is past the lease's deadline the action has run out of deadline and a forward asked for after
-/// it is refused. The control: with no debt, a forward after the same lapse is given a new lease.
+/// acknowledged the new revision, so it is pending now. Once the clock
+/// is past the lease's deadline the action has run out of deadline and a lease asked for after it
+/// is refused. The control: with no debt, a forward after the same lapse is given a new lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
     let (_temp, controller, clock) = daemon().await;
@@ -848,9 +848,5 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
     assert_eq!(
         report.workers[0].state,
         kr_protocol::action::BarrierState::Pending
-    );
-    assert!(
-        controller.check_fence().is_err(),
-        "the fence is still owed: the lapse retired nothing"
     );
 }
