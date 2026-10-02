@@ -8475,7 +8475,7 @@
         },
         {
           "const": "identifier",
-          "description": "An identifier this host generated, carrying nothing from outside it.",
+          "description": "An identifier this host generated, carrying nothing from outside it. The one exception\nis an identifier its owner named, such as the machine group a `machine.join` moved the\nenvironment into: it is exactly sixteen validated bytes, so it carries nothing but\nitself, and the row that holds it says so.",
           "type": "string"
         },
         {
@@ -17799,7 +17799,7 @@
     },
     "MachineGroup": {
       "additionalProperties": false,
-      "description": "The machine group an environment records for itself.\n\nThis type is closed: a step's result carries it, and a result is never read-only metadata. A\nmember added later is a new schema for every reader of `host.info` and `environment.list`,\nwhich hold it as an optional member.",
+      "description": "The machine group an environment records for itself.\n\nThis type is closed: a step's result carries it, and a result is never read-only metadata. A\nmember added later is a new schema for every reader of `host.info` and `environment.list`,\nwhich hold it as an optional member, and so is a new [`MachineChange`] kind: a reader whose\nschema predates it refuses the whole `host.info` or `environment.list` answer that carries it.",
       "properties": {
         "change": {
           "$ref": "#/$defs/MachineChange",

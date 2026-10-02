@@ -13064,7 +13064,8 @@ export interface EnvironmentSummary {
  *
  * This type is closed: a step's result carries it, and a result is never read-only metadata. A
  * member added later is a new schema for every reader of `host.info` and `environment.list`,
- * which hold it as an optional member.
+ * which hold it as an optional member, and so is a new [`MachineChange`] kind: a reader whose
+ * schema predates it refuses the whole `host.info` or `environment.list` answer that carries it.
  */
 export interface MachineGroup {
   /**
@@ -15290,7 +15291,8 @@ export interface MachineStepResult {
  *
  * This type is closed: a step's result carries it, and a result is never read-only metadata. A
  * member added later is a new schema for every reader of `host.info` and `environment.list`,
- * which hold it as an optional member.
+ * which hold it as an optional member, and so is a new [`MachineChange`] kind: a reader whose
+ * schema predates it refuses the whole `host.info` or `environment.list` answer that carries it.
  */
 export interface MachineGroup1 {
   /**

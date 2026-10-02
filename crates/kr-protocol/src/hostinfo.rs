@@ -4413,7 +4413,10 @@ pub mod export {
         Term,
         /// A number this build produced.
         Number,
-        /// An identifier this host generated, carrying nothing from outside it.
+        /// An identifier this host generated, carrying nothing from outside it. The one exception
+        /// is an identifier its owner named, such as the machine group a `machine.join` moved the
+        /// environment into: it is exactly sixteen validated bytes, so it carries nothing but
+        /// itself, and the row that holds it says so.
         Identifier,
         /// A value of another exported type, covered by that type's own rows.
         Structure,
