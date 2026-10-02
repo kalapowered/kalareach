@@ -195,6 +195,11 @@ enum DeviceProbe {
     // MARK: Push
 
     private static func push() {
+        // What an earlier check left names an earlier nonce and token and says its token was ready,
+        // and the step that reads them must not find them, whatever this check goes on to do.
+        let filed = container().appendingPathComponent("probe-push.json")
+        try? FileManager.default.removeItem(at: filed)
+        try? FileManager.default.removeItem(at: container().appendingPathComponent("probe-push.txt"))
         guard FirebaseApp.app() != nil else {
             finish(.push, ["firebase": "skipped"])
             return
@@ -204,10 +209,6 @@ enum DeviceProbe {
         var facts = fileFixtures(nonce: nonce)
         facts["nonce.digest"] = SHA256.hash(data: Data(nonce.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
 
-        // The file an earlier check filed names an earlier nonce and token, and the step that reads
-        // it must not find them.
-        let filed = container().appendingPathComponent("probe-push.json")
-        try? FileManager.default.removeItem(at: filed)
         pushReport = PushCheckReport(
             nonce: nonce,
             group: PreviewKeyLocation.resolvedPrivateGroup() ?? "",
