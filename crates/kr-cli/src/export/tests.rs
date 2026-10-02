@@ -570,6 +570,67 @@ async fn output_that_resumes_inside_a_clipboard_write_does_not_carry_the_rest_of
     assert!(file.omission("output_resumed_mid_stream").is_none());
 }
 
+/// A clipboard write that a program wrapped over several lines, as a tool that breaks base64 at 76
+/// characters does, can be cut by a gap in the middle of a line: the lines that remain are text to a
+/// reader that takes a line ending for the end of a string, and a terminal's string runs through them
+/// to its terminator. Nothing is read up to a terminator, so none of the write is in the file.
+#[tokio::test]
+async fn a_write_wrapped_over_lines_that_a_gap_cut_does_not_carry_the_rest_of_it() {
+    let tail = b"c2VjcmV0\r\ncmV0LXRva2Vu\nZW5k\x07visible after\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"before\r\n"),
+        page_with(1_000, tail, Some(8)),
+        end(1_000 + tail.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    let whole = String::from_utf8_lossy(&exported.document);
+    for part in ["c2VjcmV0", "cmV0LXRva2Vu", "ZW5k"] {
+        assert!(!contains(&file.output(), part.as_bytes()), "{whole}");
+    }
+    assert!(contains(&file.output(), b"visible after"), "{}", file.0);
+    assert_eq!(
+        file.count("output_resumed_mid_stream"),
+        Some(b"c2VjcmV0\r\ncmV0LXRva2Vu\nZW5k\x07".len() as u64),
+        "{}",
+        file.0
+    );
+}
+
+/// Where the byte that ends a string is the last one of a page, reading begins with the next page:
+/// the text on it is not skipped to a second boundary.
+#[tokio::test]
+async fn a_terminator_that_ends_a_page_ends_the_skipping_with_it() {
+    let first = b"c2VjcmV0LXRva2Vu\x07";
+    let second = b"visible after\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"before\r\n"),
+        page_with(1_000, first, Some(8)),
+        page(1_000 + first.len() as u64, second),
+        end(1_000 + (first.len() + second.len()) as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert!(!contains(&file.output(), b"c2Vj"), "{}", file.0);
+    assert!(contains(&file.output(), b"visible after\r\n"), "{}", file.0);
+    assert_eq!(
+        file.count("output_resumed_mid_stream"),
+        Some(first.len() as u64),
+        "{}",
+        file.0
+    );
+}
+
 /// An archive that cannot say where its output got to reports the same gap on every page, though no
 /// page skipped anything. It is listed once, and the pages are one stretch of output: a control
 /// string that runs across two of them stays one string, and is not cut where a page ends.
@@ -616,6 +677,28 @@ async fn a_gap_every_page_repeats_is_listed_once_and_does_not_cut_a_sequence() {
         file.0
     );
     assert!(contains(&file.output(), b"b\r\n"), "{}", file.0);
+}
+
+/// Every question a program asked is counted, however many there were: the engine that reads the
+/// output for the export answers each as a terminal would, and a bound on how fast a live terminal
+/// is answered is not a reason for the file to stop counting.
+#[tokio::test]
+async fn every_question_the_program_asked_is_counted_however_many() {
+    let questions = 1_000_u64;
+    let output: Vec<u8> = b"x\x1b[c".repeat(usize::try_from(questions).expect("a small count"));
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, &output),
+        end(output.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(file.count("terminal_query"), Some(questions), "{}", file.0);
+    assert!(!contains(&file.output(), b"\x1b[c"), "{}", file.0);
 }
 
 /// A program that asks the terminal to read the clipboard is answered by the terminal engine itself,

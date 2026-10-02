@@ -1409,6 +1409,7 @@ async fn export(
     json: bool,
 ) -> Result<Completion> {
     let selector = SessionSelector::parse(&arguments.session)?;
+    kr_cli::export::check_bound(arguments.max_bytes)?;
     kr_cli::export::refuse_existing(&arguments.output)?;
     let exported_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
