@@ -36,6 +36,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::build::{Build, Launch, Newer};
+use crate::keys;
 use crate::stage::AgentProcess;
 
 /// How a part's failure begins when its session ran something other than the build under test.
@@ -71,15 +72,8 @@ const EXPORTED_WITNESS: &str = "PATH";
 /// was read while it was being written, or not written whole. It cannot be a variable's name.
 pub const LIST_END: &str = "-- end of the names --";
 
-/// Whether `name` is one `pattern` names: a name, or a prefix when the pattern ends in `*`.
-fn names_of(pattern: &str, name: &str) -> bool {
-    pattern
-        .strip_suffix('*')
-        .map_or(pattern == name, |prefix| name.starts_with(prefix))
-}
-
 /// Checks the names a session's shell wrote against the variables `cleared` names, each a name or
-/// a prefix that ends in `*`, except the names in `allowed`, which the build list sets itself: the
+/// a prefix that ends in `*` or a suffix that begins with one ([`keys::names`]), except the names in `allowed`, which the build list sets itself: the
 /// agent inherits what the shell exports, so none of them may be there.
 ///
 /// # Errors
@@ -109,7 +103,7 @@ pub fn exported_clear(
         .iter()
         .copied()
         .filter(|name| !allowed.iter().any(|allowed| allowed == name))
-        .filter(|name| cleared.iter().any(|pattern| names_of(pattern, name)))
+        .filter(|name| keys::cleared(cleared, name))
         .collect();
     if present.is_empty() {
         Ok(())
@@ -367,34 +361,7 @@ impl Provenance {
                 .map(|account| account.cleared.clone())
                 .unwrap_or_default(),
             // What the build list sets in the session itself is not the person's.
-            allowed: build
-                .environment
-                .keys()
-                .chain(
-                    build
-                        .account
-                        .iter()
-                        .flat_map(|account| account.variables.keys()),
-                )
-                .chain(
-                    build
-                        .account
-                        .iter()
-                        .filter_map(|account| account.config_directory.as_ref())
-                        .map(|directory| &directory.variable),
-                )
-                .chain(
-                    build
-                        .account
-                        .iter()
-                        .filter_map(|account| account.confinement.as_ref())
-                        .flat_map(|confinement| {
-                            std::iter::once(&confinement.variable)
-                                .chain(&confinement.proxy_variables)
-                        }),
-                )
-                .cloned()
-                .collect(),
+            allowed: build.names_it_sets(),
             cleared_required: AtomicBool::new(false),
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
