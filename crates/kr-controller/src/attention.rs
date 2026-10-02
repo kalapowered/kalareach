@@ -692,9 +692,15 @@ impl AttentionModule {
     ///
     /// The state's read side is held for the whole pass, so a change of privacy mode is published
     /// wholly before the pass or wholly after it, and no decision is stamped with a state that was
-    /// replaced while it was being made. It is taken before the store, never inside it, and nothing
-    /// here waits for anything while holding it, so it only delays a change of privacy mode by the
-    /// pass. Not held across an await.
+    /// replaced while it was being made. It is taken before the store, never inside it, and the
+    /// pass waits for the store while it holds it, so a change of privacy mode waits for as long as
+    /// the store does.
+    ///
+    /// Taking it waits behind a change that is itself waiting for the sends admitted before it, and
+    /// a send holds its admission across an exchange that needs the runtime's own threads. So this
+    /// runs only on a thread that may wait, the blocking pool or one of its own, and a caller that
+    /// runs on the runtime goes through [`Self::deciding_off_the_workers`]. Not held across an
+    /// await.
     fn deciding<T>(&self, pass: impl FnOnce(HostReading) -> T) -> T {
         #[cfg(test)]
         self.decided_on
@@ -714,6 +720,26 @@ impl AttentionModule {
             });
         }
         pass(reading)
+    }
+
+    /// Runs one pass that may decide announcements on the blocking pool, under [`Self::deciding`],
+    /// and waits for it without holding a thread of the runtime.
+    ///
+    /// Every caller that runs on the runtime decides through this, as every other taker of the
+    /// privacy state's read side runs on the blocking pool. Answers `None` when the pool was shut
+    /// down before the pass ran, which only a stopping runtime does.
+    async fn deciding_off_the_workers<T: Send + 'static>(
+        self: &Arc<Self>,
+        pass: impl FnOnce(&Self, HostReading) -> T + Send + 'static,
+    ) -> Option<T> {
+        let module = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || module.deciding(|reading| pass(&module, reading)))
+            .await
+        {
+            Ok(done) => Some(done),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => None,
+        }
     }
 
     /// Returns what the host's clocks read now, in the form the store takes.
@@ -1865,7 +1891,10 @@ impl AttentionModule {
             let Some(held) = module.upgrade() else {
                 break;
             };
-            match held.take_page(session_id, &link, questions_after, host_events_after, &page) {
+            match held
+                .take_page(session_id, &link, questions_after, host_events_after, &page)
+                .await
+            {
                 Ok(Taken::Complete) => behind = false,
                 Ok(Taken::Partial) => behind = true,
                 Ok(Taken::Stale) | Err(_) => break,
@@ -1936,8 +1965,8 @@ impl AttentionModule {
     /// that look to the last write, and a closure or a replacement takes the store before it takes
     /// the link away, so a page read before either is applied before it, and one read after is not
     /// applied at all.
-    fn take_page(
-        &self,
+    async fn take_page(
+        self: &Arc<Self>,
         session_id: SessionId,
         link: &Arc<Link>,
         questions_after: u64,
@@ -1960,37 +1989,48 @@ impl AttentionModule {
                 .last()
                 .map(|record| record.sequence.get()),
         );
-        let taken = self.deciding(|reading| -> Answer<Taken> {
-            let mut store = self.store()?;
-            if !self
-                .origins()
-                .links
-                .get(&session_id)
-                .is_some_and(|current| Arc::ptr_eq(current, link))
-            {
-                return Ok(Taken::Stale);
-            }
-            store.rebuild(&events, reading).map_err(refusal)?;
-            let certified = {
-                let mut origins = self.origins();
-                if complete {
-                    let certified = origins.certified.entry(session_id).or_insert(0);
-                    *certified = (*certified).max(page.built_at_boot_ms.get());
+        let built_at_boot_ms = page.built_at_boot_ms.get();
+        let output_floor = page.output_floor.0.map(|floor| floor.get());
+        let link = Arc::clone(link);
+        let taken = self
+            .deciding_off_the_workers(move |module, reading| -> Answer<Taken> {
+                let mut store = module.store()?;
+                if !module
+                    .origins()
+                    .links
+                    .get(&session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &link))
+                {
+                    return Ok(Taken::Stale);
                 }
-                if let Some(floor) = page.output_floor.0 {
-                    origins.output_floor.insert(session_id, floor.get());
-                }
-                Certificates::of(&origins)
-            };
-            store
-                .tick(reading, &|origin| certified.at(origin))
-                .map_err(refusal)?;
-            Ok(if complete {
-                Taken::Complete
-            } else {
-                Taken::Partial
+                store.rebuild(&events, reading).map_err(refusal)?;
+                let certified = {
+                    let mut origins = module.origins();
+                    if complete {
+                        let certified = origins.certified.entry(session_id).or_insert(0);
+                        *certified = (*certified).max(built_at_boot_ms);
+                    }
+                    if let Some(floor) = output_floor {
+                        origins.output_floor.insert(session_id, floor);
+                    }
+                    Certificates::of(&origins)
+                };
+                store
+                    .tick(reading, &|origin| certified.at(origin))
+                    .map_err(refusal)?;
+                Ok(if complete {
+                    Taken::Complete
+                } else {
+                    Taken::Partial
+                })
             })
-        })?;
+            .await
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "the pass over a session's page was stopped",
+                )
+            })??;
         // A certificate that moved may let a timer be decided that the maintenance loop had put
         // aside.
         if !matches!(taken, Taken::Stale) {
@@ -2436,26 +2476,34 @@ impl AttentionModule {
                     return;
                 };
                 held.finish_again(reach.as_ref()).await;
-                let reading = held.deciding(|reading| {
-                    if let Ok(mut store) = held.store() {
-                        // Read with the store held: a closure and a replacement take the store
-                        // before they take a certificate away, so this tick never decides on one
-                        // they took.
-                        let certified = held.certificates();
-                        let _ = store.tick(reading, &|origin| certified.at(origin));
-                        // Expired records are let go of only on a wall clock this host can prove,
-                        // so a rollback cannot make a live record look expired.
-                        if held.time.may_collect_expired()
-                            && reading.wall_ms.get().saturating_sub(forgot_at) > FORGET_EVERY_MS
-                        {
-                            forgot_at = reading.wall_ms.get();
-                            let _ = store.forget_actions_before(
-                                reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
-                            );
+                let forgotten_at = forgot_at;
+                let Some((reading, forgot)) = held
+                    .deciding_off_the_workers(move |module, reading| {
+                        let mut forgot = forgotten_at;
+                        if let Ok(mut store) = module.store() {
+                            // Read with the store held: a closure and a replacement take the
+                            // store before they take a certificate away, so this tick never
+                            // decides on one they took.
+                            let certified = module.certificates();
+                            let _ = store.tick(reading, &|origin| certified.at(origin));
+                            // Expired records are let go of only on a wall clock this host can
+                            // prove, so a rollback cannot make a live record look expired.
+                            if module.time.may_collect_expired()
+                                && reading.wall_ms.get().saturating_sub(forgot) > FORGET_EVERY_MS
+                            {
+                                forgot = reading.wall_ms.get();
+                                let _ = store.forget_actions_before(
+                                    reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
+                                );
+                            }
                         }
-                    }
-                    reading
-                });
+                        (reading, forgot)
+                    })
+                    .await
+                else {
+                    return;
+                };
+                forgot_at = forgot;
                 let mut wait = held
                     .next_decidable_deadline(reading)
                     .map_or(MAINTENANCE, |due| {
@@ -3378,10 +3426,12 @@ mod tests {
             .await;
         let late = module
             .take_page(closed, &closed_link, 0, 0, &question_page(closed))
+            .await
             .expect("the store answers");
         assert!(matches!(late, Taken::Stale));
         let current = module
             .take_page(open, &open_link, 0, 0, &question_page(open))
+            .await
             .expect("the store answers");
         assert!(matches!(current, Taken::Complete));
 
@@ -3410,6 +3460,7 @@ mod tests {
             let (link, reader, writer) = linked(&temp, display, &module, session_id).await;
             module
                 .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .await
                 .expect("the page is taken");
             ends.insert(session_id, (reader, writer));
         }
@@ -3749,6 +3800,7 @@ mod tests {
         let (link, mut reader, mut writer) = linked(&temp, 1, &module, closing).await;
         module
             .take_page(closing, &link, 0, 0, &question_page(closing))
+            .await
             .expect("the page is taken");
         let assembling = {
             let module = Arc::clone(&module);
@@ -4124,6 +4176,7 @@ mod tests {
             let (link, reader, writer) = linked(&temp, display, &module, session_id).await;
             module
                 .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .await
                 .expect("the page is taken");
             ends.insert(session_id, (reader, writer));
         }
@@ -4254,6 +4307,7 @@ mod tests {
         let (link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
         module
             .take_page(session_id, &link, 0, 0, &question_page(session_id))
+            .await
             .expect("the page is taken");
         let reading = {
             let module = Arc::clone(&module);
@@ -5080,6 +5134,7 @@ mod tests {
                 let polled_on = std::thread::current().id();
                 module
                     .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                    .await
                     .expect("the page is taken");
                 polled_on
             }
