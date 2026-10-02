@@ -72,12 +72,13 @@ final class PushRegistration: NSObject {
     /// answered, and goes on only once they have agreed. Called again for a token that changes.
     var onTokenUsable: ((Data) -> Void)?
 
-    /// Whether the current APNs token has been handed to Firebase.
+    /// Whether a registration token may be asked of Firebase now.
     ///
-    /// A registration token is made for one APNs token, so one is asked of Firebase only when this
-    /// is true, and a message is sent to a token made for the APNs token the system gave last. It is
-    /// withdrawn when the person takes their agreement back and when the system refuses to
-    /// register, and it is true again once a new token has been handed over.
+    /// A registration token is made for one APNs token, so it is asked for only once the current
+    /// APNs token has been handed to Firebase, and a message is sent to a token made for the APNs
+    /// token the system gave last. This is withdrawn when the person takes their agreement back and
+    /// when the system refuses to register, and it is true again once the token has been handed over
+    /// again.
     ///
     /// Nothing here keeps a registration token: Firebase holds them, and gives back one it made
     /// earlier only for the same APNs token.
