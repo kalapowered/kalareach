@@ -1004,14 +1004,19 @@ async fn an_environment_that_cannot_read_its_record_is_not_taken_to_have_refused
     kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
         .expect("damages the record");
 
-    let before = pair.starts_left();
+    // B's daemon is told to stop the retry once it has found the step's claim unfinished, which it
+    // does only when B has received the retry: a task waits for that and lets it go.
+    let (arrived, go) = pair.b.controller.hold_the_next_machine_retry();
+    let releasing = tokio::spawn(async move {
+        arrived.await.expect("B received the retry");
+        go.send(()).expect("lets the retry go");
+    });
     let (status, still) = pair
         .a
         .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
-    assert!(
-        pair.starts_left() < before,
-        "B was reached, so its answer is what kept the step sent, not an unreachable bridge"
-    );
+    releasing
+        .await
+        .expect("B received the retry, so its answer is what kept the step sent");
     assert_eq!(status, Some(1), "{still}");
     assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
     assert_eq!(still["steps"][1]["state"], "sent", "{still}");
