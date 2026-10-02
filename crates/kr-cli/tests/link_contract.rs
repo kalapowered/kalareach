@@ -582,3 +582,74 @@ async fn a_receive_that_reads_inside_itself_is_cut_by_giving_up_on_it_inside_a_f
         "a receive given up on inside a frame lost what it had read of it"
     );
 }
+
+/// A destination that writes far more than a bridge may hold for a caller that has stopped reading
+/// does not end the link: the caller is told to take the view again, as a client of a worker on
+/// this host is, and what arrives after the marker is delivered.
+///
+/// The helper writes 12 MiB of output frames at once and the caller reads nothing for two seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bridged_caller_that_falls_behind_is_told_to_resynchronise_and_is_not_ended() {
+    const FRAMES: u64 = 3000;
+    let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let first = directory.path().join("first");
+    written_frames(
+        &first,
+        &[BridgeFrame::HelloAck(Box::new(bridge_acknowledgement(
+            connection_id,
+        )))],
+    );
+    // 3000 frames of 4 KiB of output: 12 MiB, past the 8 MiB a bridge holds.
+    let output = |sequence: u64| {
+        BridgeFrame::Control(Box::new(ControlFrame::Notification(Notification {
+            stream_id: StreamId::new("s1").expect("a stream"),
+            sequence: EventSequence::new(sequence),
+            event_type: EventType::new("session.output").expect("an event type"),
+            payload: ParamsValue::from_typed(&kr_protocol::recovery::OutputEvent {
+                cursor: U64::new(sequence * 4096),
+                bytes: Bytes::new(vec![b'x'; 4096]),
+            })
+            .expect("a payload"),
+        })))
+    };
+    let flood = directory.path().join("flood");
+    let frames: Vec<BridgeFrame> = (1..=FRAMES).map(output).collect();
+    written_frames(&flood, &frames);
+    let opening = bridge_opening(
+        "head -c 4 >/dev/null; cat \"$1\"; cat \"$2\"; sleep 5".to_owned(),
+        &[&first, &flood],
+    );
+    let invocation = opening.launch().await.expect("the helper answered");
+    let mut link = BridgedLink::new(invocation.into_stream());
+    // Nobody reads while it all arrives.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut markers = 0_u32;
+    let mut last_output = 0_u64;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), link.recv()).await;
+        match frame {
+            Ok(Ok(ControlFrame::Notification(notification))) => {
+                match notification.event_type.as_str() {
+                    "session.resync" => markers += 1,
+                    "session.output" => last_output = notification.sequence.get(),
+                    other => panic!("an unexpected event {other}"),
+                }
+                if last_output == FRAMES {
+                    break;
+                }
+            }
+            other => panic!(
+                "the link ended, or went quiet, before the newest output arrived (markers {markers}, \
+                 newest output {last_output}): {other:?}"
+            ),
+        }
+    }
+    assert!(markers >= 1, "the caller was told to take the view again");
+    assert_eq!(
+        last_output, FRAMES,
+        "and the newest output was still delivered"
+    );
+    let _ = link.close().await;
+}
