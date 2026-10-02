@@ -231,6 +231,7 @@ function leafCertificate(path) {
     const der = readFileSync(leaf)
     const ends = spawnSync('openssl', ['x509', '-inform', 'der', '-noout', '-enddate'], { input: der, encoding: 'utf8' })
     const stated = ends.status === 0 ? /^notAfter=(.*)$/m.exec(ends.stdout)?.[1] : undefined
+    // An end that cannot be read stays null; one that does not parse is an invalid date: both are told.
     return { sha1: createHash('sha1').update(der).digest('hex').toUpperCase(), notAfter: stated ? new Date(stated) : null }
   } finally {
     rmSync(scratch, { recursive: true, force: true })
@@ -249,7 +250,8 @@ export function problemsOfCertificate(found, { identity, profile, now = new Date
   if (profile && !profile.certificates.includes(found.sha1)) {
     problems.push(`the profile ${profile.name} does not list the certificate ${found.sha1}, so iOS would refuse to install it`)
   }
-  if (found.notAfter && found.notAfter <= now) problems.push(`the certificate ${found.sha1} has expired`)
+  if (!found.notAfter || Number.isNaN(found.notAfter.getTime())) problems.push(`the end of the certificate ${found.sha1}'s validity cannot be read`)
+  else if (found.notAfter <= now) problems.push(`the certificate ${found.sha1} has expired`)
   return problems
 }
 
