@@ -464,10 +464,18 @@ async fn explained(
     )
     .await;
     match answered {
-        Ok(Ok(ordinary)) => Unreached::Error(refused_by_a_peer_that_answers(
-            peer,
-            ordinary.acknowledgement().build.as_ref(),
-        )),
+        Ok(Ok(ordinary)) => match ordinary.acknowledgement().build.as_ref() {
+            // A peer of this build's own level reads what a bridge says, so what stopped it is
+            // something else, and that is what is reported.
+            Some(build)
+                if build
+                    .protocol_version
+                    .shares_frames_with(kr_protocol::hello::PACKAGE_VERSION) =>
+            {
+                Unreached::Error(error)
+            }
+            stated => Unreached::Error(refused_by_a_peer_that_answers(peer, stated)),
+        },
         _ => Unreached::Error(error),
     }
 }
