@@ -296,6 +296,21 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
+        // Whether this host runs Git for a paired device is proved once here, before anything is
+        // served, and again at each `host.doctor`.
+        let qualification = project.qualify().await;
+        // A platform that confines nothing is not news; a Linux host that could not prove it is.
+        if matches!(
+            qualification.refusal(),
+            Some(
+                kr_project::service::Refusal::SupportSet | kr_project::service::Refusal::Invocation
+            )
+        ) {
+            eprintln!(
+                "kr-controller: no repository operation is served to a paired device: {}",
+                qualification.detail()
+            );
+        }
         // The catalogue fetches through the proxy this daemon started with, the endpoint's own,
         // and asks this generation's member set what the workers hold before it makes room.
         let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
@@ -596,6 +611,7 @@ impl Controller {
             backup,
             transfer,
             project,
+            qualification: std::sync::RwLock::new(qualification),
             catalogue,
             sharing,
             voice: std::sync::OnceLock::new(),
