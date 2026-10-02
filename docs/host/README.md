@@ -2,7 +2,7 @@
 
 A KalaReach host runs one control daemon per operating-system user and environment, and one worker
 per terminal session. The split is the point: a worker owns a shell, and nothing the control daemon
-does — restarting, being upgraded, crashing — may end it.
+does (restarting, being upgraded, crashing) may end it.
 
 ```text
 kr  ──────────────┐
@@ -569,7 +569,7 @@ its first grant through `plugin.install`, with the owner's confirmation.
 
 ## Descriptors
 
-The control daemon publishes one descriptor per live session, atomically — written to a temporary
+The control daemon publishes one descriptor per live session, atomically: written to a temporary
 file in the same directory, then renamed, then the directory entry flushed. A descriptor carries
 the session identifier and epoch, the environment, the display number, the boot identity, the
 worker's process-start identity, the protocol version, the endpoint, the worker's public key and
@@ -758,13 +758,13 @@ and neither does installing the host.
 
 A worker started by the service manager is not a child of the terminal that asked for it. On macOS
 that makes it its own process as far as the operating system's privacy controls are concerned, so
-the first time a worker reads a protected location — an external volume, the desktop, the documents
-folder — the person is asked to allow it, once per installed binary. That is the operating system
+the first time a worker reads a protected location (an external volume, the desktop, the documents
+folder), the person is asked to allow it, once per installed binary. That is the operating system
 working as intended; nothing here asks for blanket access on the user's behalf.
 
 Two consequences are worth knowing. A session whose working directory is on a protected volume will
 prompt when its shell starts, not when the person later opens a file. And a host whose binaries are
-replaced — a new build, an upgrade — is a new binary to those controls, so the question is asked
+replaced (a new build, an upgrade) is a new binary to those controls, so the question is asked
 again.
 
 A launchd job's standard error goes to `<state>/environments/<prefix>/jobs/<label>.diagnostics`. A
@@ -929,8 +929,8 @@ qualification may not do.
    reservation, the session, the environment, the display number, the rendezvous address and the
    two directory roots.
 4. The worker connects to the rendezvous socket and presents its signed claim. The daemon checks
-   the signature, matches the reservation, and compares the connecting process — both its
-   identifier and the kernel's record of its start — with what the launcher reported. Exactly one
+   the signature, matches the reservation, and compares the connecting process (both its
+   identifier and the kernel's record of its start) with what the launcher reported. Exactly one
    rendezvous per reservation succeeds; a second is refused, recorded, and fences the reservation.
 5. The daemon sends the launch specification over that private channel: the create request with the
    creator's environment variables, taken from memory, its own public key, its generation and the
@@ -1146,10 +1146,10 @@ but no further output will be written to it other than any enqueued side effects
 written or recorded as described below, after which the new screen will be sent.
 
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
-apply. What it leaves out is counted rather than assumed away — the saved cursor and keyboard
+apply. What it leaves out is counted rather than assumed away: the saved cursor and keyboard
 negotiation of the buffer that is not showing, the virtual title stack, soft-wrap markers, the
-right-hand side of a row wider than the window, and a pending wrap on a row outside that window —
-and `Session::restoration_losses` is the count.
+right-hand side of a row wider than the window, and a pending wrap on a row outside that window.
+`Session::restoration_losses` is the count.
 
 To paint the buffer that is not showing, the restoration enters it through mode 1049 (clearing it)
 and leaves it (retaining what was painted) before installing anything, since leaving restores the
@@ -1475,7 +1475,7 @@ nothing, and starting belongs to refresh, create and attach.
 `environment.inventory` reads the owner-approved cache. Every row carries the environment identity,
 when it was last observed, and an explicit status: `running`, `environment_stopped` or `stale`. A
 listing contacts nothing and starts nothing, and a cached row is never evidence that a process is
-live — the row says it was read from the cache, and only a refresh that found the environment
+live: the row says it was read from the cache, and only a refresh that found the environment
 running says otherwise. `environment.refresh` is the one that asks the platform, and it starts the
 environment it selected only when the request asked it to.
 
@@ -1568,8 +1568,8 @@ attachment, is `LEASE_LOST`, and it never takes the lease as a side effect: acqu
 controller asks for.
 
 Whether it may hold the lease is a comparison rather than a label. The canonical grid knows which
-keyboard encoding the application has negotiated — the ordinary one, `modifyOtherKeys` at a level,
-or the Kitty protocol with a set of flags — and the host compares that against what the controller
+keyboard encoding the application has negotiated (the ordinary one, `modifyOtherKeys` at a level,
+or the Kitty protocol with a set of flags), and the host compares that against what the controller
 can produce. A controller that cannot produce it is refused with `INPUT_INCOMPATIBLE` and keeps
 everything else it had: it goes on watching, and its typed actions are unaffected.
 
@@ -1609,7 +1609,7 @@ any moment and without telling anybody. Parsing the output is what tells the hos
 that turns an enhanced protocol on takes the keys from a terminal that cannot send it, and one that
 turns it off leaves the ordinary encoding, which any declared terminal can send, so that terminal
 is eligible again and can ask for the keys. Nothing gives them back by itself. The release is the
-ordinary one — the epoch advances, the fence goes out, a paste the lease had open is closed — and
+ordinary one (the epoch advances, the fence goes out, a paste the lease had open is closed), and
 the holder learns on its next write, which is `LEASE_LOST`.
 
 Such a release has no answer of its own to report in, and neither does a detach, so what it
@@ -1633,7 +1633,7 @@ application is not reading have reached the terminal and done nothing at all.
 Size ownership is separate from input ownership, and both are separate from observing the session.
 The first eligible geometry claim owns rows and columns; eligibility needs a terminal attachment, a
 registered claim and the geometry right together, so reporting a viewport confers none of it and a
-conversation view — which is semantic, and cannot claim — never competes for it.
+conversation view, which is semantic and cannot claim, never competes for it.
 
 | What happens | What it does to the size |
 | --- | --- |
@@ -1647,7 +1647,7 @@ conversation view — which is semantic, and cannot claim — never competes for
 
 Every ownership change advances the geometry epoch, and a change that did not happen does not: a
 resize the kernel or the session's budget refused leaves the epoch where it was, so a refusal cannot
-invalidate every client's next request. A succession is the exception that proves the rule — the
+invalidate every client's next request. A succession is the exception that proves the rule: the
 owner did give up its claim, whatever the kernel then said about the successor's size, so the size
 goes back unowned rather than to an attachment that has left or has withdrawn.
 
@@ -1740,7 +1740,7 @@ grant store's transaction. `grant.create` checks once the parent is resolved and
 and its invitation are written. `grant.revoke` checks once the subtree it is about to withdraw has
 been read, which walks every grant this host holds. `device.revoke` withdraws the grants in that
 transaction and then marks the device's own record, which is a separate store. When the transaction
-withdrew nothing — the paired device whose grant lives in its pairing record — that record is
+withdrew nothing (the paired device whose grant lives in its pairing record), that record is
 the whole withdrawal, so the check is repeated before each wait between the two, and a refusal
 after the fence has been written down is answered once that fence has run rather than instead of
 it. When
@@ -1985,14 +1985,14 @@ What a device reaches, in order:
 2. **Paired**, it gets an authorised connection whose actor the daemon constructs: `paired_device`
    ingress, the device, the grant and the revision it was validated at, the controller generation
    that admitted the connection, and the connection's own identity.
-3. **Reads the daemon owns** — the host, the environment list, the environment's capability
+3. **Reads the daemon owns** (the host, the environment list, the environment's capability
    records, the diagnostics, the session list, one session's metadata, and the repository and
-   workspace metadata — are answered by the daemon, out of the same call a local caller reaches.
+   workspace metadata) are answered by the daemon, out of the same call a local caller reaches.
    The four host-and-environment reads leave in their export form, with no account name, local
    path or platform message in them; "What a paired device reads of this host" lists what each
    carries instead.
-4. **Effects the daemon owns** — creating a session, the repository and workspace mutations, and
-   pinning a session's name — are performed by the daemon, on a task that outlives the connection
+4. **Effects the daemon owns** (creating a session, the repository and workspace mutations, and
+   pinning a session's name) are performed by the daemon, on a task that outlives the connection
    that asked. No worker owns them: the first two name no session, and a session's pinned name is
    the environment's metadata, which outlives the session.
 5. **Everything a session owns** is forwarded to the worker over a link the daemon opened for that
@@ -2064,7 +2064,7 @@ What the grant decides, for every request:
   admits. A listing names no session, so the *answer* is narrowed instead: a device is told about
   the sessions its grant admits and no others.
 * **Rights.** Every right the method requires unconditionally, and every conditional one whose
-  condition this request meets — a `session.attach` whose `claim_geometry` registers a claim needs
+  condition this request meets: a `session.attach` whose `claim_geometry` registers a claim needs
   `terminal.geometry`. A condition the daemon cannot decide is treated as holding, so the right is
   asked for rather than skipped. *Asking for* a capability is not one of these conditions: it is a
   request the host intersects, described below. The rights are the grant's as this host's policy
@@ -2121,7 +2121,7 @@ UTC.
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own
 connection created and nothing else, and it cancels or reads its own action and nothing else,
-because the worker enforces both inside its own dispatch barrier — the attachment list is the
+because the worker enforces both inside its own dispatch barrier: the attachment list is the
 connection's, and the receipt journal is keyed by the verified actor and the action together. Whose
 attachment a caller may detach is decided before the dispatch marker, so a detach refused for it
 is recorded as a rejection; a detach that fails after the marker, as one does when the session's
@@ -2171,8 +2171,8 @@ one. The intersection is made in the worker, where the attachment is admitted, b
 where the attachment's own record is written, and the summary the caller is given then says what it
 actually holds.
 
-Every later operation on that attachment — resizing, transferring the size, acquiring the lease,
-writing input — passes two checks, not one. The daemon checks the grant's current rights for the
+Every later operation on that attachment (resizing, transferring the size, acquiring the lease,
+writing input) passes two checks, not one. The daemon checks the grant's current rights for the
 method, as it does for every request. The worker then checks the capability the attachment was
 granted. The second is what the intersection buys: a device whose grant carries `terminal.input`
 but whose attachment was admitted without the input capability is refused by the worker, and a
@@ -2194,8 +2194,8 @@ The registry admits a paired device to the ten project and workspace methods, an
 what it serves a device through the same call a local caller reaches, so a device's `project.list`
 and the owner's are one answer. The four methods that keep the owner's authorised locations are
 served on the local socket alone. The mutations take the daemon's own path: the envelope is checked
-first — a project acts on a repository or a working copy, so a target naming a session or an
-application is refused — then the action's route is recorded with this host named as the owner of
+first (a project acts on a repository or a working copy, so a target naming a session or an
+application is refused), then the action's route is recorded with this host named as the owner of
 what it produces, and the effect runs on a task a dropped connection cannot cancel part way.
 `Controller::project_mutation` is the one place either door reaches the service from, and it asks
 about the admission the ingress recorded immediately before the write.
@@ -2204,8 +2204,8 @@ What a device is additionally held to is its grant, and `session.view` for the t
 listing is narrowed to what the grant admits rather than refused: two grants over one host list
 different repositories and different working copies, and a working copy's bound sessions are
 narrowed the same way. `project.read` and `workspace.read` name one subject and require no right of
-their own, so they are refused outright for a subject in an environment the grant does not cover —
-a narrowed listing is not a way to find an identifier an unnarrowed read would then answer for —
+their own, so they are refused outright for a subject in an environment the grant does not cover
+(a narrowed listing is not a way to find an identifier an unnarrowed read would then answer for),
 and the session content they carry is narrowed exactly as the listings' is.
 
 **A paired device is refused the five repository operations**, on every platform, whatever its
@@ -3042,8 +3042,8 @@ nothing else: a generation whose descriptor was published keeps its record, so d
 outcome this host could not establish, and so does one whose ciphertext a service acknowledged
 before privacy mode cancelled its production. All three are copies somewhere else, and a host that
 deleted the acknowledgements with the production would have nothing left to show a person. What a
-cleanup pass reports is what it actually did
-— bytes it unlinked and rows it deleted — and the two counts are independent. A pass that keeps a
+cleanup pass reports is what it actually did:
+bytes it unlinked and rows it deleted, and the two counts are independent. A pass that keeps a
 retained artifact's record reports its bytes and no records at all. A pass can equally report
 records and no bytes: a removal whose file went before the store could record it is finished by a
 later pass, which finds the file already absent and takes only the rows, and a staging walk that
@@ -3074,8 +3074,8 @@ dispatch gate rather than any of this, because recording anything afterwards can
 something already sent.
 
 Turning privacy mode off releases the fence, under a generation of its own, and only when nothing
-is owed under it. The release names both generations — the fence to bring down and the one
-production resumes under — so it can neither clear a newer fence nor move the generation in force
+is owed under it. The release names both generations (the fence to bring down and the one
+production resumes under), so it can neither clear a newer fence nor move the generation in force
 backwards, and it is refused outright while that fence still has cleanup outstanding: new backup
 content does not enter a scope this host has not finished clearing, and the caller is told the
 resumption is still pending. The rule lives in the database as well as in the code, so a writer
@@ -4074,8 +4074,8 @@ exits, so there is no start value left to read, and the identity carries a reser
 the reading never happened. Such an identity always reads as ended, which is what it is, and it
 never matches a live process that inherits the identifier.
 
-If the journal is unavailable the closure still happens — storage failure must not prevent an
-authorised stop — and the reply says `durability=volatile` rather than claiming otherwise.
+If the journal is unavailable the closure still happens (storage failure must not prevent an
+authorised stop), and the reply says `durability=volatile` rather than claiming otherwise.
 
 The control daemon watches a closing worker and writes the tombstone and removes the descriptor
 once the kernel agrees the worker has gone. A worker that disappears without a close request is
@@ -4097,7 +4097,7 @@ worker's description only when the decision it is written under lets the device 
 ## Recovery
 
 A replacement daemon takes the environment's singleton lock, advances its persistent generation,
-and rebuilds its directory from the registry rows and the published descriptors — never from a list
+and rebuilds its directory from the registry rows and the published descriptors, never from a list
 of process names. Each worker is verified by a fresh challenge. A descriptor that fails is
 quarantined and never spawned from. A descriptor whose reservation this host fenced is quarantined
 without a challenge: the fence says the worker is not to be reached again, and recovery leaves such
@@ -4239,7 +4239,7 @@ intermediary bounds a call and never funds one. `sharing::roles::effective_right
 resolves the actor and the intermediary together.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
-delegates from — naming one is not holding one — and that grant has to carry `session.share`.
+delegates from (naming one is not holding one), and that grant has to carry `session.share`.
 Only this host's own device issues a grant that delegates from nothing.
 
 ### Revocation
@@ -4353,9 +4353,9 @@ reported stale rather than current.
 ### The shared history filter
 
 `crates/kr-worker/src/history_filter/` is where a grant's history lower bound is enforced. It is one
-filter with nine named surfaces — event pages, terminal and semantic snapshots, loaded
-conversations, attachment references, exports, summaries, changed-since-last-visit and voice context
-— and one decision behind all of them, so a surface cannot be served by a rule of its own. The
+filter with nine named surfaces (event pages, terminal and semantic snapshots, loaded
+conversations, attachment references, exports, summaries, changed-since-last-visit and voice context)
+and one decision behind all of them, so a surface cannot be served by a rule of its own. The
 surface list is closed: content that is not one of them is not filtered here, it is not filtered
 anywhere, and adding a surface means adding it to that list.
 
@@ -4385,8 +4385,8 @@ the pending resources those frames imply, and the arbitration that resolves them
 It is one lock, over the state **and** the durable records together. Every arbitration change is
 validated against the state as it is, written to the ledger conditionally on the state that write
 expects to find, and only then applied in memory, so a failed or racing write leaves memory exactly
-as it was. A method that makes several of those changes in turn — answering an approval claims,
-admits and resolves — holds the lock for each of them rather than for all three, and what carries
+as it was. A method that makes several of those changes in turn (answering an approval claims,
+admits and resolves) holds the lock for each of them rather than for all three, and what carries
 the rule across them is the durable dispatch marker rather than the lock.
 
 A resource snapshot, the state a view installs when it starts or resynchronises, carries every
@@ -4530,7 +4530,7 @@ argument vector, what is known about authentication, and the integration mode. I
 the launch, so a refused launch still leaves a record of what was going to be run.
 
 A launch intent is prepared against the idle root shell and executed against it. If an application
-has taken the foreground, or the prompt has moved, the launch is refused — and refusing is the
+has taken the foreground, or the prompt has moved, the launch is refused, and refusing is the
 whole answer. There is no path in this code that writes the command into whatever is reading the
 terminal.
 
@@ -4581,8 +4581,8 @@ to escape the rich method table.
 The table is what the installation qualified, and it is what the core reads frames with. A
 connection names the package it speaks for and presents nothing about the protocol, so there is
 nothing to compare and nothing to substitute. The table's recorded digest covers everything it says
-— the framing, each member name, and every entry's class, response expectation, reverse operation
-and answer shape — so a table whose framing, classification or reverse operations were altered
+(the framing, each member name, and every entry's class, response expectation, reverse operation
+and answer shape), so a table whose framing, classification or reverse operations were altered
 cannot carry the digest of the one that was qualified.
 
 A request the table does not classify is presumed mutation-capable, forwarded exactly as it is, and
@@ -4869,8 +4869,8 @@ is ended and waited for before the launch returns, the credential file it wrote 
 the broker gives back the instance and the conversation the launch took, so a retry is not refused
 for a launch that never happened.
 
-A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
-`sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that
+A connection carrying any header a browser adds (`origin`, `referer`, `sec-fetch-site`,
+`sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method`) is refused. A page that
 guesses the address still cannot speak to it.
 
 Registration authenticates against the launch and process binding **and** a private exchange. An
@@ -5132,8 +5132,8 @@ may keep the first, and what this host hashed would not be what the upstream act
 objects are normalised rather than refused, as a native frame's are. The invocation's own authority is asked again when the plan arrives, because
 the token was spent to invite the work and is not proof by the time the work comes back. What
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
-in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is
-and what else it holds — is not this host's, and what it supplies here is the snapshot.
+in the permit rather than attested by a flag beside it. The draft store itself (whose the draft is
+and what else it holds) is not this host's, and what it supplies here is the snapshot.
 
 An action whose implementation is its connector's decision destination is an approval answer, and
 `plugin.action.invoke` admits it as one: every check an approval answer meets applies, in the
