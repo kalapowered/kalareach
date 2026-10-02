@@ -6445,6 +6445,12 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         );
         if !account.dismiss.is_empty() {
             logged.type_text(stage, &account.dismiss);
+            // Keys typed while the slash command's screen is still closing would go to it.
+            logged.dialog_goes(
+                stage,
+                &account.slash.shows,
+                "the slash command's screen closes",
+            );
         }
         let _ = logged.wait_idle(stage, "the composer is back after the slash command");
         // An interrupt of a long turn.
