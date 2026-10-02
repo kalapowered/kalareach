@@ -210,6 +210,36 @@ describe('the terminal keys and the two views (KR-REQ-13.17, 13.03)', () => {
   })
 })
 
+describe('the attachment controls are one named button each (KR-REQ-13.19)', () => {
+  it('opens each source from its own button, and keeps the inputs out of the accessibility tree', async () => {
+    const person = userEvent.setup()
+    start('ios')
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+
+    const group = screen.getByRole('group', { name: 'Add an attachment' })
+    const inputs = [...(group.parentElement?.querySelectorAll<HTMLInputElement>('input[type="file"]') ?? [])]
+    expect(inputs).toHaveLength(3)
+    // No input is a control to a screen reader: none is in the tree for a role query to find.
+    for (const input of inputs) expect(input).not.toBeVisible()
+    expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
+      'Take a photo',
+      'Photo library',
+      'Files'
+    ])
+    const opened: (string | null)[] = []
+    for (const input of inputs) {
+      input.addEventListener('click', () => {
+        opened.push(input.getAttribute('accept'))
+      })
+    }
+    for (const name of ['Take a photo', 'Photo library', 'Files']) {
+      await person.click(within(group).getByRole('button', { name }))
+    }
+    expect(opened).toEqual(['image/*', 'image/*,video/*', '*/*'])
+  })
+})
+
 describe('a picked file is uploaded, not held in the screen (KR-REQ-13.17)', () => {
   it('sends a picked file through the transfer service and keeps it on the draft', async () => {
     // The files picker takes every type; the platform's picker, not the test, decides what it offers.
