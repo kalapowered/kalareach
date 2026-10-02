@@ -191,6 +191,9 @@ impl Controller {
                 | Method::SessionRename
                 | Method::DescriptionConfigure
                 | Method::DescriptionDownload
+                | Method::EnvironmentEnrol
+                | Method::EnvironmentForget
+                | Method::EnvironmentRefresh
         ) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }

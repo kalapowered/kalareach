@@ -122,6 +122,224 @@ async fn an_enrolment_records_the_identity_the_user_and_the_absolute_helper_path
     host.stop().await;
 }
 
+/// Composes one environment record mutation, as a client keeps it to send again.
+async fn composed<P: serde::Serialize>(
+    client: &mut kr_ipc::client::LocalClient,
+    host: &Host,
+    method: Method,
+    params: &P,
+) -> kr_protocol::envelope::MutationRequest {
+    client
+        .compose(
+            method,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            params,
+        )
+        .await
+        .expect("composes")
+}
+
+/// KR-REQ-23.33: `environment.enrol` is de-duplicated by actor and action. An enrolment sent again
+/// as it was first sent is answered from the receipt and enrols nothing a second time, and the same
+/// action carrying another record is `ID_CONFLICT` and records nothing.
+#[tokio::test]
+async fn an_enrolment_is_performed_once_per_action_and_a_retry_is_answered_from_its_receipt() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+
+    let record = enrolment(1, "ubuntu", EnvironmentAccess::WslDistribution);
+    let first = composed(
+        &mut client,
+        &host,
+        Method::EnvironmentEnrol,
+        &EnvironmentEnrolParams {
+            enrolment: record.clone(),
+        },
+    )
+    .await;
+    let enrolled: EnvironmentEnrolResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("enrols")
+        .to_typed()
+        .expect("an enrolment result");
+    assert_eq!(enrolled.row.enrolment.environment_id, record.environment_id);
+    assert_eq!(enrolled.row.enrolment.label, "ubuntu");
+
+    // The record is forgotten by another action. Sending the enrolment again as it was sent
+    // answers from its receipt, and does not enrol the record again.
+    let forgotten = client
+        .mutate(
+            Method::EnvironmentForget,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &EnvironmentForgetParams {
+                environment_id: record.environment_id,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("forgets");
+    assert!(
+        forgotten
+            .to_typed::<EnvironmentForgetResult>()
+            .expect("a result")
+            .forgotten
+    );
+    let again: EnvironmentEnrolResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("is answered from its receipt")
+        .to_typed()
+        .expect("an enrolment result");
+    assert_eq!(again, enrolled);
+    assert!(
+        inventory(&mut client).await.rows.is_empty(),
+        "the retry enrolled nothing"
+    );
+
+    // The same action carrying another record.
+    let mut changed = first.clone();
+    changed.params = ParamsValue::from_typed(&EnvironmentEnrolParams {
+        enrolment: enrolment(2, "debian", EnvironmentAccess::WslDistribution),
+    })
+    .expect("encodes");
+    let conflict = client
+        .repeat(&changed)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a reused action with another payload");
+    assert_eq!(conflict.code, ErrorCode::IdConflict);
+    assert!(inventory(&mut client).await.rows.is_empty());
+    host.stop().await;
+}
+
+/// KR-REQ-23.33: `environment.forget` is de-duplicated by actor and action. A forget sent again as
+/// it was first sent is answered from its receipt and forgets nothing a second time, even when the
+/// record has been enrolled again meanwhile, and the same action naming another environment is
+/// `ID_CONFLICT`.
+#[tokio::test]
+async fn a_forget_is_performed_once_per_action_and_a_retry_is_answered_from_its_receipt() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+    let record = enrolment(1, "ubuntu", EnvironmentAccess::WslDistribution);
+    enrol(&mut client, &host, record.clone()).await;
+
+    let first = composed(
+        &mut client,
+        &host,
+        Method::EnvironmentForget,
+        &EnvironmentForgetParams {
+            environment_id: record.environment_id,
+        },
+    )
+    .await;
+    let forgotten: EnvironmentForgetResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("forgets")
+        .to_typed()
+        .expect("a result");
+    assert!(forgotten.forgotten);
+
+    enrol(&mut client, &host, record.clone()).await;
+    let again: EnvironmentForgetResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("is answered from its receipt")
+        .to_typed()
+        .expect("a result");
+    assert_eq!(again, forgotten);
+    assert_eq!(
+        inventory(&mut client).await.rows.len(),
+        1,
+        "the retry forgot nothing"
+    );
+
+    let mut changed = first.clone();
+    changed.params = ParamsValue::from_typed(&EnvironmentForgetParams {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+    })
+    .expect("encodes");
+    let conflict = client
+        .repeat(&changed)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a reused action with another payload");
+    assert_eq!(conflict.code, ErrorCode::IdConflict);
+    assert_eq!(inventory(&mut client).await.rows.len(), 1);
+    host.stop().await;
+}
+
+/// KR-REQ-23.33: `environment.refresh` is de-duplicated by actor and action. A refresh sent again as
+/// it was first sent is answered with the observation its receipt holds, not a new one, and the
+/// same action naming another environment is `ID_CONFLICT`.
+#[tokio::test]
+async fn a_refresh_is_performed_once_per_action_and_a_retry_is_answered_from_its_receipt() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+    // An environment reached another way answers a refresh from its record alone, so nothing is
+    // started and no bridge is opened.
+    let record = enrolment(3, "workstation", EnvironmentAccess::SshHost);
+    enrol(&mut client, &host, record.clone()).await;
+
+    let first = composed(
+        &mut client,
+        &host,
+        Method::EnvironmentRefresh,
+        &EnvironmentRefreshParams {
+            environment_id: record.environment_id,
+            start: false,
+        },
+    )
+    .await;
+    let refreshed: EnvironmentRefreshResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("refreshes")
+        .to_typed()
+        .expect("a result");
+    assert_eq!(refreshed.row.enrolment.label, "workstation");
+
+    // The record is enrolled again under another label; a retry still answers what it answered.
+    let renamed = EnvironmentEnrolment {
+        label: "renamed".to_owned(),
+        ..record.clone()
+    };
+    enrol(&mut client, &host, renamed).await;
+    let again: EnvironmentRefreshResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("is answered from its receipt")
+        .to_typed()
+        .expect("a result");
+    assert_eq!(again, refreshed);
+
+    let mut changed = first.clone();
+    changed.params = ParamsValue::from_typed(&EnvironmentRefreshParams {
+        environment_id: record.environment_id,
+        start: true,
+    })
+    .expect("encodes");
+    let conflict = client
+        .repeat(&changed)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a reused action with another payload");
+    assert_eq!(conflict.code, ErrorCode::IdConflict);
+    host.stop().await;
+}
+
 /// KR-REQ-03.16: an enrolment whose helper path is not absolute is refused and records nothing.
 #[tokio::test]
 async fn a_record_without_an_absolute_helper_path_is_refused() {

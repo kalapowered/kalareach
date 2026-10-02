@@ -686,7 +686,16 @@ impl Controller {
                 // The envelope this host built for the connection, not anything the caller sent.
                 // A refresh may open a bridge, and what may cross one is decided by this.
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.environment_record(&actor, mutation, method).await
+                // Each is performed once per actor's action: claimed first, and what it came to is
+                // kept under the claim before it is answered, so a retry is answered from that
+                // record rather than enrolling, forgetting or observing again.
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        self.environment_record(&actor, mutation, method),
+                    )
+                    .await;
             }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the
