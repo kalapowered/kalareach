@@ -599,6 +599,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             kr_cli::contact::run_stdio(build_id()).await?;
             Ok(Completion::Done)
         }
+        Command::Export(arguments) => export(&paths, arguments, cli.json).await,
         Command::Doctor(arguments) => {
             // Before any host is asked: what the content export needs of the person is settled
             // first, so a command that could not show them the content never reads it.
@@ -1399,6 +1400,78 @@ fn choose_palette(
         Some(chosen) => (Some(chosen.palette), chosen.typed),
         None => (None, Vec::new()),
     })
+}
+
+/// Writes a closed session's retained output to the file the person named.
+///
+/// The name is checked before anything is read, and again where the file is made. The session is
+/// read through the control daemon of this host's own environment, or through a bridge to an
+/// enrolled one that is already running, which an export never starts.
+async fn export(
+    paths: &HostPaths,
+    arguments: kr_cli::cli::ExportArguments,
+    json: bool,
+) -> Result<Completion> {
+    let selector = SessionSelector::parse(&arguments.session)?;
+    kr_cli::export::refuse_existing(&arguments.output)?;
+    let exported_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
+    let exported =
+        match kr_cli::bridge::environments::selected(paths, arguments.environment.as_deref())
+            .await?
+        {
+            Selected::Local(known) => {
+                let mut client = open_controller(&known.paths, build_id()).await?;
+                kr_cli::export::read(&mut client, &selector, arguments.max_bytes, exported_at_ms)
+                    .await?
+            }
+            Selected::Enrolled(enrolment) => {
+                let mut link = kr_cli::bridge::session::open_running(&enrolment).await?;
+                let read =
+                    kr_cli::export::read(&mut link, &selector, arguments.max_bytes, exported_at_ms)
+                        .await;
+                kr_cli::bridge::link::Link::finish(link).await;
+                read?
+            }
+        };
+    kr_cli::export::write(&arguments.output, &exported)?;
+    let summary = &exported.summary;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("session_id", output::said(&summary.session_id))
+                .with("display_number", summary.display_number)
+                .with(
+                    "path",
+                    shown!("{}", kr_cli::shown::named(&arguments.output)),
+                )
+                .with("format", kr_cli::export::FORMAT)
+                .with("bytes_read", summary.bytes_read)
+                .with("bytes_carried", summary.bytes_carried)
+                .with("gaps", summary.gaps)
+                .with("truncated", summary.truncated)
+                .with("omissions", summary.omissions.clone()),
+        );
+    } else {
+        output::say(&shown!(
+            "session {} exported to {}: {} of {} bytes of retained output carried, {} gaps{}; the \
+             file declares {} omissions",
+            summary.display_number,
+            kr_cli::shown::named(&arguments.output),
+            summary.bytes_carried,
+            summary.bytes_read,
+            summary.gaps,
+            if summary.truncated {
+                ", and the read stopped at the byte bound with output left"
+            } else {
+                ""
+            },
+            summary.omissions.len()
+        ));
+    }
+    Ok(Completion::Done)
 }
 
 /// Creates a session in an enrolled environment through its bridge, and presents it.

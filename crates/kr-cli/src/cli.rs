@@ -59,6 +59,8 @@ pub enum Command {
     Skill(SkillCommand),
     /// Run the contact tools for the agent that launched this process.
     AgentTools(AgentToolsArguments),
+    /// Write a closed session's retained output to a file you name.
+    Export(ExportArguments),
     /// Run read-only diagnostics.
     Doctor(DoctorArguments),
     /// Inspect or change this host's own settings.
@@ -1361,6 +1363,24 @@ pub struct ListArguments {
     /// Restrict the listing to one environment.
     #[arg(long)]
     pub environment: Option<String>,
+}
+
+/// `kr export`.
+#[derive(Args)]
+pub struct ExportArguments {
+    /// The closed session, by display number or identifier.
+    pub session: String,
+    /// The file to write. It is created new and readable by you alone; an existing file is never
+    /// replaced.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// The environment the session is in: one of this host's own, by identifier, or an enrolled
+    /// WSL distribution or container, by label or identifier, which an export never starts.
+    #[arg(long)]
+    pub environment: Option<String>,
+    /// The most retained output to read, in bytes. The start of what is retained is kept.
+    #[arg(long, default_value_t = crate::export::DEFAULT_MAX_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_bytes: u64,
 }
 
 /// `kr status`.
