@@ -116,18 +116,26 @@ fn is_one_block(text: &str) -> bool {
 }
 
 /// Whether `after` is `before` with one marked block put in at a line boundary and nothing else
-/// changed: cutting the block's lines out gives the person's own text again, or that text and the
-/// line break the block needed when it did not end in one.
+/// changed: cutting the block's lines out gives the person's own text again, byte for byte, or that
+/// text and the one line break the block needed when the block is the last thing in the file and
+/// the text did not end in one.
 ///
 /// A shell's entry goes after everything the person wrote; PowerShell's first entry goes below the
 /// `using` statements and `param` block at the start of its profile, and its second at the end of
-/// the last one. A byte-order mark is the file's encoding and belongs to no line.
+/// the last one. A byte-order mark is the file's encoding and belongs to no line, and it is the
+/// person's: it has to be there after the install if it was there before.
 fn one_block_put_in(before: &[u8], after: &[u8]) -> bool {
     let (Ok(before), Ok(after)) = (std::str::from_utf8(before), std::str::from_utf8(after)) else {
         return false;
     };
-    let unmarked = |text: &str| text.strip_prefix('\u{feff}').unwrap_or(text).to_owned();
-    let (before, after) = (unmarked(before), unmarked(after));
+    const MARK: char = '\u{feff}';
+    if before.starts_with(MARK) != after.starts_with(MARK) {
+        return false;
+    }
+    let (before, after) = (
+        before.strip_prefix(MARK).unwrap_or(before),
+        after.strip_prefix(MARK).unwrap_or(after),
+    );
     MARKERS.iter().any(|(begin, end)| {
         let lines: Vec<&str> = after.split_inclusive('\n').collect();
         let begins: Vec<usize> = (0..lines.len())
@@ -143,8 +151,12 @@ fn one_block_put_in(before: &[u8], after: &[u8]) -> bool {
             return false;
         }
         let rest = [&lines[..from], &lines[to + 1..]].concat().concat();
+        let last = to + 1 == lines.len();
         rest == before
-            || (!before.is_empty() && !before.ends_with('\n') && rest == format!("{before}\n"))
+            || (last
+                && !before.is_empty()
+                && !before.ends_with('\n')
+                && rest == format!("{before}\n"))
     })
 }
 
@@ -492,6 +504,36 @@ fn the_checks_refuse_an_installer_that_does_more_than_the_marked_entry() {
             &powershell
         ),
         Ok(())
+    );
+
+    // The person's byte-order mark is theirs, and so is a final line break they did not have: a
+    // block that drops the first, or adds the second where it is not needed, is not accepted.
+    assert!(
+        only_marked_entries(
+            &with(&[(all_hosts, "\u{feff}$x = 1\n")]),
+            &with(&[(all_hosts, &format!("{load}$x = 1\n"))]),
+            &powershell
+        )
+        .is_err(),
+        "a dropped byte-order mark was accepted"
+    );
+    assert!(
+        only_marked_entries(
+            &with(&[(all_hosts, "$x = 1")]),
+            &with(&[(all_hosts, &format!("{load}$x = 1\n"))]),
+            &powershell
+        )
+        .is_err(),
+        "a line break the block did not need was accepted"
+    );
+    assert_eq!(
+        only_marked_entries(
+            &with(&[(all_hosts, "\u{feff}$x = 1")]),
+            &with(&[(all_hosts, &format!("\u{feff}$x = 1\n{check}"))]),
+            &powershell
+        ),
+        Ok(()),
+        "a block that ends the file takes the line break it needs, and the byte-order mark stays"
     );
 
     // `exec kr`, in every way a startup file can write it, and not the words that merely resemble it.
