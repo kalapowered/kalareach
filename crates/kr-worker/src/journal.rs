@@ -3594,24 +3594,41 @@ impl Journal {
     /// not had those rules run over it, which is a different answer from a store that has: a
     /// reader served from it is being served a session whose last actions have no ending.
     ///
+    /// Every receipt's state is read from the receipts table itself and checked against the
+    /// states the contract has, so a table that holds a state this build does not know is not
+    /// counted as one with no unfinished work. An index that carries `state` would answer from the
+    /// index, whose copy of a damaged value is as damaged, and which a table whose own pages are
+    /// unreadable can leave whole. The scan reads the table once, so its cost grows with the
+    /// receipts, as [`Self::len_checked`]'s does.
+    ///
     /// It is a read, so the archive can ask it of a store it opened read-only.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails or a stored state is not
+    /// one of the contract's, which is reported to the journal's health as corruption.
     pub fn unresolved_work(&self) -> Result<u64> {
-        let count: i64 = self
+        let read = |error| faulted(&self.health, error);
+        let mut statement = self
             .connection
-            .query_row(
-                "SELECT COUNT(*) FROM receipts WHERE state IN (?1, ?2)",
-                params![
-                    ReceiptState::Accepted.as_str(),
-                    ReceiptState::Dispatching.as_str()
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| faulted(&self.health, error))?;
-        Ok(u64::try_from(count).unwrap_or(0))
+            .prepare("SELECT state FROM receipts NOT INDEXED")
+            .map_err(read)?;
+        let mut rows = statement.query([]).map_err(read)?;
+        let mut unresolved = 0_u64;
+        while let Some(row) = rows.next().map_err(read)? {
+            let state = match row.get_ref(0).map_err(read)? {
+                rusqlite::types::ValueRef::Text(text) => std::str::from_utf8(text)
+                    .ok()
+                    .and_then(|text| parse_state(text).ok()),
+                _ => None,
+            };
+            match state {
+                Some(ReceiptState::Accepted | ReceiptState::Dispatching) => unresolved += 1,
+                Some(_) => {}
+                None => return Err(self.corrupt("a stored receipt state is not in the contract")),
+            }
+        }
+        Ok(unresolved)
     }
 
     /// Returns true when the journal holds no receipts.
