@@ -7348,7 +7348,7 @@ async fn a_webhook_under_a_grant_issued_to_a_device_is_told_nothing_once_the_dev
         announcements_waiting(controller) == Some(0)
     })
     .await;
-    until_holds("the webhook's second notification being decided", || {
+    let for_the_webhook = || {
         controller
             .delivery()
             .with(|producer| {
@@ -7356,15 +7356,22 @@ async fn a_webhook_under_a_grant_issued_to_a_device_is_told_nothing_once_the_dev
                     .journal()
                     .deliveries()
                     .expect("a read")
-                    .iter()
-                    .any(|record| {
-                        record.destination_id.as_str() == "hook"
-                            && record.state == DeliveryState::Refused
-                    }))
+                    .into_iter()
+                    .filter(|record| record.destination_id.as_str() == "hook")
+                    .map(|record| record.state)
+                    .collect::<Vec<_>>())
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
+    };
+    until_holds("the webhook's second notification being decided", || {
+        for_the_webhook().len() == 2
     })
     .await;
+    let states = for_the_webhook();
+    assert!(
+        states.contains(&DeliveryState::Refused),
+        "the second notification is refused, not sent: {states:?}"
+    );
     assert_eq!(
         posts_to_the_webhook(),
         1,
