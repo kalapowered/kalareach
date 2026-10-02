@@ -637,6 +637,68 @@ pub fn default_keychain_of_a_session(
     }
 }
 
+/// Starts a session with `kr new --attach` in a window of its own, with exactly `variables`, in the
+/// host's headless context and with no agent, waits for its shell to read, and returns the names
+/// its shell exports as it wrote them before its first prompt, one on each line and never a value,
+/// ending with [`LIST_END`]. Then it ends the session. The home must have been prepared with
+/// [`prepare_home`] first, so that the shell writes its names.
+///
+/// # Panics
+///
+/// Panics when the session does not come up or its shell writes no whole list in time.
+#[must_use]
+pub fn names_a_session_exports(
+    host: &Host<'_>,
+    shell: &ManagedShell,
+    variables: &[(String, String)],
+) -> String {
+    let run = host.run();
+    let file = run.home().join(EXPORTED_FILE);
+    crate::provenance::forget_names(&file).unwrap_or_else(|why| panic!("{why}"));
+    let work = run.work().display().to_string();
+    let executable = shell.executable.display().to_string();
+    let mut window = Window::open(
+        run,
+        "a session that exports names",
+        &run.binary("kr"),
+        &[
+            "new",
+            "--attach",
+            "--headless",
+            "--shell",
+            &executable,
+            "--shell-mode",
+            "managed",
+            "--startup",
+            "interactive",
+            "--cwd",
+            &work,
+        ],
+        run.root(),
+        variables,
+    );
+    answered(&window, window.answer_capability_queries(0));
+    let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
+    let deadline = Instant::now() + LIVENESS;
+    let names = loop {
+        let read = std::fs::read_to_string(&file);
+        if let Ok(names) = &read
+            && names.lines().last() == Some(LIST_END)
+        {
+            break names.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session's shell wrote no whole list of the names it exports to {}",
+            file.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    window.type_text(b"exit\r");
+    let _ = window.exit_code(LIVENESS);
+    names
+}
+
 /// One managed session on a terminal of its own: `kr new --attach` in a window.
 pub struct Session {
     /// The local terminal the session is attached to.
@@ -1490,12 +1552,12 @@ mod tests {
                 "-f",
                 "-c",
                 ". \"$ZDOTDIR/.zshrc\"; print -r -- \"${(j:,:)precmd_functions}:${(j:,:)preexec_functions}\"; \
-                 KR_SET_ONLY=1; kr_agents_path; export KR_EXPORTED_LATE=1; kr_agents_started",
+                 PROBE_SET_ONLY=1; kr_agents_path; export PROBE_EXPORTED_LATE=1; kr_agents_started",
             ])
             .env_clear()
             .env("ZDOTDIR", &directory)
             .env("PATH", "/usr/bin:/bin")
-            .env("KR_CLEARED_HERE", value)
+            .env("PROBE_CLEARED_HERE", value)
             .output()
             .expect("the managed shell runs");
         assert!(output.status.success(), "the hooks run: {output:?}");
@@ -1516,12 +1578,12 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
         for names in [&prompt, &started] {
             assert!(
-                names.lines().any(|line| line == "KR_CLEARED_HERE")
+                names.lines().any(|line| line == "PROBE_CLEARED_HERE")
                     && names.lines().any(|line| line == "PATH"),
                 "an exported variable is named: {names}"
             );
             assert!(
-                !names.lines().any(|line| line == "KR_SET_ONLY"),
+                !names.lines().any(|line| line == "PROBE_SET_ONLY"),
                 "a variable that is set and not exported is not: {names}"
             );
             assert!(
@@ -1530,8 +1592,8 @@ mod tests {
             );
         }
         assert!(
-            !prompt.lines().any(|line| line == "KR_EXPORTED_LATE")
-                && started.lines().any(|line| line == "KR_EXPORTED_LATE"),
+            !prompt.lines().any(|line| line == "PROBE_EXPORTED_LATE")
+                && started.lines().any(|line| line == "PROBE_EXPORTED_LATE"),
             "the second list is the one written just before the command line"
         );
         assert!(
@@ -1540,19 +1602,19 @@ mod tests {
             "each list ends with its mark: {prompt} {started}"
         );
         assert_eq!(path.trim_end(), "/usr/bin:/bin");
-        let cleared = ["KR_CLEARED_HERE".to_owned(), "KR_SET_ONLY".to_owned()];
+        let cleared = ["PROBE_CLEARED_HERE".to_owned(), "PROBE_SET_ONLY".to_owned()];
         let refused =
             exported_clear(&started, &cleared, &[]).expect_err("the exported name is refused");
-        assert!(refused.contains("KR_CLEARED_HERE") && !refused.contains("KR_SET_ONLY"));
+        assert!(refused.contains("PROBE_CLEARED_HERE") && !refused.contains("PROBE_SET_ONLY"));
         assert_eq!(exported_clear(&started, &cleared[1..], &[]), Ok(()));
         assert_eq!(
             exported_clear(
                 &started,
-                &["KR_*".to_owned()],
-                &["KR_CLEARED_HERE".to_owned()]
+                &["PROBE_*".to_owned()],
+                &["PROBE_CLEARED_HERE".to_owned()]
             ),
             Err(format!(
-                "{} the session's shell exports KR_EXPORTED_LATE, which the build list clears",
+                "{} the session's shell exports PROBE_EXPORTED_LATE, which the build list clears",
                 crate::provenance::ENVIRONMENT_NOT_CLEAR
             ))
         );

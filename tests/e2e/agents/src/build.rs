@@ -919,6 +919,44 @@ impl Build {
         );
         words.join(" ")
     }
+
+    /// The variables the build list sets in the agent's session itself, which are not the person's
+    /// and which its `cleared` names do not take out: the build's own, the account's, the
+    /// configuration directory's, the confinement's, and the one the login is.
+    #[must_use]
+    pub fn names_it_sets(&self) -> Vec<String> {
+        let account = self.account.iter();
+        self.environment
+            .keys()
+            .chain(account.clone().flat_map(|account| account.variables.keys()))
+            .chain(
+                account
+                    .clone()
+                    .filter_map(|account| account.config_directory.as_ref())
+                    .map(|directory| &directory.variable),
+            )
+            .chain(
+                account
+                    .clone()
+                    .filter_map(|account| account.confinement.as_ref())
+                    .flat_map(|confinement| {
+                        std::iter::once(&confinement.variable).chain(&confinement.proxy_variables)
+                    }),
+            )
+            .chain(account.filter_map(|account| account.variable.as_ref()))
+            .cloned()
+            .collect()
+    }
+
+    /// Takes out of `variables`, the environment a part's session is to be created with, every
+    /// variable the account's `cleared` names but for the ones the build list sets itself, and
+    /// returns the names it took out, never a value. A build with no account clears nothing here.
+    pub fn without_provider_keys(&self, variables: &mut Vec<(String, String)>) -> Vec<String> {
+        let Some(account) = &self.account else {
+            return Vec::new();
+        };
+        crate::keys::strip(variables, &account.cleared, &self.names_it_sets())
+    }
 }
 
 /// What a part reads before it starts anything.
@@ -981,7 +1019,13 @@ impl Inputs {
     }
 }
 
-fn read_build(path: &Path) -> Build {
+/// Reads the build list's entry a file holds.
+///
+/// # Panics
+///
+/// Panics when the file cannot be read or is not an entry.
+#[must_use]
+pub fn read_build(path: &Path) -> Build {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the build file {}: {error}", path.display()));
     serde_json::from_slice(&bytes)
