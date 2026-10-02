@@ -17,12 +17,13 @@
 //   node scripts/sign-ios.mjs sign-app    <KalaReach.app> --identity <sha1> --keychain <file>
 //        --app-profile <file> --extension-profile <file> --app-entitlements <file> --extension-entitlements <file>
 //   node scripts/sign-ios.mjs verify-app  <KalaReach.app> --app-profile <file> --extension-profile <file>
-//        --app-entitlements <file> --extension-entitlements <file> [--identity <sha1>]
+//        --app-entitlements <file> --extension-entitlements <file> --identity <sha1> [--device <udid>]
 //   node scripts/sign-ios.mjs sign-runner   <Runner.app> --identity <sha1> --keychain <file> --profile <file>
-//   node scripts/sign-ios.mjs verify-runner <Runner.app> --profile <file> [--identity <sha1>]
+//   node scripts/sign-ios.mjs verify-runner <Runner.app> --profile <file> --identity <sha1> [--device <udid>]
 //
-// Exit 0 when it signed or every signature holds, 1 when a signature does not hold, 2 when it could
-// not run.
+// Signing and verifying are two runs: the keychain with the identity is on the user's search list
+// only while a `sign-` run does its signing, and a `verify-` run needs no keychain at all. Exit 0
+// when it signed or every signature holds, 1 when a signature does not hold, 2 when it could not run.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -56,8 +57,17 @@ export function readProfile(path) {
     if (answer.error || answer.status !== 0) throw new Error(`${path} has no ${key}`)
     return format === 'json' ? JSON.parse(answer.stdout) : answer.stdout.trim()
   }
+  // The certificates a profile lets sign for it, each as the SHA-1 of its DER form.
+  const certificates = []
+  for (let at = 0; ; at += 1) {
+    const one = spawnSync('plutil', ['-extract', `DeveloperCertificates.${at}`, 'raw', '-o', '-', '-'], { input: decoded.stdout, encoding: 'utf8' })
+    if (one.error || one.status !== 0) break
+    certificates.push(createHash('sha1').update(Buffer.from(one.stdout.trim(), 'base64')).digest('hex').toUpperCase())
+  }
+  if (certificates.length === 0) throw new Error(`${path} lists no certificate that may sign with it`)
   return {
     path,
+    certificates,
     name: take('Name', 'raw'),
     uuid: take('UUID', 'raw'),
     team: take('TeamIdentifier', 'json')[0],
@@ -208,17 +218,39 @@ export function problemsInDescription(text, { identifier, team, adHoc = false })
   return problems
 }
 
-/** The SHA-1 of the certificate a path is signed with, in capitals, or null when there is none. */
-function leafHash(path) {
+/**
+ * The certificate a path is signed with: its SHA-1 in capitals and the time it stops being valid, or
+ * null when the path carries none.
+ */
+function leafCertificate(path) {
   const scratch = mkdtempSync(join(tmpdir(), 'kr-cert-'))
   try {
     const extracted = codesign(['-d', `--extract-certificates=${join(scratch, 'cert')}`, path])
     const leaf = join(scratch, 'cert0')
     if (extracted.status !== 0 || !existsSync(leaf)) return null
-    return createHash('sha1').update(readFileSync(leaf)).digest('hex').toUpperCase()
+    const der = readFileSync(leaf)
+    const ends = spawnSync('openssl', ['x509', '-inform', 'der', '-noout', '-enddate'], { input: der, encoding: 'utf8' })
+    const stated = ends.status === 0 ? /^notAfter=(.*)$/m.exec(ends.stdout)?.[1] : undefined
+    return { sha1: createHash('sha1').update(der).digest('hex').toUpperCase(), notAfter: stated ? new Date(stated) : null }
   } finally {
     rmSync(scratch, { recursive: true, force: true })
   }
+}
+
+/**
+ * What is wrong with the certificate a bundle is signed with, set against the one it was meant to be
+ * signed with and the profile that covers it: it is that one, the profile lets it sign, and it has
+ * not stopped being valid.
+ */
+export function problemsOfCertificate(found, { identity, profile, now = new Date() }) {
+  if (found === null) return ['it is signed with no certificate']
+  const problems = []
+  if (identity && found.sha1 !== identity) problems.push(`it is signed with ${found.sha1}, not with ${identity}`)
+  if (profile && !profile.certificates.includes(found.sha1)) {
+    problems.push(`the profile ${profile.name} does not list the certificate ${found.sha1}, so iOS would refuse to install it`)
+  }
+  if (found.notAfter && found.notAfter <= now) problems.push(`the certificate ${found.sha1} has expired`)
+  return problems
 }
 
 /** What is wrong with the signatures of a plan, one sentence each. */
@@ -236,7 +268,11 @@ export function problemsInSignatures(plan, { team, adHoc = false, now = new Date
     if (identifier) {
       problems.push(...problemsInDescription(described.stderr, { identifier, team, adHoc }).map((each) => `${name}: ${each}`))
     }
-    if (identity && !adHoc && leafHash(item.path) !== identity) problems.push(`${name} is signed with another certificate than ${identity}`)
+    if (!adHoc) {
+      problems.push(
+        ...problemsOfCertificate(leafCertificate(item.path), { identity, profile: item.covered?.profile ?? null, now }).map((each) => `${name}: ${each}`)
+      )
+    }
     if (!item.covered) continue
     const { profile, entitlements } = item.covered
     const embedded = join(item.path, 'embedded.mobileprovision')
@@ -321,11 +357,14 @@ function main(argv) {
   if (found.identity && !SHA1.test(found.identity)) {
     throw new Error('--identity is the SHA-1 of the certificate, forty hexadecimal digits in capitals')
   }
+  need(found, 'identity')
   if (mode.startsWith('sign')) {
-    need(found, 'identity', 'keychain')
+    need(found, 'keychain')
     signAll(plan, { identity: found.identity, keychain: found.keychain })
+    console.log(`${bundle}: signed; verify it with the matching verify- run`)
+    return 0
   }
-  const problems = problemsInSignatures(plan, { team, identifiers, device: found.device ?? null, identity: found.identity ?? null })
+  const problems = problemsInSignatures(plan, { team, identifiers, device: found.device ?? null, identity: found.identity })
   if (application) problems.push(...problemsInBundle(bundle))
   if (problems.length === 0) {
     console.log(`${bundle}: every signature holds`)
