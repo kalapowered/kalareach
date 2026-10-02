@@ -2857,7 +2857,7 @@ fn runtime_root_in(
 /// # Errors
 ///
 /// Returns an error naming the root when it is in a shared mount.
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 fn refuse_shared_root(root: &Path, shared: &[&Path]) -> Result<()> {
     if is_shared(root, shared) {
         return Err(IpcError::io(
