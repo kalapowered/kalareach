@@ -29,8 +29,12 @@
   --keyboard: 0px;
   /* How far the platform has panned the page to keep a focused field in sight, which the shell follows. */
   --pan: 0px;
-  /* The terminal's type before zoom, which the room kept for the terminal is counted in. */
-  --terminal-size: 0.8125rem;
+  /*
+   * The terminal's type before zoom, which the room kept for the terminal is counted in. It grows
+   * with the text up to twice the base size and holds there, so a screen 320 points wide keeps
+   * columns enough to read at iOS's largest sizes; the terminal has its own zoom beyond that.
+   */
+  --terminal-size: min(0.8125rem, 26px);
   --terminal-leading: 1.35;
   /*
    * The field's type, which the room kept for the field under the terminal is counted in. Anything
@@ -74,6 +78,11 @@
   backdrop-filter: blur(20px) saturate(180%);
   position: relative;
   z-index: 2;
+  /* A bar's spacing is measured in the bar's own unit, which stops growing with the text at one and a half times. */
+  --gap-1: calc(var(--chrome-unit) * 0.25);
+  --gap-2: calc(var(--chrome-unit) * 0.5);
+  --gap-3: calc(var(--chrome-unit) * 0.75);
+  --gap-4: var(--chrome-unit);
 }
 
 .m-topbar {
@@ -89,7 +98,7 @@
 .m-topbar h1 {
   margin: 0;
   /* Large type reads too loose at its default tracking, so it is tightened as it grows. */
-  font-size: 1.3125rem;
+  font-size: calc(var(--chrome-unit) * 1.3125);
   line-height: 1.15;
   letter-spacing: -0.014em;
   font-weight: 620;
@@ -111,7 +120,7 @@
   display: flex;
   align-items: flex-start;
   gap: var(--gap-2);
-  font-size: 0.8125rem;
+  font-size: calc(var(--chrome-unit) * 0.8125);
   line-height: 1.4;
   color: var(--muted);
 }
@@ -167,7 +176,7 @@
   background: none;
   color: var(--faint);
   font: inherit;
-  font-size: 0.6875rem;
+  font-size: calc(var(--chrome-unit) * 0.6875);
   letter-spacing: 0.01em;
   cursor: pointer;
   /* Navigation is used dozens of times a day, so it does not animate. Only the colour settles. */
@@ -281,7 +290,7 @@
   border-radius: 0.9em;
   background: var(--danger);
   color: var(--primary-text);
-  font-size: 0.625rem;
+  font-size: calc(var(--chrome-unit) * 0.625);
   font-weight: 700;
   line-height: 1.7em;
   text-align: center;
@@ -779,7 +788,8 @@
 .m-composer-line textarea {
   flex: 1 1 0;
   inline-size: auto;
-  min-inline-size: 0;
+  /* With the text large enough that the field would be left a few letters wide, Send goes under it. */
+  min-inline-size: 5rem;
   min-block-size: var(--target);
   padding-block: var(--gap-2);
 }

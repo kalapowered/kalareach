@@ -16,6 +16,7 @@ import { tauriPort } from './host/tauri'
 // The phone's shell. `Shell` picks it from the platform, so the desktop window renders exactly
 // what it rendered before and iOS and Android render the mobile surfaces.
 import { Shell, surfaceOf } from './mobile/entry'
+import { followTheSystemTextSize } from './mobile/text-size'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -23,6 +24,9 @@ import './styles/views.css'
 
 const root = document.getElementById('root')
 if (!root) throw new Error('The application has no root element.')
+
+// Where the web view has the person's text size to give, before the first render.
+followTheSystemTextSize()
 
 createRoot(root).render(
   <StrictMode>
