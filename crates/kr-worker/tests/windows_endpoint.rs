@@ -107,6 +107,24 @@ fn grant_full(path: &Path, account: &str) {
     );
 }
 
+/// Gives a path a protected list that names the Administrators group and nothing else, on the
+/// path itself and not on what it points at, so it carries no entry the host's check refuses.
+fn close_to_administrators(path: &Path) {
+    run(
+        "icacls.exe",
+        &[path.as_os_str(), "/inheritance:r".as_ref(), "/L".as_ref()],
+    );
+    run(
+        "icacls.exe",
+        &[
+            path.as_os_str(),
+            "/grant".as_ref(),
+            "*S-1-5-32-544:F".as_ref(),
+            "/L".as_ref(),
+        ],
+    );
+}
+
 fn launch_for(which: u8) -> NativeLaunch {
     NativeLaunch {
         profile_id: LaunchProfileId::new("lp-1").expect("valid"),
@@ -725,6 +743,15 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
         "a list another account was granted is refused"
     );
 
+    // A link is refused as a link, whatever list it carries. The junction's own list is made as
+    // closed as the host's own, so that the list is not what refuses it: the same list on a plain
+    // directory is the control that passes, and only the link check is left to refuse the junction.
+    let control = std::env::temp_dir().join(format!("kr-we-control-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&control).expect("a plain directory");
+    close_to_administrators(&control);
+    kr_worker::broker::process::check_private_directory(&control)
+        .expect("a plain directory carrying that list passes, so the list alone does not refuse");
+
     let link = std::env::temp_dir().join(format!("kr-we-link-{}", kr_ipc::new_uuid()));
     run(
         "cmd.exe",
@@ -737,13 +764,16 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
             private.as_os_str(),
         ],
     );
+    close_to_administrators(&link);
+    let refused = kr_worker::broker::process::check_private_directory(&link)
+        .expect_err("a junction to a private directory is not the directory it names");
     assert!(
-        kr_worker::broker::process::check_private_directory(&link).is_err(),
-        "a junction to a private directory is not the directory it names"
+        refused.to_string().contains("is a link"),
+        "it is the link that refuses it, not its list: {refused}"
     );
 
     let _ = std::fs::remove_dir(&link);
-    for directory in [&private, &ordinary, &widened] {
+    for directory in [&private, &ordinary, &widened, &control] {
         let _ = std::fs::remove_dir_all(directory);
     }
 }
