@@ -650,8 +650,9 @@ impl WorkerService {
         first
     }
 
-    /// Puts every deadline this worker decides on `clock`, for this host's own tests: a test that
-    /// moves a clock by hand moves this worker's with it.
+    /// Puts the action windows and each action's deadline on `clock`, for this host's own tests: a
+    /// test that moves a clock by hand moves this worker's with it. The clock a deadline crosses
+    /// from the daemon on, and the session's time contract, keep their own sources.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn on_clock(mut self, clock: Arc<dyn ContinuousClock>) -> Self {
@@ -1709,8 +1710,6 @@ impl WorkerService {
                     .then_some(reply)
             }
             ControlFrame::Forwarded(forwarded) => {
-                #[cfg(feature = "testing")]
-                self.record_received(&forwarded.mutation.method, &forwarded.mutation.params);
                 let reply = self.forwarded(state, &forwarded).await;
                 (state.pending_launch.is_none() && state.pending_upstream.is_none())
                     .then_some(reply)
@@ -3346,6 +3345,24 @@ impl WorkerService {
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedMutation,
     ) -> ControlFrame {
+        // The daemon's deadline is on the machine's own continuous clock, which this worker reads
+        // too, so what is left of it is a subtraction rather than a guess: the journey cost
+        // whatever it cost, and the deadline does not restart on arrival. It is anchored first, before
+        // anything this worker checks or waits for.
+        //
+        // A deadline that has already passed is carried through as absent rather than refused
+        // here. Section 9 keeps an existing receipt readable after its freshness is gone, and a
+        // retry is how a caller whose answer never arrived finds out what its action did; only a
+        // *first* admission needs the deadline, and `receipted` is where that distinction lives.
+        let deadline = vouched_deadline(
+            &*self.clock,
+            &*self.shared_clock,
+            forwarded.accepted_deadline_boot_ms.get(),
+        );
+        // A test that moves a clock reads the record this makes, so it is made once the deadline is
+        // anchored: a frame it can count is a frame whose lifetime no later movement can lengthen.
+        #[cfg(feature = "testing")]
+        self.record_received(&forwarded.mutation.method, &forwarded.mutation.params);
         if state.client_kind != LocalClientKind::Controller {
             return failure(
                 forwarded.mutation.request_id,
@@ -3385,20 +3402,6 @@ impl WorkerService {
                 ),
             );
         }
-        // The daemon's deadline is on the machine's own continuous clock, which this worker reads
-        // too, so what is left of it is a subtraction rather than a guess: the journey cost
-        // whatever it cost, and the deadline does not restart on arrival. It is anchored here,
-        // before the dispatch barrier and before anything else this worker waits for.
-        //
-        // A deadline that has already passed is carried through as absent rather than refused
-        // here. Section 9 keeps an existing receipt readable after its freshness is gone, and a
-        // retry is how a caller whose answer never arrived finds out what its action did; only a
-        // *first* admission needs the deadline, and `receipted` is where that distinction lives.
-        let deadline = vouched_deadline(
-            &*self.clock,
-            &*self.shared_clock,
-            forwarded.accepted_deadline_boot_ms.get(),
-        );
         // The marker travels to a proxy and nowhere else. A proxy forwards for somebody whose
         // receipts are not its own, which is what makes passing a retained result on a read. The
         // daemon's authority connection carries a local caller's own action, and that caller is
