@@ -2,7 +2,7 @@
 //!
 //! | Requirement | Tests |
 //! | --- | --- |
-//! | KR-REQ-09.12 | `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
+//! | KR-REQ-09.12 | `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `totals_raised_to_their_lists_are_measured_where_the_frame_is_nearly_full`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
 
 use kr_cbor::Limits;
 use kr_protocol::action::{
@@ -345,6 +345,36 @@ fn a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits() {
     assert_eq!(kept.rejected_actions_total.get(), 300);
     assert_eq!(kept.possibly_executed_total.get(), 300);
     assert!(answer.fits_a_frame());
+    assert_eq!(through_a_control_frame(&answer), answer);
+}
+
+/// The same near the frame's byte limit, where a total that is raised after the answer was
+/// measured is what pushes it over: many workers with long details take most of the frame, and each
+/// holds more names than a one-byte total counts, beside totals that say nought.
+#[test]
+fn totals_raised_to_their_lists_are_measured_where_the_frame_is_nearly_full() {
+    let workers = (0..700)
+        .map(|index| {
+            let mut one = worker(index, BarrierState::Pending);
+            one.detail = "this worker has installed the revision but reports nothing ".repeat(20);
+            one.rejected_actions = (0..30).map(|name| fenced(index * 100 + name)).collect();
+            one.possibly_executed = (0..30).map(|name| executed(index * 100 + name)).collect();
+            one
+        })
+        .collect();
+    let answer = RevocationResult::bounded(
+        revision(),
+        (0..2_000).map(grant),
+        RevocationBarrier::new(revision(), workers),
+    );
+    let measured =
+        kr_cbor::encoded_len(&kr_cbor::to_canonical_value(&answer).expect("the answer is a value"));
+    assert!(
+        measured + 4 * 1024 > Limits::DEFAULT.max_message_len - 1_500,
+        "the frame is nearly full: {measured} bytes"
+    );
+    assert!(answer.fits_a_frame(), "{measured} bytes");
+    assert_eq!(answer.barrier.workers[0].rejected_actions_total.get(), 30);
     assert_eq!(through_a_control_frame(&answer), answer);
 }
 
