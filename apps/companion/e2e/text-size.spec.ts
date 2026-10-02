@@ -176,21 +176,29 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
   }
 
   test('holds the two bars at one and a half times the base size, with the rest of the screen left to the content', async ({
-    page
+    context
   }) => {
+    // Each size gets a page of its own, so the only text size a page has is the one it was asked for.
     const barsAt = async (ratio: number): Promise<{ top: number; bottom: number }> => {
-      await page.goto('about:blank')
-      await withSystemTextScale(page, ratio)
-      await page.setViewportSize({ width: 320, height: 720 })
-      await page.goto('/harness.html?surface=ios&tab=sessions')
-      await expect(page.locator('.m-topbar')).toBeVisible()
-      return page.evaluate(() => ({
-        top: document.querySelector('.m-topbar')?.getBoundingClientRect().height ?? 0,
-        bottom: document.querySelector('.m-tabbar')?.getBoundingClientRect().height ?? 0
-      }))
+      const page = await context.newPage()
+      try {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: 320, height: 720 })
+        await page.goto('/harness.html?surface=ios&tab=sessions')
+        await expect(page.locator('.m-topbar')).toBeVisible()
+        expect(await rootSize(page), `the root text at ${ratio}`).toBeCloseTo(16 * ratio, 1)
+        return await page.evaluate(() => ({
+          top: document.querySelector('.m-topbar')?.getBoundingClientRect().height ?? 0,
+          bottom: document.querySelector('.m-tabbar')?.getBoundingClientRect().height ?? 0
+        }))
+      } finally {
+        await page.close()
+      }
     }
+    const atTheBase = await barsAt(1)
     const atOneAndAHalf = await barsAt(1.5)
     const atTheLargest = await barsAt(LARGEST)
+    expect(atOneAndAHalf.top, 'the top bar grows up to one and a half times').toBeGreaterThan(atTheBase.top)
     expect(atTheLargest.top).toBeCloseTo(atOneAndAHalf.top, 0)
     expect(atTheLargest.bottom).toBeCloseTo(atOneAndAHalf.bottom, 0)
     expect(atTheLargest.top + atTheLargest.bottom, 'the bars together').toBeLessThan(720 * 0.4)

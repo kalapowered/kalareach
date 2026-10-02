@@ -185,7 +185,7 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   by the font scale itself, and the system restarts the activity when the scale changes, which
   reloads the page at the new size. The activity does not take the change itself, because its web
   view would then keep the old size. iOS's leaves the root at 16px, so the page reads the size of an
-  element set in `-apple-system-body`, the one font keyword WebKit ties to Dynamic Type, and
+  element set in `-apple-system-body`, a font keyword WebKit ties to Dynamic Type, and
   multiplies the root by its ratio to the size at the default setting, as `--text-scale`. That
   follows a change made while the application runs. Sizes on iOS reach three times the base size, so
   there the two bars stop growing at one and a half times it and the terminal grid at twice it, and

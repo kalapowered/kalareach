@@ -89,9 +89,9 @@
    * The unit the two bars of a phone are sized in. It is the root text size up to one and a half
    * times the base size and stops there: iOS's accessibility sizes reach three times the base size,
    * and bars that grew with them would take the whole screen from what they are the bars of.
-   * Android's web view scales pixel sizes with the text as it scales the root, so the same cap
-   * changes nothing there, and its largest font scale is twice the base size. Everything else is
-   * sized in rem and grows with no bound.
+   * Android's web view scales a font size written in pixels with the text, as it scales the root,
+   * so there the cap holds the bars' spacing and not their text, and its largest font scale is
+   * twice the base size. Everything else is sized in rem and grows with no bound.
    */
   --chrome-unit: min(1rem, 24px);
 

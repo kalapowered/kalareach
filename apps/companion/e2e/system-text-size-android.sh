@@ -16,10 +16,13 @@
 #   bash <lease script> <label> apps/companion/e2e/system-text-size-android.sh <path of the .apk>
 #
 # Environment: KR_ANDROID_AVD names the virtual device (default: the first one listed);
-# KR_TEXT_SIZE_SHOTS is where its screenshots go (default /tmp). It refuses an emulator that was
-# already running, whose settings are not its to change, and leaves the font scale as it found it.
+# KR_TEXT_SIZE_SHOTS is where its screenshots go (default /tmp). Every command goes to the one
+# emulator this script starts, named by its own serial: ANDROID_SERIAL is cleared, so a phone that
+# is connected is never touched, and an emulator that was already running is refused, because its
+# settings are not this script's to change. The font scale is put back as it was found.
 # Exit status: 0 when every scale held, 1 when one did not, 3 when there is nothing to run on.
 set -u
+unset ANDROID_SERIAL
 apk=${1:-}
 [ -f "$apk" ] || { echo "usage: system-text-size-android.sh <path of the harness build's .apk>"; exit 3; }
 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
@@ -33,41 +36,71 @@ if "$adb" devices | grep -q '^emulator-'; then
   exit 3
 fi
 
-"$emulator" -avd "$avd" -read-only -no-window -no-audio -no-snapshot-save -no-boot-anim \
+# The emulator is started on a port of its own, so its serial is known before it answers, and every
+# command below names it.
+port=${KR_ANDROID_EMULATOR_PORT:-5580}
+serial=emulator-$port
+if "$adb" devices | grep -q "^$serial"; then
+  echo "$serial is already in use"
+  exit 3
+fi
+dev() { "$adb" -s "$serial" "$@"; }
+
+"$emulator" -avd "$avd" -port "$port" -read-only -no-window -no-audio -no-snapshot-save -no-boot-anim \
   >"${TMPDIR:-/tmp}/kr-text-size-emulator.log" 2>&1 &
 emulator_pid=$!
+scale_before=""
 cleanup() {
-  "$adb" shell settings put system font_scale 1.0 >/dev/null 2>&1
-  "$adb" uninstall to.kala.reach >/dev/null 2>&1
+  # Only a device this script has seen answer as its own emulator is written to.
+  if [ -n "$scale_before" ]; then
+    dev shell settings put system font_scale "$scale_before" >/dev/null 2>&1
+    dev uninstall to.kala.reach >/dev/null 2>&1
+  fi
   kill "$emulator_pid" 2>/dev/null
 }
 trap cleanup EXIT
-"$adb" wait-for-device
-for _ in $(seq 1 150); do
-  [ "$("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break
+
+# Waits for the emulator to say it has finished starting, for as long as it is running and for a
+# limit that only stops a start that will never finish.
+started=$(date +%s)
+until [ "$(dev shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
+  if ! kill -0 "$emulator_pid" 2>/dev/null; then echo "the emulator stopped before it started"; exit 3; fi
+  if [ $(( $(date +%s) - started )) -gt 300 ]; then echo "the emulator did not finish starting"; exit 3; fi
   sleep 2
 done
-echo "emulator: $("$adb" shell getprop ro.product.model | tr -d '\r'), API $("$adb" shell getprop ro.build.version.sdk | tr -d '\r')"
-"$adb" shell "settings put system font_scale 1.0; settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0"
-"$adb" uninstall to.kala.reach >/dev/null 2>&1
-"$adb" install -r "$apk" >/dev/null || { echo "the application did not install"; exit 1; }
-"$adb" shell am start -n to.kala.reach/.MainActivity >/dev/null
+# It is this script's emulator: the serial is the one asked for, and the process is the one started.
+[ "$(dev emu avd name 2>/dev/null | head -n 1 | tr -d '\r')" = "$avd" ] || { echo "$serial is not the emulator that was started"; exit 3; }
+scale_before=$(dev shell settings get system font_scale | tr -d '\r')
+[ "$scale_before" = null ] && scale_before=1.0
+echo "emulator: $(dev shell getprop ro.product.model | tr -d '\r'), API $(dev shell getprop ro.build.version.sdk | tr -d '\r'), font scale $scale_before"
+dev shell "settings put system font_scale 1.0; settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0"
+dev uninstall to.kala.reach >/dev/null 2>&1
+dev install -r "$apk" >/dev/null || { echo "the application did not install"; exit 1; }
+dev shell am start -n to.kala.reach/.MainActivity >/dev/null
 
 # Not `exec`: the shell stays to stop the emulator when the checks end.
-ADB=$adb SHOTS=${KR_TEXT_SIZE_SHOTS:-/tmp} node --input-type=module - <<'JS'
+ADB=$adb SERIAL=$serial SHOTS=${KR_TEXT_SIZE_SHOTS:-/tmp} node --input-type=module - <<'JS'
 import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import process from 'node:process'
 
 const adb = process.env.ADB
+const serial = process.env.SERIAL
 const shots = process.env.SHOTS
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const LINE = 'Find why the reconnect test is flaky.'
 const BASE_ROOT = 16
 
-const run = (...args) => execFileSync(adb, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+const run = (...args) =>
+  execFileSync(adb, ['-s', serial, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 })
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+/** Gives a wait on a device a limit, so that one that is never answered stops and says so. */
+const within = (what, limitMs, promise) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`gave up waiting for ${what}`)), limitMs))
+  ])
 const waitFor = async (what, ready, limitMs = 120_000) => {
   const started = Date.now()
   let last = 'nothing yet'
@@ -101,26 +134,40 @@ async function connect() {
   const port = 9400 + (Number(pid) % 500)
   run('forward', `tcp:${port}`, `localabstract:${sockets[0].slice(1)}`)
   const page = await waitFor('the page to be listed', async () => {
-    const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json()
+    const list = await (await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(5_000) })).json()
     return list.find((entry) => entry.type === 'page') ?? null
   })
   const socket = new WebSocket(page.webSocketDebuggerUrl)
-  await new Promise((resolve, reject) => {
+  await within('the debugging socket to open', 10_000, new Promise((resolve, reject) => {
     socket.onopen = resolve
     socket.onerror = reject
-  })
+  }))
   let next = 0
   const waiting = new Map()
+  const ended = (reason) => {
+    for (const entry of waiting.values()) entry.reject(new Error(reason))
+    waiting.clear()
+  }
+  socket.onclose = () => {
+    ended('the debugging socket closed')
+  }
+  socket.onerror = () => {
+    ended('the debugging socket failed')
+  }
   socket.onmessage = (message) => {
     const data = JSON.parse(message.data)
-    if (waiting.has(data.id)) waiting.get(data.id)(data)
+    const answer = waiting.get(data.id)
+    if (answer) {
+      waiting.delete(data.id)
+      answer.resolve(data)
+    }
   }
   const send = (method, params = {}) =>
-    new Promise((resolve) => {
+    within(`${method} to be answered`, 10_000, new Promise((resolve, reject) => {
       next += 1
-      waiting.set(next, resolve)
+      waiting.set(next, { resolve, reject })
       socket.send(JSON.stringify({ id: next, method, params }))
-    })
+    }))
   const evaluate = async (expression) => {
     const answer = await send('Runtime.evaluate', { expression, returnByValue: true })
     return answer.result?.result?.value
@@ -196,7 +243,7 @@ try {
       )
     }
     console.log(`INFO: font scale ${scale}: the top bar is ${seen.top.toFixed(1)}px and the tab bar ${seen.bottom.toFixed(1)}px`)
-    const png = execFileSync(adb, ['exec-out', 'screencap', '-p'], { maxBuffer: 64 * 1024 * 1024 })
+    const png = execFileSync(adb, ['-s', serial, 'exec-out', 'screencap', '-p'], { maxBuffer: 64 * 1024 * 1024 })
     writeFileSync(join(shots, `kr-text-size-android-${scale}.png`), png)
   }
 } catch (failure) {

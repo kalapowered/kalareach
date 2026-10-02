@@ -102,7 +102,12 @@ await new Promise((resolve) => server.listen(0, resolve))
 const port = server.address().port
 
 const simctl = (...args) =>
-  execFileSync('xcrun', ['simctl', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  execFileSync('xcrun', ['simctl', ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    // A command that is never answered stops the run, which says which one it was.
+    timeout: 300_000
+  })
 const find = JSON.parse(simctl('list', 'devices', 'available', '-j'))
 const found = Object.values(find.devices)
   .flat()
@@ -127,6 +132,8 @@ const waitFor = async (what, ready, limitMs = 120_000) => {
 }
 
 let failures = 0
+/** The text size the simulator had when it started, which is put back whatever happens. */
+let before = null
 const check = (condition, message) => {
   console.log(`${condition ? 'PASS' : 'FAIL'}: ${message}`)
   if (!condition) failures += 1
@@ -135,6 +142,7 @@ const check = (condition, message) => {
 try {
   simctl('boot', found.udid)
   simctl('bootstatus', found.udid, '-b')
+  before = simctl('ui', found.udid, 'content_size').trim()
   simctl('ui', found.udid, 'content_size', 'large')
   simctl('launch', found.udid, 'com.apple.mobilesafari')
   simctl('openurl', found.udid, `http://localhost:${port}/wrapper.html`)
@@ -172,7 +180,7 @@ try {
   failures += 1
 } finally {
   try {
-    simctl('ui', found.udid, 'content_size', 'large')
+    if (before !== null && before !== '') simctl('ui', found.udid, 'content_size', before)
   } catch {
     // The simulator may already be gone.
   }
