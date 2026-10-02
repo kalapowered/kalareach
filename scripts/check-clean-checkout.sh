@@ -54,10 +54,12 @@
 #   - the clone's `.gitignore` does not ignore a local workspace name. Each name in `local_names`,
 #     the instruction files and directories of the common coding assistants, is created in the
 #     clone, and `git check-ignore` must name the file ignored, so a name that is missing from
-#     the section and a pattern a later negation undoes are refused. The check runs with no
-#     ignore file of the machine and with case-sensitive patterns, so neither can stand in for a
-#     pattern the section lacks. A tracked file that the section's own patterns match, at any
-#     depth, is refused as well.
+#     the section and a pattern a later negation undoes are refused. The section itself must be
+#     there, from its "# Local workspace files" heading to the next blank line, and alone it must
+#     ignore every name, so a renamed heading, an empty section and a pattern moved out of it are
+#     refused. The check runs with no ignore file of the machine and with case-sensitive patterns,
+#     so neither can stand in for a pattern the section lacks. A tracked file that the section's
+#     own patterns match, at any depth, is refused as well.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
@@ -358,10 +360,25 @@ local_section() {
 # or a lower-case pattern on a case-insensitive file system cannot stand in for the section.
 refuse_ignores() {
   local clone="$1" name path created=() directories=() directory missing=() tracked item section
+  local alone=() unsectioned=0 scratch
   local options=(-c core.excludesFile=/dev/null -c core.ignoreCase=false)
   : > "$clone/.git/info/exclude"
   section="$root/local-section.ignore"
   local_section "$clone" > "$section"
+  # The section alone has to carry every name, and it has to be there at all: the patterns that
+  # ignore the names are the section's, whatever else the file holds.
+  if [ ! -s "$section" ]; then
+    unsectioned=1
+  else
+    scratch="$root/section-repository"
+    clean git init -q --template= "$scratch"
+    cp "$section" "$scratch/.gitignore"
+    for name in "${local_names[@]}"; do
+      if ! clean git -C "$scratch" "${options[@]}" check-ignore -q --no-index -- "$name"; then
+        alone+=("$name")
+      fi
+    done
+  fi
   # What the commit tracks under a name the section ignores, whatever the depth.
   if [ -s "$section" ]; then
     tracked="$(clean git -C "$clone" "${options[@]}" ls-files -c -i -X "$section")"
@@ -396,6 +413,16 @@ refuse_ignores() {
     done < <(printf '%s\n' "${directories[@]}" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
   fi
   local status=0
+  if [ "$unsectioned" -ne 0 ]; then
+    say "refused: the .gitignore has no \"# Local workspace files\" section, a heading and the lines"
+    say "that follow it up to a blank line"
+    status=1
+  fi
+  if [ "${#alone[@]}" -ne 0 ]; then
+    say "refused: the .gitignore's local workspace section does not ignore these names by itself:"
+    printf '  %s\n' "${alone[@]}"
+    status=1
+  fi
   if [ "${#missing[@]}" -ne 0 ]; then
     say "refused: .gitignore does not ignore these local workspace names:"
     printf '  %s\n' "${missing[@]}"
@@ -758,11 +785,37 @@ self_test() {
 
   directory="$work/ignore-lowercase"
   make_fixture "$directory"
-  grep -v -e '^claude' "$directory/.gitignore" > "$directory/.gitignore.next"
+  grep -v -e '^CLAUDE' "$directory/.gitignore" > "$directory/.gitignore.next"
   mv "$directory/.gitignore.next" "$directory/.gitignore"
-  commit_fixture "$directory" "Drop the lower-case pattern"
+  commit_fixture "$directory" "Drop the upper-case pattern"
   expect "a lower-case pattern cannot stand in for the upper-case one" refuse \
-    "does not ignore these local workspace names" --no-steps
+    "  CLAUDE.md" --no-steps
+
+  directory="$work/ignore-heading"
+  make_fixture "$directory"
+  sed 's/^# Local workspace files$/# Files for local use/' "$directory/.gitignore" > "$directory/.gitignore.next"
+  mv "$directory/.gitignore.next" "$directory/.gitignore"
+  printf 'notes\n' > "$directory/CLAUDE.md"
+  fixture_git -C "$directory" add -f CLAUDE.md
+  commit_fixture "$directory" "Rename the heading and track an instruction file"
+  expect "a renamed heading is refused" refuse "has no \"# Local workspace files\" section" --no-steps
+
+  directory="$work/ignore-empty-section"
+  make_fixture "$directory"
+  { printf '# Local workspace files\n\n'; sed '1d' "$directory/.gitignore"; } > "$directory/.gitignore.next"
+  mv "$directory/.gitignore.next" "$directory/.gitignore"
+  commit_fixture "$directory" "Leave the section empty"
+  expect "an empty section is refused although its patterns follow" refuse \
+    "does not ignore these names by itself" --no-steps
+
+  directory="$work/ignore-moved"
+  make_fixture "$directory"
+  grep -v -e '^\.codex/$' "$directory/.gitignore" > "$directory/.gitignore.next"
+  mv "$directory/.gitignore.next" "$directory/.gitignore"
+  printf '\n# Elsewhere\n.codex/\n' >> "$directory/.gitignore"
+  commit_fixture "$directory" "Move a pattern out of the section"
+  expect "a pattern moved out of the section is refused" refuse \
+    "  .codex/config.toml" --no-steps
 
   for planted in "root=AGENTS-project.md" "nested=src/AGENTS.md" "directory=.claude/other.json" \
     "exact=CLAUDE.md"; do
