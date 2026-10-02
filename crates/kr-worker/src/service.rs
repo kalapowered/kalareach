@@ -6927,6 +6927,10 @@ pub struct ConnectionState {
     pub client_kind: LocalClientKind,
     /// Where this connection's requests originally entered, when it is a process bridge's helper
     /// and said so in its hello. Kept for the life of the connection: a connection says hello once.
+    ///
+    /// It is a record of how the connection arrived and never authority. What a request may do is
+    /// decided by the operating-system identity of the peer and the actor envelope built from it,
+    /// and no decision reads this, so a later reader must not take it for something checked.
     pub origin: Option<kr_protocol::local::BridgeOrigin>,
     /// What the peer said it can receive. Nothing this worker sends exceeds it.
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
