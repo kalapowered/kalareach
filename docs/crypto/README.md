@@ -16,14 +16,15 @@ calls a maintained library, and the libraries are the ones below.
 | Verifying the signed metadata of a plugin catalogue | the `tough` TUF client, built on `aws-lc-rs` |
 | TLS to a service and to a pairing room | `rustls`, with `ring` and the platform's certificate verifier |
 | The transport between devices | iroh |
-| Digests in the TypeScript packages | the platform's WebCrypto |
-| Secrets at rest on a phone, and the voice confirmation's Ed25519 signature | the platform's own libraries: the Keychain and CryptoKit on iOS, the Keystore and the Java security provider on Android |
+| The media path of a voice call | DTLS-SRTP in the `webrtc` crate with its `ring` backend on a desktop, the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
+| Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
+| The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
+| Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module in the tests that recompute them |
 
 ## The unsafe boundary
 
 `src/sodium.rs` is the only module that calls the C library and the only module that may use
-`unsafe`. The crate denies unsafe code everywhere else, and every other crate in the workspace
-forbids it outright.
+`unsafe`. The crate denies unsafe code everywhere else.
 
 It is also **private**. The raw primitives are not part of the crate's interface, so a caller
 cannot reach an encryption function that accepts a nonce, a `secretstream` without the
