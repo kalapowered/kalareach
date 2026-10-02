@@ -4362,10 +4362,11 @@ that package and method has interpreted it. Machine output and terminal text can
 cannot create a request, however accurate they are, so a permission prompt read from the screen or
 from a notification is never an approval.
 
-A package gets the broker's semantic events within the default ceiling, while `terminal.stream`,
+Native protocols and hooks come first, then documented machine output, then terminal text, which a
+package reads only where nothing better exists and only once it has been granted the reading. A
+package gets the broker's semantic events within the default ceiling, while `terminal.stream`,
 `terminal.transcript_tail` and `process.observe` are outside it, so each needs an explicit package
-or repository grant. A package that reads terminal text has to be given that reading, and the
-reading never turns into approval authority.
+or repository grant. The reading never turns into approval authority.
 
 ### Decoding trust
 
@@ -4467,13 +4468,14 @@ One saved conversation takes one live execution. A second launch against it is r
 the instance that owns it. A native thread selection moves the reservation with it, so the
 conversation an instance left is free and the one it took is not.
 
-Nothing in the host replaces a running agent with a second run of its saved conversation. It starts
-an agent process only by executing a launch intent. It refuses to execute one while another live
-instance holds the conversation the intent names. An instance holds a conversation from the launch
-that named it, or from a thread selection its bridge reports. If a bridge reports that an instance
-selected a conversation another live instance holds, the host refuses the selection: the instance is
-left with no thread vouched for, and rich mutations stay suspended until the binding is verified
-again.
+Nothing in the host replaces a running agent with a second run of its saved conversation. The host
+starts an agent process only for a command the person typed, and no launch it makes names a saved
+conversation to resume. The broker still keeps the guard that a launch intent naming one would meet:
+within one session, an intent for a saved conversation is refused while another live instance holds
+it. An instance holds a conversation when its bridge reports that it selected one, and a program the
+host adopted from the terminal holds none. If a bridge reports that an instance selected a
+conversation another live instance holds, the host refuses the selection: the instance is left with
+no thread vouched for, and rich mutations stay suspended until the binding is verified again.
 
 ### What a native exit ends
 
