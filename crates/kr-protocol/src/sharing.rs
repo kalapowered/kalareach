@@ -739,15 +739,15 @@ impl RevocationResult {
         let mut order: Vec<usize> = (0..workers.len()).collect();
         order.sort_by_key(|&index| (workers[index].state.holds(), workers[index].session_id));
         let mut keep = vec![false; workers.len()];
-        let mut kept = 0_usize;
-        for (position, index) in order.into_iter().enumerate() {
+        // Every worker before this one was kept, so its position is how many are.
+        for (kept, index) in order.into_iter().enumerate() {
             let emptied = crate::action::WorkerBarrier {
                 rejected_actions: Vec::new(),
                 possibly_executed: Vec::new(),
                 ..workers[index].clone()
             };
             let cost = Cost::of(&emptied).unwrap_or_default();
-            let first_waiting = position == 0 && !workers[index].state.holds();
+            let first_waiting = kept == 0 && !workers[index].state.holds();
             let fits = kept < collection && left.take(cost, kept);
             if !fits && !first_waiting {
                 break;
@@ -758,7 +758,6 @@ impl RevocationResult {
                 left.bytes = left.bytes.saturating_sub(cost.bytes);
             }
             keep[index] = true;
-            kept += 1;
         }
         let mut workers: Vec<crate::action::WorkerBarrier> = workers
             .into_iter()
