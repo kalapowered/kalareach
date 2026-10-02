@@ -23,10 +23,11 @@
 //!   `.attach`. Authorising a location and binding a repository to one enlarge what this host will
 //!   do, so each needs the owner's fresh confirmation, bound to the opened object.
 //!
-//! A location is the owner's. The rows have a grant column, and a location naming a grant admits
-//! nothing on this host: no paired device reaches a repository operation here, and an owner's
-//! confirmation of a device's location would have to be bound to that device's four public keys,
-//! of which this host keeps only two. So such a location is not authorised in the first place.
+//! A location is the owner's to authorise, whoever it is for. The rows have a grant column: a
+//! location that names none is the owner's own, and admits the owner's operations; one that names a
+//! grant is a paired device's, and admits the operations of the caller bounded by that grant and
+//! nobody else. The owner's confirmation of a device's location is bound to that device's four
+//! public keys, which the daemon holds in full for a device that has declared them.
 //!
 //! ## The confirmation, in two submissions of one action
 //!
@@ -303,19 +304,12 @@ pub(crate) fn recheck(
 }
 
 /// Refuses a use a held location does not admit.
+///
+/// A location admits the caller it names: the owner for a location that names no grant, and the
+/// caller bounded by that grant for one that does. The owner deciding about the location itself is
+/// admitted whichever it is, because the owner authorised it.
 fn admits(held: &HeldLocation, wanted: &LocationUse) -> Result<()> {
     let row = &held.row;
-    if let Some(grant) = row.grant_id.0 {
-        // A grant's location admits nothing on this host, whoever asks: nothing here would bound
-        // what the Git program reaches for the device that holds the grant.
-        return Err(ProjectError::PermissionDenied {
-            detail: format!(
-                "location {} admits grant {grant}, and no location admits a grant on this host",
-                row.location_id
-            )
-            .into(),
-        });
-    }
     if row.purpose != wanted.purpose {
         return Err(ProjectError::PermissionDenied {
             detail: format!(
@@ -336,11 +330,15 @@ fn admits(held: &HeldLocation, wanted: &LocationUse) -> Result<()> {
             .into(),
         });
     }
-    if let Admitting::Caller(Some(grant)) = wanted.admitting {
+    if let Admitting::Caller(caller) = wanted.admitting
+        && caller != row.grant_id.0
+    {
         return Err(ProjectError::PermissionDenied {
             detail: format!(
-                "location {} admits the owner, and this request is grant {grant}'s",
-                row.location_id
+                "location {} admits {}, and this request is {}'s",
+                row.location_id,
+                grant_text(row.grant_id.0),
+                grant_text(caller)
             )
             .into(),
         });
@@ -1240,19 +1238,6 @@ impl ProjectService {
     ) -> Result<OwnerConfirmationRequest> {
         if let Some(request) = self.challenges.repeated(&key, request_digest, owner)? {
             return Ok(request);
-        }
-        if let Some(grant) = params.grant_id.0 {
-            // The confirmation of a device's location has to name the four public keys of the
-            // device that holds the grant, and this host keeps only two of them; a location that
-            // named a grant would admit nothing here anyway.
-            return Err(ProjectError::PermissionDenied {
-                detail: format!(
-                    "a location is authorised for the owner alone on this host: confirming one for \
-                     grant {grant} would have to name the four public keys of the device that holds \
-                     it, and this host keeps only two of them"
-                )
-                .into(),
-            });
         }
         if let Some(location_id) = params.location_id.0 {
             let row =
