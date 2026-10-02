@@ -543,37 +543,30 @@ A secret is never in the document. `secrets` holds named references: what this c
 it, which secure store it lives in and its name inside that store. There is no field a value would
 fit in, so `kr doctor` and a support bundle print the reference and can print nothing else.
 
-## The bundled package
+## The bundled generation
 
-One plugin package travels with the host, so that recognising an application and presenting it does
-not depend on a repository being reachable. The bytes are in `bundled-plugins/`, one directory per
-package, and `bundled-plugins.lock` beside them says what those bytes are: the package, its version,
-the digest and exact length of every file, the trust root the copy was verified against, and the
-repository, commit and generation it came from.
+A fresh host has no repository and may have no network, so a signed catalogue generation travels
+with it: the metadata, the index and the nine packages the synchronisation script lists. The bytes
+are in `bundled-plugins/`, and `bundled-plugins.lock` beside them names every file with its digest
+and exact length, the highest trust root, and the repository, commit and generation the copy came
+from. The plugin runtime reference describes the layout and how the copy is made.
 
-The lock is checked on every activation, not once at installation. Activating a bundled package
-opens the bundle directory, reads every file relative to that handle with links refused, and
-compares each one's length and SHA-256 digest with the lock before anything is parsed. A package
-whose files do not all match does not activate at all: there is no half-activated package, and no
-unverified byte reaches a parser.
+The host compiles the bundle in and checks every byte against the lock when it reads the bundle in,
+before anything is parsed. A bundle whose files do not all match its lock is refused whole.
 
-Absence and tampering are answered apart, because a caller does different things about them. A file
-that is not there is `PACKAGE_UNAVAILABLE_OFFLINE`: nothing is reachable to fetch it from, and the
-honest answer is that the package is unavailable rather than a capability that would fail the moment
-somebody used it. A file that is there and is not what the lock names, a link in place of one
-included, is `REPOSITORY_UNTRUSTED`. A read the machine could not make for want of a descriptor or
-memory is neither, and is `RESOURCE_UNAVAILABLE`: sending a person to look for tampering that never
-happened is its own kind of wrong answer.
+On its first start the daemon seeds the catalogue from the bundle, once, before it binds any
+endpoint. A build trusts the bundle's root only if the root's key identifiers are ones it commits: a
+shipped build commits no production root yet, so it refuses the bundle, and a build with debug
+assertions also trusts the development lineage and seeds only when it is started with `--seed`.
+Where the root is trusted, the seed enrols the official repository against it, activates the bundled
+generation without the network, and installs each bundled package once, enabled and with an empty
+grant. It never replaces an installation that is already there, and an uninstall or a disable by the
+owner is never undone.
 
-The bundle holds one directory per package, directly under `bundled-plugins/`. Activating a package
-reads the files the lock names and no others, so a file, a directory or a whole package that is
-there and is not in the lock is found by the check over the whole bundle,
-`scripts/sync-bundled-plugins.sh --verify`, rather than by activation.
-
-What the bundle is not: a catalogue, an enrolled repository, or a grant. It carries one generation,
-frozen at the commit it was copied from, and the package's capability requests, grants and
-repository ceiling are applied to it exactly as they are to anything installed. The plugin runtime
-reference describes how the copy is made and what the synchronisation script refuses.
+What the bundle is not: a catalogue or a grant. It carries one generation, frozen at the commit it
+was copied from, and a package's capability requests, grants and repository ceiling are applied to
+it exactly as they are to anything installed. A bundled package that asks for a native bridge gets
+its first grant through `plugin.install`, with the owner's confirmation.
 
 ## Descriptors
 
