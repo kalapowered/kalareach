@@ -781,6 +781,10 @@ mod a_link_that_is_not_given_back;
 #[cfg(test)]
 mod a_lease_that_runs_out_at_a_worker;
 
+/// A closure whose recording is dropped while it waits for the locks after the record.
+#[cfg(test)]
+mod a_closure_that_is_cancelled;
+
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.
 #[cfg(test)]

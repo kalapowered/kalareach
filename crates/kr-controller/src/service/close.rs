@@ -574,6 +574,12 @@ impl Controller {
     async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
+        // The barrier is told in the section that records the closure, under the registry's lock
+        // and before anything is awaited. A worker that has ended satisfies the barrier, and the
+        // barrier keeps a participant it has ever heard of: a retired worker left to stay pending
+        // for every later revocation, because nothing would be left to say that it ended, is what
+        // a request dropped at one of the waits below would otherwise leave.
+        self.leases.worker_ended(record.session_id);
         // The reservation outlives the closure, and it names the job the worker was started as and
         // the process that job ran. A read that fails here costs that job nothing but time: the next
         // start of this daemon looks at every job it has defined.
@@ -604,11 +610,6 @@ impl Controller {
         // A closed session has no window to report on, and a create token that replays one is
         // answered from the closure record.
         self.presentations.lock().await.remove(&record.session_id);
-        // The barrier is told before the record is gone. A worker that has ended satisfies the
-        // barrier, and the barrier keeps a participant it has ever heard of: without this, a
-        // retired worker would stay pending for every later revocation, because nothing would be
-        // left to say that it ended.
-        self.leases.worker_ended(record.session_id);
         // The worker leaves the plugin admissions' set with its session: at once where the
         // closure confirms its end, and otherwise once the kernel says its process ended.
         let unaccounted = record
