@@ -211,19 +211,6 @@ pub fn compose(
             "a push destination is not an external destination".to_owned(),
         ));
     }
-    // A message with no line of any session in it is this host's own generic alert, and nothing in
-    // it was derived from an interval of anyone's history. Who may be told of it is decided where
-    // the notice is placed in an audience, by what it is about; there is nothing here for the
-    // history filter to narrow.
-    if lines.is_empty() {
-        return Ok(assemble(
-            alert,
-            Vec::new(),
-            Provenance::over(SourceInterval::at(0)),
-            Vec::new(),
-            delivery_id,
-        ));
-    }
     let mut withheld: Vec<(Withheld, u64)> = Vec::new();
     let mut count = |reason: Withheld, by: u64| {
         if by == 0 {
@@ -251,6 +238,21 @@ pub fn compose(
     let filtered = filter.filter(Surface::EventPage, candidates);
     count(Withheld::OutsideHistoryScope, filtered.withheld_entries());
     let kept = filtered.kept;
+
+    // A message with no line of any session left in it is this host's own generic alert, and
+    // nothing in it was derived from an interval of anyone's history. Who may be told of it was
+    // decided where the notice was placed in an audience, by what it is about, so there is nothing
+    // left for the history filter to narrow; it says how many lines it left out, as any partial
+    // message does.
+    if kept.is_empty() {
+        return Ok(assemble(
+            alert,
+            Vec::new(),
+            Provenance::over(SourceInterval::at(0)),
+            withheld,
+            delivery_id,
+        ));
+    }
 
     let interval = kept
         .iter()
@@ -639,13 +641,14 @@ mod tests {
         );
     }
 
-    /// A message with no line in it is the host's generic alert and is composed for any viewer the
-    /// notice's audience admitted, whatever the viewer's history or rights: a history cursor, no
+    /// A message with no line left in it is the host's generic alert and is composed for any viewer
+    /// the notice's audience admitted, whatever the viewer's history or rights: a history cursor, no
     /// retained history and no `session.view` do not refuse it, since nothing in it was read from
-    /// anyone's history. The control: the same viewers are still refused a line from before their
-    /// bound, so the filter has not been switched off.
+    /// anyone's history, and that holds when every line offered was left out as well. The control:
+    /// the same viewers are still not given a line from before their bound, so the filter has not
+    /// been switched off, and the message says a line was left out.
     #[test]
-    fn a_generic_alert_with_no_line_is_composed_for_a_viewer_whatever_their_history() {
+    fn a_generic_alert_with_no_line_left_is_composed_for_a_viewer_whatever_their_history() {
         use kr_protocol::grant::HistoryScope;
         use kr_protocol::scalars::{CanonicalSet, Nullable};
         let no_history = HistoryScope {
@@ -685,8 +688,8 @@ mod tests {
             assert!(message.body.ends_with(RECIPIENTS_CAN_READ));
             assert!(message.withheld.is_empty(), "{name}: nothing was left out");
 
-            // The control: a line from before the bound is still not carried, or the whole
-            // message is refused, for a viewer whose history does not reach it.
+            // The control: a line from before the bound is still not carried, and the alert the
+            // audience admitted still goes, saying that a line was left out.
             let lined = compose(
                 DestinationKind::Slack,
                 PushAlert::ApprovalWaiting,
@@ -694,13 +697,18 @@ mod tests {
                 &filter,
                 &granted(&[session(1)]),
                 None,
-            );
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
             if name == "owner" {
-                assert!(lined.expect("a message").body.contains("an old line"));
+                assert!(lined.body.contains("an old line"));
             } else {
                 assert!(
-                    lined.map_or(true, |message| !message.body.contains("an old line")),
+                    !lined.body.contains("an old line"),
                     "{name}: a line from before the bound is not carried"
+                );
+                assert!(
+                    lined.body.contains("left out of this message"),
+                    "{name}: and it says so"
                 );
             }
         }
