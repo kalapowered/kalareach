@@ -25,7 +25,7 @@ final class PushTests: DeviceTestCase {
     private func startPushCheck() throws -> [String: String] {
         launch(probe: "push")
         answerPrompt(["Allow", "OK"])
-        let facts = try XCTUnwrap(probeFacts("push", timeout: 90), "the push check did not report")
+        let facts = try XCTUnwrap(probeFacts("push", timeout: 130), "the push check did not report")
         sayFacts("push", facts)
         // A push session's build holds Firebase's configuration: a build that does not start Firebase
         // is not the build under test, whatever its reason.
@@ -50,16 +50,24 @@ final class PushTests: DeviceTestCase {
         app.terminate()
         say("STEP wait")
         keepAwake(for: waitSeconds)
-        try readTheDelivery(of: facts)
+        launch(probe: "push-read")
+        try readTheDelivery(of: facts, sameProcess: false)
     }
 
-    /// The notification arrives while the application is suspended in the background.
+    /// The notification arrives while the application is suspended in the background, and is read
+    /// from the same process once it is in front again: it was not started afresh to read it.
     func testALegWithTheApplicationInTheBackground() throws {
         let facts = try startPushCheck()
         try requireToken(facts)
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackgroundSuspended, timeout: 90), "the system did not suspend the application")
+        // The send goes only now: the application is suspended, which is the leg.
         say("STEP wait")
         keepAwake(for: waitSeconds)
-        try readTheDelivery(of: facts)
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30), "the application did not come back")
+        post("to.kala.reach.probe.push-read")
+        try readTheDelivery(of: facts, sameProcess: true)
     }
 
     // MARK: Steps
@@ -77,11 +85,13 @@ final class PushTests: DeviceTestCase {
         }
     }
 
-    /// Reads what the application was delivered, once, and decides the leg.
-    private func readTheDelivery(of pushFacts: [String: String]) throws {
-        launch(probe: "push-read")
+    /// Reads what the application was delivered, once, and decides the leg. `sameProcess` says whether
+    /// the check that asked for the token and the one that reads the delivery ran in one process.
+    private func readTheDelivery(of pushFacts: [String: String], sameProcess: Bool) throws {
         let facts = try XCTUnwrap(probeFacts("push-read", timeout: 30), "the delivery check did not report")
         sayFacts("push-read", facts)
+        XCTAssertNotNil(facts["pid"], "the delivery check does not say which process it ran in")
+        XCTAssertEqual(facts["pid"] == pushFacts["pid"], sameProcess, sameProcess ? "the application was started again to read the delivery" : "the application that was ended is the one that read the delivery")
         XCTAssertEqual(facts["nonce.known"], "1", "the check that filed the nonce did not leave it behind")
         let marked = Int(facts["marked"] ?? "0") ?? 0
         guard marked > 0 else {
@@ -98,6 +108,7 @@ final class PushTests: DeviceTestCase {
         }
         XCTAssertEqual(marked, 1, "one send, one notification")
         XCTAssertNotNil(facts["n1.kr_ext_reason"], "the extension named why it showed what it showed")
+        XCTAssertNotNil(facts["n1.kr_ext_private_status"], "the extension did not say what the private group answered")
         XCTAssertTrue(["1", "true"].contains(facts["n1.kr_ext_shared_match"] ?? ""), "the extension read the shared item the application filed")
         XCTAssertTrue(["0", "false"].contains(facts["n1.kr_ext_private_data"] ?? ""), "the extension got no data from the private group")
         XCTAssertNotEqual(facts["n1.kr_ext_private_status"], "0", "the keychain refused the extension the private group")

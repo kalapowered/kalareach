@@ -104,6 +104,8 @@ class HarnessTestCase: DeviceTestCase {
     func resetPage() {
         strip("Reset")
         // The old page goes and the new one comes: its first screen is the one with the sections.
+        // Nothing the page or the system says tells when a navigation inside the web view ended,
+        // so this waits a fixed time, and the waits for the sections and the strip decide the rest.
         Thread.sleep(forTimeInterval: 2)
         XCTAssertTrue(app.buttons["Sessions"].waitForExistence(timeout: 30), "the page did not come back")
         XCTAssertTrue(app.buttons["Controls"].waitForExistence(timeout: 30))
@@ -135,6 +137,10 @@ class HarnessTestCase: DeviceTestCase {
     /// tap can never be a second send.
     func sendTheDraft() {
         eventually("Send is enabled", timeout: 15) { send.isEnabled }
+        // With the keyboard up Send lies under it, and a tap there is a tap on a key: the keyboard
+        // goes first. Whether Send is within reach of a person who is typing is a question for the
+        // layout tests, not for the tests that need a draft sent.
+        putTheKeyboardAway()
         for _ in 0..<3 {
             send.tap()
             let end = Date().addingTimeInterval(6)
