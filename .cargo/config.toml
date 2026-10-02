@@ -29,3 +29,28 @@ rustflags = [
   "-Clink-arg=/NODEFAULTLIB:LIBCMTD",
   "-Clink-arg=/IGNORE:4099",
 ]
+
+# The description process's processor baseline. llama.cpp compiles its CPU code for a fixed set of
+# x86-64 instruction sets chosen when it is built, so the set is written here and never taken from
+# the machine that compiles: a release built on a newer processor than the one it ships to would
+# stop with an illegal instruction on the older one. The baseline is SSE4.2, AVX, AVX2, BMI2, FMA
+# and F16C, which is `kr_describe::processor::Feature::X86_64`; a host checks its processor against
+# the same list before it offers a model, and a test holds the two equal. These options do nothing
+# on other targets. `force` keeps an environment variable of the same name from changing them, and
+# `kr-describe-model` refuses to build when a `target-cpu` flag would override them.
+[env]
+GGML_NATIVE = { value = "OFF", force = true }
+GGML_SSE42 = { value = "ON", force = true }
+GGML_AVX = { value = "ON", force = true }
+GGML_AVX2 = { value = "ON", force = true }
+GGML_BMI2 = { value = "ON", force = true }
+GGML_FMA = { value = "ON", force = true }
+GGML_F16C = { value = "ON", force = true }
+GGML_AVX_VNNI = { value = "OFF", force = true }
+GGML_AVX512 = { value = "OFF", force = true }
+GGML_AVX512_VBMI = { value = "OFF", force = true }
+GGML_AVX512_VNNI = { value = "OFF", force = true }
+GGML_AVX512_BF16 = { value = "OFF", force = true }
+GGML_AMX_TILE = { value = "OFF", force = true }
+GGML_AMX_INT8 = { value = "OFF", force = true }
+GGML_AMX_BF16 = { value = "OFF", force = true }

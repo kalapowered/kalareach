@@ -88,6 +88,7 @@ impl Rig {
                 environment: native(1),
                 data_access: None,
                 target: MAC.to_owned(),
+                processor: kr_describe::processor::Features::running(),
             },
             catalogue,
             MetGates::default(),

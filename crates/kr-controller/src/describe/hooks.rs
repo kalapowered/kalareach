@@ -1,7 +1,8 @@
 //! What this crate's own tests place under a daemon's description host: where the description
-//! process is and what it is told, which profiles it may choose from, a clock a test moves and the
-//! conditions the host reads. Each is keyed by the daemon's canonical state directory and gone when
-//! the test that placed it ends, so a daemon of another test never reads it.
+//! process is and what it is told, which profiles it may choose from, the target and processor it
+//! believes it runs on, a clock a test moves and the conditions the host reads. Each is keyed by
+//! the daemon's canonical state directory and gone when the test that placed it ends, so a daemon
+//! of another test never reads it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kr_describe::processor::Features;
 use kr_describe::profile::catalogue::Catalogue;
 use kr_describe::resource::HostConditions;
 
@@ -21,6 +23,7 @@ struct Hooks {
     program: PathBuf,
     environment: Vec<(OsString, OsString)>,
     catalogue: Catalogue,
+    machine: Arc<Mutex<(String, Features)>>,
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
     free_space: Arc<Mutex<Option<u64>>>,
@@ -34,6 +37,7 @@ static PLACED: Mutex<BTreeMap<PathBuf, Hooks>> = Mutex::new(BTreeMap::new());
 #[derive(Debug)]
 pub struct Placed {
     key: PathBuf,
+    machine: Arc<Mutex<(String, Features)>>,
     skew_ms: Arc<AtomicU64>,
     conditions: Arc<Mutex<HostConditions>>,
     free_space: Arc<Mutex<Option<u64>>>,
@@ -54,6 +58,10 @@ pub fn place(
     abandon: bool,
 ) -> Placed {
     let key = canonical(state_dir);
+    let machine = Arc::new(Mutex::new((
+        kr_describe::environment::build_target().to_owned(),
+        Features::running(),
+    )));
     let skew_ms = Arc::new(AtomicU64::new(0));
     let conditions = Arc::new(Mutex::new(conditions));
     let free_space = Arc::new(Mutex::new(None));
@@ -67,6 +75,7 @@ pub fn place(
                 program,
                 environment,
                 catalogue,
+                machine: Arc::clone(&machine),
                 skew_ms: Arc::clone(&skew_ms),
                 conditions: Arc::clone(&conditions),
                 free_space: Arc::clone(&free_space),
@@ -76,6 +85,7 @@ pub fn place(
         );
     Placed {
         key,
+        machine,
         skew_ms,
         conditions,
         free_space,
@@ -84,6 +94,13 @@ pub fn place(
 }
 
 impl Placed {
+    /// Says which target the host was built for and which instruction sets its processor has, in
+    /// place of this machine's own, for a daemon that starts from now on.
+    pub fn set_machine(&self, target: &str, processor: Features) {
+        *self.machine.lock().unwrap_or_else(PoisonError::into_inner) =
+            (target.to_owned(), processor);
+    }
+
     /// Moves the host's clocks forward by `ms`, and returns how far they are moved in all.
     pub fn advance(&self, ms: u64) -> u64 {
         self.skew_ms.fetch_add(ms, Ordering::AcqRel) + ms
@@ -132,10 +149,17 @@ pub(crate) fn placement_for(state_dir: &Path) -> Option<Placement> {
         .unwrap_or_else(PoisonError::into_inner)
         .get(&canonical(state_dir))
         .cloned()?;
+    let (target, processor) = hooks
+        .machine
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     Some(Placement {
         program: hooks.program,
         environment: hooks.environment,
         catalogue: hooks.catalogue,
+        target,
+        processor,
         clock: Clock::skewed(hooks.skew_ms),
         conditions: Some(hooks.conditions),
         abandon: hooks.abandon,
@@ -187,14 +211,8 @@ pub fn assets_directory(state_dir: &Path, catalogue: &Catalogue) -> PathBuf {
     super::assets::directory(&super::host::models_dir(state_dir), &selected(catalogue))
 }
 
-/// The profile the daemon selects from `catalogue` on this host.
+/// The profile whose files a test holds: the catalogue's default, which is what a daemon selects on
+/// any machine its target and processor allow.
 fn selected(catalogue: &Catalogue) -> kr_describe::profile::ModelProfile {
-    catalogue
-        .select(
-            kr_describe::environment::build_target(),
-            &kr_describe::profile::catalogue::MetGates::default(),
-        )
-        .profile()
-        .expect("the catalogue selects a profile")
-        .clone()
+    catalogue.default_profile().clone()
 }

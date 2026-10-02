@@ -82,6 +82,8 @@ impl Controller {
             state_dir,
             build: self.build_id.as_str().to_owned(),
             catalogue: placed.catalogue,
+            target: placed.target,
+            processor: placed.processor,
             settings,
             clock: placed.clock,
             privacy: self.privacy.state(),
@@ -174,6 +176,8 @@ impl Controller {
             environment: Vec::new(),
             catalogue: kr_describe::profile::catalogue::Catalogue::builtin()
                 .unwrap_or_else(|_| unreachable!("this build ships profiles it can run")),
+            target: kr_describe::environment::build_target().to_owned(),
+            processor: kr_describe::processor::Features::running(),
             clock: crate::describe::host::Clock::default(),
             conditions: None,
             abandon: false,

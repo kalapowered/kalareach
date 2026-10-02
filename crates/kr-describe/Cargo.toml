@@ -56,6 +56,8 @@ kr-describe = { path = ".", features = ["testing"] }
 # Places the stub executable on the internal disk before a test starts it.
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+# Reads the build settings the processor baseline is held equal to.
+toml_edit.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

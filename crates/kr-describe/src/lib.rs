@@ -87,6 +87,7 @@ pub mod metrics;
 pub mod output;
 pub mod priority;
 pub mod privacy;
+pub mod processor;
 pub mod profile;
 pub mod qualification;
 pub mod queue;
