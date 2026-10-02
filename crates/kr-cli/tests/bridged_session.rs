@@ -1825,6 +1825,38 @@ async fn a_distribution_is_read_as_running_or_stopped_in_whatever_language_the_h
     );
 }
 
+/// KR-REQ-18.11: a bound of no bytes is refused before anything is asked of the environment: the
+/// platform is not asked, no bridge is run, and no file is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_of_no_bytes_is_refused_before_the_environment_is_asked() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let before = world.invocations();
+    let file = world.export_path("no-bytes");
+    let refused = world.run(&[
+        "export",
+        "1",
+        "--environment",
+        "dest",
+        "--max-bytes",
+        "0",
+        "--output",
+        file.to_str().expect("a path"),
+    ]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--max-bytes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!file.exists(), "no file was made");
+    assert_eq!(
+        world.invocations(),
+        before,
+        "the platform was not asked and no bridge was run"
+    );
+}
+
 /// KR-REQ-18.11: where the destination's privacy mode is on, no session is exported, closed ones
 /// included, and the refusal names privacy mode and writes nothing. The control is the first test:
 /// the same session with the mode off is exported.
