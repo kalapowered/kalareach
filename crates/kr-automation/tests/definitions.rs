@@ -648,6 +648,62 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
     }
 }
 
+/// KR-REQ-07.25: a session a workflow creates takes the host's environment, never one a definition
+/// carries, so a create node whose parameters hold environment variables is refused when the
+/// definition is installed. A definition is stored as it was installed, and a variable in it would
+/// stay on disk for as long as the revision does.
+#[test]
+fn a_create_node_that_carries_environment_variables_is_refused() {
+    use kr_protocol::session::{
+        EnvironmentVariable, LaunchProfile, Presentation, SessionCreateParams, ShellMode,
+    };
+
+    let grant = make_dummy_grant(test_grant_id(9), true);
+    let session = |variables: Vec<EnvironmentVariable>| {
+        serde_json::to_value(SessionCreateParams {
+            environment_id: test_env_id(9),
+            presentation: Presentation::Invisible,
+            shell: Nullable::null(),
+            shell_mode: ShellMode::NativeCompat,
+            cwd: Nullable::null(),
+            dimensions: Nullable::null(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            environment_snapshot: variables,
+            palette: Nullable::null(),
+            launch_profile: LaunchProfile::default(),
+            terminal: Nullable::null(),
+        })
+        .expect("session.create's parameters")
+    };
+
+    // The control: the same node with no variables installs.
+    validate_definition(
+        &one_node_with(WorkflowActionKind::CreateSession, session(Vec::new())),
+        &grant,
+    )
+    .expect("a create node with no variables is installed");
+
+    let carrying = session(vec![EnvironmentVariable {
+        name: "KR_PLANTED_TOKEN".to_owned(),
+        value: "planted-secret-value".to_owned(),
+    }]);
+    let error = validate_definition(
+        &one_node_with(WorkflowActionKind::CreateSession, carrying),
+        &grant,
+    )
+    .expect_err("a create node that carries a variable is refused");
+    assert!(
+        matches!(error, kr_automation::AutomationError::InvalidArgument(_)),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(said.contains("environment"), "{said}");
+    assert!(
+        !said.contains("planted-secret-value") && !said.contains("KR_PLANTED_TOKEN"),
+        "the refusal names no variable and no value: {said}"
+    );
+}
+
 /// KR-REQ-25.13: a workflow definition is a versioned JSON document. One read from its text, with
 /// an event trigger, a resource scope, typed action nodes, success and failure edges, deadlines and
 /// a grant reference, installs under the revision that both the request and the document name.
