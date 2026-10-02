@@ -275,6 +275,9 @@ struct AudioTickLog {
     private(set) var outputGap: TimeInterval = 0
     private(set) var lockedInputGap: TimeInterval = 0
     private(set) var lockedOutputGap: TimeInterval = 0
+    /// Whether the tick before was locked: the first reading after an unlock sees the whole of what
+    /// went on while the phone was locked, and a stop that suspended the application shows only then.
+    private var previousWasLocked = false
 
     init(start: TimeInterval) { self.start = start }
 
@@ -294,9 +297,13 @@ struct AudioTickLog {
         outputGap = max(outputGap, output)
         if !protectedDataAvailable {
             lockedTicks += 1
+        }
+        // A gap belongs to the locked time when this tick or the one before it was locked.
+        if !protectedDataAvailable || previousWasLocked {
             lockedInputGap = max(lockedInputGap, input)
             lockedOutputGap = max(lockedOutputGap, output)
         }
+        previousWasLocked = !protectedDataAvailable
     }
 
     /// The facts, with gaps in whole milliseconds.
