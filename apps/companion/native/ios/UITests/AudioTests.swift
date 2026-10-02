@@ -15,6 +15,12 @@ import CoreFoundation
 import XCTest
 
 final class AudioTests: DeviceTestCase {
+    override func tearDown() {
+        // Whatever ended a test, the check gives the session back and the microphone is not left open.
+        post("to.kala.reach.probe.audio-stop")
+        super.tearDown()
+    }
+
     private func post(_ name: String) {
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
@@ -44,6 +50,7 @@ final class AudioTests: DeviceTestCase {
     /// The person says no: the session refuses and says the microphone is not permitted, the
     /// microphone's state is that it is unavailable, and nothing is left held.
     func testARefusedMicrophoneIsSaidAndNothingOpens() throws {
+        promptAnswers = ["Don\u{2019}t Allow", "Don't Allow"]
         launch(probe: "audio")
         answerPrompt(["Don\u{2019}t Allow", "Don't Allow"])
         let result = try XCTUnwrap(facts(until: { $0["permission"] != nil }), "the audio check did not report")
@@ -64,7 +71,7 @@ final class AudioTests: DeviceTestCase {
         XCTAssertEqual(running["permission"], "granted")
         XCTAssertEqual(running["activated"], "1")
         XCTAssertEqual(running["engine"], "running")
-        XCTAssertNotNil(running["capture"], "the microphone's state is reported")
+        XCTAssertNotEqual(running["capture"], "unavailable", "the microphone is not available to a session that was allowed it")
         let before = Int(running["route.notifications"] ?? "0") ?? 0
 
         // The output to nowhere in particular and then the speaker: two overrides, and the system

@@ -48,6 +48,25 @@ final class LayoutTests: HarnessTestCase {
         ]
     }
 
+    /// Every control a person touches is whole on screen and outside the insets, or is said to be missing.
+    private func checkControls(inset: (top: CGFloat, left: CGFloat, bottom: CGFloat, right: CGFloat), name: String, includeTop: Bool) {
+        let window = app.windows.firstMatch.frame
+        XCTAssertTrue(composer.exists, "no composer in \(name)")
+        for (control, element) in expectedControls() {
+            guard element.exists else {
+                // The page keeps the way back only in a session and the sections in every screen.
+                XCTFail("\(control) is missing in \(name)")
+                continue
+            }
+            let frame = element.frame
+            guard frame.width > 1, frame.height > 1, frame.intersects(window) else { continue }
+            XCTAssertGreaterThanOrEqual(frame.minX, inset.left - 1, "\(control) is in the left inset in \(name)")
+            XCTAssertLessThanOrEqual(frame.maxX, window.width - inset.right + 1, "\(control) is in the right inset in \(name)")
+            XCTAssertLessThanOrEqual(frame.maxY, window.height - inset.bottom + 1, "\(control) is in the bottom inset in \(name)")
+            if includeTop { XCTAssertGreaterThanOrEqual(frame.minY, inset.top - 1, "\(control) is in the top inset in \(name)") }
+        }
+    }
+
     func testTheComposerStaysAboveTheKeyboardAndSendWithIt() throws {
         shot("before the keyboard")
         composer.tap()
@@ -58,6 +77,13 @@ final class LayoutTests: HarnessTestCase {
         let field = composer.frame
         let sendFrame = send.frame
         say("LAYOUT keyboard minY=\(Int(board.minY)) height=\(Int(board.height))")
+        // A keyboard that is not up (a hardware keyboard, or none) would pass every comparison below.
+        let screen = app.windows.firstMatch.frame
+        #if targetEnvironment(simulator)
+        if board.minY >= screen.maxY { throw XCTSkip("the simulator takes its keyboard from the Mac, so no software keyboard came up") }
+        #endif
+        XCTAssertGreaterThan(board.height, 100, "no software keyboard is on screen")
+        XCTAssertLessThan(board.minY, screen.maxY - 100, "the keyboard is not on the screen")
         say("LAYOUT composer minY=\(Int(field.minY)) maxY=\(Int(field.maxY))")
         say("LAYOUT send minY=\(Int(sendFrame.minY)) maxY=\(Int(sendFrame.maxY))")
         XCTAssertLessThanOrEqual(field.maxY, board.minY + 1, "the composer is under the keyboard")
@@ -70,6 +96,7 @@ final class LayoutTests: HarnessTestCase {
         shot("portrait")
         let portrait = try insets()
         say("LAYOUT portrait insets top=\(Int(portrait.top)) left=\(Int(portrait.left)) bottom=\(Int(portrait.bottom)) right=\(Int(portrait.right))")
+        checkControls(inset: portrait, name: "portrait", includeTop: true)
         for (name, orientation) in [("landscape left", UIDeviceOrientation.landscapeLeft), ("landscape right", .landscapeRight)] {
             XCUIDevice.shared.orientation = orientation
             eventually("the application to turn to \(name)") { app.frame.width > app.frame.height }
@@ -77,17 +104,7 @@ final class LayoutTests: HarnessTestCase {
             shot(name)
             let inset = try insets()
             say("LAYOUT \(name) insets top=\(Int(inset.top)) left=\(Int(inset.left)) bottom=\(Int(inset.bottom)) right=\(Int(inset.right))")
-            let window = app.windows.firstMatch.frame
-            XCTAssertTrue(composer.exists, "no composer in \(name)")
-            for (control, element) in expectedControls() where element.exists {
-                let frame = element.frame
-                guard !frame.isEmpty, frame.width > 1, frame.height > 1 else { continue }
-                // Only what is on screen: a control the page keeps scrolled out of view is not in an inset.
-                guard frame.intersects(window) else { continue }
-                XCTAssertGreaterThanOrEqual(frame.minX, inset.left - 1, "\(control) is in the left inset in \(name)")
-                XCTAssertLessThanOrEqual(frame.maxX, window.width - inset.right + 1, "\(control) is in the right inset in \(name)")
-                XCTAssertLessThanOrEqual(frame.maxY, window.height - inset.bottom + 1, "\(control) is in the bottom inset in \(name)")
-            }
+            checkControls(inset: inset, name: name, includeTop: false)
         }
         XCUIDevice.shared.orientation = .portrait
         eventually("the application to turn upright") { app.frame.height > app.frame.width }
