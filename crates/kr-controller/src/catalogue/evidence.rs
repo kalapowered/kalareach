@@ -76,16 +76,16 @@ pub fn repositories(catalogue: &Catalogue) -> CatalogueResult<Vec<RepositoryEvid
             ),
             None => detail,
         };
-        // A repository the host seeded is moved only under a root this build trusts. One that was
+        // The seed moves a repository it made only under a root this build trusts. One that was
         // seeded by another kind of build (a development build's, read by a release) is left as it
-        // is, and the doctor says so.
-        let detail = if catalogue.seed_provenance(&view.enrolment.id)?.is_some()
+        // is, from the enrolment on, and the doctor says so.
+        let detail = if catalogue.was_seeded(&view.enrolment.id)?
             && kr_plugin_catalogue::SeedTrust::compiled()
                 .permit(&view.enrolment.root)
                 .is_err()
         {
             format!(
-                "{detail}; its root is not one this build trusts, so this build does not move it"
+                "{detail}; its root is not one this build trusts, so the seed leaves it as it is"
             )
         } else {
             detail

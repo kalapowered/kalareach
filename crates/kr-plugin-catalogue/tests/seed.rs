@@ -799,6 +799,50 @@ async fn a_bundle_this_build_refuses_still_serves_the_payloads_a_generation_pins
     assert_eq!(digest, refused.packages()[0].manifest.digest);
 }
 
+/// The bundled metadata's expiry is reported while the bundled generation is the one in use, and
+/// not once a synchronisation has moved the store past it.
+#[tokio::test]
+async fn expiry_is_reported_only_while_the_bundled_generation_is_in_use() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let expired = Generation::build(
+        home.path(),
+        GenerationSpec {
+            expired: true,
+            ..adapter_spec(1)
+        },
+    )
+    .await;
+    let bundle = seed_bundle(&expired);
+    let mut catalogue = offline(home.path());
+    let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
+    assert!(
+        outcome.expired.is_some(),
+        "the control: {}",
+        outcome.report()
+    );
+
+    // The store is moved past the bundle by a synchronisation from the repository itself.
+    let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+    let mut official = catalogue
+        .repository(&id)
+        .expect("records")
+        .expect("enrolled");
+    official.metadata_url = expired.metadata_url();
+    official.targets_url = expired.targets_url();
+    catalogue
+        .update_enrolment(official, false)
+        .expect("the owner points it at a mirror");
+    expired.rewrite_with(adapter_spec(2)).await;
+    catalogue.sync(&id).await.expect("a fresh generation");
+
+    let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
+    assert!(
+        outcome.expired.is_none(),
+        "the bundle's age says nothing about what the host runs now: {}",
+        outcome.report()
+    );
+}
+
 /// A bundle whose highest root alone has expired is reported expired, as one whose roles have: the
 /// update client waives the root's expiry for the bundled generation too, so the host's own reading
 /// is what says so.
@@ -834,10 +878,10 @@ async fn a_bundle_whose_root_alone_has_expired_is_reported_expired() {
 }
 
 /// The seeded repository's provenance is written with the commit that activates a bundled
-/// generation, so it always names the generation in use: nothing before the activation, the first
-/// bundle's generation after it, and the later bundle's after an update.
+/// generation, so it names the last bundle a generation was taken from: nothing before the
+/// activation, the first bundle's generation after it, and the later bundle's after an update.
 #[tokio::test]
-async fn the_provenance_names_the_bundled_generation_in_use() {
+async fn the_provenance_names_the_last_bundled_generation_taken() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = adapter(home.path()).await;
     let first = seed_bundle(&generation);
@@ -890,6 +934,11 @@ async fn a_pinned_repository_with_every_package_recorded_commits_nothing() {
     let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
 
     assert!(!outcome.committed, "{}", outcome.report());
+    assert!(
+        outcome.choices.is_empty(),
+        "a pin that holds nothing back is no choice to report: {}",
+        outcome.report()
+    );
     assert_eq!(records(&catalogue), before);
     assert_eq!(
         catalogue.admission_revision().expect("a revision"),

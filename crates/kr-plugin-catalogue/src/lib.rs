@@ -1503,8 +1503,10 @@ impl Catalogue {
             };
             if let Via::Bundle(bundle) = via {
                 require_seeded_in(changes, &key)?;
-                // Where the generation in use came from is kept with the commit that activates it,
-                // so the record always names the bundle the active generation was taken from.
+                // Where the bundled generation came from is kept with the commit that activates it,
+                // so the record names the last bundle this store took a generation from; a later
+                // synchronisation from the repository itself leaves it, and the doctor shows both
+                // generation numbers.
                 changes.put_setting(
                     &format!("{}{key}", seed::PROVENANCE),
                     &seed::provenance_of(bundle),
