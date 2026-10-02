@@ -44,7 +44,9 @@ fn repository_root() -> PathBuf {
 /// Every presentation document a committed package carries.
 fn committed_documents() -> Vec<(PathBuf, Value)> {
     let root = repository_root();
-    let mut paths = vec![root.join("bundled-plugins/fixture/presentation.json")];
+    let mut paths = vec![root.join(
+        "bundled-plugins/targets/packages/kalareach/example-declarative/0.1.0/presentation.json",
+    )];
     let valid = root.join("fixtures/plugins/valid");
     let mut packages: Vec<PathBuf> = std::fs::read_dir(&valid)
         .unwrap_or_else(|error| panic!("{}: {error}", valid.display()))

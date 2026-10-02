@@ -42,6 +42,8 @@ testing = []
 # the epoch, never because the machine was slow.
 kr-plugin-runtime = { path = ".", features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
+# The bundled generation is seeded into a catalogue with no network, under a kernel denial of it.
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that reads a compiled artefact back cannot

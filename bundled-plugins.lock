@@ -1,8 +1,152 @@
 {
-  "lock_version": 1,
+  "lock_version": 2,
+  "metadata": [
+    {
+      "digest": "d008a8b2f121f112108632aa5e5a99af0bdc0a770431d84865ed34fa3dd9acb7",
+      "path": "metadata/1.root.json",
+      "size_bytes": "2145"
+    },
+    {
+      "digest": "d008a8b2f121f112108632aa5e5a99af0bdc0a770431d84865ed34fa3dd9acb7",
+      "path": "metadata/root.json",
+      "size_bytes": "2145"
+    },
+    {
+      "digest": "59c1e522b23532020715ace76821d54cacd549f404559dd9be8225613e48527a",
+      "path": "metadata/snapshot.json",
+      "size_bytes": "611"
+    },
+    {
+      "digest": "84af41f8e464ef97a44be15a7a16f925a5d60ef81c3fee11e1d6d373d6e03b87",
+      "path": "metadata/targets.json",
+      "size_bytes": "13148"
+    },
+    {
+      "digest": "a785c5db07c12c24d3a3422d9574e832f2ce14ec1f9ec841670d5065d8ac40f5",
+      "path": "metadata/timestamp.json",
+      "size_bytes": "611"
+    },
+    {
+      "digest": "4e9a7f73a557a7057fb8d3f82de2f582448a7b6eabc7e0107500c90cae819be2",
+      "path": "targets/index.json",
+      "size_bytes": "23956"
+    }
+  ],
   "packages": [
     {
-      "directory": "fixture",
+      "directory": "targets/packages/kalareach/claude-code/0.4.0",
+      "manifest": {
+        "digest": "4459b1c66bf63415455dcba780501c7a8771638172acc7218e9472fa58444d88",
+        "path": "plugin.json",
+        "size_bytes": "9742"
+      },
+      "payloads": [
+        {
+          "digest": "aecc4582377dc8867e6f72847e14c635821930899ea1f0ff3ee13f68227a69c2",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "12304"
+        },
+        {
+          "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727",
+          "path": "bridge/hooks.json",
+          "role": "native_bridge",
+          "size_bytes": "1398"
+        },
+        {
+          "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea",
+          "path": "bridge/mcp-servers.json",
+          "role": "native_bridge",
+          "size_bytes": "167"
+        },
+        {
+          "digest": "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c",
+          "path": "bridge/plugin-manifest.json",
+          "role": "native_bridge",
+          "size_bytes": "326"
+        },
+        {
+          "digest": "f86f2131f523d403c987b5c076b0b5ee973349f6c362bcf894c79797eec45b3a",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "3890"
+        },
+        {
+          "digest": "56bbd8764904a0943768e6b8ecebb49b2c23dbed7874442d47bbeab0e16e20a5",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "8929"
+        },
+        {
+          "digest": "9c4247e5863ca03b98541119ca7d28cf271f84585d451b3bb88fa31f42732387",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "3860"
+        },
+        {
+          "digest": "d23e72101d1f4322be2f33a31ed852a5dbd9765c44b79d566a22ac5f8a5bd375",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "7799"
+        }
+      ],
+      "plugin_id": "kalareach/claude-code",
+      "plugin_name": "claude-code",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.2, <0.2.0",
+      "total_size_bytes": "48415",
+      "version": "0.4.0",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/codex/0.2.1",
+      "manifest": {
+        "digest": "9278761702756adbe59bfa8b252fa1011e0c9914f9c3c5933fa3813883389576",
+        "path": "plugin.json",
+        "size_bytes": "3628"
+      },
+      "payloads": [
+        {
+          "digest": "e276b90ffb7c32c01b8c8bad288852435643ffd60dc57b3067e1d56322cce971",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "6819"
+        },
+        {
+          "digest": "093e4a9fe70dee2801905a131500d53f750c3c89f730bbaf0f8f0146277e39d4",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "16103"
+        },
+        {
+          "digest": "c3d63e248eb922313d6ea5366713ee95d095497122f59a0491d42b00c1ab4f3b",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4961"
+        },
+        {
+          "digest": "122ca902b97f73a546ee1a424179c672756dc27eca9748af30d20f79daaf6f50",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "10511"
+        },
+        {
+          "digest": "51c4a083904b315b7e3fd4839f3b7bde4d6e6f298f4fea0958e6fbf7e806ef12",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "3390"
+        }
+      ],
+      "plugin_id": "kalareach/codex",
+      "plugin_name": "codex",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.1, <0.2.0",
+      "total_size_bytes": "45412",
+      "version": "0.2.1",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/example-declarative/0.1.0",
       "manifest": {
         "digest": "f8434aef081de78d9b63e34d1172b9a64399182a7420bb4f0b3352762a5aeccb",
         "path": "plugin.json",
@@ -35,21 +179,321 @@
       "total_size_bytes": "8065",
       "version": "0.1.0",
       "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/gemini-cli/0.4.0",
+      "manifest": {
+        "digest": "4022d82656b5fbb7ad4e380978194ef3c2fa08aa669ff1890559e2b57a5e567b",
+        "path": "plugin.json",
+        "size_bytes": "8065"
+      },
+      "payloads": [
+        {
+          "digest": "a7bcda7cced8487adb022022cfbc73b635424314d8e111208f5c53646d00f83f",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "10439"
+        },
+        {
+          "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
+          "path": "bridge/gemini-extension-install.json",
+          "role": "native_bridge",
+          "size_bytes": "57"
+        },
+        {
+          "digest": "2ea510ab37639c8f4b9e380c3a168b06771088d31b2b933549213479d5e764e7",
+          "path": "bridge/gemini-extension.json",
+          "role": "native_bridge",
+          "size_bytes": "204"
+        },
+        {
+          "digest": "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba",
+          "path": "bridge/hooks.json",
+          "role": "native_bridge",
+          "size_bytes": "738"
+        },
+        {
+          "digest": "b0d3a7cb428dced8f41762a93b67d5a42aabc912af449ad3eb1cb352ae95dbe3",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "7204"
+        },
+        {
+          "digest": "5777b8b689e3bcda61cec0f8b118a77aee37440dd7f7856e17b516a4d6dff56d",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "5668"
+        },
+        {
+          "digest": "f9c7c197726962a80f3e65e6afa77b172b4b909ae3b9fa819f15ab94f2125262",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "9554"
+        },
+        {
+          "digest": "f64bc2273fc628047e511f466d185f091a25855035ec38d60f60ba8cf54d67a6",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4056"
+        }
+      ],
+      "plugin_id": "kalareach/gemini-cli",
+      "plugin_name": "gemini-cli",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.2, <0.2.0",
+      "total_size_bytes": "45985",
+      "version": "0.4.0",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/kimi-cli/0.1.1",
+      "manifest": {
+        "digest": "496b25f18655bea229453e078eafd50fffdbd6fa489b016af9b0e1126661619f",
+        "path": "plugin.json",
+        "size_bytes": "4253"
+      },
+      "payloads": [
+        {
+          "digest": "5c1b2634dc9b0ba424264c22c52c3d1d7afc2616239db04db3403809d8946824",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "7510"
+        },
+        {
+          "digest": "445678f98596349fd8712ea85d4bdacb100e9d03ac0bc35c2ddb8740783adae9",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "8574"
+        },
+        {
+          "digest": "1b7638f593f260f2416b5a7da3fb6b06c26205750fcb1182708d40b7ff506365",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4884"
+        },
+        {
+          "digest": "68b188d928a430dc26e7f86a4db1c6049d1cc315cfec65ed74806bedf271faf5",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "10641"
+        },
+        {
+          "digest": "f2f99a89073b7bf9990c8e5bfeb40e0983721712f8cdbd56159ec7fd59477522",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4097"
+        }
+      ],
+      "plugin_id": "kalareach/kimi-cli",
+      "plugin_name": "kimi-cli",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.1, <0.2.0",
+      "total_size_bytes": "39959",
+      "version": "0.1.1",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/kimi-code-cli/0.2.1",
+      "manifest": {
+        "digest": "3d1a463c39c14957d412628d17041129cc1ea50508444cbe54ec9eb61351fb06",
+        "path": "plugin.json",
+        "size_bytes": "3748"
+      },
+      "payloads": [
+        {
+          "digest": "53f57fd74212cc387a3091577ae75d3bc8181b6e48b735b4bc2888fd22fdccb6",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "5842"
+        },
+        {
+          "digest": "5f98316a33332a62c3358fe534801bc83e9e81d641c4fa9b4b81e5f82bdbd391",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "8697"
+        },
+        {
+          "digest": "774cb7f425d9bcf21e5637201abbc9cb4c4ae20da6bb07e7fbb3e9dfa447187e",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4881"
+        },
+        {
+          "digest": "0ddc7b9ed451d642372078b8aed8e43651de7bdd2cbeaca66898a4669e34f59d",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "8151"
+        },
+        {
+          "digest": "36af5d987758aa5da9f54eef0ac9e15358f802856b8b2b0b764363bac7ee09cc",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4117"
+        }
+      ],
+      "plugin_id": "kalareach/kimi-code-cli",
+      "plugin_name": "kimi-code-cli",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.1, <0.2.0",
+      "total_size_bytes": "35436",
+      "version": "0.2.1",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/opencode/0.2.1",
+      "manifest": {
+        "digest": "6aeb8a1758ccfc610ce77da02d63e0e2ed134633eed2a7c6e88bcdb2da1a98c6",
+        "path": "plugin.json",
+        "size_bytes": "3679"
+      },
+      "payloads": [
+        {
+          "digest": "8bb98bdafb200588b3ce3761b25c490f28cec70ea4a622a6e6a7ca5b314682bb",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "6828"
+        },
+        {
+          "digest": "e158152f6dac24ae864fe99acd8764b04f6ed155d0325bade8dd76c0631c76dc",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "29209"
+        },
+        {
+          "digest": "b1db6178ee606513264272075d47c3638b4e6f6ae2de36ffb88d399f91a724e2",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4879"
+        },
+        {
+          "digest": "386ca8bef0315dadb35369001f8be72f0b702be927e39dcfa1cc3e2631953ec6",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "7937"
+        },
+        {
+          "digest": "d95ec63150b25abd137b6210766d84a985c0c6ee395975ee432d8e230164bd69",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4067"
+        }
+      ],
+      "plugin_id": "kalareach/opencode",
+      "plugin_name": "opencode",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.1, <0.2.0",
+      "total_size_bytes": "56599",
+      "version": "0.2.1",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/opencode-attach/0.1.1",
+      "manifest": {
+        "digest": "760387f5424be7e0c21426fed971be1b25c5cdf88213e99e5801b754982f7fc4",
+        "path": "plugin.json",
+        "size_bytes": "3784"
+      },
+      "payloads": [
+        {
+          "digest": "9fd3c38181f8889baf776474ddc6eb881f419a38124a1f42613ec275010bd825",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "7279"
+        },
+        {
+          "digest": "ebf3106d9c5326f2f7b0c069350e5084ecd555b7116b87035dafec5d7704e3ce",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "29155"
+        },
+        {
+          "digest": "7d063d6392c8624e79777265f939fea37bd1938ccbd503de54aeae9149cb1b5d",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4887"
+        },
+        {
+          "digest": "243472c0a232927ed804aaa1751503f7e8f1d1d8f87a4311c01c2154b36cd181",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "8045"
+        },
+        {
+          "digest": "86cedbaefc38123cdb2816e5b660fef2230e30a7447009b42294b3bb09d9ffe9",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4109"
+        }
+      ],
+      "plugin_id": "kalareach/opencode-attach",
+      "plugin_name": "opencode-attach",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.1, <0.2.0",
+      "total_size_bytes": "57259",
+      "version": "0.1.1",
+      "wit_range": ">=0.1.0, <0.2.0"
+    },
+    {
+      "directory": "targets/packages/kalareach/qoder-cli/0.4.0",
+      "manifest": {
+        "digest": "d26c69197ec46528fd36da257e601a1c6153aeeb76999355a2eab55d6bb1d927",
+        "path": "plugin.json",
+        "size_bytes": "5893"
+      },
+      "payloads": [
+        {
+          "digest": "0c3c912ac90dbb0a9dc810cea46338634a8ac98e54e959d88181a1a57022fada",
+          "path": "README.md",
+          "role": "asset",
+          "size_bytes": "7918"
+        },
+        {
+          "digest": "327094ff38d8c62bb93010eaf7dfc6255c915b84e570a8bfa586d0ad27b0cbbe",
+          "path": "connector.json",
+          "role": "connector",
+          "size_bytes": "8672"
+        },
+        {
+          "digest": "8240295fd5e8f51aac6091c00c5cf85a85d95689efd140facfd8c84db2538083",
+          "path": "fixtures/conformance.json",
+          "role": "fixture",
+          "size_bytes": "4896"
+        },
+        {
+          "digest": "8d62c2877ee81d152b2390845aca2a46041c36f9b1de9c6268cbdaca30b8ea36",
+          "path": "fixtures/frames.json",
+          "role": "asset",
+          "size_bytes": "7883"
+        },
+        {
+          "digest": "7efcadea1c8c941e45be6e9112ff6c5244a4f7512c653759160176779ca73cc1",
+          "path": "presentation.json",
+          "role": "presentation",
+          "size_bytes": "4058"
+        }
+      ],
+      "plugin_id": "kalareach/qoder-cli",
+      "plugin_name": "qoder-cli",
+      "publisher_id": "kalareach",
+      "sdk_range": ">=0.1.2, <0.2.0",
+      "total_size_bytes": "39320",
+      "version": "0.4.0",
+      "wit_range": ">=0.1.0, <0.2.0"
     }
   ],
   "source": {
-    "commit": "44084fc058106bca25bfb4f2118cc349187419df",
-    "generation": "1",
+    "commit": "af72bb15b34c92657f9bd8b5a57c40a09b7cac71",
+    "generation": "2",
     "generation_path": "snapshots/development",
     "produced_at": "1760000000000",
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/44084fc058106bca25bfb4f2118cc349187419df/snapshots/development"
+    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/af72bb15b34c92657f9bd8b5a57c40a09b7cac71/snapshots/development"
   },
   "trust_root": {
-    "digest": "874233c78ea4a6db808b3967fe6b750c6419084edf2007d2c4fc2e5486d1ed8e",
-    "expires": "2036-09-12T13:27:01.481482Z",
+    "digest": "d008a8b2f121f112108632aa5e5a99af0bdc0a770431d84865ed34fa3dd9acb7",
+    "expires": "2046-10-01T00:00:00Z",
     "key_ids": [
-      "f14e4ac91420a6515eb9ae321fcba909420d2cd09cf8c5fd42244af8f0e5fdf2"
+      "22a99bda605726730776823e26da03b178524617baccaee1a75ad8a67fb41eca"
     ],
     "version": 1
   }

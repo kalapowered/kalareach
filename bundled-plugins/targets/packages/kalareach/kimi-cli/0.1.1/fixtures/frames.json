@@ -1,0 +1,315 @@
+{
+  "corpus_version": 1,
+  "protocol": "kimi-cli-acp",
+  "tested_version": "1.51.0",
+  "source": "Five frames are the exact messages sent to the installed kimi-cli 1.51.0 over its standard streams with the acp subcommand, and one more is such a request with the working directory it named replaced. The rest are written from names the installed package calls and are marked as written, because observing them needs an authenticated account and a live turn.",
+  "frames": [
+    {
+      "situation": "the capability negotiation that opens a connection",
+      "note": "This exact request was sent to the installed build and answered, which is where the agent's capabilities and authentication method came from",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": true,
+              "writeTextFile": true
+            },
+            "terminal": true
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "initialize",
+        "method": "initialize",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 1,
+        "members": {
+          "params.protocolVersion": 1
+        }
+      }
+    },
+    {
+      "situation": "a method the table does not route",
+      "note": "The installed build answered -32601 for this name, and a name the table does not list is a mutation whatever the upstream says about it",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "kalareach/not-a-method",
+        "params": {}
+      },
+      "expect": {
+        "wire_name": "kalareach/not-a-method",
+        "method": null,
+        "direction": null,
+        "class": "mutation",
+        "request_id": 2
+      }
+    },
+    {
+      "situation": "creating an execution",
+      "note": "This exact request was sent to the installed build. It answered -32000 Authentication required, so the request reached the method and created nothing",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/new",
+        "params": {
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      "expect": {
+        "wire_name": "session/new",
+        "method": "session.new",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 3,
+        "members": {
+          "params.cwd": "/workspace"
+        }
+      }
+    },
+    {
+      "situation": "a method only the other distribution implements",
+      "note": "The kimi.com build answers this name and advertises it; this build answered -32601 to this exact request and advertises nothing of the kind, so the table does not route it and it falls to the mutation default",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 19,
+        "method": "session/delete",
+        "params": {}
+      },
+      "expect": {
+        "wire_name": "session/delete",
+        "method": null,
+        "direction": null,
+        "class": "mutation",
+        "request_id": 19
+      }
+    },
+    {
+      "situation": "a method this build does not implement",
+      "note": "This request was sent to the installed build with the working directory it named replaced by a neutral path. The build accepts the name and answered -32603 because its handler is not implemented, so the table states it is outside what it proxies",
+      "provenance": "abridged_capture",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "session/fork",
+        "params": {
+          "cwd": "/workspace",
+          "sessionId": "sess-probe",
+          "mcpServers": []
+        }
+      },
+      "expect": {
+        "wire_name": "session/fork",
+        "method": "session.fork",
+        "direction": "host_to_upstream",
+        "class": "unsupported",
+        "request_id": 21,
+        "members": {
+          "params.sessionId": "sess-probe"
+        }
+      }
+    },
+    {
+      "situation": "ending the turn in flight",
+      "note": "A notification, with no identifier. This exact frame was sent to the installed build, and its log records that the cancel handler received it and found no such session; as a request the same name answered method not found",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {
+          "sessionId": "sess-probe"
+        }
+      },
+      "expect": {
+        "wire_name": "session/cancel",
+        "method": "session.cancel",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": null,
+        "members": {
+          "params.sessionId": "sess-probe"
+        }
+      }
+    },
+    {
+      "situation": "the agent's own update stream",
+      "note": "This name is one the installed package calls. The build refuses to create a session until its account is authenticated, so no update was observed from it",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "sess-01",
+          "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Reading the manifest"
+            }
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "session/update",
+        "method": "session.update",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null,
+        "members": {
+          "params.update.sessionUpdate": "agent_message_chunk"
+        }
+      }
+    },
+    {
+      "situation": "a tool call the agent is waiting on",
+      "note": "A reverse request: the agent asks and the client answers, which is why it is not a report. This name is one the installed package calls; the request itself needs a live turn and was not observed",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "session/request_permission",
+        "params": {
+          "sessionId": "sess-01",
+          "toolCall": {
+            "toolCallId": "call-7",
+            "title": "Run rm -rf build"
+          },
+          "options": [
+            {
+              "optionId": "allow-once",
+              "name": "Allow once",
+              "kind": "allow_once"
+            },
+            {
+              "optionId": "reject-once",
+              "name": "Reject",
+              "kind": "reject_once"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "session/request_permission",
+        "method": "session.request-permission",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": 31,
+        "members": {
+          "params.toolCall.toolCallId": "call-7"
+        }
+      }
+    },
+    {
+      "situation": "a file read in the agent's own environment",
+      "note": "A reverse read. It changes nothing, and it has to run where the agent runs rather than wherever a client is attached",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "fs/read_text_file",
+        "params": {
+          "sessionId": "sess-01",
+          "path": "/workspace/README.md"
+        }
+      },
+      "expect": {
+        "wire_name": "fs/read_text_file",
+        "method": "fs.read-text-file",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": 32,
+        "members": {
+          "params.path": "/workspace/README.md"
+        }
+      }
+    },
+    {
+      "situation": "a process started in the agent's own environment",
+      "note": "A reverse terminal request. It starts something, so it is a mutation, and the broker scopes the resources it gets",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "terminal/create",
+        "params": {
+          "sessionId": "sess-01",
+          "command": "cargo",
+          "args": [
+            "test"
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "terminal/create",
+        "method": "terminal.create",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": 33,
+        "members": {
+          "params.command": "cargo"
+        }
+      }
+    }
+  ],
+  "evidence": {
+    "distribution": {
+      "registry": "PyPI",
+      "project": "kimi-cli",
+      "version": "1.51.0",
+      "archive": "kimi_cli-1.51.0-py3-none-any.whl",
+      "sha256": "ffb9d0d4725844d36d6c78e8d3914a96b2d6a17678c217f3abe7336fb7e02d0e",
+      "source": "https://github.com/MoonshotAI/kimi-cli",
+      "executables": [
+        "kimi",
+        "kimi-cli"
+      ],
+      "protocol_library": "agent-client-protocol 0.8.0, archive sha256 2d5712b88b3249dbd6148b24d32c6eb8992e5663f224db6291524ac80cca8037"
+    },
+    "handshake": {
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Kimi Code CLI",
+        "version": "1.51.0"
+      },
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "sessionCapabilities": [
+        "list",
+        "resume"
+      ],
+      "mcpCapabilities": {
+        "http": true,
+        "sse": false
+      },
+      "authMethods": [
+        "login"
+      ]
+    },
+    "wire": {
+      "flag": "--wire",
+      "protocol_version": "1.10",
+      "server": {
+        "name": "Kimi Code CLI",
+        "version": "1.51.0"
+      },
+      "answered": "initialize with protocol_version 1.10 answered with the server above, its slash commands and its hook events; replay answered finished with no events; an agent-protocol initialize sent to it answered -32602"
+    },
+    "acp_flag": "The --acp flag answered initialize with invalid params and a message naming the acp subcommand in its place, and a name nobody implements with method not found",
+    "final_release": "1.52.0 carries no agent protocol: with no arguments it runs an install command for the kimi.com distribution without asking, and with any other it prints a deprecation notice",
+    "other_distribution": "The kimi.com distribution installs under ~/.kimi-code and answers the same handshake with agentInfo Kimi Code CLI 2.0.2 and session capabilities list, resume, close, delete, fork and additionalDirectories. It is a separate profile with its own package, kalareach/kimi-code-cli.",
+    "read_on": "2026-09-24"
+  }
+}

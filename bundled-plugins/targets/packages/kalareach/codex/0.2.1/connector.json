@@ -1,0 +1,538 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/codex",
+  "protocol": {
+    "name": "codex-app-server",
+    "qualified_range": "=0.155.1",
+    "tested_version": "0.155.1"
+  },
+  "transport": "stdio",
+  "framing": {
+    "type": "line_delimited_json",
+    "max_message_bytes": "8388608"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "method"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "id"
+        }
+      ]
+    }
+  },
+  "routes": [
+    {
+      "method": "initialize",
+      "wire_name": "initialize",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.start",
+      "wire_name": "thread/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.resume",
+      "wire_name": "thread/resume",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.fork",
+      "wire_name": "thread/fork",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.read",
+      "wire_name": "thread/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.list",
+      "wire_name": "thread/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.turns.list",
+      "wire_name": "thread/turns/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.loaded.list",
+      "wire_name": "thread/loaded/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.unsubscribe",
+      "wire_name": "thread/unsubscribe",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.archive",
+      "wire_name": "thread/archive",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.delete",
+      "wire_name": "thread/delete",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.compact.start",
+      "wire_name": "thread/compact/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.inject-items",
+      "wire_name": "thread/inject_items",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.shell-command",
+      "wire_name": "thread/shellCommand",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.start",
+      "wire_name": "turn/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.steer",
+      "wire_name": "turn/steer",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.interrupt",
+      "wire_name": "turn/interrupt",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "review.start",
+      "wire_name": "review/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "model.list",
+      "wire_name": "model/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "mcp-server.tool.call",
+      "wire_name": "mcpServer/tool/call",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "command.exec",
+      "wire_name": "command/exec",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "process.spawn",
+      "wire_name": "process/spawn",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.value.write",
+      "wire_name": "config/value/write",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.batch-write",
+      "wire_name": "config/batchWrite",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.read-file",
+      "wire_name": "fs/readFile",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.write-file",
+      "wire_name": "fs/writeFile",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.remove",
+      "wire_name": "fs/remove",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.read",
+      "wire_name": "account/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.login.start",
+      "wire_name": "account/login/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.logout",
+      "wire_name": "account/logout",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.started",
+      "wire_name": "thread/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.closed",
+      "wire_name": "thread/closed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.status.changed",
+      "wire_name": "thread/status/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.queue.changed",
+      "wire_name": "thread/queue/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.started",
+      "wire_name": "turn/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.completed",
+      "wire_name": "turn/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.diff.updated",
+      "wire_name": "turn/diff/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.started",
+      "wire_name": "item/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.completed",
+      "wire_name": "item/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.agent-message.delta",
+      "wire_name": "item/agentMessage/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "server-request.resolved",
+      "wire_name": "serverRequest/resolved",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "warning",
+      "wire_name": "warning",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "error",
+      "wire_name": "error",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.command-execution.request-approval",
+      "wire_name": "item/commandExecution/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.file-change.request-approval",
+      "wire_name": "item/fileChange/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.permissions.request-approval",
+      "wire_name": "item/permissions/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.tool.request-user-input",
+      "wire_name": "item/tool/requestUserInput",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp-server.elicitation.request",
+      "wire_name": "mcpServer/elicitation/request",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "account.chatgpt-auth-tokens.refresh",
+      "wire_name": "account/chatgptAuthTokens/refresh",
+      "direction": "upstream_to_host"
+    }
+  ],
+  "methods": [
+    {
+      "method": "initialize",
+      "class": "mutation",
+      "evidence": "Negotiates this connection's capability opt-ins, including experimentalApi, so it changes what the connection may afterwards call"
+    },
+    {
+      "method": "thread.start",
+      "class": "mutation",
+      "evidence": "Creates a thread and subscribes this connection to its turn and item events"
+    },
+    {
+      "method": "thread.resume",
+      "class": "mutation",
+      "evidence": "Loads a stored thread so later turns append to it"
+    },
+    {
+      "method": "thread.fork",
+      "class": "mutation",
+      "evidence": "Copies stored history into a new thread id"
+    },
+    {
+      "method": "thread.read",
+      "class": "observation",
+      "evidence": "Reads a stored thread by id without resuming it or subscribing to it"
+    },
+    {
+      "method": "thread.list",
+      "class": "observation",
+      "evidence": "Pages through stored thread logs"
+    },
+    {
+      "method": "thread.turns.list",
+      "class": "observation",
+      "evidence": "Pages through a stored thread's turn history without resuming it"
+    },
+    {
+      "method": "thread.loaded.list",
+      "class": "observation",
+      "evidence": "Lists the thread ids currently loaded in memory"
+    },
+    {
+      "method": "thread.unsubscribe",
+      "class": "mutation",
+      "evidence": "Drops this connection's subscription; when it was the last one the server unloads the thread after a no-subscriber grace period"
+    },
+    {
+      "method": "thread.archive",
+      "class": "mutation",
+      "evidence": "Moves a thread's log into the archived directory and attempts the same for descendant logs that are not already archived"
+    },
+    {
+      "method": "thread.delete",
+      "class": "mutation",
+      "evidence": "Permanently deletes a persisted thread and its spawned descendants"
+    },
+    {
+      "method": "thread.compact.start",
+      "class": "mutation",
+      "evidence": "Rewrites the thread's conversation history by compaction"
+    },
+    {
+      "method": "thread.inject-items",
+      "class": "mutation",
+      "evidence": "Appends items to a loaded thread's model-visible history and persists them"
+    },
+    {
+      "method": "thread.shell-command",
+      "class": "unsupported",
+      "evidence": "Runs a command outside the sandbox with full access and does not inherit the thread sandbox policy"
+    },
+    {
+      "method": "turn.start",
+      "class": "mutation",
+      "evidence": "Starts generation against the thread and writes to the workspace the sandbox policy allows"
+    },
+    {
+      "method": "turn.steer",
+      "class": "mutation",
+      "evidence": "Appends user input to the turn named by expectedTurnId, which must be the active turn"
+    },
+    {
+      "method": "turn.interrupt",
+      "class": "mutation",
+      "evidence": "Cancels the in-flight turn, which ends with status interrupted"
+    },
+    {
+      "method": "review.start",
+      "class": "mutation",
+      "evidence": "Starts a reviewer run for the thread and streams review items"
+    },
+    {
+      "method": "model.list",
+      "class": "observation",
+      "evidence": "Lists available models and their effort options"
+    },
+    {
+      "method": "mcp-server.tool.call",
+      "class": "mutation",
+      "evidence": "Calls a tool on a configured MCP server, whose effect this table cannot bound"
+    },
+    {
+      "method": "command.exec",
+      "class": "unsupported",
+      "evidence": "Runs a command under the server sandbox with no thread or turn to bind it to"
+    },
+    {
+      "method": "process.spawn",
+      "class": "unsupported",
+      "evidence": "Starts a process session outside the Codex sandbox"
+    },
+    {
+      "method": "config.value.write",
+      "class": "unsupported",
+      "evidence": "Writes a key into the user's config.toml on disk"
+    },
+    {
+      "method": "config.batch-write",
+      "class": "unsupported",
+      "evidence": "Applies configuration edits to the user's config.toml on disk"
+    },
+    {
+      "method": "fs.read-file",
+      "class": "unsupported",
+      "evidence": "Reads an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "fs.write-file",
+      "class": "unsupported",
+      "evidence": "Writes an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "fs.remove",
+      "class": "unsupported",
+      "evidence": "Removes an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "account.read",
+      "class": "credential",
+      "evidence": "Reports the signed-in account and authentication state; the broker keeps the answer"
+    },
+    {
+      "method": "account.login.start",
+      "class": "credential",
+      "evidence": "Begins a login that carries an API key or a ChatGPT authorisation flow"
+    },
+    {
+      "method": "account.logout",
+      "class": "unsupported",
+      "evidence": "Discards the stored credentials of the account the person signed in with"
+    },
+    {
+      "method": "thread.started",
+      "class": "observation",
+      "evidence": "Reports that a thread was created or resumed"
+    },
+    {
+      "method": "thread.closed",
+      "class": "observation",
+      "evidence": "Reports that the last subscriber left and the thread was unloaded"
+    },
+    {
+      "method": "thread.status.changed",
+      "class": "observation",
+      "evidence": "Reports a loaded thread's runtime status"
+    },
+    {
+      "method": "thread.queue.changed",
+      "class": "observation",
+      "evidence": "Reports that the thread's queued input changed; the notification names the thread and carries no queue contents"
+    },
+    {
+      "method": "turn.started",
+      "class": "observation",
+      "evidence": "Reports that a turn began and names its id"
+    },
+    {
+      "method": "turn.completed",
+      "class": "observation",
+      "evidence": "Reports the turn's final status"
+    },
+    {
+      "method": "turn.diff.updated",
+      "class": "observation",
+      "evidence": "Reports the turn's accumulated diff"
+    },
+    {
+      "method": "item.started",
+      "class": "observation",
+      "evidence": "Reports an item the turn began, such as a command execution or a file change"
+    },
+    {
+      "method": "item.completed",
+      "class": "observation",
+      "evidence": "Reports an item's final state"
+    },
+    {
+      "method": "item.agent-message.delta",
+      "class": "observation",
+      "evidence": "Streams assistant message text"
+    },
+    {
+      "method": "server-request.resolved",
+      "class": "observation",
+      "evidence": "Reports that a pending server request was answered or cleared"
+    },
+    {
+      "method": "warning",
+      "class": "observation",
+      "evidence": "Reports a non-fatal runtime warning"
+    },
+    {
+      "method": "error",
+      "class": "observation",
+      "evidence": "Reports an error the server raised outside a request"
+    },
+    {
+      "method": "item.command-execution.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer runs or refuses a command; answering changes what the agent does"
+    },
+    {
+      "method": "item.file-change.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer applies or refuses a file change"
+    },
+    {
+      "method": "item.permissions.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer grants network or filesystem permissions, optionally for the whole session"
+    },
+    {
+      "method": "item.tool.request-user-input",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer becomes tool input the model acts on"
+    },
+    {
+      "method": "mcp-server.elicitation.request",
+      "class": "mutation",
+      "evidence": "A reverse request from a downstream MCP server whose answer it receives as structured input"
+    },
+    {
+      "method": "account.chatgpt-auth-tokens.refresh",
+      "class": "credential",
+      "evidence": "A reverse request for refreshed ChatGPT tokens; the broker answers it and never passes the tokens to a component"
+    }
+  ],
+  "decision_destination": null,
+  "volatile_forwarding": false,
+  "qualification_note": "Qualified against Codex CLI 0.155.1 (npm @openai/codex), whose macOS arm64 executable is sha256 8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e, the App Server documentation at learn.chatgpt.com/docs/app-server and the JSON Schema that binary's generate-json-schema writes, both read 2026-09-20. Every wire name here is in that schema except process/spawn, which the documentation describes as experimental behind the experimentalApi capability and which no request union lists. The table covers the connection between the broker and the App Server; the native --remote client speaks WebSocket and is the gateway listener's. max_message_bytes is this host's bound, not one the vendor states. Volatile forwarding is untested. fixtures/frames.json pins the evidence."
+}

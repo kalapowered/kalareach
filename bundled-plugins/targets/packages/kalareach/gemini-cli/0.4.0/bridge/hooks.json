@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "kalareach",
+            "command": "kr-hook gemini-cli hook",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "kalareach",
+            "command": "kr-hook gemini-cli hook",
+            "timeout": 1000
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "kalareach",
+            "command": "kr-hook gemini-cli hook",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

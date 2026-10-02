@@ -10,6 +10,8 @@
 //! `fixtures/plugins/catalogue/development/` at a named commit. A suite that only ever verified
 //! its own output would prove that this code agrees with itself.
 
+// Each suite that includes the support module uses what it needs of it.
+#[allow(dead_code)]
 mod support;
 
 use std::collections::BTreeSet;

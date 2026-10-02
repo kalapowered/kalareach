@@ -1,0 +1,279 @@
+{
+  "corpus_version": 1,
+  "protocol": "gemini-cli-acp",
+  "tested_version": "0.60.0",
+  "source": "Two frames are the exact requests sent to the installed Gemini CLI 0.60.0 over its standard streams with --acp, and one more is such a request with the working directory it named replaced; one is an update that build sent back, shown with its command list shortened. The rest are written from names present in that build and are marked as written, because observing them needs a live turn.",
+  "frames": [
+    {
+      "situation": "the capability negotiation that opens a connection",
+      "note": "This exact request was sent to the installed build and answered, which is where the agent's capabilities and authentication methods came from",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": true,
+              "writeTextFile": true
+            },
+            "terminal": true
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "initialize",
+        "method": "initialize",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 1,
+        "members": {
+          "params.protocolVersion": 1
+        }
+      }
+    },
+    {
+      "situation": "a method the table does not route",
+      "note": "The installed build answered -32601 for this name, and a name the table does not list is a mutation whatever the upstream says about it",
+      "provenance": "captured",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "kalareach/not-a-method",
+        "params": {}
+      },
+      "expect": {
+        "wire_name": "kalareach/not-a-method",
+        "method": null,
+        "direction": null,
+        "class": "mutation",
+        "request_id": 2
+      }
+    },
+    {
+      "situation": "creating an execution",
+      "note": "This exact request was sent to the installed build, with the working directory it named replaced by a neutral path so no machine's own layout is published here. It answered with a session identifier, its approval modes and its model list.",
+      "provenance": "abridged_capture",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/new",
+        "params": {
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      "expect": {
+        "wire_name": "session/new",
+        "method": "session.new",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": 3,
+        "members": {
+          "params.cwd": "/workspace"
+        }
+      }
+    },
+    {
+      "situation": "the agent's own update stream",
+      "note": "Observed from the installed build after it created a session; the command list it carried is shown with its first two entries",
+      "provenance": "abridged_capture",
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "bdb28d92-9c9f-40c3-bb31-922f62160358",
+          "update": {
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+              {
+                "name": "memory",
+                "description": "Manage memory."
+              },
+              {
+                "name": "memory show",
+                "description": "Shows the current memory contents."
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "session/update",
+        "method": "session.update",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": null,
+        "members": {
+          "params.update.sessionUpdate": "available_commands_update"
+        }
+      }
+    },
+    {
+      "situation": "a tool call the agent is waiting on",
+      "note": "A reverse request: the agent asks and the client answers, which is why it is not a report. This name is in the installed build; the request itself needs a live turn and was not observed",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "session/request_permission",
+        "params": {
+          "sessionId": "sess-01",
+          "toolCall": {
+            "toolCallId": "call-7",
+            "title": "Run rm -rf build"
+          },
+          "options": [
+            {
+              "optionId": "allow-once",
+              "name": "Allow once",
+              "kind": "allow_once"
+            },
+            {
+              "optionId": "reject-once",
+              "name": "Reject",
+              "kind": "reject_once"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "session/request_permission",
+        "method": "session.request-permission",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": 17,
+        "members": {
+          "params.toolCall.toolCallId": "call-7"
+        }
+      }
+    },
+    {
+      "situation": "a file read in the agent's own environment",
+      "note": "A reverse read. It changes nothing, and it has to run where the agent runs rather than wherever a client is attached",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "fs/read_text_file",
+        "params": {
+          "sessionId": "sess-01",
+          "path": "/workspace/README.md"
+        }
+      },
+      "expect": {
+        "wire_name": "fs/read_text_file",
+        "method": "fs.read-text-file",
+        "direction": "upstream_to_host",
+        "class": "observation",
+        "request_id": 18,
+        "members": {
+          "params.path": "/workspace/README.md"
+        }
+      }
+    },
+    {
+      "situation": "a process started in the agent's own environment",
+      "note": "A reverse terminal request. It starts something, so it is a mutation, and the broker scopes the resources it gets",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "id": 19,
+        "method": "terminal/create",
+        "params": {
+          "sessionId": "sess-01",
+          "command": "cargo",
+          "args": [
+            "test"
+          ]
+        }
+      },
+      "expect": {
+        "wire_name": "terminal/create",
+        "method": "terminal.create",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": 19,
+        "members": {
+          "params.command": "cargo"
+        }
+      }
+    },
+    {
+      "situation": "ending the turn in flight",
+      "note": "The specification defines this as a notification, which carries no identifier. Sent as a request the installed build answers method not found, and it was not exercised as a notification",
+      "provenance": "written",
+      "frame": {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {
+          "sessionId": "sess-01"
+        }
+      },
+      "expect": {
+        "wire_name": "session/cancel",
+        "method": "session.cancel",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": null,
+        "members": {
+          "params.sessionId": "sess-01"
+        }
+      }
+    }
+  ],
+  "evidence": {
+    "executable": {
+      "path": "node_modules/@google/gemini-cli/bundle/gemini.js",
+      "platform": "any",
+      "version": "0.60.0",
+      "distribution": "npm @google/gemini-cli",
+      "sha256": "fdff028b293149897b948a23b5d8da9e622127182a523be46d82cf267e7816f2",
+      "note": "The digest is of the entry script npm puts on the path. The inspected bundle chunks, and the vendor documents beside them, are pinned under inspected."
+    },
+    "handshake": {
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "gemini-cli",
+        "title": "Gemini CLI",
+        "version": "0.60.0"
+      },
+      "promptCapabilities": {
+        "image": true,
+        "audio": true,
+        "embeddedContext": true
+      },
+      "acp_flag": "--acp; --experimental-acp is accepted and the build marks it deprecated"
+    },
+    "read_on": "2026-09-20",
+    "inspected": [
+      {
+        "path": "node_modules/@google/gemini-cli/bundle/gemini-7INSUCPB.js",
+        "sha256": "161262ce223dc85a784bba05cd618e9ad3ea7065da557f417110dbba98b37052",
+        "note": "One of the three bundle chunks that carry every reverse agent-protocol method name this table routes"
+      },
+      {
+        "path": "node_modules/@google/gemini-cli/bundle/gemini-LUNNHKPJ.js",
+        "sha256": "98beff1e92ab73a131632832e5785ef761e2dca9257cb5a0bc8d606cfcd11ab2",
+        "note": "The second of those three chunks"
+      },
+      {
+        "path": "node_modules/@google/gemini-cli/bundle/gemini-ZTU7EMI3.js",
+        "sha256": "b6498ba094610cdf303598bce0ed2c116aedcf0ab9d26d691be5dbb7cd8bf6ef",
+        "note": "The third of those three chunks"
+      },
+      {
+        "path": "node_modules/@google/gemini-cli/bundle/docs/hooks/reference.md",
+        "sha256": "103bab9f0f8fd7251b97d06c6b7c4e52752427bf23cbacd1379f2aecaaf26e4c",
+        "note": "The vendor hook reference shipped with this build, which names the hook events and the output members"
+      },
+      {
+        "path": "node_modules/@google/gemini-cli/bundle/docs/cli/acp-mode.md",
+        "sha256": "812af1001c110f474a624c3026c31e66519ca95c251d1f79679d8ebd56edd779",
+        "note": "The vendor document for the agent-protocol mode shipped with this build"
+      }
+    ]
+  }
+}
