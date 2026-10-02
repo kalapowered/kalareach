@@ -34,8 +34,8 @@ Some announcements are taken and produce nothing. One about a session the daemon
 held back until the closure is read to its end, because its condition ends with the session; so is a
 pending question or approval that names a session being closed. One routed to the input lease holder
 is not for a destination of this host. One decided while privacy mode was on is never sent after it
-ends, even when quiet hours held it back and released it later: the store keeps the time an
-announcement was first decided through its release.
+ends, even when quiet hours held it back and released it later: the store keeps the privacy state a
+decision was made under through its release.
 
 ## What travels, and what does not
 
@@ -83,7 +83,9 @@ device's own record, where its revocation and its expiry are written. It is deci
 the device's own requests is: on the continuous clock and on UTC, under the host's policy and under
 the rights ceiling its configuration holds. A grant in the grant store that was issued to a device
 is only as good as the device's own pairing. That pairing has to be in force too, on both clocks,
-and it is read again once the policy's lock is held.
+and it is read again once the policy's lock is held. A destination whose rule names a grant of the
+grant store issued to a paired device is told nothing once that pairing has ended, as the device's
+own requests would not be served either.
 
 The grant is asked three times: when the notification is produced, when it is claimed, and once more
 after the credential has been renewed, which can wait on the gateway. That last asking comes before
@@ -316,11 +318,13 @@ alert, grouped on the device by its rule and the privacy generation and by nothi
 session. It is the only thing the outbox takes under the fence, and it is admitted in the same
 transaction as its event. Every other announcement decided while privacy mode is on is taken from
 the store and settled with nothing produced, and it is never sent after privacy mode ends, because
-turning privacy mode off cannot reconstruct what was withheld. The journal records when privacy mode
-was last turned off, and an announcement decided at or before that moment is dropped. One decided
-between the state being published as off and the journal lifting its fence is dropped too. A journal
-brought forward from an earlier build that had been through privacy mode records the time of that
-migration as the moment privacy mode ended, because the earlier build did not record when.
+turning privacy mode off cannot reconstruct what was withheld. The store stamps each decision with
+the privacy state it was made under, and an announcement decided while privacy mode was on is
+dropped once it is off, whatever either clock says. One decided before the store stamped decisions
+has only the time it was decided at, and is dropped when that time is at or before the moment
+privacy mode was last turned off. A journal brought forward from an earlier build that had been
+through privacy mode records the time of that migration as the moment privacy mode ended, because
+the earlier build did not record when.
 
 The alerts are the only rows of the generation the fence stands at. Cleanup acts on rows of earlier
 generations, so running it again at every start leaves them alone, and turning privacy mode off
