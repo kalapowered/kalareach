@@ -61,9 +61,10 @@ jobs:
             python: python3
             exe: ''
             describe: kr-describe-model/kr-describe-inference
-          # macOS 14 itself, so the floor is started on the baseline it names.
+          # The hosted Apple Silicon runners start at macOS 15, so the Apple Silicon executables
+          # are started there. Their 14.0 floor is read from their headers, as the Intel ones are.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             python: python3
             exe: ''
             describe: kr-describe-model/kr-describe-inference
