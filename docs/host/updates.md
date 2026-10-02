@@ -98,7 +98,10 @@ store has a bound: a release's files and an environment's lock file are opened w
 link or waiting for a writer, the release archive without waiting for one (a link a person names it
 by is followed), and an environment's registry is read by the controller's own reader, as it is
 and with nothing made beside it, which refuses a link, and what is not a regular file, before it
-opens anything, so a pipe in any of these places is refused; the system's own tool that says
+opens anything, so a pipe in any of these places is refused; a registry that records an earlier
+schema is opened for writing only after the same checks, and a `-shm` file beside a registry that
+is not a regular file is refused too, and a program other than this host's that has the registry
+open is waited for at most five seconds for each statement; the system's own tool that says
 its version is given ten seconds and is ended if it prints more than 4096 bytes, whatever a
 program it starts does; and a program that starts in a release that is being removed or replaced
 waits for that removal for at most thirty seconds.
@@ -130,12 +133,13 @@ Only the current release's `kr` updates the host. An update, in order:
    does not stop, because its attempt is over, holds the update: the daemons not yet told resume,
    and those already told are waited for to have gone, up to thirty seconds from the last telling,
    before anything is started again. Once every daemon has stopped, it holds every environment's
-   lock and reads every environment's registry as it is. A log that a daemon ended by a signal
-   left beside the registry is taken into its file first, as the daemon's own stop would have; a
-   registry that is a link, or is not a regular file, is refused before anything is opened, and the
-   run then starts again what it stopped and exits with 1. A worker at a level the new release does
-   not retain, a worker that does not answer its challenge and has not ended, and a session still
-   being started each hold the update;
+   lock, brings forward any registry that records an earlier schema (see "Environments whose daemon
+   did not run"), and reads every environment's registry as it is. A log that a daemon ended by a
+   signal left beside the registry is taken into its file first, as the daemon's own stop would
+   have; a registry that is a link, or is not a regular file, is refused before anything is opened,
+   and the run then starts again what it stopped and exits with 1. A worker at a level the new
+   release does not retain, a worker that does not answer its challenge and has not ended, and a
+   session still being started each hold the update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started
    before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
@@ -231,6 +235,52 @@ named either.
 A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
 worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says
 in its log which session it has left running unreached, and why.
+
+## Environments whose daemon did not run
+
+When a control daemon starts, it migrates its registry if needed to the schema it reads for its
+release. This migration does not run for all environments of a host, for instance if a second user
+account, container or WSL distribution with a control daemon has not had its daemon run since an
+earlier schema step. The update command only reads the registry at the schema for its release.
+
+When a registry is at an earlier schema, the update command migrates it. It does this once every
+daemon has stopped and it has taken the install lock and the lock for each environment, for each
+environment whose registry records an earlier schema. It runs the registry migration for the
+environment, the same as the control daemon does when it starts, and then it classes the registry
+the same as other registries at the schema for the release for the command. It does not migrate a
+registry at the same schema as the running release. The migration commits for each step,
+so if the update command fails part way through, the registry will be at the version for the last
+step that completed and the current release will continue from that point. With `--json`, it
+includes in the `carried` list in the output the details for each registry it brings forward: the
+environment, the schema it was at and the schema the migration brought it to.
+
+The update command carries forward a registry to the schema of the release that runs it, because
+that is the only release whose migration code the running program has. The registry will remain at
+this schema until the control daemon for the environment runs for the new release the first time, or
+until a later update carries it on. Changes in the registry's rows that a schema after the running
+release's makes will not apply to the environment until that time.
+
+If the update command cannot carry forward a registry, for instance because the registry is at a
+later schema than the release reads, is missing a table or the command fails to carry forward the
+registry for a step, it exits with status 1. It reports the environment and schema of the registry
+it failed to carry forward, then starts again every daemon it stopped from the release still current
+and does not switch the release. It never makes a table again, empty, for a registry that is missing
+one, because the command would then not detect any running worker when it reads the empty registry.
+An update that waits or fails after it carried a registry says in its message which registries it
+had carried, which were then at the schema this release reads, and names any recorded environment it
+could not reach, as below. A check carries nothing. An update to the release that is already
+current, once it has settled any update an earlier run left part way, looks at no environment. So
+neither lists a carried registry.
+
+The update command does not fail if it cannot find the state for an environment. The store will list
+the roots served by a previous control daemon for the environment, but the update command cannot
+look at the identity for the environment because what holds it is not there, perhaps because the
+container or distribution has stopped or a directory has been unmounted. It reports the roots and
+reason in the outcome of a finished update or of a check, or as `not_reached` with `--json`, and
+continues with the other environments. If a control daemon is running for the environment, it is
+not handed over and keeps the release it runs. The update command does stop, before it stops anything, if
+it fails in any other way to look at an identity; a link, or a file that is not a regular file, is
+among those failures.
 
 ## When an update stops part way
 
