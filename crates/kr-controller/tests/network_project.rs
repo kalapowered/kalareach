@@ -2865,6 +2865,100 @@ async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
     host.stop().await;
 }
 
+/// The acceptance record is where a confirmation is spent, so the device it names is held to the
+/// keys it names in the same transaction: a device that rotated its preview key after the owner
+/// confirmed, and before the record was written, is not authorised by that confirmation. The
+/// controls are the same confirmation before the rotation, and the owner's own location after it,
+/// which names no device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_holds_the_keys_it_names()
+ {
+    use kr_project::policy::{Enlargement, OwnerAuthority as _};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let held = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let authority =
+        kr_controller::project::HostOwner::new(std::sync::Arc::clone(host.network().pairing()));
+    let rights = || {
+        [ActionRight::ProjectCreate, ActionRight::WorkspaceManage]
+            .into_iter()
+            .collect()
+    };
+    let enlargement = |digest: u8, destination| Enlargement {
+        action_digest: kr_protocol::scalars::Digest256::from_bytes([digest; 32]),
+        rights: rights(),
+        destination,
+    };
+    let proof_for = |digest: u8, destination| {
+        let request = authority
+            .challenge(&enlargement(digest, destination))
+            .expect("a challenge for the location");
+        signed_by(&owner, &request)
+    };
+    let now = kr_ipc::now_ms;
+    let rows = host.network().pairing().rows();
+
+    // Every challenge is issued before the device rotates its key.
+    let before = proof_for(0x71, Some(held.grant.grant_id));
+    let late = proof_for(0x72, Some(held.grant.grant_id));
+    let own = proof_for(0x73, None);
+
+    rows.record_consumed(&before, "project.location", now())
+        .expect("the control: while the device holds the keys the confirmation names, it is spent");
+    assert!(
+        rows.acceptance(before.request.confirmation_id)
+            .expect("the acceptance record is read")
+            .is_some_and(|accepted| accepted.consumed_at_ms.is_some()),
+        "the control's confirmation is recorded as consumed"
+    );
+
+    let rotated = host
+        .network()
+        .devices()
+        .update_preview_key(
+            held.device_id,
+            kr_protocol::scalars::NotificationPreviewKey::from_bytes([0x9d; 32]),
+            kr_protocol::ids::DeviceKeyRevision::new(held.device_key_revision.get() + 1),
+        )
+        .expect("the device rotates its preview key");
+    assert!(matches!(
+        rotated,
+        kr_controller::service::net::devices::PreviewKeyOutcome::Recorded
+    ));
+
+    let refusal = rows
+        .record_consumed(&late, "project.location", now())
+        .expect_err("a confirmation naming keys the device no longer holds is not recorded");
+    assert!(
+        matches!(
+            refusal,
+            kr_controller::error::ControllerError::Refused {
+                code: ErrorCode::OwnerConfirmationRequired,
+                ..
+            }
+        ),
+        "the refusal asks the owner to confirm again, not a store failure: {refusal:?}"
+    );
+    assert!(
+        rows.acceptance(late.request.confirmation_id)
+            .expect("the acceptance record is read")
+            .is_none(),
+        "the refused confirmation leaves no record, so nothing was spent"
+    );
+
+    rows.record_consumed(&own, "project.location", now())
+        .expect("the control: the owner's own location names no device and is spent");
+    host.stop().await;
+}
+
 /// A device that has not declared all four keys cannot be named in a confirmation, and the owner
 /// is told to have it declare them first. Once it has, the same request is given its challenge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
