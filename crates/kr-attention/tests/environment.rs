@@ -2217,7 +2217,7 @@ fn a_replay_that_finds_a_held_condition_again_keeps_the_time_of_the_held_decisio
     );
     assert_eq!(
         only_item(&attention).decided_at_ms,
-        Some(TimestampMs::new(NOW + later)),
+        Some(TimestampMs::new(NOON + later)),
         "and dated when it was decided"
     );
 }
