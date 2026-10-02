@@ -1926,4 +1926,23 @@ mod tests {
             "{refusal}"
         );
     }
+    /// A clock behind the time the client kept at an earlier load is a clock that went back, and is
+    /// reported under the client's own name for it, not as metadata that cannot be trusted.
+    #[test]
+    fn a_clock_behind_the_last_load_is_reported_as_one() {
+        let now: jiff::Timestamp = "2026-10-01T00:00:00Z".parse().expect("an instant");
+        let later: jiff::Timestamp = "2026-10-02T00:00:00Z".parse().expect("an instant");
+        let refusal = classify(&tough::error::Error::SystemTimeSteppedBackward {
+            sys_time: now,
+            latest_known_time: later,
+        });
+        let CatalogueError::Untrusted { detail } = refusal else {
+            panic!("a refusal of trust: {refusal:?}");
+        };
+        assert!(detail.contains("System time stepped backward"), "{detail}");
+        assert!(
+            detail.contains("the clock is behind the last load"),
+            "{detail}"
+        );
+    }
 }
