@@ -470,7 +470,7 @@ async fn an_enrolled_environments_group_is_read_from_itself_through_its_bridge()
     );
 }
 
-/// KR-REQ-03.07, D-708: a merge over independent environments is a plan the client keeps, owner-only
+/// KR-REQ-03.07: a merge over independent environments is a plan the client keeps, owner-only
 /// under its own state directory and never an environment's, until each step has its result. One
 /// environment cannot be reached when its step comes, so its step stays pending and the plan is
 /// kept; once it can be reached, `finish` sends the step and the plan is gone.
