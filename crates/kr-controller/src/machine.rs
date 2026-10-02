@@ -81,6 +81,12 @@ static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Signalled each time a call lets its record go, so the calls waiting for one look again.
 static LET_GO: Condvar = Condvar::new();
 
+/// The thread of the call that holds each record in [`WRITING`], in test builds. A test asks who
+/// holds a record, and compares the answer with the step it expects to hold it, rather than only
+/// whether somebody does.
+#[cfg(test)]
+static HOLDERS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+
 /// A record one call holds in [`WRITING`], let go when the call ends, however it ends.
 struct Holding(PathBuf);
 
@@ -88,6 +94,11 @@ impl Drop for Holding {
     fn drop(&mut self) {
         let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
         writing.retain(|record| *record != self.0);
+        #[cfg(test)]
+        HOLDERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(record, _)| *record != self.0);
         drop(writing);
         LET_GO.notify_all();
     }
@@ -548,10 +559,16 @@ impl MachineStore {
     /// answers a storage failure that says another change held the record.
     fn writer(&self, deadline: Instant, operation: &'static str) -> Result<Holding> {
         let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
-        // A test learns here that a caller has come to the record, and whether another call holds
-        // it.
+        // A test learns here that a caller has come to the record, and which thread holds it, if
+        // another call does.
         #[cfg(test)]
-        seam::locking(&self.record, writing.contains(&self.record));
+        seam::locking(
+            &self.record,
+            writing
+                .contains(&self.record)
+                .then(|| seam::holder_of(&self.record))
+                .flatten(),
+        );
         while writing.contains(&self.record) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -577,6 +594,11 @@ impl MachineStore {
             ));
         }
         writing.push(self.record.clone());
+        #[cfg(test)]
+        HOLDERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((self.record.clone(), std::thread::current().id()));
         Ok(Holding(self.record.clone()))
     }
 
@@ -630,6 +652,7 @@ mod seam {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Mutex, PoisonError};
+    use std::thread::ThreadId;
     use std::time::Duration;
 
     use super::Boundary;
@@ -652,9 +675,9 @@ mod seam {
 
     static REGISTERED: Mutex<Registered> = Mutex::new(Vec::new());
 
-    /// Callers waiting to hear that a store of their record has come to the writer lock, and
-    /// whether it found the lock held by somebody else.
-    static LOCKING: Mutex<Vec<(PathBuf, Sender<bool>)>> = Mutex::new(Vec::new());
+    /// Callers waiting to hear that a store of their record has come to the writer lock, and which
+    /// thread held the lock when it did, if one did.
+    static LOCKING: Mutex<Vec<(PathBuf, Sender<Option<ThreadId>>)>> = Mutex::new(Vec::new());
 
     /// Registers one interruption of the next publication of `record` to reach `boundary`.
     pub(super) fn register(record: &Path, boundary: Boundary, interruption: Interruption) {
@@ -664,9 +687,9 @@ mod seam {
             .push((record.to_path_buf(), boundary, interruption));
     }
 
-    /// Asks to be told, once, when a store of `record` next comes to the writer lock, and whether
-    /// it found the lock held.
-    pub(super) fn watch_lock(record: &Path, told: Sender<bool>) {
+    /// Asks to be told, once, when a store of `record` next comes to the writer lock, and which
+    /// thread held it, if it found the lock held.
+    pub(super) fn watch_lock(record: &Path, told: Sender<Option<ThreadId>>) {
         LOCKING
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -711,9 +734,19 @@ mod seam {
         }
     }
 
-    /// Tells whoever asked that a store of `record` has come to the writer lock, and whether it
-    /// found the lock held by somebody else.
-    pub(super) fn locking(record: &Path, held: bool) {
+    /// The thread that holds `record`.
+    pub(super) fn holder_of(record: &Path) -> Option<ThreadId> {
+        super::HOLDERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(held, _)| held == record)
+            .map(|(_, thread)| *thread)
+    }
+
+    /// Tells whoever asked that a store of `record` has come to the writer lock, and which thread
+    /// held it when it did, if one did.
+    pub(super) fn locking(record: &Path, holder: Option<ThreadId>) {
         let watcher = {
             let mut watching = LOCKING.lock().unwrap_or_else(PoisonError::into_inner);
             watching
@@ -722,7 +755,7 @@ mod seam {
                 .map(|index| watching.remove(index))
         };
         if let Some((_, told)) = watcher {
-            let _ = told.send(held);
+            let _ = told.send(holder);
         }
     }
 
@@ -1525,12 +1558,13 @@ mod tests {
                 let _ = opened.send(());
                 read
             });
-            let held = locking
+            let holder = locking
                 .recv_timeout(WAIT)
                 .expect("the opener came to the writer lock");
-            assert!(
-                held,
-                "the opener found the writer lock free while a step was publishing"
+            assert_eq!(
+                holder,
+                Some(step.thread().id()),
+                "the opener did not find the writer lock held by the step that was publishing"
             );
             assert!(
                 opening.try_recv().is_err(),
@@ -1602,11 +1636,12 @@ mod tests {
                 opened
             });
             for _ in 0..2 {
-                assert!(
+                assert_eq!(
                     locking
                         .recv_timeout(WAIT)
                         .expect("a call came to the record"),
-                    "a call found the record free while the first step held it"
+                    Some(first.thread().id()),
+                    "a call did not find the record held by the first step"
                 );
             }
             // The first step is held until both have answered, which is longer than the bound.
@@ -1699,11 +1734,12 @@ mod tests {
                     3_000,
                 )
             });
-            assert!(
+            assert_eq!(
                 locking
                     .recv_timeout(WAIT)
                     .expect("the second step came to the record"),
-                "the second step found the record free while the first held it"
+                Some(first.thread().id()),
+                "the second step did not find the record held by the first"
             );
             drop(resume);
             let first = first
