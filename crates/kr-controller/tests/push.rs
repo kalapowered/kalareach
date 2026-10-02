@@ -2395,6 +2395,94 @@ fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
         .expect("a read");
 }
 
+/// Section 16 stops at expiry, and the last question asked about a paired device's authority, after
+/// the credential has been renewed, waits on this host's own locks. A push whose deadline passed
+/// during that question is settled and not presented, though the authority it answers is the one it
+/// was admitted under. The control: with the clock left where it was, the same push is presented.
+#[test]
+fn a_push_that_expires_during_the_final_authority_check_is_not_presented() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The authority the push was admitted under, which has not changed.
+    #[derive(Debug, Default)]
+    struct Unchanged(AtomicUsize);
+
+    impl RecipientAuthority for Unchanged {
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+            Some(Granted(BTreeSet::new()).scope())
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(Granted(BTreeSet::new()).scope())
+        }
+    }
+
+    for slow in [false, true] {
+        let environment = environment();
+        let destination = push_destination(&environment, true);
+        environment
+            .module
+            .configure(&destination)
+            .expect("a destination");
+        take_and_produce(
+            &environment,
+            &notice(1, "an approval is waiting"),
+            std::slice::from_ref(&destination),
+            1,
+        );
+        let authority = Unchanged::default();
+        // The pass asks twice: when it claims the push, and again once the credential is in hand,
+        // which is the last time anything is asked before the push is presented. With a slow
+        // answer, the second one takes longer than the push has.
+        let clock = || {
+            if slow && authority.0.load(Ordering::Relaxed) >= 2 {
+                NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1
+            } else {
+                NOW
+            }
+        };
+        let gateway = GatewayDouble::queued();
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &gateway,
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                &ExternalDouble::answering(Vec::new()),
+                &authority,
+                &clock,
+            )
+            .expect("a pass");
+        assert_eq!(
+            authority.0.load(Ordering::Relaxed),
+            2,
+            "the authority is asked at the claim and again before the presentation"
+        );
+        assert_eq!(
+            gateway.sent().len(),
+            usize::from(!slow),
+            "a slow answer {slow}: nothing is presented after the deadline it was admitted under"
+        );
+        environment
+            .module
+            .with(|producer| {
+                let record = producer.journal().deliveries().expect("a read").remove(0);
+                assert_eq!(
+                    record.state,
+                    if slow {
+                        DeliveryState::Expired
+                    } else {
+                        DeliveryState::Accepted
+                    }
+                );
+                assert_eq!(record.dispatched, !slow);
+                Ok(())
+            })
+            .expect("a read");
+    }
+}
+
 /// Taking a rejected token out of service says one thing about the destination. A rotation that
 /// landed while the gateway was answering is not undone by it.
 #[test]
