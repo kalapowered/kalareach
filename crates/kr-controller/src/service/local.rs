@@ -70,6 +70,8 @@ impl Controller {
                 | Method::DeliveryDestinationSecretSet
                 | Method::PrivacySet
                 | Method::SessionRename
+                | Method::DescriptionConfigure
+                | Method::DescriptionDownload
         ) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }

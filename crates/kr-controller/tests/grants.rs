@@ -4449,6 +4449,121 @@ async fn a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_agai
     );
 }
 
+/// KR-REQ-09.08, KR-REQ-22.09: a description setting that was written, and the stopping of a fetch,
+/// are answered from their records when the same action is sent again with the freshness window it
+/// was sent under gone, as the other host settings are, and the setting is not written again. The
+/// control is the same retry before the restart, under the window that still stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_setting_that_was_written_is_answered_from_its_record_after_a_restart() {
+    use kr_protocol::describe::{DescriptionConfigureParams, DescriptionSetup};
+
+    let host = Serving::start().await;
+    let mut client = host.client().await;
+    let environment = kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id());
+    let battery = |on_battery: bool| DescriptionConfigureParams {
+        enabled: Nullable::null(),
+        on_battery: Nullable::some(on_battery),
+    };
+    let allowed = client
+        .compose(
+            Method::DescriptionConfigure,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x66; 16])),
+            environment.clone(),
+            &battery(true),
+        )
+        .await
+        .expect("the setting is composed");
+    let first: DescriptionSetup = client
+        .repeat(&allowed)
+        .await
+        .expect("the daemon answers")
+        .expect("the setting is written")
+        .to_typed()
+        .expect("a setup");
+    assert!(first.on_battery);
+
+    // The control: the same action under the window that stands is answered from its record.
+    let same: DescriptionSetup = client
+        .repeat(&allowed)
+        .await
+        .expect("the daemon answers")
+        .expect("the same action is answered")
+        .to_typed()
+        .expect("a setup");
+    assert_eq!(same, first);
+
+    // The stopping of a fetch that is not running writes nothing and answers with the setup, which
+    // is its record.
+    let stop = client
+        .compose(
+            Method::DescriptionDownload,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x68; 16])),
+            environment.clone(),
+            &kr_protocol::describe::DescriptionDownloadParams {
+                action: kr_protocol::describe::DescriptionDownloadAction::Cancel,
+            },
+        )
+        .await
+        .expect("the stop is composed");
+    let stopped: DescriptionSetup = client
+        .repeat(&stop)
+        .await
+        .expect("the daemon answers")
+        .expect("a fetch that is not running is stopped")
+        .to_typed()
+        .expect("a setup");
+
+    // Another action takes it back, so that a second write of the first would show.
+    let forbidden = client
+        .compose(
+            Method::DescriptionConfigure,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x67; 16])),
+            environment,
+            &battery(false),
+        )
+        .await
+        .expect("the setting is composed");
+    let second: DescriptionSetup = client
+        .repeat(&forbidden)
+        .await
+        .expect("the daemon answers")
+        .expect("the setting is written")
+        .to_typed()
+        .expect("a setup");
+    assert!(!second.on_battery);
+    drop(client);
+
+    let host = host.restart().await;
+    let mut client = host.client().await;
+    let again: DescriptionSetup = client
+        .repeat(&allowed)
+        .await
+        .expect("the daemon answers")
+        .expect("the setting is answered from its record, not refused as stale")
+        .to_typed()
+        .expect("a setup");
+    assert_eq!(again, first, "the answer the first attempt gave");
+    let stopped_again: DescriptionSetup = client
+        .repeat(&stop)
+        .await
+        .expect("the daemon answers")
+        .expect("the stop is answered from its record, not refused as stale")
+        .to_typed()
+        .expect("a setup");
+    assert_eq!(stopped_again, stopped, "the answer the first attempt gave");
+    let standing: DescriptionSetup = client
+        .request(
+            Method::DescriptionSetup,
+            &kr_protocol::describe::DescriptionSetupParams {},
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("setup reads")
+        .to_typed()
+        .expect("a setup");
+    assert!(!standing.on_battery, "the setting was not written again");
+}
+
 /// Issuing and revoking the same subtree from two threads leaves a consistent store.
 ///
 /// A smoke test rather than a regression test for the read-then-write gap: it starts two threads
