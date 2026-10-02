@@ -937,11 +937,12 @@ pub(super) struct Launches {
 /// identity recorded for it, and the launcher's own process on the other end. So a reservation that
 /// failed or was fenced before a claim never will get one, nor will one that is spawned with a
 /// launcher that has since ended, nor one that is spawned and recorded no launcher when the create
-/// that spawned it has returned: only the create records a launcher. The registry is read once to
-/// find the launches that might qualify, the launchers are asked about and the creates in progress
-/// are listed, and the registry is read again under its guard before one is believed: a claim that
-/// committed in between is one a worker ran from. A registry that cannot be read says nothing
-/// about any of them, and none is over.
+/// that spawned it has stopped waiting: only the create records a launcher, and a claim is refused
+/// where no create is waiting for it. The registry is read once to find the launches that might
+/// qualify, the launchers are asked about and the creates in progress are listed, and the registry
+/// is read again under its guard before one is believed: a claim that committed in between is one
+/// a worker ran from. A registry that cannot be read says nothing about any of them, and none is
+/// over.
 pub(super) async fn launches_over(controller: &Controller, unreached: &[SessionId]) -> Launches {
     launches_between(controller, unreached, async {}).await
 }

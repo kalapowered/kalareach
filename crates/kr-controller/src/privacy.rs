@@ -878,8 +878,8 @@ impl EnvironmentPrivacy {
     /// obligations.
     ///
     /// A launch that failed or was fenced before its worker claimed its reservation, whose launcher
-    /// has ended, or whose create returned without recording one, was never given a launch
-    /// specification, so no shell ran and nothing was retained: what its obligation recorded is not
+    /// has ended without claiming it, or whose create stopped waiting without recording a launcher,
+    /// was never given a launch specification, so no shell ran and nothing was retained: what its obligation recorded is not
     /// owed, and an obligation kept for it would be reported for good as the archive's. Each
     /// obligation is deleted from the record first, and the session forgotten only once that has
     /// landed; a delete the store refuses leaves the session owed, and the next pass tries it

@@ -515,8 +515,12 @@ async fn claimed(controller: &Controller, token: u8, then: Option<LaunchPhase>) 
 }
 
 /// Records that a create is still running for a reserved session, as the daemon does from before
-/// its reservation moves to `spawned` until the create returns.
-async fn creating(controller: &Controller, session_id: SessionId) {
+/// its reservation moves to `spawned` until the create returns. The create has returned when the
+/// hold is ended or dropped.
+async fn creating(
+    controller: &Arc<Controller>,
+    session_id: SessionId,
+) -> super::create::CreateHold {
     let reservation_id = controller
         .registry
         .lock()
@@ -526,24 +530,7 @@ async fn creating(controller: &Controller, session_id: SessionId) {
         .expect("the reservation")
         .reservation_id;
     let (ready, _answer) = tokio::sync::oneshot::channel();
-    controller
-        .pending
-        .lock()
-        .await
-        .insert(reservation_id, super::create::PendingCreate { ready });
-}
-
-/// Records that the create of a reserved session has returned.
-async fn created(controller: &Controller, session_id: SessionId) {
-    let reservation_id = controller
-        .registry
-        .lock()
-        .await
-        .reservation_for_session(session_id)
-        .expect("a read")
-        .expect("the reservation")
-        .reservation_id;
-    controller.pending.lock().await.remove(&reservation_id);
+    super::create::CreateHold::open(controller, reservation_id, Vec::new(), ready).await
 }
 
 /// Has a worker claim the reservation of an already reserved, spawned session.
@@ -615,6 +602,8 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     let mut asked: Vec<SessionId> = Vec::new();
     let mut ended: Vec<SessionId> = Vec::new();
     let mut never_started: Vec<SessionId> = Vec::new();
+    // The creates that are still running, held until the classification has been made.
+    let mut running_creates = Vec::new();
     let mut token = 0_u8;
     let mut next = || {
         token += 1;
@@ -634,7 +623,7 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     ] {
         let session_id = reserved(&controller, next(), phase).await;
         if phase == LaunchPhase::Spawned {
-            creating(&controller, session_id).await;
+            running_creates.push(creating(&controller, session_id).await);
         }
         asked.push(session_id);
         if over {
@@ -680,6 +669,7 @@ async fn a_launch_is_over_only_when_no_worker_can_still_come_of_it() {
     ended.push(unknown);
 
     let launches = super::start::launches_over(&controller, &asked).await;
+    drop(running_creates);
     let sorted = |mut sessions: Vec<SessionId>| {
         sessions.sort_unstable();
         sessions
@@ -783,7 +773,7 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
     let unstarted = reserved(&controller, 3, LaunchPhase::Reserved).await;
     // A launch whose create is still running, and has recorded no launcher yet.
     let uncertain = reserved(&controller, 4, LaunchPhase::Spawned).await;
-    creating(&controller, uncertain).await;
+    let mut create = creating(&controller, uncertain).await;
     let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
     controller
         .privacy
@@ -818,7 +808,7 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
     // The fourth is spawned, and its create returns without having recorded a launcher, as one that
     // could not say what it started does: no claim can be accepted for it any more, and it is
     // forgotten the same way.
-    created(&controller, uncertain).await;
+    create.end_wait().await;
     forgotten(&controller, &[uncertain]).await;
     assert!(!is_ended(&controller, uncertain));
     assert_eq!(
