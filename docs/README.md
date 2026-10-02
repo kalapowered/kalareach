@@ -99,7 +99,7 @@ No repository uses a Git submodule, holds a second copy of another repository's 
 in production on a path in another repository's checkout. Every dependency between them is by
 released archive digest or by Git revision, as is each dependency on the project's forks of WezTerm
 and iroh. The website's relay crate takes `kr-protocol`, `kr-cbor` and `kr-crypto` by revision, and
-this repository takes its bundled plugin package from a signed catalogue generation by digest, which
+this repository takes its bundled plugin packages from a signed catalogue generation by digest, which
 `bundled-plugins.lock` records. The catalogue's `scripts/with-local-core.sh` points one command's
 fetch of the pinned revision at a local checkout; it changes neither the revision nor the lockfile.
 
@@ -113,11 +113,15 @@ stops, so a limit that a part has is written in that part's own document.
 - **Durable sessions.** A worker process for each session owns the pseudo-terminal and the terminal
   state, and the control daemon can restart without ending a session: [host](host/README.md),
   [terminal](terminal/README.md) and [cli](cli/README.md).
-- **Agent interfaces.** A broker in each worker reads an agent's state through plugin packages for
-  Codex, Claude Code, OpenCode, Gemini CLI, Kimi and Qoder CLI, and offers typed requests to submit
-  or queue a prompt, steer or cancel a turn and answer an approval, with an approval only ever
-  created from the agent's own protocol: [the broker](host/README.md#the-broker), [the
-  bridges](bridges/claude-code/README.md) and [plugins](plugins/README.md).
+- **Agent interfaces.** Plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi and
+  Qoder CLI recognise those agents in a session, and the broker in each worker holds each binding,
+  the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
+  steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
+  what an agent offers depends on its package and its build. Claude Code's approvals are answered
+  over its bridge channel, and the Gemini CLI and Qoder CLI packages report an agent's hooks to the
+  worker. An approval is only ever created from the agent's own protocol: [the
+  broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
+  [plugins](plugins/README.md).
 - **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
   on Linux, macOS, Windows, iOS and Android: [cli](cli/README.md), [companion](companion/README.md)
   and [mobile](client/mobile.md).
@@ -127,11 +131,11 @@ stops, so a limit that a part has is written in that part's own document.
 - **Voice.** A coordinator on the host decides what a call may read and send, under a voice grant
   that a device holds apart from its ordinary grant, with an unlocked-screen confirmation for the
   actions that need one: [voice](voice/README.md) and [client voice](client/voice.md). The daemon
-  this repository builds attaches no managed voice broker, so it starts no managed call.
+  this repository builds attaches no voice provider, so no call starts on it.
 - **Encrypted push.** The host composes each notification, and a preview travels sealed to the
   receiving device's own preview key, so a service that carries it cannot read it:
-  [delivery](delivery/README.md). A phone's notification handler shows the generic alert where it
-  cannot open a preview: [mobile](client/mobile.md).
+  [delivery](delivery/README.md). Neither phone build opens a preview, so a phone shows the generic
+  alert: [mobile](client/mobile.md).
 - **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
   quiet hours and review state, and a view of what changed since an actor's last visit:
   [host](host/README.md#attention-review-and-what-changed-since-a-visit).
@@ -216,7 +220,7 @@ the native client library and only through the commands its native side names
 
 KalaReach does not adopt a terminal it did not start. Every session is a new pseudo-terminal its
 worker created, with a new root shell, made by a create request from `kr new`, the companion
-application, a paired device or a workflow. A shell or terminal window already running elsewhere is
+application or a paired device. A shell or terminal window already running elsewhere is
 never taken over.
 
 ## How the repositories are kept
@@ -227,12 +231,13 @@ directories of the common assistants, are ignored at any depth by the first sect
 repository's `.gitignore`, and no commit in any of the three has tracked one. Product files that
 look similar, such as the installable `skills/kalareach-contact/SKILL.md`, are tracked.
 
-Text in the repositories describes the product and the change. It names no task, review, build tool
-or record kept outside the repositories, and a commit message is one line with no body and no
-trailer. In this repository `scripts/check-clean-checkout.sh` refuses a tracked file that names such
-a record, a commit message longer than one line and a broken relative link. The website's `pnpm
-records:check` refuses the same kinds of record, and build-assistant files, in the commits and the
-deployment bundle it is about to send.
+Text in this repository describes the product and the change, and a commit message is one line with
+no body and no trailer. `scripts/check-clean-checkout.sh` refuses a tracked file that names a task
+or a decision identifier, a numbered review or another record kept outside the repository, a commit
+message longer than one line and a broken relative link. The website's `pnpm records:check` refuses
+coding-assistant instruction files, local work records and key material by path, and three
+credential shapes by content, in the commits it is about to send, the packages it publishes and the
+deployment bundle.
 
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
@@ -259,8 +264,8 @@ Internal interfaces change in one commit with every caller in the repository, an
 deleted. The code keeps no deprecated alias and no versioned copy of an interface that all its
 callers have left. Compatibility is kept at the boundaries where something outside the commit still
 runs or exists. A worker outlives an upgrade of the control daemon
-([host/updates.md](host/updates.md)). A store an earlier build wrote is brought forward when it is
-opened, or refused: the worker's journal migrates through a ladder with a stated window and an
+([host/updates.md](host/updates.md)). A worker's journal that an earlier build wrote is brought
+forward when it is opened, or refused: it migrates through a ladder with a stated window and an
 explicit importer for what is older ([Migrations](host/README.md#migrations)). A host and a client
 of different versions negotiate a protocol version ([Version
 negotiation](protocol/README.md#version-negotiation)). A plugin package is built for an SDK and

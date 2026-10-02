@@ -3,7 +3,9 @@
 A KalaReach release is held to seven evidence gates. This page names each gate, the evidence that
 closes it, and the commands and suites in this repository that produce that evidence. A gate is
 closed for a commit when the evidence in its second column exists for that commit, and a release is
-made from a commit whose gates are closed, with the one exception recorded below. Each command
+made from a commit whose gates are closed, with the one exception recorded below. The managed
+services gate also needs its evidence at the web repository's commit that the deployed services
+run. Each command
 produces the part of the evidence its own header describes. A result that no command here can
 produce, such as audio after a hardware screen lock on a handset, comes from a run on the platform
 itself.
