@@ -4660,6 +4660,41 @@ mod tests {
         );
     }
 
+    /// A lift that waits for another writer records the time it got the write lock, not the time
+    /// it was asked: a decision made while it waited is dated at or before the time recorded, so
+    /// it is dropped with the rest of what was decided under privacy mode.
+    #[test]
+    fn a_lift_that_waits_for_another_writer_records_the_time_it_got_the_lock() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let mut journal = DeliveryJournal::open(&path).expect("a journal");
+        journal.fence(1).expect("a fence");
+        let other = rusqlite::Connection::open(&path).expect("another writer");
+        other
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the write lock is held");
+
+        let (asked, hears) = std::sync::mpsc::channel();
+        let lifting = std::thread::spawn(move || {
+            asked.send(()).expect("the test is listening");
+            journal.lift_fence(2).expect("a lift");
+            journal
+        });
+        hears.recv().expect("the lift was asked for");
+        // The clock moves on while the lift is waiting for the lock, and the lock is let go after.
+        let began = wall_ms();
+        while wall_ms() <= began {
+            std::thread::yield_now();
+        }
+        let released = wall_ms();
+        other.execute_batch("COMMIT").expect("the lock is let go");
+        let journal = lifting.join().expect("the lift ended");
+        assert!(
+            journal.lifted_at_ms().expect("a read") >= released,
+            "the lift is dated when it held the lock"
+        );
+    }
+
     /// A take made under a generation says so, and a journal at another takes nothing; an event
     /// taken before a boundary and not produced from is decided by the walk that finds it, and
     /// never stands in front of the ones after it.
