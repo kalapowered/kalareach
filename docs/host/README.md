@@ -4164,7 +4164,7 @@ tried again, and a list gives the session as the registry holds it. A paired dev
 worker's description only when the decision it is written under lets the device read the session
 (`session.view`).
 
-The session list includes all unclosed sessions from the session registry. A session whose worker cannot answer, a session created but not yet reported for by any worker, and a reservation that recovery has not resolved are each listed from the registry's own rows, as `live`, `creating` or `closing`. If the session was created with a specific shell and/or directory, these will be shown. Size is the requested session size. The session list is only held for two times 5 seconds if there is a worker connected that does not respond.
+The session list includes all unclosed sessions from the session registry. A session whose worker cannot answer, a session created but not yet reported for by any worker, and a reservation that recovery has not resolved are each listed from the registry's own rows, as `live`, `creating` or `closing`. If the session was created with a specific shell and/or directory, these will be shown. Size is the requested session size, or the invisible default where the create named none. The daemon asks the workers in turn, and each connected worker that does not respond holds the session list for up to two times 5 seconds.
 
 ## Recovery
 
