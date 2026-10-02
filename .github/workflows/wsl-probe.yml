@@ -16,7 +16,7 @@ name: wsl-probe
 
 on:
   push:
-    branches: ["task/T-025b-phase2"]
+    branches: ["task/T-025b-phase2-rebased1"]
     paths: [".github/workflows/wsl-probe.yml"]
   workflow_dispatch:
     inputs:
