@@ -978,6 +978,7 @@ fn run_daemon(arguments: &[String]) -> i32 {
             ),
             data_access: None,
             target: build_target().to_owned(),
+            processor: crate::processor::Features::running(),
         },
         catalogue,
         MetGates::default(),

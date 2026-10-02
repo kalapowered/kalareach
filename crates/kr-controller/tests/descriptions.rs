@@ -26,6 +26,7 @@ use kr_controller::service::Controller;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
 use kr_describe::budget::GIB;
+use kr_describe::processor::{Feature, Features};
 use kr_describe::resource::{HostConditions, PowerSource, ThermalState};
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Output, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
@@ -353,6 +354,9 @@ struct Setup {
     /// The real description process in place of the stub, which then chooses from the profiles
     /// this build ships, and the files that are linked in as the model's.
     real: Option<Real>,
+    /// The target the host believes it was built for and the instruction sets it believes its
+    /// processor has, in place of this machine's own.
+    machine: Option<(String, Features)>,
 }
 
 /// The real description process, and the files linked in place of the model's.
@@ -371,6 +375,7 @@ impl Setup {
             catalogue: None,
             held: true,
             real: None,
+            machine: None,
         }
     }
 }
@@ -398,6 +403,22 @@ fn catalogue() -> TestCatalogue {
         revision: 1,
         candidate: false,
         targets: Some(vec![kr_describe::environment::build_target().to_owned()]),
+        assets: vec![TestAsset {
+            file_name: WEIGHTS_FILE.to_owned(),
+            url: "http://127.0.0.1:1/tiny.gguf".to_owned(),
+            bytes: WEIGHTS.to_vec(),
+        }],
+    }])
+}
+
+/// The profiles the daemon may choose from on a host built for `target`, whatever machine the test
+/// runs on.
+fn catalogue_for(target: &str) -> TestCatalogue {
+    TestCatalogue::sign(&[TestProfile {
+        profile_id: "tiny-default".to_owned(),
+        revision: 1,
+        candidate: false,
+        targets: Some(vec![target.to_owned()]),
         assets: vec![TestAsset {
             file_name: WEIGHTS_FILE.to_owned(),
             url: "http://127.0.0.1:1/tiny.gguf".to_owned(),
@@ -671,6 +692,9 @@ impl Environment {
             setup.conditions,
             setup.abandon,
         );
+        if let Some((target, processor)) = setup.machine {
+            placed.set_machine(&target, processor);
+        }
         match (&setup.real, setup.held) {
             (Some(real), true) => {
                 let files: Vec<(&str, &std::path::Path)> = real
@@ -1038,6 +1062,40 @@ impl Environment {
             .expect("setup reads")
             .to_typed()
             .expect("decodes")
+    }
+
+    /// Asks for the fetch at the daemon's local socket and returns what the daemon says in refusing
+    /// it.
+    async fn download_refused(&self, action: DescriptionDownloadAction) -> String {
+        let mut client = self.host.client().await;
+        client
+            .mutate(
+                Method::DescriptionDownload,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.environment_id()),
+                &DescriptionDownloadParams { action },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect_err("a host with no model to fetch refuses the fetch")
+            .message
+    }
+
+    /// What `kr doctor` says of descriptions, as the daemon's diagnostics answer it.
+    async fn descriptions_check(&self) -> kr_protocol::hostinfo::DoctorCheck {
+        let mut client = self.host.client().await;
+        let doctor: kr_protocol::hostinfo::HostDoctorResult = client
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the diagnostics")
+            .to_typed()
+            .expect("the diagnostics decode");
+        doctor
+            .checks
+            .into_iter()
+            .find(|check| check.id() == "descriptions")
+            .expect("the diagnostics have a check of descriptions")
     }
 
     /// Changes the owner's settings at the daemon's local socket.
@@ -1641,6 +1699,99 @@ async fn setup_shows_the_cost_first_and_a_setting_applies_at_once_and_disabling_
         environment.figures().started >= 2 && environment.figures().jobs.published >= 2
     })
     .await;
+    environment.stop().await;
+}
+
+/// KR-REQ-22.01, KR-REQ-22.03: a host whose processor lacks an instruction set the description
+/// process's build uses offers no model and starts no process. Setup, the refusal of a fetch,
+/// `kr doctor` and the session's description each say so and name the sets, and the session keeps
+/// its title. The control is the same sequence on a processor that has them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_processor_without_an_instruction_set_the_process_uses_is_named_and_starts_no_process() {
+    let target = "x86_64-unknown-linux-gnu";
+    let lacking = Features::of([Feature::Sse42, Feature::Avx, Feature::Fma, Feature::F16c]);
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_for(target)),
+        machine: Some((target.to_owned(), lacking)),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    until("the host tracks the session", || {
+        environment.figures().sessions >= 1
+    })
+    .await;
+
+    let why = "this processor lacks AVX2 and BMI2, which the description process needs";
+    let shown = environment
+        .setup_until("the reason", |shown| {
+            shown
+                .unavailable
+                .0
+                .as_deref()
+                .is_some_and(|said| said.contains("lacks"))
+        })
+        .await;
+    assert!(!shown.offered);
+    assert_eq!(shown.unavailable.0.as_deref(), Some(why));
+    assert_eq!(shown.profile_id.0, None);
+
+    let refused = environment
+        .download_refused(DescriptionDownloadAction::Start)
+        .await;
+    assert!(refused.contains(why), "{refused}");
+
+    let check = environment.descriptions_check().await;
+    assert_eq!(
+        check.status,
+        kr_protocol::hostinfo::DoctorStatus::NotApplicable
+    );
+    assert!(
+        check
+            .detail()
+            .starts_with("this processor lacks AVX2 and BMI2, which the description process needs"),
+        "{}",
+        check.detail()
+    );
+
+    let described = environment
+        .describe_until("the pause", session_id, |described| {
+            described.paused.0 == Some(DescriptionPause::NoModelHere)
+        })
+        .await;
+    assert_eq!(described.state, DescriptionState::ResourcePaused);
+    assert_eq!(described.source, LabelSource::Metadata);
+    assert!(described.activity_text.0.is_none());
+
+    assert_eq!(environment.figures().started, 0, "no process was started");
+    assert!(environment.figures().pid.is_none());
+    assert_eq!(environment.stubs_started(), 0);
+    environment.stop().await;
+
+    // The control: the same host and the same session on a processor that has every set offers the
+    // model, shows no reason, and describes the session with a process of its own.
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_for(target)),
+        machine: Some((target.to_owned(), Features::of(Feature::X86_64))),
+        ..Setup::new()
+    })
+    .await;
+    let session_id = environment.workers[0].session_id;
+    let shown = environment
+        .setup_until("the offer", |shown| shown.offered)
+        .await;
+    assert_eq!(shown.unavailable.0, None);
+    assert_eq!(shown.profile_id.0.as_deref(), Some("tiny-default"));
+    environment.workers[0].report("make", "/home/a/kalareach", None);
+    environment
+        .describe_until("the description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert!(environment.stubs_started() >= 1);
+    let check = environment.descriptions_check().await;
+    assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Ok);
     environment.stop().await;
 }
 

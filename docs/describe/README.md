@@ -87,6 +87,14 @@ If a fetch is cancelled or fails, the partial and every file of the profile it h
 
 The process checks each file again at every load. A file it finds changed ends the load as `assets`. That is no failure of inference: it starts no restart delay and counts toward no pause. The host marks the files as not held and removes the marker, and setup shows nothing fetched, so fetching again recovers it. Once the files are held, they are not fetched again.
 
+## The processor
+
+On x86-64, the description process requires a processor with the SSE4.2, AVX, AVX2, BMI2, FMA, and F16C instruction sets. This is because the code in llama.cpp for the CPU is compiled when the process is compiled. A processor without those instruction sets stops the process with an illegal instruction the first time it loads a model. Intel Core processors from the Haswell generation in 2013 and AMD processors from the Zen generation in 2017 have all of those instruction sets. Older processors, some low-power processors, and some virtual machines that don't expose the instruction sets to the virtual machine don't. This requirement is not present for other targets, including ARM64.
+
+The build fixes the set and never reads it from the machine that compiles. In the `.cargo/config.toml` file, the options for those instruction sets in llama.cpp are forced on, while wider instruction sets are turned off. If a `target-cpu` flag is passed that would override those settings, `kr-describe-model` will not build for x86-64 targets. The required instruction sets are also listed in the `kr_describe::processor` module, and there is a test to ensure that the two lists are equal.
+
+The daemon asks the processor which of them it has before it selects a profile. On a processor that lacks one, no profile is selected and the description process is never started. A session shows the title it has from metadata or a pin. `description.setup` answers `offered: false` and names the missing instruction sets in `unavailable`, for example "this processor lacks AVX2 and BMI2, which the description process needs". `description.download` refuses and gives the same reason, and `kr doctor` reports descriptions as not applicable and says which instruction sets are missing. No setting changes this.
+
 ## Setup
 
 `description.setup` answers what descriptions offer on this host before anything is fetched. It says whether the host can run a model at all, whether the owner has enabled descriptions, the profile, its exact size in bytes, the addresses a fetch would reach, how a fetch is going, whether it can be cancelled, and what state inference is in and why it is paused. It never says a hosted account is needed, because none is. It is a read, served on the local socket and to a paired device whose grant carries host management.

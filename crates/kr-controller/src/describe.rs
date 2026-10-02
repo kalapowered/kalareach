@@ -272,6 +272,22 @@ impl DescribeModule {
                 Sentence::new().stated("this daemon is not generating session descriptions"),
                 None,
             ),
+            Some(snapshot)
+                if snapshot
+                    .setup
+                    .as_ref()
+                    .is_some_and(|setup| !setup.processor_lacks.is_empty()) =>
+            {
+                let lacks = snapshot
+                    .setup
+                    .as_ref()
+                    .map_or(&[][..], |setup| setup.processor_lacks.as_slice());
+                (
+                    DoctorStatus::NotApplicable,
+                    processor_lacks_sentence(lacks),
+                    None,
+                )
+            }
             Some(_) if !settings.enabled => (
                 DoctorStatus::NotApplicable,
                 Sentence::new().stated("descriptions are off; nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
@@ -691,9 +707,13 @@ impl crate::service::Controller {
         carried: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
         let Some(profile) = host.profile().cloned() else {
+            let detail = match host.snapshot().setup.and_then(|setup| setup.unavailable) {
+                Some(why) => format!("this host has no model to fetch: {why}"),
+                None => "this host has no model to fetch".to_owned(),
+            };
             return Err(ControllerError::Refused {
                 code: kr_protocol::error::ErrorCode::ResourceUnavailable,
-                detail: "this host has no model to fetch".to_owned(),
+                detail,
             });
         };
         if host.snapshot().setup.is_some_and(|setup| !setup.offered) {
@@ -829,6 +849,29 @@ pub const fn serves(method: kr_protocol::method::Method) -> bool {
     )
 }
 
+/// What the diagnostics say when the processor lacks instruction sets the description process
+/// needs: which, and that titles come from what a session has.
+fn processor_lacks_sentence(
+    lacks: &[kr_describe::processor::Feature],
+) -> kr_protocol::hostinfo::export::Sentence {
+    use kr_protocol::hostinfo::export::Sentence;
+
+    let mut sentence = Sentence::new().stated("this processor lacks ");
+    for (index, feature) in lacks.iter().enumerate() {
+        if index > 0 {
+            sentence = sentence.stated(if index + 1 == lacks.len() {
+                " and "
+            } else {
+                ", "
+            });
+        }
+        sentence = sentence.stated(feature.as_str());
+    }
+    sentence.stated(
+        ", which the description process needs, so nothing is generated on this host, and a session shows the title it has from metadata or a pin",
+    )
+}
+
 /// The word a pause is reported under.
 const fn pause_word(pause: DescriptionPause) -> &'static str {
     match pause {
@@ -849,6 +892,8 @@ pub(crate) struct Placement {
     pub(crate) program: std::path::PathBuf,
     pub(crate) environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub(crate) catalogue: kr_describe::profile::catalogue::Catalogue,
+    pub(crate) target: String,
+    pub(crate) processor: kr_describe::processor::Features,
     pub(crate) clock: host::Clock,
     pub(crate) conditions: Option<Arc<Mutex<kr_describe::resource::HostConditions>>>,
     pub(crate) abandon: bool,

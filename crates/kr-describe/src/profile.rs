@@ -772,6 +772,7 @@ pub mod catalogue {
         DescribeError, Gate, ModelProfile, ProfileDocument, ProfileRevision, ProfileTrust,
         QualificationGate, Result, SignedProfile,
     };
+    use crate::processor::{Feature, Features};
 
     /// The default profile's document, compiled into this binary.
     pub const DEFAULT_PROFILE_DOCUMENT: &str = include_str!("../profiles/minicpm5-2b-q4-k-m.json");
@@ -843,6 +844,9 @@ pub mod catalogue {
     pub enum NotSelected {
         /// The profile does not list this target.
         IncompatibleTarget,
+        /// The processor lacks instruction sets the description process built for this target
+        /// needs, whichever profile is asked for.
+        ProcessorLacks(Vec<Feature>),
         /// The profile is a candidate and these gates have not been met on this host.
         GatesOutstanding(Vec<QualificationGate>),
     }
@@ -870,6 +874,21 @@ pub mod catalogue {
             match self {
                 Self::Profile(profile) => Some(profile),
                 Self::DeterministicMetadata { .. } => None,
+            }
+        }
+
+        /// Returns the instruction sets the processor lacks, when that is why no profile was
+        /// selected.
+        #[must_use]
+        pub fn processor_lacks(&self) -> Option<&[Feature]> {
+            match self {
+                Self::Profile(_) => None,
+                Self::DeterministicMetadata { reasons } => {
+                    reasons.iter().find_map(|(_, why)| match why {
+                        NotSelected::ProcessorLacks(lacks) => Some(lacks.as_slice()),
+                        NotSelected::IncompatibleTarget | NotSelected::GatesOutstanding(_) => None,
+                    })
+                }
             }
         }
     }
@@ -1008,23 +1027,33 @@ pub mod catalogue {
         /// Chooses the profile this host runs.
         ///
         /// The default is considered first, whatever order the catalogue was built from, and it is
-        /// chosen when this target is one it lists. A candidate is chosen only when the owner has
+        /// chosen when this target is one it lists and the processor has every instruction set the
+        /// description process built for the target uses. A candidate is chosen only when the owner has
         /// recorded every gate it declares, which is what *may be enabled only after meeting the
         /// same declared platform/resource/quality gates* means. When neither answers, the answer
         /// is deterministic metadata.
         ///
         /// Nothing about the host's *condition* reaches this function: there is no memory figure,
-        /// no timeout, no previous failure and no output quality in its arguments. That is section
+        /// no timeout, no previous failure and no output quality in its arguments. The processor's
+        /// instruction sets are what the machine is and never how it is doing. That is section
         /// 22's rule that pressure, a timeout or bad output never selects a different model,
         /// expressed as an absence rather than as a branch somebody could add.
         #[must_use]
-        pub fn select(&self, target: &str, met: &MetGates) -> Selection {
+        pub fn select(&self, target: &str, processor: &Features, met: &MetGates) -> Selection {
             let mut reasons = Vec::new();
             for profile in self.profiles() {
                 if !profile.supports_target(target) {
                     reasons.push((
                         profile.profile_id().to_owned(),
                         NotSelected::IncompatibleTarget,
+                    ));
+                    continue;
+                }
+                let lacking = processor.lacking(target);
+                if !lacking.is_empty() {
+                    reasons.push((
+                        profile.profile_id().to_owned(),
+                        NotSelected::ProcessorLacks(lacking),
                     ));
                     continue;
                 }

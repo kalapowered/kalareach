@@ -189,6 +189,7 @@ fn the_description_process_runs_the_real_model() {
             ),
             data_access: None,
             target: build_target().to_owned(),
+            processor: kr_describe::processor::Features::running(),
         },
         catalogue,
         MetGates::default(),

@@ -59,6 +59,7 @@ use crate::priority::Cancellation;
 use crate::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
 };
+use crate::processor::{self, Feature, Features};
 use crate::profile::catalogue::{Catalogue, MetGates, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
 use crate::queue::{Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding};
@@ -139,13 +140,16 @@ pub struct SetupState {
     pub needs_hosted_account: bool,
     /// Why this host offers nothing, when it offers nothing.
     pub unavailable: Option<String>,
+    /// The instruction sets the processor lacks, when that is why this host offers nothing.
+    pub processor_lacks: Vec<Feature>,
 }
 
 /// Where a description service runs.
 ///
-/// The three facts travel together because no one of them decides anything on its own: the
+/// The facts travel together because no one of them decides anything on its own: the
 /// environment says what kind of host this is, the choice is what a WSL distribution needs before
-/// its data may cross, and the target is what a profile has to list before it can be mapped.
+/// its data may cross, the target is what a profile has to list before it can be mapped, and the
+/// processor is what the description process built for that target has to find to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPlacement {
     /// The execution environment.
@@ -154,6 +158,9 @@ pub struct HostPlacement {
     pub data_access: Option<DataAccessChoice>,
     /// The target triple this build runs on.
     pub target: String,
+    /// The instruction sets the processor this runs on has, which the description process built
+    /// for the target has to find there.
+    pub processor: Features,
 }
 
 /// One job, as it is sent to the description process.
@@ -680,8 +687,9 @@ impl DescriptionService {
             environment,
             data_access: choice,
             target,
+            processor,
         } = host;
-        let selection = catalogue.select(&target, &met);
+        let selection = catalogue.select(&target, &processor, &met);
         let budgets = Budgets::DEFAULTS;
         let policy = ResourcePolicy::new(settings, budgets);
         Self {
@@ -962,8 +970,19 @@ impl DescriptionService {
     #[must_use]
     pub fn setup_state(&self) -> SetupState {
         let placement = self.environment.placement(self.choice.as_ref());
+        let processor_lacks = self
+            .selection
+            .processor_lacks()
+            .map(<[Feature]>::to_vec)
+            .unwrap_or_default();
         let unavailable = match placement {
             Placement::Refused(refusal) => Some(refusal.as_str().to_owned()),
+            Placement::Local | Placement::NativeHostBroker if !processor_lacks.is_empty() => {
+                Some(format!(
+                    "this processor lacks {}, which the description process needs",
+                    processor::names(&processor_lacks)
+                ))
+            }
             Placement::Local | Placement::NativeHostBroker => None,
         };
         let policy = self
@@ -984,6 +1003,7 @@ impl DescriptionService {
             // assets come from their publisher, and the inference is local.
             needs_hosted_account: false,
             unavailable,
+            processor_lacks,
         }
     }
 

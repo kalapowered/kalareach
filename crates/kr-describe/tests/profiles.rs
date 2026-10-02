@@ -18,6 +18,7 @@ use kr_describe::metadata::{
     LabelSource, LifecycleFacts, RepositoryFacts, SessionFacts, SessionLabel, VerifiedStatus,
     deterministic_title,
 };
+use kr_describe::processor::Features;
 use kr_describe::profile::catalogue::builtin_trust;
 use kr_describe::profile::catalogue::{Catalogue, MetGates, NotSelected, Selection};
 use kr_describe::profile::{
@@ -217,7 +218,7 @@ fn the_default_profile_is_minicpm_and_smollm_is_a_gated_candidate() {
     );
 
     // With no gates met, the default is what a host runs.
-    let selection = catalogue.select(MAC, &MetGates::default());
+    let selection = catalogue.select(MAC, &Features::running(), &MetGates::default());
     assert_eq!(
         selection.profile().map(ModelProfile::profile_id),
         Some("minicpm5-2b-q4-k-m")
@@ -226,15 +227,16 @@ fn the_default_profile_is_minicpm_and_smollm_is_a_gated_candidate() {
 
 /// KR-REQ-22.07: pressure, a timeout and bad output never select a larger model.
 ///
-/// The proof is the selection's arguments. It takes a target and the gates an owner recorded, and
-/// nothing else: there is no memory figure, no deadline and no previous failure it could branch on.
+/// The proof is the selection's arguments. It takes a target, the instruction sets the processor
+/// has and the gates an owner recorded, and nothing else: there is no memory figure, no deadline
+/// and no previous failure it could branch on.
 /// What a host under pressure does instead is pause, and its title falls back to metadata.
 #[test]
 fn pressure_a_timeout_and_bad_output_never_select_a_larger_model() {
     let catalogue = built_in();
     let chosen = |met: &MetGates| {
         catalogue
-            .select(MAC, met)
+            .select(MAC, &Features::running(), met)
             .profile()
             .map(|profile| profile.profile_id().to_owned())
     };
@@ -254,7 +256,7 @@ fn pressure_a_timeout_and_bad_output_never_select_a_larger_model() {
     // A host on a target neither profile lists falls back to deterministic metadata rather than to
     // a bigger model.
     let Selection::DeterministicMetadata { reasons } =
-        catalogue.select("mips64-unknown-linux-gnuabi64", &all)
+        catalogue.select("mips64-unknown-linux-gnuabi64", &Features::running(), &all)
     else {
         panic!("an unlisted target selects no profile");
     };
@@ -623,7 +625,7 @@ fn the_default_is_chosen_whatever_order_the_catalogue_was_built_from() {
     );
     assert_eq!(
         reversed
-            .select(MAC, &MetGates::all())
+            .select(MAC, &Features::running(), &MetGates::all())
             .profile()
             .map(ModelProfile::profile_id),
         Some("minicpm5-2b-q4-k-m"),
