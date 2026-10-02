@@ -873,7 +873,9 @@ impl AttentionModule {
     /// nor one whose records it has finished reading, and about one closed over a worker this host
     /// could not account for: a closing session's pending questions and approvals end when the
     /// store has read what is left of its journal, and an announcement taken before that is one
-    /// about a condition that is about to end. What is held back is offered again.
+    /// about a condition that is about to end. A pending question or approval that names a session
+    /// without having been raised from it is held back while that session is being closed. What is
+    /// held back is offered again.
     ///
     /// # Errors
     ///
@@ -886,9 +888,9 @@ impl AttentionModule {
         let held: BTreeSet<SessionId> = {
             let engine = store.engine().map_err(refusal)?;
             let origins = self.origins();
-            engine
+            let by_origin = engine
                 .items()
-                .flat_map(|item| item.origin.session().into_iter().chain(named_by(item)))
+                .filter_map(|item| item.origin.session())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .filter(|session_id| {
@@ -897,8 +899,16 @@ impl AttentionModule {
                     !reads
                         || origins.closing.contains(session_id)
                         || origins.unaccounted.contains(session_id)
-                })
-                .collect()
+                });
+            // A request the environment's own sources raise about a session ends with the session
+            // as one of the session's own does, so it waits while the session is being closed. It
+            // does not wait for a session this host has not read: the environment can name one it
+            // never held, and nothing would ever let it go.
+            let by_name = engine
+                .items()
+                .filter_map(named_by)
+                .filter(|session_id| origins.closing.contains(session_id));
+            by_origin.chain(by_name).collect()
         };
         let offer = |item: &kr_attention::engine::Item| {
             item.origin
@@ -4902,9 +4912,9 @@ mod tests {
         offered_for(&module, "an item of the environment", true);
 
         // A pending approval an environment record raises about a session ends with the session
-        // as one of the session's own does, so it is held with it, and offered once the session
-        // is read. The control: the same session's failed command, which the session's ending does
-        // not end, is offered whatever the session's state.
+        // as one of the session's own does, so it is held back while the session is being closed.
+        // The controls: it is offered for a session the host has not read, which nothing would
+        // ever let go of otherwise, and again once the closing is over.
         let temp = kr_ipc::testing::TempHost::create();
         let module = self::module(&temp);
         let named = SessionId::new(kr_ipc::new_uuid());
@@ -4920,8 +4930,14 @@ mod tests {
                 },
             )])
             .expect("the store records the approval");
-        offered_for(&module, "an approval naming a session not read", false);
-        let _worker = linked(&temp, 2, &module, named).await;
-        offered_for(&module, "an approval naming a session read", true);
+        offered_for(&module, "an approval naming a session not read", true);
+        module.origins().closing.insert(named);
+        offered_for(&module, "an approval naming a session being closed", false);
+        module.origins().closing.remove(&named);
+        offered_for(
+            &module,
+            "an approval naming a session no longer closing",
+            true,
+        );
     }
 }
