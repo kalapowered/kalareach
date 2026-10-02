@@ -750,6 +750,43 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
         "a list another account was granted is refused"
     );
 
+    // A list that names only trusted accounts but is inherited from the directory above is
+    // refused, because that directory can widen it at any time. The parent here grants nobody
+    // outside the trusted accounts and the account running this test, so the inherited list is
+    // refused for being inherited and for nothing else; the same list made the directory's own and
+    // protected is the control that passes.
+    let parent = std::env::temp_dir().join(format!("kr-we-parent-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&parent).expect("a parent directory");
+    let account = std::env::var("USERNAME").expect("the account this test runs as");
+    run(
+        "icacls.exe",
+        &[parent.as_os_str(), "/inheritance:r".as_ref()],
+    );
+    run(
+        "icacls.exe",
+        &[
+            parent.as_os_str(),
+            "/grant".as_ref(),
+            "*S-1-5-18:(OI)(CI)F".as_ref(),
+            "*S-1-5-32-544:(OI)(CI)F".as_ref(),
+            format!("{account}:(OI)(CI)F").as_ref(),
+        ],
+    );
+    let inherited = parent.join("child");
+    std::fs::create_dir(&inherited).expect("a child that inherits the parent's list");
+    let refused = kr_worker::broker::process::check_private_directory(&inherited)
+        .expect_err("a list inherited from the directory above is not protected");
+    assert!(
+        refused.to_string().contains("inherits"),
+        "it is the inheritance that refuses it, not an account it names: {refused}"
+    );
+    run(
+        "icacls.exe",
+        &[inherited.as_os_str(), "/inheritance:d".as_ref()],
+    );
+    kr_worker::broker::process::check_private_directory(&inherited)
+        .expect("the same entries, now the directory's own and protected, pass");
+
     // A link is refused as a link, whatever list it carries. The junction's own list is made as
     // closed as the host's own, so that the list is not what refuses it: the same list on a plain
     // directory is the control that passes, and only the link check is left to refuse the junction.
@@ -780,7 +817,7 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
     );
 
     let _ = std::fs::remove_dir(&link);
-    for directory in [&private, &ordinary, &widened, &control] {
+    for directory in [&private, &ordinary, &widened, &control, &parent] {
         let _ = std::fs::remove_dir_all(directory);
     }
 }
