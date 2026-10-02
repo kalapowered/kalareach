@@ -3226,12 +3226,12 @@ mod tests {
     }
 
     /// A decision quiet hours hold back while privacy mode is on, over an approval the feed has not
-    /// taken yet, is the decision the release hands over when the hours end after privacy mode has,
-    /// and it was made while the mode was on: the take that settles the approval before it, and a
-    /// restart of the store, leave that, and it is never sent. The control: the same flow with no
-    /// private period sends it.
+    /// taken yet, is dated and stamped as that approval is, a decision of the generation before:
+    /// the take in privacy mode settles the approval with no alert, a restart of the store keeps
+    /// the stamp, and the release when the hours end after privacy mode has is never sent. The
+    /// control: the same flow with no private period sends it.
     #[test]
-    fn a_held_decision_made_in_privacy_mode_is_dropped_after_the_approval_before_it_is_taken_and_a_restart()
+    fn a_decision_held_in_privacy_mode_over_an_untaken_approval_is_dropped_with_it_and_after_a_restart()
      {
         use kr_attention::PrivacyStamp;
         use kr_protocol::attention::QuietHours;
@@ -3304,6 +3304,11 @@ mod tests {
                 assert_eq!(
                     taken.taken, 1,
                     "the approval before it is taken and settled"
+                );
+                assert_eq!(
+                    (taken.alerts, taken.dropped, taken.across_privacy),
+                    (0, 1, 1),
+                    "a decision of the generation before gets no alert"
                 );
                 assert_eq!(attention.awaiting_delivery().expect("a count"), 0);
             }
