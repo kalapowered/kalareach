@@ -33,7 +33,7 @@ natively and then started on the machine that built it. None is only cross-built
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | `ubuntu-22.04` |
 | `aarch64-unknown-linux-gnu` | `ubuntu-22.04-arm` |
-| `aarch64-apple-darwin` | `macos-14`, the baseline itself |
+| `aarch64-apple-darwin` | `macos-15`; the hosted Apple Silicon runners start at macOS 15 |
 | `x86_64-apple-darwin` | `macos-15-intel`; the hosted Intel runners start at macOS 15 |
 | `x86_64-pc-windows-msvc` | `windows-2025` |
 | `aarch64-pc-windows-msvc` | `windows-11-arm` |
