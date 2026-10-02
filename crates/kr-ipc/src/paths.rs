@@ -3034,7 +3034,9 @@ mod tests {
     }
 
     fn no_home() -> Result<PathBuf> {
-        panic!("the home directory is not needed where the runtime directory is the distribution's own")
+        panic!(
+            "the home directory is not needed where the runtime directory is the distribution's own"
+        )
     }
 
     /// A WSL machine's graphical service sets the runtime directory inside a mount that every
