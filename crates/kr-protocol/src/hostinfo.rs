@@ -1311,7 +1311,8 @@ pub mod configuration {
          themselves are names in the user's own named-pipe namespace rather than files"
     } else {
         "$XDG_RUNTIME_DIR/kalareach/<prefix>, or ~/.cache/kalareach/run/<prefix> where that \
-         variable is not set"
+         variable is not set or names a directory under /mnt/wslg, which every WSL distribution \
+         on the machine shares"
     };
 
     /// Where this platform puts the configuration document, as this build documents it.

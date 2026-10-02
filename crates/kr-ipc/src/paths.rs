@@ -2802,11 +2802,54 @@ fn default_runtime_root() -> Result<PathBuf> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn default_runtime_root() -> Result<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
+    runtime_root_in(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        Path::new(SHARED_BETWEEN_DISTRIBUTIONS),
+        home_directory,
+    )
+}
+
+/// The mount a WSL machine's graphical service shares between every distribution that runs on it.
+///
+/// Where that service is installed it sets `XDG_RUNTIME_DIR` to a directory in this mount, and the
+/// mount is one directory of the virtual machine, not one of the distribution: another
+/// distribution can open what is written there.
+#[cfg(all(unix, not(target_os = "macos")))]
+const SHARED_BETWEEN_DISTRIBUTIONS: &str = "/mnt/wslg";
+
+/// Where this installation keeps its runtime files on Linux.
+///
+/// The user's runtime directory, `runtime_dir`, is used when it names one and the directory is the
+/// distribution's own. A directory inside `shared` is not: the control socket and every worker's
+/// socket would be reachable from each other distribution on the machine, and a distribution is a
+/// separate environment. The home directory is the distribution's own, so the runtime files go
+/// below it, as they do where no runtime directory is named.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the home directory is needed and is not known.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn runtime_root_in(
+    runtime_dir: Option<std::ffi::OsString>,
+    shared: &Path,
+    home: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(value) = runtime_dir
+        && !is_inside(Path::new(&value), shared)
+    {
         return Ok(PathBuf::from(value).join("kalareach"));
     }
-    let home = home_directory()?;
-    Ok(home.join(".cache").join("kalareach").join("run"))
+    Ok(home()?.join(".cache").join("kalareach").join("run"))
+}
+
+/// Whether `path`, where it really lies, is `shared` or inside it.
+///
+/// Both are resolved through their links where they exist. Where one does not, the name it has is
+/// all there is to compare, so a machine without the shared mount still refuses a name inside it.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn is_inside(path: &Path, shared: &Path) -> bool {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    resolved(path).starts_with(resolved(shared))
 }
 
 #[cfg(windows)]
@@ -2984,6 +3027,92 @@ mod tests {
         let base = std::env::temp_dir().join(format!("kr-{name}-{}", &suffix[..6]));
         create_private_tree(&base, &base).expect("temporary directory");
         base
+    }
+
+    fn home() -> Result<PathBuf> {
+        Ok(PathBuf::from("/home/kala"))
+    }
+
+    fn no_home() -> Result<PathBuf> {
+        panic!("the home directory is not needed where the runtime directory is the distribution's own")
+    }
+
+    /// A WSL machine's graphical service sets the runtime directory inside a mount that every
+    /// distribution on the machine shares, so the runtime files go below the home directory
+    /// instead: one environment's sockets are never reachable from another.
+    #[test]
+    fn a_runtime_directory_inside_the_shared_mount_is_not_the_runtime_root() {
+        let root = temporary_root("shared-runtime");
+        let shared = root.join("wslg");
+        std::fs::create_dir_all(shared.join("runtime-dir")).expect("the shared mount");
+        let private = PathBuf::from("/home/kala/.cache/kalareach/run");
+        for named in [shared.join("runtime-dir"), shared.clone()] {
+            assert_eq!(
+                runtime_root_in(Some(named.clone().into()), &shared, home).expect("a root"),
+                private,
+                "{} is shared",
+                named.display()
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory that is not named inside the shared mount but resolves into it is as shared as
+    /// the one that is: `/run/user/<uid>` is a link to it where the service puts it there.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_directory_that_resolves_into_the_shared_mount_is_not_the_runtime_root() {
+        let root = temporary_root("linked-runtime");
+        let shared = root.join("wslg");
+        std::fs::create_dir_all(shared.join("runtime-dir")).expect("the shared mount");
+        let linked = root.join("user-1000");
+        std::os::unix::fs::symlink(shared.join("runtime-dir"), &linked).expect("a link");
+        assert_eq!(
+            runtime_root_in(Some(linked.into()), &shared, home).expect("a root"),
+            PathBuf::from("/home/kala/.cache/kalareach/run")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The shared mount is named whether or not this machine has it, so a runtime directory inside
+    /// a mount that is not there is still not used.
+    #[test]
+    fn a_runtime_directory_below_a_shared_mount_this_machine_lacks_is_not_the_runtime_root() {
+        let root = temporary_root("absent-shared");
+        let shared = root.join("wslg");
+        assert_eq!(
+            runtime_root_in(Some(shared.join("runtime-dir").into()), &shared, home)
+                .expect("a root"),
+            PathBuf::from("/home/kala/.cache/kalareach/run")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The controls: a runtime directory of the distribution's own is the root as it always was,
+    /// including one whose name only begins like the shared mount's; and with none named the root
+    /// is below the home directory.
+    #[test]
+    fn a_runtime_directory_of_the_distributions_own_is_the_runtime_root() {
+        let root = temporary_root("own-runtime");
+        let shared = root.join("wslg");
+        std::fs::create_dir_all(&shared).expect("the shared mount");
+        let alike = root.join("wslg-other").join("run");
+        std::fs::create_dir_all(&alike).expect("a directory named like it");
+        for own in [
+            PathBuf::from("/run/user/1000"),
+            alike.clone(),
+            root.join("elsewhere"),
+        ] {
+            assert_eq!(
+                runtime_root_in(Some(own.clone().into()), &shared, no_home).expect("a root"),
+                own.join("kalareach")
+            );
+        }
+        assert_eq!(
+            runtime_root_in(None, &shared, home).expect("a root"),
+            PathBuf::from("/home/kala/.cache/kalareach/run")
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
