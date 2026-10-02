@@ -2237,7 +2237,8 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
 /// left as it is. The rewritten row keeps its claim and its time.
 ///
 /// One immediate transaction, so two processes opening one store change a row once, and a row
-/// already in this build's shape is not touched, so a second open writes nothing.
+/// already in this build's shape does not decode as the earlier one and is not touched, so a second
+/// open writes nothing.
 ///
 /// Remove this upgrade, with [`EarlierRevocationResult`], once no supported upgrade starts from a
 /// build that stored a revocation's answer without totals.
@@ -2245,15 +2246,15 @@ fn migrate_revocation_answers(connection: &Connection) -> Result<()> {
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-    // A revocation's answer names its grants under `revoked_grants`, and this build's answer also
-    // names `revoked_grants_total`: only rows that carry the first and not the second can be in the
-    // earlier shape. The decode below decides.
+    // A revocation's answer names its grants under `revoked_grants`, so a result that holds no such
+    // text is not one. What holds it is decided by the decode below, which accepts only the earlier
+    // shape: an answer in this build's shape carries a field the earlier one did not, and is left as
+    // it is.
     let candidates: Vec<(String, Vec<u8>, Vec<u8>)> = transaction
         .prepare(
             "SELECT actor_id, action_id, result FROM authority_receipts
               WHERE result IS NOT NULL
-                AND instr(result, CAST('revoked_grants' AS BLOB)) > 0
-                AND instr(result, CAST('revoked_grants_total' AS BLOB)) = 0",
+                AND instr(result, CAST('revoked_grants' AS BLOB)) > 0",
         )
         .and_then(|mut statement| {
             statement
@@ -2302,7 +2303,7 @@ fn migrate_revocation_answers(connection: &Connection) -> Result<()> {
 #[serde(deny_unknown_fields)]
 struct EarlierRevocationResult {
     authority_revision: kr_protocol::ids::AuthorityRevision,
-    revoked_grants: Vec<GrantId>,
+    revoked_grants: kr_protocol::scalars::CanonicalSet<GrantId>,
     barrier: EarlierRevocationBarrier,
 }
 
@@ -2354,7 +2355,7 @@ impl EarlierRevocationResult {
             .collect();
         kr_protocol::sharing::RevocationResult::bounded(
             self.authority_revision,
-            self.revoked_grants,
+            self.revoked_grants.iter().copied(),
             RevocationBarrier::new(self.barrier.authority_revision, workers),
         )
     }
@@ -2863,7 +2864,7 @@ mod tests {
     }
 
     /// A revocation's answer in the shape an earlier build stored: every list whole.
-    fn earlier_answer(grants: usize, names: usize) -> EarlierRevocationResult {
+    fn earlier_answer(grants: usize, names: usize, detail: &str) -> EarlierRevocationResult {
         use kr_protocol::action::{BarrierState, FencedAction, PossiblyExecutedAction};
         use kr_protocol::ids::ActorId;
         use kr_protocol::scalars::U64;
@@ -2900,7 +2901,7 @@ mod tests {
                         .collect(),
                     omitted_actions: U64::new(0),
                     names_pending: U64::new(0),
-                    detail: "the worker fenced it".to_owned(),
+                    detail: detail.to_owned(),
                 }],
             },
         }
@@ -2918,8 +2919,9 @@ mod tests {
         drop(GrantDirectory::open(&path).expect("the store is created"));
 
         let grants = kr_cbor::Limits::DEFAULT.max_collection_len + 5;
-        let earlier = kr_cbor::to_canonical_vec(&earlier_answer(grants, 5_000))
-            .expect("the earlier shape encodes");
+        let earlier =
+            kr_cbor::to_canonical_vec(&earlier_answer(grants, 5_000, "the worker fenced it"))
+                .expect("the earlier shape encodes");
         assert!(
             kr_cbor::from_canonical_slice::<RevocationResult>(&earlier, &kr_cbor::Limits::DEFAULT)
                 .is_err(),
@@ -2934,10 +2936,39 @@ mod tests {
         )]))
         .expect("a map encodes");
         write_raw_receipt(&path, 2, &other);
-        let current = kr_cbor::to_canonical_vec(&earlier_answer(2, 1).cut()).expect("encodes");
+        let current =
+            kr_cbor::to_canonical_vec(&earlier_answer(2, 1, "the worker fenced it").cut())
+                .expect("encodes");
         write_raw_receipt(&path, 3, &current);
-        let small = kr_cbor::to_canonical_vec(&earlier_answer(3, 2)).expect("encodes");
+        let small = kr_cbor::to_canonical_vec(&earlier_answer(3, 2, "the worker fenced it"))
+            .expect("encodes");
         write_raw_receipt(&path, 4, &small);
+        // Answers in the earlier shape whose own words hold the name of the field this build added,
+        // one small and one larger than a frame carries.
+        let wordy = kr_cbor::to_canonical_vec(&earlier_answer(3, 2, "revoked_grants_total"))
+            .expect("encodes");
+        write_raw_receipt(&path, 5, &wordy);
+        // A grant list the earlier type would have refused, naming one grant twice: not an answer
+        // an earlier build wrote, so it is left as it is.
+        #[derive(serde::Serialize)]
+        struct Repeating {
+            authority_revision: AuthorityRevision,
+            revoked_grants: Vec<GrantId>,
+            barrier: EarlierRevocationBarrier,
+        }
+        let shaped = earlier_answer(3, 1, "the worker fenced it");
+        let twice = GrantId::new(Uuid::from_bytes([0x11; 16]));
+        let repeating = kr_cbor::to_canonical_vec(&Repeating {
+            authority_revision: shaped.authority_revision,
+            revoked_grants: vec![twice, twice],
+            barrier: shaped.barrier,
+        })
+        .expect("encodes");
+        write_raw_receipt(&path, 7, &repeating);
+        let wordy_large =
+            kr_cbor::to_canonical_vec(&earlier_answer(grants, 5_000, "revoked_grants_total"))
+                .expect("encodes");
+        write_raw_receipt(&path, 6, &wordy_large);
 
         drop(GrantDirectory::open(&path).expect("the store opens and upgrades the row"));
 
@@ -2975,6 +3006,23 @@ mod tests {
                 .expect("a small answer is read in this build's shape");
         assert_eq!(small_read.revoked_grants.len(), 3);
         assert_eq!(small_read.revoked_grants_total.get(), 3);
+
+        assert_eq!(
+            raw_receipt(&path, 7).0,
+            repeating,
+            "a grant list the earlier type refused is left as it is"
+        );
+        for (action, expected_grants) in [(5_u8, 3_usize), (6, grants)] {
+            let read: RevocationResult = kr_cbor::from_canonical_slice(
+                &raw_receipt(&path, action).0,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect(
+                "an earlier answer whose words name the new field is read in this build's shape",
+            );
+            assert_eq!(read.revoked_grants_total.get(), expected_grants as u64);
+            assert_eq!(read.barrier.workers[0].detail, "revoked_grants_total");
+        }
 
         let written = raw_receipt(&path, 1).0;
         drop(GrantDirectory::open(&path).expect("the store opens again"));
