@@ -930,6 +930,56 @@ async fn a_retry_that_looked_before_another_step_settled_its_claim_is_answered_f
     }
 }
 
+/// KR-REQ-03.07: a retry of an unfinished step whose record cannot be read now is told that, and
+/// that `host.doctor` says why, and not that a change cannot be confirmed to survive a crash. A wrote
+/// the record and its attempt ended before its receipt; the record then becomes unreadable; A's retry
+/// is an outcome nobody knows that names no path; once the record is whole again it is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_that_finds_the_record_unreadable_is_pointed_at_the_doctor() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let record = host.tree().environment().state_dir().join(RECORD_FILE);
+
+    host.controller().lose_the_next_machine_receipt();
+    let a = composed_join(&host, &mut client, some_group(0xa9), &minted).await;
+    client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the attempt ended before it answered");
+    let whole = std::fs::read(&record).expect("the record");
+    kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
+        .expect("damages the record");
+
+    let unknown = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the record cannot be read");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+    assert!(
+        unknown.message.contains("host.doctor"),
+        "a record that cannot be read points at the doctor: {}",
+        unknown.message
+    );
+
+    kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
+    let answered = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect("answered once the record is whole");
+    assert_eq!(
+        typed::<MachineStepResult>(&answered).machine.machine_id,
+        some_group(0xa9)
+    );
+
+    drop(client);
+    host.stop().await;
+}
+
 /// KR-REQ-03.07: a step that wrote the record and could not confirm that its directory survives a
 /// crash is an outcome nobody knows, at either door, and its answer names no path: a paired device
 /// is given it. The record shows the change, so asking again under the same action is answered from

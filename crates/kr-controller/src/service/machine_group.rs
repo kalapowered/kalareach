@@ -218,6 +218,14 @@ const NOT_CONFIRMED_NOW: &str = "an earlier attempt at this action ended without
                                  cannot be confirmed to survive a crash now; ask again under the \
                                  same action";
 
+/// What a retry of an unfinished step is answered with while the record cannot be read: nothing can
+/// be said of what it did, and `host.doctor` says why the record cannot be read.
+const NOT_READABLE_NOW: &str = "an earlier attempt at this action ended without recording what it \
+                                did, and this environment's machine group record cannot be read \
+                                now, so what it did is not known; host.doctor says what is wrong \
+                                with the record, and asking again under the same action says what \
+                                it did once the record can be read";
+
 /// What a step that wrote nothing is answered with.
 const NOT_WRITTEN: &str = "this environment's machine group record could not be written, and it \
                            is as it was";
@@ -572,6 +580,10 @@ impl Controller {
                 "kr-controller: an unfinished machine group step could not be settled: {error}"
             );
         }
+        let unreadable = matches!(
+            &settled,
+            Err(ControllerError::Storage { detail, .. }) if detail == NO_RECORD
+        );
         // What the claim holds now is the answer, whether this settle or an earlier one put it
         // there. Where it holds none, and the settle failed, the record may show the step and
         // cannot be confirmed to survive a crash; where the settle worked, the record does not
@@ -581,6 +593,11 @@ impl Controller {
             .grants()
             .recorded_action(actor_id, action_id, digest)?
         {
+            Some(crate::grants::ActionRecord::Unfinished) | None if unreadable => {
+                Err(ControllerError::Uncertain {
+                    detail: NOT_READABLE_NOW.to_owned(),
+                })
+            }
             Some(crate::grants::ActionRecord::Unfinished) | None if settled.is_err() => {
                 Err(ControllerError::Uncertain {
                     detail: NOT_CONFIRMED_NOW.to_owned(),
