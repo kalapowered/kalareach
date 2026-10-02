@@ -750,11 +750,49 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
         "a list another account was granted is refused"
     );
 
-    // A list that names only trusted accounts but is inherited from the directory above is
-    // refused, because that directory can widen it at any time. The parent here grants nobody
-    // outside the trusted accounts and the account running this test, so the inherited list is
-    // refused for being inherited and for nothing else; the same list made the directory's own and
-    // protected is the control that passes.
+    // A link is refused as a link, whatever list it carries. The junction's own list is made as
+    // closed as the host's own, so that the list is not what refuses it: the same list on a plain
+    // directory is the control that passes, and only the link check is left to refuse the junction.
+    let control = std::env::temp_dir().join(format!("kr-we-control-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&control).expect("a plain directory");
+    close_to_administrators(&control);
+    kr_worker::broker::process::check_private_directory(&control)
+        .expect("a plain directory carrying that list passes, so the list alone does not refuse");
+
+    let link = std::env::temp_dir().join(format!("kr-we-link-{}", kr_ipc::new_uuid()));
+    run(
+        "cmd.exe",
+        &[
+            "/d".as_ref(),
+            "/c".as_ref(),
+            "mklink".as_ref(),
+            "/J".as_ref(),
+            link.as_os_str(),
+            private.as_os_str(),
+        ],
+    );
+    close_to_administrators(&link);
+    let refused = kr_worker::broker::process::check_private_directory(&link)
+        .expect_err("a junction to a private directory is not the directory it names");
+    assert!(
+        refused.to_string().contains("is a link"),
+        "it is the link that refuses it, not its list: {refused}"
+    );
+
+    let _ = std::fs::remove_dir(&link);
+    for directory in [&private, &ordinary, &widened, &control] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+/// KR-REQ-11.23: a directory whose list names only accounts the host trusts is still refused when
+/// it inherits that list from the directory above it, which can widen it at any time. The parent
+/// here grants nobody but the trusted accounts and the account running this test, so the refusal is
+/// for being inherited and for nothing else; the same entries made the directory's own and
+/// protected are the control that passes. It holds on every host, whatever its temporary directory
+/// inherits.
+#[test]
+fn kr_req_11_23_a_registration_directory_must_hold_its_own_protected_list() {
     let parent = std::env::temp_dir().join(format!("kr-we-parent-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&parent).expect("a parent directory");
     let account = std::env::var("USERNAME").expect("the account this test runs as");
@@ -787,39 +825,7 @@ fn kr_req_11_23_a_registration_directory_is_checked_by_its_list() {
     kr_worker::broker::process::check_private_directory(&inherited)
         .expect("the same entries, now the directory's own and protected, pass");
 
-    // A link is refused as a link, whatever list it carries. The junction's own list is made as
-    // closed as the host's own, so that the list is not what refuses it: the same list on a plain
-    // directory is the control that passes, and only the link check is left to refuse the junction.
-    let control = std::env::temp_dir().join(format!("kr-we-control-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&control).expect("a plain directory");
-    close_to_administrators(&control);
-    kr_worker::broker::process::check_private_directory(&control)
-        .expect("a plain directory carrying that list passes, so the list alone does not refuse");
-
-    let link = std::env::temp_dir().join(format!("kr-we-link-{}", kr_ipc::new_uuid()));
-    run(
-        "cmd.exe",
-        &[
-            "/d".as_ref(),
-            "/c".as_ref(),
-            "mklink".as_ref(),
-            "/J".as_ref(),
-            link.as_os_str(),
-            private.as_os_str(),
-        ],
-    );
-    close_to_administrators(&link);
-    let refused = kr_worker::broker::process::check_private_directory(&link)
-        .expect_err("a junction to a private directory is not the directory it names");
-    assert!(
-        refused.to_string().contains("is a link"),
-        "it is the link that refuses it, not its list: {refused}"
-    );
-
-    let _ = std::fs::remove_dir(&link);
-    for directory in [&private, &ordinary, &widened, &control, &parent] {
-        let _ = std::fs::remove_dir_all(directory);
-    }
+    let _ = std::fs::remove_dir_all(&parent);
 }
 
 /// KR-REQ-11.23: the credential file the host writes is the owner's, and one another account was
