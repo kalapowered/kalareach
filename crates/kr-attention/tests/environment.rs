@@ -2381,3 +2381,72 @@ fn a_held_decision_made_in_privacy_mode_is_not_stamped_with_the_normal_state_of_
         );
     }
 }
+
+/// A release does not date a decision that nothing recorded a time for: such a row, which only a
+/// store from before the time of decision was kept can hold, stays without a time and a privacy
+/// state through the release, so that a consumer treats it as one that may have been decided while
+/// privacy mode was on and not as one decided at the release. The control: a decision whose time
+/// was recorded keeps its time and its state through the same release.
+#[test]
+fn a_release_leaves_a_decision_nothing_recorded_a_time_for_without_one() {
+    use kr_attention::PrivacyStamp;
+
+    let private = PrivacyStamp {
+        generation: 3,
+        private: true,
+    };
+    let normal = PrivacyStamp {
+        generation: 4,
+        private: false,
+    };
+    for recorded in [true, false] {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("attention.db");
+        let mut attention =
+            Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+        attention
+            .set_quiet_hours(Some(quiet_over_noon()))
+            .expect("the store records the window");
+        attention
+            .apply(
+                &approval(session(1), 1, "req-1"),
+                reading(1_000).under(private),
+            )
+            .expect("the store records the decision");
+        assert!(only_item(&attention).deferred, "quiet hours hold it back");
+        drop(attention);
+        if !recorded {
+            // The row a store from before the time of decision was kept leaves for a decision whose
+            // last announcement time had been cleared.
+            let raw = rusqlite::Connection::open(&path).expect("the file opens");
+            raw.execute_batch(
+                "UPDATE attention_items
+                 SET decided_at_ms = NULL, decided_generation = NULL, decided_private = NULL;",
+            )
+            .expect("a row with no decision recorded");
+        }
+        let mut attention =
+            Attention::open(&path, reading(2_000), &opener()).expect("the feature store opens");
+        let after = HostReading::new(boot(), 7_200_000, NOON + 7_200_000, true).under(normal);
+        attention
+            .tick(after, &all_read)
+            .expect("the store records the release");
+        let released = only_item(&attention);
+        assert!(!released.deferred, "the hours have ended");
+        if recorded {
+            assert_eq!(
+                released.decided_at_ms,
+                Some(TimestampMs::new(NOON + 1_000)),
+                "the control keeps its time"
+            );
+            assert_eq!(
+                released.decided_privacy,
+                Some(private),
+                "and its state, not the release's"
+            );
+        } else {
+            assert_eq!(released.decided_at_ms, None, "no time is made up");
+            assert_eq!(released.decided_privacy, None, "and no state");
+        }
+    }
+}

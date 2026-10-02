@@ -3274,6 +3274,112 @@ mod tests {
         }
     }
 
+    /// A decision kept across a private period is never sent after it, whatever state it was made
+    /// under: entering privacy mode fences what carries content, and turning it off brings none of
+    /// it back. A decision is produced only when the privacy generation it was stamped with is the
+    /// one in force, so one decided in normal mode before the period, and held by something such as
+    /// quiet hours until after it, is dropped. The control: the same decision, stamped with the
+    /// generation in force after the lift, is sent to each phone.
+    #[test]
+    fn a_decision_kept_across_a_private_period_is_not_sent_after_it() {
+        use kr_attention::PrivacyStamp;
+
+        for (decided_under, sent) in [(0, false), (2, true)] {
+            let mut producer = producer();
+            let phones = two_phones(&mut producer);
+            let mut attention = store();
+            raise_failure_under(
+                &mut attention,
+                1,
+                NOON,
+                "cargo build",
+                PrivacyStamp {
+                    generation: decided_under,
+                    private: false,
+                },
+            );
+            // Privacy mode is turned on and off again before the feed takes it.
+            producer.journal_mut().fence(1).expect("a fence");
+            producer.journal_mut().lift_fence(2).expect("a lift");
+            let taken = take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                PrivacyView {
+                    generation: 2,
+                    private: false,
+                },
+            );
+            assert_eq!(taken.taken, 1, "decided under generation {decided_under}");
+            assert_eq!(
+                taken.dropped,
+                usize::from(!sent),
+                "decided under generation {decided_under}"
+            );
+            let produced = producer
+                .finish_pending(&phones, &Everything(BTreeSet::new()), 1_000)
+                .expect("production");
+            assert_eq!(
+                produced.admitted,
+                if sent { 2 } else { 0 },
+                "decided under generation {decided_under}"
+            );
+        }
+    }
+
+    /// While privacy mode is on, a pending question or approval is alerted only when it was
+    /// decided under the generation in force: one decided in normal mode, before the mode was
+    /// turned on and not yet taken, is a decision of the generation before and is not produced under
+    /// this one. The control: the same approval decided while the mode was on is alerted to each
+    /// phone.
+    #[test]
+    fn a_decision_of_the_generation_before_is_not_alerted_while_privacy_mode_is_on() {
+        use kr_attention::PrivacyStamp;
+
+        for (stamp, alerted) in [
+            (
+                PrivacyStamp {
+                    generation: 0,
+                    private: false,
+                },
+                false,
+            ),
+            (
+                PrivacyStamp {
+                    generation: 1,
+                    private: true,
+                },
+                true,
+            ),
+        ] {
+            let mut producer = producer();
+            let _phones = two_phones(&mut producer);
+            let mut attention = store();
+            raise_approval_under(&mut attention, 1, NOON, "req-1", stamp);
+            producer.journal_mut().fence(1).expect("a fence");
+            let taken = take(
+                &mut producer,
+                &mut attention,
+                &Everything(BTreeSet::new()),
+                PrivacyView {
+                    generation: 1,
+                    private: true,
+                },
+            );
+            assert_eq!(taken.taken, 1, "decided under {stamp:?}");
+            assert_eq!(
+                taken.alerts,
+                if alerted { 2 } else { 0 },
+                "decided under {stamp:?}"
+            );
+            assert_eq!(
+                taken.dropped,
+                usize::from(!alerted),
+                "decided under {stamp:?}"
+            );
+        }
+    }
+
     /// What a grant reaches is decided by its history and by the right each kind of subject asks
     /// for.
     #[test]
