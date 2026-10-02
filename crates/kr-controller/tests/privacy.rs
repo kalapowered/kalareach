@@ -2718,6 +2718,108 @@ fn kr_req_24_27_a_send_on_the_wire_is_waited_for_before_the_change_is_recorded()
     );
 }
 
+/// KR-REQ-24.27: a pass of the attention store that is deciding an announcement holds the privacy
+/// state from the moment it reads it to the end of the pass, so a change of privacy mode that comes
+/// meanwhile waits for it: nothing is recorded until the pass ends, and what the pass decided is
+/// stamped with the state it read, the state before the change. The control: the same pass with no
+/// change arriving is stamped the same.
+#[test]
+fn kr_req_24_27_a_change_of_privacy_mode_waits_for_the_pass_that_is_deciding_an_announcement() {
+    for changes in [false, true] {
+        let subsystems = Arc::new(Subsystems::open());
+        let temp = kr_ipc::testing::TempHost::create();
+        let attention = Arc::new(
+            kr_controller::attention::AttentionModule::open(
+                &temp.environment(),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+            )
+            .expect("the attention store opens"),
+        );
+        attention.attach_privacy(subsystems.privacy.state());
+        let failure = kr_attention::SourceEvent::new(
+            kr_attention::EventCursor::in_session(
+                session(),
+                kr_protocol::attention::AttentionSource::Receipts,
+                1,
+            ),
+            TimestampMs::new(NOW),
+            kr_attention::EventKind::CommandCompleted {
+                session_id: session(),
+                command: "make".to_owned(),
+                exit_code: 2,
+            },
+        );
+        let (arrived, release) = attention.pause_after_privacy_read();
+
+        // The pass holds the state and has not decided.
+        let deciding = std::thread::spawn({
+            let attention = Arc::clone(&attention);
+            move || attention.observe(&[failure])
+        });
+        arrived
+            .recv_timeout(PATIENCE)
+            .expect("the pass holds the state");
+
+        // Privacy mode is turned on meanwhile. It waits for the pass, and records nothing yet.
+        let turning = changes.then(|| {
+            let (enabled, enabling) = std::sync::mpsc::channel();
+            let turning = std::thread::spawn({
+                let subsystems = Arc::clone(&subsystems);
+                move || {
+                    let report = subsystems
+                        .privacy
+                        .enable(&[], TimestampMs::new(NOW + 10), &|write| write())
+                        .expect("privacy mode is turned on");
+                    let _ = enabled.send(());
+                    report
+                }
+            });
+            assert!(
+                enabling.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the change waits for the pass that is deciding"
+            );
+            assert_eq!(
+                subsystems.recorded_generation(),
+                0,
+                "and is not recorded while it waits"
+            );
+            turning
+        });
+
+        release.send(()).expect("the pass goes on");
+        deciding
+            .join()
+            .expect("the pass ends")
+            .expect("the store records the failure");
+        if let Some(turning) = turning {
+            turning.join().expect("the change ends");
+        }
+        assert_eq!(
+            subsystems.recorded_generation(),
+            i64::from(changes),
+            "changes {changes}"
+        );
+        let stamps = attention
+            .take_for_delivery(|store, _| {
+                store
+                    .engine()
+                    .expect("the store is this owner's")
+                    .items()
+                    .map(|item| item.decided_privacy)
+                    .collect::<Vec<_>>()
+            })
+            .expect("the store is taken");
+        assert_eq!(
+            stamps,
+            vec![Some(kr_attention::PrivacyStamp {
+                generation: 0,
+                private: false,
+            })],
+            "stamped with the state the pass read, changes {changes}"
+        );
+    }
+}
+
 /// KR-REQ-24.27: a send claimed before privacy mode is turned on and presented after it is taken
 /// back rather than presented. The pass claims the delivery and renews the credential, which waits
 /// on the gateway; privacy mode is turned on during that wait; and the send, admitted under the
