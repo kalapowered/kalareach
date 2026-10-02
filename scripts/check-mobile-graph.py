@@ -54,6 +54,7 @@ SHARED = {
     "kr-protocol": "docs/protocol/README.md: wire types and the method table",
     "kr-transport": "docs/transport/README.md: how a client reaches a host",
     "kr-voice": "docs/voice/client.md: the voice client's coordinator",
+    "kr-width": "docs/terminal/README.md: the width model a phone measures with, the same tables as the desktop",
 }
 
 # The host's packages, each with the document that puts it on the host's side.
@@ -64,6 +65,7 @@ HOST_ONLY = {
     "kr-hook": "docs/host/README.md: the forwarder an application starts beside its terminal",
     "kr-shell-integration": "docs/shell-integration/host.md: the worker's side of the root-editor contract",
     "kr-term": "docs/terminal/README.md: the terminal engine a host runs for each session",
+    "kr-term-probe": "docs/terminal/README.md: the tool that measures a physical terminal against the grid",
     "kr-transfer": "docs/transfer/README.md: filesystem authority and previews on the host",
     "kr-project": "docs/project/README.md: repositories, workspaces and the restricted Git profile",
     "kr-changeset": "docs/project/README.md: change sets captured and applied on the host",
