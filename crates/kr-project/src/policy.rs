@@ -97,6 +97,13 @@ pub struct Enlargement {
     pub action_digest: Digest256,
     /// The rights the enlargement carries, which the owner is shown.
     pub rights: CanonicalSet<ActionRight>,
+    /// The grant whose holder the enlargement sends authority to, or none for the owner's own
+    /// location.
+    ///
+    /// The daemon resolves the device that holds the grant and binds the owner's confirmation to
+    /// that device's four public keys, so a proof for one device's location verifies for no other
+    /// device's.
+    pub destination: Option<GrantId>,
 }
 
 /// What the daemon lends this service for the owner's own decisions.
@@ -135,12 +142,18 @@ pub trait OwnerAuthority: Send + Sync {
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError>;
 
-    /// Spends the challenge a verified proof answers. It succeeds once.
+    /// Spends the challenge a verified proof answers, for exactly this enlargement. It succeeds
+    /// once.
     ///
     /// # Errors
     ///
-    /// Returns the daemon's refusal when the challenge is no longer outstanding.
-    fn consume(&self, proof: &OwnerConfirmationProof) -> std::result::Result<(), ProtocolError>;
+    /// Returns the daemon's refusal when the challenge is no longer outstanding, or when the
+    /// device the enlargement names no longer holds the keys the challenge named.
+    fn consume(
+        &self,
+        enlargement: &Enlargement,
+        proof: &OwnerConfirmationProof,
+    ) -> std::result::Result<(), ProtocolError>;
 }
 
 /// One active location: the handle this process opened for it, and its row.
@@ -1258,6 +1271,7 @@ impl ProjectService {
         let enlargement = Enlargement {
             action_digest: authorisation_digest(params, handle.identity())?,
             rights: location_rights(),
+            destination: params.grant_id.0,
         };
         self.challenges.issue(
             key,
@@ -1281,15 +1295,15 @@ impl ProjectService {
         action: &Action,
         owner: &dyn OwnerAuthority,
     ) -> Result<Subject> {
-        let verified = match taken.enlargement() {
-            Some(enlargement) => owner.verify(enlargement, proof).map_err(declined),
-            None => Err(ProjectError::Unconfirmed {
+        let Some(enlargement) = taken.enlargement().cloned() else {
+            taken.restore(owner);
+            return Err(ProjectError::Unconfirmed {
                 detail: "the challenge for this action is no longer outstanding"
                     .to_owned()
                     .into(),
-            }),
+            });
         };
-        if let Err(error) = verified {
+        if let Err(error) = owner.verify(&enlargement, proof).map_err(declined) {
             taken.restore(owner);
             return Err(error);
         }
@@ -1300,7 +1314,7 @@ impl ProjectService {
             taken.restore(owner);
             return Err(error);
         }
-        if let Err(refusal) = owner.consume(proof) {
+        if let Err(refusal) = owner.consume(&enlargement, proof) {
             drop(taken);
             return self.answered(action, Err(declined(refusal)), true);
         }
@@ -1582,6 +1596,7 @@ impl ProjectService {
                 tree.identity(),
             )?,
             rights: location_rights(),
+            destination: location.grant_id.0,
         };
         self.challenges.issue(
             key,
@@ -1772,9 +1787,10 @@ mod tests {
     }
 
     #[test]
-    fn an_owner_location_admits_the_owner_and_a_grant_location_admits_nobody() {
+    fn an_owner_location_admits_the_owner_and_a_grant_location_admits_that_grants_caller() {
         let environment_id = EnvironmentId::new(Uuid::from_bytes([3; 16]));
         let grant = GrantId::new(Uuid::from_bytes([5; 16]));
+        let other = GrantId::new(Uuid::from_bytes([6; 16]));
         let owners = held(None, LocationPurpose::Source);
         let wanted = |admitting| LocationUse {
             purpose: LocationPurpose::Source,
@@ -1786,15 +1802,34 @@ mod tests {
         admits(&owners, &wanted(Admitting::Caller(Some(grant))))
             .expect_err("a caller bounded by a grant is not the owner");
         let grants = held(Some(grant), LocationPurpose::Source);
-        for admitting in [
-            Admitting::Caller(Some(grant)),
-            Admitting::Caller(None),
-            Admitting::OwnerDecision,
-        ] {
+        admits(&grants, &wanted(Admitting::Caller(Some(grant))))
+            .expect("a grant's location admits the caller bounded by that grant");
+        admits(&grants, &wanted(Admitting::OwnerDecision))
+            .expect("and the owner's decision about it");
+        for admitting in [Admitting::Caller(None), Admitting::Caller(Some(other))] {
             let refusal = admits(&grants, &wanted(admitting))
-                .expect_err("a grant's location admits nothing on this host");
+                .expect_err("a grant's location admits nobody else");
             assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
         }
+        // The purpose and the environment are held to exactly as an owner location holds them.
+        let refusal = admits(
+            &grants,
+            &LocationUse {
+                purpose: LocationPurpose::Destination,
+                ..wanted(Admitting::Caller(Some(grant)))
+            },
+        )
+        .expect_err("a source is not a destination");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        let refusal = admits(
+            &grants,
+            &LocationUse {
+                environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                ..wanted(Admitting::Caller(Some(grant)))
+            },
+        )
+        .expect_err("another environment's use is refused");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     }
 
     #[test]

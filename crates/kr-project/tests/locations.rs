@@ -569,32 +569,139 @@ fn location_matches_exact_grant_environment_and_purpose() {
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }
 
+/// The four public keys of one device, which differ from every other device's by `seed`.
+fn device_keys(seed: u8) -> kr_protocol::pairing::DevicePublicKeys {
+    kr_protocol::pairing::DevicePublicKeys {
+        transport: kr_protocol::scalars::EndpointKey::from_bytes([seed; 32]),
+        authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes(
+            [seed.wrapping_add(1); 32],
+        ),
+        stored_envelope: kr_protocol::scalars::StoredEnvelopeKey::from_bytes(
+            [seed.wrapping_add(2); 32],
+        ),
+        notification_preview: kr_protocol::scalars::NotificationPreviewKey::from_bytes(
+            [seed.wrapping_add(3); 32],
+        ),
+    }
+}
+
 #[test]
-fn a_location_for_a_grant_is_not_authorised_and_nothing_is_issued_for_it() {
-    // An owner's confirmation of a device's location has to name the keys of the device that
-    // holds the grant, and this host keeps no complete set of them. So no such location is
-    // authorised, no challenge is issued for one, and the refusal says why.
+fn a_location_for_a_grant_is_confirmed_for_the_device_that_holds_it_and_admits_that_grants_caller()
+{
+    // The owner's confirmation of a device's location names the four public keys of the device
+    // that holds the grant, as the daemon's records have them. The location then admits a caller
+    // bounded by that grant and nobody else, and the owner's own location is as it was.
     let fixture = Fixture::create();
     let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let grant = GrantId::new(Uuid::from_bytes([0x64; 16]));
+    let other = GrantId::new(Uuid::from_bytes([0x65; 16]));
+    let keys = device_keys(0x70);
+    owner.knows_device(grant, keys);
+    owner.knows_device(other, device_keys(0x80));
     let root = fixture.work().join("devices");
     std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(environment, &root, LocationPurpose::Source, Some(grant));
+    let request = challenge_for(fixture.service(), &owner, &params, 12);
+    assert_eq!(
+        request.destination_keys.0,
+        Some(keys),
+        "the challenge names the device that holds the grant, by all four keys"
+    );
+    // The control: the owner's own location names no device.
+    let own = authorise_params(environment, &root, LocationPurpose::Source, None);
+    assert_eq!(
+        challenge_for(fixture.service(), &owner, &own, 14)
+            .destination_keys
+            .0,
+        None,
+        "an owner location is bound to no device"
+    );
+    let location = confirm(fixture.service(), &owner, &params, &request, 12)
+        .expect("the owner's proof for the device's location authorises it");
+    assert_eq!(location.grant_id.0, Some(grant));
+    let policy = fixture.service().locations();
+    let used_by = |admitting| LocationUse {
+        purpose: LocationPurpose::Source,
+        environment_id: environment,
+        admitting,
+    };
+    policy
+        .admit(
+            location.location_id,
+            &used_by(Admitting::Caller(Some(grant))),
+        )
+        .expect("the location admits the caller bounded by its grant");
+    for admitting in [Admitting::Caller(None), Admitting::Caller(Some(other))] {
+        let refusal = policy
+            .admit(location.location_id, &used_by(admitting))
+            .expect_err("and nobody else");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{admitting:?}");
+    }
+}
+
+#[test]
+fn a_location_confirmation_for_a_grant_names_a_device_this_host_holds_in_full() {
+    // A grant no paired device holds has no keys to bind the confirmation to, so nothing is
+    // issued for it. The control is the same request for a grant whose device is known.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let grant = GrantId::new(Uuid::from_bytes([0x66; 16]));
+    let root = fixture.work().join("unknown");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Source,
+        Some(grant),
+    );
     let refusal = fixture
         .service()
         .project_location_authorise(
             &actor(),
-            &authorise_params(
-                fixture.environment_id(),
-                &root,
-                LocationPurpose::Source,
-                Some(GrantId::new(Uuid::from_bytes([0x64; 16]))),
-            ),
-            Some(&submission(AUTHORISE, 12, false)),
+            &params,
+            Some(&submission(AUTHORISE, 15, false)),
             Some(&owner),
         )
-        .expect_err("a grant's location is not authorised");
+        .expect_err("a grant no device holds is not given a challenge");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-    assert!(refusal.to_string().contains("keys"), "{refusal}");
-    assert_eq!(owner.issued(), 0, "no challenge was issued for it");
+    assert_eq!(owner.outstanding(), 0, "nothing was issued");
+    owner.knows_device(grant, device_keys(0x71));
+    challenge_for(fixture.service(), &owner, &params, 16);
+    assert_eq!(
+        owner.outstanding(),
+        1,
+        "the same request, once its device is known"
+    );
+}
+
+#[test]
+fn a_proof_for_a_device_whose_keys_have_changed_since_its_challenge_authorises_nothing() {
+    // The challenge names the keys the device held when it was issued. A device that declares
+    // others before the owner's proof is spent is not the device the owner confirmed, and the
+    // proof is refused without being spent. The control: with the keys restored, the same proof
+    // authorises the location.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let grant = GrantId::new(Uuid::from_bytes([0x67; 16]));
+    let keys = device_keys(0x72);
+    owner.knows_device(grant, keys);
+    let root = fixture.work().join("changing");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Source,
+        Some(grant),
+    );
+    let request = challenge_for(fixture.service(), &owner, &params, 17);
+    owner.knows_device(grant, device_keys(0x73));
+    let refusal = confirm(fixture.service(), &owner, &params, &request, 17)
+        .expect_err("a proof for keys the device no longer holds");
+    assert_eq!(refusal.code(), ErrorCode::OwnerConfirmationRequired);
+    owner.knows_device(grant, keys);
+    confirm(fixture.service(), &owner, &params, &request, 17)
+        .expect("with its keys back, the same proof authorises the location");
 }
 
 #[test]

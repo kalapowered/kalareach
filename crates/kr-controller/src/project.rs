@@ -42,9 +42,10 @@ use kr_protocol::envelope::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
-use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
-use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
+use kr_protocol::pairing::{
+    DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction,
+};
+use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
 use crate::service::net::owner::Resolved;
@@ -97,16 +98,69 @@ impl HostOwner {
         Self { pairing }
     }
 
-    /// What a challenge for an owner location's enlargement has to say, member for member.
+    /// The four public keys of the device that holds `grant`, which a confirmation of a location
+    /// for that grant is bound to.
+    ///
+    /// The device is found in this host's own records and has to be paired, with its grant in
+    /// force, and to have declared all four keys: an owner is shown the device it enlarges
+    /// authority for, so a device whose keys this host does not hold in full cannot be named.
+    fn destination(&self, grant: GrantId) -> std::result::Result<DevicePublicKeys, ProtocolError> {
+        let rows = self.pairing.rows();
+        let devices = rows
+            .directory()
+            .devices()
+            .map_err(|error| error.to_protocol_error())?;
+        let refused = |why: String| ProtocolError::new(ErrorCode::PermissionDenied, why);
+        let Some(device) = devices
+            .into_iter()
+            .find(|device| device.grant.grant_id == grant && device.is_paired())
+        else {
+            return Err(refused(format!(
+                "no paired device holds grant {grant}, so no location is confirmed for it"
+            )));
+        };
+        if !rows
+            .lifetimes()
+            .in_force(&device)
+            .map_err(|error| error.to_protocol_error())?
+        {
+            return Err(refused(format!(
+                "grant {grant} is no longer in force, so no location is confirmed for it"
+            )));
+        }
+        device.public_keys().ok_or_else(|| {
+            refused(format!(
+                "the device that holds grant {grant} has not declared all four of its public keys, \
+                 so no confirmation can name it: the device declares them first with \
+                 device.keys.complete"
+            ))
+        })
+    }
+
+    /// The keys an enlargement sends authority to: the holder of its grant, or nobody for the
+    /// owner's own location.
+    fn destination_of(
+        &self,
+        enlargement: &Enlargement,
+    ) -> std::result::Result<Option<DevicePublicKeys>, ProtocolError> {
+        enlargement
+            .destination
+            .map(|grant| self.destination(grant))
+            .transpose()
+    }
+
+    /// What a challenge for a location's enlargement has to say, member for member.
     fn expectation<'a>(
         &self,
-        action_digest: Digest256,
-        rights: &'a CanonicalSet<ActionRight>,
+        enlargement: &'a Enlargement,
+        destination: Option<&'a DevicePublicKeys>,
     ) -> ConfirmationExpectation<'a> {
-        // An owner location sends authority to no device, so its challenge names none.
-        self.pairing
-            .owner()
-            .expectation(SensitiveAction::EnlargeGrant, action_digest, None, rights)
+        self.pairing.owner().expectation(
+            SensitiveAction::EnlargeGrant,
+            enlargement.action_digest,
+            destination,
+            &enlargement.rights,
+        )
     }
 }
 
@@ -115,18 +169,20 @@ impl OwnerAuthority for HostOwner {
         &self,
         enlargement: &Enlargement,
     ) -> std::result::Result<OwnerConfirmationRequest, ProtocolError> {
+        let destination = self.destination_of(enlargement)?;
         self.pairing
             .owner()
             .challenge(Resolved {
                 action: SensitiveAction::EnlargeGrant,
                 digest: enlargement.action_digest,
-                destination: None,
+                destination,
                 rights: enlargement.rights.clone(),
-                // What an owner device shows the owner before it signs.
+                // What an owner device shows the owner before it signs: the device the authority
+                // goes to, when it goes to one.
                 display: ConfirmationDisplay::Described(DescribedAction {
                     action: SensitiveAction::EnlargeGrant,
                     action_digest: enlargement.action_digest,
-                    destination_keys: Nullable::null(),
+                    destination_keys: Nullable(destination),
                     destination_rights: enlargement.rights.clone(),
                 }),
                 first_owner: false,
@@ -143,26 +199,26 @@ impl OwnerAuthority for HostOwner {
         enlargement: &Enlargement,
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError> {
+        let destination = self.destination_of(enlargement)?;
         self.pairing
             .owner()
-            .verify_presented(
-                &self.expectation(enlargement.action_digest, &enlargement.rights),
-                proof,
-            )
+            .verify_presented(&self.expectation(enlargement, destination.as_ref()), proof)
             .map_err(|error| error.to_protocol_error())
     }
 
-    fn consume(&self, proof: &OwnerConfirmationProof) -> std::result::Result<(), ProtocolError> {
-        // The proof was verified against the enlargement it answers. The spend holds it to an
-        // owner location's shape and to the ledger's own copy of the challenge, and checks the
-        // signer's authority again.
+    fn consume(
+        &self,
+        enlargement: &Enlargement,
+        proof: &OwnerConfirmationProof,
+    ) -> std::result::Result<(), ProtocolError> {
+        // The proof was verified against the enlargement it answers. The spend holds it to the
+        // enlargement's own shape and to the ledger's own copy of the challenge, checks the
+        // signer's authority again, and names the device by the keys it holds now.
+        let destination = self.destination_of(enlargement)?;
         self.pairing
             .owner()
             .spend_presented(
-                &self.expectation(
-                    proof.request.action_digest,
-                    &proof.request.destination_rights,
-                ),
+                &self.expectation(enlargement, destination.as_ref()),
                 proof,
                 "project.location",
             )

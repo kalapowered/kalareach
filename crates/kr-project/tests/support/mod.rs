@@ -846,6 +846,14 @@ pub const fn include_everything() -> kr_protocol::project::InclusionPolicy {
 /// can make the ledger let a challenge go between its verification and its spending.
 #[derive(Debug, Default)]
 pub struct TestOwner {
+    /// The paired devices this owner knows, by the grant each holds: what the daemon's own
+    /// records say, which is where a challenge for a device's location takes its destination.
+    devices: std::sync::Mutex<
+        std::collections::BTreeMap<
+            kr_protocol::ids::GrantId,
+            kr_protocol::pairing::DevicePublicKeys,
+        >,
+    >,
     outstanding: std::sync::Mutex<
         Vec<(
             kr_protocol::pairing::OwnerConfirmationRequest,
@@ -864,6 +872,41 @@ pub struct TestOwner {
 const TEST_SIGNATURE: [u8; 64] = [0x5a; 64];
 
 impl TestOwner {
+    /// Records that the device holding `grant` has declared `keys`, as the daemon's records say.
+    pub fn knows_device(
+        &self,
+        grant: kr_protocol::ids::GrantId,
+        keys: kr_protocol::pairing::DevicePublicKeys,
+    ) {
+        self.devices
+            .lock()
+            .expect("the devices")
+            .insert(grant, keys);
+    }
+
+    /// Returns the keys of the device an enlargement names, as they stand now.
+    fn destination(
+        &self,
+        enlargement: &kr_project::policy::Enlargement,
+    ) -> Result<Option<kr_protocol::pairing::DevicePublicKeys>, kr_protocol::error::ProtocolError>
+    {
+        let Some(grant) = enlargement.destination else {
+            return Ok(None);
+        };
+        self.devices
+            .lock()
+            .expect("the devices")
+            .get(&grant)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::PermissionDenied,
+                    format!("no paired device holds grant {grant}"),
+                )
+            })
+    }
+
     /// Returns how many challenges this owner has issued.
     #[must_use]
     pub fn issued(&self) -> u64 {
@@ -940,7 +983,7 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
             ),
             action: kr_protocol::pairing::SensitiveAction::EnlargeGrant,
             action_digest: enlargement.action_digest,
-            destination_keys: kr_protocol::scalars::Nullable(None),
+            destination_keys: kr_protocol::scalars::Nullable(self.destination(enlargement)?),
             destination_rights: enlargement.rights.clone(),
             host_device_id: kr_protocol::ids::DeviceId::new(
                 kr_protocol::scalars::Uuid::from_bytes([0x11; 16]),
@@ -989,6 +1032,7 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
         if &outstanding[position].1 != enlargement
             || proof.request.action_digest != enlargement.action_digest
             || proof.request.destination_rights != enlargement.rights
+            || proof.request.destination_keys.0 != self.destination(enlargement)?
         {
             return Err(Self::refused("the challenge was issued for something else"));
         }
@@ -1003,6 +1047,7 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
 
     fn consume(
         &self,
+        enlargement: &kr_project::policy::Enlargement,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
     ) -> Result<(), kr_protocol::error::ProtocolError> {
         let held = self.held_spending.lock().expect("the hold").take();
@@ -1019,6 +1064,11 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
                 "the challenge has run out or was already spent",
             ));
         };
+        if proof.request.destination_keys.0 != self.destination(enlargement)? {
+            return Err(Self::refused(
+                "the device the challenge names no longer holds those keys",
+            ));
+        }
         outstanding.remove(position);
         Ok(())
     }
