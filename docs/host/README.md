@@ -33,6 +33,17 @@ world-writable by design and `~/.cache` is usually group-readable, and neither i
 change. The root and everything below it is created with mode 0700 and verified on every open. A
 directory that is a symbolic link, or that belongs to another user, is refused rather than repaired.
 
+On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
+in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
+which is on shared storage and accessible from the entire VM. Therefore, if the resolved path is on
+/mnt/wslg, on /mnt/wsl, would be linked into /mnt/wslg or /mnt/wsl, or is on the same storage as
+/mnt/wslg or /mnt/wsl, ~/.cache/kalareach/run will be used instead. ~/.cache/kalareach/run will also
+be used if $XDG_RUNTIME_DIR is not set, because each distro has its own $HOME. A path that cannot be
+said to lie anywhere, such as one that climbs out of a directory that does not exist yet with .., is
+treated as shared, and ~/.cache/kalareach/run is used for it too. A socket path there must still fit
+a Unix socket address, which a very long $HOME does not: the runtime root is refused then, and the
+product does not fall back to shared storage.
+
 Per environment the directories are `<runtime>/<prefix>` and `<state>/environments/<prefix>`, where
 the prefix is the first four bytes of the environment identifier in hexadecimal. The prefix is
 short because a Unix socket address is 104 bytes on macOS and the runtime directory already spends
@@ -1454,6 +1465,36 @@ refused, and so is a carried request that would open a bridge of its own: the de
 what arrives over the helper's local connection as an ordinary local request, so the rule is kept at
 the hop that knows one was crossed. A federated proxy is not part of this version.
 
+### Opening a bridge to create or attach
+
+The opening frame an invoker writes says where the invocation began, whether it may start what it
+needs, and what to reach: the destination's control daemon, or the worker of one session. The
+helper's answer carries the destination's own identity, the user it runs as, the build and protocol
+version of the process it reached, and a starting point for a session made through the bridge: the
+user's home and the helper's allowlisted variables. An invoker refuses a destination whose build
+does not share its protocol level before it sends a request, because the frames that follow are
+closed schemas.
+
+The opening also says whether the terminal the invoker attaches from takes the clipboard writes the
+session asks for. The helper tells the worker, and the worker enforces it: a write that its lease
+holder's terminal does not take is sent to nobody, and is a host event of its own kind in the
+session's journal, with the selection and the size and none of the content. Nothing between filters
+bytes. The declaration only ever narrows what an attachment is sent. A local attach declares nothing
+and is sent what a lease holder is sent.
+
+An SSH host is not a process bridge, and it registers differently. Its helper answers one opening
+over ssh, which is ended as soon as it has, and that answer is how this host learns the identity and
+the scoped channel the helper holds there. The answer is refused when it is the environment of the
+invoker or of any other environment this installation holds, which is what a forwarded socket looks
+like, and when the user is not the one the record names. A record that is replaced while its helper
+is being asked takes nothing from the answer that comes back.
+
+A container's runtime refuses to run anything in a stopped container, so a create or an attach
+starts it first, with the platform's own command, and only where one asked. A distribution is
+started by running the helper in it. The container tests in `crates/kr-cli/tests/bridged_session.rs`
+run a real container through a bridge, a create and a restart where a container runtime is
+installed.
+
 ### The enrolled environments, and the cached inventory
 
 An enrolment records the identity the platform issued, the operating-system user the helper runs
@@ -1543,6 +1584,29 @@ registered, it makes a second by exporting and importing the first, removes the 
 copy inherited before anything starts in it, and removes the copy at the end. A prerequisite it
 cannot meet is a failure, because a run that could not establish these results has not established
 them.
+
+The acceptance also runs on a GitHub-hosted Windows runner. `.github/workflows/wsl-acceptance.yml`
+builds the Linux set on Ubuntu 24.04, whose C library matches the Ubuntu 24.04 root file system it
+imports as the first distribution on a `windows-2025` runner, installs the set there, and runs the
+script, which makes the second distribution itself. The root file system is pinned by its digest. A
+Windows Server does not offer mirrored networking, so the hosted run sets
+`KR_WSL_NETWORK_MODES=nat`, measures NAT only, and prints that mirrored networking was not measured.
+The script's default is both modes, a mode asked for that a host cannot offer is a failure, and the
+result of a run is the modes it measured.
+
+Step 3 also checks that nothing of either distribution's daemon or worker is in storage the
+distributions share. Each socket the process holds open is read from the kernel's table, its
+directory is resolved through links to where it really is, and none may be under `/mnt/wslg` or
+`/mnt/wsl`. A daemon with no named socket fails the step, because its runtime root is then not
+known. A worker's open file whose path names the product in that storage is counted among the files
+it holds outside the distribution. The self-test covers the listing of a process's sockets,
+including one bound through a link.
+
+The acceptance will make changes to the machine it runs on - it will set the default WSL version to
+2, it will create and delete a distribution and it will bring WSL down to set the networking mode.
+It will restore the `.wslconfig` file to its original state at the end of the run. It will delete
+any exported images that it creates. The acceptance will upload an artefact that does not contain
+any keys for the Windows daemon. The artefact will be set to expire after 3 days.
 
 `scripts/e2e-wsl.sh --self-test` checks that removal on any Linux host, against trees of its own.
 An installation is removed whole and nothing beside it is touched, and a name that holds a newline,
