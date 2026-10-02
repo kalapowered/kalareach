@@ -740,7 +740,15 @@ fn kr_req_11_23_a_handle_names_the_executable_and_both_halves_authenticate() {
     assert_eq!(rendered, "Credential(<redacted>)");
     let whole_process = format!("{process:?}");
     assert!(whole_process.contains("Credential(<redacted>)"));
-    assert!(!whole_process.contains("0909"));
+    assert!(
+        !whole_process.contains(
+            &CREDENTIAL
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        "the whole credential is not in what the process prints"
+    );
 
     // A transcript tail is a supported transport and is not one the forwarding path uses.
     assert!(BrokerTransport::PrivateSocket.carries_forwarding());
