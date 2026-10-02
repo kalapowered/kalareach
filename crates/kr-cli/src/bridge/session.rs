@@ -102,12 +102,56 @@ kr_client::debug_as_name!(Found);
 /// reaches the destination's own configured startup rather than failing for want of one.
 async fn open(enrolment: &EnvironmentEnrolment, target: BridgeTarget) -> Result<BridgedLink> {
     started(enrolment).await?;
+    reach(enrolment, target, true).await
+}
+
+/// Opens a bridge to the control daemon of an enrolled environment that is already running, and
+/// starts nothing.
+///
+/// Running the helper in a stopped distribution starts it, and a container's runtime refuses to
+/// run anything in a stopped one, so what the platform says of the environment is asked first, as
+/// an enrolment by probe asks it: one that is not running is reported rather than started. The
+/// opening says that it may not start the environment's daemon either, so a running environment
+/// whose daemon is not is reported by the helper.
+///
+/// # Errors
+///
+/// Returns `ENVIRONMENT_UNAVAILABLE` for an environment that is not running, and the destination's
+/// refusal or a failure to reach it otherwise.
+pub async fn open_running(enrolment: &EnvironmentEnrolment) -> Result<BridgedLink> {
+    use kr_controller::bridge::platform::PlatformObserver;
+    use kr_controller::bridge::store::Observer as _;
+    use kr_protocol::identity::EnvironmentPresence;
+
+    let observed = {
+        let enrolment = enrolment.clone();
+        tokio::task::spawn_blocking(move || PlatformObserver.observe(&enrolment))
+            .await
+            .map_err(|_| CliError::Other(Shown::said("asking the environment did not finish")))?
+    };
+    match observed {
+        Ok(EnvironmentPresence::Running) => reach(enrolment, BridgeTarget::Controller, false).await,
+        Ok(_) | Err(_) => Err(CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: Shown::said(
+                "the environment is not running, or this host could not ask whether it is, and \
+                 this command starts nothing; start it, then run the command again",
+            ),
+        }),
+    }
+}
+
+async fn reach(
+    enrolment: &EnvironmentEnrolment,
+    target: BridgeTarget,
+    start: bool,
+) -> Result<BridgedLink> {
     let opening = invoke::open_for_person(
         enrolment,
         environments::origin_environment_id(),
         crate::build_id(),
         target,
-        true,
+        start,
     )
     .map_err(failed)?;
     let invocation = opening.launch().await.map_err(failed)?;
