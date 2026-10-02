@@ -648,6 +648,27 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
     }
 }
 
+/// A create node's parameters in the other form a typed decoder reads: the values of the fields in
+/// the order the type declares them, as a JSON array.
+fn as_field_array(object: &serde_json::Value) -> serde_json::Value {
+    [
+        "environment_id",
+        "presentation",
+        "shell",
+        "shell_mode",
+        "cwd",
+        "dimensions",
+        "worker_profile",
+        "environment_snapshot",
+        "palette",
+        "launch_profile",
+        "terminal",
+    ]
+    .iter()
+    .map(|field| object[*field].clone())
+    .collect()
+}
+
 /// KR-REQ-07.25: a session a workflow creates takes the host's environment, never one a definition
 /// carries, so a create node whose parameters hold environment variables is refused when the
 /// definition is installed. A definition is stored as it was installed, and a variable in it would
@@ -737,6 +758,42 @@ fn a_create_node_that_carries_environment_variables_is_refused() {
         );
     }
 
+    // The same parameters as an array of the field values: a derived decoder reads that form too,
+    // and a check that looks for the field by name would not see it.
+    let mut as_array = session(vec![EnvironmentVariable {
+        name: "KR_PLANTED_TOKEN".to_owned(),
+        value: "planted-secret-value".to_owned(),
+    }]);
+    as_array = as_field_array(&as_array);
+    let error = validate_definition(
+        &one_node_with(WorkflowActionKind::CreateSession, as_array),
+        &grant,
+    )
+    .expect_err("a create node whose parameters are an array is refused");
+    let said = error.to_string();
+    assert!(
+        !said.contains("planted-secret-value") && !said.contains("KR_PLANTED_TOKEN"),
+        "the refusal names no variable and no value: {said}"
+    );
+    let mut as_array = as_field_array(&session(Vec::new()));
+    as_array[7] = serde_json::json!("planted-secret-value");
+    let error = validate_definition(
+        &one_node_with(WorkflowActionKind::CreateSession, as_array),
+        &grant,
+    )
+    .expect_err("a create node whose parameters are an array is refused");
+    let said = error.to_string();
+    assert!(
+        !said.contains("planted-secret-value"),
+        "the refusal quotes no value: {said}"
+    );
+    // The control: the same node with no variables, as an object, still installs.
+    validate_definition(
+        &one_node_with(WorkflowActionKind::CreateSession, session(Vec::new())),
+        &grant,
+    )
+    .expect("a create node with no variables is installed");
+
     // A name repeated in the parameters is read as its last value by a JSON reader that keeps one
     // value for a name, and the stored text keeps both. So the first copy, which holds the
     // variables, would stay in the journal behind an empty list that passes the check.
@@ -825,6 +882,15 @@ fn a_refused_install_leaves_no_variable_in_the_journal() {
     shapes[1]["environment_snapshot"] =
         serde_json::json!(["KR_PLANTED_TOKEN=planted-secret-value"]);
     shapes[2]["environment_snapshot"] = serde_json::json!("planted-secret-value");
+    // The array form of the same parameters, with the variables as structured values and as text.
+    let structured = as_field_array(&session(vec![EnvironmentVariable {
+        name: "KR_PLANTED_TOKEN".to_owned(),
+        value: "planted-secret-value".to_owned(),
+    }]));
+    let mut text = as_field_array(&session(Vec::new()));
+    text[7] = serde_json::json!("planted-secret-value");
+    shapes.push(structured);
+    shapes.push(text);
     for (at, shape) in shapes.into_iter().enumerate() {
         let error = service
             .submit_install(&install(1 + at as u64, shape), 1_000)
@@ -838,15 +904,23 @@ fn a_refused_install_leaves_no_variable_in_the_journal() {
         .expect("a create node with no variables installs");
 
     drop(service);
+    // The journal itself is read, so the scan cannot pass for want of a file; its log and its
+    // rollback journal are read where they exist.
     for name in ["workflows.db", "workflows.db-wal", "workflows.db-journal"] {
-        if let Ok(bytes) = std::fs::read(directory.path().join(name)) {
-            assert!(
-                !bytes
-                    .windows("planted-secret-value".len())
-                    .any(|window| window == b"planted-secret-value"),
-                "{name} holds a variable a refused install carried"
-            );
-        }
+        let read = std::fs::read(directory.path().join(name));
+        let bytes = if name == "workflows.db" {
+            read.expect("the journal's file")
+        } else if let Ok(bytes) = read {
+            bytes
+        } else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows("planted-secret-value".len())
+                .any(|window| window == b"planted-secret-value"),
+            "{name} holds a variable a refused install carried"
+        );
     }
 }
 
