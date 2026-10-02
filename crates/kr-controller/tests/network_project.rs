@@ -1766,6 +1766,14 @@ impl Recorded {
                     kind: WorkspaceKind::SharedExisting,
                     isolation: Nullable::null(),
                     destination: Nullable::null(),
+                    // A shared working copy is the user's own tree, in which every class stays.
+                    policy: InclusionPolicy {
+                        dirty_files: InclusionChoice::Include,
+                        untracked_files: InclusionChoice::Include,
+                        submodules: InclusionChoice::Include,
+                        binary_files: InclusionChoice::Include,
+                        generated_artefacts: InclusionChoice::Include,
+                    },
                     ..workspace_params(&host, adopted.project.project_repository_id, "the tree")
                 },
             )
@@ -3354,8 +3362,9 @@ async fn a_device_reads_nothing_outside_its_location_through_repository_content(
     assert!(!granted.root.join("from-linked").exists());
 
     // The control: the same repository and the same include, with the link leading to a file
-    // inside the location. The file is read, and the clone is made.
-    let inside = granted.root.join("inside.config");
+    // inside the repository. The file is read, and the clone is made.
+    // Inside the repository the device is lent, which is all the clone may read.
+    let inside = linked.join("inside.config");
     std::fs::write(&inside, "[secret]\n\tvalue = held-inside-the-location\n")
         .expect("a file inside the location");
     std::fs::remove_file(&link).expect("the link is replaced");
