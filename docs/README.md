@@ -239,7 +239,8 @@ name in its clone and refuses a `.gitignore` for which `git check-ignore` does n
 and the `release-checks` workflow runs it on every change. The website's `pnpm records:check` refuses
 coding-assistant instruction files, local work records and key material by path, and three
 credential shapes by content, in the commits it is about to send, the packages it publishes and the
-deployment bundle.
+deployment bundle, and makes the same proof of its `.gitignore` in a repository of its own. The
+catalogue's `scripts/check-local-names.sh` makes that proof for the catalogue repository.
 
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
