@@ -1565,6 +1565,7 @@ fn declared_origin() -> BridgeOrigin {
     BridgeOrigin {
         environment_id: EnvironmentId::new(Uuid::from_bytes([0x0a; 16])),
         ingress: ActorIngress::LocalIpc,
+        clipboard_writes: false,
     }
 }
 
@@ -1702,6 +1703,7 @@ async fn an_origin_that_is_not_a_local_peer_is_refused_at_the_hello() {
             BridgeOrigin {
                 environment_id: declared_origin().environment_id,
                 ingress,
+                clipboard_writes: false,
             },
         )
         .await

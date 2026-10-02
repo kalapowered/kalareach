@@ -162,6 +162,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
     };
     enrolment
         .validate()
+        .and_then(|()| enrolment.validate_clipboard_destination())
         .map_err(|error| CliError::Usage(shown!("{}", error)))?;
     let mut client = resolve::open_controller(&known.paths, crate::build_id()).await?;
     let answer = client
