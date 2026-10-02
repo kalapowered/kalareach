@@ -292,13 +292,13 @@ async fn a_refresh_that_cannot_reach_a_destination_says_so_and_scopes_no_channel
 
 #[tokio::test]
 async fn a_refresh_of_an_environment_that_is_not_a_process_bridge_opens_none() {
-    // An SSH user runs the command line on the destination host and a named remote host is reached
-    // through its own paired endpoint. Neither is a process bridge, and a refresh of one says that
-    // rather than starting a helper.
+    // A named remote host is reached through its own paired endpoint. That is not a process bridge,
+    // and a refresh of one says so rather than starting a helper. (An SSH host is asked who it is
+    // over ssh, which the tests of SSH registration below cover.)
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut client = host.client().await;
-    let record = enrolment(4, "build-host", EnvironmentAccess::SshHost);
+    let record = enrolment(4, "build-host", EnvironmentAccess::PairedHost);
     enrol(&mut client, &host, record.clone()).await;
 
     let answered = client
