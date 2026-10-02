@@ -136,6 +136,12 @@ mod tests {
             "*_KEY",
             "*_PAT",
             "*_APIKEY",
+            "DATABRICKS_*",
+            "INFOMANIAK_*",
+            "PRIVATEMODE_*",
+            "SNOWFLAKE_*",
+            "WATSONX_*",
+            "*_ENDPOINT",
             "*_API_KEY",
             "*_API_TOKEN",
             "*_ACCESS_TOKEN",
@@ -222,6 +228,15 @@ mod tests {
             "AZURE_RESOURCE_NAME",
             "CLOUDFLARE_API_TOKEN",
             "SOME_PROVIDER_BASE_URL",
+            // Names from the catalogue of the pinned OpenCode that the first lists missed.
+            "WATSONX_AI_APIKEY",
+            "CLARIFAI_PAT",
+            "AICORE_SERVICE_KEY",
+            "SNOWFLAKE_CORTEX_PAT",
+            "DATABRICKS_HOST",
+            "WATSONX_AI_PROJECT_ID",
+            "PRIVATEMODE_ENDPOINT",
+            "AWS_BEARER_TOKEN_BEDROCK",
         ];
         for name in documented {
             assert!(cleared(&patterns, name), "{name} is cleared");
