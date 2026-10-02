@@ -279,6 +279,29 @@ final class ProbeSupportTests: XCTestCase {
         XCTAssertEqual(clock.longestIntervalSinceLastReading() ?? 0, 4.0, accuracy: 0.0001)
     }
 
+    func testAStopThatSuspendedTheApplicationIsSeenOnTheFirstTickAfterTheUnlock() {
+        // Locked for thirty ticks; audio stopped at the fortieth second and the application was
+        // suspended, so no tick ran until the unlock, and the first tick after it reads the phone as
+        // unlocked with the last callback fifteen seconds old.
+        var log = AudioTickLog(start: 0)
+        for second in 1...45 {
+            log.tick(now: Double(second), lastInput: Double(second) - 0.02, lastOutput: Double(second) - 0.01, protectedDataAvailable: second <= 10)
+        }
+        log.tick(now: 60, lastInput: 44.98, lastOutput: 44.99, protectedDataAvailable: true)
+        XCTAssertEqual(log.facts["gap.input.max"], "15020")
+        XCTAssertEqual(log.facts["gap.input.locked.max"], "15020", "the first reading after the unlock belongs to the locked time")
+        XCTAssertEqual(log.facts["gap.output.locked.max"], "15010")
+    }
+
+    func testAGapTwoTicksAfterAnUnlockIsNotAGapWhileLocked() {
+        var log = AudioTickLog(start: 0)
+        log.tick(now: 1, lastInput: 0.99, lastOutput: 0.99, protectedDataAvailable: false)
+        log.tick(now: 2, lastInput: 1.99, lastOutput: 1.99, protectedDataAvailable: true)
+        log.tick(now: 3, lastInput: 1.0, lastOutput: 2.99, protectedDataAvailable: true)
+        XCTAssertEqual(log.facts["gap.input.max"], "2000")
+        XCTAssertEqual(log.facts["gap.input.locked.max"], "10", "only the ticks of the lock and the one after it")
+    }
+
     func testSomethingNeverSeenCountsFromTheStartOfTheCheck() {
         var log = AudioTickLog(start: 10)
         log.tick(now: 14, lastInput: nil, lastOutput: nil, protectedDataAvailable: false)
