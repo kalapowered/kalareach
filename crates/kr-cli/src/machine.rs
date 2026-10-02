@@ -952,7 +952,23 @@ async fn take_steps(paths: &HostPaths, mut plan: Plan, json: bool) -> Result<Com
     for index in 0..plan.undo.len() {
         advance(paths, &mut plan, Which::Undo, index).await?;
     }
-    let complete = plan.complete();
+    let removal = if plan.complete() {
+        finished(paths)
+    } else {
+        Ok(())
+    };
+    let (kept, failure) = conclusion(&plan, removal);
+    report_plan(&plan, kept, failure.as_ref(), json);
+    Ok(failure.map_or(Completion::Done, Completion::Reported))
+}
+
+/// What a plan has come to once its file has been dealt with: whether it is still kept, and the one
+/// failure to report with it.
+///
+/// A plan whose file could not be removed is still kept, and that failure is the one reported: it
+/// is in the same report as the plan, not a second one after it.
+fn conclusion(plan: &Plan, removal: Result<()>) -> (bool, Option<CliError>) {
+    let kept = !plan.complete() || removal.is_err();
     let pending = plan
         .steps
         .iter()
@@ -964,14 +980,16 @@ async fn take_steps(paths: &HostPaths, mut plan: Plan, json: bool) -> Result<Com
             StepState::Refused(_, Why::Environment | Why::Moved)
         )
     });
-    // What the plan came to is said whether or not the file could be removed.
-    let removal = if complete { finished(paths) } else { Ok(()) };
-    let failure = if pending {
+    let failure = if let Err(error) = removal {
+        Some(error)
+    } else if pending {
         Some(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
             message: Shown::said(
                 "a step has no result yet: kr host machine finish takes it again once its \
-                 environment can be reached and can answer",
+                 environment can be reached and can answer; a plan that is no longer wanted is \
+                 abandoned by moving machine-merge-plan aside, and each environment keeps the \
+                 group it reports",
             ),
         })
     } else if refused {
@@ -985,9 +1003,7 @@ async fn take_steps(paths: &HostPaths, mut plan: Plan, json: bool) -> Result<Com
     } else {
         None
     };
-    report_plan(&plan, !complete, failure.as_ref(), json);
-    removal?;
-    Ok(failure.map_or(Completion::Done, Completion::Reported))
+    (kept, failure)
 }
 
 /// Writes what the plan has come to, with the failure beside it where there is one.
@@ -1178,8 +1194,14 @@ fn judge(
     fresh: bool,
 ) -> Verdict {
     let Some(group) = record else {
-        // An environment with no usable record takes no step.
-        return Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment);
+        // An environment with no usable record takes no step, and says nothing of one it took
+        // before the record was lost: a step it could not answer, or is still running, is not
+        // given a result it was not given. Where it refused the step before it claimed it, the step
+        // was not taken.
+        return match code {
+            ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable => Verdict::Pending,
+            _ => Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
+        };
     };
     if group.machine_id == step.expected.machine_id && group.revision == step.expected.revision {
         // Nothing was applied.
@@ -1211,8 +1233,12 @@ fn judge(
         && matches!(group.change, MachineChange::Merged | MachineChange::Joined)
     {
         // The record shows the step was taken. An environment that could not say whether its
-        // change survives a crash has not said it was taken: that stays to be answered.
-        return if code == ErrorCode::OutcomeUnknown {
+        // change survives a crash has not said it was taken, and one whose action is still running
+        // has not finished it: that stays to be answered.
+        return if matches!(
+            code,
+            ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable
+        ) {
             Verdict::Pending
         } else {
             Verdict::Done(group.clone())
@@ -1460,7 +1486,6 @@ mod tests {
             ErrorCode::PermissionDenied,
             ErrorCode::DraftConflict,
             ErrorCode::StorageUnavailable,
-            ErrorCode::ResourceUnavailable,
         ] {
             for fresh in [false, true] {
                 assert_eq!(
@@ -1470,13 +1495,16 @@ mod tests {
                 );
             }
         }
-        // A step the environment could not say it took is not called taken from its record alone.
+        // A step the environment could not say it took, or whose action is still running, is not
+        // called taken from its record alone.
         for fresh in [false, true] {
-            assert_eq!(
-                judge(&step, Some(&taken), ErrorCode::OutcomeUnknown, fresh),
-                Verdict::Pending,
-                "fresh {fresh}"
-            );
+            for code in [ErrorCode::OutcomeUnknown, ErrorCode::ResourceUnavailable] {
+                assert_eq!(
+                    judge(&step, Some(&taken), code, fresh),
+                    Verdict::Pending,
+                    "{code:?}, fresh {fresh}"
+                );
+            }
         }
         // Another change at another revision, or another group, can never apply.
         let elsewhere = elsewhere();
@@ -1495,11 +1523,24 @@ mod tests {
                 "{moved:?}"
             );
         }
-        // An environment with no usable record takes no step.
-        assert_eq!(
-            judge(&step, None, ErrorCode::PermissionDenied, false),
-            Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment)
-        );
+        // An environment with no usable record takes no step, and is not taken to have refused one
+        // it may have taken before the record was lost.
+        for code in [ErrorCode::PermissionDenied, ErrorCode::StorageUnavailable] {
+            assert_eq!(
+                judge(&step, None, code, false),
+                Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
+                "{code:?}"
+            );
+        }
+        for code in [ErrorCode::OutcomeUnknown, ErrorCode::ResourceUnavailable] {
+            for fresh in [false, true] {
+                assert_eq!(
+                    judge(&step, None, code, fresh),
+                    Verdict::Pending,
+                    "{code:?}, fresh {fresh}"
+                );
+            }
+        }
     }
 
     /// KR-REQ-03.07: at the record the step was approved against, nothing was applied. A mutation
@@ -1548,6 +1589,50 @@ mod tests {
             judge(&step, Some(&at), ErrorCode::IdConflict, true),
             Verdict::Refused(ErrorCode::IdConflict, Why::Environment)
         );
+    }
+
+    /// KR-REQ-03.07: a plan whose file could not be removed is still kept, and the failure is the
+    /// one reported with it; a complete plan that was removed is not kept; a plan with a step still
+    /// to be answered is kept and says so.
+    #[test]
+    fn a_plan_whose_file_could_not_be_removed_is_kept_and_reports_that() {
+        let mut done = step();
+        done.state = StepState::Done(one_step_on());
+        let mut plan = Plan {
+            into: done.into,
+            from: done.expected.machine_id,
+            steps: vec![done],
+            undo: Vec::new(),
+            undoing: false,
+        };
+        let (kept, failure) = conclusion(&plan, Ok(()));
+        assert!(
+            !kept && failure.is_none(),
+            "a complete plan that was removed"
+        );
+
+        let (kept, failure) = conclusion(
+            &plan,
+            Err(CliError::Other(Shown::said(
+                "the plan could not be removed",
+            ))),
+        );
+        assert!(kept, "the file is still there");
+        assert!(
+            matches!(failure, Some(CliError::Other(_))),
+            "the removal failure is the one reported: {failure:?}"
+        );
+
+        plan.steps[0].state = StepState::Sent;
+        let (kept, failure) = conclusion(&plan, Ok(()));
+        assert!(kept);
+        assert!(matches!(
+            failure,
+            Some(CliError::Unfinished {
+                code: ErrorCode::EnvironmentUnavailable,
+                ..
+            })
+        ));
     }
 
     /// KR-REQ-03.07: a plan that asks for an undo has a step for each environment its merge moved,
