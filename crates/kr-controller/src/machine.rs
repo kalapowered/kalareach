@@ -37,6 +37,13 @@
 //! which every later read returns, and says that whether the change survives a crash is not known.
 //! The first record is written the same way and given its name by a link instead, which never
 //! replaces a record that exists.
+//!
+//! The rename is the moment a step changes the record, so it is the moment the step's approval has
+//! to stand: the file is written and flushed first, and each attempt at the rename is made through
+//! [`Standing::while_standing`], which refuses it, and leaves the old record, when the approval has
+//! lapsed, and holds the approval standing for as long as the attempt takes. Nothing waits while
+//! it is held: a rename that Windows refuses because a program holds the record is tried again
+//! after a pause, and each attempt asks again.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -169,13 +176,36 @@ pub struct Expected {
     pub revision: u64,
 }
 
-/// The owner's approval of one step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Approval {
+/// The owner's approval of one step, and the means of asking whether it still stands.
+#[derive(Clone, Debug)]
+pub struct Approval<'a> {
     /// The verified actor whose owner authority approved the step.
     pub actor: ActorId,
     /// The action that carries the step.
     pub action_id: ActionId,
+    /// Asked at the moment the step would change the record.
+    pub standing: &'a dyn Standing,
+}
+
+/// Whether the authority an owner's step was admitted under still stands at the moment the step
+/// changes the record.
+///
+/// Authority lapses while a step is on its way: a device's registration is withdrawn, the host's
+/// authority moves on, or the window the step was admitted in closes. Asking before the step starts
+/// does not say it still stands when the record is replaced, and the time between is not short:
+/// the new record is written and flushed first, and on Windows the replacement can wait for another
+/// program to let the record go. The store therefore hands the replacement itself to the caller,
+/// which runs it only while the authority stands.
+pub trait Standing: std::fmt::Debug + Sync {
+    /// Runs `publish` while the authority stands, and keeps it standing until `publish` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, without having run `publish`, when the authority no longer stands.
+    fn while_standing(
+        &self,
+        publish: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> Result<std::io::Result<()>>;
 }
 
 /// Where a step takes this environment.
@@ -273,7 +303,7 @@ impl MachineStore {
         lock: &SingletonLock,
         into: MachineId,
         expected: Expected,
-        approval: &Approval,
+        approval: &Approval<'_>,
         now_ms: u64,
     ) -> Result<MachineGroup> {
         self.take(lock, Destination::Join(into), expected, approval, now_ms)
@@ -294,7 +324,7 @@ impl MachineStore {
         lock: &SingletonLock,
         into: MachineId,
         expected: Expected,
-        approval: &Approval,
+        approval: &Approval<'_>,
         now_ms: u64,
     ) -> Result<MachineGroup> {
         self.take(lock, Destination::Merge(into), expected, approval, now_ms)
@@ -313,7 +343,7 @@ impl MachineStore {
         &self,
         lock: &SingletonLock,
         expected: Expected,
-        approval: &Approval,
+        approval: &Approval<'_>,
         now_ms: u64,
     ) -> Result<MachineGroup> {
         self.take(lock, Destination::Split, expected, approval, now_ms)
@@ -325,7 +355,7 @@ impl MachineStore {
         lock: &SingletonLock,
         destination: Destination,
         expected: Expected,
-        approval: &Approval,
+        approval: &Approval<'_>,
         now_ms: u64,
     ) -> Result<MachineGroup> {
         let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
@@ -368,7 +398,7 @@ impl MachineStore {
             revision,
             change,
         };
-        self.publish(&record, deadline)?;
+        self.publish(&record, deadline, approval.standing)?;
         Ok(record)
     }
 
@@ -468,28 +498,43 @@ impl MachineStore {
             .map_err(|error| storage("create the machine group record", &self.record, error))
     }
 
-    /// Replaces the record with `record`, whole.
-    fn publish(&self, record: &MachineGroup, deadline: Instant) -> Result<()> {
+    /// Replaces the record with `record`, whole, if the step's approval stands when it does.
+    fn publish(
+        &self,
+        record: &MachineGroup,
+        deadline: Instant,
+        standing: &dyn Standing,
+    ) -> Result<()> {
         let bytes = encode(record, &self.record)?;
         let temporary = self.temporary();
+        // Set when the approval no longer stands at an attempt, which then is the last one.
+        let mut lapsed = None;
         // On Windows another program can hold the record it just saw written, and a rename over it
-        // is refused while it does; the rename is tried again until the step's own deadline.
+        // is refused while it does; the rename is tried again until the step's own deadline, and
+        // each attempt is made only while the approval stands.
         let staged = self
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
             .and_then(|()| {
                 kr_flush::retry_while_held_until(deadline, || {
-                    std::fs::rename(&temporary, &self.record)
+                    match standing.while_standing(&mut || std::fs::rename(&temporary, &self.record))
+                    {
+                        Ok(renamed) => renamed,
+                        Err(refusal) => {
+                            lapsed = Some(refusal);
+                            Err(std::io::Error::other(
+                                "the approval this step was taken under no longer stands",
+                            ))
+                        }
+                    }
                 })
             });
         if let Err(error) = staged {
             // Nothing was published: the record is still the one this step read.
             let _ = std::fs::remove_file(&temporary);
-            return Err(storage(
-                "write the machine group record",
-                &self.record,
-                error,
-            ));
+            return Err(lapsed.unwrap_or_else(|| {
+                storage("write the machine group record", &self.record, error)
+            }));
         }
         // The record's name holds the new record from here on, and every later read returns it.
         // What cannot be told without the directory flush is whether it survives a crash.
@@ -845,11 +890,33 @@ mod tests {
         }
     }
 
+    /// The approval of an owner whose authority never lapses.
+    #[derive(Debug)]
+    struct Always;
+
+    impl Standing for Always {
+        fn while_standing(
+            &self,
+            publish: &mut dyn FnMut() -> std::io::Result<()>,
+        ) -> Result<std::io::Result<()>> {
+            Ok(publish())
+        }
+    }
+
+    static ALWAYS: Always = Always;
+
     /// An approval by the owner at this machine, with an action of its own.
-    fn approval() -> Approval {
+    fn approval() -> Approval<'static> {
+        approval_standing(&ALWAYS)
+    }
+
+    /// An approval by the owner at this machine, with an action of its own, that stands as
+    /// `standing` says.
+    fn approval_standing(standing: &dyn Standing) -> Approval<'_> {
         Approval {
             actor: ActorId::new("local:owner").expect("a principal"),
             action_id: ActionId::new(kr_ipc::new_uuid()),
+            standing,
         }
     }
 
@@ -1994,6 +2061,162 @@ mod tests {
             "a refused step wrote"
         );
         assert_eq!(store.group().expect("reads the group"), joined);
+    }
+
+    /// A standing that notes what the state directory held each time it was asked, and then lets the
+    /// replacement run or refuses it.
+    #[derive(Debug)]
+    struct Asked {
+        directory: PathBuf,
+        record: PathBuf,
+        refuses: bool,
+        /// For each time asked: whether a staged temporary file existed, and the record's bytes.
+        seen: Mutex<Vec<(bool, Vec<u8>)>>,
+    }
+
+    impl Asked {
+        fn new(environment: &Environment, refuses: bool) -> Self {
+            Self {
+                directory: environment.paths().state_dir().to_path_buf(),
+                record: environment.record(),
+                refuses,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<(bool, Vec<u8>)> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Standing for Asked {
+        fn while_standing(
+            &self,
+            publish: &mut dyn FnMut() -> std::io::Result<()>,
+        ) -> Result<std::io::Result<()>> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((
+                    !leftovers(&self.directory).is_empty(),
+                    std::fs::read(&self.record).expect("reads the record"),
+                ));
+            if self.refuses {
+                return Err(ControllerError::WindowExpired {
+                    detail: "the step's window closed while its record was being written"
+                        .to_owned(),
+                });
+            }
+            Ok(publish())
+        }
+    }
+
+    /// KR-REQ-03.07: a step changes the record only while the approval it was taken under stands at
+    /// the moment the record is replaced, which is after its new record is written and flushed. An
+    /// approval that lapses by then leaves the old record and no temporary file, for each of the
+    /// three steps, and the control, a standing approval, replaces the record from inside that same
+    /// check.
+    #[test]
+    fn a_step_replaces_the_record_only_while_its_approval_stands_at_the_replacement() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let created = store.group().expect("reads the group");
+        let on_disk = Facts::of(&environment.record());
+        let directory = environment.paths().state_dir().to_path_buf();
+        let lock = &environment.lock;
+
+        let lapsing = Asked::new(&environment, true);
+        let refusals = [
+            store.join(
+                lock,
+                some_group(),
+                created.expected(),
+                &approval_standing(&lapsing),
+                2_000,
+            ),
+            store.merge(
+                lock,
+                some_group(),
+                created.expected(),
+                &approval_standing(&lapsing),
+                2_000,
+            ),
+            store.split(
+                lock,
+                created.expected(),
+                &approval_standing(&lapsing),
+                2_000,
+            ),
+        ];
+        for refusal in refusals {
+            let refusal = refusal.expect_err("a step whose approval lapsed changes nothing");
+            assert!(
+                matches!(refusal, ControllerError::WindowExpired { .. }),
+                "the refusal is the standing's own: {refusal:?}"
+            );
+        }
+        assert_eq!(
+            lapsing.seen(),
+            vec![(true, on_disk.bytes.clone()); 3],
+            "each step asked once, with its new record staged and the old one in place"
+        );
+        assert_eq!(
+            Facts::of(&environment.record()),
+            on_disk,
+            "a refused step wrote"
+        );
+        assert!(
+            leftovers(&directory).is_empty(),
+            "a refused step left its file"
+        );
+        assert_eq!(store.group().expect("reads the group"), created);
+
+        // The control: an approval that stands is asked once for each step, with the old record
+        // still in place and the new one staged, and the replacement runs inside that check.
+        let standing = Asked::new(&environment, false);
+        let record = environment.record();
+        let before_join = std::fs::read(&record).expect("reads the record");
+        let joined = store
+            .join(
+                lock,
+                some_group(),
+                created.expected(),
+                &approval_standing(&standing),
+                3_000,
+            )
+            .expect("joins");
+        let before_merge = std::fs::read(&record).expect("reads the record");
+        let merged = store
+            .merge(
+                lock,
+                some_group(),
+                joined.expected(),
+                &approval_standing(&standing),
+                4_000,
+            )
+            .expect("merges");
+        let before_split = std::fs::read(&record).expect("reads the record");
+        let split = store
+            .split(
+                lock,
+                merged.expected(),
+                &approval_standing(&standing),
+                5_000,
+            )
+            .expect("splits");
+        assert_eq!(
+            standing.seen(),
+            vec![
+                (true, before_join),
+                (true, before_merge),
+                (true, before_split)
+            ]
+        );
+        assert_eq!(store.group().expect("reads the group"), split);
+        assert!(leftovers(&directory).is_empty());
     }
 
     /// KR-REQ-03.07: only the holder of this environment's own singleton lock opens or writes its

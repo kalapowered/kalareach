@@ -13,8 +13,10 @@
 //! performs on its own account, performed, and its receipt kept there. The whole sequence runs on a
 //! task of its own, behind one lock, so a caller that goes away does not cancel a write that has
 //! started, and a second step cannot replace the record between the first one's write and its
-//! receipt. A caller that goes before the write loses its registration, so the check at the write
-//! refuses the step, and that refusal is what a retry of the action is answered with. Before each
+//! receipt. A caller that goes before the record is replaced loses its registration, so the check
+//! made at the replacement refuses the step, and that refusal is what a retry of the action is
+//! answered with. The same check refuses a step whose accepted deadline passes, or whose authority
+//! is withdrawn, while its new record is being written and flushed. Before each
 //! step, and once at start, the claim the record's last change names is settled from the record,
 //! after the record's directory has been flushed: if an attempt ended after its write and before
 //! its receipt, its answer is kept before anything can change the record again, and a step is not
@@ -42,7 +44,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 
 use crate::error::{ControllerError, Result};
-use crate::machine::{Approval, Change, Expected, MachineGroup, MachineStore};
+use crate::machine::{Approval, Change, Expected, MachineGroup, MachineStore, Standing};
 use crate::singleton::SingletonLock;
 
 use super::authority_changes::decoded;
@@ -62,6 +64,54 @@ pub(super) struct Machine {
     /// its admission again and writes. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_write: super::ReadPause,
+    /// Where this host's own tests stop a step once its new record is written and flushed, before
+    /// the record is replaced. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_publication: PublicationPause,
+}
+
+/// A point on the blocking thread that replaces the record, which a test can stop a step at: the
+/// step says it has arrived and waits until the test lets it go. Armed once, it fires once.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct PublicationPause(
+    std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+);
+
+#[cfg(feature = "testing")]
+impl PublicationPause {
+    fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here when the pause is armed. Blocks the calling thread, which is a blocking one.
+    fn hold(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
 }
 
 /// What this host's own tests make fail. Each flag but the last is taken by the first step to meet
@@ -123,6 +173,8 @@ impl Machine {
             faults: Faults::default(),
             #[cfg(feature = "testing")]
             before_the_write: super::ReadPause::default(),
+            #[cfg(feature = "testing")]
+            before_the_publication: PublicationPause::default(),
         })
     }
 }
@@ -153,6 +205,30 @@ const NOT_CONFIRMED: &str = "this environment's machine group record was changed
 /// What a step that wrote nothing is answered with.
 const NOT_WRITTEN: &str = "this environment's machine group record could not be written, and it \
                            is as it was";
+
+/// Whether the authority a step was admitted under stands, as the store asks it when it replaces the
+/// record.
+struct StepStanding<'a> {
+    controller: &'a Controller,
+    carried: &'a crate::authority::AdmittedMutation,
+}
+
+impl std::fmt::Debug for StepStanding<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StepStanding")
+    }
+}
+
+impl Standing for StepStanding<'_> {
+    fn while_standing(
+        &self,
+        publish: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> Result<std::io::Result<()>> {
+        #[cfg(feature = "testing")]
+        self.controller.machine.before_the_publication.hold();
+        self.controller.under_registration(self.carried, publish)
+    }
+}
 
 impl Controller {
     /// The group this environment records, as `host.info` and `environment.list` report it.
@@ -244,14 +320,16 @@ impl Controller {
                 return self.machine_recorded(record);
             }
         };
-        let approval = Approval {
-            actor: actor_id.clone(),
-            action_id: mutation.action_id,
-        };
         #[cfg(feature = "testing")]
         self.machine.before_the_write.wait().await;
         let outcome = self
-            .machine_perform(movement, expected, approval, carried)
+            .machine_perform(
+                movement,
+                expected,
+                actor_id.clone(),
+                mutation.action_id,
+                carried,
+            )
             .await
             .and_then(|record| encode(&result_of(self.paths.environment_id(), &record)));
         // A daemon that stopped here would leave the record written and no receipt.
@@ -279,20 +357,23 @@ impl Controller {
         outcome
     }
 
-    /// Writes the step to the record on a blocking thread, with the admission checked again at
-    /// the write.
+    /// Writes the step to the record on a blocking thread, with the authority it was admitted
+    /// under checked again at the moment the record is replaced.
     ///
-    /// The check and the write are one step with respect to a withdrawal of authority:
-    /// [`Self::under_registration`] holds the connection table across both, so a revocation or a
-    /// lapsed deadline lands wholly before the check or wholly after the write. The write is a
-    /// short one: the store waits only for a call of this daemon on the same record, and this
-    /// daemon takes one step at a time. The one thing that can hold it longer is a platform that
-    /// keeps the replaced record open, for which the store gives up after its own bound.
+    /// What has been withdrawn already is refused before the record is read. After that the store
+    /// writes and flushes the new record, and replaces the old one through [`StepStanding`], which
+    /// runs the replacement only while the registration, the authority revision and the accepted
+    /// deadline stand: [`Self::under_registration`] holds the connection table across that check
+    /// and the replacement, so a revocation lands wholly before it or wholly after, and a deadline
+    /// that passes while the record is being written leaves the old record. The table is not held
+    /// while the file is written and flushed, or while a replacement that the platform refuses for
+    /// a moment waits to be tried again.
     async fn machine_perform(
         self: &Arc<Self>,
         movement: Move,
         expected: Expected,
-        approval: Approval,
+        actor: ActorId,
+        action_id: ActionId,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<MachineGroup> {
         let controller = Arc::clone(self);
@@ -304,14 +385,24 @@ impl Controller {
                     detail: NO_RECORD.to_owned(),
                 });
             };
+            // A caller whose authority is already gone is refused before it is told anything of
+            // the record, such as that its precondition no longer holds.
+            controller.check_registration(&carried)?;
+            let standing = StepStanding {
+                controller: &controller,
+                carried: &carried,
+            };
+            let approval = Approval {
+                actor,
+                action_id,
+                standing: &standing,
+            };
             let lock = &controller.lock;
-            let written = controller
-                .under_registration(&carried, || match movement {
-                    Move::Join(into) => store.join(lock, into, expected, &approval, now_ms),
-                    Move::Merge(into) => store.merge(lock, into, expected, &approval, now_ms),
-                    Move::Split => store.split(lock, expected, &approval, now_ms),
-                })
-                .and_then(|written| written);
+            let written = match movement {
+                Move::Join(into) => store.join(lock, into, expected, &approval, now_ms),
+                Move::Merge(into) => store.merge(lock, into, expected, &approval, now_ms),
+                Move::Split => store.split(lock, expected, &approval, now_ms),
+            };
             // A write whose directory could not be flushed, as the store reports it.
             #[cfg(feature = "testing")]
             let written = match written {
@@ -609,6 +700,20 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.machine.before_the_write.arm()
+    }
+
+    /// Stops the next machine group step once its new record is written and flushed, before the
+    /// record is replaced and before the step's authority is asked about for the last time. Returns
+    /// the end that says the step has arrived, and the end that lets it go. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_next_machine_publication(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.machine.before_the_publication.arm()
     }
 
     /// Ends the next machine group step after its write and before its receipt, as a daemon that
