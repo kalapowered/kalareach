@@ -1560,7 +1560,41 @@ run rather than passing it.
 
 ## Machine groups
 
-Each environment records its own machine group and changes it only by its own owner-approved step.
+A machine group is a random identifier that the owner uses to show several environments together. It is not a hardware identity. A machine group has no relation to the environment's host name, serial number, user name, path or identity, and it is always minted from the platform's secure random source. Each Windows, WSL and container installation is treated as a separate environment (and each environment runs its own control daemon), likewise each user on a multi-user host is treated as a separate environment. Each environment records its own group and changes it only by its own owner-approved step. A group exists only as the value its members record, and nothing else creates or lists it.
+
+A group grants nothing. No part of the daemon reads a group to decide a right, a route, what a device may see or whom it may pair with, and a step never touches a key, a grant, a device, a session identifier or the environment's identity file. A device paired with one environment of a group has no grant, no visibility, no route and no pairing on another, and enrolling an environment for a process bridge neither names nor changes a group.
+
+### The record
+
+The control daemon mints a machine group for each environment the first time it runs, after it has obtained the environment's singleton lock and bumped the generation. The machine group is a simple random identifier. The machine group is persisted in a record in the environment's state directory called `machine-group`. This file is limited to 4096 bytes and is only readable by the owner. It contains a JSON object with the environment's identity, the machine group, a revision number, and the change that last wrote the record. The revision is a positive integer starting at one and incremented each time the record is modified. The change is one of the strings `created`, `joined`, `merged` or `split`. A step also records the group the environment left, the verified actor whose authority approved it, the action it came under and when.
+
+The record is written by writing the new record into a temporary file in the same directory, flushing that file, renaming the temporary file to `machine-group`, and then flushing the directory. Because the record is written in one step, the file `machine-group` will always contain a complete record: the old one until the rename, the new one after it. If the write fails before the rename, the previous record remains in place and the step says nothing was written. If it fails after the rename, the new record is published and the step says that whether the change survives a crash is not known. When the control daemon creates the machine group for the first time, it gives the record its name by a link or a rename that never replaces a record that exists (so two processes can't create two machine groups for the same environment). The control daemon will delete any file with a name starting with `.machine-group.` and ending with `.tmp` when opening the machine group record (to remove any temporary files from failed writes of the previous instance), and nothing reads them.
+
+The environment's machine group is published as an optional property in the `host.info` and `environment.list` operations (as a JSON object member called `machine` with the machine group, revision, last change and previous machine group). This property is informational, read-only and ignored by older control clients. This property will not be present if the machine group record is not available. A paired device reads the same member in the export form of those answers.
+
+### The three steps
+
+`machine.join` moves the environment into a group the owner names. Any identifier is accepted, including one whose members have all left it, because a group is only the value its members record and this environment cannot see the others. `machine.merge` merges this environment's machine group into another. If two environments have independent machine groups, the operator can merge the groups by performing a `machine.merge` on each environment on that environment's own control connection, so no environment accepts or forwards a step for another. `machine.split` moves the environment to a new machine group of its own.
+
+Each step names the record it was approved against, the group and the revision the owner saw. If it names any other record, the step is refused with `DRAFT_CONFLICT`, and nothing is written. A step that attempts to join or merge into a group that the environment is already in is refused with `INVALID_ARGUMENT`. Undoing a step is a join of the group it left, with the step's own result as the precondition, so an undo never reverses a later change.
+
+The steps need `host.manage` on this environment, held by the owner on the environment's own socket or by a paired device whose grant carries it here. No fresh owner confirmation is asked, because grouping grants nothing. A request that names a session or another environment is refused with `INVALID_ARGUMENT`. The daemon checks again when the step is to be written whether the connection on which the step was requested is still registered and the action by which the step was requested is still within its deadline; it holds the registration table while it both checks and writes, so that a revocation is either entirely before the check or entirely after the write. If, however, the step was requested in a revision of the actor's authority that has been replaced, the step is refused.
+
+### Retries and crashes
+
+A step is claimed in the receipt store that holds the other actions of the daemon's own, by the actor, the action identifier and a digest of the request. The daemon performs it, keeps its result under the claim, and answers a retry from that receipt on any connection, whatever window the retry quotes. If the action is used to request a different step, that step is refused with `ID_CONFLICT`. A step the daemon refused, including one that could not write, is kept as that action's refusal, so asking again takes a new action.
+
+A step whose attempt ended after it wrote the record and before it kept the result is answered from the record while the record's last change names that actor and action. Before every step, and once at start before anything is served, the daemon keeps that answer under its claim, so a later step cannot take it away. A claim that nothing finished and the record does not name is answered as `OUTCOME_UNKNOWN` and is never performed again.
+
+### A record that cannot be used
+
+If the record is damaged, names a different environment, or cannot be created, the record is refused and left unaltered, since a group minted over it would be a change nobody approved. The daemon then serves with no group. `host.info` and `environment.list` leave the `machine` member out, all steps are refused with `STORAGE_UNAVAILABLE` before they claim anything, and the `machine-group` check of `host.doctor` fails and says what to do. The reason that the record was refused is logged by the daemon; the doctor reports its class and length, since the reason can quote the file.
+
+There is no command to resolve the problem; instead, the owner must move the `machine-group` file to a different name that does not both begin `.machine-group.` and end `.tmp` (the daemon removes files with such names) and restart the daemon. Since the `machine-group` file will then be missing, the daemon will take this as if it were being started for the first time and mint a new machine group of one. If the environment is known to belong to some other group, the owner can then join it using `kr host machine join`. The old `machine-group` file that was moved to a new name will not be read again. If the record could not be created, the owner should ensure that the state directory can be written to and restart the daemon.
+
+### Backup and restore
+
+A backup carries the sessions' data, the device configuration, the checkpoints and the grants, and it does not carry the machine group, whether it is produced or restored. When an environment is restored, since no state directory is written, no machine group is minted; if the environment has a valid machine group, that group is left as it was.
 
 ## Who may type
 
@@ -4122,9 +4156,11 @@ asks for closed sessions. The worker describes its session in its ready report, 
 each read and in its acceptance of a close, and the daemon keeps the description furthest along
 the lifecycle, so a close it passed on, the first time or as a retry, leaves it one to answer with.
 Where the daemon holds no word of an end, the read is refused with `RESOURCE_UNAVAILABLE` to be
-tried again, and a list leaves the session out. A paired device's close answer carries the
+tried again, and a list gives the session as the registry holds it. A paired device's close answer carries the
 worker's description only when the decision it is written under lets the device read the session
 (`session.view`).
+
+The session list is a list of all unclosed sessions known to the registry. A session whose worker cannot answer, a create that no worker has yet reported for, and a reservation that recovery has not yet resolved are each listed from the registry's own rows, as `live`, `creating` or `closing`, with the shell, directory and size the create asked for where it named them. A connected worker that answers nothing holds the list for one exchange of five seconds, and no longer.
 
 ## Recovery
 
