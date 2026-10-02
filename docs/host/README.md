@@ -2314,13 +2314,15 @@ receipt revision, its event and its outbox record. It permits safe grouped commi
 flush; it does not forbid grouping these with each other. **This build commits each of them on its
 own**, which is its own policy rather than something the section requires.
 
-They are not the only writes a caller waits for, either. Turning privacy mode on waits for the
-generation to be recorded, a create made while privacy mode is on waits for its session's obligation
-to be recorded, and a closure waits for its own record, because in each case the answer would
-otherwise claim something the store had not yet taken. Section 24 forbids a per-keystroke,
-per-output-byte or ordinary prompt and command telemetry event from waiting for an fsync, and this
-host goes further with the first two: a keystroke and an output byte write no durable row at all.
-The live parser is in worker memory and the retained output is a bounded indexed spool.
+They are not the only writes a caller may need to wait for. When a caller turns privacy mode on, it
+must wait for the generation to be recorded in the store. Similarly, if the caller creates a session
+while privacy mode is on, it must wait for the store to record the session's obligation. Finally, if
+the caller closes a session, it must wait for the store to record the closure, because in each case
+the answer would otherwise claim something the store had not yet taken. Section 24 forbids a
+per-keystroke, per-output-byte or ordinary prompt and command telemetry event from waiting for an
+fsync, and this host goes further with the first two: a keystroke and an output byte write no
+durable row at all. The live parser is in worker memory and the retained output is a bounded indexed
+spool.
 
 Grouping is the transaction. A receipt transition writes three rows - the receipt, its event and
 its outbox record - in one transaction, so three rows share one flush and either all three are
@@ -2849,11 +2851,15 @@ launch failed after a worker claimed it, or whose session has closed. A session 
 reported yet is one this host has not reached, and it holds turning privacy mode off back until its
 worker answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the
 next generation is recorded first, the backup fence is released under it, the delivery fence is
-lifted, and each live session is told until it answers. When a launch never handed a worker its
-launch specification, this host can tell. In other words, it failed, or was fenced, before any
-worker claimed it, its launcher ended without claiming it, or its create returned without having
-recorded a launcher, which no claim can be accepted without. Since no shell ran, there's nothing to
-retain. The obligation is deleted from the record and the session is not reported as ended.
+lifted, and each live session is told until it answers. When a launch has never handed a worker its
+launch specification, no shell has run and nothing was retained. The registry and the daemon's own
+creates show it in one of three cases: It has either failed or been fenced before any worker claimed
+it. Its launcher has ended without claiming it. Its create has returned without recording a
+launcher, which a claim cannot be accepted without. In any of these cases, the obligation is deleted
+from the record. Additionally, the session is not reported as ended. If the launch is in any other
+case, for example if its create ended due to an error with the registry, then it keeps its
+obligation, and holds privacy mode on, until its worker claims it or the daemon's next start settles
+it.
 
 **The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
 about an earlier one, is admitted under the privacy state the record publishes: only while privacy
