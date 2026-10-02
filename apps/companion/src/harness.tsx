@@ -16,6 +16,7 @@ import { fakeHost, type FakeHostControls } from './host/fake'
 // The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
 // the phone's one without pretending to be a phone.
 import { Shell, surfaceOf } from './mobile/entry'
+import { followTheSystemTextSize } from './mobile/text-size'
 import './styles/tokens.css'
 import './styles/base.css'
 import './styles/components.css'
@@ -33,6 +34,9 @@ if (!root) throw new Error('The application has no root element.')
 
 const { port, controls } = fakeHost()
 window.krTestHost = controls
+
+// Where the web view has the person's text size to give, before the first render.
+followTheSystemTextSize()
 
 createRoot(root).render(
   <StrictMode>

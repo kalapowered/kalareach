@@ -955,3 +955,32 @@ fn no_file_names_an_identifier_or_a_team_the_application_no_longer_has() {
         stale.join("\n")
     );
 }
+
+/// KR-REQ-13.19: a change of the system's font scale reaches the page while the application is
+/// open, and it does so because the system restarts the activity, which reloads the page at the new
+/// size. An activity that declares it handles the change itself is not restarted, and its web view
+/// keeps the size the page loaded with, so the person's new text size would not arrive until the
+/// application was closed and opened again.
+#[test]
+fn the_android_activity_is_restarted_by_a_font_scale_change_so_the_page_follows_it() {
+    let manifest =
+        std::fs::read_to_string(crate_root().join("gen/android/app/src/main/AndroidManifest.xml"))
+            .expect("the application's manifest can be read");
+    let changes = manifest
+        .split("android:configChanges=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the main activity declares the configuration changes it handles");
+    let handled: Vec<&str> = changes.split('|').collect();
+    assert!(
+        !handled.contains(&"fontScale"),
+        "the main activity handles a change of fontScale itself, so its web view keeps the old text size: {changes}"
+    );
+    // What it does handle, so a change of one of these is not a restart that loses the person's place.
+    for needed in ["uiMode", "screenSize", "orientation"] {
+        assert!(
+            handled.contains(&needed),
+            "the main activity does not handle {needed}: {changes}"
+        );
+    }
+}

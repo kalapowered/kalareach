@@ -12,8 +12,13 @@
 
 html {
   min-width: 320px;
-  /* The person's text size, not a fixed pixel size. */
-  font-size: 100%;
+  /*
+   * The person's text size, not a fixed pixel size. Android's web view and the desktop browsers
+   * apply it to the root's 100%. iOS does not: its web view keeps the root at 16px whatever
+   * Dynamic Type says, so `--text-scale` carries the ratio the system's body text has to its size
+   * at the default setting (see `mobile/text-size.ts`), and is 1 everywhere else.
+   */
+  font-size: calc(100% * var(--text-scale, 1));
 }
 
 body {
