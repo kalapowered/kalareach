@@ -642,6 +642,41 @@ fn a_version_6_journal_that_holds_variables(
     );
     definition.description = Nullable::some("d".repeat(24_000));
     plant(&keeper, &definition);
+    // A create node whose parameters are the array form of the fields, which a derived decoder
+    // reads and an earlier build installed: its variables are in a position, not under a name.
+    let object: serde_json::Value = serde_json::from_str(&create_with(&[("KR_PLANTED", PLANTED)]))
+        .expect("the parameters of a create node");
+    let array: serde_json::Value = [
+        "environment_id",
+        "presentation",
+        "shell",
+        "shell_mode",
+        "cwd",
+        "dimensions",
+        "worker_profile",
+        "environment_snapshot",
+        "palette",
+        "launch_profile",
+        "terminal",
+    ]
+    .iter()
+    .map(|field| object[*field].clone())
+    .collect();
+    let mut definition = create_workflow_definition(
+        test_wf_id(4),
+        1,
+        "installed-by-an-earlier-build",
+        test_grant_id(4),
+        vec![WorkflowNode {
+            node_id: "as-an-array".to_owned(),
+            action_kind: WorkflowActionKind::CreateSession,
+            action_params: array.to_string(),
+            declared_environment: Nullable::null(),
+        }],
+        vec![],
+    );
+    definition.description = Nullable::some("d".repeat(24_000));
+    plant(&keeper, &definition);
     keeper
         .pragma_update(None, "user_version", 6_u32)
         .expect("the earlier version");
@@ -701,16 +736,16 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
             "{mode}: the variable's name is still on disk after the open"
         );
 
-        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1), (3, 1)] {
+        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1), (3, 1), (4, 1)] {
             let installed = store
                 .get_definition(test_wf_id(workflow), revision)
                 .expect("reads")
                 .expect("the revision is still installed");
             let nodes = &installed.definition.nodes;
-            let create = if workflow == 3 { 1 } else { 2 };
+            let create = if workflow >= 3 { 1 } else { 2 };
             assert_eq!(
                 nodes.len(),
-                if workflow == 3 { 1 } else { 3 },
+                if workflow >= 3 { 1 } else { 3 },
                 "{mode}: {workflow}/{revision}"
             );
             for node in &nodes[..create] {
@@ -723,8 +758,16 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
                     node.node_id
                 );
             }
+            // A create node of the array form comes forward as the object a name-keyed reader
+            // reads, which the typed decoder reads as the same parameters.
+            if workflow == 4 {
+                let params: kr_protocol::session::SessionCreateParams =
+                    serde_json::from_str(&nodes[0].action_params).expect("a session's parameters");
+                assert!(params.environment_snapshot.is_empty());
+                assert_eq!(params.environment_id, common::environment());
+            }
             // The rest of the definition is as it was installed.
-            if workflow != 3 {
+            if workflow < 3 {
                 assert_eq!(
                     nodes[2].action_params,
                     common::params(kr_protocol::automation::WorkflowActionKind::RunTests)
