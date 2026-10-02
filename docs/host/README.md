@@ -4362,6 +4362,11 @@ that package and method has interpreted it. Machine output and terminal text can
 cannot create a request, however accurate they are, so a permission prompt read from the screen or
 from a notification is never an approval.
 
+A package gets the broker's semantic events within the default ceiling, while `terminal.stream`,
+`terminal.transcript_tail` and `process.observe` are outside it, so each needs an explicit package
+or repository grant. A package that reads terminal text has to be given that reading, and the
+reading never turns into approval authority.
+
 ### Decoding trust
 
 An installed connector is a semantic trust boundary, and the record that says so names the package
