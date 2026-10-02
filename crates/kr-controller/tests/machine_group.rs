@@ -980,6 +980,54 @@ async fn a_retry_that_finds_the_record_unreadable_is_pointed_at_the_doctor() {
     host.stop().await;
 }
 
+/// KR-REQ-03.07: a daemon that started with a record it cannot use answers a retry of a step it has a
+/// claim for, with an outcome nobody knows that points at `host.doctor`, and never performs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_with_no_usable_record_answers_a_retry_of_an_unfinished_step_with_the_doctor() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let unfinished = composed_join(&host, &mut client, some_group(0xaa), &minted).await;
+    drop(client);
+    let record = host.tree().environment().state_dir().join(RECORD_FILE);
+    let stopped = host.shut_down().await;
+    kr_ipc::paths::write_owner_only_file(&record, b"this is not a machine group record")
+        .expect("damages the record");
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let mut client = host.client().await;
+
+    // A claim an attempt left unfinished, as a crash does.
+    let actor = local_owner();
+    let digest = kr_protocol::digest::mutation_digest(&unfinished, &actor).expect("a digest");
+    let claimed = host
+        .controller()
+        .sharing()
+        .grants()
+        .claim_action(&actor, unfinished.action_id, &digest, 1_000)
+        .expect("claims the action");
+    let kr_controller::grants::ActionClaim::Claimed { hold } = claimed else {
+        panic!("nothing held this action before");
+    };
+    drop(hold);
+
+    let unknown = client
+        .repeat(&unfinished)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("a daemon with no record cannot say what the step did");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+    assert!(
+        unknown.message.contains("host.doctor"),
+        "the answer points at the doctor: {}",
+        unknown.message
+    );
+
+    drop(client);
+    host.stop().await;
+}
+
 /// KR-REQ-03.07: a step that wrote the record and could not confirm that its directory survives a
 /// crash is an outcome nobody knows, at either door, and its answer names no path: a paired device
 /// is given it. The record shows the change, so asking again under the same action is answered from
