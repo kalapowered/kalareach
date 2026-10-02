@@ -1063,7 +1063,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
 /// and the leg fails saying so.
 #[test]
 fn the_host_installs_the_published_catalogue_release_byte_for_byte_the_bundled_copy() {
-    use kr_e2e_m1b::catalogue::{BundledLock, PLUGIN, enrol, pinned_root, workspace};
+    use kr_e2e_m1b::catalogue::{BundledLock, PLUGIN, bundled_root, enrol, workspace};
     use kr_e2e_m1b::device::Device;
     use kr_e2e_m1b::{LIVENESS, RELEASE_VARIABLE};
     use kr_protocol::catalogue::CatalogueKind;
@@ -1095,7 +1095,7 @@ fn the_host_installs_the_published_catalogue_release_byte_for_byte_the_bundled_c
         .expect("the targets address")
         .to_string();
     let lock = BundledLock::read();
-    let root = pinned_root(&lock);
+    let root = bundled_root(&lock);
 
     let runtime = runtime();
     let run = Run::start(LEG);
@@ -1177,7 +1177,8 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
     use kr_e2e_m1b::LIVENESS;
     use kr_e2e_m1b::agent::Agent;
     use kr_e2e_m1b::catalogue::{
-        BundledLock, PLUGIN, copy_tree, development_generation, directory_url, enrol, pinned_root,
+        PLUGIN, copy_tree, development_generation, directory_url, enrol, fixture_release,
+        fixture_root,
     };
     use kr_e2e_m1b::device::Device;
     use kr_e2e_m1b::view::{View, pending_questions, session_target};
@@ -1203,8 +1204,8 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         LEG,
         "nothing: this leg serves its generation from the internal disk and never contacts the site",
     );
-    let lock = BundledLock::read();
-    let root = pinned_root(&lock);
+    let root = fixture_root();
+    let (version, manifest_digest) = fixture_release();
     let runtime = runtime();
     let run = Run::start(LEG);
     let host = Host::start(&run, &HostOptions::default());
@@ -1230,9 +1231,9 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         "install",
         "development",
         PLUGIN,
-        &lock.version,
+        &version,
         "--digest",
-        &lock.manifest_digest,
+        &manifest_digest,
     ]);
     let _ = host.kr_json(&["plugin", "enable", PLUGIN]);
 
