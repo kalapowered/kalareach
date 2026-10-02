@@ -383,6 +383,20 @@ self_test_ordinary_tree() {
   [ ! -e "$state" ] && [ ! -e "$d/run/kalareach" ] && [ -f "$d/home/.local/state/beside/kept" ]
 }
 
+# Where WSLg puts the runtime directory in what it shares between distributions, the product keeps
+# its runtime files below the home directory, and that is what is removed. The shared directory is
+# left whatever it holds.
+self_test_shared_runtime_directory() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  local run="$d/home/.cache/kalareach/run"
+  mkdir -p "$run/environment" "$d/home/.cache/beside" || return 1
+  printf x >"$run/environment/socket" || return 1
+  printf x >"$d/home/.cache/beside/kept" || return 1
+  self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" \
+    XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir || return 1
+  [ ! -e "$run" ] && [ -f "$d/home/.cache/beside/kept" ]
+}
+
 # A name that holds a newline is one entry of the tree like any other, and the tree is removed.
 self_test_newline_name() {
   local d="$self_test_work/${FUNCNAME[0]}"
@@ -865,6 +879,8 @@ STAND_IN
 
   self_test_case self_test_ordinary_tree \
     "an ordinary installation is removed whole, and what lies beside it is left"
+  self_test_case self_test_shared_runtime_directory \
+    "where the runtime directory is the one WSLg shares, the root below the home directory is removed"
   self_test_case self_test_newline_name \
     "a name that holds a newline is one entry of the tree, and the tree is removed"
   self_test_case self_test_ordinary_root \
@@ -1309,7 +1325,6 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its daemon $daemon_pid has for a root"
   [ "$daemon_root" = "/" ] ||
     fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
-
   # A session of the distribution's own, named by the identifier the create answered with.
   session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)" ||
     fail "$distribution could not be asked to create a session of its own"
