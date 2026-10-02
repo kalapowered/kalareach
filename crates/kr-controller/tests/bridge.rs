@@ -347,6 +347,63 @@ async fn a_refresh_is_performed_once_per_action_and_a_retry_is_answered_from_its
     host.stop().await;
 }
 
+/// KR-REQ-23.33: an enrolment whose receipt cannot be kept is answered with what it did. The
+/// registry refuses every update of a receipt, as a disk that cannot be written would, after the
+/// action was claimed: the enrolment is made and the caller is told so, the claim stays unfinished,
+/// and a retry is an outcome this host does not know and enrols nothing a second time.
+#[tokio::test]
+async fn an_enrolment_whose_receipt_cannot_be_kept_is_answered_with_what_it_did() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut client = host.client().await;
+
+    {
+        let connection =
+            rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER no_receipt_is_kept BEFORE UPDATE ON authority_receipts \
+                 BEGIN SELECT RAISE(ABORT, 'a test makes every receipt unwritable'); END;",
+            )
+            .expect("makes the receipts unwritable");
+    }
+    let record = enrolment(1, "ubuntu", EnvironmentAccess::WslDistribution);
+    let first = composed(
+        &mut client,
+        &host,
+        Method::EnvironmentEnrol,
+        &EnvironmentEnrolParams {
+            enrolment: record.clone(),
+        },
+    )
+    .await;
+    let enrolled: EnvironmentEnrolResult = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect("the enrolment was made, so the answer says so")
+        .to_typed()
+        .expect("an enrolment result");
+    assert_eq!(enrolled.row.enrolment.environment_id, record.environment_id);
+    assert_eq!(inventory(&mut client).await.rows.len(), 1);
+
+    let unknown = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a claim nobody finished is not performed again");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        inventory(&mut client).await.rows.len(),
+        1,
+        "the retry enrolled nothing"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-03.16: an enrolment whose helper path is not absolute is refused and records nothing.
 #[tokio::test]
 async fn a_record_without_an_absolute_helper_path_is_refused() {
