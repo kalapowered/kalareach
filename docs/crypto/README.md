@@ -8,18 +8,18 @@ calls a maintained library, and the libraries are the ones below.
 
 | What | Implementation |
 | --- | --- |
-| `crypto_box_easy`, Ed25519, `crypto_secretstream_xchacha20poly1305`, XChaCha20-Poly1305, `crypto_kdf`, the CSPRNG | libsodium, through the pinned `libsodium-sys-stable` binding, which builds the C library from source |
+| `crypto_box_easy`, Ed25519, X25519 agreement (`crypto_scalarmult`), `crypto_secretstream_xchacha20poly1305`, XChaCha20-Poly1305, `crypto_kdf`, the CSPRNG | libsodium, through the pinned `libsodium-sys-stable` binding, which builds the C library from source |
 | HKDF-SHA256, HMAC-SHA256, SHA-256 | the maintained RustCrypto `hkdf`, `hmac` and `sha2` crates |
 | Canonical encoding and digests | `crates/kr-cbor`, over the RustCrypto `sha2` crate |
 | Wire shapes | `crates/kr-protocol` |
 | The short-code PAKE | the RustCrypto `spake2` crate, which `crates/kr-pairing` alone depends on |
-| Verifying the signed metadata of a plugin catalogue | the `tough` TUF client, built on `aws-lc-rs` |
+| Verifying the signed metadata of a plugin catalogue, and a host's own update | the `tough` TUF client, built on `aws-lc-rs` |
 | TLS to a service and to a pairing room | `rustls`, with `ring` and the platform's certificate verifier |
 | The transport between devices | iroh |
 | The media path of a voice call | DTLS-SRTP in the `webrtc` crate with its `ring` backend on a desktop, the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
 | Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
-| Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module in the tests that recompute them |
+| Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module for the hashes, HMAC, HKDF and Ed25519 signatures that the tests recompute |
 
 ## The unsafe boundary
 
