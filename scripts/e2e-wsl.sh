@@ -34,6 +34,12 @@
 #   KR_WSL_SECOND     the name of the second distribution this script makes (default kr-acc-011)
 #   KR_WSL_ROOT       where that distribution's image is written (default /c/kala/wsl)
 #   KR_WSL_KEEP       1 to keep the second distribution and the daemons for inspection
+#   KR_WSL_NETWORK_MODES
+#                     the networking modes step 6 measures, as `nat`, `mirrored` or `nat mirrored`
+#                     (default `nat mirrored`). A host that cannot offer a mode is a failure when
+#                     the mode is asked for, so a host that cannot offer mirrored networking, as a
+#                     hosted Windows Server cannot, names only `nat` and the run says that mirrored
+#                     was not measured on it. The run's result is the modes it measured and no more.
 #
 # `bash scripts/e2e-wsl.sh --self-test` checks the part of step 3 that removes the installation a
 # copied distribution inherited. It runs on a Linux host, with no Windows and no WSL, against trees
@@ -1035,6 +1041,13 @@ linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
 keep="${KR_WSL_KEEP:-0}"
+network_modes="${KR_WSL_NETWORK_MODES:-nat mirrored}"
+for mode in $network_modes; do
+  case "$mode" in
+    nat | mirrored) ;;
+    *) echo "FAIL: KR_WSL_NETWORK_MODES names $mode, which is not a mode this run measures: nat or mirrored" >&2; exit 1 ;;
+  esac
+done
 
 # MSYS2 rewrites an argument that looks like a POSIX path before it hands it to a native program,
 # which is wrong for every argument here: `/bin/sh` is a path inside the distribution, not on this
@@ -1774,7 +1787,7 @@ set_mode() {
   done
 }
 
-for mode in nat mirrored; do
+for mode in $network_modes; do
   set_mode "$mode"
   networking_facts "$mode" "$first"
   # The bridge opens no socket, so it must behave the same in both modes. This is the measurement
@@ -1807,4 +1820,12 @@ grep -q "test result: ok" "$run_dir/wsl-bridge-suite.log" ||
 pass "the bridge suite passes inside the distribution, including the refusal of a network origin"
 
 echo
+case " $network_modes " in
+  *" mirrored "*) : ;;
+  *) echo "mirrored networking was not measured: this run asked for $network_modes only." ;;
+esac
+case " $network_modes " in
+  *" nat "*) : ;;
+  *) echo "NAT networking was not measured: this run asked for $network_modes only." ;;
+esac
 echo "KR-ACC-011: $passed checks passed."

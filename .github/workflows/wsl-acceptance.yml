@@ -22,7 +22,7 @@ name: wsl-acceptance
 
 on:
   push:
-    branches: ["task/T-025b-phase2"]
+    branches: ["task/T-025b-phase2-rebased1"]
     paths: [".github/workflows/wsl-acceptance.yml", "scripts/e2e-wsl.sh"]
   workflow_dispatch:
 
@@ -183,6 +183,10 @@ jobs:
         env:
           KR_WSL_USER: root
           KR_WSL_ROOT: /c/wsl-images
+          # A hosted Windows Server does not offer mirrored networking ("The specified request is
+          # unsupported"), so this run measures NAT and says it did. Mirrored networking is
+          # measured on a Windows 11 machine, where the script is run with its default.
+          KR_WSL_NETWORK_MODES: nat
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           KR_TEST_ARTIFACTS_DIR="$(cygpath -u "$KR_TEST_ARTIFACTS_DIR")"
