@@ -7257,6 +7257,122 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
     host.stop().await;
 }
 
+/// KR-REQ-16.12, KR-REQ-10: a destination whose rule names a grant issued to a paired device, a
+/// grant of the grant store, receives nothing once that device's pairing has ended, as a request
+/// of the device's own would not be served either. The control: while the device is paired, the
+/// same webhook under the same grant is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_webhook_under_a_grant_issued_to_a_device_is_told_nothing_once_the_device_is_unpaired() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(90));
+    let (device_id, _, _) = pair_phone(controller, 10, SessionSelector::Any);
+    let now = kr_ipc::now_ms().get();
+    let issued = Grant {
+        grant_id: GrantId::new(uuid(150)),
+        authority_revision: controller.policy().authority_revision(),
+        actions: [kr_protocol::rights::ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        ..dummy_grant(device_id)
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &kr_controller::grants::GrantRecord {
+                grant: issued.clone(),
+                session_id: None,
+                issued_at_ms: now - 20_000,
+                activated_at_ms: Some(now - 10_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is issued");
+    controller
+        .delivery()
+        .configure(&DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: "https://example.invalid/hook".to_owned(),
+                idempotency: Idempotency::Unsupported,
+                credential: None,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on a pending approval".to_owned(),
+                grant_id: Some(issued.grant_id),
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(now),
+        })
+        .expect("a destination");
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    let posts_to_the_webhook = || {
+        gateway
+            .asked()
+            .iter()
+            .filter(|asked| asked.url == "https://example.invalid/hook")
+            .count()
+    };
+
+    // The control: the device is paired, and the webhook is told.
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, 1, "req-before")])
+        .expect("the store records the approval");
+    until_holds("the webhook being told while the device is paired", || {
+        posts_to_the_webhook() == 1
+    })
+    .await;
+    until_holds("the announcement being settled with", || {
+        announcements_waiting(controller) == Some(0)
+    })
+    .await;
+
+    // The device is unpaired: its pairing ends, and the grant issued to it stands in the store.
+    controller
+        .devices()
+        .revoke(device_id, TimestampMs::new(kr_ipc::now_ms().get()))
+        .expect("the device is unpaired");
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, 2, "req-after")])
+        .expect("the store records the approval");
+    until_holds("the second announcement being settled with", || {
+        announcements_waiting(controller) == Some(0)
+    })
+    .await;
+    until_holds("the webhook's second notification being decided", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| {
+                        record.destination_id.as_str() == "hook"
+                            && record.state == DeliveryState::Refused
+                    }))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        posts_to_the_webhook(),
+        1,
+        "nothing more was sent to the webhook after the device was unpaired"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-24.29: a journal that cannot list what has left says so, under `unlisted` with its
 /// reason, and never by an empty list. The control: the same daemon, with its journal whole, lists
 /// the copy.
