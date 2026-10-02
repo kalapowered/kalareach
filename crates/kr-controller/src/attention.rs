@@ -502,6 +502,10 @@ pub struct AttentionModule {
     /// keeps and writing it.
     #[cfg(test)]
     in_save: Pause,
+    /// Where this host's own tests stop a pass that decides announcements once it holds the
+    /// privacy state's read side, before it decides. Compiled away in every shipped build.
+    #[cfg(any(test, feature = "testing"))]
+    after_privacy_read: Pause,
     /// The threads each pass that decided announcements ran on, which a test reads to see that no
     /// pass ran on a thread of the runtime that drives the exchanges privacy mode waits for.
     #[cfg(test)]
@@ -605,6 +609,8 @@ impl AttentionModule {
             save_entry: Pause::default(),
             #[cfg(test)]
             in_save: Pause::default(),
+            #[cfg(any(test, feature = "testing"))]
+            after_privacy_read: Pause::default(),
             #[cfg(test)]
             decided_on: std::sync::Mutex::new(Vec::new()),
         };
@@ -699,7 +705,7 @@ impl AttentionModule {
     /// Taking it waits behind a change that is itself waiting for the sends admitted before it, and
     /// a send holds its admission across an exchange that needs the runtime's own threads. So this
     /// runs only on a thread that may wait, the blocking pool or one of its own, and a caller that
-    /// runs on the runtime goes through [`Self::deciding_off_the_workers`]. Not held across an
+    /// runs on the runtime goes through [`Self::deciding_on_the_blocking_pool`]. Not held across an
     /// await.
     fn deciding<T>(&self, pass: impl FnOnce(HostReading) -> T) -> T {
         #[cfg(test)]
@@ -719,6 +725,8 @@ impl AttentionModule {
                 private: published.private,
             });
         }
+        #[cfg(any(test, feature = "testing"))]
+        self.after_privacy_read.wait();
         pass(reading)
     }
 
@@ -728,7 +736,7 @@ impl AttentionModule {
     /// Every caller that runs on the runtime decides through this, as every other taker of the
     /// privacy state's read side runs on the blocking pool. Answers `None` when the pool was shut
     /// down before the pass ran, which only a stopping runtime does.
-    async fn deciding_off_the_workers<T: Send + 'static>(
+    async fn deciding_on_the_blocking_pool<T: Send + 'static>(
         self: &Arc<Self>,
         pass: impl FnOnce(&Self, HostReading) -> T + Send + 'static,
     ) -> Option<T> {
@@ -1431,6 +1439,10 @@ impl AttentionModule {
     /// The environment's own producers feed the store through this, and so does a host that
     /// learns of a condition in a session by a route other than the session's own records.
     ///
+    /// It decides under the privacy state's read side, which waits behind a change of privacy mode
+    /// that is itself waiting for a send on the wire, so it is called from a thread that may wait,
+    /// never from one of the runtime's own.
+    ///
     /// # Errors
     ///
     /// Returns the store's refusal; nothing about the events is kept then.
@@ -1705,6 +1717,21 @@ impl AttentionModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.before_store.arm()
+    }
+
+    /// Stops the next pass that decides announcements once it holds the privacy state's read side,
+    /// before it decides, for this host's own tests.
+    ///
+    /// Returns the end that says the pass has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_privacy_read(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_privacy_read.arm()
     }
 
     /// Performs one mutation of this group and returns the frame it answers with.
@@ -1993,7 +2020,7 @@ impl AttentionModule {
         let output_floor = page.output_floor.0.map(|floor| floor.get());
         let link = Arc::clone(link);
         let taken = self
-            .deciding_off_the_workers(move |module, reading| -> Answer<Taken> {
+            .deciding_on_the_blocking_pool(move |module, reading| -> Answer<Taken> {
                 let mut store = module.store()?;
                 if !module
                     .origins()
@@ -2478,7 +2505,7 @@ impl AttentionModule {
                 held.finish_again(reach.as_ref()).await;
                 let forgotten_at = forgot_at;
                 let Some((reading, forgot)) = held
-                    .deciding_off_the_workers(move |module, reading| {
+                    .deciding_on_the_blocking_pool(move |module, reading| {
                         let mut forgot = forgotten_at;
                         if let Ok(mut store) = module.store() {
                             // Read with the store held: a closure and a replacement take the
