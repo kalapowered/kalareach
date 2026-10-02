@@ -12,8 +12,8 @@ Licence, version 3 or later, and `shells/fish/` version 2 of that licence, each 
 `LICENSE` file that keeps the upstream licence text. `shells/psreadline/` copies nothing from
 upstream and stays BSD 3-Clause. Every crate, script and document written for KalaReach stays BSD
 3-Clause, and no code under any of those licences is compiled into a crate. The Gradle wrapper
-scripts under `apps/companion/src-tauri/gen/android/` are Gradle's own and keep their Apache License
-2.0 headers.
+under `apps/companion/src-tauri/gen/android/`, its scripts and `gradle-wrapper.jar`, is Gradle's own
+code under the Apache License 2.0, and the scripts keep their headers.
 
 ## Repository layout
 
