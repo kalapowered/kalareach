@@ -231,6 +231,84 @@ async fn stub_controller(
     .await
 }
 
+/// What a daemon acknowledges a hello with: the user it says it authenticated the caller as, and the
+/// build it states, if it states one.
+fn hello_ack(
+    environment_id: EnvironmentId,
+    authenticated_uid: u64,
+    build: Option<kr_protocol::local::LocalBuild>,
+) -> LocalHelloAck {
+    let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+    LocalHelloAck {
+        selected_version: PROTOCOL_VERSION,
+        role: LocalRole::Controller,
+        connection_id,
+        environment_id,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        // The helper checks that the daemon it reached authenticated it as the user it runs as.
+        peer: LocalPeer {
+            uid: U64::new(authenticated_uid),
+            gid: U64::new(0),
+            pid: Nullable::null(),
+        },
+        action_window: ActionWindow {
+            action_window_id: kr_protocol::ids::ActionWindowId::new("w").expect("a window"),
+            connection_id,
+            boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+            issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+            valid_for_ms: DurationMs::new(120_000),
+        },
+        capabilities: CanonicalSet::new(),
+        max_receive: ReceiveLimits::default(),
+        build,
+    }
+}
+
+/// A daemon of a build from before a hello could say where an invocation began.
+///
+/// It answers an ordinary hello, stating `build`, and ends the connection a hello that carries an
+/// origin arrived on without a word, which is what a host that cannot decode the frame does. It
+/// serves every connection that is made to it, and counts the ones that said where they began.
+async fn stub_earlier_controller(
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    build: Option<kr_protocol::local::LocalBuild>,
+    bridged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the stub endpoint");
+    tokio::spawn(async move {
+        while let Ok((connection, _peer)) = listener.accept().await {
+            let build = build.clone();
+            let bridged = std::sync::Arc::clone(&bridged);
+            tokio::spawn(async move {
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, StreamKind::Control);
+                let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await
+                else {
+                    return;
+                };
+                if hello.origin.is_some() {
+                    bridged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                let acknowledgement = hello_ack(
+                    environment_id,
+                    u64::from(kr_ipc::paths::current_uid()),
+                    build,
+                );
+                if writer
+                    .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while reader.read_message::<ControlFrame>().await.is_ok() {}
+            });
+        }
+    })
+}
+
 /// [`stub_controller`], naming the user it says it authenticated the caller as.
 async fn stub_controller_seeing(
     endpoint: kr_ipc::paths::Endpoint,
@@ -261,32 +339,13 @@ async fn stub_controller_hearing(
         if let Some(heard) = heard {
             *heard.lock().expect("the slot") = Some(hello);
         }
-        let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
-        let acknowledgement = LocalHelloAck {
-            selected_version: PROTOCOL_VERSION,
-            role: LocalRole::Controller,
-            connection_id,
+        let acknowledgement = hello_ack(
             environment_id,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            // The helper checks that the daemon it reached authenticated it as the user it runs as.
-            peer: LocalPeer {
-                uid: U64::new(authenticated_uid),
-                gid: U64::new(0),
-                pid: Nullable::null(),
-            },
-            action_window: ActionWindow {
-                action_window_id: kr_protocol::ids::ActionWindowId::new("w").expect("a window"),
-                connection_id,
-                boot_epoch: kr_protocol::ids::BootEpoch::new(1),
-                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
-                valid_for_ms: DurationMs::new(120_000),
-            },
-            capabilities: CanonicalSet::new(),
-            max_receive: ReceiveLimits::default(),
-            build: Some(kr_protocol::local::LocalBuild::this(
+            authenticated_uid,
+            Some(kr_protocol::local::LocalBuild::this(
                 BuildId::new("kr-controller/test").expect("a build"),
             )),
-        };
+        );
         if writer
             .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
             .await
@@ -1171,4 +1230,80 @@ async fn the_helper_tells_the_destination_where_the_invocation_began() {
     assert_eq!(said.client, kr_protocol::local::LocalClientKind::Cli);
     drop(helper.finish());
     stub.abort();
+}
+
+/// What a helper refuses with when the daemon it reaches is of an earlier build that ends a
+/// connection saying where the invocation began, for an opening that does or does not start what
+/// it needs, and how many such connections the daemon was made.
+async fn refusal_from_an_earlier_daemon(
+    start: bool,
+    build: Option<kr_protocol::local::LocalBuild>,
+) -> (ProtocolError, usize) {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let bridged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stub = stub_earlier_controller(
+        endpoint,
+        tree.environment_id(),
+        build,
+        std::sync::Arc::clone(&bridged),
+    )
+    .await;
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello_to(ActorIngress::LocalIpc, start, BridgeTarget::Controller));
+    let BridgeFrame::Refused(error) = helper.read() else {
+        panic!("a daemon that takes no bridge is a refusal, not an acknowledgement");
+    };
+    drop(helper.finish());
+    stub.abort();
+    (error, bridged.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// KR-REQ-03.13: a daemon of a build from before a hello could say where an invocation began ends
+/// the connection that says it, which reads like a daemon that is not running. It answers an
+/// ordinary connection, though, so the helper says what is true: which build it is, which build
+/// the helper is, and that a restart is what to do. It does not carry the request without the
+/// origin, so the daemon is made exactly one connection that declares one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_of_an_earlier_build_is_named_and_not_reported_absent() {
+    let earlier = Some(kr_protocol::local::LocalBuild {
+        build_id: BuildId::new("kr-controller/0.0.9").expect("a build"),
+        protocol_version: kr_protocol::hello::PackageVersion::new(0, 0, 9),
+    });
+    for start in [false, true] {
+        let (error, bridged) = refusal_from_an_earlier_daemon(start, earlier.clone()).await;
+        assert_eq!(error.code, ErrorCode::UnsupportedSchema, "start {start}");
+        assert!(
+            error.message.contains("control daemon")
+                && error.message.contains("kr-controller/0.0.9 with protocol 0.0.9")
+                && error.message.contains("this helper is kr/")
+                && error.message.contains("restart it"),
+            "start {start}: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("no KalaReach host is running"),
+            "start {start}: a daemon that answers is running: {}",
+            error.message
+        );
+        assert_eq!(bridged, 1, "start {start}: nothing was retried without the origin");
+    }
+}
+
+/// The same, for a daemon of a build that states none, which is every one from before builds were
+/// stated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_that_states_no_build_is_said_to_state_none() {
+    let (error, _) = refusal_from_an_earlier_daemon(false, None).await;
+    assert_eq!(error.code, ErrorCode::UnsupportedSchema);
+    assert!(
+        error
+            .message
+            .contains("a build that does not state its build or its protocol version"),
+        "{}",
+        error.message
+    );
 }

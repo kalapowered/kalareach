@@ -338,7 +338,13 @@ async fn reach(
     };
     let (client, role) = match hello.target {
         BridgeTarget::Controller => (
-            controller(&paths, &known, hello.start, origin).await?,
+            match controller(&paths, &known, hello.start, origin).await {
+                Ok(client) => client,
+                Err(error) => {
+                    let endpoint = known.paths.controller_endpoint().ok();
+                    return Err(explained(Peer::Daemon, endpoint, error).await);
+                }
+            },
             kr_protocol::local::LocalRole::Controller,
         ),
         BridgeTarget::Session { session_id } => {
@@ -348,7 +354,16 @@ async fn reach(
                 Some(known.environment_id),
             ) {
                 Ok((_, descriptor)) => (
-                    resolve::open_worker_for(&descriptor, crate::build_id(), Some(origin)).await?,
+                    match resolve::open_worker_for(&descriptor, crate::build_id(), Some(origin))
+                        .await
+                    {
+                        Ok(client) => client,
+                        Err(error) => {
+                            let endpoint =
+                                kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).ok();
+                            return Err(explained(Peer::Worker, endpoint, error).await);
+                        }
+                    },
                     kr_protocol::local::LocalRole::Worker,
                 ),
                 Err(CliError::UnknownSession(_)) => {
@@ -389,6 +404,111 @@ async fn reach(
         )));
     }
     Ok((client, role))
+}
+
+/// What a bridge's helper reaches inside its environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peer {
+    /// The environment's control daemon.
+    Daemon,
+    /// A session's worker.
+    Worker,
+}
+
+impl Peer {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Daemon => "control daemon",
+            Self::Worker => "session worker",
+        }
+    }
+
+    /// What a person does about one of an earlier build that will not take a bridge's connection.
+    const fn action(self) -> &'static str {
+        match self {
+            Self::Daemon => "restart it, so that it runs this release",
+            Self::Worker => {
+                "attach to the session from a shell inside this environment, with the kr of its \
+                 own build"
+            }
+        }
+    }
+}
+
+/// Turns the failure to open a connection that says where the invocation began into what is said
+/// of it.
+///
+/// A daemon or worker of a build before that declaration existed ends the connection that carries
+/// it, so what the connection reports is that the peer went away, which reads like a daemon that is
+/// not running. One that answers an ordinary connection is running, though, so it is asked who it is
+/// and the failure is said to be this one: the peer's build and this helper's, and what to do. A
+/// failure of any other kind, and a peer that answers nothing, are reported as they were.
+async fn explained(
+    peer: Peer,
+    endpoint: Option<kr_ipc::paths::Endpoint>,
+    error: CliError,
+) -> Unreached {
+    if !matches!(error, CliError::HostUnavailable(_)) {
+        return Unreached::Error(error);
+    }
+    let Some(endpoint) = endpoint else {
+        return Unreached::Error(error);
+    };
+    let answered = tokio::time::timeout(
+        crate::startup::ANSWER_BOUND,
+        kr_ipc::client::LocalClient::connect(
+            &endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            crate::build_id(),
+        ),
+    )
+    .await;
+    match answered {
+        Ok(Ok(ordinary)) => Unreached::Error(refused_by_a_peer_that_answers(
+            peer,
+            ordinary.acknowledgement().build.as_ref(),
+        )),
+        _ => Unreached::Error(error),
+    }
+}
+
+/// The refusal a caller is given when the peer in `peer` answers an ordinary connection, states
+/// `theirs` as its build, and did not take the connection a bridge makes.
+fn refused_by_a_peer_that_answers(
+    peer: Peer,
+    theirs: Option<&kr_protocol::local::LocalBuild>,
+) -> CliError {
+    let own = kr_protocol::local::LocalBuild::this(crate::build_id());
+    let version = |build: &kr_protocol::local::LocalBuild| {
+        shown!(
+            "{}.{}.{}",
+            build.protocol_version.major,
+            build.protocol_version.minor,
+            build.protocol_version.patch
+        )
+    };
+    let theirs = match theirs {
+        Some(build) => shown!(
+            "{} with protocol {}",
+            crate::shown::build_name(&build.build_id),
+            version(build)
+        ),
+        None => Shown::said("a build that does not state its build or its protocol version"),
+    };
+    CliError::Refused(kr_client::error::refusal(
+        ErrorCode::UnsupportedSchema,
+        shown!(
+            "the {} in this environment answers an ordinary connection and not the one a process \
+             bridge makes. It is {}, and this helper is {} with protocol {}: a {} of an earlier \
+             build does not take a connection that says where an invocation began. To go on, {}",
+            peer.name(),
+            theirs,
+            crate::shown::build_name(&own.build_id),
+            version(&own),
+            peer.name(),
+            peer.action()
+        ),
+    ))
 }
 
 /// Reaches the control daemon, starting it only where the opening may.
@@ -668,6 +788,38 @@ mod tests {
         let mut chained = hello(ActorIngress::LocalIpc);
         chained.already_bridged = true;
         assert_eq!(admit(&chained), Err(Refusal::AlreadyBridged));
+    }
+
+    /// What a caller is told when the daemon or worker that answers an ordinary connection took no
+    /// bridge's: both builds, and the thing to do for that kind of peer.
+    #[test]
+    fn a_peer_of_an_earlier_build_is_named_with_what_to_do_about_that_kind_of_peer() {
+        let earlier = kr_protocol::local::LocalBuild {
+            build_id: BuildId::new("kr-worker/0.0.9").expect("a build"),
+            protocol_version: kr_protocol::hello::PackageVersion::new(0, 0, 9),
+        };
+        let said = |peer, build: Option<&kr_protocol::local::LocalBuild>| {
+            let CliError::Refused(error) = refused_by_a_peer_that_answers(peer, build) else {
+                panic!("a refusal");
+            };
+            assert_eq!(error.code, ErrorCode::UnsupportedSchema);
+            error.message
+        };
+        let daemon = said(Peer::Daemon, Some(&earlier));
+        assert!(
+            daemon.contains("the control daemon")
+                && daemon.contains("kr-worker/0.0.9 with protocol 0.0.9")
+                && daemon.contains("this helper is kr/")
+                && daemon.contains("restart it"),
+            "{daemon}"
+        );
+        let worker = said(Peer::Worker, None);
+        assert!(
+            worker.contains("the session worker")
+                && worker.contains("a build that does not state its build")
+                && worker.contains("attach to the session from a shell inside this environment"),
+            "{worker}"
+        );
     }
 
     #[test]

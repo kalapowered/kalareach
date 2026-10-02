@@ -1054,6 +1054,56 @@ mod tests {
         assert!(bytes.len() > plain_bytes.len(), "the origin is on the wire");
     }
 
+    /// KR-REQ-03.13: a hello as a host or worker built before the origin member declares it, member
+    /// for member. What an earlier client writes reads here as one that declares no origin; what
+    /// this build writes without an origin is the earlier frame, byte for byte; and a hello that
+    /// declares one is refused by the earlier build, which is what makes the helper's report of it
+    /// necessary.
+    #[test]
+    fn a_hello_is_read_both_ways_between_a_build_with_an_origin_member_and_one_without() {
+        use crate::hello::{ProtocolVersion, ReceiveLimits as Limits};
+
+        #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Earlier {
+            offered_versions: Vec<ProtocolVersion>,
+            build_id: BuildId,
+            client: LocalClientKind,
+            capabilities: CanonicalSet<crate::ids::CapabilityId>,
+            max_receive: Limits,
+        }
+
+        let limits = kr_cbor::Limits::DEFAULT;
+        let earlier = Earlier {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: BuildId::new("kr/0.1.0").expect("a build identifier"),
+            client: LocalClientKind::Cli,
+            capabilities: CanonicalSet::new(),
+            max_receive: ReceiveLimits::default(),
+        };
+        let written = kr_cbor::to_canonical_vec(&earlier).expect("encodes");
+        let read: LocalHello =
+            kr_cbor::from_canonical_slice(&written, &limits).expect("this build reads it");
+        assert_eq!(read, a_hello(None), "an earlier client declares no origin");
+
+        let plain = kr_cbor::to_canonical_vec(&a_hello(None)).expect("encodes");
+        assert_eq!(plain, written, "no origin, no member: the earlier frame");
+        assert_eq!(
+            kr_cbor::from_canonical_slice::<Earlier>(&plain, &limits).expect("an earlier build"),
+            earlier
+        );
+
+        let bridged = kr_cbor::to_canonical_vec(&a_hello(Some(BridgeOrigin {
+            environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([6; 16])),
+            ingress: ActorIngress::LocalIpc,
+        })))
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<Earlier>(&bridged, &limits).is_err(),
+            "an earlier build cannot read a hello that declares an origin"
+        );
+    }
+
     /// KR-REQ-03.13, KR-ACC-021: the one ingress a destination admits an origin for is the locally
     /// authenticated one; every network ingress, a workflow and a plugin are refused.
     #[test]
