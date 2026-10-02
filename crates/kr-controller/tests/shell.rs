@@ -502,7 +502,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     for package in set.packages() {
         for target in layout.targets(package.kind()) {
             assert_eq!(
-                startup::remove(&target.path, &record).expect("removes"),
+                startup::remove(&target.path, &record, package.kind()).expect("removes"),
                 Change::Removed
             );
         }

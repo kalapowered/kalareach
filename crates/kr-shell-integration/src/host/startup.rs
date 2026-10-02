@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::qualification::ShellKind;
+use crate::host::refusal::Refusal;
 
 /// The line that opens a KalaReach entry.
 pub const MARKER_BEGIN: &str = "# >>> KalaReach shell integration >>>";
@@ -694,7 +695,7 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
     // file as it was read, before this placement's entry is cut out of it, because that cut can
     // hold the block.
     if placement.shell().is_some() && holds_signature_words(existing) {
-        return Err(cannot_take_the_entry(SIGNED));
+        return Err(Refusal::SignedForInstall.into());
     }
     let (begin, end) = placement.markers();
     let stripped = strip(existing, begin, end);
@@ -763,9 +764,7 @@ fn after_the_prologue(
     placement: &Placement,
 ) -> std::io::Result<(String, usize)> {
     if second_mark(theirs) {
-        return Err(cannot_take_the_entry(
-            "it begins with a second byte-order mark",
-        ));
+        return Err(Refusal::SecondByteOrderMark.into());
     }
     let (mark, text) = match theirs.strip_prefix('\u{feff}') {
         Some(text) => ("\u{feff}", text),
@@ -789,7 +788,7 @@ fn after_the_prologue(
 fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
     match entry_refused(old, new, placement)? {
         None => Ok(()),
-        Some(why) => Err(cannot_take_the_entry(&why)),
+        Some(refusal) => Err(refusal.into()),
     }
 }
 
@@ -804,7 +803,7 @@ fn checked(old: &str, new: &str, placement: &Placement) -> std::io::Result<()> {
 macro_rules! unsafe_profile {
     () => {
         "function Unsafe($text) { \
-            if ($text -match \"`r(?!`n)\") { return 'it has a line end that is a carriage return alone' }; \
+            if ($text -match \"`r(?!`n)\") { return 'lone-carriage-return' }; \
             $null \
         }; "
     };
@@ -820,9 +819,6 @@ fn second_mark(text: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('\u{feff}'))
 }
 
-/// Why a signed profile is refused.
-const SIGNED: &str = "it is signed, and any change to it breaks its signature";
-
 /// What begins the signature block that a PowerShell signer adds to a script.
 const SIGNATURE_BEGIN: &[u8] = b"# SIG # Begin signature block";
 
@@ -834,13 +830,6 @@ fn holds_signature_words(text: &str) -> bool {
     text.as_bytes()
         .windows(SIGNATURE_BEGIN.len())
         .any(|window| window.eq_ignore_ascii_case(SIGNATURE_BEGIN))
-}
-
-/// The refusal of a profile an entry cannot be put into, with its reason.
-fn cannot_take_the_entry(why: &str) -> std::io::Error {
-    std::io::Error::other(format!(
-        "this profile cannot take the entry: {why}, so nothing was written"
-    ))
 }
 
 /// The script that says where a profile's entry goes.
@@ -870,9 +859,9 @@ const PLACE_SCRIPT: &str = concat!(
      foreach ($token in $tokens) { \
          if ($token.Extent.EndOffset -le $at -or $token.Extent.StartOffset -gt $lineEnd) { continue }; \
          if ($lf -ge 0 -and $token.Extent.StartOffset -lt $lf -and $token.Extent.EndOffset -gt $lf + 1) { \
-             [Console]::Out.Write('kr-refused a comment or a string runs over the line its using statements or param block end on'); return }; \
+             [Console]::Out.Write('kr-refused comment-or-string-runs-over'); return }; \
          if ($token.Kind -notin 'Comment', 'NewLine', 'Semi', 'EndOfInput') { \
-             [Console]::Out.Write('kr-refused a statement shares the line its using statements or param block end on, and an entry cannot go between them; put it on a line of its own'); return } \
+             [Console]::Out.Write('kr-refused statement-shares-the-line'); return } \
      }; \
      if ($lf -lt 0) { [Console]::Out.Write('kr-placed ' + $text.Length) } else { [Console]::Out.Write('kr-placed ' + ($lf + 1)) }"
 );
@@ -910,41 +899,41 @@ const VERIFY_SCRIPT: &str = concat!(
      $had = @{}; foreach ($id in $old.Errors) { $had[$id] = 1 + [int]$had[$id] }; \
      $added = @(); \
      foreach ($id in $new.Errors) { if ($had[$id] -gt 0) { $had[$id] = $had[$id] - 1 } else { $added += $id } }; \
-     if ($added.Count -gt 0) { Refuse ('PowerShell would report ' + ($added -join ',')); return }; \
+     if ($added.Count -gt 0) { Refuse ('would-report ' + ($added -join ',')); return }; \
      $ended = 0; foreach ($left in $had.Values) { $ended += $left }; \
-     if ($ended -gt 0) { Refuse 'the entry would change which errors PowerShell reports for the profile'; return }; \
+     if ($ended -gt 0) { Refuse 'would-change-the-errors'; return }; \
      if ($old.Errors.Count -gt 0) { [Console]::Out.Write('kr-verified'); return }; \
      $beginText = Read 'KR_BEGIN'; $endText = Read 'KR_END'; \
      $begin = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and (Same $_.Text $beginText) }); \
      $end = @($new.Tokens | Where-Object { $_.Kind -eq 'Comment' -and (Same $_.Text $endText) }); \
-     if ($begin.Count -ne 1 -or $end.Count -ne 1) { Refuse 'its entry is not one block between its markers'; return }; \
+     if ($begin.Count -ne 1 -or $end.Count -ne 1) { Refuse 'entry-not-one-block'; return }; \
      $from = $begin[0].Extent.StartOffset; $to = $end[0].Extent.EndOffset; \
      $inside = @(); $outside = @(); \
      foreach ($statement in @($new.Ast.EndBlock.Statements)) { \
          $start = $statement.Extent.StartOffset; $stop = $statement.Extent.EndOffset; \
          if ($start -ge $from -and $stop -le $to) { $inside += $statement } \
          elseif ($stop -le $from -or $start -ge $to) { $outside += $statement } \
-         else { Refuse 'its entry would sit inside a statement of the profile'; return } \
+         else { Refuse 'entry-inside-a-statement'; return } \
      }; \
      $holding = @($new.Ast.FindAll({ param($node) $node.Extent.StartOffset -lt $from -and $node.Extent.EndOffset -gt $to -and -not ($node -is [System.Management.Automation.Language.ScriptBlockAst] -and $node.Parent -eq $null) -and -not ($node -is [System.Management.Automation.Language.NamedBlockAst]) }, $true)); \
-     if ($holding.Count -gt 0) { Refuse 'its entry would sit inside a block of the profile'; return }; \
+     if ($holding.Count -gt 0) { Refuse 'entry-inside-a-block'; return }; \
      foreach ($statement in $outside) { \
-         if ($order -eq 'first' -and $statement.Extent.StartOffset -lt $from) { Refuse 'a statement of the profile would run before the entry'; return }; \
-         if ($order -eq 'last' -and $statement.Extent.StartOffset -gt $to) { Refuse 'a statement of the profile would run after the entry'; return } \
+         if ($order -eq 'first' -and $statement.Extent.StartOffset -lt $from) { Refuse 'statement-before-the-entry'; return }; \
+         if ($order -eq 'last' -and $statement.Extent.StartOffset -gt $to) { Refuse 'statement-after-the-entry'; return } \
      }; \
      if ($order -eq 'first') { \
          $prologue = @($new.Ast.UsingStatements) + @($new.Ast.ParamBlock | Where-Object { $null -ne $_ }); \
-         foreach ($part in $prologue) { if ($part.Extent.EndOffset -gt $from) { Refuse 'its using statements or param block would come after the entry'; return } } \
+         foreach ($part in $prologue) { if ($part.Extent.EndOffset -gt $from) { Refuse 'prologue-after-the-entry'; return } } \
      }; \
      $join = [string][char]1; \
      $oldTop = @($old.Ast.EndBlock.Statements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $newTop = @($outside | ForEach-Object { $_.Extent.Text }) -join $join; \
-     if (-not (Same $oldTop $newTop)) { Refuse 'the statements of the profile are not what they were'; return }; \
+     if (-not (Same $oldTop $newTop)) { Refuse 'statements-changed'; return }; \
      $oldUsing = @($old.Ast.UsingStatements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $newUsing = @($new.Ast.UsingStatements | ForEach-Object { $_.Extent.Text }) -join $join; \
      $oldParam = if ($null -ne $old.Ast.ParamBlock) { $old.Ast.ParamBlock.Extent.Text } else { '' }; \
      $newParam = if ($null -ne $new.Ast.ParamBlock) { $new.Ast.ParamBlock.Extent.Text } else { '' }; \
-     if (-not (Same $oldUsing $newUsing) -or -not (Same $oldParam $newParam)) { Refuse 'its using statements or param block are not what they were'; return }; \
+     if (-not (Same $oldUsing $newUsing) -or -not (Same $oldParam $newParam)) { Refuse 'prologue-changed'; return }; \
      [Console]::Out.Write('kr-verified')"
 );
 
@@ -952,25 +941,27 @@ const VERIFY_SCRIPT: &str = concat!(
 fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
     let said = ask_with(
         shell,
-        &["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", PLACE_SCRIPT],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-Command",
+            PLACE_SCRIPT,
+        ],
         &[("KR_PROFILE_TEXT", text)],
         PLACEMENT_DEADLINE,
     )
-    .ok_or_else(|| {
-        std::io::Error::other(
-            "PowerShell did not say where the entry goes: it did not answer in time or could not start",
-        )
-    })?;
+    .ok_or(Refusal::PlacementUnanswered)?;
     let said = said.trim();
-    if let Some(why) = said.strip_prefix("kr-refused ") {
-        return Err(cannot_take_the_entry(why));
+    if let Some(code) = said.strip_prefix("kr-refused ") {
+        return Err(Refusal::from_script(code)
+            .unwrap_or(Refusal::PlacementNotUnderstood)
+            .into());
     }
     let utf16 = said
         .strip_prefix("kr-placed ")
         .and_then(|offset| offset.parse::<usize>().ok())
-        .ok_or_else(|| {
-            std::io::Error::other("PowerShell's answer about the entry was not understood")
-        })?;
+        .ok_or(Refusal::PlacementNotUnderstood)?;
     // PowerShell counts UTF-16 code units. A count that falls inside a character is not one.
     let mut units = 0;
     for (index, character) in text.char_indices() {
@@ -985,18 +976,19 @@ fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
     if units == utf16 {
         return Ok(text.len());
     }
-    Err(std::io::Error::other(
-        "PowerShell's answer about the entry is not inside the profile",
-    ))
+    Err(Refusal::PlacementOutsideTheProfile.into())
 }
 
 /// Returns why an entry would not sit in a profile as whole statements, or nothing when it would.
-fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<String>> {
+///
+/// The reason is one of this host's own ([`Refusal`]): the scripts say a short code of their own and
+/// never a sentence, and a code this host does not know is a check that was not understood.
+fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<Refusal>> {
     let Some(shell) = placement.shell() else {
         return Ok(None);
     };
     if second_mark(old) {
-        return Ok(Some("it begins with a second byte-order mark".to_owned()));
+        return Ok(Some(Refusal::SecondByteOrderMark));
     }
     let markers = placement.markers();
     let order = match placement {
@@ -1005,44 +997,49 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
     };
     let said = ask_with(
         shell,
-        &["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", VERIFY_SCRIPT],
         &[
-            ("KR_PROFILE_OLD", old.strip_prefix('\u{feff}').unwrap_or(old)),
-            ("KR_PROFILE_NEW", new.strip_prefix('\u{feff}').unwrap_or(new)),
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-Command",
+            VERIFY_SCRIPT,
+        ],
+        &[
+            (
+                "KR_PROFILE_OLD",
+                old.strip_prefix('\u{feff}').unwrap_or(old),
+            ),
+            (
+                "KR_PROFILE_NEW",
+                new.strip_prefix('\u{feff}').unwrap_or(new),
+            ),
             ("KR_BEGIN", markers.0),
             ("KR_END", markers.1),
             ("KR_ORDER", order),
         ],
         PLACEMENT_DEADLINE,
     )
-    .ok_or_else(|| {
-        std::io::Error::other(
-            "PowerShell did not check the profile with the entry in it: it did not answer in time or could not start",
-        )
-    })?;
+    .ok_or(Refusal::CheckUnanswered)?;
     let said = said.trim();
     if said == "kr-verified" {
         return Ok(None);
     }
     said.strip_prefix("kr-refused ")
-        .map(|why| Some(why.to_owned()))
-        .ok_or_else(|| {
-            std::io::Error::other("PowerShell's check of the profile was not understood")
-        })
+        .and_then(Refusal::from_script)
+        .map(Some)
+        .ok_or_else(|| Refusal::CheckNotUnderstood.into())
 }
 
-/// Removes one shell's guarded entry, and nothing else.
+/// Returns what removing the entries from a file with this text leaves, or `None` when it holds
+/// none.
 ///
-/// # Errors
-///
-/// Returns the underlying failure when the file cannot be read or written.
-pub fn remove(path: &Path, record: &EntryRecord) -> std::io::Result<Change> {
-    let _writing = writing();
-    let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
-    let existing = read_or_empty(path)?;
+/// A signed PowerShell profile is refused, as an install refuses it: taking the entries out changes
+/// the text its signature covers, so PowerShell would refuse the whole profile. The refusal says
+/// what the person has to do, and nothing is written.
+fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<String>> {
     // Each of the entries a file can hold, with its own markers: PowerShell's two can be in one
     // file when its two profiles are.
-    let mut rebuilt = existing.clone();
+    let mut rebuilt = existing.to_owned();
     let mut found = false;
     for (begin, end) in [
         (MARKER_BEGIN, MARKER_END),
@@ -1062,8 +1059,43 @@ pub fn remove(path: &Path, record: &EntryRecord) -> std::io::Result<Change> {
         }
     }
     if !found {
-        return Ok(Change::Absent);
+        return Ok(None);
     }
+    if kind == ShellKind::PowerShell && holds_signature_words(existing) {
+        return Err(Refusal::SignedForRemoval.into());
+    }
+    Ok(Some(rebuilt))
+}
+
+/// Says what [`remove`] would do to a file, and writes nothing.
+///
+/// # Errors
+///
+/// Returns the underlying failure when the file cannot be read, or the refusal of a signed
+/// PowerShell profile.
+pub fn plan_removal(path: &Path, kind: ShellKind) -> std::io::Result<Change> {
+    Ok(match removed_from(&read_or_empty(path)?, kind)? {
+        Some(_) => Change::Removed,
+        None => Change::Absent,
+    })
+}
+
+/// Removes one shell's guarded entry, and nothing else.
+///
+/// A PowerShell profile that is signed is never changed: it is refused, with the entries it holds,
+/// and nothing is written.
+///
+/// # Errors
+///
+/// Returns the underlying failure when the file cannot be read or written, or the refusal of a
+/// signed PowerShell profile.
+pub fn remove(path: &Path, record: &EntryRecord, kind: ShellKind) -> std::io::Result<Change> {
+    let _writing = writing();
+    let _held = FileLock::take_for_startup_file(path, &record.lock_directory())?;
+    let existing = read_or_empty(path)?;
+    let Some(rebuilt) = removed_from(&existing, kind)? else {
+        return Ok(Change::Absent);
+    };
     // A file this entry created and nothing else ever wrote to goes with it. One the user owns
     // stays, with their own lines exactly as they left them. A link the user made is theirs
     // whatever the file it names holds: deleting it would leave that file behind with the entry
@@ -2243,8 +2275,11 @@ mod tests {
         super::install(path, body, placement, record())
     }
 
+    /// Removes through the record every test here writes through, as a PowerShell profile is
+    /// removed from, which is the strictest of the shells' files: none of the files these tests
+    /// remove from is signed except where a test says so.
     fn remove(path: &Path) -> std::io::Result<Change> {
-        super::remove(path, record())
+        super::remove(path, record(), ShellKind::PowerShell)
     }
 
     /// The PowerShell a test that places an entry in a profile asks, which is whichever one is on
@@ -2957,9 +2992,10 @@ mod tests {
             );
             if refused && !name.contains("nobody sees") {
                 assert!(
-                    said.as_deref()
-                        .is_some_and(|why| why.contains("before the entry")
-                            || why.contains("after the entry")),
+                    matches!(
+                        said,
+                        Some(Refusal::StatementBeforeTheEntry | Refusal::StatementAfterTheEntry)
+                    ),
                     "{name}: the refusal says which way: {said:?}"
                 );
             }
@@ -3067,7 +3103,6 @@ mod tests {
     }
 
     /// What a PowerShell signer adds to a script: a line end of its own, then the signature block.
-    #[cfg(unix)]
     const SIGNER_BLOCK: &str =
         "\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n";
 
@@ -3230,6 +3265,126 @@ mod tests {
             Change::Added
         );
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), both);
+    }
+
+    /// KR-REQ-07.23: every code the two scripts refuse with is a refusal this host knows, so a
+    /// reason one of them gives is said as itself and never as an answer that was not understood.
+    #[test]
+    fn every_code_a_script_refuses_with_is_a_refusal_this_host_knows() {
+        let mut codes: Vec<String> = Vec::new();
+        for script in [PLACE_SCRIPT, VERIFY_SCRIPT] {
+            for opening in ["Refuse '", "Refuse ('", "'kr-refused ", "return '"] {
+                for (at, _) in script.match_indices(opening) {
+                    let rest = &script[at + opening.len()..];
+                    let code = rest.split('\'').next().unwrap_or("").trim();
+                    // The scripts' own `kr-placed` and `kr-signature` answers are not refusals, and
+                    // the generic `'kr-refused ' + $why` passes on a code found elsewhere.
+                    if !code.is_empty()
+                        && !code.contains('$')
+                        && !codes.iter().any(|known| known == code)
+                    {
+                        codes.push(code.to_owned());
+                    }
+                }
+            }
+        }
+        codes.sort();
+        assert_eq!(
+            codes.len(),
+            13,
+            "a script refuses with a code this test does not count: {codes:?}"
+        );
+        for code in &codes {
+            let said = if code == "would-report" {
+                format!("{code} MissingEndCurlyBrace")
+            } else {
+                code.clone()
+            };
+            assert!(
+                Refusal::from_script(&said).is_some(),
+                "{code} is a code of a script that this host does not know"
+            );
+        }
+    }
+
+    /// KR-REQ-07.23: removal never changes a signed profile either, and says what to do.
+    ///
+    /// Taking the entries out of a profile that was signed after they were written changes the text
+    /// the signature covers, so PowerShell would refuse the whole profile. Nothing is written, and
+    /// the refusal names the signature and the way out. A profile that holds no entry has nothing
+    /// to remove and is not an error, and the same profile without the signature is cleaned.
+    #[test]
+    fn a_signed_profile_keeps_its_entries_when_their_removal_is_asked() {
+        let root = tempfile::tempdir().expect("a directory");
+        let load = format!("{MARKER_BEGIN}\nImport-Module x\n{MARKER_END}\n");
+        let check =
+            format!("{CHECK_MARKER_BEGIN}\nConfirm-KalaReachReadLine\n{CHECK_MARKER_END}\n");
+        let theirs = "using namespace System\n$x = 1\n";
+        let both = format!("using namespace System\n{load}$x = 1\n{check}");
+        for (name, text) in [
+            (
+                "both entries, signed after",
+                format!("{both}{SIGNER_BLOCK}"),
+            ),
+            (
+                "the check entry alone, signed after",
+                format!("{theirs}{check}{SIGNER_BLOCK}"),
+            ),
+            (
+                "the words in another case",
+                format!("{both}\n# sig # begin signature block\n# MIIx\n"),
+            ),
+        ] {
+            let path = root
+                .path()
+                .join(format!("{}.ps1", name.replace([' ', ','], "-")));
+            std::fs::write(&path, &text).expect("writes");
+            let refused =
+                remove(&path).expect_err(&format!("{name}: a signed profile was written to"));
+            let said = refused.to_string();
+            assert!(
+                said.contains("it is signed") && said.contains("nothing was removed"),
+                "{name}: the refusal names the signature: {said}"
+            );
+            assert!(
+                said.contains("sign the profile again"),
+                "{name}: the refusal says what to do: {said}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                text,
+                "{name}: the profile was touched"
+            );
+        }
+        // Signed and holding no entry: nothing to take out, and nothing changed.
+        let path = root.path().join("signed-without-entries.ps1");
+        let text = format!("{theirs}{SIGNER_BLOCK}");
+        std::fs::write(&path, &text).expect("writes");
+        assert_eq!(remove(&path).expect("nothing to remove"), Change::Absent);
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), text);
+        // A dry run says what a real removal does, signed or not.
+        let signed = root.path().join("both-entries--signed-after.ps1");
+        assert!(plan_removal(&signed, ShellKind::PowerShell).is_err());
+        // The control: the same entries without the signature come out, so it is the signature
+        // that refuses.
+        let path = root.path().join("unsigned.ps1");
+        std::fs::write(&path, &both).expect("writes");
+        assert_eq!(
+            plan_removal(&path, ShellKind::PowerShell).expect("plans"),
+            Change::Removed
+        );
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
+        // A signature is a PowerShell profile's: another shell's file that only says the words in a
+        // comment is cleaned like any other.
+        let path = root.path().join(".zshrc");
+        let words = "# SIG # Begin signature block is how a PowerShell script is signed\n";
+        std::fs::write(&path, format!("{words}{load}")).expect("writes");
+        assert_eq!(
+            super::remove(&path, record(), ShellKind::Zsh).expect("removes"),
+            Change::Removed
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), words);
     }
 
     /// KR-REQ-07.23: whether a file holds an entry is asked of the markers of the entry in question:
