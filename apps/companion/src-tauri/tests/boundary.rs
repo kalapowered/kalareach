@@ -1111,7 +1111,9 @@ fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
                 }
             }
         }
-        if name == "project.pbxproj" {
+        // A floor written as a build setting, which in the project description overrides the
+        // deployment target above, and which the generated project carries as it is.
+        if name == "project.pbxproj" || name == "project.yml" {
             for (setting, platform) in [
                 ("IPHONEOS_DEPLOYMENT_TARGET", Floor::Ios),
                 ("MACOSX_DEPLOYMENT_TARGET", Floor::Macos),
@@ -1368,6 +1370,14 @@ fn the_floor_scan_reads_each_way_a_file_can_write_a_floor() {
             "options:\n  deploymentTarget:\n    iOS: 14.0\n    macOS: 12.0\n  other: 1\n"
         ),
         [(Floor::Ios, (14, 0, 0)), (Floor::Macos, (12, 0, 0))]
+    );
+    // A floor written as a build setting beside a correct deployment target.
+    assert_eq!(
+        read(
+            "project.yml",
+            "options:\n  deploymentTarget:\n    iOS: 17.0\nsettings:\n  base:\n    IPHONEOS_DEPLOYMENT_TARGET: 16.0\n"
+        ),
+        [(Floor::Ios, (17, 0, 0)), (Floor::Ios, (16, 0, 0))]
     );
     // A target's own override, nested deeper, beside a correct global floor, and a later key at the
     // same depth that is not a floor.
