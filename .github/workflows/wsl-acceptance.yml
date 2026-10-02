@@ -198,10 +198,14 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wsl-acceptance
+          # The Windows daemon this run starts keeps its keys in a directory of its own, and that
+          # directory is not part of the record.
           path: |
             C:\wsl-acceptance.log
             ${{ env.KR_TEST_ARTIFACTS_DIR }}
+            !**/windows-state/**
           if-no-files-found: warn
+          retention-days: 3
 
       # The first distribution is this job's own, by the name it gave it.
       - name: Remove what the job made
