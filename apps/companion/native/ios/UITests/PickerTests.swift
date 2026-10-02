@@ -54,6 +54,7 @@ final class PickerTests: HarnessTestCase {
             !app.buttons.matching(NSPredicate(format: "identifier == %@", "Cancel")).firstMatch.exists
         }
         XCTAssertEqual(draftText, "", "nothing was put on the draft")
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Remove '")).firstMatch.exists, "something was attached to the draft")
         say("PICKER \(control) cancelled")
     }
 

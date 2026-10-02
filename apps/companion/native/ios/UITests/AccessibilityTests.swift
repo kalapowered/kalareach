@@ -72,6 +72,10 @@ final class AccessibilityTests: HarnessTestCase {
         launchHarness(arguments)
     }
 
+    /// The three ways to attach something to a draft, each a label over a file input the page keeps
+    /// hidden. The label is what a finger meets, so the label is measured.
+    private static let attachmentLabels = ["Photo library", "Take a photo", "Files"]
+
     // MARK: Target sizes
 
     /// Every control a person is expected to touch is at least 44 by 44 points, at the default size.
@@ -93,6 +97,20 @@ final class AccessibilityTests: HarnessTestCase {
                 if frame.width < 44 || frame.height < 44 {
                     say("A11Y \(screen.rawValue): \(control.label) is \(Int(frame.width)) by \(Int(frame.height))")
                     XCTFail("\(control.label) on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
+                }
+            }
+            if screen == .conversation {
+                for name in Self.attachmentLabels {
+                    let label = app.staticTexts[name].firstMatch
+                    guard label.exists else {
+                        XCTFail("the \(name) control is not on the conversation")
+                        continue
+                    }
+                    let frame = label.frame
+                    if frame.width < 44 || frame.height < 44 {
+                        say("A11Y \(screen.rawValue): the \(name) control is \(Int(frame.width)) by \(Int(frame.height))")
+                        XCTFail("the \(name) control on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
+                    }
                 }
             }
         }
