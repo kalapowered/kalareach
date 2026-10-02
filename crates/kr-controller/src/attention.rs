@@ -502,6 +502,10 @@ pub struct AttentionModule {
     /// keeps and writing it.
     #[cfg(test)]
     in_save: Pause,
+    /// The threads each pass that decided announcements ran on, which a test reads to see that no
+    /// pass ran on a thread of the runtime that drives the exchanges privacy mode waits for.
+    #[cfg(test)]
+    decided_on: std::sync::Mutex<Vec<std::thread::ThreadId>>,
 }
 
 impl std::fmt::Debug for AttentionModule {
@@ -601,6 +605,8 @@ impl AttentionModule {
             save_entry: Pause::default(),
             #[cfg(test)]
             in_save: Pause::default(),
+            #[cfg(test)]
+            decided_on: std::sync::Mutex::new(Vec::new()),
         };
         module.keep_time();
         Ok(module)
@@ -690,6 +696,11 @@ impl AttentionModule {
     /// here waits for anything while holding it, so it only delays a change of privacy mode by the
     /// pass. Not held across an await.
     fn deciding<T>(&self, pass: impl FnOnce(HostReading) -> T) -> T {
+        #[cfg(test)]
+        self.decided_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::thread::current().id());
         let held = self
             .privacy
             .get()
@@ -5050,6 +5061,63 @@ mod tests {
             .observe(&[failure(SessionId::new(kr_ipc::new_uuid()))])
             .expect("the store records the failure");
         assert_eq!(stamped(&module), vec![None]);
+    }
+
+    /// A page is decided on the blocking pool and never on a thread of the runtime that read it. A
+    /// pass that decides takes the privacy state's read side, which a change of privacy mode that is
+    /// waiting for a send on the wire makes wait, and the send's exchange needs the runtime's own
+    /// threads: a pass that waited on one would hold it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_is_decided_off_the_runtimes_threads() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let polled_on = tokio::spawn({
+            let module = Arc::clone(&module);
+            let link = Arc::clone(&link);
+            async move {
+                let polled_on = std::thread::current().id();
+                module
+                    .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                    .expect("the page is taken");
+                polled_on
+            }
+        })
+        .await
+        .expect("the task ends");
+        let decided = module.decided_on.lock().expect("not poisoned").clone();
+        assert_eq!(decided.len(), 1, "one pass decided the page");
+        assert_ne!(
+            decided[0], polled_on,
+            "the page was decided on the thread that read it"
+        );
+    }
+
+    /// The maintenance tick is decided on the blocking pool too, and never on the runtime's own
+    /// thread: the runtime here has the one, so a tick that waited on it would hold the whole
+    /// runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_maintenance_tick_is_decided_off_the_runtimes_threads() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let worker = tokio::spawn(async { std::thread::current().id() })
+            .await
+            .expect("the worker answers");
+        module.maintain(Arc::new(Stub { unaccounted: false }) as Arc<dyn Reach>);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while module.decided_on.lock().expect("not poisoned").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the maintenance loop never ticked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let decided = module.decided_on.lock().expect("not poisoned").clone();
+        assert!(
+            decided.iter().all(|thread| *thread != worker),
+            "the maintenance tick was decided on the runtime's thread"
+        );
     }
 
     /// A reach whose answer to "was the closure unaccounted for" is held until the test lets it go,
