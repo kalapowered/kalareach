@@ -1087,10 +1087,10 @@ fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<Strin
             found = true;
         }
     }
-    // The line break an owner added is a bare line feed. A PowerShell profile refuses a carriage
-    // return alone, so there a line feed that follows a carriage return is the person's own line end
-    // and is not taken; the other shells' files accept one, and the break an owner added after it is
-    // its own.
+    // The line break an owner added is a bare line feed. This build's PowerShell installs refuse a
+    // carriage return alone, so there a line feed that follows a carriage return is the person's own
+    // line end and is not taken; the other shells' files accept one, and the break an owner added
+    // after it is its own.
     let persons_line_end = kind == ShellKind::PowerShell && rebuilt.ends_with("\r\n");
     if owners.contains(&rebuilt.len()) && rebuilt.ends_with('\n') && !persons_line_end {
         rebuilt.pop();
@@ -3344,6 +3344,33 @@ mod tests {
         }
     }
 
+    /// KR-REQ-26.05: a person's CRLF line end in front of an owning entry is theirs in a PowerShell
+    /// profile, where an install refuses a carriage return alone, and is not in another shell's.
+    ///
+    /// No PowerShell is needed: the removal reads the text and the kind of file.
+    #[test]
+    fn a_crlf_line_end_before_an_owner_is_the_persons_in_a_powershell_profile_only() {
+        let check = with_separator_note(
+            &format!("{CHECK_MARKER_BEGIN}\nConfirm-KalaReachReadLine\n{CHECK_MARKER_END}\n"),
+            CHECK_MARKER_BEGIN,
+        );
+        let text = format!("$x = 1\n$y = 1\r\n{check}");
+        assert_eq!(
+            removed_from(&text, ShellKind::PowerShell)
+                .expect("reads")
+                .as_deref(),
+            Some("$x = 1\n$y = 1\r\n"),
+            "a PowerShell profile's CRLF is the person's"
+        );
+        assert_eq!(
+            removed_from(&text, ShellKind::Zsh)
+                .expect("reads")
+                .as_deref(),
+            Some("$x = 1\n$y = 1\r"),
+            "another shell's file accepts a carriage return alone, and the owned line feed goes"
+        );
+    }
+
     /// KR-REQ-26.05: a startup file of another shell whose last line ends in a carriage return alone
     /// is given back exactly: the install adds the line feed it needs, and the removal takes it.
     ///
@@ -3379,7 +3406,7 @@ mod tests {
     }
 
     /// KR-REQ-26.05: a removal whose second entry's lines hold the first one's owner does not
-    /// panic, and takes no line break of the person's.
+    /// panic, and takes no line break of the person's outside the span.
     ///
     /// A person's own text can repeat an entry's begin line above the entry. The span from it to the
     /// entry's end line then holds the line break the other entry owned, which goes with the span.
