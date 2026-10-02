@@ -224,56 +224,114 @@ profile_file() { # <uuid>
   echo "$profiles/$1.mobileprovision"
 }
 
-# The user's keychain search list, one path a line.
-search_list() { security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//'; }
+# The user's keychain search list, one path a line, in $listing. A list that could not be read, or is
+# empty, is an error: it would be put back as nothing.
+read_search_list() {
+  local raw
+  raw=$(security list-keychains -d user) || return 1
+  listing=$(printf '%s\n' "$raw" | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' | sed '/^$/d')
+  [ -n "$listing" ]
+}
+
+signing_lock=""
+signing_child=""
+signing_paths=()
+signing_before=""
+signing_ended=1
+
+# Puts the search list back as it was recorded and locks the signing keychain, once, whichever way the
+# signing ended. The lock is released only when the list is known to be what it was: a list that could
+# not be put back keeps the lock, so that no other build signs on top of it.
+end_signing() {
+  [ "$signing_ended" = 1 ] && return 0
+  signing_ended=1
+  local restored=1
+  security list-keychains -d user -s "${signing_paths[@]}" || restored=0
+  security lock-keychain "$KR_KEYCHAIN" || say "THE SIGNING KEYCHAIN COULD NOT BE LOCKED: lock it by hand"
+  read_search_list || restored=0
+  say "keychain search list after signing: $(printf '%s' "$listing" | tr '\n' ' ')"
+  if [ "$restored" = 1 ] && [ "$listing" = "$signing_before" ]; then
+    rmdir "$signing_lock" 2>/dev/null
+    return 0
+  fi
+  say "THE KEYCHAIN SEARCH LIST IS NOT WHAT IT WAS BEFORE SIGNING: put it back by hand, then remove $signing_lock"
+  return 1
+}
+
+# A TERM, INT or HUP while signing: the command is stopped, then the list is put back and the keychain
+# locked, before this shell goes.
+signing_interrupted() { # <exit status>
+  [ -n "$signing_child" ] && kill "$signing_child" 2>/dev/null
+  wait "$signing_child" 2>/dev/null
+  end_signing
+  exit "$1"
+}
 
 # Runs a command with the signing keychain at the end of the user's keychain search list, where
 # codesign has to find the identity, and puts the list back as it was however the command ends. The
 # keychain is unlocked from its password file just before, which is never printed, and locked again
 # after. Nothing else changes: the login keychain stays first and the default keychain is not touched.
+# One signing runs at a time on this checkout, and a list that already holds the signing keychain, or
+# cannot be read, is not signed on top of.
 with_signing_keychain() { # <command...>
   [ "$target" = device ] || die "only a device build is signed"
   [ -n "${KR_KEYCHAIN:-}" ] && [ -f "${KR_KEYCHAIN_PASSWORD_FILE:-}" ] || die "KR_KEYCHAIN and KR_KEYCHAIN_PASSWORD_FILE are needed to sign"
-  local before after status
-  before=$(search_list) || die "the keychain search list could not be read"
-  say "keychain search list before signing: $(echo "$before" | tr '\n' ' ')"
-  (
-    paths=()
-    while IFS= read -r each; do [ -n "$each" ] && paths+=("$each"); done <<< "$before"
-    restore() { security list-keychains -d user -s "${paths[@]}"; }
-    trap 'restore; exit 130' INT
-    trap 'restore; exit 143' TERM
-    trap restore EXIT
-    security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" || exit 2
-    security list-keychains -d user -s "${paths[@]}" "$KR_KEYCHAIN" || exit 2
-    "$@"
-  )
-  status=$?
-  after=$(search_list)
-  say "keychain search list after signing: $(echo "$after" | tr '\n' ' ')"
-  security lock-keychain "$KR_KEYCHAIN"
-  [ "$after" = "$before" ] || die "THE KEYCHAIN SEARCH LIST IS NOT WHAT IT WAS BEFORE SIGNING: put it back by hand"
+  mkdir -p "$work"
+  signing_lock="$work/signing.lock"
+  mkdir "$signing_lock" 2>/dev/null || die "another build is signing, or one ended without restoring the list: see $signing_lock"
+  if ! read_search_list; then rmdir "$signing_lock"; die "the keychain search list could not be read, or it is empty"; fi
+  signing_before=$listing
+  if printf '%s\n' "$signing_before" | grep -Fxq "$KR_KEYCHAIN"; then
+    rmdir "$signing_lock"
+    die "the signing keychain is already on the search list: an earlier signing did not put it back, so put it back by hand"
+  fi
+  say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
+  signing_paths=()
+  local each
+  while IFS= read -r each; do signing_paths+=("$each"); done <<< "$signing_before"
+  signing_ended=0
+  trap 'signing_interrupted 130' INT
+  trap 'signing_interrupted 143' TERM
+  trap 'signing_interrupted 129' HUP
+  local status
+  if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
+    && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
+    "$@" &
+    signing_child=$!
+    wait "$signing_child"
+    status=$?
+    signing_child=""
+  else
+    status=2
+  fi
+  trap - INT TERM HUP
+  end_signing || die "the signing left the keychain search list changed"
   return "$status"
 }
 
 signer() { echo "$companion/scripts/sign-ios.mjs"; }
 
-# Signs the application, its extension and what they hold, and checks every signature and the
-# entitlements it is sealed with.
+# Signs the application, its extension and what they hold, then checks every signature, the
+# certificate it was made with and the entitlements it is sealed with, with no keychain on the list.
 sign_application() { # <KalaReach.app>
   [ -n "${KR_SIGN_IDENTITY:-}" ] && [ -n "${KR_APP_PROFILE:-}" ] && [ -n "${KR_EXTENSION_PROFILE:-}" ] \
     || die "a device build needs KR_SIGN_IDENTITY, KR_APP_PROFILE and KR_EXTENSION_PROFILE"
-  with_signing_keychain node "$(signer)" sign-app "$1" --identity "$KR_SIGN_IDENTITY" --keychain "$KR_KEYCHAIN" \
-    --app-profile "$(profile_file "$KR_APP_PROFILE")" --extension-profile "$(profile_file "$KR_EXTENSION_PROFILE")" \
-    --app-entitlements "$apple/companion-tauri_iOS/companion-tauri_iOS.entitlements" \
-    --extension-entitlements "$apple/KalaReachNotificationService/KalaReachNotificationService.entitlements" \
+  local arguments=(
+    "$1" --identity "$KR_SIGN_IDENTITY"
+    --app-profile "$(profile_file "$KR_APP_PROFILE")" --extension-profile "$(profile_file "$KR_EXTENSION_PROFILE")"
+    --app-entitlements "$apple/companion-tauri_iOS/companion-tauri_iOS.entitlements"
+    --extension-entitlements "$apple/KalaReachNotificationService/KalaReachNotificationService.entitlements"
     --device "$KR_DEVICE"
+  )
+  with_signing_keychain node "$(signer)" sign-app "${arguments[@]}" --keychain "$KR_KEYCHAIN" || return 1
+  node "$(signer)" verify-app "${arguments[@]}"
 }
 
 sign_runner() { # <Runner.app>
   [ -n "${KR_SIGN_IDENTITY:-}" ] && [ -n "${KR_RUNNER_PROFILE:-}" ] || die "a device build needs KR_SIGN_IDENTITY and KR_RUNNER_PROFILE"
-  with_signing_keychain node "$(signer)" sign-runner "$1" --identity "$KR_SIGN_IDENTITY" --keychain "$KR_KEYCHAIN" \
-    --profile "$(profile_file "$KR_RUNNER_PROFILE")" --device "$KR_DEVICE"
+  local arguments=("$1" --identity "$KR_SIGN_IDENTITY" --profile "$(profile_file "$KR_RUNNER_PROFILE")" --device "$KR_DEVICE")
+  with_signing_keychain node "$(signer)" sign-runner "${arguments[@]}" --keychain "$KR_KEYCHAIN" || return 1
+  node "$(signer)" verify-runner "${arguments[@]}"
 }
 
 build_app() {
@@ -338,6 +396,10 @@ build_tests() {
     $plist -c "Add $key:CommandLineArguments:$at string $each" "$session_plan" || die "the test plan took no argument $each"
     at=$((at + 1))
   done
+  # A simulator run can be asked to leave the application's tree and picture of a failure under /tmp.
+  if [ "$target" = simulator ] && [ "${KR_FAILURE_DUMP:-}" = 1 ]; then
+    $plist -c "Add $key:TestingEnvironmentVariables:KR_FAILURE_DUMP string 1" "$session_plan" || die "the test plan took no failure dump setting"
+  fi
   # Every value is read back: a plan that did not take them is not one to run on a phone.
   [ "$($plist -c "Print $key:SystemAttachmentLifetime" "$session_plan")" = keepNever ] || die "the plan does not keep no system attachments"
   [ "$($plist -c "Print $key:UserAttachmentLifetime" "$session_plan")" = keepNever ] || die "the plan does not keep no user attachments"
@@ -402,7 +464,8 @@ forward_what_the_tests_say() { # <the runner's output> <where the lines are kept
   local total
   total=$(wc -l < "$1" 2>/dev/null || echo 0)
   [ "$total" -gt "$forwarded" ] || return 0
-  tail -n +"$((forwarded + 1))" "$1" | grep -E 'KR-' | while IFS= read -r line; do
+  # Only the lines counted: the runner may have written more since, and they are read next time.
+  tail -n +"$((forwarded + 1))" "$1" | head -n "$((total - forwarded))" | grep -E 'KR-' | while IFS= read -r line; do
     printf 'device-ios: [%s] %s\n' "$(date +%s)" "${line#*KR-}"
   done | tee -a "$2"
   forwarded=$total
@@ -424,6 +487,40 @@ copy_shots() { # <session>
 # then the application and the runner removed and checked gone. A session that cannot show all of that
 # keeps its record, so that `cleanup` knows what is left, and ends with a failure.
 finish_session() {
+  [ "$ending" = 1 ] && return
+  ending=1
+  stop_runner
+  say "ending the session"
+  local keep_app=0
+  if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
+    copy_shots "${session_name:-session}"
+    [ "${session_name:-}" = s0 ] && check_shot_proof "$shots/s0"
+    echo "sweep=pending" >> "$record"
+    if sweep; then
+      echo "sweep=done" >> "$record"
+    else
+      # The sweep runs through the application, so the application stays until a sweep has worked:
+      # removing it now would leave the items with nothing to remove them.
+      say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: the application stays installed, and cleanup runs the sweep again"
+      keep_app=1
+      unclean=1
+    fi
+  else
+    say "no empty baseline is on record, so nothing is swept"
+  fi
+  [ "$keep_app" = 1 ] || target_uninstall "$app_id"
+  target_uninstall "$runner_id"
+  for id in "$app_id" "$runner_id"; do
+    if [ "$id" = "$app_id" ] && [ "$keep_app" = 1 ]; then continue; fi
+    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
+  done
+  if [ "$unclean" = 0 ]; then rm -f "$record"; fi
+  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}" "$(dirname "$(cat "$work/tests-$target.path" 2>/dev/null)")/attachment-proof.xctestrun"
+  [ "$unclean" = 0 ] || exit 3
+  [ "$unproven" = 0 ] || exit 4
+}
+
+session() {
   [ "$ending" = 1 ] && return
   ending=1
   stop_runner
@@ -496,6 +593,8 @@ session() {
   xcodebuild test-without-building -xctestrun "$(cat "$work/tests-$target.path")" -destination "$(destination)" \
     -resultBundlePath "$result" -collect-test-diagnostics never "${only[@]}" > "$out" 2>&1 &
   runner_pid=$!
+  # The record names the driver, so that cleanup can end it if this script is killed.
+  echo "runner=$runner_pid" >> "$record"
   local sent=0
   forwarded=0
   while kill -0 "$runner_pid" 2>/dev/null; do
@@ -578,7 +677,19 @@ attachment_proof() {
     || { say "PROOF NOT MET: the plan for the attachment check could not be written"; unproven=1; return; }
   say "running a test that fails on purpose, with every attachment kept"
   xcodebuild test-without-building -xctestrun "$proof_plan" -destination "$(destination)" -resultBundlePath "$bundle" \
-    -collect-test-diagnostics never "-only-testing:$tests_scheme/ProofTests/testAFailureLeavesNothingBehind" > "$out" 2>&1
+    -collect-test-diagnostics never "-only-testing:$tests_scheme/ProofTests/testAFailureLeavesNothingBehind" > "$out" 2>&1 &
+  runner_pid=$!
+  echo "runner=$runner_pid" >> "$record"
+  # Five minutes is far more than a test of a few seconds needs; a phone that does not answer is not waited for.
+  local waited=0
+  while kill -0 "$runner_pid" 2>/dev/null && [ "$waited" -lt 300 ]; do sleep 2; waited=$((waited + 2)); done
+  if kill -0 "$runner_pid" 2>/dev/null; then
+    say "the attachment check did not end in five minutes: stopping it"
+    stop_runner
+    unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
+  fi
+  wait "$runner_pid" 2>/dev/null
+  runner_pid=""
   if ! grep -q "Test Case '.*testAFailureLeavesNothingBehind.*' failed" "$out"; then
     say "PROOF NOT MET: the test that fails on purpose did not run and fail, so what a failure leaves is not known"
     unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
@@ -587,15 +698,16 @@ attachment_proof() {
     say "PROOF NOT MET: the result of the test that fails on purpose could not be read"
     unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
   fi
-  # By kind alone: the file name's extension, counted. Nothing is opened.
-  local kinds pictures
+  # By kind alone: the file name's extension, counted. Nothing is opened. Only kinds that are text may
+  # be left; a picture, a recording or any kind this does not know is a failure.
+  local kinds others
   kinds=$(find "$exported" -type f ! -name manifest.json | sed 's/.*\.//' | sort | uniq -c | awk '{printf "%s %s, ", $2, $1}')
-  pictures=$(find "$exported" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' -o -iname '*.mp4' -o -iname '*.mov' \) | wc -l | tr -d ' ')
+  others=$(find "$exported" -type f ! -name manifest.json ! \( -iname '*.txt' -o -iname '*.log' -o -iname '*.json' -o -iname '*.plist' -o -iname '*.xml' \) | wc -l | tr -d ' ')
   rm -rf "$bundle" "$exported" "$proof_plan"
-  if [ "$pictures" = 0 ]; then
+  if [ "$others" = 0 ]; then
     say "PROOF the failure left no picture or recording (kinds left: ${kinds:-none})"
   else
-    say "PROOF NOT MET: the failure left $pictures picture or recording files (kinds: $kinds), which were deleted unopened: tell the lead before anything else runs"
+    say "PROOF NOT MET: the failure left $others files that are not text (kinds: $kinds), which were deleted unopened: stop and report before anything else runs"
     unproven=1
   fi
 }
@@ -613,8 +725,25 @@ send_push() {
 # The names and outcomes of the tests, and the lines the tests said; skipped tests are named too, so
 # a session that skipped what it was for does not read as a pass.
 report() { # <output>
-  grep -E "Test Case '.*' (started|passed|failed|skipped)|Executed [0-9]+ test|\*\* TEST|Restarting after|crashed" "$1" \
+  grep -E "Test Case '.*' (started|passed|failed|skipped)|Executed [0-9]+ test|\*\* TEST|Restarting after unexpected exit, crash, or test timeout" "$1" \
     | sed -E "s/Test Case '-\[KalaReachUITests\./Test Case '[/" || true
+}
+
+# Ends the driver the record names, if it is still running: a session killed with no chance to stop it
+# leaves its xcodebuild behind, and nothing is uninstalled or deleted while that is still driving the
+# phone. Only a process the record names whose command is the test run.
+stop_recorded_driver() {
+  local pid waited=0
+  for pid in $(sed -n 's/^runner=//p' "$record" | sort -u); do
+    kill -0 "$pid" 2>/dev/null || continue
+    ps -o command= -p "$pid" 2>/dev/null | grep -q 'xcodebuild test-without-building' || continue
+    say "stopping the test run $pid that the record names"
+    kill "$pid" 2>/dev/null
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+    kill -9 "$pid" 2>/dev/null
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then say "THE TEST RUN $pid WOULD NOT STOP: nothing is cleaned up"; exit 3; fi
+  done
 }
 
 cleanup() {
@@ -627,21 +756,36 @@ cleanup() {
     || die "the record at $record is of another target or phone: nothing is touched"
   boot_simulator
   say "cleaning up the session the record names"
+  stop_recorded_driver
+  local keep_app=0
   if [ "$(installed_state "$app_id")" = yes ]; then
     if grep -q '^baseline=empty$' "$record"; then
       copy_shots "cleanup"
-      sweep || { say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY"; unclean=1; }
+      echo "sweep=pending" >> "$record"
+      if sweep; then
+        echo "sweep=done" >> "$record"
+      else
+        say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: the application stays installed"
+        keep_app=1
+        unclean=1
+      fi
     else
       say "that session did not begin with an empty baseline, so nothing is swept: report what is there"
     fi
+  elif grep -q '^baseline=empty$' "$record" && [ "$(sed -n 's/^sweep=//p' "$record" | tail -1)" != done ]; then
+    # The application is gone and no sweep of this session is known to have finished: what it filed in the
+    # two groups cannot be counted from here.
+    say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: the application is gone and the session's sweep did not finish"
+    unclean=1
   fi
-  target_uninstall "$app_id"
+  [ "$keep_app" = 1 ] || target_uninstall "$app_id"
   target_uninstall "$runner_id"
   for id in "$app_id" "$runner_id"; do
+    if [ "$id" = "$app_id" ] && [ "$keep_app" = 1 ]; then continue; fi
     if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
   done
   [ "$unclean" = 0 ] && rm -f "$record"
-  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}"
+  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}" "$(dirname "$(cat "$work/tests-$target.path" 2>/dev/null)")/attachment-proof.xctestrun"
   [ "$unclean" = 0 ] || exit 3
 }
 
