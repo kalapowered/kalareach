@@ -747,6 +747,9 @@ mod tests {
         use kr_shell_integration::host::refusal::ParserError;
 
         let file = std::path::Path::new("/home/someone/profile.ps1");
+        // A path is said with the platform's own separator throughout, so on Windows the person
+        // reads `\home\someone\profile.ps1`.
+        let spelled = ["", "home", "someone", "profile.ps1"].join(std::path::MAIN_SEPARATOR_STR);
         let errors = |names: &[&str]| {
             names
                 .iter()
@@ -804,8 +807,7 @@ mod tests {
         for refusal in classes {
             let said = startup_failure(file, &refusal.clone().into()).to_string();
             assert!(
-                said.starts_with("/home/someone/profile.ps1: ")
-                    && said.ends_with(&refusal.to_string()),
+                said.starts_with(&format!("{spelled}: ")) && said.ends_with(&refusal.to_string()),
                 "{refusal:?} is said as {said:?}"
             );
             assert!(!said.contains("other error"), "{refusal:?}: {said}");
@@ -824,7 +826,7 @@ mod tests {
         // sentence some other library put in one is not repeated.
         let marker = "kr-marker-4f2a-from-another-library";
         let other = startup_failure(file, &std::io::Error::other(marker)).to_string();
-        assert_eq!(other, "/home/someone/profile.ps1: other error");
+        assert_eq!(other, format!("{spelled}: other error"));
         assert!(!other.contains(marker));
         let missing = startup_failure(file, &std::io::Error::from_raw_os_error(2)).to_string();
         assert!(missing.contains("(os error 2)"), "{missing}");
