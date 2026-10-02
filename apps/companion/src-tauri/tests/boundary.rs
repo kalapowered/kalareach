@@ -1131,14 +1131,14 @@ fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
                 }
             }
         }
-        if name == "Podfile" {
-            if let Some(rest) = trimmed.strip_prefix("platform") {
-                let rest = rest.trim_start();
-                for (marker, platform) in [(":ios", Floor::Ios), (":osx", Floor::Macos)] {
-                    if let Some(value) = rest.strip_prefix(marker) {
-                        let value = value.trim_start().trim_start_matches(',').trim();
-                        found.push((number, platform, value.to_owned()));
-                    }
+        if name == "Podfile"
+            && let Some(rest) = trimmed.strip_prefix("platform")
+        {
+            let rest = rest.trim_start();
+            for (marker, platform) in [(":ios", Floor::Ios), (":osx", Floor::Macos)] {
+                if let Some(value) = rest.strip_prefix(marker) {
+                    let value = value.trim_start().trim_start_matches(',').trim();
+                    found.push((number, platform, value.to_owned()));
                 }
             }
         }
