@@ -194,6 +194,14 @@ impl Controller {
         ) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
+        // A machine group step is claimed in the same store and answered from it the same way, and
+        // from the machine group record where an attempt ended without recording what it did.
+        if matches!(
+            method,
+            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit
+        ) {
+            return self.machine_retained(actor_id, mutation);
+        }
         // A declaration of a device's keys is answered the same way, from the outcome the device
         // directory recorded beside the keys: a completion or a refusal alike, so a retry whose
         // reply was lost is told what happened rather than that its window is gone.

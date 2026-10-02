@@ -1032,6 +1032,31 @@ impl RemoteConnection {
                 });
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
+            // A machine group step changes this environment's own record and nothing else: the
+            // daemon's own effect, once per actor's action, and never forwarded to a worker or to
+            // another environment. The route names this host as the owner of the receipt, and the
+            // step is claimed, written and its receipt kept on a task that outlives this
+            // connection, so a retry is answered from that record.
+            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let effect = tokio::spawn(async move {
+                    controller
+                        .machine_step(&actor_id, &mutation, method, carried)
+                        .await
+                });
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+            }
             Method::DevicePreviewKeyUpdate => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());

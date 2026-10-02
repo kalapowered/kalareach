@@ -141,6 +141,7 @@ impl Controller {
             session_limit: U64::new(limit),
             default_worker_profile: self.default_profile().await,
             power: self.power_state().await,
+            machine: self.machine_report(),
         })
     }
 
@@ -158,6 +159,7 @@ impl Controller {
                 runtime_directory: self.paths.runtime_dir().display().to_string(),
                 state_directory: self.paths.state_dir().display().to_string(),
                 live_sessions: U64::new(live),
+                machine: self.machine_report(),
             }],
         })
     }
@@ -371,6 +373,7 @@ impl Controller {
                 ),
             None,
         ));
+        checks.push(self.machine_check());
         checks.push(DoctorCheck::new(
             "supervisor",
             "Workers outlive this daemon",

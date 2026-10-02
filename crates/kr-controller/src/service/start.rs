@@ -229,6 +229,11 @@ impl Controller {
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         let generation = lock.advance(&mut registry)?;
+        // The environment's machine group: minted here at its first start, and read from then on.
+        // A record that cannot be used does not stop the daemon: it serves with no group, takes
+        // no step, and says so in its diagnostics.
+        let machine =
+            super::machine_group::Machine::open(&lock, &setup.paths, kr_ipc::now_ms().get())?;
         // The configured session number, intersected with what this machine's resources allow,
         // becomes the number admission enforces. Only when the document actually names one: a
         // document that says nothing, and one this build cannot read, must not lift a restriction
@@ -633,8 +638,12 @@ impl Controller {
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),
             handover: super::host::Handover::default(),
-            _lock: lock,
+            machine,
+            lock,
         });
+        // A step that wrote the machine group record and ended before its receipt is answered from
+        // the record before anything is served, so no later step can take the answer with it.
+        controller.settle_machine_record()?;
         // Bound before anything can reach the module: from here on a workflow's grant is decided
         // under this daemon's policy, its configured ceiling and its clock model, and a node's
         // change-set write is held under this daemon's registry.

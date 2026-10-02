@@ -36,6 +36,7 @@ fn host_info() -> HostInfoResult {
                 kr_protocol::desktop::PowerSource::Unknown,
             )
         },
+        machine: None,
     }
 }
 
@@ -130,6 +131,7 @@ fn read_only_metadata_may_carry_an_optional_field_a_receiver_does_not_know() {
         runtime_directory: "/run/kr".to_owned(),
         state_directory: "/var/kr".to_owned(),
         live_sessions: U64::new(1),
+        machine: None,
     };
     let listing = CanonicalValue::Map(
         CanonicalMap::from_entries([(
@@ -477,6 +479,7 @@ fn a_message_may_use_only_an_extension_its_connection_negotiated() {
         runtime_directory: "/run/kr".to_owned(),
         state_directory: "/var/kr".to_owned(),
         live_sessions: U64::new(1),
+        machine: None,
     };
     let elsewhere = with(&summary, &[("org.example.thermal", level(2))]);
     let error = wire::from_value_extended::<EnvironmentSummary>(&elsewhere, &negotiated)
@@ -524,4 +527,37 @@ fn a_negotiated_member_is_read_into_its_own_type_before_it_is_returned() {
         wire::from_value_extended::<HostInfoResult>(&message, &negotiated).expect("a valid member");
     let member: Thermal = wire::from_value(&read.members[0].value).expect("its own type");
     assert_eq!(member, Thermal { level: 0 });
+}
+
+/// A group an environment records is read where an answer carries one, an answer that carries none
+/// reads as it did before groups existed, and the group itself is a closed object: a member it does
+/// not know is refused rather than ignored, because a step's result carries the same object.
+#[test]
+fn an_answer_may_carry_a_machine_group_and_the_group_is_closed() {
+    use kr_protocol::machine::{MachineChange, MachineGroup};
+
+    let group = MachineGroup {
+        machine_id: kr_protocol::ids::MachineId::new(Uuid::from_bytes([9; 16])),
+        revision: U64::new(2),
+        change: MachineChange::Split,
+        previous: Nullable::some(kr_protocol::ids::MachineId::new(Uuid::from_bytes([8; 16]))),
+    };
+    let mut info = host_info();
+    let without: HostInfoResult =
+        wire::from_value(&with(&info, &[])).expect("an answer with no group");
+    assert_eq!(without.machine, None);
+    assert!(
+        !serde_json::to_string(&info)
+            .expect("the answer serialises")
+            .contains("machine"),
+        "an answer with no group carries no member for one"
+    );
+
+    info.machine = Some(group.clone());
+    let read: HostInfoResult = wire::from_value(&with(&info, &[])).expect("an answer with a group");
+    assert_eq!(read.machine, Some(group.clone()));
+
+    let widened = with(&group, &[("host_name", CanonicalValue::text("laptop"))]);
+    let error = wire::from_value::<MachineGroup>(&widened).expect_err("a closed object");
+    assert_eq!(error.rule(), "unknown_field", "{error}");
 }

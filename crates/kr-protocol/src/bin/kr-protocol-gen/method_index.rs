@@ -118,6 +118,9 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::DescriptionSetup | Method::DescriptionConfigure | Method::DescriptionDownload => {
             at(DESCRIBE, "Setup")
         }
+        Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
+            at(HOST, "Machine groups")
+        }
 
         Method::PairInvite | Method::PairFinish | Method::PairConfirm => {
             at(PAIRING, "The exchange")

@@ -456,6 +456,32 @@ methods! {
           fetch needs no account, checks every file against the profile before it keeps it, and \
           a cancellation deletes what it had written.";
 
+    MachineJoin = "machine.join", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Move this environment into the machine group the owner names, against the group and \
+          revision the owner saw. The environment records its own group, and no other \
+          environment's changes with it.";
+
+    MachineMerge = "machine.merge", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Take this environment's part in merging its machine group into another, against the \
+          group and revision the owner saw. A merge of independent environments is one such step \
+          on each of them.";
+
+    MachineSplit = "machine.split", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Move this environment into a fresh machine group of its own, against the group and \
+          revision the owner saw.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],

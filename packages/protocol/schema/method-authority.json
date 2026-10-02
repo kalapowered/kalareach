@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 158,
+  "method_count": 161,
   "methods": [
     {
       "capability": "none",
@@ -402,6 +402,96 @@
         "environment"
       ],
       "summary": "Start or cancel the fetch of the selected profile's files, at the host itself. A fetch needs no account, checks every file against the profile before it keeps it, and a cancellation deletes what it had written.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "machine.join",
+      "name": "machine.join",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Move this environment into the machine group the owner names, against the group and revision the owner saw. The environment records its own group, and no other environment's changes with it.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "machine.merge",
+      "name": "machine.merge",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Take this environment's part in merging its machine group into another, against the group and revision the owner saw. A merge of independent environments is one such step on each of them.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "machine.split",
+      "name": "machine.split",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Move this environment into a fresh machine group of its own, against the group and revision the owner saw.",
       "version": 1
     },
     {

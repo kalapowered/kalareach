@@ -18,6 +18,7 @@ use crate::desktop::SleepInhibitionState;
 use crate::hello::ProtocolVersion;
 use crate::identity::{BootIdentity, WorkerProfile};
 use crate::ids::{BuildId, ControllerGeneration, EnvironmentId};
+use crate::machine::MachineGroup;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// The result of `host.info`.
@@ -48,6 +49,10 @@ pub struct HostInfoResult {
     pub default_worker_profile: WorkerProfile,
     /// What this host's sleep inhibition is doing, whether it is active or not.
     pub power: SleepInhibitionState,
+    /// The machine group this environment records for itself. Absent when the host has none to
+    /// report: an older host, or one whose record could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineGroup>,
 }
 
 impl export::ForExport for HostInfoResult {
@@ -112,6 +117,10 @@ pub struct EnvironmentSummary {
     pub state_directory: String,
     /// How many sessions are live or creating.
     pub live_sessions: U64,
+    /// The machine group this environment records for itself. Absent when the host has none to
+    /// report: an older host, or one whose record could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineGroup>,
 }
 
 impl EnvironmentSummary {
@@ -4839,6 +4848,7 @@ pub mod export {
             ContentClass::Term,
         ),
         field("HostInfoResult", "power", ContentClass::Structure),
+        field("HostInfoResult", "machine", ContentClass::Structure),
         field("ProtocolVersion", "major", ContentClass::Number),
         field("ProtocolVersion", "minor", ContentClass::Number),
         // `environment.list`, as a paired device reads it. The account and the directories are
@@ -4865,6 +4875,16 @@ pub mod export {
         ),
         field("EnvironmentSummary", "state_directory", ContentClass::Path),
         field("EnvironmentSummary", "live_sessions", ContentClass::Number),
+        field("EnvironmentSummary", "machine", ContentClass::Structure),
+        // A machine group, which both answers carry as one structure. Its group and its previous
+        // group are identifiers the environment records, either minted by it or named by its
+        // owner: a validated identifier carries nothing but its sixteen bytes, so a reader learns
+        // no name, path or account from it, and it is what lets a client show environments
+        // together.
+        field("MachineGroup", "machine_id", ContentClass::Identifier),
+        field("MachineGroup", "revision", ContentClass::Number),
+        field("MachineGroup", "change", ContentClass::Term),
+        field("MachineGroup", "previous", ContentClass::Identifier),
     ];
 
     const fn field(
@@ -6857,6 +6877,19 @@ mod tests {
                     crate::desktop::PowerSource::Unknown,
                 )
             },
+            machine: Some(a_machine_group()),
+        }
+    }
+
+    /// The group an environment records, after its owner moved it into another.
+    fn a_machine_group() -> MachineGroup {
+        MachineGroup {
+            machine_id: crate::ids::MachineId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+            revision: U64::new(2),
+            change: crate::machine::MachineChange::Joined,
+            previous: Nullable::some(crate::ids::MachineId::new(
+                crate::scalars::Uuid::from_bytes([6; 16]),
+            )),
         }
     }
 
@@ -6873,6 +6906,7 @@ mod tests {
                 state_directory: "/home/someone/.local/state/kalareach/environments/03030303"
                     .to_owned(),
                 live_sessions: U64::new(2),
+                machine: Some(a_machine_group()),
             }],
         }
     }

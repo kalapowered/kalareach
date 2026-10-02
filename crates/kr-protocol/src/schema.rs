@@ -127,6 +127,10 @@ use crate::invitation::{
 use crate::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalHello, LocalHelloAck,
 };
+use crate::machine::{
+    MachineChange, MachineExpected, MachineGroup, MachineJoinParams, MachineMergeParams,
+    MachineSplitParams, MachineStepResult,
+};
 use crate::mailbox::{EnvelopePlaintext, ForwardedAuthority, SealedEnvelope};
 use crate::method::{Method, REGISTRY};
 use crate::pairing::{
@@ -449,6 +453,13 @@ pub fn protocol_schema() -> Value {
         "launch_profile" => LaunchProfile,
         "local_hello" => LocalHello,
         "local_hello_ack" => LocalHelloAck,
+        "machine_change" => MachineChange,
+        "machine_expected" => MachineExpected,
+        "machine_group" => MachineGroup,
+        "machine_join_params" => MachineJoinParams,
+        "machine_merge_params" => MachineMergeParams,
+        "machine_split_params" => MachineSplitParams,
+        "machine_step_result" => MachineStepResult,
         "membership_lease" => MembershipLease,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,

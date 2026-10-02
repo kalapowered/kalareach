@@ -31,6 +31,9 @@ links to its document.
 | `description.setup` | read | `local_ipc`, `paired_device` | What session descriptions offer on this host: the profile, its exact size and where the fetch would reach before anything is fetched, how a fetch is going, the two settings, and what state inference is in. | [Descriptions: Setup](../describe/README.md) |
 | `description.configure` | write | `local_ipc` | Turn session descriptions on or off, or allow inference on battery, at the host itself. The setting is recorded in the host's configuration and applies at once: turning them off cancels the work in flight and ends the description process. | [Descriptions: Setup](../describe/README.md) |
 | `description.download` | write | `local_ipc` | Start or cancel the fetch of the selected profile's files, at the host itself. A fetch needs no account, checks every file against the profile before it keeps it, and a cancellation deletes what it had written. | [Descriptions: Setup](../describe/README.md) |
+| `machine.join` | write | `local_ipc`, `paired_device` | Move this environment into the machine group the owner names, against the group and revision the owner saw. The environment records its own group, and no other environment's changes with it. | [Host: Machine groups](../host/README.md) |
+| `machine.merge` | write | `local_ipc`, `paired_device` | Take this environment's part in merging its machine group into another, against the group and revision the owner saw. A merge of independent environments is one such step on each of them. | [Host: Machine groups](../host/README.md) |
+| `machine.split` | write | `local_ipc`, `paired_device` | Move this environment into a fresh machine group of its own, against the group and revision the owner saw. | [Host: Machine groups](../host/README.md) |
 
 ## Pairing
 

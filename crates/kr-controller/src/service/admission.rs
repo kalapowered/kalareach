@@ -708,6 +708,18 @@ impl Controller {
                     ));
                 }
             }
+            // A machine group step changes this environment's own record, not a session's. A
+            // request that named a session here would be asking for a record scoped to something
+            // the record does not have.
+            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a machine group belongs to this environment, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                super::machine_group::check_step(method, &mutation.params)?;
+            }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;
             }

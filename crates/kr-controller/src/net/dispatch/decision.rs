@@ -326,6 +326,22 @@ impl RemoteConnection {
             crate::catalogue::CatalogueModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
+        // A machine group step changes this environment's own record. A target naming a session is
+        // refused rather than producing a receipt against something the step never touched, and
+        // the parameters are the ones the local ingress reads.
+        if matches!(
+            entry.method,
+            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit
+        ) {
+            if mutation.target.session_id.as_ref().is_some() {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "a machine group belongs to this environment, not to one session",
+                ));
+            }
+            crate::service::machine_group::check_step(entry.method, &mutation.params)
+                .map_err(|error| error.to_protocol_error())?;
+        }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the
         // target names none, and the session a delegation acts on travels in the parameters where
         // the coordinator checks it against what that voice session may reach. Its own subject
