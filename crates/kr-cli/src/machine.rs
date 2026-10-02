@@ -28,13 +28,18 @@
 //!   it answers from its receipt. A step the environment refuses without a receipt is read against
 //!   what the environment reports: at the precondition nothing was applied, and the step is
 //!   composed again under a new action identity (unless its first action is still running, in which
-//!   case it waits for that); one step on, the record shows it was taken, unless the environment
-//!   could not say whether it survives a crash or its action is still running, which stay sent;
-//!   and anywhere else it can never apply and is given its refusal. A step whose outcome the
-//!   environment does not know, or could not confirm, or could not write, is not given a result it
-//!   was not given: it stays sent. An environment that reports no record takes no step: what it
-//!   refused before it claimed the action is refused, and what it could not answer stays sent. An
-//!   environment that cannot be reached stays pending.
+//!   case it waits for that); one step on, the record shows the step was taken once the environment
+//!   has confirmed that the record survives a crash, which it does before it claims any step, so a
+//!   step it refuses for the record it now holds is taken, while one refused any other way may have
+//!   come before that confirmation and is composed again under a new action to ask if it was sent
+//!   before, and stays sent if it was composed now; an environment that could not say whether its
+//!   change survives a crash, or whose action is still running, leaves the step sent; and anywhere
+//!   else it can never apply and is given its refusal. A step whose outcome the environment does
+//!   not know, or could not confirm, or could not write, is not given a result it was not given: it
+//!   stays sent. An environment that reports no record takes no step: a step never sent before that
+//!   it refuses is refused, while one sent again that it refuses for storage, which can come before
+//!   it looks up its receipts, and one it could not answer, stay sent. An environment that cannot
+//!   be reached stays pending.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
 //!   never sent is given up. One that may or may not have been taken has to be finished first,
@@ -1179,8 +1184,9 @@ enum Verdict {
     Refused(ErrorCode, Why),
     /// It may still be taken, or answered, and nothing more is done now: it stays sent.
     Pending,
-    /// Nothing was applied and the action cannot be asked again: the step is composed again under a
-    /// new action, against the same record.
+    /// The action cannot be asked again, and nothing the environment answered settles the step: it
+    /// is composed again under a new action, against the same record, and what the environment
+    /// answers that is read once more.
     AskAgain,
 }
 
@@ -1188,8 +1194,8 @@ enum Verdict {
 /// environment reports now.
 ///
 /// Every action a step is sent under carries the same record as its precondition, so at most one of
-/// them applies. `fresh` says the refused mutation was composed on the connection that sent it, and
-/// so was not refused for the window it quotes.
+/// them applies. `fresh` says the refused mutation was composed on the connection that sent it: its
+/// action was not sent before, and it was not refused for the window it quotes.
 fn judge(
     step: &PlannedStep,
     record: Option<&MachineGroup>,
@@ -1199,13 +1205,14 @@ fn judge(
     let Some(group) = record else {
         // An environment with no usable record takes no step, and says nothing of one it took
         // before the record was lost: a step it could not answer, or is still running, is not
-        // given a result it was not given. Where it refused the step before it claimed it, the step
-        // was not taken.
+        // given a result it was not given. A step whose action was never sent before was not taken
+        // by an earlier attempt, so what refuses it is a refusal. One sent again may have been
+        // taken by an earlier attempt of its action: an environment can refuse it for storage
+        // before it looks up its receipts, so that refusal does not say it was not taken. The plan
+        // keeps the step sent without relying on the order in which an environment makes its
+        // checks.
         return match (fresh, code) {
             (_, ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable) => Verdict::Pending,
-            // A step sent again, refused for storage, proves nothing about an earlier attempt:
-            // the environment may have failed before it looked up its receipts, and the earlier
-            // attempt may have applied the step. A step composed here was not sent before.
             (false, ErrorCode::StorageUnavailable) => Verdict::Pending,
             _ => Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
         };
@@ -1239,16 +1246,20 @@ fn judge(
         && group.previous.as_ref() == Some(&step.expected.machine_id)
         && matches!(group.change, MachineChange::Merged | MachineChange::Joined)
     {
-        // The record shows the step was taken. An environment that could not say whether its
+        // The record shows the step was taken, and a record shows that only once its environment
+        // has confirmed that it survives a crash. An environment confirms its record before it
+        // claims a step, so a step refused for the record it now holds, as approved against
+        // another, comes from one that has: that takes the step as done. Any other refusal may have
+        // come before the confirmation, at the door or from a record that cannot be confirmed now.
+        // A step sent again is composed again, under a new action, to ask; one composed here stays
+        // sent until the environment can answer. An environment that could not say whether its
         // change survives a crash has not said it was taken, and one whose action is still running
         // has not finished it: that stays to be answered.
-        return if matches!(
-            code,
-            ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable
-        ) {
-            Verdict::Pending
-        } else {
-            Verdict::Done(group.clone())
+        return match (fresh, code) {
+            (_, ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable) => Verdict::Pending,
+            (_, ErrorCode::DraftConflict) => Verdict::Done(group.clone()),
+            (false, _) => Verdict::AskAgain,
+            (true, _) => Verdict::Pending,
         };
     }
     Verdict::Refused(ErrorCode::DraftConflict, Why::Moved)
@@ -1482,26 +1493,40 @@ mod tests {
         group(5, 9, MachineChange::Split, Some(1))
     }
 
-    /// KR-REQ-03.07: an environment that took the step another way, or whose record shows it, has
-    /// the step taken; one that moved elsewhere has it refused for good; one with no record has
-    /// it refused where it refused it before it claimed the action; and no answer that leaves it
-    /// unknown whether the step was taken is called taken.
+    /// KR-REQ-03.07: an environment that took the step another way has the step taken once it
+    /// refuses a step for the record it holds, which it does only after it has confirmed that record
+    /// survives a crash; any other refusal may have come before that, so a step sent again is
+    /// composed again to ask and one composed here stays sent. One that moved elsewhere has the step
+    /// refused for good; one with no record has it refused where it was not sent before; and no
+    /// answer that leaves it unknown whether the step was taken is called taken.
     #[test]
     fn what_an_environment_reports_decides_what_a_refused_step_has_come_to() {
         let step = step();
         let taken = one_step_on();
+        for fresh in [false, true] {
+            assert_eq!(
+                judge(&step, Some(&taken), ErrorCode::DraftConflict, fresh),
+                Verdict::Done(taken.clone()),
+                "fresh {fresh}: a step approved against another record is refused for the record the environment holds, which it has confirmed"
+            );
+        }
+        // Refused before the environment confirmed its record: at its door, or because the record
+        // cannot be confirmed now. The record shows the step, and does not show it survives a crash.
         for code in [
             ErrorCode::PermissionDenied,
-            ErrorCode::DraftConflict,
             ErrorCode::StorageUnavailable,
+            ErrorCode::IdConflict,
         ] {
-            for fresh in [false, true] {
-                assert_eq!(
-                    judge(&step, Some(&taken), code, fresh),
-                    Verdict::Done(taken.clone()),
-                    "{code:?}, fresh {fresh}: the record shows the step was taken"
-                );
-            }
+            assert_eq!(
+                judge(&step, Some(&taken), code, false),
+                Verdict::AskAgain,
+                "{code:?}: a step sent again is composed again, which the environment answers after it has confirmed its record"
+            );
+            assert_eq!(
+                judge(&step, Some(&taken), code, true),
+                Verdict::Pending,
+                "{code:?}: a step composed here stays sent until the environment can answer"
+            );
         }
         // A step the environment could not say it took, or whose action is still running, is not
         // called taken from its record alone.

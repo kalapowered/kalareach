@@ -777,6 +777,78 @@ async fn a_step_the_owner_took_another_way_meanwhile_is_taken_as_done_and_not_ta
     );
 }
 
+/// KR-REQ-03.07: a record that shows a step taken is not called taken while its environment cannot
+/// confirm that the record survives a crash. The owner took B's part by hand and B could not confirm
+/// the write; every step the plan sends B meanwhile is refused before B has looked at its record,
+/// whether it is composed for the first time or sent again, so none of them says the record is
+/// confirmed. The step stays `sent` and the plan is kept until B can confirm its record, and then a
+/// step that finds the record moved on is what takes it as done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_is_unconfirmed() {
+    let pair = Pair::start().await;
+    let shared = pair.together();
+    let a_id = pair.a.environment_id();
+    let into = a_group();
+    pair.allow(1);
+    pair.a.failed(
+        Some(pair.bridges.path()),
+        &[
+            "host",
+            "machine",
+            "merge",
+            &into,
+            "--from",
+            &shared.machine_id,
+            "--environment",
+            &a_id,
+            "--environment",
+            "bravo",
+        ],
+    );
+    let own = pair.b.group();
+    pair.b
+        .controller
+        .report_the_next_machine_write_as_unconfirmed();
+    let by_hand = pair.b.failed(
+        None,
+        &["host", "machine", "merge", &into, "--expect", &own.expect()],
+    );
+    assert_eq!(by_hand["code"], "OUTCOME_UNKNOWN", "{by_hand}");
+    pair.b.controller.fail_the_machine_recovery_flush(true);
+    let written = pair.b.group();
+    assert_eq!(written.machine_id, into, "the record shows B's step");
+    assert_eq!(written.revision, own.revision + 1);
+
+    pair.allow(10);
+    // The first `finish` composes B's step and is refused before B reads its record; each later one
+    // sends what the plan holds, or composes it again.
+    for round in 1..=3 {
+        let (status, still) = pair
+            .a
+            .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+        assert_eq!(status, Some(1), "round {round}: {still}");
+        assert_eq!(
+            still["code"], "ENVIRONMENT_UNAVAILABLE",
+            "round {round}: {still}"
+        );
+        assert_eq!(still["steps"][1]["state"], "sent", "round {round}: {still}");
+        assert_eq!(still["kept"], Value::Bool(true), "round {round}: {still}");
+        assert!(pair.a.plan_file().exists(), "round {round}");
+    }
+    assert_eq!(pair.b.group(), written, "B took no second step");
+
+    pair.b.controller.fail_the_machine_recovery_flush(false);
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
+    assert!(!pair.a.plan_file().exists());
+    assert_eq!(
+        pair.b.group(),
+        written,
+        "the plan took no second step: the record is as the owner's own left it"
+    );
+}
+
 /// Takes the plan to the point where A has taken its step and B, stopped, has not, and then has B's
 /// owner move B on to another group. Returns the group both were in, the group A was merged into,
 /// and the group B's owner moved it to.
@@ -999,24 +1071,38 @@ async fn an_environment_that_cannot_read_its_record_is_not_taken_to_have_refused
         b.controller.lose_the_next_machine_receipt();
     });
     assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    assert_eq!(
+        pair.b.group().machine_id,
+        into,
+        "B took the step under the identity the plan holds, before its record is damaged"
+    );
+    let identity = text(&started["steps"][1]["action_id"]);
     let record = pair.b.temp.environment().state_dir().join("machine-group");
     let whole = std::fs::read(&record).expect("B's record");
     kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
         .expect("damages the record");
 
     // B's daemon is told to stop the retry once it has found the step's claim unfinished, which it
-    // does only when B has received the retry: a task waits for that and lets it go.
+    // does only when B has received the retry: a task notes that and lets it go, and B cannot
+    // answer before then.
     let (arrived, go) = pair.b.controller.hold_the_next_machine_retry();
-    let releasing = tokio::spawn(async move {
-        arrived.await.expect("B received the retry");
-        go.send(()).expect("lets the retry go");
+    let received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let releasing = tokio::spawn({
+        let received = Arc::clone(&received);
+        async move {
+            arrived.await.expect("B received the retry");
+            received.store(true, std::sync::atomic::Ordering::SeqCst);
+            go.send(()).expect("lets the retry go");
+        }
     });
     let (status, still) = pair
         .a
         .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
-    releasing
-        .await
-        .expect("B received the retry, so its answer is what kept the step sent");
+    assert!(
+        received.load(std::sync::atomic::Ordering::SeqCst),
+        "B received the retry, so its answer is what kept the step sent: {still}"
+    );
+    releasing.await.expect("the retry was let go");
     assert_eq!(status, Some(1), "{still}");
     assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
     assert_eq!(still["steps"][1]["state"], "sent", "{still}");
@@ -1026,14 +1112,21 @@ async fn an_environment_that_cannot_read_its_record_is_not_taken_to_have_refused
     kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
     let finished = pair.at_a(&["host", "machine", "finish"]);
     assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(
+        text(&finished["steps"][1]["action_id"]),
+        identity,
+        "the step is answered under the identity it was sent under, and no other"
+    );
     assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
     assert_eq!(pair.b.group().machine_id, into);
 }
 
-/// KR-REQ-03.07: an environment that cannot look up its receipts says nothing of a step it took. B
-/// took its step and lost its answer; its record is damaged and its receipts cannot be read. `finish`
-/// is told by B that it does not know, and keeps the step `sent` and the plan, where an answer that
-/// B refused the step would have given it up; once B can read both again the step is answered.
+/// KR-REQ-03.07: an environment that can read neither its receipts nor its record is not taken to
+/// have refused a step it took. B took its step and lost its answer, and both are then unreadable:
+/// `finish` reaches B, keeps the step `sent` and the plan, and once B can read both again the step
+/// is answered. B's own answer, an outcome nobody knows, is the daemon test's
+/// `a_retry_whose_receipt_cannot_be_looked_up_is_an_outcome_nobody_knows`; this test shows the plan
+/// keeps the step through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_environment_that_cannot_read_its_receipts_or_its_record_has_not_refused_its_step() {
     let pair = Pair::start().await;
