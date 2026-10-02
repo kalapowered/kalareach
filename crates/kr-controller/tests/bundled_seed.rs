@@ -63,15 +63,15 @@ impl Drop for Daemon {
     }
 }
 
-/// What the daemon on `host` answers for its diagnostics and its installed plugins, once it
-/// answers at all: the client endpoint is bound after the seed, so an answer is an answer after it.
-async fn answers(host: &kr_ipc::testing::TempHost) -> (HostDoctorResult, PluginListResult) {
+/// A client of the daemon on `host`, once it answers at all: the client endpoint is bound after
+/// the seed, so an answer is an answer after it.
+async fn connected(host: &kr_ipc::testing::TempHost) -> kr_ipc::client::LocalClient {
     let endpoint = host
         .environment()
         .controller_endpoint()
         .expect("an endpoint");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut client = loop {
+    loop {
         if let Ok(client) = kr_ipc::client::LocalClient::connect(
             &endpoint,
             kr_protocol::local::LocalClientKind::Cli,
@@ -79,7 +79,7 @@ async fn answers(host: &kr_ipc::testing::TempHost) -> (HostDoctorResult, PluginL
         )
         .await
         {
-            break client;
+            return client;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -88,7 +88,12 @@ async fn answers(host: &kr_ipc::testing::TempHost) -> (HostDoctorResult, PluginL
                 .unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
+    }
+}
+
+/// What the daemon on `host` answers for its diagnostics and its installed plugins.
+async fn answers(host: &kr_ipc::testing::TempHost) -> (HostDoctorResult, PluginListResult) {
+    let mut client = connected(host).await;
     let doctor: HostDoctorResult = client
         .request(Method::HostDoctor, &())
         .await
@@ -133,6 +138,12 @@ async fn a_daemon_seeds_its_catalogue_from_the_bundle_only_when_started_with_see
     for plugin in &plugins.plugins {
         assert_eq!(plugin.catalogue_id, "official", "{plugin:?}");
         assert!(plugin.enabled, "{plugin:?}");
+        // The admissions in force let new bindings use it: a seeded package is not merely present.
+        assert_eq!(
+            plugin.admission.0,
+            Some(kr_protocol::catalogue::PluginAdmission::Admitted),
+            "{plugin:?}"
+        );
     }
     let catalogue = doctor
         .checks
@@ -181,5 +192,56 @@ async fn a_daemon_seeds_its_catalogue_from_the_bundle_only_when_started_with_see
         catalogue.status,
         DoctorStatus::NotApplicable,
         "{catalogue:?}"
+    );
+}
+
+/// The owner's removal of the seeded repository is a supported choice, not a fault: the daemon
+/// started with `--seed` again enrols nothing, installs nothing more and leaves the doctor's
+/// catalogue check without a warning; what was installed from the repository stays installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_seeded_repository_is_not_enrolled_again_and_is_no_warning() {
+    let host = kr_ipc::testing::TempHost::create();
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
+    let first = Daemon::start(&program, &host, true);
+    let (_, plugins) = answers(&host).await;
+    let installed = plugins.plugins.len();
+    assert!(installed > 0, "the control: the first start seeded");
+    drop(first);
+    // The owner removes the seeded repository while the daemon is stopped, as `catalogue.remove`
+    // does: what was installed from it stays installed.
+    {
+        let mut catalogue = kr_plugin_catalogue::Catalogue::open(
+            &host.environment().state_dir().join("catalogue"),
+            std::sync::Arc::new(
+                kr_plugin_catalogue::transport::RepositoryTransport::local_only(
+                    "this test reads nothing",
+                ),
+            ),
+        )
+        .expect("the catalogue the daemon made");
+        catalogue
+            .remove_repository(
+                &kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier"),
+            )
+            .expect("the owner removes the repository");
+    }
+
+    let _second = Daemon::start(&program, &host, true);
+    let (doctor, plugins) = answers(&host).await;
+
+    assert_eq!(plugins.plugins.len(), installed, "what was installed stays");
+    let catalogue = doctor
+        .checks
+        .iter()
+        .find(|check| check.id() == "catalogue")
+        .expect("the catalogue check");
+    assert_eq!(
+        catalogue.status,
+        DoctorStatus::NotApplicable,
+        "no repository is enrolled again and nothing is warned about: {catalogue:?}"
     );
 }

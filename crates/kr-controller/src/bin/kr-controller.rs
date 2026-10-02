@@ -235,10 +235,10 @@ async fn run(
         })
         .await?
     };
-    // The catalogue is seeded from the generation compiled into this build, once, before an
-    // endpoint a client could reach is bound: a request that came meanwhile would wait for the
-    // catalogue, and none can come. A seed that fails or does nothing is reported and the daemon
-    // starts all the same.
+    // The catalogue is seeded from the generation compiled into this build at every start, before
+    // the local endpoints are bound. The network endpoint, where the host has one, is bound inside
+    // `Controller::start`; a request on it meanwhile waits for the catalogue's lock. A seed that
+    // fails or does nothing is reported and the daemon starts all the same.
     #[cfg(debug_assertions)]
     let seeds = arguments.seed;
     #[cfg(not(debug_assertions))]

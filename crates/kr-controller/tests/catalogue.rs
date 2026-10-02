@@ -3710,12 +3710,22 @@ mod native_bridges {
     /// The installation of release 0.3.0 with the grant it needs, carrying the owner's
     /// confirmation of exactly that installation when `confirmed`.
     async fn install(host: &Host, digest: &str, confirmed: bool) -> ControlFrame {
+        install_from(host, "development", digest, confirmed).await
+    }
+
+    /// The same installation from the repository `catalogue_id`.
+    async fn install_from(
+        host: &Host,
+        catalogue_id: &str,
+        digest: &str,
+        confirmed: bool,
+    ) -> ControlFrame {
         let grant: Vec<String> = GRANT.iter().map(|name| (*name).to_owned()).collect();
         let owner_confirmation = if confirmed {
-            let ceiling = listed_ceiling(host, "development").await;
+            let ceiling = listed_ceiling(host, catalogue_id).await;
             let plan = PluginInstallPlan {
                 environment_id: host.environment_id,
-                catalogue_id: "development".to_owned(),
+                catalogue_id: catalogue_id.to_owned(),
                 ceiling: ceiling.into_iter().collect(),
                 plugin_id: claude_code(),
                 version: "0.3.0".to_owned(),
@@ -3732,7 +3742,7 @@ mod native_bridges {
         };
         let params = wire::PluginInstallParams {
             environment_id: host.environment_id,
-            catalogue_id: "development".to_owned(),
+            catalogue_id: catalogue_id.to_owned(),
             plugin_id: claude_code(),
             version: "0.3.0".to_owned(),
             package_digest: digest.to_owned(),
@@ -4358,6 +4368,18 @@ mod native_bridges {
         number: u64,
         edit: Option<fn(&mut kr_plugin_sdk::catalogue::IndexEntry)>,
     ) -> generations::KeySet {
+        built_again(host, home, keys, number, edit).await.keys()
+    }
+
+    /// What [`signed_again`] publishes, as the generation it built.
+    #[cfg(unix)]
+    async fn built_again(
+        host: &Host,
+        home: &Path,
+        keys: Option<generations::KeySet>,
+        number: u64,
+        edit: Option<fn(&mut kr_plugin_sdk::catalogue::IndexEntry)>,
+    ) -> generations::Generation {
         let package = home.join("claude-code-0.3.0");
         if !package.exists() {
             copy_tree(
@@ -4378,7 +4400,7 @@ mod native_bridges {
         .await;
         let _ = std::fs::remove_dir_all(&host.working);
         copy_tree(&built.directory(), &host.working);
-        built.keys()
+        built
     }
 
     /// Synchronises the repository this test enrolled.
@@ -4999,6 +5021,19 @@ mod native_bridges {
             outcome.report()
         );
         assert_eq!(site.tree(), before, "seeding applies no bridge");
+        // The test's own root is not one this build trusts, so the doctor says that this build
+        // does not move the repository it seeded.
+        let evidence = host
+            .module
+            .evidence_within(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await
+            .expect("readable");
+        assert!(
+            evidence[0]
+                .detail
+                .contains("its root is not one this build trusts"),
+            "{evidence:?}"
+        );
         assert!(
             host.module
                 .native_bridges()
@@ -5134,6 +5169,60 @@ mod native_bridges {
             "the confirmed install applies the recipe"
         );
         assert!(bridge_facts(&host, &digest).is_some());
+    }
+
+    /// KR-REQ-11.42: a bundled generation newer than the one in use is followed as a
+    /// synchronisation is. A release it revokes, whose bridge the owner confirmed, keeps no
+    /// registration once the seed activates it; the control is a newer bundle that revokes
+    /// nothing, which leaves the registration where it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_11_42_a_newer_bundle_that_revokes_a_confirmed_bridge_takes_its_registration_out()
+     {
+        let site = Site::new();
+        let host = host(&site);
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let first = built_again(&host, home.path(), None, 1, None).await;
+        let keys = first.keys();
+        let outcome = host.module.seed(&generations::seed_bundle(&first)).await;
+        assert!(outcome.failure.is_none(), "{}", outcome.report());
+        let before = site.tree();
+        let digest = seeded_digest(&host).await;
+        let _: wire::PluginInstallResult = ok(install_from(&host, "official", &digest, true).await);
+        let placed = applied(&before, &generation());
+        assert_eq!(
+            site.tree(),
+            placed,
+            "the confirmed install applies the recipe"
+        );
+
+        let second = built_again(&host, home.path(), Some(keys.clone()), 2, None).await;
+        let outcome = host.module.seed(&generations::seed_bundle(&second)).await;
+        assert!(outcome.activated.is_some(), "{}", outcome.report());
+        assert_eq!(
+            site.tree(),
+            placed,
+            "a bundle that revokes nothing leaves the registration"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+
+        let third = built_again(&host, home.path(), Some(keys), 3, Some(revoked)).await;
+        let outcome = host.module.seed(&generations::seed_bundle(&third)).await;
+        assert!(outcome.activated.is_some(), "{}", outcome.report());
+        assert_eq!(
+            site.tree(),
+            before,
+            "the revoked release's registration is out"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .is_some(),
+            "the installation stays"
+        );
     }
 
     /// A seed that has been made is not repeated by a restart, and one that is asked again does
