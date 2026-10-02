@@ -2338,16 +2338,9 @@ fn a_removal_is_decided_by_the_listing_on_hfs_and_fat_volumes() {
         let image = root.path().join("volume.dmg");
         let volume = root.path().join("volume");
         std::fs::create_dir(&volume).expect("a mount point");
-        let made = std::process::Command::new("/usr/bin/hdiutil")
-            .args([
-                "create", "-size", size, "-fs", filesystem, "-volname", "decided", "-quiet",
-            ])
-            .arg(&image)
-            .status();
-        assert!(
-            made.is_ok_and(|status| status.success()),
-            "this host's disk image tool would not create a {filesystem} image, so this check cannot run here"
-        );
+        if let Err(why) = make_image(&image, size, filesystem, "decided") {
+            panic!("{why}");
+        }
         let attached = std::process::Command::new("/usr/bin/hdiutil")
             .args([
                 "attach",
@@ -2618,23 +2611,9 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
     std::fs::create_dir_all(&graft).expect("the tree");
     std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
     let image = root.path().join("elsewhere.dmg");
-    let made = std::process::Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-size",
-            "1m",
-            "-fs",
-            "HFS+",
-            "-volname",
-            "elsewhere",
-            "-quiet",
-        ])
-        .arg(&image)
-        .status();
-    assert!(
-        made.is_ok_and(|status| status.success()),
-        "this host's disk image tool would not create an image, so this check cannot run here"
-    );
+    if let Err(why) = make_image(&image, "1m", "HFS+", "elsewhere") {
+        panic!("{why}");
+    }
     let attached = std::process::Command::new("/usr/bin/hdiutil")
         .args([
             "attach",
@@ -2705,16 +2684,9 @@ fn a_removal_on_a_filesystem_that_lists_a_removed_directory_answers_by_where_it_
     let image = root.path().join("exfat.dmg");
     let volume = root.path().join("volume");
     std::fs::create_dir(&volume).expect("a mount point");
-    let made = std::process::Command::new("/usr/bin/hdiutil")
-        .args([
-            "create", "-size", "4m", "-fs", "ExFAT", "-volname", "exfat", "-quiet",
-        ])
-        .arg(&image)
-        .status();
-    assert!(
-        made.is_ok_and(|status| status.success()),
-        "this host's disk image tool would not create an exFAT image, so this check cannot run here"
-    );
+    if let Err(why) = make_image(&image, "4m", "ExFAT", "exfat") {
+        panic!("{why}");
+    }
     let attached = std::process::Command::new("/usr/bin/hdiutil")
         .args([
             "attach",
@@ -2829,6 +2801,316 @@ fn a_removal_on_a_filesystem_that_lists_a_removed_directory_answers_by_where_it_
     }
 }
 
+/// How long a creation waits after each refusal the disk image tool gives for a moment, before it
+/// asks again: one entry for each new attempt, so a creation is made at most one more time than
+/// there are entries.
+///
+/// The pauses double up to sixteen seconds, which is about a minute and a quarter in all. What
+/// holds a new image for a moment is the system's own scan of a file it has not seen, which a busy
+/// machine takes longer over. A load makes the attempts slower and so the whole longer, never
+/// shorter, and a first attempt that succeeds waits for nothing.
+#[cfg(target_os = "macos")]
+const CREATION_PAUSES: [std::time::Duration; 7] = {
+    use std::time::Duration;
+    [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        Duration::from_secs(16),
+        Duration::from_secs(16),
+        Duration::from_secs(16),
+    ]
+};
+
+/// Creates the disk image `image` of `size` with `filesystem` in it, where a tool that refuses
+/// for a moment is asked again and one that cannot make the image fails.
+///
+/// # Errors
+///
+/// Returns why the image was not made: what `hdiutil` said, how many times it was asked, and, for
+/// a refusal that left an attachment it will not release, what still serves the image.
+#[cfg(target_os = "macos")]
+fn make_image(
+    image: &std::path::Path,
+    size: &str,
+    filesystem: &str,
+    volume_name: &str,
+) -> Result<(), String> {
+    make_image_with(
+        std::path::Path::new("/usr/bin/hdiutil"),
+        &CREATION_PAUSES,
+        image,
+        [size, filesystem, volume_name],
+    )
+}
+
+/// What `hdiutil` says when it cannot get the access it needs for a moment: a resource it wants
+/// exclusively is held (`EBUSY`), or a lock on the image is (`EAGAIN`). Anything else it says,
+/// such as a missing directory or a full disk, is not that.
+#[cfg(target_os = "macos")]
+fn is_transient(said: &str) -> bool {
+    said.contains("Resource busy") || said.contains("Resource temporarily unavailable")
+}
+
+/// How a program ended and what it wrote.
+#[cfg(target_os = "macos")]
+struct Ran {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `tool` with `arguments` and returns how it ended and what it wrote.
+///
+/// What it writes goes to two files of this process's own, not to pipes. A disk image tool starts
+/// a helper to serve an image and the helper inherits what the tool had open, so a pipe the helper
+/// holds keeps a read of it from ending for as long as the image stays attached, which is the case
+/// a refused creation leaves behind. A file is read after the program has ended, whatever still
+/// holds it.
+///
+/// # Errors
+///
+/// Returns why the program could not be run or its output could not be read.
+#[cfg(target_os = "macos")]
+fn run_tool<A: AsRef<std::ffi::OsStr>>(
+    tool: &std::path::Path,
+    arguments: impl IntoIterator<Item = A>,
+) -> Result<Ran, String> {
+    use std::io::{Read as _, Seek as _};
+
+    let reading =
+        |error: std::io::Error| format!("what {} wrote could not be read: {error}", tool.display());
+    let mut stdout = tempfile::tempfile().map_err(reading)?;
+    let mut stderr = tempfile::tempfile().map_err(reading)?;
+    let status = std::process::Command::new(tool)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout.try_clone().map_err(reading)?)
+        .stderr(stderr.try_clone().map_err(reading)?)
+        .status()
+        .map_err(|error| format!("{} could not be run: {error}", tool.display()))?;
+    let read = |file: &mut std::fs::File| -> Result<String, String> {
+        let mut bytes = Vec::new();
+        file.rewind()
+            .and_then(|()| file.read_to_end(&mut bytes))
+            .map_err(reading)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    Ok(Ran {
+        status,
+        stdout: read(&mut stdout)?,
+        stderr: read(&mut stderr)?,
+    })
+}
+
+/// Why one attempt to make an image did not.
+#[cfg(target_os = "macos")]
+enum Refusal {
+    /// The tool said it could not have the access for a moment. Asked again.
+    Transient(String),
+    /// Anything else. The creation fails.
+    Fatal(String),
+}
+
+/// [`make_image`] with the tool and the pauses between its attempts given.
+///
+/// The tool formats an image by attaching it, and can end with a refusal after the image exists
+/// and is attached. A new attempt over that finds the file in its way, and the attachment's helper
+/// goes on holding whatever volume the image file is on, so each refusal that is asked again
+/// first lets go of what the tool left. That release is asked again as well when the tool refuses
+/// it for a moment: the helper that serves a new image is the very thing that refused.
+#[cfg(target_os = "macos")]
+fn make_image_with(
+    tool: &std::path::Path,
+    pauses: &[std::time::Duration],
+    image: &std::path::Path,
+    details: [&str; 3],
+) -> Result<(), String> {
+    let attempts = pauses.len() + 1;
+    let mut left_something = false;
+    for attempt in 1..=attempts {
+        let why = match attempt_once(tool, image, details, &mut left_something) {
+            Ok(()) => return Ok(()),
+            Err(Refusal::Transient(said)) if attempt < attempts => {
+                let pause = pauses[attempt - 1];
+                eprintln!(
+                    "hdiutil refused for a moment, on attempt {attempt} of {attempts} to make {} ({said}); asking again in {pause:?}",
+                    image.display()
+                );
+                std::thread::sleep(pause);
+                continue;
+            }
+            Err(Refusal::Transient(said) | Refusal::Fatal(said)) => said,
+        };
+        // Nothing is left attached for the next run of the machine to find, whatever ended this.
+        let released = if left_something {
+            match release_refused_image(tool, image) {
+                Ok(()) => "; what the refusal left was released".to_owned(),
+                Err(Release::Retry(said) | Release::Failed(said)) => {
+                    format!("; releasing what the refusal left said: {said}")
+                }
+            }
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "this host's disk image tool would not create a {} image after {attempt} of {attempts} attempts (it said {why}){released}, so this check cannot run here",
+            details[1]
+        ));
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// One attempt: first lets go of what an earlier refusal left, then asks the tool to make the image.
+#[cfg(target_os = "macos")]
+fn attempt_once(
+    tool: &std::path::Path,
+    image: &std::path::Path,
+    [size, filesystem, volume_name]: [&str; 3],
+    left_something: &mut bool,
+) -> Result<(), Refusal> {
+    if *left_something {
+        release_refused_image(tool, image).map_err(|release| match release {
+            Release::Retry(said) => Refusal::Transient(said),
+            Release::Failed(said) => Refusal::Fatal(said),
+        })?;
+        *left_something = false;
+    }
+    let ran = run_tool(
+        tool,
+        [
+            "create",
+            "-size",
+            size,
+            "-fs",
+            filesystem,
+            "-volname",
+            volume_name,
+        ]
+        .map(std::ffi::OsStr::new)
+        .into_iter()
+        .chain([image.as_os_str()]),
+    )
+    .map_err(Refusal::Fatal)?;
+    if ran.status.success() {
+        return Ok(());
+    }
+    *left_something = true;
+    let said = format!("{}: {}", ran.status, ran.stderr.trim());
+    Err(if is_transient(&ran.stderr) {
+        Refusal::Transient(said)
+    } else {
+        Refusal::Fatal(said)
+    })
+}
+
+/// Why what a refused creation left could not be let go of.
+#[cfg(target_os = "macos")]
+enum Release {
+    /// The tool refused for a moment, or could not say what is attached. Asked again.
+    Retry(String),
+    /// It cannot be let go of.
+    Failed(String),
+}
+
+/// Lets go of what a creation that was refused left: every attachment of `image` the tool lists,
+/// and the file. The file is removed only once the tool lists no attachment of the image.
+///
+/// # Errors
+///
+/// Returns why an attachment did not come off, as [`detach_image`] does, or why the tool could not
+/// say what is attached.
+#[cfg(target_os = "macos")]
+fn release_refused_image(tool: &std::path::Path, image: &std::path::Path) -> Result<(), Release> {
+    let names = [
+        image.to_path_buf(),
+        std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()),
+    ];
+    let attached = || -> Result<Vec<String>, Release> {
+        let listing = run_tool(tool, ["info"]).map_err(Release::Failed)?;
+        if !listing.status.success() {
+            return Err(Release::Retry(format!(
+                "hdiutil info ended with {}: {}",
+                listing.status,
+                listing.stderr.trim()
+            )));
+        }
+        Ok(devices_in(&listing.stdout, &names))
+    };
+    for device in attached()? {
+        eprintln!(
+            "the refused creation left {} attached at {device}; detaching it",
+            image.display()
+        );
+        let detached = run_tool(tool, ["detach", "-force", &device]).map_err(Release::Failed)?;
+        if !detached.status.success() {
+            let said = format!(
+                "the disk image {} a refused creation left attached did not detach from {device} (hdiutil ended with {}: {}); {}",
+                image.display(),
+                detached.status,
+                detached.stderr.trim(),
+                serving(image)
+            );
+            return Err(if is_transient(&detached.stderr) {
+                Release::Retry(said)
+            } else {
+                Release::Failed(said)
+            });
+        }
+    }
+    // Nothing is made again over an attachment that is still there.
+    let remaining = attached()?;
+    if !remaining.is_empty() {
+        return Err(Release::Retry(format!(
+            "the disk image {} is still attached at {} after it was detached; {}",
+            image.display(),
+            remaining.join(", "),
+            serving(image)
+        )));
+    }
+    match std::fs::remove_file(image) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Release::Failed(format!(
+            "the half-made disk image {} could not be removed: {error}",
+            image.display()
+        ))),
+    }
+}
+
+/// The whole device (`/dev/diskN`) of each attachment an `hdiutil info` listing shows of an image
+/// that goes by one of `names`, in the order the listing gives them.
+///
+/// The listing gives an image's path as it was attached and, beside it, the path resolved, and the
+/// temporary directory is reached through a link, so either may be the one a caller holds.
+#[cfg(target_os = "macos")]
+fn devices_in(listing: &str, names: &[std::path::PathBuf]) -> Vec<String> {
+    let mut ours = false;
+    let mut taken = false;
+    let mut devices = Vec::new();
+    for line in listing.lines() {
+        if line.starts_with("====") {
+            ours = false;
+            taken = false;
+        } else if let Some((key, value)) = line.split_once(':')
+            && matches!(key.trim(), "image-path" | "image-alias")
+        {
+            ours |= names
+                .iter()
+                .any(|name| name == std::path::Path::new(value.trim()));
+        } else if ours && !taken && line.starts_with("/dev/disk") {
+            let device = line.split_whitespace().next().unwrap_or_default();
+            let number = device.trim_start_matches("/dev/disk");
+            if !number.is_empty() && number.chars().all(|digit| digit.is_ascii_digit()) {
+                devices.push(device.to_owned());
+                taken = true;
+            }
+        }
+    }
+    devices
+}
+
 /// A disk image a test attached at a mount point, which the test detaches with [`Self::detach`]
 /// before it ends.
 ///
@@ -2905,37 +3187,47 @@ fn detach_image(image: &std::path::Path, mount_point: &std::path::Path) -> Resul
 /// Says which processes `hdiutil info` shows serving `image`, by number and name.
 #[cfg(target_os = "macos")]
 fn serving(image: &std::path::Path) -> String {
-    // The listing names an image by its resolved path: the temporary directory is reached
-    // through a link.
-    let resolved = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
+    // The listing names an image by the path it was attached by and, beside it, by the path
+    // resolved: the temporary directory is reached through a link, and either may be the one the
+    // caller holds.
+    let names = [
+        image.to_path_buf(),
+        std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()),
+    ];
     match std::process::Command::new("/usr/bin/hdiutil")
         .arg("info")
         .output()
     {
         Ok(output) if output.status.success() => described(&serving_in(
             &String::from_utf8_lossy(&output.stdout),
-            &resolved,
+            &names,
         )),
         Ok(output) => format!("hdiutil info ended with {}", output.status),
         Err(error) => format!("hdiutil info could not be run: {error}"),
     }
 }
 
-/// The process of each attachment of `image` an `hdiutil info` listing shows, by number, in the
-/// order the listing gives them.
+/// The process of each attachment an `hdiutil info` listing shows of an image that goes by one of
+/// `names`, by number, in the order the listing gives them.
 #[cfg(target_os = "macos")]
-fn serving_in(listing: &str, image: &std::path::Path) -> Vec<String> {
-    let mut current = None;
+fn serving_in(listing: &str, names: &[std::path::PathBuf]) -> Vec<String> {
+    let mut ours = false;
     let mut processes = Vec::new();
     for line in listing.lines() {
+        if line.starts_with("====") {
+            ours = false;
+            continue;
+        }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
         match key.trim() {
-            "image-path" => current = Some(std::path::PathBuf::from(value.trim())),
-            "process ID" if current.as_deref() == Some(image) => {
-                processes.push(value.trim().to_owned());
+            "image-path" | "image-alias" => {
+                ours |= names
+                    .iter()
+                    .any(|name| name == std::path::Path::new(value.trim()));
             }
+            "process ID" if ours => processes.push(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -2975,23 +3267,32 @@ fn the_processes_serving_an_image_are_named_from_hdiutil_info() {
         "framework       : 683.160.3\n\
          ================================================\n\
          image-path      : /private/tmp/another.dmg\n\
+         image-alias     : /private/tmp/another.dmg\n\
          process ID      : 101\n\
          /dev/disk4s1\tGUID\t/private/tmp/another\n\
          ================================================\n\
          image-path      : /private/tmp/served.dmg\n\
+         image-alias     : /private/tmp/served.dmg\n\
          process ID      : {own}\n\
          /dev/disk5s1\tGUID\t/private/tmp/first\n\
          ================================================\n\
-         image-path      : /private/tmp/served.dmg\n\
+         image-path      : /tmp/served.dmg\n\
+         image-alias     : /private/tmp/served.dmg\n\
          process ID      : 303\n\
          /dev/disk6s1\tGUID\t/private/tmp/second\n"
     );
+    let named = |name: &str| vec![std::path::PathBuf::from(name)];
     assert_eq!(
-        serving_in(&listing, std::path::Path::new("/private/tmp/served.dmg")),
+        serving_in(&listing, &named("/private/tmp/served.dmg")),
         [own.clone(), "303".to_owned()],
-        "both attachments of the image, and not the other image's"
+        "both attachments of the image, whichever path each was attached by, and not the other image's"
     );
-    assert!(serving_in(&listing, std::path::Path::new("/private/tmp/absent.dmg")).is_empty());
+    assert_eq!(
+        serving_in(&listing, &named("/tmp/served.dmg")),
+        ["303"],
+        "the path an attachment was made by finds that one"
+    );
+    assert!(serving_in(&listing, &named("/private/tmp/absent.dmg")).is_empty());
     let this_test = std::env::current_exe().expect("this test's own executable");
     let name = this_test
         .file_name()
@@ -3042,6 +3343,549 @@ fn a_guard_dropped_before_its_image_detaches_fails_with_the_report() {
         mount_point: nothing,
         detached: false,
     });
+}
+
+/// What a stand-in for `hdiutil` does.
+///
+/// Its `create` refuses `create_refusals` times with `create_said`, each time leaving the image
+/// file made and, if `attached`, attached at `/dev/disk77` as the real tool's formatting step can,
+/// and after that makes the image, but refuses over a file that is already there, as the real tool
+/// does. Its `detach` refuses `detach_refusals` times with `detach_said` before it releases the
+/// attachment; with `stays_attached` it says it did and does not. Its `info` fails when
+/// `info_fails`. A `create` that `holds_output` leaves a process behind that holds what the tool
+/// wrote to, until the file `release` is made or the stand-in's directory is gone, as a helper that
+/// serves an attached image can.
+#[cfg(target_os = "macos")]
+struct Behaviour {
+    create_refusals: u32,
+    create_said: &'static str,
+    attached: bool,
+    detach_refusals: u32,
+    detach_said: &'static str,
+    stays_attached: bool,
+    info_fails: bool,
+    holds_output: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for Behaviour {
+    fn default() -> Self {
+        Self {
+            create_refusals: 0,
+            create_said: "Resource busy",
+            attached: false,
+            detach_refusals: 0,
+            detach_said: "couldn't eject - Resource busy",
+            stays_attached: false,
+            info_fails: false,
+            holds_output: false,
+        }
+    }
+}
+
+/// A program standing in for `hdiutil` in a directory of its own, which keeps a `log` of the calls
+/// it takes, one to a line.
+#[cfg(target_os = "macos")]
+struct StandIn {
+    directory: std::path::PathBuf,
+    tool: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl StandIn {
+    fn new(root: &Path, behaviour: &Behaviour) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::fs::canonicalize(root).expect("the directory resolves");
+        let tool = directory.join("hdiutil");
+        let Behaviour {
+            create_refusals,
+            create_said,
+            attached,
+            detach_refusals,
+            detach_said,
+            stays_attached,
+            info_fails,
+            holds_output,
+        } = behaviour;
+        let leave = if *attached {
+            r#"echo "$image" > "$d/attached""#
+        } else {
+            ":"
+        };
+        let hold = if *holds_output {
+            r#"( while [ -d "$d" ] && [ ! -e "$d/release" ]; do sleep 0.1; done ) &"#
+        } else {
+            ":"
+        };
+        let release = if *stays_attached {
+            ":"
+        } else {
+            r#"rm -f "$d/attached""#
+        };
+        let info = if *info_fails {
+            r#"echo "hdiutil: info failed - Resource busy" >&2; exit 16"#
+        } else {
+            r#"if [ -e "$d/attached" ]; then
+    printf '====\nimage-path      : %s\nimage-alias     : %s\nprocess ID      : 4242\n/dev/disk77\tGUID_partition_scheme\t\n/dev/disk77s1\tApple_HFS\t/Volumes/elsewhere\n' "$(cat "$d/attached")" "$(cat "$d/attached")"
+  fi"#
+        };
+        std::fs::write(
+            &tool,
+            format!(
+                r#"#!/bin/sh
+d=$(dirname "$0")
+case "$1" in
+create)
+  for image; do :; done
+  echo create >> "$d/log"
+  if [ "$(grep -c '^create' "$d/log")" -le {create_refusals} ]; then
+    : > "$image"
+    {leave}
+    {hold}
+    echo "hdiutil: create failed - {create_said}" >&2
+    exit 1
+  fi
+  if [ -e "$image" ]; then echo "hdiutil: create failed - File exists" >&2; exit 1; fi
+  : > "$image"
+  echo "created: $image";;
+info)
+  {info};;
+detach)
+  echo "$*" >> "$d/log"
+  if [ "$(grep -c '^detach' "$d/log")" -le {detach_refusals} ]; then
+    echo "hdiutil: {detach_said}" >&2
+    exit 16
+  fi
+  {release};;
+esac
+"#
+            ),
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in runs");
+        Self { directory, tool }
+    }
+
+    /// What the stand-in was asked, in order, one call to a line.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.directory.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// Pauses that are no pause, for as many new attempts as there are entries.
+#[cfg(target_os = "macos")]
+const NO_PAUSE: std::time::Duration = std::time::Duration::ZERO;
+
+/// A creation the tool refuses once for a moment, leaving the image made and attached, is made
+/// again after the attachment is released and the half-made file is removed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_creation_refused_for_a_moment_is_made_again_once_what_it_left_is_released() {
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: 1,
+            attached: true,
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    make_image_with(
+        &stand_in.tool,
+        &[NO_PAUSE; 3],
+        &image,
+        ["1m", "HFS+", "elsewhere"],
+    )
+    .expect("the second attempt makes the image");
+    assert_eq!(
+        stand_in.calls(),
+        ["create", "detach -force /dev/disk77", "create"],
+        "the refusal's attachment is released before the second attempt"
+    );
+    assert!(image.exists(), "the image is there");
+    assert!(
+        !stand_in.directory.join("attached").exists(),
+        "and nothing is left attached"
+    );
+}
+
+/// The release of what a refusal left is asked again when the tool refuses it for a moment, which
+/// the helper that serves a new image does for as long as it holds the image: the creation is not
+/// made again over an attachment that is still there.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detach_refused_for_a_moment_is_asked_again_before_the_creation_is() {
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: 1,
+            attached: true,
+            detach_refusals: 2,
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    make_image_with(
+        &stand_in.tool,
+        &[NO_PAUSE; 5],
+        &image,
+        ["1m", "HFS+", "elsewhere"],
+    )
+    .expect("the image is made once the attachment came off");
+    assert_eq!(
+        stand_in.calls(),
+        [
+            "create",
+            "detach -force /dev/disk77",
+            "detach -force /dev/disk77",
+            "detach -force /dev/disk77",
+            "create"
+        ],
+        "the detach is asked until it is taken and the creation only after"
+    );
+}
+
+/// A creation the tool refuses every time fails once its bound is spent, saying what the tool said
+/// and how many times it was asked.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_creation_refused_every_time_fails_after_its_bound() {
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: u32::MAX,
+            create_said: "Resource temporarily unavailable",
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    let why = make_image_with(
+        &stand_in.tool,
+        &[NO_PAUSE; 2],
+        &image,
+        ["1m", "HFS+", "elsewhere"],
+    )
+    .expect_err("a tool that never makes the image fails");
+    assert!(
+        why.contains("3 of 3 attempts") && why.contains("Resource temporarily unavailable"),
+        "it says how often it asked and what the tool said: {why}"
+    );
+    assert_eq!(
+        stand_in.calls(),
+        ["create"; 3],
+        "the tool was asked as often as the bound allows and no more"
+    );
+}
+
+/// A refusal that is not a moment's one is not asked again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_creation_refused_for_any_other_reason_is_asked_once() {
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: u32::MAX,
+            create_said: "No space left on device",
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    let why = make_image_with(
+        &stand_in.tool,
+        &[NO_PAUSE; 3],
+        &image,
+        ["1m", "HFS+", "elsewhere"],
+    )
+    .expect_err("a full disk is not a moment's refusal");
+    assert!(
+        why.contains("1 of 4 attempts") && why.contains("No space left on device"),
+        "it fails at once and says what the tool said: {why}"
+    );
+    assert_eq!(stand_in.calls(), ["create"], "the tool was asked once");
+}
+
+/// A creation that ends for good, by its bound or by a refusal that is not a moment's, does not
+/// leave what the refusal made attached: it is released first, and the failure says so.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_creation_that_fails_releases_what_the_last_refusal_left() {
+    for (said, bound, attempts) in [
+        ("Resource busy", 1, "2 of 2 attempts"),
+        ("Operation not permitted", 3, "1 of 4 attempts"),
+    ] {
+        let root = tempfile::tempdir().expect("a directory");
+        let stand_in = StandIn::new(
+            root.path(),
+            &Behaviour {
+                create_refusals: u32::MAX,
+                create_said: said,
+                attached: true,
+                ..Behaviour::default()
+            },
+        );
+        let image = stand_in.directory.join("elsewhere.dmg");
+        let why = make_image_with(
+            &stand_in.tool,
+            &vec![NO_PAUSE; bound],
+            &image,
+            ["1m", "HFS+", "elsewhere"],
+        )
+        .expect_err("a tool that never makes the image fails");
+        assert!(why.contains(attempts), "{said}: {why}");
+        assert!(
+            why.contains("what the refusal left was released"),
+            "{said}: {why}"
+        );
+        assert!(
+            !stand_in.directory.join("attached").exists() && !image.exists(),
+            "{said}: nothing is left attached or on disk"
+        );
+    }
+}
+
+/// A refusal whose attachment the tool refuses to release for good fails the creation with the
+/// report of what serves the image, rather than asking again over it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_refusal_whose_attachment_does_not_detach_fails_the_creation() {
+    for (behaviour, attempts_made) in [
+        // Refused for a moment every time: asked until the bound is spent.
+        (
+            Behaviour {
+                create_refusals: 1,
+                attached: true,
+                detach_refusals: u32::MAX,
+                ..Behaviour::default()
+            },
+            3,
+        ),
+        // Refused for another reason: asked once.
+        (
+            Behaviour {
+                create_refusals: 1,
+                attached: true,
+                detach_refusals: u32::MAX,
+                detach_said: "couldn't eject - Operation not permitted",
+                ..Behaviour::default()
+            },
+            1,
+        ),
+        // Taken, and still listed afterwards.
+        (
+            Behaviour {
+                create_refusals: 1,
+                attached: true,
+                stays_attached: true,
+                ..Behaviour::default()
+            },
+            3,
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("a directory");
+        let stand_in = StandIn::new(root.path(), &behaviour);
+        let image = stand_in.directory.join("elsewhere.dmg");
+        let why = make_image_with(
+            &stand_in.tool,
+            &[NO_PAUSE; 2],
+            &image,
+            ["1m", "HFS+", "elsewhere"],
+        )
+        .expect_err("an attachment that stays fails the creation");
+        assert!(
+            why.contains("/dev/disk77") && why.contains("hdiutil info shows"),
+            "it names the device and what serves the image: {why}"
+        );
+        let calls = stand_in.calls();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "create").count(),
+            1,
+            "and the tool was not asked to create again over it: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("detach"))
+                .count()
+                >= attempts_made,
+            "{calls:?}"
+        );
+        assert!(image.exists(), "the file is not removed from under it");
+    }
+}
+
+/// A tool that cannot say what is attached is not taken to have nothing attached: the file is not
+/// removed and the creation is not made again over what may be there.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_tool_that_cannot_list_what_is_attached_is_not_taken_to_list_nothing() {
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: 1,
+            attached: true,
+            info_fails: true,
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    let why = make_image_with(
+        &stand_in.tool,
+        &[NO_PAUSE; 2],
+        &image,
+        ["1m", "HFS+", "elsewhere"],
+    )
+    .expect_err("a tool that cannot list what is attached fails the creation");
+    assert!(why.contains("hdiutil info ended with"), "{why}");
+    assert_eq!(
+        stand_in.calls(),
+        ["create"],
+        "nothing was detached or made again"
+    );
+    assert!(image.exists(), "and the file is not removed");
+}
+
+/// A creation does not wait for a process the refused tool left behind that still holds what the
+/// tool wrote to: what it wrote is kept in files and read once the tool has ended.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_creation_does_not_wait_for_a_process_that_holds_the_tools_output() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let stand_in = StandIn::new(
+        root.path(),
+        &Behaviour {
+            create_refusals: u32::MAX,
+            create_said: "Operation not permitted",
+            holds_output: true,
+            ..Behaviour::default()
+        },
+    );
+    let image = stand_in.directory.join("elsewhere.dmg");
+    let release = stand_in.directory.join("release");
+    let gave_up = AtomicBool::new(false);
+    let (done, waiting) = mpsc::channel::<()>();
+    let (gave_up_flag, released_by) = (&gave_up, &release);
+    std::thread::scope(|scope| {
+        // The holder is let go after a minute if the creation is still waiting for it, so that a
+        // creation that does wait ends and is failed below instead of hanging.
+        scope.spawn(move || {
+            if waiting
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_err()
+            {
+                gave_up_flag.store(true, Ordering::SeqCst);
+                std::fs::write(released_by, b"").expect("the holder is let go");
+            }
+        });
+        let why = make_image_with(
+            &stand_in.tool,
+            &[NO_PAUSE; 1],
+            &image,
+            ["1m", "HFS+", "elsewhere"],
+        )
+        .expect_err("the refusal is not a moment's");
+        assert!(why.contains("Operation not permitted"), "{why}");
+        let _ = done.send(());
+    });
+    std::fs::write(&release, b"").expect("the holder is let go");
+    assert!(
+        !gave_up.load(Ordering::SeqCst),
+        "the creation waited for the process that held the tool's output"
+    );
+    // Nothing of the stand-in is left running when the test ends: the holder goes with the file,
+    // and a holder that did not would outlive this test.
+    let started = std::time::Instant::now();
+    let directory = stand_in.directory.display().to_string();
+    loop {
+        let listing = std::process::Command::new("/bin/ps")
+            .args(["axww", "-o", "command="])
+            .output()
+            .expect("ps lists the processes");
+        assert!(
+            listing.status.success(),
+            "ps could not list the processes: {}",
+            listing.status
+        );
+        if !String::from_utf8_lossy(&listing.stdout).contains(&directory) {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the process that held the tool's output did not end with the file that releases it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A host whose tool truly cannot make an image, here by a directory that is not there, fails on
+/// the first refusal with the tool's own words, under the pauses the cases use.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_host_that_cannot_make_an_image_still_fails() {
+    let root = tempfile::tempdir().expect("a directory");
+    let why = make_image(
+        &root.path().join("not-there/elsewhere.dmg"),
+        "1m",
+        "HFS+",
+        "elsewhere",
+    )
+    .expect_err("an image cannot be made in a directory that is not there");
+    assert!(
+        why.contains("1 of 8 attempts") && why.contains("No such file or directory"),
+        "it fails at once with what hdiutil said: {why}"
+    );
+}
+
+/// The device of each attachment of an image is read from an `hdiutil info` listing: the whole
+/// device, once for each attachment of that image, and nothing another image has.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_devices_of_an_image_are_read_from_hdiutil_info() {
+    let listing = "framework       : 683.160.3\n\
+         ================================================\n\
+         image-path      : /private/tmp/another.dmg\n\
+         image-alias     : /private/tmp/another.dmg\n\
+         process ID      : 101\n\
+         /dev/disk4          \tGUID_partition_scheme\t\n\
+         /dev/disk4s1        \tApple_HFS\t/private/tmp/another\n\
+         ================================================\n\
+         image-path      : /private/tmp/served.dmg\n\
+         image-alias     : /private/tmp/served.dmg\n\
+         process ID      : 202\n\
+         /dev/disk5          \tGUID_partition_scheme\t\n\
+         /dev/disk5s1        \tApple_HFS\t/private/tmp/first\n\
+         ================================================\n\
+         image-path      : /tmp/served.dmg\n\
+         image-alias     : /private/tmp/served.dmg\n\
+         process ID      : 303\n\
+         /dev/disk6s1        \tApple_HFS\t/private/tmp/second\n\
+         /dev/disk6          \tGUID_partition_scheme\t\n";
+    let served = |name: &str| vec![std::path::PathBuf::from(name)];
+    assert_eq!(
+        devices_in(listing, &served("/private/tmp/served.dmg")),
+        ["/dev/disk5", "/dev/disk6"],
+        "the whole device of each attachment of the image, whichever path it was attached by, and \
+         not the other image's"
+    );
+    assert_eq!(
+        devices_in(listing, &served("/tmp/served.dmg")),
+        ["/dev/disk6"],
+        "a name that is the path an attachment was made by finds that one"
+    );
+    assert!(devices_in(listing, &served("/private/tmp/absent.dmg")).is_empty());
 }
 
 /// A directory made to stage in is made only where nothing was, and it is this account's alone.
