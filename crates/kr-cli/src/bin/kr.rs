@@ -1427,7 +1427,8 @@ async fn export(
                 let read =
                     kr_cli::export::read(&mut link, &selector, arguments.max_bytes, exported_at_ms)
                         .await;
-                kr_cli::bridge::link::Link::finish(link).await;
+                // A failure of the bridge is returned as the export's own, and is not said again.
+                link.finish_told().await;
                 read?
             }
         };
