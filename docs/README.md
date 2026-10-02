@@ -94,6 +94,14 @@ The other two pin what they take from this one. The website service pins a `@kal
 release archive by URL and digest, and the catalogue pipeline pins `kr-plugin-sdk`, the validator a
 host runs before it trusts a package, by Git revision in its lockfile.
 
+No repository uses a Git submodule, holds a second copy of another repository's server, or depends
+in production on a path in another repository's checkout. Every dependency between them is by
+released archive digest or by Git revision, as is each dependency on the project's forks of WezTerm
+and iroh. The website's relay crate takes `kr-protocol`, `kr-cbor` and `kr-crypto` by revision, and
+this repository takes its bundled plugin package from a signed catalogue generation by digest, which
+`bundled-plugins.lock` records. The catalogue's `scripts/with-local-core.sh` points one command's
+fetch of the pinned revision at a local checkout; it changes neither the revision nor the lockfile.
+
 ## What KalaReach includes
 
 KalaReach is a host that owns durable terminal sessions on a person's own computers, the clients
