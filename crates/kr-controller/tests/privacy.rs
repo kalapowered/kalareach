@@ -1635,21 +1635,35 @@ async fn kr_req_18_08_a_delivered_question_leaves_none_of_the_sessions_words_in_
         .environment()
         .state_dir()
         .to_path_buf();
+    let holds = |bytes: &[u8], words: &str| {
+        bytes
+            .windows(words.len())
+            .any(|window| window == words.as_bytes())
+    };
+    // The scan reads what it is pointed at: it finds words planted among other bytes, and it finds
+    // the one word this host does record about the delivery, the paired device it was for.
+    assert!(holds(format!("a{WORDS}b").as_bytes(), WORDS));
+    let device = phone.record.device_id.to_string();
+    let mut found_the_device = false;
     for name in [
         "delivery.sqlite3",
         "delivery.sqlite3-wal",
         "delivery.sqlite3-shm",
     ] {
         let Ok(bytes) = std::fs::read(state.join(name)) else {
+            assert_ne!(
+                name, "delivery.sqlite3",
+                "the journal's own file is the one that is scanned"
+            );
             continue;
         };
-        assert!(
-            !bytes
-                .windows(WORDS.len())
-                .any(|window| window == WORDS.as_bytes()),
-            "{name} holds the question"
-        );
+        assert!(!holds(&bytes, WORDS), "{name} holds the question");
+        found_the_device |= holds(&bytes, &device);
     }
+    assert!(
+        found_the_device,
+        "the scan reads a file that records the delivery"
+    );
     environment.stop().await;
 }
 

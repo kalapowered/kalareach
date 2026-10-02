@@ -2564,6 +2564,27 @@ impl DeliveryJournal {
         Ok(as_u64(outstanding))
     }
 
+    /// Returns how many sends are on the wire: claimed by a pass and not yet answered, from before
+    /// the fence, which is the cleanup privacy mode waits for.
+    ///
+    /// Those are the only deliveries whose answer is still coming. One settled as an unknown
+    /// outcome has left this host and has no answer to wait for. An alert privacy mode let through
+    /// is not content captured before the boundary and does not count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn on_the_wire(&self) -> Result<u64> {
+        let before = generations_before_the_fence(&self.connection)?;
+        let on_the_wire: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM delivery_notifications
+              WHERE state = 'in_flight' AND privacy_generation < ?1",
+            params![before],
+            |row| row.get(0),
+        )?;
+        Ok(as_u64(on_the_wire))
+    }
+
     /// Returns everything that has already left this host.
     ///
     /// Section 24: already-sent notifications and already-delivered external messages are not
@@ -2642,10 +2663,12 @@ impl DeliveryJournal {
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn lift_fence(&mut self, generation: u64) -> Result<()> {
-        let now_ms = wall_ms();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Read once the write lock is held, after any wait for it: a decision made while this
+        // waited is a decision made before the lift, and is dated at or before the time recorded.
+        let now_ms = wall_ms();
         let (held, fenced): (i64, i64) = transaction.query_row(
             "SELECT generation, fenced FROM delivery_privacy WHERE id = 0",
             [],
@@ -3694,6 +3717,20 @@ fn admit_alert_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryReco
             in_force: as_u64(generation),
         });
     }
+    // An alert is a notification to a paired device. An external message has no alert form, and a
+    // row for one is not made under the fence whatever it carries.
+    let kind: Option<String> = transaction
+        .query_row(
+            "SELECT kind FROM delivery_destinations WHERE destination_id = ?1",
+            params![record.destination_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.as_deref() != Some(DestinationKind::Push.as_str()) {
+        return Err(DeliveryError::NotAuthorised(
+            "an alert is for a paired device".to_owned(),
+        ));
+    }
     insert_notification(transaction, record)
 }
 
@@ -3787,22 +3824,18 @@ fn insert_notification(
     Ok(())
 }
 
-/// What a delivery whose outcome this host cannot establish is recorded as.
-///
-/// A notification the gateway holds can be asked about by its identifier, so it is the outcome
-/// nobody knows, outstanding until a question resolves it. An external message has no such
-/// question: section 25 marks the duplicate-delivery uncertainty instead. Neither keeps its
-/// request, because neither will be presented again.
-///
-/// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
 /// Brings a version 6 or version 7 journal forward to version 8, in one transaction.
 ///
 /// Version 7 added one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
 /// credential, so every row gets none and every binding it computed is computed the same way.
 /// Version 8 adds one column to the privacy row, the time privacy mode was last turned off. A
-/// journal that has never been through privacy mode has none, which reads as no time at all. The
-/// version is read again inside the transaction, so two openers cannot both add a column.
+/// journal that has never been through privacy mode has none, which reads as no time at all. One
+/// that has been through it and is out of it is given the time of this migration: the earlier
+/// build did not record when, so everything decided before this moment may have been decided while
+/// privacy mode was on, and none of it is sent. A journal that is still fenced records the time
+/// when it is lifted. The version is read again inside the transaction, so two openers cannot both
+/// add a column.
 fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3823,6 +3856,10 @@ fn migrate_forward(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(
             "ALTER TABLE delivery_privacy ADD COLUMN lifted_at_ms INTEGER NOT NULL DEFAULT 0;",
         )?;
+        transaction.execute(
+            "UPDATE delivery_privacy SET lifted_at_ms = ?1 WHERE generation > 0 AND fenced = 0",
+            params![as_i64(wall_ms())],
+        )?;
     }
     if version < SCHEMA_VERSION {
         transaction.execute(
@@ -3834,6 +3871,14 @@ fn migrate_forward(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// What a delivery whose outcome this host cannot establish is recorded as.
+///
+/// A notification the gateway holds can be asked about by its identifier, so it is the outcome
+/// nobody knows, outstanding until a question resolves it. An external message has no such
+/// question: section 25 marks the duplicate-delivery uncertainty instead. Neither keeps its
+/// request, because neither will be presented again.
+///
+/// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
 const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
     match kind {
         DestinationKind::Push => DeliveryState::OutcomeUnknown,
@@ -4372,6 +4417,15 @@ mod tests {
                 },
                 ..private_entry(4, 1, None)
             },
+            // A row for an external destination, however empty.
+            PrivateEntry {
+                records: vec![DeliveryRecord {
+                    privacy_generation: 1,
+                    content: None,
+                    ..delivery(5, event(5), "hook")
+                }],
+                ..private_entry(5, 1, None)
+            },
         ] {
             assert!(
                 matches!(
@@ -4538,6 +4592,15 @@ mod tests {
             1,
             "the content on the wire from before the fence, and not the alert on the wire"
         );
+        // What privacy mode asks before it reports its cleanup complete is the same count, so an
+        // alert on the wire does not stop it from being turned off.
+        assert_eq!(journal.on_the_wire().expect("a count"), 1);
+        let hook = crate::privacy::DeliveryOutbox::over(&mut journal, 3_000);
+        assert_eq!(
+            kr_worker::privacy::PrivacySubsystem::outstanding(&hook).expect("a count"),
+            1,
+            "privacy mode's own question counts the content, and not the alert"
+        );
     }
 
     /// Lifting the fence takes back the alerts nothing sent, so none is sent once privacy mode is
@@ -4584,7 +4647,11 @@ mod tests {
                 .state,
             DeliveryState::Cancelled
         );
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Once the clock reads later than the lift did, so that a lift that moved the time would
+        // show.
+        while wall_ms() <= lifted {
+            std::thread::yield_now();
+        }
         journal.lift_fence(2).expect("a second lift");
         assert_eq!(
             journal.lifted_at_ms().expect("a read"),
@@ -5422,6 +5489,93 @@ mod tests {
         let exported = journal.exported().expect("a read");
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].kind, "notification");
+    }
+
+    /// The list of copies that left holds the ones that did, and only those: a delivery nothing
+    /// has sent, one this host refused, one it collapsed into another and one it took back are not
+    /// listed, however many there are. The control: one the gateway accepted is.
+    #[test]
+    fn the_list_of_copies_holds_what_left_and_not_what_did_not() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(
+                &consumer(),
+                &[
+                    taken(1, 1),
+                    taken(2, 2),
+                    taken(3, 3),
+                    taken(4, 4),
+                    taken(5, 5),
+                ],
+                5,
+            )
+            .expect("a page");
+        let phone = phone();
+        // Not sent, refused, collapsed, and taken back.
+        journal
+            .admit(&delivery_for(1, event(1), &phone))
+            .expect("an unsent one");
+        journal
+            .admit(&DeliveryRecord {
+                state: DeliveryState::Refused,
+                content: None,
+                ..delivery_for(2, event(2), &phone)
+            })
+            .expect("a refused one");
+        journal
+            .admit(&DeliveryRecord {
+                state: DeliveryState::Collapsed,
+                content: None,
+                ..delivery_for(3, event(3), &phone)
+            })
+            .expect("a collapsed one");
+        journal
+            .admit(&delivery_for(4, event(4), &phone))
+            .expect("one to take back");
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(2_500).expect("a cancellation");
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(4)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::Cancelled
+        );
+        assert!(
+            journal.exported().expect("a read").is_empty(),
+            "nothing has left"
+        );
+        // The control: one the gateway accepted is a copy.
+        journal.lift_fence(2).expect("a lift");
+        journal
+            .admit(&DeliveryRecord {
+                privacy_generation: 2,
+                ..delivery_for(5, event(5), &phone)
+            })
+            .expect("admitted");
+        let claimed = claim(&mut journal, 5, 3_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: claimed.notification_id,
+                attempt: claimed.attempt,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(3_000),
+                settled_at_ms: Some(TimestampMs::new(3_010)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("queued".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: true,
+            })
+            .expect("a transition");
+        let exported = journal.exported().expect("a read");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].notification_id, NotificationId::new(uuid(5)));
     }
 
     /// An answer that arrives after privacy mode drew its boundary is recorded and queues
@@ -6663,6 +6817,44 @@ mod tests {
             }
         );
         assert_eq!(journal.lifted_at_ms().expect("a read"), 0);
+    }
+
+    /// A version 7 journal that has been through privacy mode and is out of it has no record of
+    /// when, so it is given the time of its migration: nothing decided before it is sent. One that
+    /// has never been through it keeps no time at all.
+    #[test]
+    fn a_version_7_journal_that_has_left_privacy_mode_is_given_a_boundary_when_brought_forward() {
+        for left_it in [true, false] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("delivery.sqlite3");
+            {
+                let mut journal = DeliveryJournal::open(&path).expect("a journal");
+                if left_it {
+                    journal.fence(1).expect("a fence");
+                    journal.lift_fence(2).expect("a lift");
+                }
+            }
+            {
+                let connection = rusqlite::Connection::open(&path).expect("a connection");
+                connection
+                    .execute_batch(
+                        "ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
+                         UPDATE delivery_schema SET version = 7;",
+                    )
+                    .expect("the version 7 shape");
+            }
+            let before = wall_ms();
+            let journal = DeliveryJournal::open(&path).expect("brought forward");
+            let lifted = journal.lifted_at_ms().expect("a read");
+            if left_it {
+                assert!(
+                    lifted >= before,
+                    "the time of the migration, which is not before it began"
+                );
+            } else {
+                assert_eq!(lifted, 0, "never in privacy mode, so no boundary");
+            }
+        }
     }
 
     /// A credential replaced under a configured destination is a new binding: what was admitted

@@ -2951,9 +2951,20 @@ struct DeliveringGateway {
     asked: Mutex<Vec<Asked>>,
     /// What it answers a status question with: no record, unless a test says otherwise.
     status: Option<PushDeliveryState>,
+    /// A status it answers every delivery with instead of taking it, which a notification is left
+    /// with an outcome nobody knows by.
+    delivery_fails_with: Option<u16>,
 }
 
 impl DeliveringGateway {
+    /// A gateway that answers every delivery with `status`, and so takes none of them.
+    fn failing_with(status: u16) -> Self {
+        Self {
+            delivery_fails_with: Some(status),
+            ..Self::default()
+        }
+    }
+
     /// A gateway still retrying the provider for every notification it is asked about.
     fn retrying() -> Self {
         Self {
@@ -3010,6 +3021,16 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                     .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                     .collect(),
             });
+        if url.ends_with("/api/push/deliver")
+            && let Some(status) = self.delivery_fails_with
+        {
+            return Box::pin(async move {
+                Ok(kr_client::services::ServiceHttpAnswer {
+                    status,
+                    body: Vec::new(),
+                })
+            });
+        }
         let answer = if url.ends_with("/api/push/deliver") {
             let request: PushDeliveryRequest =
                 serde_json::from_slice(body).expect("a delivery request");
@@ -6858,6 +6879,20 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
         announcements_waiting(controller) == Some(0)
     })
     .await;
+    until_holds("the alert being recorded as accepted", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::Accepted))
+            })
+            .unwrap_or(false)
+    })
+    .await;
     let alerts = requests_to(&gateway);
     assert_eq!(
         alerts.len(),
@@ -6920,6 +6955,144 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
         .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
         .expect("a read");
     assert_eq!(rows, 2);
+    host.stop().await;
+}
+
+/// KR-REQ-24.29, KR-REQ-16.13: an alert privacy mode let through, whose outcome nobody knows, is
+/// asked about while privacy mode is on, because it is of the generation in force and carries no
+/// content; the answer settles it, and it is still listed as a copy that left. Nothing from the
+/// generation before it is asked about, and once privacy mode is off the alert's own generation
+/// has ended and it is not asked about either. The control: the same question about the same alert
+/// is asked once, and a second sweep asks nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_on() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(90));
+    pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::failing_with(503));
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, 1, "req-write-hosts")])
+        .expect("the store records the approval");
+    let state_of_the_alert = || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .first()
+                    .map(|record| {
+                        (
+                            record.state,
+                            record.notification_id,
+                            record.privacy_generation,
+                        )
+                    }))
+            })
+            .ok()
+            .flatten()
+    };
+    until_holds("the alert being left with an outcome nobody knows", || {
+        state_of_the_alert().is_some_and(|(state, _, _)| state == DeliveryState::OutcomeUnknown)
+    })
+    .await;
+    let (_, alert, generation) = state_of_the_alert().expect("the alert");
+    assert!(
+        controller
+            .delivery()
+            .with(|producer| Ok(producer.journal().is_fenced().expect("a read")))
+            .expect("a read"),
+        "the journal is fenced, and the alert is of the fence's own generation"
+    );
+
+    // Asked about while privacy mode is on: the gateway holds it, and the record settles.
+    let status = GatewayDouble::queued();
+    let clock = || kr_ipc::now_ms().get();
+    let resolved = controller
+        .delivery()
+        .resolve_unknown(
+            &status,
+            controller.delivery_runtime().credentials().as_ref(),
+            &clock,
+            64,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("a sweep");
+    assert_eq!(resolved, 1, "the question about the alert was asked");
+    assert_eq!(status.questions(), 1);
+    assert_eq!(
+        state_of_the_alert().map(|(state, _, _)| state),
+        Some(DeliveryState::Accepted)
+    );
+    let again = controller
+        .delivery()
+        .resolve_unknown(
+            &status,
+            controller.delivery_runtime().credentials().as_ref(),
+            &clock,
+            64,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("a second sweep");
+    assert_eq!(
+        (again, status.questions()),
+        (0, 1),
+        "nothing is left to ask"
+    );
+    let report = privacy_report(&host).await;
+    assert_eq!(report.exported.len(), 1, "{:?}", report.exported);
+
+    // A second alert left unknown, and then privacy mode ends: its generation has ended with it,
+    // and nothing asks the gateway about it.
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, 2, "req-second")])
+        .expect("the store records the approval");
+    until_holds(
+        "the second alert being left with an outcome nobody knows",
+        || {
+            controller
+                .delivery()
+                .with(|producer| {
+                    Ok(producer
+                        .journal()
+                        .deliveries()
+                        .expect("a read")
+                        .iter()
+                        .any(|record| {
+                            record.notification_id != alert
+                                && record.state == DeliveryState::OutcomeUnknown
+                        }))
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    set_privacy(&host, false).await;
+    let silent = GatewayDouble::queued();
+    let resolved = controller
+        .delivery()
+        .resolve_unknown(
+            &silent,
+            controller.delivery_runtime().credentials().as_ref(),
+            &clock,
+            64,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("a sweep");
+    assert_eq!(
+        (resolved, silent.questions()),
+        (0, 0),
+        "an alert of a generation that has ended is not asked about (generation {generation})"
+    );
     host.stop().await;
 }
 

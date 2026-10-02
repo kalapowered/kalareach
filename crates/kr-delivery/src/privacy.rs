@@ -7,8 +7,9 @@
 //! Section 24, in the order it states them:
 //!
 //! 1. **Fence** the content-bearing outbox *at once*. [`DeliveryJournal::due`] answers with
-//!    nothing while the fence is up, so the stop is in the read every sender makes rather than in
-//!    a flag each of them remembers to check.
+//!    nothing from a generation before the fence's, so the stop is in the read every sender makes
+//!    rather than in a flag each of them remembers to check. The one thing admitted under the
+//!    fence is an alert with no content, which belongs to the fence's own generation.
 //! 2. **Cancel** what was admitted and never dispatched. It has not left, so it is taken back and
 //!    its bytes go with it.
 //! 3. **Remove** the retained local content: the built request bodies and the encrypted objects a
@@ -17,8 +18,8 @@
 //! 4. **Reconcile** before completion is reported. [`DeliveryOutbox::outstanding`] counts the
 //!    sends on the wire, whose answers are still coming, and privacy mode is not complete while
 //!    any is. A notification whose outcome nobody knows is not waited for: under the fence
-//!    nothing asks the gateway what became of it, so the wait would never end. It is a copy that
-//!    may have left, shown in the exported list with its local content gone.
+//!    nothing asks the gateway what became of one from before it, so the wait would never end. It
+//!    is a copy that may have left, shown in the exported list with its local content gone.
 //!
 //! And the part section 24 is most specific about: *already uploaded archives and notifications
 //! and copies held by authorised viewers are not retroactively erased. Show those retained
@@ -32,7 +33,7 @@ use kr_worker::privacy::{
     Unavailable,
 };
 
-use crate::journal::{DeliveryJournal, DeliveryState};
+use crate::journal::DeliveryJournal;
 
 /// The delivery outbox, as privacy mode sees it.
 ///
@@ -67,18 +68,16 @@ impl DeliveryOutbox<'_> {
     ///
     /// Those are the only deliveries whose answer is still coming. One settled as an unknown
     /// outcome, or marked as the uncertainty an external message leaves, has left this host and
-    /// has no answer to wait for.
+    /// has no answer to wait for. An alert privacy mode let through while it is on is neither
+    /// content captured before the boundary nor cleanup of it, so it is not counted: privacy
+    /// mode can be turned off while one is on the wire.
     fn on_the_wire(&self) -> Result<u64, Unavailable> {
-        let unreconciled = self.journal.unreconciled().map_err(|error| {
+        self.journal.on_the_wire().map_err(|error| {
             unavailable(
                 "the delivery journal cannot say what is on the wire",
                 &error,
             )
-        })?;
-        Ok(unreconciled
-            .iter()
-            .filter(|record| record.state == DeliveryState::InFlight)
-            .count() as u64)
+        })
     }
 }
 

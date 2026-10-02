@@ -617,11 +617,6 @@ impl DeliveryModule {
         limit: usize,
         budget: std::time::Duration,
     ) -> Result<usize> {
-        let is_fenced =
-            self.with(|producer| producer.journal().is_fenced().map_err(unavailable))?;
-        if is_fenced {
-            return Ok(0);
-        }
         let started = std::time::Instant::now();
         let unknown = self.with(|producer| {
             producer
@@ -636,18 +631,13 @@ impl DeliveryModule {
             }
             // A record admitted under a generation privacy mode has ended is not asked about.
             // Nothing from a generation that has been walked past reaches the gateway again, and
-            // an identifier is something: it says this host had work for that installation. Both
-            // are read again for every record, because a person can turn privacy mode on while
-            // this pass is waiting for an answer about the record before this one.
-            let (generation, fenced) = self.with(|producer| {
-                Ok((
-                    producer.journal().generation().map_err(unavailable)?,
-                    producer.journal().is_fenced().map_err(unavailable)?,
-                ))
-            })?;
-            if fenced {
-                return Ok(resolved);
-            }
+            // an identifier is something: it says this host had work for that installation. While
+            // privacy mode is on that leaves the alerts it let through, which carry no content,
+            // and nothing of an earlier generation. The generation is read again for every
+            // record, because a person can turn privacy mode on while this pass is waiting for an
+            // answer about the record before this one.
+            let generation =
+                self.with(|producer| producer.journal().generation().map_err(unavailable))?;
             let settled = match self.ask_about(&record, generation, status, credentials, clock)? {
                 // Nothing more can be asked until the allowance comes back, and this record was
                 // not asked about, so its turn stays where it is.
@@ -707,16 +697,12 @@ impl DeliveryModule {
         let Some(credential) = credentials.current(push.sender_record_id) else {
             return Ok(Considered::HadItsTurn(None));
         };
-        // Asked only under an admission of the generation the record was admitted under, held to
-        // the end of the exchange. A change of privacy mode waits for it, and none is given while
-        // privacy mode is on: the journal's own fence goes up after the change is published, and
-        // nothing is asked in between.
-        let Some(_admission) = self
-            .privacy
-            .admit_send(kr_worker::privacy::PrivacyGeneration::new(
-                record.privacy_generation,
-            ))
-        else {
+        // Asked only under the generation the record was admitted under, read from the published
+        // state and held to the end of the exchange: a change of privacy mode waits for it. The
+        // published generation is the row's in either mode, as it is for a send: while privacy
+        // mode is on it is the alerts' own, and the journal's fence goes up after the change is
+        // published, so a row of the generation before it is not asked about in between.
+        let Some(_admission) = self.admitted_generation(record.privacy_generation) else {
             return Ok(Considered::KeepsItsTurn);
         };
         if !status.reserve(clock.steady_ms()) {
@@ -998,10 +984,14 @@ impl DeliveryModule {
     /// alerts a pending question or approval still owes, which carry none. The reading is held
     /// until the answer is recorded, as an admission is: a change of privacy mode waits for it.
     fn admitted(&self, delivery: &ClaimedDelivery) -> Option<crate::privacy::Reading<'_>> {
+        self.admitted_generation(delivery.privacy_generation)
+    }
+
+    /// The published privacy state, held, when its generation is `generation`.
+    fn admitted_generation(&self, generation: u64) -> Option<crate::privacy::Reading<'_>> {
         let reading = self.privacy.reading();
-        (reading.published().generation
-            == kr_worker::privacy::PrivacyGeneration::new(delivery.privacy_generation))
-        .then_some(reading)
+        (reading.published().generation == kr_worker::privacy::PrivacyGeneration::new(generation))
+            .then_some(reading)
     }
 
     /// Settles a claimed delivery privacy mode took back before it was presented. Nothing was
