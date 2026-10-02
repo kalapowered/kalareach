@@ -762,7 +762,6 @@ enum Seeded {
     Skipped(String),
 }
 
-/// The digest that names a root's key set, which a decline is recorded under.
 /// Where the generation a bundle activates came from: the repository, commit and generation the
 /// copy was made from, and the root it was verified against.
 pub(crate) fn provenance_of(bundle: &SeedBundle) -> String {
@@ -776,6 +775,7 @@ pub(crate) fn provenance_of(bundle: &SeedBundle) -> String {
     .to_string()
 }
 
+/// The digest that names a root's key set, which a decline is recorded under.
 fn key_set_digest(keys: &[String]) -> String {
     PayloadDigest::of(keys.join(",").as_bytes()).to_string()
 }
@@ -879,12 +879,6 @@ impl Catalogue {
         };
 
         let id = enrolled.enrolment.id.clone();
-        if let Some(expired) = bundle
-            .earliest_expiry()
-            .filter(|at| *at <= jiff::Timestamp::now())
-        {
-            outcome.expired = Some(expired.to_string());
-        }
 
         // Only the sync is skipped by a pin, and by a generation that is already as high: the
         // packages the bundle carries are still installed against whatever is active.
@@ -911,8 +905,18 @@ impl Catalogue {
         #[cfg(any(test, feature = "testing"))]
         self.stop_if(SeedPoint::AfterActivation)?;
         let enrolled = self.enrolled(&id)?;
-        if enrolled.active.is_none() {
+        let Some(in_use) = enrolled.active else {
             return Ok(());
+        };
+        // The bundled metadata's expiry is the host's to report only while the bundled generation
+        // is the one in use: once a synchronisation has moved the store past it, what the bundle
+        // says about itself no longer says anything about what the host runs.
+        if in_use.generation == bundle.generation().get()
+            && let Some(expired) = bundle
+                .earliest_expiry()
+                .filter(|at| *at <= jiff::Timestamp::now())
+        {
+            outcome.expired = Some(expired.to_string());
         }
         let packages: Vec<BundledPackage> = bundle.packages().to_vec();
         for package in &packages {
@@ -1157,6 +1161,20 @@ impl Catalogue {
                 Ok((Seeded::Installed, Transition::Installed(view)))
             },
         )
+    }
+
+    /// Whether the seed made this enrolment, from its permanent record: true from the enrolment on,
+    /// whether or not a generation was ever activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the records cannot be read.
+    pub fn was_seeded(&self, id: &RepositoryId) -> CatalogueResult<bool> {
+        let Some(enrolled) = self.db.read(|records| records.enrolment(id))? else {
+            return Ok(false);
+        };
+        let name = format!("{SEEDED}{}", enrolled.key);
+        Ok(self.db.read(|records| records.setting(&name))?.is_some())
     }
 
     /// Records that the seed found an installation of this plugin and left it.

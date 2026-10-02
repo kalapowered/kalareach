@@ -5031,7 +5031,7 @@ mod native_bridges {
         assert!(
             evidence[0]
                 .detail
-                .contains("its root is not one this build trusts"),
+                .contains("its root is not one this build trusts, so the seed leaves it"),
             "{evidence:?}"
         );
         assert!(
@@ -5206,9 +5206,21 @@ mod native_bridges {
         );
         assert!(bridge_facts(&host, &digest).is_some());
 
+        // The seed is stopped right after it activates the revoking generation, as an interruption
+        // would: what it committed is followed all the same.
         let third = built_again(&host, home.path(), Some(keys), 3, Some(revoked)).await;
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .stop_seed_at(Some(kr_plugin_catalogue::SeedPoint::AfterActivation));
         let outcome = host.module.seed(&generations::seed_bundle(&third)).await;
         assert!(outcome.activated.is_some(), "{}", outcome.report());
+        assert!(
+            outcome.failure.is_some(),
+            "the seed was stopped: {}",
+            outcome.report()
+        );
         assert_eq!(
             site.tree(),
             before,
@@ -5222,6 +5234,36 @@ mod native_bridges {
                 .expect("readable")
                 .is_some(),
             "the installation stays"
+        );
+    }
+
+    /// A repository the seed made under a root this build does not trust is named by the doctor
+    /// from the enrolment on, before any generation is activated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_doctor_names_a_seeded_repository_this_build_leaves_alone_from_its_enrolment() {
+        let site = Site::new();
+        let host = host(&site);
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .stop_seed_at(Some(kr_plugin_catalogue::SeedPoint::AfterEnrolment));
+
+        let outcome = host.module.seed(&seed_bundle()).await;
+
+        assert!(outcome.enrolled, "{}", outcome.report());
+        let evidence = host
+            .module
+            .evidence_within(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await
+            .expect("readable");
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(
+            evidence[0]
+                .detail
+                .contains("its root is not one this build trusts, so the seed leaves it"),
+            "{evidence:?}"
         );
     }
 
