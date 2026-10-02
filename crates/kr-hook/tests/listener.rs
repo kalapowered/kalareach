@@ -6,22 +6,22 @@
 //! application then starts `kr-hook claude-code hook` itself, as Claude Code starts a hook, so the
 //! process the kernel names on the accepted socket is a process the launched application started.
 //!
-//! Where the platform has no private socket the endpoint is loopback with the launch's credential,
-//! and the last case stands in for that listener on every platform.
+//! The last case stands in for the worker's listener on every platform, on the private endpoint the
+//! platform gives a launch: a socket on Unix, a named pipe on Windows.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.43 | every case: the registration file and the private exchange, never a session identifier alone |
-//! | KR-REQ-12.14 | `kr_req_12_14_*`: the private socket, and loopback with the per-launch credential |
+//! | KR-REQ-12.14 | `kr_req_12_14_*`: the private endpoint, and the per-launch credential |
 //! | KR-REQ-05.09 | `kr_req_05_09_*`: the installation is validated before anything is accepted |
 
 mod common;
 
-use std::io::{Read as _, Write as _};
+use tokio::io::AsyncWriteExt as _;
 
 #[cfg(unix)]
 use common::launched;
-use common::{LIVENESS, Placed, run_with_input};
+use common::{LIVENESS, Placed, StandIn, read_line, run_with_input};
 
 /// A `SessionStart` payload as Claude Code writes it on a hook's standard input.
 const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"SessionStart","source":"startup"}"#;
@@ -287,57 +287,54 @@ async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused(
     assert_eq!((outcome.code, outcome.stdout.as_slice()), (0, &b"{}\n"[..]));
 }
 
-/// KR-REQ-12.14, KR-REQ-11.43: where the platform has no private socket the registration names a
-/// loopback address, and the per-launch credential is what decides there. This listener stands in
-/// for that one on every platform: the forwarder reaches it over loopback only, presents exactly
-/// the credential the owner-only file holds and its own process as the operating system reads it,
-/// declares which bridge it is, and waits for the admission before it answers `{}`. A listener that
-/// closes without admitting it, or never answers at all, changes nothing about its answer, and the
-/// one that never answers cannot hold it past its deadline.
-#[test]
-fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
+/// KR-REQ-12.14, KR-REQ-11.43: the private exchange is what decides. This listener stands in for
+/// the worker's on this platform's own private endpoint (a socket on Unix, a named pipe on
+/// Windows): the forwarder reaches it there only, presents exactly the credential the owner-only
+/// file holds and its own process as the operating system reads it, declares which bridge it is,
+/// and waits for the admission before it answers `{}`. A listener that closes without admitting it,
+/// or never answers at all, changes nothing about its answer, and the one that never answers
+/// cannot hold it past its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launch_credential() {
     let placed = Placed::new();
     let credential = "5e".repeat(32);
     let files = placed.host.root().join("files");
-    std::fs::create_dir_all(&files).expect("a directory");
+    kr_ipc::paths::create_private_directory(&files).expect("a private directory");
     let credential_file = files.join("credential");
-    std::fs::write(&credential_file, &credential).expect("the credential is written");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600))
-            .expect("owner-only");
-    }
+    kr_ipc::paths::create_new_owner_only_file(&credential_file, credential.as_bytes())
+        .expect("the credential is written");
 
     for answer in ["admit", "close", "withhold"] {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let port = listener.local_addr().expect("its address").port();
-        let registration = files.join("registration");
+        let stand_in = StandIn::bind(&files, answer);
+        let registration = files.join(format!("registration.{answer}"));
         std::fs::write(
             &registration,
             format!(
-                "endpoint=127.0.0.1:{port}\nprofile=lp-1\n\
+                "endpoint={}\nprofile=lp-1\n\
                  instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
                  credential={}\nframing=json_lines\n",
+                stand_in.address,
                 credential_file.display()
             ),
         )
         .expect("the registration is written");
         let mut command = placed.command(&["claude-code", "hook"]);
         command.env("KR_REGISTRATION", &registration);
-        let running = std::thread::spawn(move || run_with_input(command, SESSION_START));
+        let mut running =
+            tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START));
 
-        let (mut stream, _) = listener
-            .accept()
-            .expect("the forwarder connects over loopback");
-        stream
-            .set_read_timeout(Some(LIVENESS))
-            .expect("a bounded read");
-        let mut hello = Vec::new();
-        let mut byte = [0_u8; 1];
-        while stream.read(&mut byte).expect("the hello is read") == 1 && byte[0] != b'\n' {
-            hello.push(byte[0]);
-        }
+        let (mut stream, _) = tokio::select! {
+            accepted = stand_in.listener.accept() => accepted.expect("the forwarder connects"),
+            ran = &mut running => {
+                let ran = ran.expect("the forwarder ran");
+                panic!(
+                    "{answer}: the forwarder ended without connecting, with {:?}: {}",
+                    ran.code, ran.stderr
+                );
+            }
+            () = tokio::time::sleep(LIVENESS) => panic!("{answer}: the forwarder did not connect"),
+        };
+        let hello = read_line(&mut stream).await;
         let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
         let presented = &hello["kr_hello"];
         assert_eq!(presented["credential"], credential.as_str());
@@ -364,15 +361,11 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
             "admit" => {
                 stream
                     .write_all(b"{\"kr_bridge\":{\"admitted\":\"hook\"}}\n")
+                    .await
                     .expect("admitted");
                 // The observation comes behind the hello, and the forwarder waits for this end to
                 // close once it has been read.
-                let mut observation = Vec::new();
-                while stream.read(&mut byte).expect("the observation is read") == 1
-                    && byte[0] != b'\n'
-                {
-                    observation.push(byte[0]);
-                }
+                let observation = read_line(&mut stream).await;
                 let observation: serde_json::Value =
                     serde_json::from_slice(&observation).expect("the observation is JSON");
                 assert_eq!(
@@ -384,15 +377,15 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
                     }})
                 );
                 drop(stream);
-                running.join().expect("the forwarder ran")
+                running.await.expect("the forwarder ran")
             }
             "close" => {
                 drop(stream);
-                running.join().expect("the forwarder ran")
+                running.await.expect("the forwarder ran")
             }
             _ => {
                 // The connection stays open and says nothing until the forwarder has ended.
-                let ran = running.join().expect("the forwarder ran");
+                let ran = running.await.expect("the forwarder ran");
                 drop(stream);
                 assert!(
                     ran.took < std::time::Duration::from_secs(1),
