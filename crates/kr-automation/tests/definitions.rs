@@ -751,17 +751,103 @@ fn a_create_node_that_carries_environment_variables_is_refused() {
     assert!(said.contains("repeat"), "{said}");
     assert!(!said.contains("planted-secret-value"), "{said}");
 
-    // The same for every kind: parameters whose reading depends on which copy of a name is read
-    // are not parameters.
+    // The other kinds carry nothing of the kind, and a definition already installed with a name
+    // repeated in one of them is admitted again each time it runs, which checks it again: so the
+    // refusal is the create node's alone.
     let mut definition = one_node_with(
         WorkflowActionKind::AttentionNotice,
         serde_json::json!({ "summary": "done" }),
     );
     definition.nodes[0].action_params = "{\"summary\":\"first\",\"summary\":\"done\"}".to_owned();
-    assert!(
-        validate_definition(&definition, &grant).is_err(),
-        "a repeated name is refused in a node of any kind"
-    );
+    validate_definition(&definition, &grant)
+        .expect("a repeated name in a node of another kind is not refused");
+}
+
+/// KR-REQ-07.25: an install the host refuses for the variables a create node carries leaves
+/// neither the variables nor a record of them on disk: the refusal says nothing of them, and the
+/// refusal is what the journal records with the action.
+#[test]
+fn a_refused_install_leaves_no_variable_in_the_journal() {
+    use common::Submit;
+    use kr_automation::{AutomationService, ManualClock, MockActionRunner};
+    use kr_protocol::automation::WorkflowInstallParams;
+    use kr_protocol::session::{
+        EnvironmentVariable, LaunchProfile, Presentation, SessionCreateParams, ShellMode,
+    };
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().expect("a journal directory");
+    let grant_id = test_grant_id(9);
+    let service = AutomationService::open(
+        directory.path(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            common::every_right(&[grant_id]),
+            Arc::new(ManualClock::new(1_000)),
+        ),
+    )
+    .expect("a service");
+    let session = |variables: Vec<EnvironmentVariable>| {
+        serde_json::to_value(SessionCreateParams {
+            environment_id: common::environment(),
+            presentation: Presentation::Invisible,
+            shell: Nullable::null(),
+            shell_mode: ShellMode::NativeCompat,
+            cwd: Nullable::null(),
+            dimensions: Nullable::null(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            environment_snapshot: variables,
+            palette: Nullable::null(),
+            launch_profile: LaunchProfile::default(),
+            terminal: Nullable::null(),
+        })
+        .expect("session.create's parameters")
+    };
+    let install = |revision: u64, params: serde_json::Value| {
+        let mut definition = one_node_with(WorkflowActionKind::CreateSession, params);
+        definition.revision = kr_protocol::scalars::U64::new(revision);
+        WorkflowInstallParams {
+            workflow_id: definition.workflow_id,
+            revision: definition.revision,
+            grant_reference: definition.grant_reference,
+            definition,
+        }
+    };
+
+    let mut shapes = vec![
+        session(vec![EnvironmentVariable {
+            name: "KR_PLANTED_TOKEN".to_owned(),
+            value: "planted-secret-value".to_owned(),
+        }]),
+        session(Vec::new()),
+        session(Vec::new()),
+    ];
+    shapes[1]["environment_snapshot"] =
+        serde_json::json!(["KR_PLANTED_TOKEN=planted-secret-value"]);
+    shapes[2]["environment_snapshot"] = serde_json::json!("planted-secret-value");
+    for (at, shape) in shapes.into_iter().enumerate() {
+        let error = service
+            .submit_install(&install(1 + at as u64, shape), 1_000)
+            .expect_err("the install is refused");
+        let said = format!("{error} {error:?}");
+        assert!(!said.contains("planted-secret-value"), "{at}: {said}");
+    }
+    // The control: the same node with none installs.
+    service
+        .submit_install(&install(9, session(Vec::new())), 1_000)
+        .expect("a create node with no variables installs");
+
+    drop(service);
+    for name in ["workflows.db", "workflows.db-wal", "workflows.db-journal"] {
+        if let Ok(bytes) = std::fs::read(directory.path().join(name)) {
+            assert!(
+                !bytes
+                    .windows("planted-secret-value".len())
+                    .any(|window| window == b"planted-secret-value"),
+                "{name} holds a variable a refused install carried"
+            );
+        }
+    }
 }
 
 /// KR-REQ-25.13: a workflow definition is a versioned JSON document. One read from its text, with
