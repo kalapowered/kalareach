@@ -223,6 +223,9 @@ impl RemoteConnection {
     /// retains none of it. A version this host cannot read is refused the way one outside the
     /// grant is, so a device learns nothing about which identifiers exist.
     ///
+    /// Returns the number of the version it checked, which is the latest one when none was named:
+    /// what is then read has to be that version, and not the one that is latest by then.
+    ///
     /// # Errors
     ///
     /// Returns the refusal when the grant does not reach the version.
@@ -230,7 +233,7 @@ impl RemoteConnection {
         &self,
         change_set_id: kr_protocol::ids::ChangeSetId,
         version: Option<kr_protocol::ids::ChangeSetVersion>,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<kr_protocol::ids::ChangeSetVersion, ProtocolError> {
         let Some(bound) = self.device.grant.history.lower_bound_ms.0 else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -252,7 +255,7 @@ impl RemoteConnection {
         })
         .await;
         match checked {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(record)) => Ok(record.version),
             Ok(Err(OutOfScope::History)) => Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this version was captured before the moment this device's grant reaches back to",
@@ -266,6 +269,39 @@ impl RemoteConnection {
                 "this host could not check the version against this device's grant",
             )),
         }
+    }
+
+    /// Checks a device's `changeset.read` and returns the request that reads exactly the version
+    /// that was checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the parameters are not a change-set read's or the grant does not
+    /// reach the version.
+    pub(super) async fn pinned_change_set_read(
+        &self,
+        request: &Request,
+    ) -> Result<Request, ProtocolError> {
+        let params: kr_protocol::changeset::ChangesetReadParams =
+            request.params.to_typed().map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    kr_project::git::redact(&error.to_string()),
+                )
+            })?;
+        let checked = self
+            .check_version(params.change_set_id, params.version.0)
+            .await?;
+        let pinned = kr_protocol::changeset::ChangesetReadParams {
+            version: kr_protocol::scalars::Nullable::some(checked),
+            ..params
+        };
+        Ok(Request {
+            params: ParamsValue::from_typed(&pinned).map_err(|error| {
+                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+            })?,
+            ..request.clone()
+        })
     }
 
     /// Answers a device's `diff.read` of a recorded version.

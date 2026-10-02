@@ -222,8 +222,19 @@ impl OwnerAuthority for HostOwner {
                 proof,
                 "project.location",
             )
-            .map(|_| ())
-            .map_err(|error| error.to_protocol_error())
+            .map_err(|error| error.to_protocol_error())?;
+        // The device can rotate its notification-preview key while the confirmation is spent, and
+        // the acceptance record checks the signer's standing and not the destination's keys. So
+        // the keys are read once more now, and a location whose confirmation named keys the
+        // device no longer holds is not authorised: the owner confirms it again.
+        if self.destination_of(enlargement)? != destination {
+            return Err(ProtocolError::new(
+                ErrorCode::OwnerConfirmationRequired,
+                "the device's keys changed while this confirmation was spent, so it no longer \
+                 names the device that holds the grant; confirm the location again",
+            ));
+        }
+        Ok(())
     }
 }
 
