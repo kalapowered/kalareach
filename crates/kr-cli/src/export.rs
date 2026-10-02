@@ -46,6 +46,7 @@ use kr_protocol::session::{
 use kr_term::budget::GridSize;
 use kr_term::diag::DiagnosticKind;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
+use kr_term::lane::{LaneGate, LaneLimits};
 use kr_term::sideeffect::SideEffectKind;
 use kr_term::span::ByteSpan;
 use serde::Serialize;
@@ -88,6 +89,24 @@ pub struct Summary {
     pub omissions: Vec<&'static str>,
 }
 
+/// Refuses a bound of no bytes, which names nothing to read.
+///
+/// The command asks this before it reaches an environment, so a mistake in the arguments starts and
+/// asks nothing.
+///
+/// # Errors
+///
+/// Returns a usage failure when `max_bytes` is zero.
+pub fn check_bound(max_bytes: u64) -> Result<()> {
+    if max_bytes == 0 {
+        return Err(CliError::Usage(Shown::said(
+            "--max-bytes names how much retained output to read, and an export reads at least one \
+             byte",
+        )));
+    }
+    Ok(())
+}
+
 /// Reads one closed session's retained output and composes the export of it.
 ///
 /// Nothing is written: the file is made by [`write`] once this has passed.
@@ -104,12 +123,7 @@ pub async fn read<L: Link>(
     max_bytes: u64,
     exported_at_ms: u64,
 ) -> Result<Exported> {
-    if max_bytes == 0 {
-        return Err(CliError::Usage(Shown::said(
-            "--max-bytes names how much retained output to read, and an export reads at least one \
-             byte",
-        )));
-    }
+    check_bound(max_bytes)?;
     let listed: SessionListResult = ask(
         link,
         Method::SessionList,
@@ -354,6 +368,12 @@ impl Run {
     fn start(start: u64, size: GridSize, resuming: bool) -> Result<Self> {
         let engine = Engine::new(EngineConfig {
             size,
+            // The replies are written to nobody, so a bound on how fast a terminal is answered
+            // would only stop the count of the questions asked.
+            lane: LaneLimits {
+                responses_per_second: u32::MAX,
+                ..LaneLimits::DEFAULT
+            },
             ..EngineConfig::DEFAULT
         })
         .map_err(|_| {
@@ -375,21 +395,35 @@ impl Run {
         let mut bytes = bytes;
         let mut from = from;
         if self.resuming {
-            let skipped = resumption_point(bytes);
+            let Some(skipped) = resumption_point(bytes) else {
+                // Nothing in this page is somewhere a sequence can be taken to begin at, so the
+                // next page is asked the same.
+                tally.bytes_resumed += bytes.len() as u64;
+                self.start = from + bytes.len() as u64;
+                return;
+            };
             tally.bytes_resumed += skipped as u64;
             bytes = &bytes[skipped..];
             from += skipped as u64;
+            self.start = from;
+            // Reading has begun, even where the point was the last byte of the page.
+            self.resuming = false;
             if bytes.is_empty() {
-                // Nothing in this page is somewhere a sequence can be taken to begin at.
-                self.start = from;
                 return;
             }
-            self.resuming = false;
-            self.start = from;
         }
         self.fed.extend_from_slice(bytes);
         let outcome = self.engine.feed(bytes, 0);
         self.take(&outcome, tally);
+        self.discard_replies();
+    }
+
+    /// Throws away the replies the engine queued, which nothing is waiting for.
+    fn discard_replies(&mut self) {
+        let _ = self
+            .engine
+            .lane_mut()
+            .drain(LaneGate::default(), usize::MAX, 0);
     }
 
     fn take(&mut self, outcome: &FeedOutcome, tally: &mut Tally) {
@@ -406,6 +440,7 @@ impl Run {
     fn finish(mut self, read: &mut Read) {
         let tail = self.engine.quiesce(0);
         self.take(&tail, &mut read.tally);
+        self.discard_replies();
         let closing = self.engine.close(0);
         self.take(&closing, &mut read.tally);
         for (kind, count) in self.engine.diagnostic_totals() {
@@ -429,22 +464,21 @@ impl Run {
     }
 }
 
-/// How many of the first bytes of output that begins somewhere in the stream are not read.
+/// How many of the first bytes of output that begins somewhere in the stream are not read, or
+/// `None` when none of it is somewhere reading can begin.
 ///
 /// Output that begins after a range the archive no longer holds can begin inside a control string:
 /// the rest of a clipboard write, a title or a notification looks like text, and the byte that
-/// ends it like a bell. So nothing is read until a point where one can be taken to begin: before
-/// an escape, which begins a sequence or ends a string, or after a bell or a line ending, which
-/// ends one. Everything before it is counted as not carried. Output with none of these in it is not
-/// read at all.
-fn resumption_point(bytes: &[u8]) -> usize {
+/// ends it like a bell. So nothing is read until a point where one can be taken to begin: before an
+/// escape, which begins a sequence or ends a string, or after a bell, a cancel or a substitute,
+/// which end one. A line ending is not such a point, because a terminal's control string carries
+/// carriage returns and line feeds as part of its payload, as a clipboard write wrapped at a fixed
+/// width does. Everything before the point is counted as not carried.
+fn resumption_point(bytes: &[u8]) -> Option<usize> {
     bytes
         .iter()
-        .position(|byte| matches!(byte, 0x07 | b'\n' | b'\r' | 0x1b))
-        .map_or(
-            bytes.len(),
-            |at| if bytes[at] == 0x1b { at } else { at + 1 },
-        )
+        .position(|byte| matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b))
+        .map(|at| if bytes[at] == 0x1b { at } else { at + 1 })
 }
 
 /// What the engines found in the output that the file does not carry.
