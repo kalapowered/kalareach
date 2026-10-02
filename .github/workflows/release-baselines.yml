@@ -54,28 +54,36 @@ jobs:
             runner: ubuntu-22.04
             python: python3
             exe: ''
+            describe: kr-describe-model/kr-describe-inference
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             python: python3
             exe: ''
+            describe: kr-describe-model/kr-describe-inference
           # macOS 14 itself, so the floor is started on the baseline it names.
           - target: aarch64-apple-darwin
             runner: macos-14
             python: python3
             exe: ''
+            describe: kr-describe-model/kr-describe-inference
           # The Intel runners start at macOS 15, so the Intel executables are started there.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             python: python3
             exe: ''
+            describe: kr-describe-model/kr-describe-inference
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             python: python
             exe: .exe
+            describe: kr-describe-model/kr-describe-inference
+          # The description process is left out of this target: llama.cpp's CPU backend does not
+          # build with MSVC for Arm, and no shipped model profile lists this target.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             python: python
             exe: .exe
+            describe: ''
     env:
       TARGET: ${{ matrix.target }}
       PYTHON: ${{ matrix.python }}
@@ -86,7 +94,7 @@ jobs:
         kr-cli/kr-attach-guard
         kr-worker/kr-worker
         kr-controller/kr-controller
-        kr-describe-model/kr-describe-inference
+        ${{ matrix.describe }}
         kr-hook/kr-hook
         kr-plugin-host/kr-plugin-host
     steps:
