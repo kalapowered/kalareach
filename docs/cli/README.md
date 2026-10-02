@@ -675,7 +675,8 @@ clipboard write appears nowhere in the file.
 The archive can have lost the start of the output, or a range inside it. Output that resumes after
 such a gap can begin inside a control string whose start is gone: the end of a clipboard write looks
 like text, and the byte that closes it looks like a bell. So after a gap nothing is read until the
-first escape, bell or line ending, and the bytes skipped are counted under
+first escape, bell, cancel or substitute character. A line ending does not count, because a control
+string carries line endings as part of what it holds. The bytes skipped are counted under
 `output_resumed_mid_stream`. A gap the archive reports on every page without skipping anything is
 listed once.
 
@@ -701,8 +702,9 @@ file is created new. Something already at the name, a link included, is refused 
 read and again where the file is made, and is left as it was. The bytes go into a file beside the
 final name, which is given its name without replacing anything, so a failed export leaves no partial
 file. The mode is 0600 on Unix, and on Windows the file takes the access list of the folder it is
-in. Giving a file its name this way needs a file system that supports hard links, so an export to a
-FAT or exFAT volume, or to some network shares, is refused. Nothing is uploaded, and no destination
+in. On Unix the file is given its name by a hard link, so an export to a FAT or exFAT volume, or to
+some network shares, is refused. Windows gives it its name by a rename that replaces nothing, and has
+no such limit. Nothing is uploaded, and no destination
 is chosen for you.
 
 With `--json` the command prints one document: `ok`, `session_id`, `display_number`, `path`,
