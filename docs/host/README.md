@@ -4448,9 +4448,10 @@ others exactly as they were, and withdrawing the interpreter grant also withdraw
 trust that depended on it, because a trust record nobody will act on is one somebody will
 eventually read as permission.
 
-The host reads an agent's state from three kinds of source: a framed message on the connector's own
-native connection, a documented machine-readable output, and text read from the terminal. Each event
-carries which of the three produced it, because provenance is never guessed from an event's shape.
+The component interface names three kinds of source for an agent's state: a framed message on the
+connector's own native connection, a documented machine-readable output, and text read from the
+terminal. A source event carries which of the three produced it, because provenance is never guessed
+from an event's shape.
 Only a native connection can carry an approval, and only the worker's own launch can open one: a
 terminal the worker launched, or a native bridge channel. The broker records a pending request when
 one of those delivers it, and nothing offers it to a person to answer until a decoder trusted for
@@ -4458,11 +4459,12 @@ that package and method has interpreted it. Machine output and terminal text can
 cannot create a request, however accurate they are, so a permission prompt read from the screen or
 from a notification is never an approval.
 
-Native protocols and hooks come first, then documented machine output, then terminal text, which a
-package reads only where nothing better exists and only once it has been granted the reading. A
-package gets the broker's semantic events within the default ceiling, while `terminal.stream`,
+The order of preference is native protocols and hooks, then documented machine output, then
+terminal text. The host does not rank the sources by itself: the grants hold the order. A package
+gets the broker's semantic events within the default ceiling, while `terminal.stream`,
 `terminal.transcript_tail` and `process.observe` are outside it, so each needs an explicit package
-or repository grant. The reading never turns into approval authority.
+or repository grant, and only a native connection can carry an approval. The reading of terminal
+text never turns into approval authority.
 
 ### Decoding trust
 
@@ -4560,18 +4562,21 @@ has taken the foreground, or the prompt has moved, the launch is refused — and
 whole answer. There is no path in this code that writes the command into whatever is reading the
 terminal.
 
-One saved conversation takes one live execution. A second launch against it is refused and names
-the instance that owns it. A native thread selection moves the reservation with it, so the
-conversation an instance left is free and the one it took is not.
+One saved conversation takes one live execution within a session. A launch intent that names a saved
+conversation is refused, and names the instance that owns it, while that live instance holds the
+conversation; an instance in another session is not seen. A native thread selection moves the
+reservation with it, so the conversation an instance left is free and the one it took is not. An
+instance holds a conversation when its bridge reports that it selected one, and a program the host
+adopted from the terminal holds none.
 
-Nothing in the host replaces a running agent with a second run of its saved conversation. The host
-starts an agent process only for a command the person typed, and no launch it makes names a saved
-conversation to resume. The broker still keeps the guard that a launch intent naming one would meet:
-within one session, an intent for a saved conversation is refused while another live instance holds
-it. An instance holds a conversation when its bridge reports that it selected one, and a program the
-host adopted from the terminal holds none. If a bridge reports that an instance selected a
-conversation another live instance holds, the host refuses the selection: the instance is left with
-no thread vouched for, and rich mutations stay suspended until the binding is verified again.
+Nothing in the host replaces a running agent with a second run of its saved conversation. An agent
+process starts only from the managed shell: from a command the person typed, or from one a client
+installed at the empty prompt with `shell.launch`. The broker records no saved conversation for
+either, even when the command resumes one, so the guard above covers a launch intent that names a
+conversation and a bridge's selection, and not a command line that resumes a conversation by
+itself. If a bridge reports that an instance selected a conversation another live instance of the
+same session holds, the host refuses the selection: the instance is left with no thread vouched for,
+and rich mutations stay suspended until the binding is verified again.
 
 ### What a native exit ends
 
