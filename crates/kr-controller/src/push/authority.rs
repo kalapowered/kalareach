@@ -57,6 +57,14 @@ pub struct GrantedRecipients {
     /// before the policy's lock is taken. Compiled away in every shipped build.
     #[cfg(test)]
     before_the_policy_lock: crate::attention::Pause,
+    /// Where this host's own tests stop a question once the configured ceiling has been read and
+    /// before the records are read again. Compiled away in every shipped build.
+    #[cfg(test)]
+    after_the_ceiling: crate::attention::Pause,
+    /// Where this host's own tests stop a question between the two records it reads again: the
+    /// grant and the device it is bound to. Compiled away in every shipped build.
+    #[cfg(test)]
+    between_the_records: crate::attention::Pause,
 }
 
 impl std::fmt::Debug for GrantedRecipients {
@@ -112,6 +120,10 @@ impl GrantedRecipients {
             ceiling: None,
             #[cfg(test)]
             before_the_policy_lock: crate::attention::Pause::default(),
+            #[cfg(test)]
+            after_the_ceiling: crate::attention::Pause::default(),
+            #[cfg(test)]
+            between_the_records: crate::attention::Pause::default(),
         }
     }
 
@@ -198,6 +210,8 @@ impl GrantedRecipients {
                 .is_some_and(|fresh| fresh.revoked_at_ms.is_none() && fresh.is_active()),
             Standing::Paired(device) => self.is_still_paired(device),
         };
+        #[cfg(test)]
+        self.between_the_records.wait();
         grant_stands && bound_to.is_none_or(|device| self.is_still_paired(device))
     }
 
@@ -268,6 +282,8 @@ impl GrantedRecipients {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         });
+        #[cfg(test)]
+        self.after_the_ceiling.wait();
         if !self.still_standing(standing, bound_to) {
             return None;
         }
@@ -1491,6 +1507,78 @@ mod tests {
         }
     }
 
+    /// A rule under a grant of the grant store issued to a paired device stops being admitted when
+    /// the device's own pairing runs out, in UTC or on the continuous clock, while the record still
+    /// says paired and the stored grant never ends: the question a rule is asked reads the pairing
+    /// as a destination named by the device does, and the end is written in the device's record.
+    /// The control: before either deadline the rule is admitted.
+    #[test]
+    fn a_rule_under_a_stored_grant_stops_when_the_devices_pairing_runs_out() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for runs_out in [None, Some("in UTC"), Some("on the continuous clock")] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            issued(
+                &sharing,
+                Grant {
+                    recipient_device_id: DeviceId::new(uuid(2)),
+                    ..grant(43, SessionSelector::Any, &[ActionRight::SessionView])
+                },
+                true,
+            );
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let continuous = kr_transport::clock::ManualClock::new();
+            let recipients = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                personal(),
+                environment(),
+                Arc::new(continuous.clone()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            );
+            let pairing = Grant {
+                recipient_device_id: DeviceId::new(uuid(2)),
+                expiry: GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(NOW + 1_000),
+                },
+                ..grant(44, SessionSelector::Any, &[ActionRight::SessionView])
+            };
+            recipients
+                .lifetimes()
+                .devices()
+                .commit(&device(DeviceId::new(uuid(2)), pairing))
+                .expect("a device");
+            assert!(
+                recipients.scope_for(&rule(Some(43))).is_some(),
+                "admitted before either deadline"
+            );
+            match runs_out {
+                Some("in UTC") => wall.store(NOW + 1_000, Ordering::SeqCst),
+                Some(_) => continuous.advance(std::time::Duration::from_millis(1_000)),
+                None => {}
+            }
+            let case = runs_out.unwrap_or("nowhere");
+            // The rule is asked first, so what finds the end is the question under test and not
+            // the record of it that another question would have written.
+            assert_eq!(
+                recipients.scope_for(&rule(Some(43))).is_some(),
+                runs_out.is_none(),
+                "the pairing runs out {case}"
+            );
+            let ended = recipients
+                .lifetimes()
+                .devices()
+                .record_for_device(DeviceId::new(uuid(2)))
+                .expect("a read")
+                .expect("the device")
+                .expired_at_ms
+                .is_some();
+            assert_eq!(ended, runs_out.is_some(), "the record of the end, {case}");
+        }
+    }
+
     /// A device revoked while a question about its stored grant waits for the policy's lock is
     /// found, as one whose grant was revoked is: the device's record is read again once the lock
     /// is held, and a revocation that marks only the device ends the answer. The control: left
@@ -1543,13 +1631,13 @@ mod tests {
         }
     }
 
-    /// A revocation that lands while the question waits for the configured ceiling, which a
-    /// configuration change holds across its own write, is found: the records are read again after
-    /// the ceiling has been read, with the policy's lock held. The test holds the ceiling and waits
-    /// for the question to be holding the policy's lock, which it takes first, and then revokes.
-    /// The controls: the same wait with nothing revoked admits the recipient.
+    /// A revocation that lands after the configured ceiling has been read, which a configuration
+    /// change holds across its own write, is found: the records are read again after the ceiling
+    /// has been read, with the policy's lock held, and not before it. The test stops the question
+    /// between the two and revokes there. The controls: the same stop with nothing revoked admits
+    /// the recipient.
     #[test]
-    fn a_revocation_that_lands_while_the_question_waits_for_the_ceiling_is_found() {
+    fn a_revocation_that_lands_after_the_ceiling_is_read_is_found() {
         #[derive(Clone, Copy, Debug)]
         enum Revokes {
             Nothing,
@@ -1560,11 +1648,10 @@ mod tests {
         for revokes in [Revokes::Nothing, Revokes::TheGrant, Revokes::TheDevice] {
             let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
             let ceiling = Arc::new(Mutex::new(None));
-            let policy = personal();
             let recipients = Arc::new(
                 GrantedRecipients::at(
                     Arc::clone(&sharing),
-                    Arc::clone(&policy),
+                    personal(),
                     environment(),
                     Arc::new(kr_transport::clock::ManualClock::new()),
                     || NOW,
@@ -1588,19 +1675,14 @@ mod tests {
                 ))
                 .expect("a device");
 
-            let held = ceiling.lock().expect("not poisoned");
+            let (arrived, go) = recipients.after_the_ceiling.arm();
             let asking = {
                 let recipients = Arc::clone(&recipients);
                 std::thread::spawn(move || recipients.device_scope(&destination(Some(46))))
             };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !matches!(policy.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the question never held the policy's lock while it waited for the ceiling"
-                );
-                std::thread::yield_now();
-            }
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the question read the ceiling");
             match revokes {
                 Revokes::Nothing => {}
                 Revokes::TheGrant => {
@@ -1620,12 +1702,70 @@ mod tests {
                         .expect("a revocation");
                 }
             }
-            drop(held);
+            go.send(()).expect("the question waits");
             assert_eq!(
                 asking.join().expect("the question ends").is_some(),
                 matches!(revokes, Revokes::Nothing),
                 "{revokes:?}"
             );
+        }
+    }
+
+    /// A revocation of a stored grant that lands between the two records the question reads again,
+    /// the device it is issued to and the grant, is found: the grant is read last, because
+    /// revoking a device withdraws the grants issued to it before it marks the device, so a
+    /// grant read last that still stands says the device was not unpaired before it either. Both
+    /// ways in, a destination named by its device and a rule under the grant, are asked. The
+    /// controls: the same stop with nothing revoked admits the recipient.
+    #[test]
+    fn a_stored_grant_revoked_while_the_device_is_read_is_found() {
+        for revokes in [false, true] {
+            for by_the_device in [true, false] {
+                let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+                let recipients = Arc::new(recipients(&sharing));
+                issued(
+                    &sharing,
+                    Grant {
+                        recipient_device_id: DeviceId::new(uuid(2)),
+                        ..grant(41, SessionSelector::Any, &[ActionRight::SessionView])
+                    },
+                    true,
+                );
+                recipients
+                    .lifetimes()
+                    .devices()
+                    .commit(&device(
+                        DeviceId::new(uuid(2)),
+                        grant(42, SessionSelector::Any, &[ActionRight::SessionView]),
+                    ))
+                    .expect("a device");
+                let (arrived, go) = recipients.between_the_records.arm();
+                let asking = {
+                    let recipients = Arc::clone(&recipients);
+                    std::thread::spawn(move || {
+                        if by_the_device {
+                            recipients.device_scope(&destination(Some(41)))
+                        } else {
+                            recipients.scope_for(&rule(Some(41)))
+                        }
+                    })
+                };
+                arrived
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the question read its first record");
+                if revokes {
+                    sharing
+                        .grants()
+                        .revoke(GrantId::new(uuid(41)), NOW, || Ok(()))
+                        .expect("a revocation");
+                }
+                go.send(()).expect("the question waits");
+                assert_eq!(
+                    asking.join().expect("the question ends").is_some(),
+                    !revokes,
+                    "grant revoked {revokes}, asked by the device {by_the_device}"
+                );
+            }
         }
     }
 
