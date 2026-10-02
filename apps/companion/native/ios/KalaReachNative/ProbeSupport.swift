@@ -33,6 +33,12 @@ enum ProbeColourMode: String {
 
 /// Reads the flags a check was started with.
 enum ProbeArguments {
+    /// The run named after `-KRProbeRun`, which a script gives each check so that it reads the result
+    /// of the check it started and never one an earlier check left behind.
+    static func run(from arguments: [String]) -> String? {
+        word(after: "-KRProbeRun", in: arguments)
+    }
+
     /// The mode named after `-KRDeviceProbe`, or nil when there is none or it is not one.
     static func mode(from arguments: [String]) -> ProbeMode? {
         word(after: "-KRDeviceProbe", in: arguments).flatMap(ProbeMode.init(rawValue:))
@@ -269,6 +275,18 @@ struct AudioTickLog {
             "gap.input.locked.max": ms(lockedInputGap),
             "gap.output.locked.max": ms(lockedOutputGap),
         ]
+    }
+}
+
+/// The number of the next picture, after those a folder already holds: a check started again must
+/// not write over the pictures of the one before it.
+enum ShotNumbering {
+    static func next(existing names: [String]) -> Int {
+        let numbers = names.compactMap { name -> Int? in
+            guard name.hasPrefix("shot-"), name.hasSuffix(".png") else { return nil }
+            return Int(name.dropFirst("shot-".count).dropLast(".png".count))
+        }
+        return (numbers.max() ?? 0) + 1
     }
 }
 #endif

@@ -251,5 +251,20 @@ final class ProbeSupportTests: XCTestCase {
         XCTAssertEqual(log.facts["gap.output.locked.max"], "4000")
         XCTAssertEqual(log.facts["locked.ticks"], "1")
     }
+
+    // MARK: Which run a result belongs to
+
+    func testTheRunNamedAfterItsFlagIsRead() {
+        XCTAssertEqual(ProbeArguments.run(from: ["app", "-KRDeviceProbe", "count", "-KRProbeRun", "abc-123"]), "abc-123")
+        XCTAssertNil(ProbeArguments.run(from: ["app", "-KRDeviceProbe", "count"]))
+        XCTAssertNil(ProbeArguments.run(from: ["app", "-KRProbeRun"]))
+    }
+
+    func testPicturesAreNumberedAfterThoseAlreadyInTheFolder() {
+        XCTAssertEqual(ShotNumbering.next(existing: []), 1)
+        XCTAssertEqual(ShotNumbering.next(existing: ["shot-01.png", "shot-02.png"]), 3)
+        XCTAssertEqual(ShotNumbering.next(existing: ["shot-07.png", "notes.txt", "shot-02.png"]), 8)
+        XCTAssertEqual(ShotNumbering.next(existing: ["shot-xx.png"]), 1)
+    }
 }
 #endif
