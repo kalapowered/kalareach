@@ -5175,6 +5175,162 @@ mod tests {
         );
     }
 
+    /// What each item of `module` was last decided at, and under which privacy state.
+    fn decisions(
+        module: &AttentionModule,
+    ) -> Vec<(Option<TimestampMs>, Option<kr_attention::PrivacyStamp>)> {
+        module
+            .take_for_delivery(|store, _| {
+                store
+                    .engine()
+                    .expect("the store is this owner's")
+                    .items()
+                    .map(|item| (item.last_notified_ms, item.decided_privacy))
+                    .collect::<Vec<_>>()
+            })
+            .expect("the store is taken")
+    }
+
+    /// The privacy state the stamp tests publish: generation 3, on.
+    fn private_in_generation_three() -> (crate::privacy::PrivacyState, kr_attention::PrivacyStamp) {
+        (
+            crate::privacy::PrivacyState::at(crate::privacy::Published {
+                generation: kr_worker::privacy::PrivacyGeneration::new(3),
+                private: true,
+            }),
+            kr_attention::PrivacyStamp {
+                generation: 3,
+                private: true,
+            },
+        )
+    }
+
+    /// A page that certifies its session decides what it raised under the privacy state the daemon
+    /// publishes, and stamps it. The control: a module attached no state stamps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_stamps_what_it_decides_with_the_privacy_state() {
+        for attached in [true, false] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let module = self::module(&temp);
+            let (state, stamp) = private_in_generation_three();
+            if attached {
+                module.attach_privacy(state);
+            }
+            let session_id = SessionId::new(kr_ipc::new_uuid());
+            let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+            module
+                .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .await
+                .expect("the page is taken");
+            let decided = decisions(&module);
+            assert_eq!(decided.len(), 1, "one item");
+            assert!(decided[0].0.is_some(), "the page decided it");
+            assert_eq!(
+                decided[0].1,
+                attached.then_some(stamp),
+                "attached {attached}"
+            );
+        }
+    }
+
+    /// The maintenance tick decides what a certificate that arrived since the last pass lets be
+    /// decided, under the privacy state the daemon publishes, and stamps it. The item is raised by a
+    /// page that certifies nothing, so only the tick can decide it. The control: a module attached
+    /// no state stamps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_maintenance_tick_stamps_what_it_decides_with_the_privacy_state() {
+        for attached in [true, false] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let module = self::module(&temp);
+            let (state, stamp) = private_in_generation_three();
+            if attached {
+                module.attach_privacy(state);
+            }
+            let session_id = SessionId::new(kr_ipc::new_uuid());
+            let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+            // A page that is not the end of what the session recorded: it raises the item and
+            // certifies nothing, so nothing is decided yet.
+            let mut partial = question_page(session_id);
+            partial.questions.head = U64::new(2);
+            let taken = module
+                .take_page(session_id, &link, 0, 0, &partial)
+                .await
+                .expect("the page is taken");
+            assert!(matches!(taken, Taken::Partial));
+            let undecided = decisions(&module);
+            assert_eq!(undecided.len(), 1, "one item");
+            assert_eq!(undecided[0].0, None, "nothing decided it yet");
+
+            module
+                .origins()
+                .certified
+                .insert(session_id, kr_ipc::clock::boot_elapsed_ms());
+            module.maintain(Arc::new(Stub { unaccounted: false }) as Arc<dyn Reach>);
+            module.wake.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while decisions(&module)[0].0.is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the maintenance tick never decided the item"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                decisions(&module)[0].1,
+                attached.then_some(stamp),
+                "attached {attached}"
+            );
+        }
+    }
+
+    /// The certification of the workflow journal's records decides what an environment item is owed
+    /// under the privacy state the daemon publishes, and stamps it. The control: a module attached
+    /// no state stamps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_environment_s_certification_stamps_what_it_decides_with_the_privacy_state() {
+        for attached in [true, false] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let module = self::module(&temp);
+            let (state, stamp) = private_in_generation_three();
+            if attached {
+                module.attach_privacy(state);
+            }
+            let reading = module.reading();
+            module
+                .store()
+                .expect("the store")
+                .rebuild(
+                    &[SourceEvent::new(
+                        kr_attention::EventCursor::new(AttentionSource::Automation, 1),
+                        TimestampMs::new(kr_ipc::now_ms().get()),
+                        EventKind::AutomationPaused {
+                            subject: kr_protocol::attention::AttentionAutomationSubject::Workflow {
+                                workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                                revision: U64::new(1),
+                            },
+                            reason: "max_concurrent_runs".to_owned(),
+                            grant_id: None,
+                        },
+                    )],
+                    reading,
+                )
+                .expect("the store reads the record");
+            let undecided = decisions(&module);
+            assert_eq!(undecided.len(), 1, "one item");
+            assert_eq!(undecided[0].0, None, "reading a record decides nothing");
+            module
+                .certify_environment(kr_ipc::clock::boot_elapsed_ms())
+                .expect("the certification is recorded");
+            let decided = decisions(&module);
+            assert!(decided[0].0.is_some(), "the certification decided it");
+            assert_eq!(
+                decided[0].1,
+                attached.then_some(stamp),
+                "attached {attached}"
+            );
+        }
+    }
+
     /// A reach whose answer to "was the closure unaccounted for" is held until the test lets it go,
     /// and which says when it was asked.
     struct Gated {
