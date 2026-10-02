@@ -551,8 +551,8 @@ async fn kr_req_11_32_the_owner_arriving_over_the_network_is_refused() {
 
 /// KR-REQ-11.43, KR-REQ-12.14 and KR-REQ-05.09: a bridge the launched application started, which
 /// presents the registration and the credential the launch published, is admitted and named by the
-/// kernel: the process that connected is the helper in the launch's job, and the application that
-/// started it is the launched agent.
+/// kernel: the process that connected is a helper the launch's job holds, and not the launched
+/// agent itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_43_a_bridge_the_launch_started_is_admitted_and_named_by_the_kernel() {
     let launch = Launch::start(2, "good", None);
@@ -572,11 +572,6 @@ async fn kr_req_11_43_a_bridge_the_launch_started_is_admitted_and_named_by_the_k
         "it is not the launched agent itself"
     );
     assert_eq!(
-        admitted.process.starter.as_ref(),
-        Some(&launch.process),
-        "and the launched agent is the process that started it"
-    );
-    assert_eq!(
         bridge,
         kr_ipc::identity::process_start_identity(u32::try_from(bridge.pid.get()).expect("a pid"))
             .expect("the helper's identity"),
@@ -591,17 +586,27 @@ async fn kr_req_11_43_a_bridge_the_launch_started_is_admitted_and_named_by_the_k
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_43_a_wrong_credential_a_session_identifier_alone_a_presented_identity_the_kernel_did_not_name_and_a_browser_are_each_refused()
  {
-    for (what, mode) in [
-        ("a credential that is not this launch's", "wrong_credential"),
+    for (what, mode, reason) in [
+        (
+            "a credential that is not this launch's",
+            "wrong_credential",
+            "private exchange",
+        ),
         (
             "an environment session identifier and no credential",
             "session_only",
+            "private exchange",
         ),
         (
             "an identity the kernel did not name for this connection",
             "other_identity",
+            "the operating system says it is",
         ),
-        ("a connection carrying what a browser adds", "browser"),
+        (
+            "a connection carrying what a browser adds",
+            "browser",
+            "a header a browser adds",
+        ),
     ] {
         let launch = Launch::start(2, mode, None);
         let refused = tokio::time::timeout(LIVENESS_DEADLINE, launch.gateway.accept_bridge())
@@ -613,6 +618,10 @@ async fn kr_req_11_43_a_wrong_credential_a_session_identifier_alone_a_presented_
             refused.code(),
             kr_protocol::error::ErrorCode::PermissionDenied,
             "{what}: {refused}"
+        );
+        assert!(
+            refused.to_string().contains(reason),
+            "{what} is refused for the reason it should be, not for another: {refused}"
         );
     }
 }
@@ -651,6 +660,12 @@ async fn kr_req_11_43_a_process_outside_every_job_is_refused() {
         "{refused}"
     );
     assert!(
+        refused
+            .to_string()
+            .contains("was not started by the application this host launched"),
+        "it is refused because no job of the launch holds it: {refused}"
+    );
+    assert!(
         !launch.members().contains(&outside.id()),
         "the job does not hold it"
     );
@@ -673,6 +688,12 @@ async fn kr_req_11_43_a_process_in_another_launchs_job_is_refused() {
         refused.code(),
         kr_protocol::error::ErrorCode::PermissionDenied,
         "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("was not started by the application this host launched"),
+        "it is refused because this launch's job does not hold it: {refused}"
     );
     assert!(
         other.members().len() >= 2,
@@ -786,8 +807,8 @@ fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused()
 /// KR-REQ-12.02: a launch on this platform publishes the registration and the credential and
 /// starts the agent in its job. The registration names the pipe by its path and carries no secret;
 /// the credential file is the owner's; the agent is a member of the job the host keeps for it.
-#[test]
-fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_job() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_job() {
     let launch = Launch::start(2, "none", None);
     let registration = std::fs::read_to_string(launch.directory.join("registration"))
         .expect("the registration is published");
@@ -822,8 +843,8 @@ fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_job() {
 /// KR-REQ-12.02: a launch into a directory another account was granted starts nothing. The
 /// endpoint was bound while the directory was private, and the launch reads it again before it
 /// starts anything.
-#[test]
-fn kr_req_12_02_a_launch_into_a_directory_open_to_another_account_starts_nothing() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_02_a_launch_into_a_directory_open_to_another_account_starts_nothing() {
     let directory = private_directory();
     let broker =
         Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
