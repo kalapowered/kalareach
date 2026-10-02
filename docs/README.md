@@ -113,20 +113,25 @@ stops, so a limit that a part has is written in that part's own document.
 - **Durable sessions.** A worker process for each session owns the pseudo-terminal and the terminal
   state, and the control daemon can restart without ending a session: [host](host/README.md),
   [terminal](terminal/README.md) and [cli](cli/README.md).
-- **Agent interfaces.** A broker and gateway in each worker interpret what an agent does through
-  plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi and Qoder CLI, with
-  conversations, drafts, attachments and approvals that only the agent's own protocol can create:
-  [the broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
-  [plugins](plugins/README.md).
+- **Agent interfaces.** A broker in each worker reads an agent's state through plugin packages for
+  Codex, Claude Code, OpenCode, Gemini CLI, Kimi and Qoder CLI, and offers typed requests to submit
+  or queue a prompt, steer or cancel a turn and answer an approval, with an approval only ever
+  created from the agent's own protocol: [the broker](host/README.md#the-broker), [the
+  bridges](bridges/claude-code/README.md) and [plugins](plugins/README.md).
 - **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
   on Linux, macOS, Windows, iOS and Android: [cli](cli/README.md), [companion](companion/README.md)
   and [mobile](client/mobile.md).
 - **Diff review.** Projects, workspaces and immutable change sets, with the diffs between versions
   and a review state bound to an exact version: [project](project/README.md) and
   [host](host/README.md#attention-review-and-what-changed-since-a-visit).
-- **Voice and encrypted push.** Voice through a coordinator on the host ([voice](voice/README.md)
-  and [client voice](client/voice.md)), and push notifications whose previews only the receiving
-  device can open ([delivery](delivery/README.md)).
+- **Voice.** A coordinator on the host decides what a call may read and send, under a voice grant
+  that a device holds apart from its ordinary grant, with an unlocked-screen confirmation for the
+  actions that need one: [voice](voice/README.md) and [client voice](client/voice.md). The daemon
+  this repository builds attaches no managed voice broker, so it starts no managed call.
+- **Encrypted push.** The host composes each notification, and a preview travels sealed to the
+  receiving device's own preview key, so a service that carries it cannot read it:
+  [delivery](delivery/README.md). A phone's notification handler shows the generic alert where it
+  cannot open a preview: [mobile](client/mobile.md).
 - **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
   quiet hours and review state, and a view of what changed since an actor's last visit:
   [host](host/README.md#attention-review-and-what-changed-since-a-visit).
@@ -148,8 +153,8 @@ stops, so a limit that a part has is written in that part's own document.
   objects](protocol/README.md#account-authority-objects)). The roles, single sign-on and SCIM that
   issue them run in the website's account system.
 - **External notification destinations.** Webhook, Slack, Discord, Telegram and email destinations,
-  each with its own credential, recipient and content policy:
-  [delivery](delivery/README.md#external-destinations).
+  each with its own recipient and content policy, and a stored credential for the four that need
+  one: [delivery](delivery/README.md#external-destinations).
 - **Environments and diagnostics.** WSL, container, SSH and paired environments the owner enrols
   with `kr bridge`, and `kr doctor`, which reports diagnostics and writes a support bundle that
   carries content only when the person passes `--include-content` and approves its preview:
@@ -225,9 +230,9 @@ look similar, such as the installable `skills/kalareach-contact/SKILL.md`, are t
 Text in the repositories describes the product and the change. It names no task, review, build tool
 or record kept outside the repositories, and a commit message is one line with no body and no
 trailer. In this repository `scripts/check-clean-checkout.sh` refuses a tracked file that names such
-a record, a commit message longer than one line and a broken relative link, and it passes on the
-whole tree and the whole history. The website's `pnpm records:check` refuses the same kinds of
-record, and build-assistant files, in the commits and the deployment bundle it is about to send.
+a record, a commit message longer than one line and a broken relative link. The website's `pnpm
+records:check` refuses the same kinds of record, and build-assistant files, in the commits and the
+deployment bundle it is about to send.
 
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
@@ -254,8 +259,9 @@ Internal interfaces change in one commit with every caller in the repository, an
 deleted. The code keeps no deprecated alias and no versioned copy of an interface that all its
 callers have left. Compatibility is kept at the boundaries where something outside the commit still
 runs or exists. A worker outlives an upgrade of the control daemon
-([host/updates.md](host/updates.md)). A store an earlier build wrote is migrated forward in one
-transaction, inside a stated window, with no branch that reads two schemas
-([Migrations](host/README.md#migrations)). A host and a client of different versions negotiate a
-protocol version ([Version negotiation](protocol/README.md#version-negotiation)). A plugin package
-is built for an SDK and component interface range ([plugins/README.md](plugins/README.md)).
+([host/updates.md](host/updates.md)). A store an earlier build wrote is brought forward when it is
+opened, or refused: the worker's journal migrates through a ladder with a stated window and an
+explicit importer for what is older ([Migrations](host/README.md#migrations)). A host and a client
+of different versions negotiate a protocol version ([Version
+negotiation](protocol/README.md#version-negotiation)). A plugin package is built for an SDK and
+component interface range ([plugins/README.md](plugins/README.md)).
