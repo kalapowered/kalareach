@@ -639,16 +639,19 @@ impl Controller {
             Change::Joined(step) | Change::Merged(step) | Change::Split(step) => step,
         };
         #[cfg(feature = "testing")]
-        if self
+        let flushed = if self
             .machine
             .faults
             .recovery_flush_fails
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(unconfirmed(&"a test made the flush fail"));
-        }
-        kr_flush::flush_directory(self.paths.state_dir(), kr_flush::NameKind::File)
-            .map_err(|error| unconfirmed(&error))?;
+            Err(std::io::Error::other("a test made the flush fail"))
+        } else {
+            kr_flush::flush_directory(self.paths.state_dir(), kr_flush::NameKind::File)
+        };
+        #[cfg(not(feature = "testing"))]
+        let flushed = kr_flush::flush_directory(self.paths.state_dir(), kr_flush::NameKind::File);
+        flushed.map_err(|error| unconfirmed(&error))?;
         let result = encode(&result_of(self.paths.environment_id(), &record))?;
         self.sharing
             .grants()
