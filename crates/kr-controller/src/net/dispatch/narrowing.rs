@@ -1,7 +1,7 @@
 //! Narrowing an answer to what the device's grant admits.
 
 use kr_protocol::changeset::{
-    ChangesetMaterializeParams, ChangesetMaterializeResult, DiffReadParams, VersionRef,
+    ChangesetMaterializeParams, ChangesetMaterializeResult, DiffReadParams,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -226,7 +226,11 @@ impl RemoteConnection {
     /// # Errors
     ///
     /// Returns the refusal when the grant does not reach the version.
-    pub(super) async fn check_version(&self, version: VersionRef) -> Result<(), ProtocolError> {
+    pub(super) async fn check_version(
+        &self,
+        change_set_id: kr_protocol::ids::ChangeSetId,
+        version: Option<kr_protocol::ids::ChangeSetVersion>,
+    ) -> Result<(), ProtocolError> {
         let Some(bound) = self.device.grant.history.lower_bound_ms.0 else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -244,7 +248,7 @@ impl RemoteConnection {
         };
         let service = std::sync::Arc::clone(self.controller.changesets().service());
         let checked = tokio::task::spawn_blocking(move || {
-            crate::changeset::version_in_scope(&service, version, &scope)
+            crate::changeset::version_in_scope(&service, change_set_id, version, &scope)
         })
         .await;
         match checked {
@@ -255,10 +259,7 @@ impl RemoteConnection {
             )),
             Ok(Err(_)) => Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
-                format!(
-                    "this device's grant does not reach change set {} version {}",
-                    version.change_set_id, version.version
-                ),
+                format!("this device's grant does not reach change set {change_set_id}"),
             )),
             Err(_) => Err(ProtocolError::new(
                 ErrorCode::OutcomeUnknown,
@@ -289,10 +290,13 @@ impl RemoteConnection {
             }
             Err(error) => return failure(request.request_id, error),
         };
-        if let Err(error) = self.check_version(version).await {
+        if let Err(error) = self
+            .check_version(version.change_set_id, Some(version.version))
+            .await
+        {
             return failure(request.request_id, error);
         }
-        self.controller.changesets().read_frame(request).await
+        without_host_text(self.controller.changesets().read_frame(request).await)
     }
 
     /// Checks the version a device asks to have materialised.
@@ -311,11 +315,8 @@ impl RemoteConnection {
                 kr_project::git::redact(&error.to_string()),
             )
         })?;
-        self.check_version(VersionRef {
-            change_set_id: params.change_set_id,
-            version: params.version,
-        })
-        .await
+        self.check_version(params.change_set_id, Some(params.version))
+            .await
     }
 
     /// Answers a repeat of a materialisation this device asked for, from the record the first
@@ -344,6 +345,31 @@ impl RemoteConnection {
     }
 }
 
+/// Puts a refusal that came out of the change-set service in the form a device is shown.
+///
+/// Such a refusal carries a store's or a filesystem's own words, which can name the directory a
+/// materialisation is in. The code travels, and so does a refusal the daemon decided itself
+/// (`PERMISSION_DENIED`: the authority was withdrawn, the version is outside the grant); the text
+/// of every other one is replaced by its class and length.
+pub(super) fn without_host_text(answer: ControlFrame) -> ControlFrame {
+    match answer {
+        ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Error(error),
+        }) if error.code != ErrorCode::PermissionDenied => failure(
+            request_id,
+            ProtocolError::new(
+                error.code,
+                kr_protocol::hostinfo::export::withheld(
+                    kr_protocol::hostinfo::export::ContentClass::Message,
+                    &error.message,
+                ),
+            ),
+        ),
+        other => other,
+    }
+}
+
 /// Puts the answer to a materialisation in the form a device is shown: no host path.
 pub(super) fn shown_materialisation(answer: ControlFrame) -> ControlFrame {
     let ControlFrame::Response(Response {
@@ -351,7 +377,7 @@ pub(super) fn shown_materialisation(answer: ControlFrame) -> ControlFrame {
         outcome: Outcome::Ok(value),
     }) = answer
     else {
-        return answer;
+        return without_host_text(answer);
     };
     match value.to_typed::<ChangesetMaterializeResult>() {
         Ok(result) => encoded(
@@ -397,5 +423,56 @@ fn encoded<T: serde::Serialize + serde::de::DeserializeOwned>(
             request_id,
             ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(code: ErrorCode, message: &str) -> ControlFrame {
+        failure(RequestId::new(7), ProtocolError::new(code, message))
+    }
+
+    fn said(frame: &ControlFrame) -> (ErrorCode, String) {
+        match frame {
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) => (error.code, error.message.clone()),
+            other => panic!("a refusal was expected: {other:?}"),
+        }
+    }
+
+    /// A refusal that carries a store's own words reaches a device without them, and one the
+    /// daemon decided reaches it as it was.
+    #[test]
+    fn the_text_of_a_refusal_from_the_change_set_service_is_not_shown_to_a_device() {
+        let path = "/home/owner/.local/state/kr/changesets/materialisations/0123";
+        let from_the_store = refused(
+            ErrorCode::StorageUnavailable,
+            &format!("could not flush the directory {path}"),
+        );
+        let (code, message) = said(&shown_materialisation(from_the_store));
+        assert_eq!(code, ErrorCode::StorageUnavailable, "the code travels");
+        assert!(
+            message.starts_with("[message withheld, ") && !message.contains(path),
+            "{message}"
+        );
+        // The control: the daemon's own refusal is not the store's words.
+        let withdrawn = refused(
+            ErrorCode::PermissionDenied,
+            "the authority this connection was admitted under has been withdrawn",
+        );
+        let (code, message) = said(&shown_materialisation(withdrawn));
+        assert_eq!(code, ErrorCode::PermissionDenied);
+        assert!(message.contains("withdrawn"), "{message}");
+        // And an answer that is not a materialisation's is refused rather than passed on.
+        let other = encoded(
+            RequestId::new(8),
+            &kr_protocol::scalars::Nullable::<u8>::null(),
+        );
+        let (code, _) = said(&shown_materialisation(other));
+        assert_eq!(code, ErrorCode::OutcomeUnknown);
     }
 }

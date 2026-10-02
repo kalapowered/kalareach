@@ -2152,11 +2152,22 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
         ),
     ] {
         let (read, materialised) = read_and_materialise(device, env, version).await;
+        // `changeset.read` of the same version is held to the same scope.
+        let listed = device
+            .read::<_, kr_protocol::changeset::ChangesetReadResult>(
+                Method::ChangesetRead,
+                &kr_protocol::changeset::ChangesetReadParams {
+                    change_set_id: version.change_set_id,
+                    version: Nullable::some(version.version),
+                },
+            )
+            .await;
         if reached {
             read.unwrap_or_else(|error| panic!("{why}: the diff: {error}"));
             materialised.unwrap_or_else(|error| panic!("{why}: the materialisation: {error}"));
+            listed.unwrap_or_else(|error| panic!("{why}: the change set: {error}"));
         } else {
-            for refusal in [read.err(), materialised.err()] {
+            for refusal in [read.err(), materialised.err(), listed.err()] {
                 let refusal = refusal.unwrap_or_else(|| panic!("{why} is out of scope"));
                 assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{why}");
                 assert!(said(&refusal).contains(does_not_reach), "{why}: {refusal}");
@@ -2293,10 +2304,15 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
     recorded.stop().await;
 }
 
-/// KR-REQ-23.44 and section 9: a materialisation for a device whose registration was withdrawn
-/// writes nothing, and the same action is performed once the device is admitted again.
+/// KR-REQ-23.44 and section 9: a materialisation asked for by a device whose registration was
+/// withdrawn is not performed, and the same request is performed once the device is admitted again.
+///
+/// The withdrawal here comes before the request, so what this holds is the door: the connection is
+/// gone and nothing is dispatched. What holds the authority in force while the store commits the
+/// effect is the change-set module's own hold, which this door hands the connection's admission to
+/// and which `tests/changeset.rs` withdraws authority inside, through the owner's door.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_materialisation_for_a_device_whose_authority_has_gone_writes_nothing() {
+async fn a_materialisation_asked_for_by_a_device_whose_authority_has_gone_is_not_performed() {
     let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
     let mut proposal = net_support::proposal(VERSION_RIGHTS);
@@ -2907,7 +2923,8 @@ async fn bind_for(
 struct Granted {
     host: Host,
     control: LocalClient,
-    device: net_support::Device,
+    /// The device's own endpoint, which has to live as long as its connection does.
+    _device: net_support::Device,
     session: Session,
     owner: DeviceKeys,
     record: kr_controller::service::net::devices::DeviceRecord,
@@ -2988,7 +3005,7 @@ impl Granted {
         Some(Self {
             host,
             control,
-            device,
+            _device: device,
             session,
             owner,
             record,
@@ -3300,6 +3317,7 @@ async fn authorise_owner_location(
 /// outside every directory the invocation was lent. Neither refusal repeats what the outside file
 /// holds. The control is the same repository with the link leading to a file inside the location,
 /// which is read and cloned from.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_nothing_outside_its_location_through_repository_content() {
     let Some(granted) = Granted::on_a_qualified_host(
@@ -3618,6 +3636,11 @@ async fn labelled(control: &mut LocalClient, env: EnvironmentId, label: &str) ->
 /// Tells the run of the test below inside a mount namespace where the location is.
 const INSIDE_A_NAMESPACE: &str = "KR_CONTROLLER_DEVICE_LOCATION_INSIDE_A_MOUNT_NAMESPACE";
 
+/// What the run inside the namespace says when it asserted the refusal, and when this host's
+/// daemon did not prove the boundary there and so asserted nothing.
+const INNER_ASSERTED: &str = "the mount refusal was asserted inside the namespace";
+const INNER_NOT_EXERCISED: &str = "the mount refusal was not exercised inside the namespace";
+
 /// Runs one clone as a device, from the repository `src` beneath `root`, into `into` beneath it.
 ///
 /// Both locations are the owner's, authorised for the device's grant over `root`. Returns none,
@@ -3712,8 +3735,8 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
         );
         let Some(outcome) = a_device_clones_from_a_repository_in(&root, "inside", test).await
         else {
-            // This host's daemon did not prove the boundary inside the namespace either; the run
-            // outside has said so.
+            // The run outside says so by name: a run that asserted nothing is not a pass.
+            println!("{INNER_NOT_EXERCISED}");
             return;
         };
         let refusal = outcome.expect_err("a clone from a repository with a mount beneath it");
@@ -3723,6 +3746,7 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
             "the refusal names the mount point: {said}"
         );
         assert!(!root.join("inside").exists(), "nothing was cloned");
+        println!("{INNER_ASSERTED}");
         return;
     }
     let Some(bwrap) = ["/usr/bin/bwrap", "/bin/bwrap"]
@@ -3772,6 +3796,16 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
     assert!(
         output.status.success() && report.contains("1 passed"),
         "the run inside the namespace passed: {report}"
+    );
+    if report.contains(INNER_NOT_EXERCISED) {
+        println!(
+            "not exercised: {test} asserted nothing, because this host's daemon did not prove Git's reads confined inside the namespace"
+        );
+        return;
+    }
+    assert!(
+        report.contains(INNER_ASSERTED),
+        "the run inside the namespace asserted the refusal: {report}"
     );
 }
 

@@ -511,10 +511,8 @@ fn version_in_scope(
     let refused = |detail: String| kr_automation::AutomationError::PermissionDenied(detail);
     crate::changeset::version_in_scope(
         changesets,
-        kr_protocol::changeset::VersionRef {
-            change_set_id: asked.change_set_id,
-            version: asked.version,
-        },
+        asked.change_set_id,
+        Some(asked.version),
         &VersionScope {
             environments: ScopedEnvironments::One(environment_id),
             workspace: definition.resource_scope.workspace_id.0,
