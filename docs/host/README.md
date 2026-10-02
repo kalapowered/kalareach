@@ -4423,6 +4423,16 @@ others exactly as they were, and withdrawing the interpreter grant also withdraw
 trust that depended on it, because a trust record nobody will act on is one somebody will
 eventually read as permission.
 
+The host reads an agent's state from three kinds of source: a framed message on the connector's own
+native connection, a documented machine-readable output, and text read from the terminal. Each event
+carries which of the three produced it, because provenance is never guessed from an event's shape.
+Only a native connection can carry an approval, and only the worker's own launch can open one: a
+terminal the worker launched, or a native bridge channel. The broker records a pending request when
+one of those delivers it, and nothing offers it to a person to answer until a decoder trusted for
+that package and method has interpreted it. Machine output and terminal text can be presented but
+cannot create a request, however accurate they are, so a permission prompt read from the screen or
+from a notification is never an approval.
+
 ### Decoding trust
 
 An installed connector is a semantic trust boundary, and the record that says so names the package
