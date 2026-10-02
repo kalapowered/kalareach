@@ -375,7 +375,8 @@ session_app() { case $1 in s0 | s1) echo app ;; s2a | s2b) echo harness-nofireba
 
 ending=0
 runner_pid=""
-forwarder_pid=""
+# How many lines of the runner's output have been looked through for what the tests say.
+forwarded=0
 # Whether the phone is clean afterwards, and whether the session's proofs held. A session that
 # leaves something behind keeps its record; one whose proof was not met ends with its own status.
 unclean=0
@@ -383,7 +384,6 @@ unproven=0
 
 # Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
 stop_runner() {
-  [ -n "$forwarder_pid" ] && kill "$forwarder_pid" 2>/dev/null
   if [ -n "$runner_pid" ] && kill -0 "$runner_pid" 2>/dev/null; then
     kill "$runner_pid" 2>/dev/null
     local waited=0
@@ -392,6 +392,20 @@ stop_runner() {
   fi
   wait "$runner_pid" 2>/dev/null
   runner_pid=""
+}
+
+# What the tests say goes to the person as it is said, with the time it arrived: an instruction to
+# lock the phone is useless afterwards, and the times show the output is live. It reads the lines the
+# runner has finished since the last call, nothing is left running between calls, and the lines are
+# kept in a file for the proofs.
+forward_what_the_tests_say() { # <the runner's output> <where the lines are kept>
+  local total
+  total=$(wc -l < "$1" 2>/dev/null || echo 0)
+  [ "$total" -gt "$forwarded" ] || return 0
+  tail -n +"$((forwarded + 1))" "$1" | grep -E 'KR-' | while IFS= read -r line; do
+    printf 'device-ios: [%s] %s\n' "$(date +%s)" "${line#*KR-}"
+  done | tee -a "$2"
+  forwarded=$total
 }
 
 # Copies the application's own pictures out of its container, before the uninstall takes them.
@@ -443,6 +457,8 @@ session() {
   started=$(date +%s)
   require_lease
   require_target
+  # Pictures an earlier run of this session left are not this run's, and the proof reads this run's.
+  rm -rf "${shots:?}/$name"
   mkdir -p "$work/checks" "$work/push" "$shots" "$raw"
   [ -f "$work/$(session_app "$name").app/Info.plist" ] || die "build the application first: build-app (the $(session_app "$name") build)"
   [ -f "$work/tests-$target.path" ] && [ -f "$(cat "$work/tests-$target.path")" ] || die "build the test runner first: build-tests"
@@ -480,18 +496,11 @@ session() {
   xcodebuild test-without-building -xctestrun "$(cat "$work/tests-$target.path")" -destination "$(destination)" \
     -resultBundlePath "$result" -collect-test-diagnostics never "${only[@]}" > "$out" 2>&1 &
   runner_pid=$!
-  # What the tests say goes to the person as it is said, with the time it arrived: an instruction to
-  # lock the phone is useless afterwards, and the time shows the output is live.
-  ( tail -n +1 -f "$out" 2>/dev/null | grep --line-buffered -E "KR-" | while IFS= read -r line; do
-      printf 'device-ios: [%s] %s\n' "$(date +%s)" "${line#*KR-}"
-    done ) > "$raw/live.out" &
-  forwarder_pid=$!
-  local sent=0 printed=0
+  local sent=0
+  forwarded=0
   while kill -0 "$runner_pid" 2>/dev/null; do
     sleep 2
-    local lines
-    lines=$(wc -l < "$raw/live.out" 2>/dev/null || echo 0)
-    if [ "$lines" -gt "$printed" ]; then tail -n +"$((printed + 1))" "$raw/live.out"; printed=$lines; fi
+    forward_what_the_tests_say "$out" "$raw/live.out"
     # A push leg says it is waiting once the application has its token and has been put away: the
     # one test notification goes then, to the token the application filed, and never twice for a step.
     local waiting
@@ -507,7 +516,7 @@ session() {
     fi
   done
   sleep 1
-  tail -n +"$((printed + 1))" "$raw/live.out" 2>/dev/null
+  forward_what_the_tests_say "$out" "$raw/live.out"
   wait "$runner_pid" 2>/dev/null
   local status=$?
   runner_pid=""
@@ -537,7 +546,8 @@ proofs() { # <live output>
 # colour compresses to almost nothing, so its file is small.
 check_shot_proof() { # <folder>
   local picture size width height
-  picture=$(ls "$1"/shot-*.png 2>/dev/null | head -1)
+  # Wherever the copy put it: devicectl may keep the folder's own name.
+  picture=$(find "$1" -name 'shot-*.png' 2>/dev/null | head -1)
   if [ -z "$picture" ]; then say "PROOF NOT MET: the application's picture of itself did not come out of its container"; unproven=1; return; fi
   width=$(sips -g pixelWidth "$picture" 2>/dev/null | awk '/pixelWidth/ {print $2}')
   height=$(sips -g pixelHeight "$picture" 2>/dev/null | awk '/pixelHeight/ {print $2}')
