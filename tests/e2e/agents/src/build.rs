@@ -114,7 +114,7 @@ pub struct RequestRecord {
 }
 
 /// The characters an agent draws the sides of a dialog with: not text of the dialog's rows.
-const FRAME: [char; 8] = ['│', '┃', '║', '╭', '╮', '╰', '╯', '─'];
+const FRAME: [char; 3] = ['│', '┃', '║'];
 
 /// A row of a dialog without the frame an agent draws around it, and without the spaces beside it:
 /// `│ │ echo a │ │` is `echo a`.
@@ -150,15 +150,21 @@ impl Approval {
                 at.len()
             ));
         };
+        // A command in a box of its own has the box's top border on the row above it and its bottom
+        // border on the row below, so nothing else is in the box.
+        let mut after_box = line + 1;
         if self.boxed {
-            let blank = |index: Option<usize>| {
-                index
-                    .and_then(|index| rows.get(index))
-                    .is_some_and(|row| unframed(row).is_empty())
+            let border = |index: Option<usize>, (open, close): (char, char)| {
+                index.and_then(|index| rows.get(index)).is_some_and(|row| {
+                    let row = unframed(row);
+                    row.starts_with(open) && row.ends_with(close)
+                })
             };
-            if !blank(line.checked_sub(1)) || !blank(Some(line + 1)) {
+            if !border(line.checked_sub(1), ('╭', '╮')) || !border(Some(line + 1), ('╰', '╯'))
+            {
                 return Err("the command is not alone in its box".to_owned());
             }
+            after_box = line + 2;
         }
         if let Some(prefix) = &self.command_line {
             let others = rows
@@ -171,7 +177,7 @@ impl Approval {
             }
         }
         if let Some(start) = &self.options_start {
-            let after = &rows[line + 1..];
+            let after = &rows[after_box..];
             let Some(end) = after.iter().position(|row| row.contains(start.as_str())) else {
                 return Err(format!(
                     "the dialog shows no {start:?} after the part's command"
@@ -1425,6 +1431,27 @@ mod tests {
                 "{extra:?}"
             );
         }
+        // A blank row inside the box, or a character of the frame's kind ending the command, is not
+        // the border and not a command that was verified.
+        let blank = [
+            "│ ╭───────╮ │",
+            "│ │ echo EXTRA >> /tmp/other │ │",
+            "│ │ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&blank), command).is_err());
+        let dashed = ["│ │ echo kr0123 >> /tmp/run/a─ │ │"];
+        assert!(gemini.names_only(&owned(&dashed), command).is_err());
+        let blank_below = [
+            "│ ╭───────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ │ │ │",
+            "│ │ echo Allow execution of x │ │",
+            "│ ╰───────╯ │",
+        ];
+        assert!(gemini.names_only(&owned(&blank_below), command).is_err());
     }
 
     #[test]

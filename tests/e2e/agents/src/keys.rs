@@ -84,17 +84,19 @@ pub fn scan_values_from_descriptor() -> Result<Vec<String>, String> {
     std::fs::File::open(format!("/dev/fd/{descriptor}"))
         .and_then(|mut file| file.read_to_string(&mut text))
         .map_err(|error| format!("descriptor {descriptor}: {error}"))?;
-    Ok(searchable_values(&text))
+    Ok(long_values(&text))
 }
 
-/// The lines of `text` that are long enough to be a key: at least [`SHORTEST`] characters. Every one
-/// is searched for in the run's directory; a result is held out of only those that
-/// [`crate::confine::searchable`] accepts, since the others cannot be told from the result's own
-/// syntax, and the harness searches the evidence for all of them.
+/// The values in `text`, one on each line, that are long enough to be a key: at least [`SHORTEST`]
+/// characters, a line's own end alone removed, so a value that ends in a carriage return keeps it.
 #[must_use]
-pub fn searchable_values(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|line| line.trim_end_matches('\r'))
+pub fn long_values(text: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last().is_some_and(|last| last.is_empty()) {
+        lines.pop();
+    }
+    lines
+        .into_iter()
         .filter(|line| line.chars().count() >= SHORTEST)
         .map(str::to_owned)
         .collect()
@@ -188,7 +190,6 @@ mod tests {
             "ANTHROPIC_MODEL",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_USE_BEDROCK",
-            "AWS_BEARER_TOKEN_BEDROCK",
             "CLOUD_ML_REGION",
             // Codex.
             "OPENAI_API_KEY",
@@ -228,7 +229,7 @@ mod tests {
             "AZURE_RESOURCE_NAME",
             "CLOUDFLARE_API_TOKEN",
             "SOME_PROVIDER_BASE_URL",
-            // Names from the catalogue of the pinned OpenCode that the first lists missed.
+            // Names the agents' own catalogues use.
             "WATSONX_AI_APIKEY",
             "CLARIFAI_PAT",
             "AICORE_SERVICE_KEY",
@@ -311,13 +312,13 @@ mod tests {
 
     /// Values to search for are the lines that are long enough.
     #[test]
-    fn every_long_value_is_searched_for_in_the_runs_directory() {
+    fn every_long_value_keeps_its_bytes() {
         let text = "short\nabcdefghijklmnop\nhas\"quote-and-more-text\r\nhas space but long enough\n\nabcdefghijklmnopq\n";
         assert_eq!(
-            searchable_values(text),
+            long_values(text),
             [
                 "abcdefghijklmnop",
-                "has\"quote-and-more-text",
+                "has\"quote-and-more-text\r",
                 "has space but long enough",
                 "abcdefghijklmnopq"
             ]

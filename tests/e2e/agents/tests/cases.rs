@@ -1978,6 +1978,18 @@ fn staged(
             .into_iter()
             .filter(|value| key.as_ref().is_none_or(|(_, own)| own != value))
             .collect();
+        // A value a result's own syntax could hide, because JSON writes it differently from the
+        // bytes the searches look for, cannot be held out or found in one: the part does not start.
+        let unsearchable = others
+            .iter()
+            .filter(|value| !confine::searchable(value))
+            .count();
+        assert!(
+            unsearchable == 0,
+            "{ISOLATION_UNPROVEN} {unsearchable} key value(s) the person's shell holds have a \
+             quote, bracket, backslash or control character, so a result could not be searched for \
+             them: unset them for the run"
+        );
         let person_home =
             PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
         let mut account = account;
@@ -4206,6 +4218,16 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             )
         });
     }
+    // The files an agent searches for up the tree come before any program of it runs, the probes
+    // included: one that was there would load into them.
+    for path in absent_paths(stage, Absent::Ancestors) {
+        assert!(
+            !path.exists(),
+            "{ISOLATION_UNPROVEN} {} exists, which an agent searches for up the tree and would load \
+             into its environment",
+            path.display()
+        );
+    }
     for probe in &account.isolated {
         guards_hold(stage);
         answered(probe).unwrap_or_else(|why| {
@@ -4217,7 +4239,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         });
     }
     confine_holds(stage);
-    for path in absent_paths(stage) {
+    for path in absent_paths(stage, Absent::All) {
         assert!(
             !path.exists(),
             "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks or \
@@ -4412,7 +4434,19 @@ fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
 /// The files the build list says must not exist before the agent starts, with `{config}` and
 /// `{work}` made the run's configuration and working directories, `{home}` the home the agent runs
 /// with, and `{user}` the account name the system has for the person, as `id -un` says it.
-fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
+/// Which of an entry's `absent` paths [`absent_paths`] gives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Absent {
+    /// Every path, each `{ancestors}` entry expanded for every folder above the working folder.
+    All,
+    /// Only the `{ancestors}` entries, expanded: the files an agent searches for up the tree, which
+    /// must be known absent before any program of the agent runs.
+    Ancestors,
+    /// Every path, with an `{ancestors}` entry as its template, for the record.
+    Published,
+}
+
+fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
     let home = login_home(stage).display().to_string();
     let config = stage
@@ -4457,6 +4491,7 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
     account
         .absent
         .iter()
+        .filter(|path| which != Absent::Ancestors || path.contains("{ancestors}"))
         .flat_map(|path| {
             let expand = |path: &str| {
                 PathBuf::from(
@@ -4467,7 +4502,9 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
                         .replace("{user}", &user),
                 )
             };
-            if path.contains("{ancestors}") {
+            if path.contains("{ancestors}") && which == Absent::Published {
+                vec![PathBuf::from(path)]
+            } else if path.contains("{ancestors}") {
                 folders
                     .iter()
                     .map(|folder| expand(&path.replace("{ancestors}", folder)))
@@ -4615,7 +4652,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
             "tools_offered": stage.offered.lock().map(|offered| offered.clone()).unwrap_or_default(),
             "switches": switches_of(stage),
             "servers_switched_off": server_names(stage),
-            "absent_before_start": absent_paths(stage),
+            "absent_before_start": absent_paths(stage, Absent::Published),
         },
     })
 }
@@ -7964,7 +8001,7 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
 
 /// The variables a person's own shell can hold that would give an agent another model account,
 /// with the harmless one a control passes alongside them: each with a value that is no key.
-const PROVIDER_KEYS_HELD: [&str; 32] = [
+const PROVIDER_KEYS_HELD: [&str; 35] = [
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "CODEX_API_KEY",
@@ -7994,6 +8031,9 @@ const PROVIDER_KEYS_HELD: [&str; 32] = [
     "AZURE_API_KEY",
     "CLOUDFLARE_API_TOKEN",
     "SOME_PROVIDER_BASE_URL",
+    "CLARIFAI_PAT",
+    "WATSONX_AI_APIKEY",
+    "PRIVATEMODE_ENDPOINT",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "KR_SESSION_TOKEN",
