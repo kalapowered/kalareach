@@ -901,28 +901,17 @@ fn plan_shown(paths: &HostPaths, json: bool) -> Result<()> {
 
 /// `kr host machine finish`.
 async fn finish(paths: &HostPaths, json: bool) -> Result<Completion> {
-    let Some(_) = load(paths)? else {
-        return Err(CliError::Usage(Shown::said("no merge plan is kept")));
-    };
+    // The plan is read under the lock, never before it: another command may be taking it to its
+    // results, or may have.
     let _lock = lock_plan(paths)?;
-    // Read again under the lock: another command may have taken the plan to its results meanwhile.
-    let Some(mut plan) = load(paths)? else {
+    let Some(plan) = load(paths)? else {
         return Err(CliError::Usage(Shown::said("no merge plan is kept")));
     };
-    // A merge the owner asked to undo has a step for each environment it moved, however the command
-    // that asked ended.
-    if !plan.missing_undo().is_empty() {
-        plan.with_the_missing_undo();
-        save(paths, &plan)?;
-    }
     take_steps(paths, plan, json).await
 }
 
 /// `kr host machine undo`.
 async fn undo(paths: &HostPaths, json: bool) -> Result<Completion> {
-    let Some(_) = load(paths)? else {
-        return Err(CliError::Usage(Shown::said("no merge plan is kept")));
-    };
     let _lock = lock_plan(paths)?;
     let Some(mut plan) = load(paths)? else {
         return Err(CliError::Usage(Shown::said("no merge plan is kept")));
@@ -947,7 +936,8 @@ async fn undo(paths: &HostPaths, json: bool) -> Result<Completion> {
         }
     }
     // Each moved environment gets a step that goes back, against the record the first one left. They
-    // are kept together with the owner's asking, so that no plan asks for an undo and lacks a step.
+    // are kept in the same save as the owner's asking, so that no plan kept asks for an undo and
+    // lacks a step.
     plan.with_the_missing_undo();
     save(paths, &plan)?;
     take_steps(paths, plan, json).await

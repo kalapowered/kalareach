@@ -165,6 +165,30 @@ fn run_kr(temp: &kr_ipc::testing::TempHost, bridges: Option<&Path>, line: &[&str
         .expect("kr runs")
 }
 
+/// The action identities this host's own environment holds a receipt for, as it keeps them.
+fn receipts_of(host: &Host) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        host.temp.environment().registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the registry");
+    let mut statement = connection
+        .prepare("SELECT action_id FROM authority_receipts")
+        .expect("reads the receipts");
+    statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .expect("reads the rows")
+        .map(|bytes| {
+            let bytes: [u8; 16] = bytes
+                .expect("a row")
+                .try_into()
+                .expect("an action identity is sixteen bytes");
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+                .to_string()
+        })
+        .collect()
+}
+
 /// A group, as `kr host machine --json` reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Group {
@@ -909,7 +933,13 @@ async fn a_step_is_first_sent_under_the_identity_the_plan_holds_for_it() {
     assert_eq!(
         text(&finished["steps"][1]["action_id"]),
         identity,
-        "the step was taken under the identity the plan held, not under another made on the way"
+        "the plan names the identity the step was sent under"
+    );
+    assert!(
+        receipts_of(&pair.b).contains(&identity),
+        "the environment holds its receipt under the identity the plan held, which is the one it \
+         was sent under: {:?}",
+        receipts_of(&pair.b)
     );
     assert_eq!(pair.b.group().machine_id, into);
 }
@@ -1006,7 +1036,7 @@ async fn only_one_command_at_a_time_works_on_the_plan() {
     let a_id = pair.a.environment_id();
     let into = a_group();
     pair.allow(1);
-    pair.a.failed(
+    let started = pair.a.failed(
         Some(pair.bridges.path()),
         &[
             "host",
@@ -1021,6 +1051,8 @@ async fn only_one_command_at_a_time_works_on_the_plan() {
             "bravo",
         ],
     );
+    assert_eq!(started["steps"][1]["state"], "unsent", "{started}");
+    assert!(pair.a.plan_file().exists(), "the merge kept its plan");
     pair.allow(10);
 
     let lock_path = pair.a.plan_file().with_file_name("machine-merge-plan.lock");
