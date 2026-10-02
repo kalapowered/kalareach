@@ -208,7 +208,8 @@ async fn started(enrolment: &EnvironmentEnrolment) -> Result<()> {
 pub async fn create(enrolment: &EnvironmentEnrolment, new: &NewSession) -> Result<Created> {
     let mut link = open(enrolment, BridgeTarget::Controller).await?;
     let made = create_over(&mut link, new, || open(enrolment, BridgeTarget::Controller)).await;
-    link.finish().await;
+    // A failure of the bridge is returned as the create's own, and is not said again.
+    link.finish_told().await;
     made
 }
 
@@ -298,7 +299,7 @@ where
 pub async fn locate(enrolment: &EnvironmentEnrolment, selector: &SessionSelector) -> Result<Found> {
     let mut link = open(enrolment, BridgeTarget::Controller).await?;
     let listed = listed(&mut link).await;
-    link.finish().await;
+    link.finish_told().await;
     let sessions = listed?.sessions;
     let found = sessions.into_iter().find(|summary| match selector {
         SessionSelector::Display(number) => summary.display_number.get() == *number,
@@ -352,7 +353,17 @@ pub async fn attach(
     let session_id = attaching.session_id;
     crate::session::run_over(
         attaching,
-        || open(enrolment, BridgeTarget::Session { session_id }),
+        || {
+            open(
+                enrolment,
+                BridgeTarget::Session {
+                    session_id,
+                    // This terminal takes the clipboard writes the session asks for only where the
+                    // owner named it as the environment's clipboard destination.
+                    clipboard_writes: enrolment.takes_clipboard_writes(),
+                },
+            )
+        },
         owed,
         options,
     )

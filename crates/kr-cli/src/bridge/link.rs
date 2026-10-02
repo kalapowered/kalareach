@@ -178,6 +178,14 @@ impl BridgedLink {
         self.stream.diagnostics().clone()
     }
 
+    /// Ends the connection after a command that was told why the bridge stopped, if it did, as
+    /// its own failure: what the command goes on to say is that failure, so it is not said twice.
+    /// What else there is to say of the helper is still said.
+    pub async fn finish_told(mut self) {
+        self.ended = None;
+        Link::finish(self).await;
+    }
+
     /// Ends the connection and the helper with it.
     ///
     /// # Errors
