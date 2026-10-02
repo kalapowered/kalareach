@@ -4562,12 +4562,12 @@ has taken the foreground, or the prompt has moved, the launch is refused — and
 whole answer. There is no path in this code that writes the command into whatever is reading the
 terminal.
 
-One saved conversation takes one live execution within a session. A launch intent that names a saved
-conversation is refused, and names the instance that owns it, while that live instance holds the
-conversation; an instance in another session is not seen. A native thread selection moves the
-reservation with it, so the conversation an instance left is free and the one it took is not. An
-instance holds a conversation when its bridge reports that it selected one, and a program the host
-adopted from the terminal holds none.
+Within a session, one live instance at a time holds a saved conversation. A launch intent that
+names a saved conversation is refused, and names the instance that owns it, while that live
+instance holds the conversation; an instance in another session is not seen. A native thread
+selection moves the reservation with it, so the conversation an instance left is free and the one it
+took is not. An instance holds a conversation when its bridge reports that it selected one, and a
+program the host adopted from the terminal holds none.
 
 Nothing in the host replaces a running agent with a second run of its saved conversation. An agent
 process starts only from the managed shell: from a command the person typed, or from one a client
