@@ -635,6 +635,22 @@ pub struct RawDevice {
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
+        Self::try_connect(host, device, record)
+            .await
+            .expect("the paired device connects")
+    }
+
+    /// Connects a device under the identity `record` gave it, and returns why the host did not let
+    /// it in where it did not: a device that is not paired with `host` is one such.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client's error when the connection is refused or cannot be made.
+    pub async fn try_connect(
+        host: &Host,
+        device: &Device,
+        record: &DeviceRecord,
+    ) -> std::result::Result<Self, kr_client::ClientError> {
         let pairing = host.network.pairing();
         let host_record = PairedPeer {
             device_id: pairing.identity().device_id,
@@ -656,17 +672,16 @@ impl RawDevice {
             &host_record,
             SendLimits::default(),
         )
-        .await
-        .expect("the paired device connects");
+        .await?;
         let action_window_id = {
             use kr_client::transport::ControlTransport as _;
             transport.initial_action_window().action_window_id.clone()
         };
-        Self {
+        Ok(Self {
             transport,
             action_window_id,
             next_request: std::sync::atomic::AtomicU64::new(1),
-        }
+        })
     }
 
     /// Submits one mutation under the action identity given, and returns what the host answered.

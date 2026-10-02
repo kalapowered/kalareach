@@ -750,40 +750,482 @@ async fn a_claim_nobody_finished_that_the_record_does_not_name_is_an_outcome_nob
     host.stop().await;
 }
 
-/// The bytes and metadata of the files that a step must leave alone: the host's identity file, the
-/// environment's markers and the secret store.
-fn untouched_files(host: &Host) -> BTreeMap<PathBuf, (Vec<u8>, u64)> {
+/// The local owner's identity, as the daemon names it in its own records.
+fn local_owner() -> kr_protocol::ids::ActorId {
+    kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("the local principal")
+}
+
+/// What the daemon's records hold of a step's action, or `None` where it never claimed it.
+fn claim_of(host: &Host, step: &MutationRequest) -> Option<kr_controller::grants::ActionRecord> {
+    let actor = local_owner();
+    let digest = kr_protocol::digest::mutation_digest(step, &actor).expect("a digest");
+    host.controller()
+        .sharing()
+        .grants()
+        .recorded_action(&actor, step.action_id, &digest)
+        .expect("the registry reads")
+}
+
+/// The refusals and the unknown outcomes a step is answered with carry no path of this host's
+/// state: an answer can reach a paired device.
+fn assert_names_no_path(host: &Host, answer: &ProtocolError) {
+    let state = host.tree().environment().state_dir().display().to_string();
+    assert!(
+        !answer.message.contains(&state) && !answer.message.contains(RECORD_FILE_PATH_MARKER),
+        "the answer names the state directory: {}",
+        answer.message
+    );
+}
+
+/// What a path of the machine group record would show in a message.
+const RECORD_FILE_PATH_MARKER: &str = "/machine-group";
+
+/// KR-REQ-03.07: a step is not taken while the change an earlier step made cannot be confirmed to
+/// survive a crash. A wrote the record and its attempt ended before its receipt; the flush that
+/// settles A before the next step fails. B is refused before it claims anything, the record is still
+/// A's, and a retry of A is an outcome nobody knows, with no path in the answer, instead of a result
+/// the record cannot yet vouch for. Once the flush works, A is answered from the record and B goes
+/// through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_is_not_taken_while_the_change_before_it_cannot_be_confirmed() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+
+    host.controller().lose_the_next_machine_receipt();
+    let a = composed_join(&host, &mut client, some_group(0xa1), &minted).await;
+    let lost = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the attempt ended before it answered");
+    assert_eq!(lost.code, ErrorCode::OutcomeUnknown);
+    let written = group_of(&mut client).await;
+    assert_eq!(
+        written.machine_id,
+        some_group(0xa1),
+        "the record was written"
+    );
+
+    host.controller().fail_the_machine_recovery_flush(true);
+    let b = composed_join(&host, &mut client, some_group(0xa2), &written).await;
+    let refused = client
+        .repeat(&b)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("a change nobody can confirm blocks the next step");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+    assert_names_no_path(&host, &refused);
+    assert_eq!(
+        group_of(&mut client).await,
+        written,
+        "the next step replaced a record whose change was not confirmed"
+    );
+    assert!(
+        claim_of(&host, &b).is_none(),
+        "a step that was refused before anything changed claimed its action"
+    );
+
+    // A retry of A is not answered from a record that cannot be vouched for.
+    let unknown = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("what the record shows cannot be confirmed yet");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+
+    // The flush works again: A is answered from the record, and B, under a new action, goes
+    // through and does not take A's answer with it.
+    host.controller().fail_the_machine_recovery_flush(false);
+    let answered = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect("is answered from the record once it can be confirmed");
+    assert_eq!(typed::<MachineStepResult>(&answered).machine, written);
+    let next = join(&host, &mut client, some_group(0xa2), &written)
+        .await
+        .expect("the next step goes through");
+    let still = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect("is answered from its receipt");
+    assert_eq!(typed::<MachineStepResult>(&still).machine, written);
+    assert_eq!(group_of(&mut client).await, next.machine);
+
+    drop(client);
+    host.stop().await;
+}
+
+/// KR-REQ-03.07: a retry of an unfinished step is answered from what the claim holds once it has its
+/// turn, not from what the record showed when it first looked. A wrote the record and its attempt
+/// ended before its receipt. A's retry finds the claim unfinished and is stopped before it takes its
+/// turn; B, under another action, settles A's claim from the record and moves the record on; the
+/// retry then goes on, and is answered with A's result, where an answer read from the record as it
+/// stands now would be an outcome nobody knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_that_looked_before_another_step_settled_its_claim_is_answered_from_it() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let mut other = host.client().await;
+
+    host.controller().lose_the_next_machine_receipt();
+    let a = composed_join(&host, &mut client, some_group(0xa7), &minted).await;
+    client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the attempt ended before it answered");
+    let written = group_of(&mut other).await;
+    assert!(
+        matches!(
+            claim_of(&host, &a),
+            Some(kr_controller::grants::ActionRecord::Unfinished)
+        ),
+        "A's claim is unfinished: {:?}",
+        claim_of(&host, &a)
+    );
+
+    let answer = held(
+        host.controller(),
+        Point::Retry,
+        async move {
+            let answer = client.repeat(&a).await.expect("reaches the daemon");
+            (client, answer)
+        },
+        async {
+            join(&host, &mut other, some_group(0xa8), &written)
+                .await
+                .expect("B settles A's claim and moves the record on");
+        },
+    )
+    .await
+    .expect("the retry's connection stands");
+    let result: MachineStepResult = typed(&answer.1.expect("answered from A's claim"));
+    assert_eq!(
+        result.machine, written,
+        "the retry was answered with a record that was not A's"
+    );
+
+    drop(answer.0);
+    drop(other);
+    host.stop().await;
+}
+
+/// KR-REQ-03.07: a step that wrote the record and could not confirm that its directory survives a
+/// crash is an outcome nobody knows, at either door, and its answer names no path: a paired device
+/// is given it. The record shows the change, so asking again under the same action is answered from
+/// the record once the flush works, and the step is never performed twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_directory_could_not_be_flushed_is_an_outcome_nobody_knows_that_names_no_path()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut local = host.client().await;
+    let minted = group_of(&mut local).await;
+    let device = Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+
+    // At the device door.
+    host.controller()
+        .report_the_next_machine_write_as_unconfirmed();
+    let a = action();
+    let first = joining(some_group(0xa3), &minted);
+    let unknown = connection
+        .mutate(Method::MachineJoin, a, target(&host), &first)
+        .await
+        .expect_err("whether the change survives a crash is not known");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+    let written = group_of(&mut local).await;
+    assert_eq!(
+        written.machine_id,
+        some_group(0xa3),
+        "the record shows the change"
+    );
+    // The same action again, over the same connection: answered from the record, not performed.
+    let again: MachineStepResult = typed(
+        &connection
+            .mutate(Method::MachineJoin, a, target(&host), &first)
+            .await
+            .expect("is answered from the record"),
+    );
+    assert_eq!(again.machine, written);
+    assert_eq!(group_of(&mut local).await, written);
+
+    // At the daemon's own socket.
+    host.controller()
+        .report_the_next_machine_write_as_unconfirmed();
+    let b = composed_join(&host, &mut local, some_group(0xa4), &written).await;
+    let unknown = local
+        .repeat(&b)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("whether the change survives a crash is not known");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_names_no_path(&host, &unknown);
+    let answered = local
+        .repeat(&b)
+        .await
+        .expect("reaches the daemon")
+        .expect("is answered from the record");
+    let b_group = group_of(&mut local).await;
+    assert_eq!(b_group.machine_id, some_group(0xa4));
+    assert_eq!(typed::<MachineStepResult>(&answered).machine, b_group);
+
+    connection.close();
+    drop(local);
+    host.stop().await;
+}
+
+/// KR-REQ-03.07: a step that wrote the record is answered with its result even when its receipt
+/// cannot be kept: the answer never says a change did not happen after it did. The claim stays
+/// unfinished, and the record, which names the step, answers a retry, at either door, with the same
+/// result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_receipt_cannot_be_kept_is_answered_with_its_result() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut local = host.client().await;
+    let minted = group_of(&mut local).await;
+    let device = Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+
+    // At the daemon's own socket.
+    host.controller().make_the_next_machine_receipt_unwritable();
+    let a = composed_join(&host, &mut local, some_group(0xa5), &minted).await;
+    let result: MachineStepResult = typed(
+        &local
+            .repeat(&a)
+            .await
+            .expect("reaches the daemon")
+            .expect("the record was written, so the step is answered with its result"),
+    );
+    assert_eq!(result.machine.machine_id, some_group(0xa5));
+    assert!(
+        matches!(
+            claim_of(&host, &a),
+            Some(kr_controller::grants::ActionRecord::Unfinished)
+        ),
+        "the receipt was not kept: {:?}",
+        claim_of(&host, &a)
+    );
+    let retried: MachineStepResult = typed(
+        &local
+            .repeat(&a)
+            .await
+            .expect("reaches the daemon")
+            .expect("is answered from the record"),
+    );
+    assert_eq!(retried, result);
+    assert!(
+        matches!(
+            claim_of(&host, &a),
+            Some(kr_controller::grants::ActionRecord::Answered { .. })
+        ),
+        "the retry kept the answer"
+    );
+
+    // At the device door.
+    host.controller().make_the_next_machine_receipt_unwritable();
+    let b = action();
+    let params = joining(some_group(0xa6), &result.machine);
+    let device_result: MachineStepResult = typed(
+        &connection
+            .mutate(Method::MachineJoin, b, target(&host), &params)
+            .await
+            .expect("the record was written, so the step is answered with its result"),
+    );
+    assert_eq!(device_result.machine.machine_id, some_group(0xa6));
+    let retried: MachineStepResult = typed(
+        &connection
+            .mutate(Method::MachineJoin, b, target(&host), &params)
+            .await
+            .expect("is answered from the record"),
+    );
+    assert_eq!(retried, device_result);
+    assert_eq!(group_of(&mut local).await, device_result.machine);
+
+    connection.close();
+    drop(local);
+    host.stop().await;
+}
+
+/// What a file holds and what its metadata says: a rewrite with equal bytes, a replaced file and a
+/// changed mode each change one of these.
+#[derive(Debug, PartialEq, Eq)]
+struct Kept {
+    bytes: Vec<u8>,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl Kept {
+    fn of(path: &Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            bytes,
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            mode: std::os::unix::fs::MetadataExt::mode(&metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+        })
+    }
+}
+
+/// Every file of the host's own that a step must leave alone: the host's identity file, the
+/// environment's markers, its secret store, and everything else in its state directory but the
+/// machine group record, which the step writes, and the registry, which is compared by its rows.
+fn untouched_files(host: &Host) -> BTreeMap<PathBuf, Kept> {
     let paths = host.tree().paths();
     let environment = host.tree().environment();
+    let registry = environment.registry_database();
+    let registry_name = registry
+        .file_name()
+        .expect("the registry has a name")
+        .to_string_lossy()
+        .into_owned();
     let mut found = BTreeMap::new();
     let mut take = |path: &Path| {
-        if let Ok(bytes) = std::fs::read(path) {
-            let length = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-            found.insert(path.to_path_buf(), (bytes, length));
+        if let Some(kept) = Kept::of(path) {
+            found.insert(path.to_path_buf(), kept);
         }
     };
     take(&paths.environment_id_file());
-    take(&environment.state_dir().join("environment"));
     take(&environment.runtime_dir().join("environment"));
-    fn walk(directory: &Path, take: &mut impl FnMut(&Path)) {
+    fn walk(directory: &Path, skip: &dyn Fn(&Path) -> bool, take: &mut impl FnMut(&Path)) {
         let Ok(entries) = std::fs::read_dir(directory) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if skip(&path) {
+                continue;
+            }
             if path.is_dir() {
-                walk(&path, take);
+                walk(&path, skip, take);
             } else {
                 take(&path);
             }
         }
     }
-    walk(&environment.secrets_dir(), &mut take);
+    walk(&environment.secrets_dir(), &|_| false, &mut take);
+    walk(
+        environment.state_dir(),
+        &|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            name == RECORD_FILE
+                || name.starts_with(&registry_name)
+                || name.starts_with(".machine-group.")
+        },
+        &mut take,
+    );
     found
 }
 
-/// What the registry holds of the people and the sessions, as rows: the devices, the grants, and
-/// the sessions the daemon knows.
+/// Every row of every table of the registry but the tables named, each rendered as text, so that a
+/// row written, changed or removed shows. The registry holds the daemon's grants, devices,
+/// reservations, workers and tombstones, which are the sessions and the people it knows.
+fn registry_rows(host: &Host, except: &[&str]) -> BTreeMap<String, Vec<String>> {
+    let connection = rusqlite::Connection::open_with_flags(
+        host.registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the registry");
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .expect("lists the tables")
+        .query_map([], |row| row.get(0))
+        .expect("reads the tables")
+        .collect::<std::result::Result<_, _>>()
+        .expect("table names");
+    let mut found = BTreeMap::new();
+    for table in tables {
+        if except.contains(&table.as_str()) {
+            continue;
+        }
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .expect("reads the table");
+        let columns = statement.column_count();
+        let mut rows: Vec<String> = statement
+            .query_map([], |row| {
+                let mut values = Vec::new();
+                for column in 0..columns {
+                    values.push(format!("{:?}", row.get_ref(column)?));
+                }
+                Ok(values.join(" | "))
+            })
+            .expect("reads the rows")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        rows.sort();
+        found.insert(table, rows);
+    }
+    found
+}
+
+/// Gives the registry a closed session and a fenced reservation, so that what a step must leave
+/// alone includes session identifiers and the rows that hold them.
+fn hold_sessions(host: &Host, byte: u8) {
+    let connection =
+        rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    connection
+        .execute(
+            "INSERT INTO tombstones (session_id, record, closed_at_ms) VALUES (?1, ?2, ?3)",
+            rusqlite::params![vec![byte; 16], vec![byte, 1, 2, 3], 1_i64],
+        )
+        .expect("a closed session");
+    connection
+        .execute(
+            "INSERT INTO reservations (reservation_id, actor_id, create_token, payload_digest, \
+             create_intent, session_id, display_number, phase, created_at_ms) \
+             VALUES (?1, 'local:1', ?2, ?3, NULL, ?4, ?5, 'fenced', 1)",
+            rusqlite::params![
+                vec![byte.wrapping_add(1); 16],
+                vec![byte.wrapping_add(2); 16],
+                vec![byte.wrapping_add(3); 32],
+                vec![byte.wrapping_add(4); 16],
+                i64::from(byte),
+            ],
+        )
+        .expect("a fenced reservation");
+}
+
+/// What the registry holds of the people the daemon knows, through its own interfaces: the devices
+/// and the grants.
 fn rows_of_authority(host: &Host) -> String {
     let devices = host.controller().devices().devices().expect("devices");
     let grants = host
@@ -795,10 +1237,66 @@ fn rows_of_authority(host: &Host) -> String {
     format!("{devices:#?}\n{grants:#?}")
 }
 
+/// Whether `host` lets `device`, which presents the identity `record` gave it, in and answer it.
+async fn lets_in(
+    host: &Host,
+    device: &Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+) -> bool {
+    match RawDevice::try_connect(host, device, record).await {
+        Ok(connection) => {
+            let answered = connection.read(Method::HostInfo, &()).await.is_ok();
+            connection.close();
+            answered
+        }
+        Err(_) => false,
+    }
+}
+
+/// The enrolments the daemon holds, as `environment.inventory` reads them from its store.
+async fn enrolments_of(
+    client: &mut LocalClient,
+) -> Vec<kr_protocol::identity::EnvironmentEnrolment> {
+    let inventory: kr_protocol::identity::EnvironmentInventoryResult = typed(
+        &client
+            .request(
+                Method::EnvironmentInventory,
+                &kr_protocol::identity::EnvironmentInventoryParams {
+                    access: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.inventory is served"),
+    );
+    inventory
+        .rows
+        .into_iter()
+        .map(|row| row.enrolment)
+        .collect()
+}
+
+/// The groups `environment.list` reports, which is this environment's own and no other's.
+async fn listed_groups(client: &mut LocalClient) -> Vec<(EnvironmentId, Option<MachineGroup>)> {
+    let list: EnvironmentListResult = typed(
+        &client
+            .request(Method::EnvironmentList, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.list is served"),
+    );
+    list.environments
+        .into_iter()
+        .map(|row| (row.environment_id, row.machine))
+        .collect()
+}
+
 /// KR-REQ-03.11: grouping grants nothing. A device paired with one environment of a group gains
 /// nothing on the other: no grant, no visibility, no route and no pairing there. A step that
-/// changes an environment's group leaves its keys, its grants, its devices and its identity file as
-/// they were, and an environment's group is not what a bridge enrolment changes.
+/// changes an environment's group leaves its keys, its grants, its devices, its session identifiers,
+/// its enrolments and its identity file as they were, bytes, mode, modification time and file
+/// identity included, and every row of its registry but the step's own receipt, and an environment's
+/// group is not what a bridge enrolment changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_the_group() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -818,16 +1316,67 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
     .await;
     let connection = RawDevice::connect(&first, &device, &record).await;
 
+    // The second environment enrols another environment before its group changes, and both
+    // registries hold a closed session and a fenced reservation.
+    let enrolled_id = EnvironmentId::new(Uuid::from_bytes([9; 16]));
+    let enrolment = kr_protocol::identity::EnvironmentEnrolment {
+        environment_id: enrolled_id,
+        access: kr_protocol::identity::EnvironmentAccess::SshHost,
+        label: "elsewhere".to_owned(),
+        target: "elsewhere.example".to_owned(),
+        os_user: "kala".to_owned(),
+        helper_path: "/usr/local/bin/kr".to_owned(),
+        clipboard_destination: Nullable::null(),
+        approved_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+    };
+    second_client
+        .mutate(
+            Method::EnvironmentEnrol,
+            action(),
+            target(&second),
+            &kr_protocol::identity::EnvironmentEnrolParams { enrolment },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("enrols an environment");
+    hold_sessions(&first, 0x30);
+    hold_sessions(&second, 0x50);
+
     let first_before = group_of(&mut first_client).await;
     let second_before = group_of(&mut second_client).await;
     assert_ne!(first_before.machine_id, second_before.machine_id);
+    let second_enrolments = enrolments_of(&mut second_client).await;
+    assert_eq!(second_enrolments.len(), 1, "the enrolment is in the store");
+    assert_eq!(
+        listed_groups(&mut second_client)
+            .await
+            .iter()
+            .map(|(environment, _)| *environment)
+            .collect::<Vec<_>>(),
+        vec![second.environment_id],
+        "an enrolled environment's group is read from itself, never from the enrolment: the list \
+         holds this environment alone"
+    );
     let first_files = untouched_files(&first);
-    let first_rows = rows_of_authority(&first);
+    let first_authority = rows_of_authority(&first);
+    let first_rows = registry_rows(&first, &["authority_receipts", "network_actions"]);
     let second_files = untouched_files(&second);
-    let second_rows = rows_of_authority(&second);
+    let second_authority = rows_of_authority(&second);
+    let second_rows = registry_rows(&second, &["authority_receipts"]);
     assert!(
-        !second_rows.contains(&format!("{:?}", record.device_id)),
+        second_files.len() > 3
+            && second_rows["tombstones"].len() == 1
+            && second_rows["reservations"].len() == 1,
+        "the comparison holds files and session rows to compare"
+    );
+    assert!(
+        !second_authority.contains(&format!("{:?}", record.device_id)),
         "the second environment knows nothing of the device before the group"
+    );
+    // No visibility, no route and no pairing: the device is not let in to the second environment.
+    assert!(
+        !lets_in(&second, &device, &record).await,
+        "the device reached the second environment before any group"
     );
 
     // The owner puts both environments in one group, each by its own step.
@@ -850,9 +1399,14 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         Some(shared)
     );
     assert_eq!(
-        second_rows,
+        second_authority,
         rows_of_authority(&second),
         "no grant, device or pairing appeared on the second environment"
+    );
+    assert_eq!(
+        second_rows,
+        registry_rows(&second, &["authority_receipts"]),
+        "the join changed a row of the second environment's registry"
     );
     assert!(
         second
@@ -864,19 +1418,25 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         "the device is not paired with the second environment"
     );
     assert!(
-        second
-            .controller()
-            .devices()
-            .action_route(&device_principal(&record), action())
-            .expect("readable")
-            .is_none(),
-        "no route to the second environment was made for the device"
+        !lets_in(&second, &device, &record).await,
+        "the group let the device into the second environment"
     );
-    // Nothing of what it took to change the group touched the second environment's own files.
+    // Nothing of what it took to change the group touched the second environment's own files, its
+    // enrolments included, and the enrolment still names no group.
     assert_eq!(second_files, untouched_files(&second));
+    assert_eq!(
+        enrolments_of(&mut second_client).await,
+        second_enrolments,
+        "the group change touched the enrolment"
+    );
+    assert_eq!(
+        listed_groups(&mut second_client).await,
+        vec![(second.environment_id, Some(joined.machine.clone()))],
+        "the list reports the new group for this environment and no other"
+    );
 
     // A step on the first environment, taken by the device that manages it, changes only the
-    // record there.
+    // record there, and the receipt and the route its own door keeps.
     let moved: MachineStepResult = typed(
         &connection
             .mutate(
@@ -898,15 +1458,22 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
     );
     assert_eq!(first_files, untouched_files(&first));
     assert_eq!(
-        first_rows,
+        first_authority,
         rows_of_authority(&first),
         "a step leaves the grants and the devices as they were"
     );
+    assert_eq!(
+        first_rows,
+        registry_rows(&first, &["authority_receipts", "network_actions"]),
+        "a step changed a row of the registry other than its own receipt and route"
+    );
 
-    // The control: the comparisons above do detect a pairing. The same device paired with the
-    // second environment on purpose, by that environment's own owner, changes its rows and makes
-    // it known there, so what held before was the absence of a pairing and not a blind check.
-    net_support::pair_with(
+    // The controls: the comparisons above do detect what they claim to. The same device paired with
+    // the second environment on purpose, by that environment's own owner, changes its rows, makes it
+    // known there and lets it in; and a file rewritten with the bytes it already held is a change
+    // the file comparison sees. What held before was the absence of a pairing and of a change, and
+    // not a blind check.
+    let second_record = net_support::pair_with(
         &second,
         &device,
         &owner,
@@ -914,9 +1481,14 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
     )
     .await;
     assert_ne!(
-        second_rows,
+        second_authority,
         rows_of_authority(&second),
         "an explicit pairing is a change the comparison sees"
+    );
+    assert_ne!(
+        second_rows,
+        registry_rows(&second, &["authority_receipts"]),
+        "an explicit pairing is a change the registry comparison sees"
     );
     assert!(
         second
@@ -928,14 +1500,26 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
             .any(|known| known.endpoint_id == record.endpoint_id),
         "the device is known to the second environment once it is paired with it"
     );
+    assert!(
+        lets_in(&second, &device, &second_record).await,
+        "the device is let in where it is paired"
+    );
+    let marker = second.tree().environment().state_dir().join("environment");
+    let held = std::fs::read(&marker).expect("the environment marker");
+    std::fs::write(&marker, &held).expect("rewrites the marker with the bytes it held");
+    assert_ne!(
+        second_files,
+        untouched_files(&second),
+        "a rewrite with equal bytes is a change the file comparison sees"
+    );
 
-    // An environment's group is not what a bridge enrolment changes.
+    // An environment's group is not what a bridge enrolment changes, on the first environment too.
     let enrolled_before = group_of(&mut first_client).await;
-    let enrolment = kr_protocol::identity::EnvironmentEnrolment {
-        environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+    let other = kr_protocol::identity::EnvironmentEnrolment {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([10; 16])),
         access: kr_protocol::identity::EnvironmentAccess::SshHost,
-        label: "elsewhere".to_owned(),
-        target: "elsewhere.example".to_owned(),
+        label: "another".to_owned(),
+        target: "another.example".to_owned(),
         os_user: "kala".to_owned(),
         helper_path: "/usr/local/bin/kr".to_owned(),
         clipboard_destination: Nullable::null(),
@@ -946,7 +1530,7 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
             Method::EnvironmentEnrol,
             action(),
             target(&first),
-            &kr_protocol::identity::EnvironmentEnrolParams { enrolment },
+            &kr_protocol::identity::EnvironmentEnrolParams { enrolment: other },
         )
         .await
         .expect("reaches the daemon")
@@ -964,16 +1548,11 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
     second.stop().await;
 }
 
-fn device_principal(
-    record: &kr_controller::service::net::devices::DeviceRecord,
-) -> kr_protocol::ids::ActorId {
-    record.principal()
-}
-
 /// KR-REQ-03.07: a step that wrote nothing is answered as refused, and asked again under the same
 /// action it is answered the same way, never as an outcome nobody knows. A record that became
-/// unreadable while the daemon ran makes the step fail before it writes; the action is spent, and
-/// the owner asks again under a new one once the record is whole.
+/// unreadable while the daemon ran makes the step fail before it claims anything, so the action is
+/// not spent: asked again it gets the same refusal, and the owner's step goes through once the
+/// record is whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_that_wrote_nothing_is_answered_as_refused_every_time_it_is_asked() {
     let host = Host::start_unowned().await;
@@ -991,6 +1570,10 @@ async fn a_step_that_wrote_nothing_is_answered_as_refused_every_time_it_is_asked
         .expect("reaches the daemon")
         .expect_err("the record cannot be read");
     assert_eq!(first.code, ErrorCode::StorageUnavailable);
+    assert!(
+        claim_of(&host, &a).is_none(),
+        "a step that could not read the record claimed its action"
+    );
     for _ in 0..2 {
         let again = client
             .repeat(&a)
@@ -1010,6 +1593,50 @@ async fn a_step_that_wrote_nothing_is_answered_as_refused_every_time_it_is_asked
         .await
         .expect("takes the step under a new action");
     assert_eq!(joined.machine.machine_id, some_group(0xd2));
+
+    drop(client);
+    host.stop().await;
+}
+
+/// KR-REQ-03.07: a step that claimed its action and then could not write the record is a refusal
+/// the claim keeps: it changed nothing, so asked again under the same action it is answered the same
+/// way and never as an outcome nobody knows, and its answer names no path. A new action takes the
+/// step once the disk can be written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_that_claimed_its_action_and_could_not_write_keeps_its_refusal() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+
+    host.controller().fail_the_next_machine_write();
+    let a = composed_join(&host, &mut client, some_group(0xd3), &minted).await;
+    let first = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the record cannot be written");
+    assert_eq!(first.code, ErrorCode::StorageUnavailable);
+    assert_names_no_path(&host, &first);
+    assert!(
+        matches!(
+            claim_of(&host, &a),
+            Some(kr_controller::grants::ActionRecord::Refused { .. })
+        ),
+        "the refusal was kept under the claim: {:?}",
+        claim_of(&host, &a)
+    );
+    let again = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the same refusal");
+    assert_eq!(again.code, ErrorCode::StorageUnavailable);
+    assert_eq!(group_of(&mut client).await, minted, "nothing was written");
+
+    let joined = join(&host, &mut client, some_group(0xd4), &minted)
+        .await
+        .expect("a new action takes the step");
+    assert_eq!(joined.machine.machine_id, some_group(0xd4));
 
     drop(client);
     host.stop().await;
@@ -1052,22 +1679,38 @@ async fn an_unreadable_or_foreign_record_is_refused_and_kept_and_moving_it_aside
         assert!(text.contains("restart"), "{text}");
         assert!(text.contains("kr host machine join"), "{text}");
 
-        // A step is refused, writes nothing and claims nothing.
-        let refused = local_step(
-            &host,
-            &mut client,
-            Method::MachineSplit,
-            action(),
-            &MachineSplitParams {
-                expected: MachineExpected {
-                    machine_id: some_group(1),
-                    revision: U64::new(1),
+        // A step is refused, writes nothing and claims nothing, however often it is asked.
+        let step = client
+            .compose(
+                Method::MachineSplit,
+                action(),
+                target(&host),
+                &MachineSplitParams {
+                    expected: MachineExpected {
+                        machine_id: some_group(1),
+                        revision: U64::new(1),
+                    },
                 },
-            },
-        )
-        .await
-        .expect_err("a daemon with no group takes no step");
+            )
+            .await
+            .expect("composes");
+        let refused = client
+            .repeat(&step)
+            .await
+            .expect("reaches the daemon")
+            .expect_err("a daemon with no group takes no step");
         assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+        assert!(
+            claim_of(&host, &step).is_none(),
+            "a daemon with no group claimed the step's action, which would turn the next answer \
+             into an outcome nobody knows"
+        );
+        let again = client
+            .repeat(&step)
+            .await
+            .expect("reaches the daemon")
+            .expect_err("the same refusal");
+        assert_eq!(again.code, ErrorCode::StorageUnavailable);
         assert!(
             !refused
                 .message
@@ -1118,6 +1761,8 @@ enum Point {
     /// Once its new record is written and flushed, before the record is replaced and the authority
     /// is asked about for the last time.
     AtTheReplacement,
+    /// For a retry: once it has found its action's claim unfinished, before it takes its turn.
+    Retry,
 }
 
 /// Runs `step`, stops it at `point` while `between` runs, and then lets it go. Returns what the step
@@ -1147,6 +1792,13 @@ where
             (
                 arrived,
                 Box::new(move || go.send(()).expect("lets the step go")),
+            )
+        }
+        Point::Retry => {
+            let (arrived, go) = controller.hold_the_next_machine_retry();
+            (
+                arrived,
+                Box::new(move || go.send(()).expect("lets the retry go")),
             )
         }
     };

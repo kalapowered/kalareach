@@ -68,6 +68,10 @@ pub(super) struct Machine {
     /// the record is replaced. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_publication: PublicationPause,
+    /// Where this host's own tests stop a retry that has just found its action's claim unfinished,
+    /// before it takes its turn. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_claim_is_read: super::ReadPause,
 }
 
 /// A point on the blocking thread that replaces the record, which a test can stop a step at: the
@@ -114,8 +118,8 @@ impl PublicationPause {
     }
 }
 
-/// What this host's own tests make fail. Each flag but the last is taken by the first step to meet
-/// it.
+/// What this host's own tests make fail. Each flag but one is taken by the first step to meet it;
+/// the recovery flush fails for as long as it is set.
 #[cfg(feature = "testing")]
 #[derive(Default)]
 struct Faults {
@@ -127,6 +131,9 @@ struct Faults {
     write_unconfirmed: std::sync::atomic::AtomicBool,
     /// The flush that settles an earlier step fails for as long as this is set.
     recovery_flush_fails: std::sync::atomic::AtomicBool,
+    /// The step's write fails before it changes anything, as a disk that cannot be written would
+    /// make it.
+    write_fails: std::sync::atomic::AtomicBool,
 }
 
 /// The record, or why there is none to use.
@@ -175,6 +182,8 @@ impl Machine {
             before_the_write: super::ReadPause::default(),
             #[cfg(feature = "testing")]
             before_the_publication: PublicationPause::default(),
+            #[cfg(feature = "testing")]
+            after_the_claim_is_read: super::ReadPause::default(),
         })
     }
 }
@@ -385,6 +394,25 @@ impl Controller {
                     detail: NO_RECORD.to_owned(),
                 });
             };
+            #[cfg(feature = "testing")]
+            if controller
+                .machine
+                .faults
+                .write_fails
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ControllerError::Storage {
+                    operation: "write the machine group record",
+                    detail: format!(
+                        "{}: a test made the write fail",
+                        controller
+                            .paths
+                            .state_dir()
+                            .join(crate::machine::RECORD_FILE)
+                            .display()
+                    ),
+                });
+            }
             // A caller whose authority is already gone is refused before it is told anything of
             // the record, such as that its precondition no longer holds.
             controller.check_registration(&carried)?;
@@ -512,6 +540,8 @@ impl Controller {
             {
                 Ok(None) => return None,
                 Ok(Some(crate::grants::ActionRecord::Unfinished)) => {
+                    #[cfg(feature = "testing")]
+                    self.machine.after_the_claim_is_read.wait().await;
                     self.machine_unfinished(actor_id, mutation.action_id, &digest)
                         .await
                 }
@@ -716,6 +746,19 @@ impl Controller {
         self.machine.before_the_publication.arm()
     }
 
+    /// Stops the next retry of a machine group step that has found its action's claim unfinished,
+    /// before it takes its turn behind the steps in progress. Returns the end that says the retry
+    /// has arrived, and the end that lets it go. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_next_machine_retry(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.machine.after_the_claim_is_read.arm()
+    }
+
     /// Ends the next machine group step after its write and before its receipt, as a daemon that
     /// stopped there would. For this host's own tests.
     #[cfg(feature = "testing")]
@@ -743,6 +786,16 @@ impl Controller {
         self.machine
             .faults
             .write_unconfirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next machine group step fail to write the record, before it changes anything, as a
+    /// disk that cannot be written would. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn fail_the_next_machine_write(&self) {
+        self.machine
+            .faults
+            .write_fails
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
