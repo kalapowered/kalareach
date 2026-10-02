@@ -7,6 +7,13 @@
 //! and the worker both: an action holds a lease, a revocation is raised that the worker never hears
 //! of, the clock passes the lease, and the worker refuses the action as expired, shows pending, and
 //! leaves the fence owed. With no debt owed, the same lapse leaves the next action its lease.
+//!
+//! One clock is moved by hand, and it is the continuous clock each side decides its deadlines on.
+//! The deadline an action crosses from the daemon to the worker is read on the machine's own boot
+//! clock, which neither side lets a test move, so what is left of a lease counts down in real time
+//! from the moment the daemon takes it until the worker anchors it on arrival: some microseconds,
+//! against the five seconds a lease lasts. The worker's record of a forwarded frame is made once it
+//! has anchored, and a test waits on that record before it moves the clock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +39,6 @@ use kr_protocol::scalars::{CanonicalSet, Nullable, U64, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_transport::clock::ManualClock;
 use kr_transport::window::{AcceptedDeadline, DeadlineBound};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -109,12 +115,7 @@ async fn world() -> World {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -305,8 +306,8 @@ impl World {
         })
     }
 
-    /// Waits until the worker has been sent `count` mutations, which is when it holds the frame and
-    /// has anchored what is left of its deadline on its own clock.
+    /// Waits until the worker has recorded `count` mutations, which it does once it holds the frame
+    /// and has anchored what is left of its deadline on its own clock.
     async fn until_the_worker_holds(&self, count: usize) {
         let deadline = tokio::time::Instant::now() + WAIT;
         while self.service.received().len() < count {
@@ -324,6 +325,16 @@ impl World {
             .forwarded_deadline(self.session_id, &self.actor, self.accepted())
             .await
     }
+}
+
+/// Waits for a forward to end, and fails the test when it does not within [`WAIT`].
+async fn ended(
+    forward: tokio::task::JoinHandle<(LocalClient, Result<ParamsValue, ProtocolError>)>,
+) -> (LocalClient, Result<ParamsValue, ProtocolError>) {
+    tokio::time::timeout(WAIT, forward)
+        .await
+        .unwrap_or_else(|_| panic!("the forward did not end within {WAIT:?}"))
+        .expect("the forward ends")
 }
 
 /// Holds the worker's session until it is released, which is how a test holds its serial boundary
@@ -384,7 +395,7 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
     world.until_the_worker_holds(1).await;
     world.clock.advance(Duration::from_secs(6));
     shut.open().await;
-    let (link, answer) = waiting.await.expect("the forward ends");
+    let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     let refused = answer.expect_err("the lapse expires the action at the worker");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
@@ -401,7 +412,7 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
         .await
         .expect("with no fence owed the next action is given a new lease");
     let waiting = world.forward_in_the_background(deadline);
-    let (link, answer) = waiting.await.expect("the forward ends");
+    let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     answer.expect("the worker runs the action that holds a lease");
 
@@ -434,7 +445,7 @@ async fn a_lease_that_runs_out_at_a_worker_is_not_renewed_while_a_fence_is_owed(
     // The clock passes the lease, and the worker refuses the action that held it.
     world.clock.advance(Duration::from_secs(6));
     shut.open().await;
-    let (link, answer) = waiting.await.expect("the forward ends");
+    let (link, answer) = ended(waiting).await;
     world.link = Some(link);
     let refused = answer.expect_err("the lease ran out before the action was dispatched");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
