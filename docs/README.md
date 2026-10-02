@@ -75,6 +75,7 @@ Releases:
 | [releases/windows-signing.md](releases/windows-signing.md) | How Windows executables and PowerShell packages are signed, and the identity behind the signatures |
 | [releases/platforms.md](releases/platforms.md) | The platforms and oldest releases a release runs on, where each executable is built, how each one's floor is read back, and the Linux distributions tested |
 | [releases/evidence-gates.md](releases/evidence-gates.md) | The seven gates a release is made against, the evidence that closes each and the commands that produce it, and the pairing review exception |
+| [releases/keys.md](releases/keys.md) | The signing keys of a release, the plugin catalogue, the relay service and each organisation: what each signs, where it is held and pinned, who rotates it and how it is recovered |
 
 The [repository README](../README.md) says how to build and test this repository, how it is
 released and how a host recovers.
