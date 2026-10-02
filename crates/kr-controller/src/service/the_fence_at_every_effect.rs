@@ -745,16 +745,56 @@ async fn a_forward_stopped_by_the_fence_starts_no_announcement() {
 }
 
 /// KR-REQ-09.12: a lease taken just before a debt was published still bounds the action that holds
-/// it, to the five seconds section 9 gives a lease, and nothing renews it: once the clock is past
-/// its deadline the action's deadline has passed, a forward asked for after it is refused for the
-/// fence and renews nothing, and the worker, which acknowledged nothing of the withdrawal, is
-/// pending. The control: with no debt a forward after the lapse is given a new lease and runs.
+/// it, to the five seconds section 9 gives a lease, and nothing renews it once the withdrawal's
+/// revision has been adopted and the barrier that would announce it has stopped. The worker held
+/// the revision in force with its fence reported, so it was complete before; it has not
+/// acknowledged the new revision, so it is pending now, and the fence is still owed. Once the clock
+/// is past the lease's deadline the action has run out of deadline and a forward asked for after
+/// it is refused. The control: with no debt, a forward after the same lapse is given a new lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
     let (_temp, controller, clock) = daemon().await;
     let (session_id, actor) = acknowledged_worker_and_a_paired_device(&controller);
+    let before = controller.leases.authority_revision();
+    let binding = controller.leases.binding(session_id);
+    assert!(controller.leases.acknowledge(
+        session_id,
+        binding,
+        before,
+        Some(kr_protocol::action::FenceEvidence {
+            rejected_actions: Vec::new(),
+            possibly_executed: Vec::new(),
+            remaining: kr_protocol::scalars::U64::ZERO,
+            omitted: kr_protocol::scalars::U64::ZERO,
+        }),
+    ));
+    assert!(
+        controller.leases.report(before, [session_id]).holds(),
+        "the worker held the revision in force before anything was withdrawn"
+    );
     let accepted = accepted(&controller);
 
+    // The control: no debt, and a forward after the lapse is given a new lease.
+    controller
+        .forwarded_deadline(session_id, &actor, accepted)
+        .await
+        .expect("the forward is given its lease");
+    let first = controller
+        .leases
+        .current_lease(session_id)
+        .expect("the forward took a lease");
+    clock.advance(kr_transport::lease::MAX_LEASE + Duration::from_secs(1));
+    controller
+        .forwarded_deadline(session_id, &actor, accepted)
+        .await
+        .expect("with no fence owed a forward after the lapse renews");
+    assert_ne!(
+        controller.leases.current_lease(session_id),
+        Some(first),
+        "the lease was renewed"
+    );
+
+    // A lease taken just before the debt is published.
     let forwarded = controller
         .forwarded_deadline(session_id, &actor, accepted)
         .await
@@ -769,7 +809,16 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         "the deadline the worker is given is bounded by the lease: {forwarded:?}"
     );
 
+    // The debt is published, the barrier adopts the revision the withdrawal advanced to, and stops
+    // before its announcement travels.
     controller.hold_fence(true);
+    let withdrawn = kr_protocol::ids::AuthorityRevision::new(before.get() + 1);
+    controller.leases.revoke(withdrawn);
+    assert!(
+        !lease.permits(controller.clock.now(), controller.generation, withdrawn),
+        "the revision moved, so the lease no longer permits a dispatch"
+    );
+
     clock.advance(kr_transport::lease::MAX_LEASE + Duration::from_secs(1));
     assert_eq!(
         crate::service::remaining_deadline(
@@ -782,25 +831,26 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         "the action that held the lease has run out of deadline"
     );
     let refused = controller
-        .forwarded_deadline(session_id, &actor, accepted)
+        .dispatch_lease(session_id, &actor)
         .await
-        .expect_err("a forward after the lapse is refused for the fence");
-    assert!(refused.to_string().contains("fence"), "{refused}");
+        .expect_err("nothing renews the lease");
+    assert!(
+        matches!(refused, super::LeaseDenied::NotAcknowledged(_)),
+        "the worker has not acknowledged the revision the withdrawal advanced to: {refused:?}"
+    );
     assert_eq!(
         controller.leases.current_lease(session_id),
         Some(lease),
-        "nothing renewed the lease"
+        "the lease the action held is the last one issued"
     );
-    let report = controller
-        .leases
-        .report(controller.leases.authority_revision(), [session_id]);
+    let report = controller.leases.report(withdrawn, [session_id]);
     assert!(!report.holds(), "the worker is pending: {report:?}");
-
-    // The control: with no debt, a forward after the lapse renews.
-    controller.hold_fence(false);
-    controller
-        .forwarded_deadline(session_id, &actor, accepted)
-        .await
-        .expect("with no fence owed the forward runs");
-    assert_ne!(controller.leases.current_lease(session_id), Some(lease));
+    assert_eq!(
+        report.workers[0].state,
+        kr_protocol::action::BarrierState::Pending
+    );
+    assert!(
+        controller.check_fence().is_err(),
+        "the fence is still owed: the lapse retired nothing"
+    );
 }
