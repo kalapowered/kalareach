@@ -1295,29 +1295,14 @@ impl CatalogueModule {
             }
             None => Vec::new(),
         };
-        self.follow_after_commit(&mut catalogue, subjects, &*admission)
-            .await;
-        answer
-    }
-
-    /// Brings each native bridge `subjects` names to what its installation now wants, after a
-    /// change committed or stopped: the subjects first, then the admission revision rising where
-    /// there are any, then each bridge read and followed.
-    ///
-    /// A bridge the admissions carry may move here, whether or not the change committed, so the
-    /// admission revision rises first, under the change's own authority, every time: every
-    /// snapshot computed before this is below every one after it, and every worker is sent the
-    /// bridges as they are now. A change that raised it already raises it once more, which costs
-    /// nothing a round does not. Where the revision cannot rise, no bridge moves; the daemon's next
-    /// start or the next change follows them.
-    async fn follow_after_commit(
-        &self,
-        catalogue: &mut Catalogue,
-        subjects: Vec<PluginId>,
-        authority: &dyn Authority,
-    ) {
+        // A bridge the admissions carry may move here, whether or not the change committed, so the
+        // admission revision rises first, under the change's own authority, every time: every
+        // snapshot computed before this write is below every one after it, and every worker is
+        // sent the bridges as they are now. A change that raised it already raises it once more,
+        // which costs nothing a round does not. Where the revision cannot rise, no bridge moves;
+        // the daemon's next start or the next change follows them.
         let raised = subjects.is_empty()
-            || match catalogue.raise_admission_revision(authority) {
+            || match catalogue.raise_admission_revision(&*admission) {
                 Ok(_) => true,
                 Err(error) => {
                     eprintln!(
@@ -1328,34 +1313,25 @@ impl CatalogueModule {
                 }
             };
         let subjects = if raised { subjects } else { Vec::new() };
-        let wanted = self.wanted_bridges(catalogue, subjects);
+        let wanted = self.wanted_bridges(&catalogue, subjects);
         self.follow_bridges(wanted).await;
+        answer
     }
 
     /// Seeds the catalogue from the generation compiled into this host, under the catalogue's own
     /// lock: a request that reaches the catalogue meanwhile waits for it.
     ///
     /// The seed enrols with the budgets this host's configuration allows (the SDK's defaults, each
-    /// capped by the configured maximum, and no mirror). What it committed is followed as any
-    /// change is: the bridges its installations now want are brought to that, after the admission
-    /// revision rises for them. A seed that did nothing, or only recorded its own decision, moves
-    /// no revision and no bridge.
+    /// capped by the configured maximum, and no mirror). It installs with an empty grant, so no
+    /// native bridge is wanted for what it installs and none is followed here; the admission
+    /// revision rises with each installation's own commit.
     pub async fn seed(
         &self,
         bundle: &kr_plugin_catalogue::SeedBundle,
     ) -> kr_plugin_catalogue::SeedOutcome {
         let mut catalogue = self.catalogue.lock().await;
         let budgets = seed_budgets(&self.budgets_in_force());
-        let outcome = catalogue.seed(bundle, self.environment_id, budgets).await;
-        let installed_something = !outcome.installed.is_empty()
-            || !outcome.left.is_empty()
-            || outcome.activated.is_some();
-        if outcome.committed && installed_something {
-            let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
-            self.follow_after_commit(&mut catalogue, subjects, &Owner::acting())
-                .await;
-        }
-        outcome
+        catalogue.seed(bundle, self.environment_id, budgets).await
     }
 
     // Each argument is one part of the change: what was asked, by whom, under which admission,
