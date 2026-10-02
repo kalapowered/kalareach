@@ -299,7 +299,11 @@ remove` works from that record and from nothing else: it deletes exactly the mar
 file the record names, wherever an entry would go now that a `ZDOTDIR` or a login file may have
 changed, and takes the file out of the record. A file the record does not name is left as it is; one
 that holds a marked entry all the same is reported as left. Everything the user wrote stays as they
-left it.
+left it. A signed PowerShell profile is the one file `kr shell remove` does not change, because
+taking the entries out would change the text its signature covers. It refuses the profile by name,
+says that it is signed and what to do (take the signature block out of the profile, run `kr shell
+remove` again, and sign the profile again), writes nothing, and leaves the file in the record for
+that later removal. A dry run refuses it the same way.
 
 Either one writes the file beside itself and renames it over, so a full disk or a crash leaves the
 configuration as it was rather than half of it. The file beside it is created exclusively, under a
