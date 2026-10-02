@@ -54,8 +54,10 @@
 #   - the clone's `.gitignore` does not ignore a local workspace name. Each name in `local_names`,
 #     the instruction files and directories of the common coding assistants, is created in the
 #     clone, and `git check-ignore` must name the file ignored, so a name that is missing from
-#     the section, a pattern a later negation undoes and a file that is already tracked under
-#     such a name are all refused.
+#     the section and a pattern a later negation undoes are refused. The check runs with no
+#     ignore file of the machine and with case-sensitive patterns, so neither can stand in for a
+#     pattern the section lacks. A tracked file that the section's own patterns match, at any
+#     depth, is refused as well.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
@@ -343,20 +345,28 @@ refuse_links() {
   say "every relative Markdown link names a path the tree has"
 }
 
-# Creates each name in `local_names` in the clone, asks `git check-ignore` whether it is ignored,
-# and removes what it created. A name the clone already holds is refused rather than replaced: a
-# tracked file under such a name is the defect this check looks for.
+# Prints the local workspace section of the .gitignore the clone holds: the lines from its
+# "# Local workspace files" heading to the next blank line. Prints nothing when it has none.
+local_section() {
+  awk '/^# Local workspace files$/ { found = 1 } found && /^[[:space:]]*$/ { exit } found { print }' \
+    "$1/.gitignore" 2> /dev/null
+}
+
+# Asks `git check-ignore` about each name in `local_names`, created in the clone and removed again,
+# and refuses a tracked file that the section's own patterns match. Git runs with no ignore file of
+# this machine and with case-sensitive patterns, so an ignore rule of the person running the check
+# or a lower-case pattern on a case-insensitive file system cannot stand in for the section.
 refuse_ignores() {
-  local clone="$1" name path created=() directories=() directory held=() missing=() item
-  for name in "${local_names[@]}"; do
-    if [ -e "$clone/$name" ] || [ -L "$clone/$name" ]; then
-      held+=("$name")
-    fi
-  done
-  if [ "${#held[@]}" -ne 0 ]; then
-    say "refused: the tree already holds a file or directory under a local workspace name:"
-    printf '  %s\n' "${held[@]}"
-    return 1
+  local clone="$1" name path created=() directories=() directory missing=() tracked item section
+  local options=(-c core.excludesFile=/dev/null -c core.ignoreCase=false)
+  : > "$clone/.git/info/exclude"
+  section="$root/local-section.ignore"
+  local_section "$clone" > "$section"
+  # What the commit tracks under a name the section ignores, whatever the depth.
+  if [ -s "$section" ]; then
+    tracked="$(clean git -C "$clone" "${options[@]}" ls-files -c -i -X "$section")"
+  else
+    tracked=""
   fi
   for name in "${local_names[@]}"; do
     path="$clone/$name"
@@ -366,29 +376,40 @@ refuse_ignores() {
       directory="$(dirname "$directory")"
     done
     mkdir -p "$(dirname "$path")"
-    : > "$path"
-    created+=("$path")
+    if [ ! -e "$path" ]; then
+      : > "$path"
+      created+=("$path")
+    fi
   done
   for name in "${local_names[@]}"; do
-    if ! clean git -C "$clone" check-ignore -q -- "$name"; then
+    if ! clean git -C "$clone" "${options[@]}" check-ignore -q -- "$name"; then
       missing+=("$name")
     fi
   done
-  for item in "${created[@]}"; do
+  for item in ${created[@]+"${created[@]}"}; do
     rm -f "${item:?}"
   done
   # A directory is longer than the one that holds it, so the longest goes first.
   if [ "${#directories[@]}" -ne 0 ]; then
     while IFS= read -r item; do
-      rmdir "$item" 2>/dev/null || true
+      rmdir "$item" 2> /dev/null || true
     done < <(printf '%s\n' "${directories[@]}" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
   fi
+  local status=0
   if [ "${#missing[@]}" -ne 0 ]; then
     say "refused: .gitignore does not ignore these local workspace names:"
     printf '  %s\n' "${missing[@]}"
-    return 1
+    status=1
   fi
-  say "the .gitignore ignores every local workspace name it lists"
+  if [ -n "$tracked" ]; then
+    say "refused: the commit tracks files that the .gitignore's local workspace section matches:"
+    printf '%s\n' "$tracked" | sed 's/^/  /'
+    status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    say "the .gitignore ignores every local workspace name it lists and the commit tracks none"
+  fi
+  return "$status"
 }
 
 # Prints each step README.md lists, as its group, a tab and its command, in README.md's order.
@@ -710,7 +731,7 @@ self_test() {
   commit_fixture "$directory" "Add the product's own words"
   expect "the product's own words pass" pass "no tracked file names a record"
   expect "a clean fixture's .gitignore ignores every local workspace name" pass \
-    "the .gitignore ignores every local workspace name it lists" --no-steps
+    "the .gitignore ignores every local workspace name it lists and the commit tracks none" --no-steps
 
   directory="$work/ignore-missing"
   make_fixture "$directory"
@@ -735,13 +756,26 @@ self_test() {
   expect "a repository with no .gitignore is refused" refuse \
     "does not ignore these local workspace names" --no-steps
 
-  directory="$work/ignore-tracked"
+  directory="$work/ignore-lowercase"
   make_fixture "$directory"
-  printf 'notes\n' > "$directory/CLAUDE.md"
-  fixture_git -C "$directory" add -f CLAUDE.md
-  fixture_git -C "$directory" commit -q -m "Track an instruction file"
-  expect "a tracked file under a local workspace name is refused" refuse \
-    "the tree already holds a file or directory under a local workspace name" --no-steps
+  grep -v -e '^claude' "$directory/.gitignore" > "$directory/.gitignore.next"
+  mv "$directory/.gitignore.next" "$directory/.gitignore"
+  commit_fixture "$directory" "Drop the lower-case pattern"
+  expect "a lower-case pattern cannot stand in for the upper-case one" refuse \
+    "does not ignore these local workspace names" --no-steps
+
+  for planted in "root=AGENTS-project.md" "nested=src/AGENTS.md" "directory=.claude/other.json" \
+    "exact=CLAUDE.md"; do
+    name="${planted%%=*}"
+    directory="$work/ignore-tracked-$name"
+    make_fixture "$directory"
+    mkdir -p "$directory/$(dirname "${planted#*=}")"
+    printf 'notes\n' > "$directory/${planted#*=}"
+    fixture_git -C "$directory" add -f "${planted#*=}"
+    fixture_git -C "$directory" commit -q -m "Track an instruction file"
+    expect "a tracked file the section matches ($name) is refused" refuse \
+      "the commit tracks files that the .gitignore's local workspace section matches" --no-steps
+  done
 
   directory="$work/commit-body"
   make_fixture "$directory"
