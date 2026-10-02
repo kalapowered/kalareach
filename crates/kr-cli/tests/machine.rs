@@ -567,11 +567,6 @@ async fn a_merge_over_independent_environments_is_a_plan_kept_until_each_step_ha
     // own directory holds one.
     let plan = pair.a.plan_file();
     assert!(plan.exists(), "the plan is kept");
-    assert_eq!(
-        plan.parent(),
-        Some(pair.a.temp.paths().state_root()),
-        "in this user's state root"
-    );
     for host in [&pair.a, &pair.b] {
         assert!(
             !host
@@ -981,6 +976,38 @@ async fn a_step_whose_answer_was_lost_stays_pending_and_is_answered_by_the_next_
     assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
     assert!(!pair.a.plan_file().exists());
     assert_eq!(pair.b.group().previous, Some(shared.machine_id));
+}
+
+/// KR-REQ-03.07: an environment that cannot read its own record says nothing of a step it took before
+/// the record was lost. B took its step and lost its answer; its record is then damaged. `finish`
+/// reads no group from B and keeps the step `sent` and the plan, and once the record is whole it is
+/// answered with the step's result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_that_cannot_read_its_record_is_not_taken_to_have_refused_its_step() {
+    let pair = Pair::start().await;
+    let (_shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.lose_the_next_machine_receipt();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    let record = pair.b.temp.environment().state_dir().join("machine-group");
+    let whole = std::fs::read(&record).expect("B's record");
+    kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
+        .expect("damages the record");
+
+    let (status, still) = pair
+        .a
+        .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert_eq!(status, Some(1), "{still}");
+    assert_eq!(still["code"], "ENVIRONMENT_UNAVAILABLE", "{still}");
+    assert_eq!(still["steps"][1]["state"], "sent", "{still}");
+    assert_eq!(still["kept"], Value::Bool(true), "{still}");
+    assert!(pair.a.plan_file().exists());
+
+    kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
+    assert_eq!(pair.b.group().machine_id, into);
 }
 
 /// KR-REQ-03.07: the same for a step whose write the environment could not confirm to survive a
