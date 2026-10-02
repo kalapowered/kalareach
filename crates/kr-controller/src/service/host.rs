@@ -209,9 +209,14 @@ impl Controller {
         match claimed {
             Ok(crate::grants::ActionClaim::Claimed { hold }) => {
                 let outcome = perform.await;
-                let kept = self.settle_claim(&hold, &outcome);
+                // A receipt that cannot be kept does not change what the action did, and the caller
+                // is told that, not that the registry failed: the claim stays unfinished, and a
+                // retry is answered as an outcome this host does not know, never performed again.
+                if let Err(unrecorded) = self.settle_claim(&hold, &outcome) {
+                    eprintln!("kr-controller: an action's receipt could not be kept: {unrecorded}");
+                }
                 drop(hold);
-                super::respond(mutation.request_id, kept.and(outcome))
+                super::respond(mutation.request_id, outcome)
             }
             Ok(crate::grants::ActionClaim::Recorded(_)) => self
                 .retained_authority_answer(actor_id, mutation)
