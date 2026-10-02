@@ -15,7 +15,7 @@ use super::super::proxy::Vouched;
 use crate::error::Result;
 
 use super::super::Retained;
-use super::decision::{Answered, Asked, claims_geometry, refuses_to_run_git, session_of};
+use super::decision::{Answered, Asked, claims_geometry, refuses_a_working_tree, session_of};
 use super::forwarding::RouteRefusal;
 use super::{RemoteConnection, failure, outcome_unknown};
 
@@ -53,15 +53,12 @@ pub(super) enum DeviceRead {
     /// the session content it carries is narrowed as the listing's is. A session read and a
     /// change-set read carry content the grant's lower bound decides.
     Narrowed,
-    /// `diff.read`, which a device is refused for one of two reasons.
-    ///
-    /// A diff of a **captured version** is retained content whose answer carries the moment of the
-    /// read rather than the moment of the capture, so nothing on this path can apply the grant's
-    /// lower bound to it, and a host that cannot narrow content to a grant refuses it rather than
-    /// serve more than the grant allows; a change-set read does carry the capture, and is
-    /// narrowed. A diff of a **working copy** opens the repository and runs the Git program, and
-    /// this host cannot bound what that program reaches, which is why the five repository
-    /// operations are refused too.
+    /// `diff.read`. A diff of a **recorded version** is answered from this host's own store, with
+    /// no Git, for a version inside the device's grant: its environment, its session and the
+    /// moment its history reaches back to ([`RemoteConnection::check_version`]). A diff of a
+    /// **working copy** reads the working tree by running the Git program outside the boundary
+    /// that confines what that program reads for a device's repository operations, and is
+    /// refused.
     Diff,
     /// A receipt. One of an action this host performed itself is kept by the service that
     /// performed it, and the catalogue's are answered here; any other goes to the session whose
@@ -311,23 +308,15 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
-            DeviceRead::Diff => {
-                if let Ok(params) = request
-                    .params
-                    .to_typed::<kr_protocol::changeset::DiffReadParams>()
-                    && params.change_set_id.is_present()
-                {
-                    return failure(
-                        request.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "this host does not serve a diff of a recorded change-set version to \
-                             a paired device",
-                        ),
-                    );
+            DeviceRead::Diff => match request
+                .params
+                .to_typed::<kr_protocol::changeset::DiffReadParams>()
+            {
+                Ok(params) if params.change_set_id.is_present() => {
+                    self.recorded_diff(request, &params).await
                 }
-                return failure(request.request_id, refuses_to_run_git());
-            }
+                _ => return failure(request.request_id, refuses_a_working_tree(entry.method)),
+            },
             DeviceRead::Receipt => {
                 // A catalogue action's receipt is decided again under the right its method
                 // required, and the answer is written under that decision.
@@ -510,6 +499,15 @@ impl RemoteConnection {
                 .project
                 .retained(&actor_id, mutation, entry.method)
                 .await;
+        }
+        // A materialisation's record is the change-set service's own, so a device that lost its
+        // reply is answered from it, in the form a device is shown and under what its grant
+        // reaches now.
+        if held.is_none() && entry.method == Method::ChangesetMaterialize {
+            match self.retained_materialisation(&actor_id, mutation).await {
+                Ok(retained) => held = retained,
+                Err(error) => return failure(mutation.request_id, error),
+            }
         }
         // An automation action's record is the workflow journal's, written in the transaction
         // that performed it, so a device that lost its reply is answered from it.
@@ -810,29 +808,50 @@ impl RemoteConnection {
                 }
             }
             // The change-set mutations. Like the project's, they are the daemon's own effect and
-            // no session owns them, so a worker proxy is not where they belong either. They are
-            // **not served to a device**, and the reason is admission rather than routing.
+            // no session owns them, so a worker proxy is not where they belong either.
             //
-            // A project mutation carries its admission into the transaction that begins its
-            // effect, so a revocation or an expiry that completes while the service prepares
-            // reaches an action that then does not begin. The change-set service offers no such
-            // check: its write waits for a blocking thread and for its own store's lock with
-            // nothing but the answer this door already gave, and a grant withdrawn inside that
-            // window reaches an effect that goes on. For the owner's own client that window is
-            // bounded by the owner being the one revoking; for a device it is the difference
-            // between a revoked grant and a change this host still made on its behalf. Until the
-            // change-set service asks inside its own transaction, this door does not open.
-            _ if crate::changeset::ChangeSetModule::serves(entry.method) => failure(
-                mutation.request_id,
-                ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    format!(
-                        "{} is not served to a paired device: this host cannot yet refuse a \
-                         change-set write whose grant is withdrawn while the write prepares",
-                        entry.method.as_str()
-                    ),
-                ),
-            ),
+            // A materialisation is served: it runs no Git and reads no working tree, it writes a
+            // private directory of the change-set service's own from the version's stored content,
+            // and every transaction that commits it runs inside the daemon's hold of this
+            // connection's admission, so a grant withdrawn while it waits leaves nothing behind.
+            // What a device may ask for is a version inside its grant, and what it is told is the
+            // materialisation without the host path of its directory.
+            Method::ChangesetMaterialize => {
+                if let Err(error) = self.check_materialisation(mutation).await {
+                    return failure(mutation.request_id, error);
+                }
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                // On a task that outlives this connection: a materialisation writes a tree of
+                // files, and dropping the future part way is a cancellation.
+                let effect = tokio::spawn(async move {
+                    let held = Arc::clone(&controller);
+                    controller
+                        .changesets()
+                        .write_frame(&actor_id, &mutation, method, carried, held)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(answer)) => super::narrowing::shown_materialisation(answer),
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
+            // Every other change-set mutation reads or writes a working tree by running the Git
+            // program, outside the boundary that confines what that program reads for a device's
+            // repository operations, and says so.
+            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
+                failure(mutation.request_id, refuses_a_working_tree(entry.method))
+            }
             // The ten catalogue and plugin mutations. They are the daemon's own effect: a catalogue
             // and an installed package belong to the environment, so no worker owns them and the
             // module performs them under its own lock.

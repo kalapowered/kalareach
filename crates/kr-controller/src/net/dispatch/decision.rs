@@ -661,6 +661,28 @@ pub(super) fn refuses_to_run_git() -> ProtocolError {
     )
 }
 
+/// The refusal a device is given for a change-set method that reads or writes a working tree.
+///
+/// Capture, apply, revert and a diff of a working copy each run the Git program on a working tree,
+/// and that program does not run inside the boundary that confines what Git reads for a device's
+/// repository operations. So the method is not served, and the sentence says which part of what it
+/// does is the reason.
+pub(super) fn refuses_a_working_tree(method: Method) -> ProtocolError {
+    let does = match method {
+        Method::DiffApply | Method::DiffRevert => "checks and writes a working tree",
+        _ => "reads a working tree",
+    };
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        format!(
+            "{} is not served to a paired device: it {does} by running the Git program, outside \
+             the boundary that confines what that program reads for a device's repository \
+             operations",
+            method.as_str()
+        ),
+    )
+}
+
 /// Returns whether one request claims or adds a geometry claim.
 ///
 /// The condition on `terminal.geometry` is "when the request claims or adds a geometry claim", so

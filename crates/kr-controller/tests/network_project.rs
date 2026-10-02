@@ -1714,150 +1714,628 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     host.stop().await;
 }
 
-/// KR-REQ-23.42: neither subject of `diff.read` is served to a paired device, and for two reasons.
-///
-/// `diff.read` names either a live working copy or a captured version, and each is refused by its
-/// own rule. The **captured version** is retained content, and this answer carries the moment of
-/// the read rather than the moment of the capture, so nothing on this path can hold it to the
-/// grant's history lower bound: a host that cannot narrow content to a grant refuses it rather
-/// than serving more than the grant allows. The **working copy** is refused because reading one
-/// opens the repository and runs the Git program, which this host does not start for a device.
-/// Each refusal gives its own reason, and the working copy's comes before anything looks for it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
-    let (_device, session) = net_support::paired_device(
-        &host,
-        &owner,
-        &[ActionRight::SessionView, ActionRight::FilesRead],
-    )
-    .await;
+/// The grant a device needs to read and materialise a recorded version.
+const VERSION_RIGHTS: &[ActionRight] = &[
+    ActionRight::SessionView,
+    ActionRight::FilesRead,
+    ActionRight::WorkspaceManage,
+];
 
-    // Both spellings of a captured version: one that names the version and one that takes the
-    // latest. Neither is served.
-    for version in [
-        Nullable::null(),
-        Nullable::some(kr_protocol::ids::ChangeSetVersion::new(1)),
-    ] {
-        let refused = session
-            .read::<_, kr_protocol::changeset::DiffReadResult>(
-                Method::DiffRead,
-                &kr_protocol::changeset::DiffReadParams {
-                    workspace_id: Nullable::null(),
-                    change_set_id: Nullable::some(kr_protocol::ids::ChangeSetId::new(
-                        kr_ipc::new_uuid(),
-                    )),
-                    version,
+/// A host whose owner has captured one version of a repository's working tree, and one more for a
+/// session, with the identifiers a device names them by.
+struct Recorded {
+    host: Host,
+    owner: DeviceKeys,
+    control: LocalClient,
+    workspace: kr_protocol::ids::WorkspaceId,
+    /// The version captured for no session.
+    plain: kr_protocol::changeset::VersionRef,
+    /// The version captured for `session`.
+    for_a_session: kr_protocol::changeset::VersionRef,
+    session: SessionId,
+    /// When the later of the two was captured.
+    captured_at_ms: kr_protocol::scalars::TimestampMs,
+}
+
+impl Recorded {
+    async fn start() -> Self {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start(&owner).await;
+        let mut control = host.client().await;
+        repository(host.work(), "recorded");
+        let adopted: ProjectAdoptResult = typed(
+            &local_mutation(
+                &mut control,
+                host.environment_id,
+                Method::ProjectAdopt,
+                &ProjectAdoptParams {
+                    destination: destination(&host, "recorded"),
+                    label: "recorded".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
                 },
             )
             .await
-            .expect_err("a recorded version is not served to a device");
-        assert_eq!(refused.code(), ErrorCode::PermissionDenied);
-        assert!(
-            refused.to_string().contains("recorded change-set version"),
-            "the refusal says which subject it refused: {refused}"
+            .expect("the owner adopts the repository"),
         );
+        let created: WorkspaceCreateResult = typed(
+            &local_mutation(
+                &mut control,
+                host.environment_id,
+                Method::WorkspaceCreate,
+                &WorkspaceCreateParams {
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: Nullable::null(),
+                    destination: Nullable::null(),
+                    ..workspace_params(&host, adopted.project.project_repository_id, "the tree")
+                },
+            )
+            .await
+            .expect("the owner takes the working copy"),
+        );
+        let workspace = created
+            .workspace
+            .0
+            .expect("a creation returns the workspace")
+            .workspace_id;
+        let session = SessionId::new(kr_ipc::new_uuid());
+        let mut capture = |session: Option<SessionId>, label: &str| {
+            kr_protocol::changeset::ChangesetCaptureParams {
+                workspace_id: workspace,
+                change_set_id: Nullable::null(),
+                label: label.to_owned(),
+                policy: InclusionPolicy {
+                    dirty_files: InclusionChoice::Include,
+                    untracked_files: InclusionChoice::Include,
+                    submodules: InclusionChoice::Exclude,
+                    binary_files: InclusionChoice::Exclude,
+                    generated_artefacts: InclusionChoice::Exclude,
+                },
+                grant: kr_protocol::changeset::FileGrant {
+                    included_paths: Vec::new(),
+                    excluded_paths: Vec::new(),
+                    secret_rules_applied: true,
+                },
+                quiescence_declared: false,
+                required_consistency: Nullable::null(),
+                pin: true,
+                session_id: Nullable(session),
+                workflow_run_id: Nullable::null(),
+                note: String::new(),
+            }
+        };
+        let mut captured = Vec::new();
+        for (session, label) in [(None, "plain"), (Some(session), "for a session")] {
+            let result: kr_protocol::changeset::ChangesetCaptureResult = typed(
+                &local_mutation(
+                    &mut control,
+                    host.environment_id,
+                    Method::ChangesetCapture,
+                    &capture(session, label),
+                )
+                .await
+                .expect("the owner captures a version"),
+            );
+            captured.push(result.version);
+        }
+        let named = |version: &kr_protocol::changeset::ChangeSetVersionRecord| {
+            kr_protocol::changeset::VersionRef {
+                change_set_id: version.change_set_id,
+                version: version.version,
+            }
+        };
+        Self {
+            plain: named(&captured[0]),
+            for_a_session: named(&captured[1]),
+            captured_at_ms: captured[1].captured_at_ms,
+            host,
+            owner,
+            control,
+            workspace,
+            session,
+        }
     }
 
-    // A diff that names a working copy is refused too, and by the other rule: reading one opens
-    // the repository and runs the Git program, which is what this host will not start for a
-    // device. The refusal comes before the working copy is looked for, so a device learns nothing
-    // about which working copies exist.
-    let other = session
+    /// Pairs a device whose grant is the version rights, adjusted by `adjust`, and connects it.
+    async fn paired(
+        &self,
+        adjust: impl FnOnce(&mut kr_protocol::pairing::ProposedGrant),
+    ) -> (
+        net_support::Device,
+        kr_controller::service::net::devices::DeviceRecord,
+        Session,
+    ) {
+        let mut proposal = net_support::proposal(VERSION_RIGHTS);
+        // History reaches back to the start of the host's life unless a test says otherwise.
+        proposal.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(1));
+        adjust(&mut proposal);
+        let device = net_support::Device::create().await;
+        let record = net_support::pair_with(&self.host, &device, &self.owner, proposal).await;
+        let session = net_support::connect(&self.host, &device, &record).await;
+        (device, record, session)
+    }
+
+    /// The same, for a test that wants only the connection and keeps the device.
+    async fn device(
+        &self,
+        adjust: impl FnOnce(&mut kr_protocol::pairing::ProposedGrant),
+    ) -> (net_support::Device, Session) {
+        let (device, _record, session) = self.paired(adjust).await;
+        (device, session)
+    }
+
+    async fn stop(self) {
+        self.host.stop().await;
+    }
+}
+
+fn read_of(version: kr_protocol::changeset::VersionRef) -> kr_protocol::changeset::DiffReadParams {
+    kr_protocol::changeset::DiffReadParams {
+        workspace_id: Nullable::null(),
+        change_set_id: Nullable::some(version.change_set_id),
+        version: Nullable::some(version.version),
+    }
+}
+
+fn materialise_of(
+    version: kr_protocol::changeset::VersionRef,
+) -> kr_protocol::changeset::ChangesetMaterializeParams {
+    kr_protocol::changeset::ChangesetMaterializeParams {
+        change_set_id: version.change_set_id,
+        version: version.version,
+        purpose: kr_protocol::changeset::MaterialisationPurpose::Review,
+        label: "a device's own copy".to_owned(),
+    }
+}
+
+/// What a device asking to read and to materialise `version` is told, as a refusal or as the
+/// answer, for each of the two.
+async fn read_and_materialise(
+    session: &Session,
+    env: EnvironmentId,
+    version: kr_protocol::changeset::VersionRef,
+) -> (
+    std::result::Result<kr_protocol::changeset::DiffReadResult, ClientError>,
+    std::result::Result<kr_protocol::changeset::ChangesetMaterializeResult, ClientError>,
+) {
+    let read = session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(Method::DiffRead, &read_of(version))
+        .await;
+    let materialised = remote_mutation(
+        session,
+        env,
+        Method::ChangesetMaterialize,
+        &materialise_of(version),
+    )
+    .await
+    .map(|answer| typed::<kr_protocol::changeset::ChangesetMaterializeResult>(&answer));
+    (read, materialised)
+}
+
+/// KR-REQ-23.44: a device reads a recorded version and has it written out, and is never told where
+/// on this host the directory is.
+///
+/// Both run no Git and read no working tree: the diff is answered from the version's stored
+/// manifest and the materialisation is written from the stored content into a directory of the
+/// change-set service's own. The answer to the materialisation, a repeat of it, and what
+/// `changeset.read` lists carry the form a device is shown. The control is the owner's own answer
+/// over its own socket, which names the directory it wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_host_path() {
+    let mut recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let (device, record, session) = recorded.paired(|_| {}).await;
+    let (read, materialised) = read_and_materialise(&session, env, recorded.plain).await;
+    let read = read.expect("a recorded version's diff is served to a device inside its grant");
+    assert_eq!(read.source_version.0, Some(recorded.plain));
+    assert!(
+        read.tracked.iter().any(|entry| entry.path == "README.md")
+            && read.untracked.iter().any(|entry| entry.path == "notes.txt"),
+        "the diff names what the version captured"
+    );
+    let materialised = materialised.expect("the version is written out for the device");
+    let shown = materialised.materialisation.directory_path.clone();
+    assert!(
+        shown.starts_with("[path withheld, ") && !shown.contains('/'),
+        "a device is shown the form and not the path: {shown}"
+    );
+
+    // The owner's own answer names the directory, and the files are there: the directory is real,
+    // and what the device was not told is where it is.
+    let owners: kr_protocol::changeset::ChangesetReadResult = locally(
+        &mut recorded.control,
+        Method::ChangesetRead,
+        &kr_protocol::changeset::ChangesetReadParams {
+            change_set_id: recorded.plain.change_set_id,
+            version: Nullable::some(recorded.plain.version),
+        },
+    )
+    .await;
+    assert_eq!(owners.materialisations.len(), 1);
+    let real = PathBuf::from(&owners.materialisations[0].directory_path);
+    assert!(real.is_absolute() && real.join("README.md").is_file());
+    assert_eq!(
+        owners.materialisations[0].materialisation_id,
+        materialised.materialisation.materialisation_id,
+        "the device names the materialisation by its identity"
+    );
+
+    // `changeset.read` lists the materialisation to the device in the same form.
+    let listed: kr_protocol::changeset::ChangesetReadResult = session
+        .read(
+            Method::ChangesetRead,
+            &kr_protocol::changeset::ChangesetReadParams {
+                change_set_id: recorded.plain.change_set_id,
+                version: Nullable::some(recorded.plain.version),
+            },
+        )
+        .await
+        .expect("changeset.read is served to a device");
+    assert_eq!(listed.materialisations.len(), 1);
+    assert_eq!(listed.materialisations[0].directory_path, shown);
+    assert!(
+        !format!("{listed:?}").contains(&real.display().to_string()),
+        "no part of the answer names the directory"
+    );
+
+    // A repeat under the same action is answered from the record, in the same form.
+    let raw = net_support::RawDevice::connect(&recorded.host, &device, &record).await;
+    raw.claim();
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(env);
+    let params = materialise_of(recorded.plain);
+    let first: kr_protocol::changeset::ChangesetMaterializeResult = typed(
+        &raw.mutate(
+            Method::ChangesetMaterialize,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("a second materialisation of the version"),
+    );
+    let again: kr_protocol::changeset::ChangesetMaterializeResult = typed(
+        &raw.mutate(Method::ChangesetMaterialize, action, target, &params)
+            .await
+            .expect("the repeat is answered from the record"),
+    );
+    assert_eq!(again, first, "the record answers the repeat");
+    assert!(
+        again
+            .materialisation
+            .directory_path
+            .starts_with("[path withheld, "),
+        "and in the form a device is shown: {}",
+        again.materialisation.directory_path
+    );
+    assert_ne!(
+        first.materialisation.materialisation_id, materialised.materialisation.materialisation_id,
+        "the repeat did not make a third directory"
+    );
+    raw.close();
+    session.close();
+    recorded.stop().await;
+}
+
+/// KR-REQ-23.44: the version a device names has to be inside its grant, and a version it does not
+/// reach is refused the way one that does not exist is.
+///
+/// Each case is one grant against the same two recorded versions, asked for the diff and for the
+/// materialisation, beside a control: the same request under a grant that reaches the version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
+    use kr_protocol::grant::{EnvironmentSelector, SessionSelector};
+
+    let recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let elsewhere = EnvironmentId::new(kr_ipc::new_uuid());
+    let another = SessionId::new(kr_ipc::new_uuid());
+    let beyond = kr_protocol::scalars::TimestampMs::new(recorded.captured_at_ms.get() + 3_600_000);
+    let does_not_reach = "does not reach change set";
+
+    // The environment: a grant that selects another one reaches neither, and one that selects this
+    // one reaches both.
+    let (_a, outside) = recorded
+        .device(|grant| {
+            grant.environment_selector = EnvironmentSelector::These {
+                environment_ids: [elsewhere].into_iter().collect(),
+            };
+        })
+        .await;
+    let (read, materialised) = read_and_materialise(&outside, env, recorded.plain).await;
+    for refusal in [read.err(), materialised.err()] {
+        let refusal = refusal.expect("a version in an environment the grant does not select");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(said(&refusal).contains(does_not_reach), "{refusal}");
+    }
+    let (_b, inside) = recorded
+        .device(|grant| {
+            grant.environment_selector = EnvironmentSelector::These {
+                environment_ids: [env].into_iter().collect(),
+            };
+        })
+        .await;
+    let (read, materialised) = read_and_materialise(&inside, env, recorded.plain).await;
+    read.expect("the grant that selects the environment reaches the diff");
+    materialised.expect("and the materialisation");
+
+    // An identifier no change set has is refused in the same words, so a device learns nothing
+    // about which exist.
+    let unknown = kr_protocol::changeset::VersionRef {
+        change_set_id: kr_protocol::ids::ChangeSetId::new(kr_ipc::new_uuid()),
+        version: recorded.plain.version,
+    };
+    let (read, materialised) = read_and_materialise(&inside, env, unknown).await;
+    for refusal in [read.err(), materialised.err()] {
+        let refusal = refusal.expect("a version that is not there");
+        assert!(said(&refusal).contains(does_not_reach), "{refusal}");
+    }
+
+    // The history: a grant that reaches back only to a moment after the capture reaches neither,
+    // and one with no lower bound retains none.
+    let (_c, later) = recorded
+        .device(|grant| grant.history.lower_bound_ms = Nullable::some(beyond))
+        .await;
+    let (read, materialised) = read_and_materialise(&later, env, recorded.for_a_session).await;
+    for refusal in [read.err(), materialised.err()] {
+        let refusal = refusal.expect("a version captured before the grant reaches back to");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            said(&refusal).contains("captured before the moment"),
+            "{refusal}"
+        );
+    }
+    let (_d, none) = recorded
+        .device(|grant| grant.history.lower_bound_ms = Nullable::null())
+        .await;
+    let (read, materialised) = read_and_materialise(&none, env, recorded.plain).await;
+    for refusal in [read.err(), materialised.err()] {
+        let refusal = refusal.expect("a grant with no history");
+        assert!(said(&refusal).contains("retains no history"), "{refusal}");
+    }
+
+    // The session: a grant that names sessions reaches a version captured for one of them and no
+    // other, and a version that records none is out of scope for it. A grant over any session
+    // reaches both, which is the control.
+    let (_e, other) = recorded
+        .device(|grant| {
+            grant.session_selector = SessionSelector::These {
+                session_ids: [another].into_iter().collect(),
+            };
+        })
+        .await;
+    let (_f, named) = recorded
+        .device(|grant| {
+            grant.session_selector = SessionSelector::These {
+                session_ids: [recorded.session].into_iter().collect(),
+            };
+        })
+        .await;
+    let (_g, no_session) = recorded
+        .device(|grant| grant.session_selector = SessionSelector::None)
+        .await;
+    for (device, version, reached, why) in [
+        (
+            &other,
+            recorded.for_a_session,
+            false,
+            "another session's version",
+        ),
+        (
+            &named,
+            recorded.for_a_session,
+            true,
+            "the named session's version",
+        ),
+        (
+            &named,
+            recorded.plain,
+            false,
+            "a version that records no session",
+        ),
+        (
+            &no_session,
+            recorded.for_a_session,
+            false,
+            "a grant that names no session",
+        ),
+    ] {
+        let (read, materialised) = read_and_materialise(device, env, version).await;
+        if reached {
+            read.unwrap_or_else(|error| panic!("{why}: the diff: {error}"));
+            materialised.unwrap_or_else(|error| panic!("{why}: the materialisation: {error}"));
+        } else {
+            for refusal in [read.err(), materialised.err()] {
+                let refusal = refusal.unwrap_or_else(|| panic!("{why} is out of scope"));
+                assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{why}");
+                assert!(said(&refusal).contains(does_not_reach), "{why}: {refusal}");
+            }
+        }
+    }
+    // Nothing the refused requests asked for was written out: only the control cases did.
+    let owners: kr_protocol::changeset::ChangesetReadResult = {
+        let mut control = recorded.host.client().await;
+        locally(
+            &mut control,
+            Method::ChangesetRead,
+            &kr_protocol::changeset::ChangesetReadParams {
+                change_set_id: recorded.plain.change_set_id,
+                version: Nullable::some(recorded.plain.version),
+            },
+        )
+        .await
+    };
+    assert_eq!(
+        owners.materialisations.len(),
+        1,
+        "the one version a device reached was written out once, and no refused request wrote any"
+    );
+    recorded.stop().await;
+}
+
+/// KR-REQ-23.44: capture, apply, revert and the diff of a working copy are refused to a device,
+/// each by name and for the reason that is so: each reads or writes a working tree by running the
+/// Git program, outside the boundary that confines what that program reads for a device's
+/// repository operations. The refusal comes before the subject is looked up, so a device learns
+/// nothing about which working copies exist. The control is the same host serving a recorded
+/// version, which runs no Git.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
+    let recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let (_device, session) = recorded
+        .device(|grant| {
+            grant.actions.insert(ActionRight::ChangesetCreate);
+            grant.actions.insert(ActionRight::FilesApplyDiff);
+        })
+        .await;
+    let unknown = kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid());
+    let capture = kr_protocol::changeset::ChangesetCaptureParams {
+        workspace_id: unknown,
+        change_set_id: Nullable::null(),
+        label: "a capture this host does not run for a device".to_owned(),
+        policy: InclusionPolicy {
+            dirty_files: InclusionChoice::Include,
+            untracked_files: InclusionChoice::Exclude,
+            submodules: InclusionChoice::Exclude,
+            binary_files: InclusionChoice::Exclude,
+            generated_artefacts: InclusionChoice::Exclude,
+        },
+        grant: kr_protocol::changeset::FileGrant {
+            included_paths: Vec::new(),
+            excluded_paths: Vec::new(),
+            secret_rules_applied: true,
+        },
+        quiescence_declared: false,
+        required_consistency: Nullable::null(),
+        pin: false,
+        session_id: Nullable::null(),
+        workflow_run_id: Nullable::null(),
+        note: String::new(),
+    };
+    let apply = kr_protocol::changeset::DiffApplyParams {
+        change_set_id: recorded.plain.change_set_id,
+        version: recorded.plain.version,
+        destination: kr_protocol::changeset::DestinationClass::Proposal,
+        workspace_id: Nullable::null(),
+        expected_reference: Nullable::null(),
+        affected: Vec::new(),
+        paths: Vec::new(),
+        preflight_only: true,
+        acknowledged_limitations: Vec::new(),
+    };
+    let mut refused = Vec::new();
+    refused.push((
+        Method::ChangesetCapture,
+        remote_mutation(&session, env, Method::ChangesetCapture, &capture).await,
+    ));
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        refused.push((method, remote_mutation(&session, env, method, &apply).await));
+    }
+    for (method, outcome) in refused {
+        let refusal = outcome.expect_err("a method that runs Git on a working tree");
+        assert_eq!(
+            refusal.code(),
+            ErrorCode::PermissionDenied,
+            "{}",
+            method.as_str()
+        );
+        let message = said(&refusal);
+        assert!(
+            message.contains(method.as_str())
+                && message.contains("is not served to a paired device")
+                && message
+                    .contains("by running the Git program, outside the boundary that confines"),
+            "the refusal names the method and the reason it is so: {message}"
+        );
+        assert!(
+            !message.contains("cannot yet") && !message.contains("no workspace"),
+            "it is not the old reason, and nothing looked the subject up: {message}"
+        );
+    }
+    let working_copy = session
         .read::<_, kr_protocol::changeset::DiffReadResult>(
             Method::DiffRead,
             &kr_protocol::changeset::DiffReadParams {
-                workspace_id: Nullable::some(
-                    kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid()),
-                ),
+                workspace_id: Nullable::some(recorded.workspace),
                 change_set_id: Nullable::null(),
                 version: Nullable::null(),
             },
         )
         .await
-        .expect_err("a working copy's diff runs Git, which this host does not start for a device");
-    assert_eq!(other.code(), ErrorCode::PermissionDenied);
-    assert_eq!(
-        said(&other),
-        REFUSAL,
-        "a working copy's diff is refused by the same one rule as the five operations"
+        .expect_err("a working copy's diff runs Git on its working tree");
+    assert_eq!(working_copy.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&working_copy).contains("diff.read is not served to a paired device")
+            && said(&working_copy).contains("by running the Git program, outside the boundary"),
+        "{working_copy}"
     );
-
+    // The control: the same session reads the recorded version, which runs none.
+    session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &read_of(recorded.plain),
+        )
+        .await
+        .expect("a recorded version's diff runs no Git");
     session.close();
-    host.stop().await;
+    recorded.stop().await;
 }
 
-/// KR-REQ-23.44 and KR-REQ-09.09: a change-set write is not served to a paired device.
-///
-/// The five project and workspace mutations carry their admission into the transaction that
-/// begins the effect, so a grant withdrawn while the service prepares reaches an action that then
-/// does not begin. The change-set service offers no such check: its write waits for a blocking
-/// thread and for its own store's lock with nothing but the answer the door already gave. Until it
-/// asks inside its own transaction, a device is refused the group by name rather than served a
-/// write this host cannot withdraw under it.
+/// KR-REQ-23.44 and section 9: a materialisation for a device whose registration was withdrawn
+/// writes nothing, and the same action is performed once the device is admitted again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_is_refused_a_change_set_write_this_host_cannot_withdraw() {
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
-    let (_device, session) = net_support::paired_device(
-        &host,
-        &owner,
-        &[
-            ActionRight::SessionView,
-            ActionRight::ChangesetCreate,
-            ActionRight::FilesApplyDiff,
-            ActionRight::WorkspaceManage,
-        ],
-    )
-    .await;
-
-    let refused = remote_mutation(
+async fn a_materialisation_for_a_device_whose_authority_has_gone_writes_nothing() {
+    let mut recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let mut proposal = net_support::proposal(VERSION_RIGHTS);
+    proposal.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(1));
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(&recorded.host, &device, &recorded.owner, proposal).await;
+    let session = net_support::connect(&recorded.host, &device, &record).await;
+    // The environment's authority is withdrawn, and every registration admitted under it goes
+    // with it, this device's connection included.
+    recorded
+        .host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the revocation is recorded");
+    let refusal = remote_mutation(
         &session,
-        host.environment_id,
-        Method::ChangesetCapture,
-        &kr_protocol::changeset::ChangesetCaptureParams {
-            workspace_id: kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid()),
-            change_set_id: Nullable::null(),
-            label: "a capture this door does not open".to_owned(),
-            policy: InclusionPolicy {
-                dirty_files: InclusionChoice::Include,
-                untracked_files: InclusionChoice::Exclude,
-                submodules: InclusionChoice::Exclude,
-                binary_files: InclusionChoice::Exclude,
-                generated_artefacts: InclusionChoice::Exclude,
-            },
-            grant: kr_protocol::changeset::FileGrant {
-                included_paths: Vec::new(),
-                excluded_paths: Vec::new(),
-                secret_rules_applied: true,
-            },
-            quiescence_declared: false,
-            required_consistency: Nullable::null(),
-            pin: false,
-            session_id: Nullable::null(),
-            workflow_run_id: Nullable::null(),
-            note: String::new(),
-        },
+        env,
+        Method::ChangesetMaterialize,
+        &materialise_of(recorded.plain),
     )
     .await
-    .unwrap_err();
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
-    let message = refused.to_string();
+    .expect_err("a registration that was withdrawn writes nothing");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    let owners: kr_protocol::changeset::ChangesetReadResult = locally(
+        &mut recorded.control,
+        Method::ChangesetRead,
+        &kr_protocol::changeset::ChangesetReadParams {
+            change_set_id: recorded.plain.change_set_id,
+            version: Nullable::some(recorded.plain.version),
+        },
+    )
+    .await;
     assert!(
-        message.contains(Method::ChangesetCapture.as_str())
-            && message.contains("is not served to a paired device"),
-        "the refusal names the method and says the door is shut: {refused}"
+        owners.materialisations.is_empty(),
+        "nothing was written out under the withdrawn authority"
     );
-    // The refusal is about the group rather than about this one method's parameters: the subject
-    // was never read, so a workspace that does not exist is not what it answered.
-    assert!(
-        !message.contains("no workspace"),
-        "nothing looked the subject up: {refused}"
-    );
-
+    // The control: the device is admitted again on a new connection, and the same request writes
+    // the version out.
+    let again = net_support::connect(&recorded.host, &device, &record).await;
+    remote_mutation(
+        &again,
+        env,
+        Method::ChangesetMaterialize,
+        &materialise_of(recorded.plain),
+    )
+    .await
+    .expect("the device admitted again has the version written out");
+    again.close();
     session.close();
-    host.stop().await;
+    recorded.stop().await;
 }
 
 /// The owner's four location methods are the owner's alone. A paired device that asks for any of
@@ -2679,7 +3157,7 @@ async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for
         },
     };
     let refused = granted.refused(Method::ProjectClone, &by_path).await;
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(
         said(&refused).contains("names a location for a destination"),
         "{refused}"
@@ -2707,7 +3185,7 @@ async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for
         ..granted.clone_of_src("taken")
     };
     let refused = granted.refused(Method::ProjectClone, &into_owners).await;
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(said(&refused).contains("admits the owner"), "{refused}");
     assert!(!outside.join("taken").exists());
 
@@ -2720,7 +3198,7 @@ async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for
         },
     );
     let refused = granted.refused(Method::ProjectClone, &from_owners).await;
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     for leaving in ["../outside/elsewhere", "/etc"] {
         let leaves = granted.clone_into(
             "taken",
@@ -2755,7 +3233,7 @@ async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for
         },
     );
     let refused = granted.refused(Method::ProjectClone, &remote).await;
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(
         said(&refused).contains("does not clone a remote"),
         "{refused}"
@@ -2840,7 +3318,6 @@ async fn a_device_reads_nothing_outside_its_location_through_repository_content(
             ),
         )
         .await;
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
     assert!(
         said(&refused).contains("objects/info/alternates"),
         "the refusal names the alternates file: {refused}"
@@ -3222,7 +3699,6 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
             return;
         };
         let refusal = outcome.expect_err("a clone from a repository with a mount beneath it");
-        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
         let said = said(&refusal);
         assert!(
             said.contains(&format!("a filesystem is mounted at {}", mounted.display())),

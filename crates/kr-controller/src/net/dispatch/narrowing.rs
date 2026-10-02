@@ -1,11 +1,18 @@
 //! Narrowing an answer to what the device's grant admits.
 
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+use kr_protocol::changeset::{
+    ChangesetMaterializeParams, ChangesetMaterializeResult, DiffReadParams, VersionRef,
+};
+use kr_protocol::envelope::{
+    ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::RequestId;
+use kr_protocol::ids::{ActorId, RequestId};
+use kr_protocol::method::Method;
 use kr_protocol::session::SessionListResult;
 
 use super::{RemoteConnection, failure};
+use crate::changeset::{OutOfScope, ScopedEnvironments, VersionScope};
 
 impl RemoteConnection {
     /// Narrows an answer to what this device's grant admits.
@@ -157,6 +164,13 @@ impl RemoteConnection {
                     .into_iter()
                     .filter(|summary| summary.captured_at_ms.get() >= bound.get())
                     .collect(),
+                // Where a materialisation is on this host is for a person here, and no answer to a
+                // device names it.
+                materialisations: read
+                    .materialisations
+                    .into_iter()
+                    .map(crate::changeset::shown_to_a_device)
+                    .collect(),
                 ..read
             };
             return encoded(request_id, &narrowed);
@@ -199,6 +213,163 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
             ),
         }
+    }
+
+    /// Checks that the recorded version a device names is one its grant reaches.
+    ///
+    /// The version has to be in an environment the grant selects, for a session the grant selects
+    /// (a grant that names sessions reaches only a version that records one of them), and captured
+    /// at or after the moment the grant's history reaches back to. A grant with no lower bound
+    /// retains none of it. A version this host cannot read is refused the way one outside the
+    /// grant is, so a device learns nothing about which identifiers exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the grant does not reach the version.
+    pub(super) async fn check_version(&self, version: VersionRef) -> Result<(), ProtocolError> {
+        let Some(bound) = self.device.grant.history.lower_bound_ms.0 else {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this device's grant retains no history, so it does not read a recorded \
+                 change-set version",
+            ));
+        };
+        let scope = VersionScope {
+            environments: ScopedEnvironments::Selected(
+                self.device.grant.environment_selector.clone(),
+            ),
+            workspace: None,
+            sessions: Some(self.device.grant.session_selector.clone()),
+            captured_since: Some(bound),
+        };
+        let service = std::sync::Arc::clone(self.controller.changesets().service());
+        let checked = tokio::task::spawn_blocking(move || {
+            crate::changeset::version_in_scope(&service, version, &scope)
+        })
+        .await;
+        match checked {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(OutOfScope::History)) => Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this version was captured before the moment this device's grant reaches back to",
+            )),
+            Ok(Err(_)) => Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                format!(
+                    "this device's grant does not reach change set {} version {}",
+                    version.change_set_id, version.version
+                ),
+            )),
+            Err(_) => Err(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this host could not check the version against this device's grant",
+            )),
+        }
+    }
+
+    /// Answers a device's `diff.read` of a recorded version.
+    ///
+    /// It reads the version's captured manifest from this host's own store and runs no Git, so it
+    /// is served where the version is inside the grant ([`Self::check_version`]).
+    pub(super) async fn recorded_diff(
+        &self,
+        request: &Request,
+        params: &DiffReadParams,
+    ) -> ControlFrame {
+        let version = match crate::changeset::version_of(params) {
+            Ok(Some(version)) => version,
+            Ok(None) => {
+                return failure(
+                    request.request_id,
+                    ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "a diff read of a change set names the exact version it reads",
+                    ),
+                );
+            }
+            Err(error) => return failure(request.request_id, error),
+        };
+        if let Err(error) = self.check_version(version).await {
+            return failure(request.request_id, error);
+        }
+        self.controller.changesets().read_frame(request).await
+    }
+
+    /// Checks the version a device asks to have materialised.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the parameters are not a materialisation's or the grant does not
+    /// reach the version.
+    pub(super) async fn check_materialisation(
+        &self,
+        mutation: &MutationRequest,
+    ) -> Result<(), ProtocolError> {
+        let params: ChangesetMaterializeParams = mutation.params.to_typed().map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                kr_project::git::redact(&error.to_string()),
+            )
+        })?;
+        self.check_version(VersionRef {
+            change_set_id: params.change_set_id,
+            version: params.version,
+        })
+        .await
+    }
+
+    /// Answers a repeat of a materialisation this device asked for, from the record the first
+    /// attempt left, when there is one.
+    ///
+    /// The answer is given under what the grant reaches now, and in the form a device is shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the grant no longer reaches the version.
+    pub(super) async fn retained_materialisation(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<Option<ControlFrame>, ProtocolError> {
+        let Some(retained) = self
+            .controller
+            .changesets()
+            .retained(actor_id, mutation, Method::ChangesetMaterialize)
+            .await
+        else {
+            return Ok(None);
+        };
+        self.check_materialisation(mutation).await?;
+        Ok(Some(shown_materialisation(retained)))
+    }
+}
+
+/// Puts the answer to a materialisation in the form a device is shown: no host path.
+pub(super) fn shown_materialisation(answer: ControlFrame) -> ControlFrame {
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = answer
+    else {
+        return answer;
+    };
+    match value.to_typed::<ChangesetMaterializeResult>() {
+        Ok(result) => encoded(
+            request_id,
+            &ChangesetMaterializeResult {
+                materialisation: crate::changeset::shown_to_a_device(result.materialisation),
+                ..result
+            },
+        ),
+        // An answer that is not a materialisation's is not passed on as it is: it may carry what
+        // this form exists to leave out.
+        Err(_) => failure(
+            request_id,
+            ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this host performed the action and could not state its answer to a paired device",
+            ),
+        ),
     }
 }
 

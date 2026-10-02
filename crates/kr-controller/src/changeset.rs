@@ -461,8 +461,134 @@ fn read_change_set(
     })
 }
 
+/// The environments a reader of a recorded version acts in.
+#[derive(Clone, Debug)]
+pub enum ScopedEnvironments {
+    /// The one environment this host acts in, for a workflow.
+    One(kr_protocol::ids::EnvironmentId),
+    /// The environments a paired device's grant selects.
+    Selected(kr_protocol::grant::EnvironmentSelector),
+}
+
+impl ScopedEnvironments {
+    fn admits(&self, environment_id: kr_protocol::ids::EnvironmentId) -> bool {
+        match self {
+            Self::One(only) => *only == environment_id,
+            Self::Selected(selector) => selector.admits(environment_id),
+        }
+    }
+}
+
+/// What a recorded version has to be inside for a caller to read it or write it out.
+///
+/// One rule for every caller that is bounded by a scope: a workflow, whose definition names the
+/// workspace it works on, and a paired device, whose grant selects environments and sessions and
+/// reaches back to a moment. A member that is `None` bounds nothing.
+#[derive(Clone, Debug)]
+pub struct VersionScope {
+    /// The environments the caller acts in.
+    pub environments: ScopedEnvironments,
+    /// The workspace the caller is scoped to, when it is scoped to one.
+    pub workspace: Option<kr_protocol::ids::WorkspaceId>,
+    /// The sessions the caller reaches, when it is bounded by a selector of them.
+    ///
+    /// A selector that is not "any" admits a version only when the version records the session it
+    /// was captured for and the selector admits that one: a version that records none is out of
+    /// scope rather than assumed to be inside it.
+    pub sessions: Option<kr_protocol::grant::SessionSelector>,
+    /// The earliest capture the caller reaches, when its history reaches back to a moment.
+    pub captured_since: Option<kr_protocol::scalars::TimestampMs>,
+}
+
+/// Why a recorded version is not inside a scope.
+#[derive(Debug)]
+pub enum OutOfScope {
+    /// The version could not be read, so it could not be checked.
+    Unreadable(kr_changeset::ChangeSetError),
+    /// It was captured in an environment the caller does not act in.
+    Environment {
+        /// The environment it was captured in.
+        captured_in: kr_protocol::ids::EnvironmentId,
+    },
+    /// It was captured from a workspace the caller is not scoped to.
+    Workspace {
+        /// The workspace it was captured from.
+        captured_from: kr_protocol::ids::WorkspaceId,
+        /// The workspace the caller is scoped to.
+        declared: kr_protocol::ids::WorkspaceId,
+    },
+    /// It was captured for a session the caller does not reach, or for none.
+    Session,
+    /// It was captured before the moment the caller's history reaches back to.
+    History,
+}
+
+/// Returns the recorded version `version` names when it is inside `scope`.
+///
+/// The check is made against the version's own record, so an identifier the caller made up, one
+/// from another environment and one captured from another workspace are each out of scope the same
+/// way. A version that cannot be read cannot be checked, and is refused.
+///
+/// # Errors
+///
+/// Returns why the version is not inside the scope.
+pub fn version_in_scope(
+    service: &ChangeSetService,
+    version: VersionRef,
+    scope: &VersionScope,
+) -> std::result::Result<kr_protocol::changeset::ChangeSetVersionRecord, OutOfScope> {
+    let record = service
+        .record(version.change_set_id, Some(version.version))
+        .map_err(OutOfScope::Unreadable)?;
+    if !scope.environments.admits(record.environment_id) {
+        return Err(OutOfScope::Environment {
+            captured_in: record.environment_id,
+        });
+    }
+    if let Some(declared) = scope.workspace
+        && record.workspace_id != declared
+    {
+        return Err(OutOfScope::Workspace {
+            captured_from: record.workspace_id,
+            declared,
+        });
+    }
+    if let Some(sessions) = scope.sessions.as_ref() {
+        let reached = matches!(sessions, kr_protocol::grant::SessionSelector::Any)
+            || record
+                .provenance
+                .session_id
+                .0
+                .is_some_and(|session| sessions.admits(session));
+        if !reached {
+            return Err(OutOfScope::Session);
+        }
+    }
+    if let Some(since) = scope.captured_since
+        && record.captured_at_ms.get() < since.get()
+    {
+        return Err(OutOfScope::History);
+    }
+    Ok(record)
+}
+
+/// A materialisation as a paired device is shown it: where it is on this host is not told.
+///
+/// The directory is for a person at this host and for a tool the caller runs there, and a device
+/// is neither. What it keeps is the materialisation's identity, which is what it names the
+/// materialisation by.
+pub fn shown_to_a_device(
+    mut record: kr_protocol::changeset::MaterialisationRecord,
+) -> kr_protocol::changeset::MaterialisationRecord {
+    record.directory_path = kr_protocol::hostinfo::export::withheld(
+        kr_protocol::hostinfo::export::ContentClass::Path,
+        &record.directory_path,
+    );
+    record
+}
+
 /// Returns the version a diff read names, when it names one.
-fn version_of(params: &DiffReadParams) -> Answer<Option<VersionRef>> {
+pub(crate) fn version_of(params: &DiffReadParams) -> Answer<Option<VersionRef>> {
     match (params.change_set_id.0, params.version.0) {
         (None, None) => Ok(None),
         (Some(change_set_id), Some(version)) => Ok(Some(VersionRef {
