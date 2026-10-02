@@ -688,7 +688,7 @@ fn a_create_node_that_carries_environment_variables_is_refused() {
         value: "planted-secret-value".to_owned(),
     }]);
     let error = validate_definition(
-        &one_node_with(WorkflowActionKind::CreateSession, carrying),
+        &one_node_with(WorkflowActionKind::CreateSession, carrying.clone()),
         &grant,
     )
     .expect_err("a create node that carries a variable is refused");
@@ -701,6 +701,66 @@ fn a_create_node_that_carries_environment_variables_is_refused() {
     assert!(
         !said.contains("planted-secret-value") && !said.contains("KR_PLANTED_TOKEN"),
         "the refusal names no variable and no value: {said}"
+    );
+
+    // However the variables are spelled, the refusal is the same and says nothing of them: a
+    // typed decoder's own message would quote the value it could not read, and the refusal is
+    // recorded with the action.
+    let spelled: Vec<(&str, String)> = vec![
+        (
+            "a list of text",
+            "[\"KR_PLANTED_TOKEN=planted-secret-value\"]".to_owned(),
+        ),
+        (
+            "one text",
+            "\"KR_PLANTED_TOKEN=planted-secret-value\"".to_owned(),
+        ),
+        ("null", "null".to_owned()),
+        (
+            "a mapping",
+            "{\"KR_PLANTED_TOKEN\":\"planted-secret-value\"}".to_owned(),
+        ),
+    ];
+    for (case, value) in &spelled {
+        let mut params = session(Vec::new());
+        params["environment_snapshot"] =
+            serde_json::from_str(value).expect("a JSON value for the field");
+        let error = validate_definition(
+            &one_node_with(WorkflowActionKind::CreateSession, params),
+            &grant,
+        )
+        .expect_err(&format!("{case}: refused"));
+        let said = error.to_string();
+        assert!(
+            !said.contains("planted-secret-value") && !said.contains("KR_PLANTED_TOKEN"),
+            "{case}: the refusal names no variable and no value: {said}"
+        );
+    }
+
+    // A name repeated in the parameters is read as its last value by a JSON reader that keeps one
+    // value for a name, and the stored text keeps both. So the first copy, which holds the
+    // variables, would stay in the journal behind an empty list that passes the check.
+    let mut text = carrying.to_string();
+    text.pop();
+    text.push_str(",\"environment_snapshot\":[]}");
+    let mut definition = one_node_with(WorkflowActionKind::CreateSession, session(Vec::new()));
+    definition.nodes[0].action_params = text;
+    let error = validate_definition(&definition, &grant)
+        .expect_err("a name repeated in a node's parameters is refused");
+    let said = error.to_string();
+    assert!(said.contains("repeat"), "{said}");
+    assert!(!said.contains("planted-secret-value"), "{said}");
+
+    // The same for every kind: parameters whose reading depends on which copy of a name is read
+    // are not parameters.
+    let mut definition = one_node_with(
+        WorkflowActionKind::AttentionNotice,
+        serde_json::json!({ "summary": "done" }),
+    );
+    definition.nodes[0].action_params = "{\"summary\":\"first\",\"summary\":\"done\"}".to_owned();
+    assert!(
+        validate_definition(&definition, &grant).is_err(),
+        "a repeated name is refused in a node of any kind"
     );
 }
 
