@@ -142,6 +142,9 @@ pub struct BridgedLink {
     stream: BridgeStream,
     /// The last request number this link used. They are this connection's own.
     last_request: u64,
+    /// Why the bridge stopped, once it has: said when the link is finished, because anything said
+    /// while a terminal shows a projection of a session damages the screen it is describing.
+    ended: Option<Refusal>,
 }
 
 kr_client::debug_as_name!(BridgedLink);
@@ -153,7 +156,14 @@ impl BridgedLink {
         Self {
             stream,
             last_request: 0,
+            ended: None,
         }
+    }
+
+    /// Keeps why the bridge stopped, and says it as this command's own failure.
+    fn stopped(&mut self, refusal: Refusal) -> CliError {
+        self.ended.get_or_insert_with(|| refusal.clone());
+        failed(refusal)
     }
 
     /// What the destination acknowledged.
@@ -209,12 +219,12 @@ impl Link for BridgedLink {
                     params,
                 }))
                 .await
-                .map_err(failed)?;
+                .map_err(|refusal| self.stopped(refusal))?;
             let response = self
                 .stream
                 .response(request_id, SILENCE_LIMIT)
                 .await
-                .map_err(failed)?;
+                .map_err(|refusal| self.stopped(refusal))?;
             Ok(answer(response.outcome))
         }
     }
@@ -247,27 +257,38 @@ impl Link for BridgedLink {
             self.stream
                 .send(ControlFrame::Mutation(Box::new(mutation)))
                 .await
-                .map_err(failed)?;
+                .map_err(|refusal| self.stopped(refusal))?;
             let response = self
                 .stream
                 .response(request_id, MUTATION_LIMIT)
                 .await
-                .map_err(failed)?;
+                .map_err(|refusal| self.stopped(refusal))?;
             Ok(answer(response.outcome))
         }
     }
 
     async fn recv(&mut self) -> Result<ControlFrame> {
-        self.stream.recv().await.map_err(failed)
+        self.stream
+            .recv()
+            .await
+            .map_err(|refusal| self.stopped(refusal))
     }
 
     async fn send(&mut self, frame: ControlFrame) -> Result<()> {
-        self.stream.send(frame).await.map_err(failed)
+        self.stream
+            .send(frame)
+            .await
+            .map_err(|refusal| self.stopped(refusal))
     }
 
-    async fn finish(self) {
+    async fn finish(mut self) {
         let diagnostics = self.diagnostics();
+        let stopped = self.ended.take();
         let ended = self.close().await;
+        // Why the bridge stopped, said now that the terminal is the person's again.
+        if let Some(refusal) = stopped {
+            crate::report::say(&kr_client::shown::Said::said(&failed(refusal)));
+        }
         // What the helper wrote to its standard error is the destination's to write, so it is
         // counted and not repeated.
         let written = diagnostics.written();
