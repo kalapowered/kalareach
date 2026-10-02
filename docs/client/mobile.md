@@ -305,6 +305,63 @@ exercise suspension. Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` and `KR_ANDROID_AVD` choose the
 device.
 
+## Checking it on an iPhone
+
+Some of what the application promises needs a real phone: push through the platform's service, audio
+that carries on under a locked screen, a software keyboard, a turn of the phone and the system's own
+pickers. The device checks cover those. They are a debug build of the application, a UI-test runner
+that drives the installed application by its identifier, and `scripts/device-ios.sh`, which builds
+both, runs one session at a time and removes everything afterwards.
+
+The debug build of the application contains a few hooks for the device tests to interact with, such
+as the keychain count and sweep feature, running the push and audio tests, and dumping the app's
+windows to files. These are not present in the release build of the app. To verify that, run
+`pnpm -C apps/companion debug-code <KalaReach.app>`, which reads every executable in the bundle and
+reports any it finds. The Firebase configuration belongs to the account that owns the project and is
+not in the repository. A build copies it from the file that `KR_GOOGLE_SERVICE_INFO` names, so a
+debug build without the variable leaves Firebase alone and a release build without it fails.
+
+What a build is signed with is the signer's choice. `Build.xcconfig` reads `Local.xcconfig`, which
+the repository ignores, so `KR_SIGN_STYLE`, `KR_SIGN_IDENTITY`, `KR_SIGN_FLAGS`, `KR_APP_PROFILE`,
+`KR_EXTENSION_PROFILE` and `KR_RUNNER_PROFILE` go there, with paths written out in full because a
+build setting does not expand `~`. `tauri ios build` starts `xcodebuild` itself, so an environment
+variable does not reach it. A device build without these values signs automatically, as before.
+
+```sh
+# The applications and the test runner, signed with what Local.xcconfig names. The script's own
+# header lists the variables it needs, among them KR_DEVICE and KR_DEVICE_LEASE.
+apps/companion/scripts/device-ios.sh build-app                           # for s0 and s1
+apps/companion/scripts/device-ios.sh build-app --no-firebase             # for s3a, s3b and s4
+apps/companion/scripts/device-ios.sh build-app --harness --no-firebase   # for s2
+apps/companion/scripts/device-ios.sh build-tests
+
+# One session, then the clean-up for a session that was stopped before its own.
+apps/companion/scripts/device-ios.sh session s1
+apps/companion/scripts/device-ios.sh cleanup
+```
+
+A session runs under the device lease of whoever starts it. The general flow is to install both apps
+on the device, check if the app's keychain groups are empty and fail if not, run the tests, delete
+any items the app may have put in its keychain groups, and finally uninstall both apps. The sessions
+are:
+
+- `s0` shows that the tests report while they run and that Home presses keep the phone awake, and
+  checks the keychain boundary.
+- `s1` sends a Firebase notification to the app's registration token while it's terminated and again
+  when it's in the background.
+- `s2` uses the harness build, whose page is the phone shell on a scripted host, to check recovery
+  after a suspension and a restart, the keyboard, rotation and safe areas, accessibility, and the
+  file pickers and camera, with a person at the phone.
+- `s3a` and `s3b` run the audio check with the microphone refused and then allowed, and count a
+  change of route.
+- `s4` runs the audio check and asks the person to lock and unlock the device's screen.
+
+The runner reads nothing of the phone except the application's own screens and the answer button of
+a prompt that names the application. It takes no screenshot: the application draws its own windows,
+which cannot hold anything else, into its container, and the script copies the files out. Dynamic
+Type comes from a launch argument, the colour mode from the debug build's own switch and the turn of
+the phone from the test, so no setting of the phone is touched.
+
 ## The boundary on a phone
 
 The same one the desktop window has, with one addition. `capabilities/mobile.json` grants the file
