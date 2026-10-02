@@ -4209,15 +4209,6 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         }
     };
     guards_hold(stage);
-    if let Some(status) = &account.status {
-        answered(status).unwrap_or_else(|why| {
-            panic!(
-                "{LOGIN_UNPROVEN} `{} {}` did not say that it holds: {why}",
-                stage.build.command,
-                status.arguments.join(" ")
-            )
-        });
-    }
     // The files an agent searches for up the tree come before any program of it runs, the probes
     // included: one that was there would load into them.
     for path in absent_paths(stage, Absent::Ancestors) {
@@ -4227,6 +4218,15 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
              into its environment",
             path.display()
         );
+    }
+    if let Some(status) = &account.status {
+        answered(status).unwrap_or_else(|why| {
+            panic!(
+                "{LOGIN_UNPROVEN} `{} {}` did not say that it holds: {why}",
+                stage.build.command,
+                status.arguments.join(" ")
+            )
+        });
     }
     for probe in &account.isolated {
         guards_hold(stage);
@@ -4446,6 +4446,7 @@ enum Absent {
     Published,
 }
 
+/// The paths of the entry's `absent` list that `which` selects, with each template filled in.
 fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
     let home = login_home(stage).display().to_string();

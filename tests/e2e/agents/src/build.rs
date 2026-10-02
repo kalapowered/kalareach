@@ -116,6 +116,27 @@ pub struct RequestRecord {
 /// The characters an agent draws the sides of a dialog with: not text of the dialog's rows.
 const FRAME: [char; 3] = ['│', '┃', '║'];
 
+/// A row with one level of frame taken off each side, and the spaces beside it: `│ ╭──╮ │` is
+/// `╭──╮`, and `│ │ echo a │ │` is `│ echo a │`. A character of the row's own text that is the
+/// frame's kind stays unless it is the one at the edge.
+fn peeled(row: &str) -> &str {
+    let row = row.trim();
+    let row = row.strip_prefix(FRAME).unwrap_or(row);
+    let row = row.strip_suffix(FRAME).unwrap_or(row);
+    row.trim()
+}
+
+/// Whether `row`, with one level of frame off, is exactly a box's border: `open`, one or more `─`,
+/// `close`, and nothing else.
+fn is_border(row: &str, open: char, close: char) -> bool {
+    let row = peeled(row);
+    row.strip_prefix(open)
+        .and_then(|rest| rest.strip_suffix(close))
+        .is_some_and(|middle| {
+            !middle.is_empty() && middle.chars().all(|character| character == '─')
+        })
+}
+
 /// A row of a dialog without the frame an agent draws around it, and without the spaces beside it:
 /// `│ │ echo a │ │` is `echo a`.
 fn unframed(row: &str) -> &str {
@@ -141,7 +162,16 @@ impl Approval {
         let at: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| unframed(row) == wanted.trim())
+            .filter(|(_, row)| {
+                // A command in a box of its own is in two frames, the dialog's and the box's, and
+                // each is taken off once, so the command's own edge characters are kept.
+                let shown = if self.boxed {
+                    peeled(peeled(row))
+                } else {
+                    unframed(row)
+                };
+                shown == wanted.trim()
+            })
             .map(|(index, _)| index)
             .collect();
         let [line] = at.as_slice() else {
@@ -150,17 +180,14 @@ impl Approval {
                 at.len()
             ));
         };
-        // A command in a box of its own has the box's top border on the row above it and its bottom
-        // border on the row below, so nothing else is in the box.
+        // A command in a box of its own has the box's top border, and nothing else, on the row above
+        // it and its bottom border on the row below, so nothing else is in the box.
         let mut after_box = line + 1;
         if self.boxed {
-            let border = |index: Option<usize>, (open, close): (char, char)| {
-                index.and_then(|index| rows.get(index)).is_some_and(|row| {
-                    let row = unframed(row);
-                    row.starts_with(open) && row.ends_with(close)
-                })
-            };
-            if !border(line.checked_sub(1), ('╭', '╮')) || !border(Some(line + 1), ('╰', '╯'))
+            let above = line.checked_sub(1).and_then(|index| rows.get(index));
+            let below = rows.get(line + 1);
+            if !above.is_some_and(|row| is_border(row, '╭', '╮'))
+                || !below.is_some_and(|row| is_border(row, '╰', '╯'))
             {
                 return Err("the command is not alone in its box".to_owned());
             }
@@ -1442,8 +1469,42 @@ mod tests {
             "│ Allow execution of [Shell]? │",
         ];
         assert!(gemini.names_only(&owned(&blank), command).is_err());
-        let dashed = ["│ │ echo kr0123 >> /tmp/run/a─ │ │"];
-        assert!(gemini.names_only(&owned(&dashed), command).is_err());
+        let boxed_with = |command_row: &str| {
+            owned(&[
+                "│ ╭───────╮ │",
+                command_row,
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ])
+        };
+        assert_eq!(
+            gemini.names_only(&boxed_with("│ │ echo kr0123 >> /tmp/run/a │ │"), command),
+            Ok(())
+        );
+        // A character of the frame's kind at the end of the command is the command's, not the frame's.
+        for changed in [
+            "│ │ echo kr0123 >> /tmp/run/a─ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a│ │ │",
+        ] {
+            assert!(gemini.names_only(&boxed_with(changed), command).is_err());
+        }
+        // A line of the command drawn like a border is a command row, not the box's border.
+        let crafted = [
+            "│ ╭───────╮ │",
+            "│ │ ╭(){ :; }; echo EXTRA >> /tmp/other; #╮ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&crafted), command).is_err());
+        let crafted_below = [
+            "│ ╭───────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ │ ╰; echo EXTRA >> /tmp/other; ╯ │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&crafted_below), command).is_err());
         let blank_below = [
             "│ ╭───────╮ │",
             "│ │ echo kr0123 >> /tmp/run/a │ │",
