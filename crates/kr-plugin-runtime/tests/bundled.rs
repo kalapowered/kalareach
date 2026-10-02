@@ -522,6 +522,68 @@ fn the_script_verifies_the_committed_bundle_and_refuses_a_changed_one() {
         String::from_utf8_lossy(&outcome.stderr)
     );
 
+    // The check that scans the files is not skipped when the scan cannot be loaded: a copy of the
+    // script with no scan beside it says so and fails.
+    let (_directory, bundle_root, lock_path) = copy();
+    let alone = tempfile::tempdir().expect("a directory");
+    std::fs::create_dir_all(alone.path().join("scripts")).expect("a directory");
+    std::fs::copy(
+        &script,
+        alone.path().join("scripts/sync-bundled-plugins.sh"),
+    )
+    .expect("the script copies");
+    let outcome = Command::new("bash")
+        .arg(alone.path().join("scripts/sync-bundled-plugins.sh"))
+        .arg("--verify")
+        .arg("--bundle-root")
+        .arg(&bundle_root)
+        .arg("--lock")
+        .arg(&lock_path)
+        .current_dir(alone.path())
+        .output()
+        .expect("the script runs");
+    assert!(
+        !outcome.status.success()
+            && String::from_utf8_lossy(&outcome.stderr).contains("cannot be loaded"),
+        "{}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+
+    // A shipped root that names a key neither the development set nor a production set commits is
+    // refused, whichever root it is: the lock is made consistent with the changed bytes, so only
+    // the keys are what is wrong.
+    let (_directory, bundle_root, lock_path) = copy();
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).expect("a lock"))
+            .expect("a readable lock");
+    let root_text =
+        std::fs::read_to_string(bundle_root.join("metadata/1.root.json")).expect("a root");
+    let mut root: serde_json::Value = serde_json::from_str(&root_text).expect("a root document");
+    let foreign = "ab".repeat(32);
+    root["signed"]["roles"]["root"]["keyids"] = serde_json::json!([foreign]);
+    let changed = serde_json::to_string(&root).expect("a root");
+    for name in ["metadata/1.root.json", "metadata/root.json"] {
+        std::fs::write(bundle_root.join(name), &changed).expect("a root");
+    }
+    let digest = kr_plugin_sdk::digest::PayloadDigest::of(changed.as_bytes()).to_string();
+    for entry in lock["metadata"].as_array_mut().expect("metadata") {
+        if entry["path"] == "metadata/1.root.json" || entry["path"] == "metadata/root.json" {
+            entry["digest"] = serde_json::json!(digest);
+            entry["size_bytes"] = serde_json::json!(changed.len().to_string());
+        }
+    }
+    lock["trust_root"]["digest"] = serde_json::json!(digest);
+    lock["trust_root"]["key_ids"] = serde_json::json!([foreign]);
+    std::fs::write(&lock_path, lock.to_string()).expect("a lock");
+    let outcome = verify(&bundle_root, &lock_path, &[]);
+    assert!(
+        !outcome.status.success()
+            && String::from_utf8_lossy(&outcome.stderr)
+                .contains("names root keys that are not all development keys"),
+        "{}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+
     // A file that is a private key, locked consistently with what it now holds, is refused by the
     // release scan's own checks, whatever the file is called.
     let (_directory, bundle_root, lock_path) = copy();
@@ -586,10 +648,11 @@ fn cleanup_block() -> String {
     text[start..end].to_owned()
 }
 
-/// What the cleanup leaves on disk when a signal ends a run that has published its bundle and not
-/// yet its lock, and when it ends one that has published nothing. A signal runs the cleanup once:
-/// the pending lock is the only copy of the lock that describes the new bundle, so a second pass
-/// that took the run for an unpublished one would delete it.
+/// What the cleanup leaves on disk when a signal ends a run, in each state it can be in: the bundle
+/// published and the lock not, the lock installed too, and nothing published. A signal runs the
+/// cleanup once: the pending lock is the only copy of the lock that describes the new bundle, so a
+/// second pass that took the run for an unpublished one would delete it; and a second signal while
+/// the cleanup runs does not abandon it.
 #[test]
 fn an_interrupted_sync_keeps_what_it_published_and_puts_back_what_it_did_not() {
     use std::process::Command;
@@ -601,9 +664,22 @@ fn an_interrupted_sync_keeps_what_it_published_and_puts_back_what_it_did_not() {
         return;
     }
     let block = cleanup_block();
-    let run = |published: bool, signal: &str| {
+    // The harness is started with SIGINT at its default, whatever it was when this process started:
+    // a background job of a shell without job control (a job started over ssh, as the build box
+    // does) ignores it, and bash can neither trap nor reset a signal that was ignored at entry.
+    let run = |state: &str, signals: &[&str]| {
         let directory = tempfile::tempdir().expect("a directory");
         let root = directory.path();
+        // The first signal ends the run; any other arrives while its cleanup is running, which a
+        // slow `rm` makes long enough to hit.
+        let kills = match signals {
+            [first] => format!("kill -{first} $$\n"),
+            [first, later] => format!(
+                "rm() {{ sleep 1; command rm \"$@\"; }}\n( sleep 0.4; kill -{later} $$ ) &\n\
+                 kill -{first} $$\n"
+            ),
+            _ => unreachable!("one signal, or one and a later one"),
+        };
         let harness = format!(
             r#"set -euo pipefail
 root="$1"
@@ -616,28 +692,35 @@ pending_lock="$root/.bundled-plugins.lock.pending"
 retiring="$root/.bundled-plugins.retiring"
 rename_path() {{ python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2"; }}
 {block}
-mkdir -p "$stage_root"
-echo previous > "$lock_file"
-if [ "$2" = published ]; then
-  mkdir -p "$retiring" "$bundle_root"; echo previous > "$retiring/file"; echo new > "$bundle_root/file"
-  echo new > "$pending_lock"
-else
-  mkdir -p "$staged_bundle" "$retiring"; echo previous > "$retiring/file"; echo new > "$pending_lock"
-fi
-kill -{signal} $$
-sleep 5
+mkdir -p "$stage_root" "$publish_lock"
+echo "$$ now" > "$publish_lock/owner"; held_lock=true
+case "$2" in
+  bundle-published)
+    echo previous > "$lock_file"
+    mkdir -p "$retiring" "$bundle_root"; echo previous > "$retiring/file"; echo new > "$bundle_root/file"
+    echo new > "$pending_lock" ;;
+  lock-installed)
+    echo new > "$lock_file"
+    mkdir -p "$retiring" "$bundle_root"; echo previous > "$retiring/file"; echo new > "$bundle_root/file" ;;
+  *)
+    echo previous > "$lock_file"
+    mkdir -p "$staged_bundle" "$retiring"; echo previous > "$retiring/file"; echo new > "$pending_lock" ;;
+esac
+{kills}sleep 5
 "#
         );
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&harness)
-            .arg("harness")
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); \
+                 os.execvp(sys.argv[1], sys.argv[1:])",
+                "bash",
+                "-c",
+                &harness,
+                "harness",
+            ])
             .arg(root)
-            .arg(if published {
-                "published"
-            } else {
-                "unpublished"
-            })
+            .arg(state)
             .output()
             .expect("bash runs");
         (
@@ -646,37 +729,73 @@ sleep 5
             output.status.code(),
         )
     };
+    let read = |root: &Path, name: &str| std::fs::read_to_string(root.join(name)).ok();
 
-    let (directory, stderr, code) = run(true, "TERM");
+    for (signal, code) in [("TERM", 143), ("INT", 130)] {
+        let (directory, stderr, status) = run("bundle-published", &[signal]);
+        let root = directory.path();
+        assert_eq!(status, Some(code), "{signal}: {stderr}");
+        assert!(
+            root.join(".bundled-plugins.lock.pending").is_file(),
+            "{signal}: the pending lock is the only copy of the lock for the new bundle: {stderr}"
+        );
+        assert_eq!(read(root, "bundled-plugins/file").as_deref(), Some("new\n"));
+        assert!(
+            root.join(".bundled-plugins.retiring/file").is_file(),
+            "{signal}: the previous bundle is kept: {stderr}"
+        );
+        assert!(!root.join("stage").exists(), "{signal}: {stderr}");
+        assert!(
+            !root.join(".sync.lock").exists(),
+            "{signal}: the publication lock is released"
+        );
+        assert!(stderr.contains("the new lock is at"), "{signal}: {stderr}");
+
+        let (directory, stderr, status) = run("lock-installed", &[signal]);
+        let root = directory.path();
+        assert_eq!(status, Some(code), "{signal}: {stderr}");
+        assert_eq!(
+            read(root, "bundled-plugins/file").as_deref(),
+            Some("new\n"),
+            "{signal}: the published bundle stays: {stderr}"
+        );
+        assert_eq!(read(root, "bundled-plugins.lock").as_deref(), Some("new\n"));
+        assert!(
+            !root.join(".bundled-plugins.retiring").exists(),
+            "{signal}: once the lock is installed the previous bundle is nothing: {stderr}"
+        );
+        assert!(
+            !root.join(".sync.lock").exists(),
+            "{signal}: the publication lock is released"
+        );
+
+        let (directory, stderr, status) = run("nothing-published", &[signal]);
+        let root = directory.path();
+        assert_eq!(status, Some(code), "{signal}: {stderr}");
+        assert_eq!(
+            read(root, "bundled-plugins/file").as_deref(),
+            Some("previous\n"),
+            "{signal}: the previous bundle is put back: {stderr}"
+        );
+        assert!(
+            !root.join(".bundled-plugins.lock.pending").exists(),
+            "{signal}: an unpublished run drops its pending lock: {stderr}"
+        );
+        assert!(!root.join("stage").exists(), "{signal}: {stderr}");
+        assert!(
+            !root.join(".sync.lock").exists(),
+            "{signal}: the publication lock is released"
+        );
+    }
+
+    // A second signal straight after the first does not abandon the cleanup.
+    let (directory, stderr, status) = run("nothing-published", &["TERM", "INT"]);
     let root = directory.path();
-    assert_eq!(code, Some(143), "{stderr}");
-    assert!(
-        root.join(".bundled-plugins.lock.pending").is_file(),
-        "the pending lock is the only copy of the lock for the new bundle: {stderr}"
-    );
+    assert_eq!(status, Some(143), "{stderr}");
     assert_eq!(
-        std::fs::read_to_string(root.join("bundled-plugins/file")).expect("the new bundle"),
-        "new\n",
+        read(root, "bundled-plugins/file").as_deref(),
+        Some("previous\n"),
         "{stderr}"
     );
-    assert!(
-        root.join(".bundled-plugins.retiring/file").is_file(),
-        "the previous bundle is kept: {stderr}"
-    );
-    assert!(!root.join("stage").exists(), "{stderr}");
-    assert!(stderr.contains("the new lock is at"), "{stderr}");
-
-    let (directory, stderr, code) = run(false, "INT");
-    let root = directory.path();
-    assert_eq!(code, Some(130), "{stderr}");
-    assert_eq!(
-        std::fs::read_to_string(root.join("bundled-plugins/file")).expect("the old bundle"),
-        "previous\n",
-        "the previous bundle is put back: {stderr}"
-    );
-    assert!(
-        !root.join(".bundled-plugins.lock.pending").exists(),
-        "an unpublished run drops its pending lock: {stderr}"
-    );
-    assert!(!root.join("stage").exists(), "{stderr}");
+    assert!(!root.join(".bundled-plugins.retiring").exists(), "{stderr}");
 }

@@ -568,6 +568,13 @@ if root_document is not None:
                 f"{path} names root keys that are not all development keys and not all"
                 " production keys this build commits"
             )
+        elif (
+            production_keys
+            and all(key in production_keys for key in keys)
+            and json.loads(contents[path])["signed"]["roles"]["root"]["threshold"]
+            < int(production_threshold)
+        ):
+            problems.append(f"{path} does not meet the production threshold")
     if release_only == "true":
         if not production_keys:
             problems.append("a release trusts no root yet: the production set is empty")
@@ -621,13 +628,16 @@ try:
     spec = importlib.util.spec_from_file_location("check_release_secrets", scan_script)
     release_scan = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(release_scan)
-except (OSError, AttributeError, SyntaxError) as error:
+except Exception as error:  # noqa: BLE001 - whatever stops the scan loading is a finding
     release_scan = None
     problems.append(f"{scan_script} cannot be loaded, so the files are not scanned: {error}")
 if release_scan is not None:
-    for path, content in sorted(contents.items()):
-        for scanned, what in release_scan.scan_member(path, content, 0):
-            problems.append(f"{scanned} {what}")
+    try:
+        for path, content in sorted(contents.items()):
+            for scanned, what in release_scan.scan_member(path, content, 0):
+                problems.append(f"{scanned} {what}")
+    except Exception as error:  # noqa: BLE001 - a scan that fails has not cleared the files
+        problems.append(f"{scan_script} failed, so the files are not cleared: {error}")
 
 # What the host compiles in and the trust it commits, regenerated and compared.
 if generated == "true":
@@ -772,8 +782,10 @@ cleaned=false
 cleanup() {
     local status=$?
     set +e
-    # Once only: a signal ends the run through its exit, which runs this again, and a second pass
-    # would find the staging directory gone and mistake a published bundle for an unpublished one.
+    # A signal ends the run through its exit, which runs this once. Another signal while it runs
+    # must not abandon it half done, and a second pass would find the staging directory gone and
+    # mistake a published bundle for an unpublished one.
+    trap '' INT TERM
     [ "$cleaned" = false ] || return "$status"
     cleaned=true
     local published_here=false
