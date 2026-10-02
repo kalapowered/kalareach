@@ -29,9 +29,10 @@ sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 adb=$sdk/platform-tools/adb
 emulator=$sdk/emulator/emulator
 [ -x "$adb" ] && [ -x "$emulator" ] || { echo "no Android platform tools or emulator"; exit 3; }
+command -v timeout >/dev/null || { echo "the timeout command is needed (coreutils)"; exit 3; }
 avd=${KR_ANDROID_AVD:-$("$emulator" -list-avds | head -n 1)}
 [ -n "$avd" ] || { echo "no Android virtual device"; exit 3; }
-if "$adb" devices | grep -q '^emulator-'; then
+if timeout 60 "$adb" devices | grep -q '^emulator-'; then
   echo "an emulator is already running: its font scale is not this script's to change"
   exit 3
 fi
@@ -40,11 +41,13 @@ fi
 # command below names it.
 port=${KR_ANDROID_EMULATOR_PORT:-5580}
 serial=emulator-$port
-if "$adb" devices | grep -q "^$serial"; then
+if timeout 60 "$adb" devices | grep -q "^$serial"; then
   echo "$serial is already in use"
   exit 3
 fi
-dev() { "$adb" -s "$serial" "$@"; }
+# Every command to the device has a limit, so one that is never answered stops and does not hold the
+# run, or the clean-up that stops the emulator, for ever.
+dev() { timeout 60 "$adb" -s "$serial" "$@"; }
 
 "$emulator" -avd "$avd" -port "$port" -read-only -no-window -no-audio -no-snapshot-save -no-boot-anim \
   >"${TMPDIR:-/tmp}/kr-text-size-emulator.log" 2>&1 &
@@ -58,7 +61,10 @@ cleanup() {
   fi
   kill "$emulator_pid" 2>/dev/null
 }
+# The emulator is stopped however the script ends, an interruption included.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Waits for the emulator to say it has finished starting, for as long as it is running and for a
 # limit that only stops a start that will never finish.
@@ -243,7 +249,10 @@ try {
       )
     }
     console.log(`INFO: font scale ${scale}: the top bar is ${seen.top.toFixed(1)}px and the tab bar ${seen.bottom.toFixed(1)}px`)
-    const png = execFileSync(adb, ['-s', serial, 'exec-out', 'screencap', '-p'], { maxBuffer: 64 * 1024 * 1024 })
+    const png = execFileSync(adb, ['-s', serial, 'exec-out', 'screencap', '-p'], {
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 60_000
+    })
     writeFileSync(join(shots, `kr-text-size-android-${scale}.png`), png)
   }
 } catch (failure) {

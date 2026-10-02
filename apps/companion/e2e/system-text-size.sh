@@ -139,6 +139,31 @@ const check = (condition, message) => {
   if (!condition) failures += 1
 }
 
+/** Puts the simulator's text size back as it was found and stops it, once, whatever ended the run. */
+let restored = false
+function restore() {
+  if (restored) return
+  restored = true
+  try {
+    if (before !== null && before !== '') simctl('ui', found.udid, 'content_size', before)
+  } catch {
+    // The simulator may already be gone.
+  }
+  try {
+    simctl('shutdown', found.udid)
+  } catch {
+    // It may already be shut down.
+  }
+  server.close()
+}
+// An interruption ends the run the same way: the setting is put back before the script goes.
+for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  process.on(signal, () => {
+    restore()
+    process.exit(code)
+  })
+}
+
 try {
   simctl('boot', found.udid)
   simctl('bootstatus', found.udid, '-b')
@@ -179,13 +204,7 @@ try {
   console.log(`FAIL: ${failure.message}`)
   failures += 1
 } finally {
-  try {
-    if (before !== null && before !== '') simctl('ui', found.udid, 'content_size', before)
-  } catch {
-    // The simulator may already be gone.
-  }
-  simctl('shutdown', found.udid)
-  server.close()
+  restore()
 }
 console.log(failures === 0 ? 'every size held' : `${failures} did not hold`)
 process.exit(failures === 0 ? 0 : 1)
