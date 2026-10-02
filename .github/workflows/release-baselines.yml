@@ -1,7 +1,8 @@
 name: release-baselines
 
 # Section 3's release baselines, checked on the executables the host ships. Every one of them is
-# built for every release target, each target on a standard hosted runner of its own platform, and
+# built for every release target that ships it, each target on a standard hosted runner of its own
+# platform (the description process is left out of Windows on Arm, see the matrix), and
 # then each executable's own headers are read for the oldest system it says it runs on. A floor that
 # does not match its baseline fails the job: a macOS executable that is not built for 14.0, a Linux
 # one that needs a newer glibc than Ubuntu 22.04's, or a Windows one that asks for a newer Windows
