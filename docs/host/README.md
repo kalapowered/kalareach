@@ -1561,8 +1561,8 @@ result of a run is the modes it measured.
 Step 3 also checks that nothing of either distribution's daemon or worker is in storage the
 distributions share. Each socket the process holds open is read from the kernel's table, its
 directory is resolved through links to where it really is, and none may be under `/mnt/wslg` or
-`/mnt/wsl`. A daemon with no named socket fails the step, because its runtime root is then not
-known. A worker's open file whose path names the product in that storage is counted among the files
+`/mnt/wsl`. A daemon or a worker with no named socket fails the step, because its runtime root is
+then not known. A worker's open file whose path names the product in that storage is counted among the files
 it holds outside the distribution. The self-test covers the listing of a process's sockets,
 including one bound through a link.
 

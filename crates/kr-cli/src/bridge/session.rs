@@ -271,14 +271,15 @@ where
         )
         .await
         // The destination refuses in its answer. An error here is the bridge, which ended without
-        // saying whether the session was made.
-        .map_err(|_| CliError::Unfinished {
+        // saying whether the session was made, and why it ended is said with that.
+        .map_err(|stopped| CliError::Unfinished {
             code: ErrorCode::OutcomeUnknown,
             message: shown!(
                 "the bridge ended before the environment answered the create, so whether it made \
-                 the session is not known; it was asked as action {}. Look for the session with \
-                 `kr attach` before creating another",
-                action_id
+                 the session is not known; it was asked as action {}. {}. Look for the session \
+                 with `kr attach` before creating another",
+                action_id,
+                stopped.said()
             ),
         })?;
     Ok(Created {
@@ -534,6 +535,47 @@ mod tests {
         .expect("the second read answers");
         assert_eq!(profile, WorkerProfile::DesktopBound);
         assert_eq!(opened.get(), 1, "one new bridge, and no more");
+        let _ = link.close().await;
+    }
+
+    /// A create whose bridge ends before it is answered says that it is not known whether the
+    /// session was made, which action asked, and why the bridge ended: the command then says that
+    /// and nothing else of the bridge.
+    #[tokio::test]
+    async fn a_create_whose_bridge_ends_unanswered_says_why_it_ended() {
+        // The helper answers the opening and then says nothing more and ends.
+        let (_directory, opening) = answering(&[]);
+        let mut link = linked(opening).await;
+        let new = NewSession {
+            presentation: Presentation::Invisible,
+            shell: None,
+            shell_mode: ShellMode::NativeCompat,
+            cwd: None,
+            dimensions: None,
+            profile: Some(WorkerProfile::HeadlessUser),
+            palette: None,
+            launch_profile: LaunchProfile::default(),
+        };
+        let refused = create_over(&mut link, &new, || async {
+            panic!("the profile was named, so nothing is read")
+        })
+        .await
+        .expect_err("the bridge ended");
+        let CliError::Unfinished { code, message } = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(*code, ErrorCode::OutcomeUnknown);
+        let said = message.as_str();
+        assert!(
+            said.contains("whether it made the session is not known"),
+            "{said}"
+        );
+        assert!(said.contains("it was asked as action"), "{said}");
+        assert!(
+            said.contains("said nothing for")
+                || said.contains("the bridge to the environment failed"),
+            "the reason the bridge ended is said: {said}"
+        );
         let _ = link.close().await;
     }
 

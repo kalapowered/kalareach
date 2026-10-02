@@ -1196,7 +1196,9 @@ to write the clipboard reaches nobody: the write is not sent to any terminal, an
 journal records that a write was declined, with its selection and size and none of its content. A
 write goes to the attachment that holds the input lease and to no other. Enrolling again replaces
 the record, and an attach reads it once, when it opens its bridge. A read of the clipboard is
-answered empty in every case.
+answered empty in every case. `kr bridge list` shows the name a record holds under
+`clipboard_destination` and, under `takes_clipboard_writes`, whether the host delivers to it: a
+record kept with any name but `terminal` shows `false`.
 
 ## `kr pair`
 

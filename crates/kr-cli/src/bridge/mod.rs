@@ -201,6 +201,9 @@ fn enrolment(enrolment: &EnvironmentEnrolment) -> Document {
                 .as_ref()
                 .map(|destination| asked(destination)),
         )
+        // Whether the destination does anything, which a record kept from before a destination had
+        // to be one the host delivers to can say differently from the text it holds.
+        .with("takes_clipboard_writes", enrolment.takes_clipboard_writes())
         .with("approved_at_ms", closed(&enrolment.approved_at_ms))
 }
 
@@ -248,6 +251,34 @@ mod tests {
     use super::*;
     use crate::output::planted::{only_asked, only_asked_lines, planted, planted_text};
     use crate::shown::marker::MARKER;
+
+    /// KR-REQ-18.11: a record that holds a destination this host does not deliver to is shown as one
+    /// that takes no clipboard writes, whatever text it holds, and one that names the terminal as
+    /// one that does.
+    #[test]
+    fn a_stored_destination_the_host_does_not_deliver_to_is_shown_as_taking_none() {
+        let mut record = EnvironmentEnrolment {
+            environment_id: kr_protocol::ids::EnvironmentId::new(
+                kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+            ),
+            access: kr_protocol::identity::EnvironmentAccess::WslDistribution,
+            label: "dest".to_owned(),
+            target: "Ubuntu".to_owned(),
+            os_user: "kala".to_owned(),
+            helper_path: "/usr/local/bin/kr".to_owned(),
+            clipboard_destination: kr_protocol::scalars::Nullable::some(
+                "clipboard-sync".to_owned(),
+            ),
+            approved_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        assert_eq!(enrolment(&record).json()["takes_clipboard_writes"], false);
+        record.clipboard_destination = kr_protocol::scalars::Nullable::null();
+        assert_eq!(enrolment(&record).json()["takes_clipboard_writes"], false);
+        record.clipboard_destination = kr_protocol::scalars::Nullable::some(
+            kr_protocol::identity::CLIPBOARD_DESTINATION_TERMINAL.to_owned(),
+        );
+        assert_eq!(enrolment(&record).json()["takes_clipboard_writes"], true);
+    }
 
     /// KR-REQ-23.25: planted text in the bridge's answers shows only where the person asked for it
     /// (what they recorded of an enrolment: its label, target, user, helper and clipboard
