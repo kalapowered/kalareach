@@ -1604,6 +1604,10 @@ async fn an_enrolment_can_name_only_the_terminal_as_its_clipboard_destination() 
         listed["rows"][0]["enrolment"]["clipboard_destination"], "terminal",
         "{listed}"
     );
+    assert_eq!(
+        listed["rows"][0]["enrolment"]["takes_clipboard_writes"], true,
+        "{listed}"
+    );
 }
 
 /// KR-REQ-18.11, KR-REQ-25.25: `kr export` of a closed session in an enrolled environment reads the
