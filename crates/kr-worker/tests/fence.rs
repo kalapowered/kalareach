@@ -1941,6 +1941,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
         Bridging {
             clock: Arc::clone(&clock) as Arc<_>,
             fence_hold: None,
+            hello_abi: "zle-5.9",
         },
         |config| config.worker_profile = WorkerProfile::DesktopBound,
     )
