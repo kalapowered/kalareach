@@ -50,13 +50,15 @@ impl Controller {
             .iter()
             .map(|(session_id, link)| (*session_id, Arc::clone(link)))
             .collect();
-        for (session_id, link) in links {
-            let mut held = link.lock().await;
-            if let Some(client) = held.as_mut()
-                && client.confirm_delivery(action_id).await.is_err()
-            {
-                *held = None;
-                self.lost_control_path(session_id);
+        for (session_id, slot) in links {
+            // A worker with no link has nothing to be told: one is not opened for this. A link that
+            // is written to is the daemon's own like any other, so one that does not take the
+            // notice whole, or whose future is dropped part way, is given up with the lease.
+            let Some(mut link) = self.link_in(session_id, slot.lock_owned().await) else {
+                continue;
+            };
+            if link.client().confirm_delivery(action_id).await.is_ok() {
+                link.give_back();
             }
         }
     }
