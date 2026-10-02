@@ -1454,7 +1454,7 @@ impl Container {
             String::from_utf8_lossy(&doctor.stderr)
         );
         let document: Value = serde_json::from_slice(&doctor.stdout).expect("doctor printed JSON");
-        document["environment_id"]
+        document["host"]["environment_id"]
             .as_str()
             .unwrap_or_else(|| panic!("doctor names the environment: {document}"))
             .to_owned()
