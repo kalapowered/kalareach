@@ -238,10 +238,25 @@ fn hello_ack(
     authenticated_uid: u64,
     build: Option<kr_protocol::local::LocalBuild>,
 ) -> LocalHelloAck {
+    hello_ack_as(
+        LocalRole::Controller,
+        environment_id,
+        authenticated_uid,
+        build,
+    )
+}
+
+/// [`hello_ack`], for a daemon or a worker.
+fn hello_ack_as(
+    role: LocalRole,
+    environment_id: EnvironmentId,
+    authenticated_uid: u64,
+    build: Option<kr_protocol::local::LocalBuild>,
+) -> LocalHelloAck {
     let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
     LocalHelloAck {
         selected_version: PROTOCOL_VERSION,
-        role: LocalRole::Controller,
+        role,
         connection_id,
         environment_id,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
@@ -269,9 +284,10 @@ fn hello_ack(
 /// It answers an ordinary hello, stating `build`, and ends the connection a hello that carries an
 /// origin arrived on without a word, which is what a host that cannot decode the frame does. It
 /// serves every connection that is made to it, and counts the ones that said where they began.
-async fn stub_earlier_controller(
+async fn stub_earlier_peer(
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
+    role: LocalRole,
     build: Option<kr_protocol::local::LocalBuild>,
     bridged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
@@ -291,7 +307,8 @@ async fn stub_earlier_controller(
                     bridged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
-                let acknowledgement = hello_ack(
+                let acknowledgement = hello_ack_as(
+                    role,
                     environment_id,
                     u64::from(kr_ipc::paths::current_uid()),
                     build,
@@ -1245,9 +1262,10 @@ async fn refusal_from_an_earlier_daemon(
         .controller_endpoint()
         .expect("an endpoint");
     let bridged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let stub = stub_earlier_controller(
+    let stub = stub_earlier_peer(
         endpoint,
         tree.environment_id(),
+        LocalRole::Controller,
         build,
         std::sync::Arc::clone(&bridged),
     )
@@ -1315,4 +1333,105 @@ async fn a_daemon_that_states_no_build_is_said_to_state_none() {
         "{}",
         error.message
     );
+}
+
+/// A daemon of this build's own level that ends the connection which declares an origin has not
+/// failed for being of an earlier build, and is not said to be: the helper reports the failure it
+/// saw, and does not tell a person to restart something that is current.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_of_this_level_that_ends_a_connection_is_not_said_to_be_of_an_earlier_build() {
+    let current = Some(kr_protocol::local::LocalBuild::this(
+        BuildId::new("kr-controller/test").expect("a build"),
+    ));
+    let (error, bridged) = refusal_from_an_earlier_daemon(false, current).await;
+    assert_ne!(
+        error.code,
+        ErrorCode::UnsupportedSchema,
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("earlier build") && !error.message.contains("restart it"),
+        "{}",
+        error.message
+    );
+    assert_eq!(bridged, 1);
+}
+
+/// The same for a session's worker, which a bridge to a session reaches through its published
+/// descriptor: a worker of an earlier build is named, with what to do about a worker, which is not
+/// to restart it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_of_an_earlier_build_is_named_and_not_reported_absent() {
+    use kr_protocol::identity::{BootIdentity, BootIdentitySource, ProcessStartIdentity};
+    use kr_protocol::scalars::{AuthorisationKey, Bytes, TimestampMs};
+
+    let tree = kr_ipc::testing::TempHost::create();
+    let session_id = SessionId::new(Uuid::from_bytes([0x51; 16]));
+    let socket = tree.root().join("w.sock");
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&socket).expect("an endpoint");
+    let bridged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stub = stub_earlier_peer(
+        endpoint,
+        tree.environment_id(),
+        LocalRole::Worker,
+        Some(kr_protocol::local::LocalBuild {
+            build_id: BuildId::new("kr-worker/0.0.9").expect("a build"),
+            protocol_version: kr_protocol::hello::PackageVersion::new(0, 0, 9),
+        }),
+        std::sync::Arc::clone(&bridged),
+    )
+    .await;
+    kr_ipc::descriptor::publish(
+        &tree.environment(),
+        &kr_protocol::worker::WorkerDescriptor {
+            session_id,
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id: tree.environment_id(),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::LinuxBootId,
+                value: Bytes::new(b"boot".to_vec()),
+            },
+            process_start_identity: ProcessStartIdentity::new(
+                42,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                99,
+            ),
+            protocol_version: PROTOCOL_VERSION,
+            endpoint: socket.display().to_string(),
+            worker_public_key: AuthorisationKey::from_bytes([1; 32]),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: TimestampMs::new(1),
+        },
+    )
+    .expect("publishes the descriptor");
+
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello_to(
+        ActorIngress::LocalIpc,
+        false,
+        BridgeTarget::Session { session_id },
+    ));
+    let BridgeFrame::Refused(error) = helper.read() else {
+        panic!("a worker that takes no bridge is a refusal, not an acknowledgement");
+    };
+    drop(helper.finish());
+    stub.abort();
+    assert_eq!(
+        error.code,
+        ErrorCode::UnsupportedSchema,
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("session worker")
+            && error
+                .message
+                .contains("kr-worker/0.0.9 with protocol 0.0.9")
+            && error.message.contains("with the kr of its own build"),
+        "{}",
+        error.message
+    );
+    assert_eq!(bridged.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
