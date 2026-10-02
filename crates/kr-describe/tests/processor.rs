@@ -134,6 +134,35 @@ fn a_host_whose_processor_lacks_an_instruction_set_says_which_and_starts_no_proc
     assert!(matches!(asked, Instruction::Load { .. }), "{asked:?}");
 }
 
+/// The instruction sets the compiler adds on its own (POPCNT with SSE4.2, the scalar BMI, LZCNT and
+/// MOVBE with the AVX2 level) have no llama.cpp option, and a hypervisor can hide any of them from a
+/// processor that has the six that do. Each is checked like the rest, and the reason names it.
+#[test]
+fn an_instruction_set_the_compiler_implies_is_checked_like_the_pinned_ones() {
+    let implied = [
+        Feature::Popcnt,
+        Feature::Bmi1,
+        Feature::Lzcnt,
+        Feature::Movbe,
+    ];
+    for missing in implied {
+        assert_eq!(missing.build_option(), None, "{}", missing.as_str());
+        let selection = built_in().select(LINUX, &all_but(missing), &MetGates::default());
+        assert_eq!(
+            selection.processor_lacks(),
+            Some(&[missing][..]),
+            "{}",
+            missing.as_str()
+        );
+    }
+    let pinned: Vec<_> = Feature::X86_64
+        .iter()
+        .filter(|feature| feature.build_option().is_some())
+        .collect();
+    assert_eq!(pinned.len(), 6, "{pinned:?}");
+    assert_eq!(Feature::X86_64.len(), 10);
+}
+
 /// A processor that lacks several is told all of them, in the baseline's order, so one answer says
 /// everything that is missing.
 #[test]
@@ -142,11 +171,22 @@ fn every_missing_instruction_set_is_named_in_one_answer() {
     let selection = built_in().select(LINUX, &processor, &MetGates::default());
     assert_eq!(
         selection.processor_lacks(),
-        Some(&[Feature::Avx2, Feature::Bmi2, Feature::Fma, Feature::F16c][..])
+        Some(
+            &[
+                Feature::Popcnt,
+                Feature::Avx2,
+                Feature::Bmi1,
+                Feature::Bmi2,
+                Feature::Fma,
+                Feature::F16c,
+                Feature::Lzcnt,
+                Feature::Movbe,
+            ][..]
+        )
     );
     assert_eq!(
         names(selection.processor_lacks().expect("it lacks some")),
-        "AVX2, BMI2, FMA and F16C"
+        "POPCNT, AVX2, BMI1, BMI2, FMA, F16C, LZCNT and MOVBE"
     );
 }
 
@@ -229,6 +269,22 @@ fn the_running_processor_is_asked_for_each_instruction_set() {
         running.has(Feature::F16c),
         std::arch::is_x86_feature_detected!("f16c")
     );
+    assert_eq!(
+        running.has(Feature::Popcnt),
+        std::arch::is_x86_feature_detected!("popcnt")
+    );
+    assert_eq!(
+        running.has(Feature::Bmi1),
+        std::arch::is_x86_feature_detected!("bmi1")
+    );
+    assert_eq!(
+        running.has(Feature::Lzcnt),
+        std::arch::is_x86_feature_detected!("lzcnt")
+    );
+    assert_eq!(
+        running.has(Feature::Movbe),
+        std::arch::is_x86_feature_detected!("movbe")
+    );
 }
 
 /// A processor that is not x86 has none of the x86 instruction sets, and its target asks for none.
@@ -246,6 +302,67 @@ fn instruction_sets_are_named_for_a_sentence() {
     assert_eq!(
         names(&[Feature::Avx, Feature::Avx2, Feature::Bmi2]),
         "AVX, AVX2 and BMI2"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The processor check cannot be folded away
+// ---------------------------------------------------------------------------------------------
+
+/// The processor check asks the processor, and the standard library answers a question about an
+/// instruction set the build itself enabled with a constant yes. A daemon built that way would
+/// start on a processor without the set and stop on it, the failure the check exists to prevent, so
+/// the crate refuses to build when any instruction set of the baseline is enabled at compile time.
+/// The control is the same source built with no flag; each refusal names what to remove.
+///
+/// This builds `src/processor.rs` alone with the compiler, on the host's own architecture.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn a_build_that_enables_an_instruction_set_of_the_baseline_is_refused() {
+    let source = concat!(env!("CARGO_MANIFEST_DIR"), "/src/processor.rs");
+    let directory = tempfile::tempdir().expect("a directory");
+    let build = |flags: &[String]| {
+        std::process::Command::new("rustc")
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--emit=metadata",
+            ])
+            .arg("--out-dir")
+            .arg(directory.path())
+            .args(flags)
+            .arg(source)
+            .output()
+            .expect("the compiler starts")
+    };
+
+    let control = build(&[]);
+    assert!(
+        control.status.success(),
+        "the control builds: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    for name in [
+        "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma", "f16c", "lzcnt", "movbe",
+    ] {
+        let refused = build(&[format!("-Ctarget-feature=+{name}")]);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{name} was accepted");
+        assert!(
+            said.contains("built for the target's own instruction sets"),
+            "{name}: {said}"
+        );
+        assert!(said.contains("target-feature"), "{name}: {said}");
+    }
+    let native = build(&["-Ctarget-cpu=native".to_owned()]);
+    let said = String::from_utf8_lossy(&native.stderr);
+    // A native build on a machine with none of the sets would be accepted, and no machine a release
+    // is built on lacks AVX2, so this holds wherever the test runs.
+    assert!(
+        !native.status.success() || !std::arch::is_x86_feature_detected!("avx2"),
+        "{said}"
     );
 }
 
@@ -302,13 +419,17 @@ fn pinned(settings: &str) -> BTreeMap<String, String> {
     pins
 }
 
-/// Where the build's pins differ from the baseline: an instruction set of the baseline that is not
-/// on, an option that must be off and is not, and an option that is pinned and is neither.
+/// Where the build's pins differ from the baseline: an instruction set of the baseline that has an
+/// option and is not on, an option that must be off and is not, and an option that is pinned and is
+/// neither.
 fn disagreements(pins: &BTreeMap<String, String>) -> Vec<String> {
     let mut found = Vec::new();
-    for feature in Feature::X86_64 {
-        if pins.get(feature.build_option()).map(String::as_str) != Some("ON") {
-            found.push(format!("{} is not forced on", feature.build_option()));
+    for option in Feature::X86_64
+        .iter()
+        .filter_map(|feature| feature.build_option())
+    {
+        if pins.get(option).map(String::as_str) != Some("ON") {
+            found.push(format!("{option} is not forced on"));
         }
     }
     for option in OPTIONS_LEFT_OFF {
@@ -320,7 +441,7 @@ fn disagreements(pins: &BTreeMap<String, String>) -> Vec<String> {
         let known = OPTIONS_LEFT_OFF.contains(&option.as_str())
             || Feature::X86_64
                 .iter()
-                .any(|feature| feature.build_option() == option);
+                .any(|feature| feature.build_option() == Some(option.as_str()));
         if !known {
             found.push(format!(
                 "{option} is pinned and is not part of the baseline"
@@ -343,12 +464,12 @@ fn the_build_compiles_the_instruction_sets_the_baseline_names_and_no_others() {
 
     let complete = |left_out: &str, forced_off: &str, extra: &str| {
         let mut text = String::from("[env]\n");
-        for feature in Feature::X86_64 {
-            if feature.build_option() != left_out {
-                text.push_str(&format!(
-                    "{} = {{ value = \"ON\", force = true }}\n",
-                    feature.build_option()
-                ));
+        for option in Feature::X86_64
+            .iter()
+            .filter_map(|feature| feature.build_option())
+        {
+            if option != left_out {
+                text.push_str(&format!("{option} = {{ value = \"ON\", force = true }}\n"));
             }
         }
         for option in OPTIONS_LEFT_OFF {

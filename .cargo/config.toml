@@ -33,11 +33,14 @@ rustflags = [
 # The description process's processor baseline. llama.cpp compiles its CPU code for a fixed set of
 # x86-64 instruction sets chosen when it is built, so the set is written here and never taken from
 # the machine that compiles: a release built on a newer processor than the one it ships to would
-# stop with an illegal instruction on the older one. The baseline is SSE4.2, AVX, AVX2, BMI2, FMA
-# and F16C, which is `kr_describe::processor::Feature::X86_64`; a host checks its processor against
-# the same list before it offers a model, and a test holds the two equal. These options do nothing
-# on other targets. `force` keeps an environment variable of the same name from changing them, and
-# `kr-describe-model` refuses to build when a `target-cpu` flag would override them.
+# stop with an illegal instruction on the older one. The baseline is the x86-64-v3 level as compiled
+# code uses it, `kr_describe::processor::Feature::X86_64`. Six of its members have a llama.cpp
+# option, pinned on below (SSE4.2, AVX, AVX2, BMI2, FMA and F16C); the compilers add POPCNT, BMI1,
+# LZCNT and MOVBE themselves. A host checks its processor against all ten before it offers a model,
+# and a test holds the pins and that list equal. The options do nothing on a target that is not
+# x86-64; 32-bit x86 has no model profile, so no process is started there. `force` keeps an
+# environment variable of the same name from changing them, and `kr-describe-model` refuses to
+# build when a `target-cpu` flag, or a target feature wider than the baseline, would override them.
 [env]
 GGML_NATIVE = { value = "OFF", force = true }
 GGML_SSE42 = { value = "ON", force = true }
