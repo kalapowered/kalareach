@@ -504,34 +504,51 @@ fn version_in_scope(
 ) -> kr_automation::Result<()> {
     // A version that cannot be read cannot be checked, and a version that does not exist yet can
     // be captured before the materialisation reads it. Either way the dispatch is refused: what is
-    // materialised is only ever a version whose scope was checked here.
-    let version = changesets
-        .record(asked.change_set_id, Some(asked.version))
-        .map_err(|error| {
-            kr_automation::AutomationError::PermissionDenied(format!(
-                "change set {} version {} could not be checked against workflow {}'s scope: {}",
-                asked.change_set_id,
-                asked.version,
-                definition.workflow_id,
-                kr_project::git::redact(&error.to_string())
-            ))
-        })?;
-    if version.environment_id != environment_id {
-        return Err(kr_automation::AutomationError::PermissionDenied(format!(
+    // materialised is only ever a version whose scope was checked here, by the one rule every
+    // caller bounded by a scope is held to.
+    use crate::changeset::{OutOfScope, ScopedEnvironments, VersionScope};
+
+    let refused = |detail: String| kr_automation::AutomationError::PermissionDenied(detail);
+    crate::changeset::version_in_scope(
+        changesets,
+        kr_protocol::changeset::VersionRef {
+            change_set_id: asked.change_set_id,
+            version: asked.version,
+        },
+        &VersionScope {
+            environments: ScopedEnvironments::One(environment_id),
+            workspace: definition.resource_scope.workspace_id.0,
+            sessions: None,
+            captured_since: None,
+        },
+    )
+    .map(|_| ())
+    .map_err(|out| match out {
+        OutOfScope::Unreadable(error) => refused(format!(
+            "change set {} version {} could not be checked against workflow {}'s scope: {}",
+            asked.change_set_id,
+            asked.version,
+            definition.workflow_id,
+            kr_project::git::redact(&error.to_string())
+        )),
+        OutOfScope::Environment { captured_in } => refused(format!(
             "change set {} version {} was captured in environment {}, and this host acts in {}",
-            asked.change_set_id, asked.version, version.environment_id, environment_id
-        )));
-    }
-    if let Some(declared) = definition.resource_scope.workspace_id.0
-        && version.workspace_id != declared
-    {
-        return Err(kr_automation::AutomationError::PermissionDenied(format!(
+            asked.change_set_id, asked.version, captured_in, environment_id
+        )),
+        OutOfScope::Workspace {
+            captured_from,
+            declared,
+        } => refused(format!(
             "change set {} version {} was captured from workspace {}, and workflow {} is scoped \
              to workspace {declared}",
-            asked.change_set_id, asked.version, version.workspace_id, definition.workflow_id
-        )));
-    }
-    Ok(())
+            asked.change_set_id, asked.version, captured_from, definition.workflow_id
+        )),
+        // A workflow's scope names neither sessions nor a moment, so neither can refuse one.
+        OutOfScope::Session | OutOfScope::History => refused(format!(
+            "change set {} version {} is outside workflow {}'s scope",
+            asked.change_set_id, asked.version, definition.workflow_id
+        )),
+    })
 }
 
 /// Why this host cannot hold a workspace still while a workflow's capture reads it.
