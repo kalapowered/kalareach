@@ -226,4 +226,49 @@ struct PushCheckReport {
         finish(facts)
     }
 }
+
+/// What a run of the audio check saw, second by second.
+///
+/// Each tick says how long ago the check's own input and output last ran and whether the device's
+/// protected data was available, which is how a locked phone shows itself to an application. The
+/// gaps over every tick and over the ticks while the phone was locked are kept apart, because
+/// audio that carries on through a lock is the thing being asked.
+struct AudioTickLog {
+    private let start: TimeInterval
+    private(set) var ticks = 0
+    private(set) var lockedTicks = 0
+    private(set) var inputGap: TimeInterval = 0
+    private(set) var outputGap: TimeInterval = 0
+    private(set) var lockedInputGap: TimeInterval = 0
+    private(set) var lockedOutputGap: TimeInterval = 0
+
+    init(start: TimeInterval) { self.start = start }
+
+    /// One reading. A time that has never been seen counts from the start of the check.
+    mutating func tick(now: TimeInterval, lastInput: TimeInterval?, lastOutput: TimeInterval?, protectedDataAvailable: Bool) {
+        let input = now - (lastInput ?? start)
+        let output = now - (lastOutput ?? start)
+        ticks += 1
+        inputGap = max(inputGap, input)
+        outputGap = max(outputGap, output)
+        if !protectedDataAvailable {
+            lockedTicks += 1
+            lockedInputGap = max(lockedInputGap, input)
+            lockedOutputGap = max(lockedOutputGap, output)
+        }
+    }
+
+    /// The facts, with gaps in whole milliseconds.
+    var facts: [String: String] {
+        func ms(_ gap: TimeInterval) -> String { String(Int((gap * 1000).rounded())) }
+        return [
+            "ticks": String(ticks),
+            "locked.ticks": String(lockedTicks),
+            "gap.input.max": ms(inputGap),
+            "gap.output.max": ms(outputGap),
+            "gap.input.locked.max": ms(lockedInputGap),
+            "gap.output.locked.max": ms(lockedOutputGap),
+        ]
+    }
+}
 #endif
