@@ -2788,6 +2788,32 @@ mod tests {
         raise_failure_of(attention, sequence, wall_ms, "cargo test");
     }
 
+    /// A pending approval in session one, seen and decided at `wall_ms` under the privacy state
+    /// `stamp` says.
+    fn raise_approval_under(
+        attention: &mut Attention,
+        sequence: u64,
+        wall_ms: u64,
+        request: &str,
+        stamp: kr_attention::PrivacyStamp,
+    ) {
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Receipts, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::ApprovalRequested {
+                        request_id: kr_protocol::ids::ApprovalRequestId::new(request)
+                            .expect("an identifier"),
+                        session_id: session(1),
+                        summary: "write /etc/hosts".to_owned(),
+                    },
+                ),
+                reading(0, wall_ms).under(stamp),
+            )
+            .expect("the store records the approval");
+    }
+
     /// A failure of `command` in session one, seen and decided at `wall_ms`, under the privacy state
     /// `stamp` says.
     fn raise_failure_under(
@@ -3178,12 +3204,13 @@ mod tests {
             private: true,
         };
         // Decided while privacy mode is on, at a time later than the moment it is lifted at, and
-        // held back from the take until after the lift.
-        raise_failure_under(
+        // held back from the take until after the lift. It is an approval, so that a notification
+        // made from it is told from the other one by its alert.
+        raise_approval_under(
             &mut attention,
             1,
             in_an_hour,
-            "cargo test",
+            "req-1",
             PrivacyStamp {
                 generation: 1,
                 private: true,
@@ -3234,6 +3261,17 @@ mod tests {
             produced.admitted, 2,
             "the one decided after is sent to each phone, whatever time it carries"
         );
+        for delivery in producer.journal().deliveries().expect("a read") {
+            let request: PushDeliveryRequest =
+                serde_json::from_slice(delivery.content.as_deref().expect("a request"))
+                    .expect("a push request");
+            assert_ne!(
+                request.hints.alert,
+                PushAlert::ApprovalWaiting,
+                "what was sent is the failure decided after, and not the approval decided while \
+                 privacy mode was on"
+            );
+        }
     }
 
     /// What a grant reaches is decided by its history and by the right each kind of subject asks
