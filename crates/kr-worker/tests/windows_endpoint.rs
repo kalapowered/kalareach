@@ -125,6 +125,13 @@ fn close_to_administrators(path: &Path) {
     );
 }
 
+/// Whether `text` carries `secret`: the whole value, as written. A registration is full of
+/// numbers (a process identifier, a creation time) and random names, so any short run of digits can
+/// turn up in one by chance; only the credential itself says whether the credential was written.
+fn carries(text: &str, secret: &str) -> bool {
+    !secret.is_empty() && text.contains(secret)
+}
+
 fn launch_for(which: u8) -> NativeLaunch {
     NativeLaunch {
         profile_id: LaunchProfileId::new("lp-1").expect("valid"),
@@ -847,14 +854,15 @@ async fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_j
         "it names the pipe by its path: {registration}"
     );
     assert!(registration.contains("pid="));
-    assert!(
-        registration.contains("credential=") && !registration.contains("0909"),
-        "it names the file the private exchange is in and carries none of it"
-    );
     let stored = kr_ipc::paths::read_owner_only_file(&launch.directory.join("credential"), 256)
         .expect("the credential file is the owner's")
         .expect("it is there");
     assert_eq!(stored.len(), 64);
+    let secret = String::from_utf8(stored).expect("hexadecimal");
+    assert!(
+        registration.contains("credential=") && !carries(&registration, &secret),
+        "it names the file the private exchange is in and carries none of it: {registration}"
+    );
     assert!(
         launch
             .members()
@@ -865,6 +873,24 @@ async fn kr_req_12_02_a_launch_publishes_its_files_and_starts_the_agent_in_its_j
         launch.broker.binding_state(instance(2)).is_ok(),
         "and its instance is registered"
     );
+}
+
+/// KR-REQ-12.02: what judges a registration to carry the credential is the credential. Digits that
+/// happen to read like a fixed test value do not, and the credential written into a line does, so
+/// the launch test above can neither fail on a number nor pass over a secret.
+#[test]
+fn kr_req_12_02_a_registration_is_judged_by_the_credential_and_not_by_its_digits() {
+    let secret = "ab".repeat(32);
+    let registration = "endpoint=\\\\.\\pipe\\kr-0909\npid=10909\nstart=134353840909000000\ncredential=C:\\0909\\credential\n";
+    assert!(
+        !carries(registration, &secret),
+        "a registration full of 0909 and without the credential carries none"
+    );
+    assert!(
+        carries(&format!("{registration}credential={secret}\n"), &secret),
+        "and one that has the credential written into it does"
+    );
+    assert!(!carries("", ""), "nothing is carried by nothing");
 }
 
 /// KR-REQ-12.02: a launch into a directory another account was granted starts nothing. The
