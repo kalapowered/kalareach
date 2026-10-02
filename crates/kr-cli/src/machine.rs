@@ -1201,8 +1201,12 @@ fn judge(
         // before the record was lost: a step it could not answer, or is still running, is not
         // given a result it was not given. Where it refused the step before it claimed it, the step
         // was not taken.
-        return match code {
-            ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable => Verdict::Pending,
+        return match (fresh, code) {
+            (_, ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable) => Verdict::Pending,
+            // A step sent again, refused for storage, proves nothing about an earlier attempt:
+            // the environment may have failed before it looked up its receipts, and the earlier
+            // attempt may have applied the step. A step composed here was not sent before.
+            (false, ErrorCode::StorageUnavailable) => Verdict::Pending,
             _ => Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
         };
     };
@@ -1529,13 +1533,20 @@ mod tests {
         }
         // An environment with no usable record takes no step, and is not taken to have refused one
         // it may have taken before the record was lost.
-        for code in [ErrorCode::PermissionDenied, ErrorCode::StorageUnavailable] {
-            assert_eq!(
-                judge(&step, None, code, false),
-                Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
-                "{code:?}"
-            );
-        }
+        assert_eq!(
+            judge(&step, None, ErrorCode::PermissionDenied, false),
+            Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment)
+        );
+        // A step composed here was not sent before, so a storage refusal is a refusal; one sent
+        // again may have been applied by an earlier attempt, and stays sent.
+        assert_eq!(
+            judge(&step, None, ErrorCode::StorageUnavailable, true),
+            Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment)
+        );
+        assert_eq!(
+            judge(&step, None, ErrorCode::StorageUnavailable, false),
+            Verdict::Pending
+        );
         for code in [ErrorCode::OutcomeUnknown, ErrorCode::ResourceUnavailable] {
             for fresh in [false, true] {
                 assert_eq!(
