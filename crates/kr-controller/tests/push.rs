@@ -2954,9 +2954,26 @@ struct DeliveringGateway {
     /// A status it answers every delivery with instead of taking it, which a notification is left
     /// with an outcome nobody knows by.
     delivery_fails_with: Option<u16>,
+    /// Holds every delivery until a permit is given, which leaves a send on the wire.
+    hold: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl DeliveringGateway {
+    /// A gateway that holds every delivery it is given until [`Self::release`].
+    fn holding() -> Self {
+        Self {
+            hold: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..Self::default()
+        }
+    }
+
+    /// Lets one held delivery be answered.
+    fn release(&self) {
+        if let Some(hold) = &self.hold {
+            hold.add_permits(1);
+        }
+    }
+
     /// A gateway that answers every delivery with `status`, and so takes none of them.
     fn failing_with(status: u16) -> Self {
         Self {
@@ -3060,7 +3077,15 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
         } else {
             serde_json::json!({ "ok": true, "data": null })
         };
+        let hold = if url.ends_with("/api/push/deliver") {
+            self.hold.clone()
+        } else {
+            None
+        };
         Box::pin(async move {
+            if let Some(hold) = hold {
+                hold.acquire().await.expect("the gate is open").forget();
+            }
             Ok(kr_client::services::ServiceHttpAnswer {
                 status: 200,
                 body: serde_json::to_vec(&answer).expect("an answer"),
@@ -6955,6 +6980,81 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
         .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
         .expect("a read");
     assert_eq!(rows, 2);
+    host.stop().await;
+}
+
+/// KR-REQ-24.27, KR-REQ-24.28: an alert privacy mode lets through, while it is on the wire, is not
+/// cleanup of content captured before the boundary, so `privacy.status` reports the change complete
+/// and turning privacy mode off is not held up by it. The control: the same report names the work
+/// still outstanding while a send of content from before the boundary is on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alert_on_the_wire_is_not_cleanup_privacy_mode_waits_for() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let session_id = SessionId::new(uuid(90));
+    pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::holding());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    let on_the_wire = || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::InFlight))
+            })
+            .unwrap_or(false)
+    };
+
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[pending_approval_in(session_id, 1, "req-during")])
+        .expect("the store records the approval");
+    until_holds("the alert being on the wire", on_the_wire).await;
+    let report = privacy_report(&host).await;
+    assert_eq!(
+        report.completion,
+        kr_protocol::privacy::PrivacyCompletion::Complete,
+        "an alert on the wire is not cleanup"
+    );
+
+    // The control: the same send, recorded as one admitted before the boundary, is cleanup the
+    // report waits for.
+    let path = host
+        .tree()
+        .environment()
+        .state_dir()
+        .join("delivery.sqlite3");
+    let second = rusqlite::Connection::open(&path).expect("a second connection");
+    second
+        .execute(
+            "UPDATE delivery_notifications SET privacy_generation = 0 WHERE state = 'in_flight'",
+            [],
+        )
+        .expect("the send is recorded as one from before the boundary");
+    let report = privacy_report(&host).await;
+    assert!(
+        matches!(
+            report.completion,
+            kr_protocol::privacy::PrivacyCompletion::Reconciling { .. }
+        ),
+        "{:?}",
+        report.completion
+    );
+    second
+        .execute(
+            "UPDATE delivery_notifications SET privacy_generation = 1 WHERE state = 'in_flight'",
+            [],
+        )
+        .expect("the record is put back");
+    gateway.release();
+    until_holds("the held send being answered", || !on_the_wire()).await;
     host.stop().await;
 }
 
