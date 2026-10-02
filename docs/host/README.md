@@ -2577,14 +2577,14 @@ carries the terminated process identities, whatever the fence reached, the resou
 survive, and an ownership-coverage flag that never claims every application was discovered.
 Nothing is rebuilt from terminal history.
 
-**What the fence reaches today is nothing, and it says so.** A worker's descendants join the
+**What the fence reaches is nothing, and it says so.** A worker's descendants join the
 process group it led, and once the worker has gone the kernel is free to give its number to an
 unrelated process whose group would answer to it; the root shell also starts a session of its own,
 so its jobs need not be in the worker's group even while the worker lives. Stopping what such a
 group held would be stopping somebody else's processes on the strength of a coincidence. The
 boundary that would work is the one the platform keeps - the transient unit or Job the supervisor
 started the worker in, named from the reservation and unable to name anything else - and this host
-does not stop one yet. So the coverage is incomplete and the record says which part of it this
+does not stop one. So the coverage is incomplete and the record says which part of it this
 host could not account for.
 
 **A closed session can be collected.** A session with no worker has no maintenance tick, so the
@@ -3280,10 +3280,11 @@ the control endpoint and an ordinary request on the chunk endpoint are both refu
 process binds both and owns the tasks that serve them, so a restart releases the addresses before it
 binds them again.
 
-The service cannot know which sessions this host still retains, so the daemon answers for them: a
-session the registry has a reservation for, in any launch phase, keeps what was submitted to it.
-That preserves files rather than losing them, and it is the daemon's own answer rather than the
-archive's retention policy. An hourly sweep expires
+The service cannot know which sessions this host still retains, so the daemon answers for them, and
+the answer is the union of two records: a session the registry has a reservation or a worker row
+for, in any launch phase, keeps what was submitted to it, and so does a session only the archive
+knows about whose archive retains submissions. That preserves files rather than losing them. An
+hourly sweep expires
 unfinished uploads after twenty-four hours, unused attachments after seven days, and download
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
