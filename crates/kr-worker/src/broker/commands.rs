@@ -1316,16 +1316,7 @@ async fn admit_launch(
             "this connection is not the operating-system user who owns the session",
         ));
     }
-    let Some(process) = peer
-        .process()
-        .filter(|_| peer.from_operating_system())
-        .cloned()
-    else {
-        return Err(BrokerError::denied(
-            "the kernel named no process for this connection, and a launch is admitted only by \
-             the process the kernel names",
-        ));
-    };
+    let process = peer.process().clone();
     if process.pid.get() != launch.pid || process.start_value.get() != launch.start {
         return Err(BrokerError::denied(
             "this connection says it is another process than the one the kernel named",

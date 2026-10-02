@@ -3,10 +3,11 @@
 //! Section 12 fixes four properties, and this module is where each one is decided rather than
 //! hoped for.
 //!
-//! * **It is private.** A Unix socket inside the owner-only runtime directory where the platform
-//!   supports one; loopback with a random per-launch credential where it does not. Either way the
-//!   address is local: [`ListenerAddress::is_local`] is what the host checks before it publishes
-//!   one, and nothing here can produce an address a relay could carry.
+//! * **It is private.** A Unix socket inside the owner-only runtime directory on Unix, and a named
+//!   pipe that carries its owner's own access list on Windows. On both the kernel names the process
+//!   at the other end. Either way the address is local: [`ListenerAddress::is_local`] is what the
+//!   host checks before it publishes one, and nothing here can produce an address a relay could
+//!   carry.
 //! * **A browser cannot use it.** [`reject_browser_origin`] refuses a connection that arrives with
 //!   any of the headers a browser adds. A page that guesses the address still cannot speak to it.
 //! * **An unauthenticated request is refused.** [`Registration::authenticate`] wants the private
@@ -15,8 +16,8 @@
 //!   authority.
 //! * **Credentials stay out of what people see.** The address a diagnostic prints carries none,
 //!   and neither does an argument vector: the secret travels in an owner-only file the launched
-//!   process opens, or, where a file's protection cannot be proved, over the endpoint's own
-//!   access-controlled channel.
+//!   process opens, and the file's protection is read back from the opened file before it is
+//!   trusted.
 //!
 //! And one property that belongs to a binding rather than to the listener: an installed upgrade
 //! affects new launches. [`BoundBinary`] is pinned when a process starts, and
@@ -44,28 +45,39 @@ pub const BROWSER_HEADERS: &[&str] = &[
     "access-control-request-method",
 ];
 
+/// The longest name a launch's pipe may have, in characters.
+pub const MAX_PIPE_NAME: usize = 64;
+
+/// The prefix every local pipe's path has.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
 /// Where the launched agent connects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerAddress {
     /// A socket file inside the owner-only runtime directory.
     ///
-    /// Preferred wherever the platform has one, because the filesystem answers "who may connect"
-    /// before any byte is read.
+    /// The Unix endpoint, because the filesystem answers "who may connect" before any byte is
+    /// read.
     PrivateSocket(std::path::PathBuf),
-    /// Loopback, with a random per-launch credential every connection must present.
+    /// A named pipe, by its one name inside the local pipe namespace.
     ///
-    /// The address is not the secret. Anyone on this machine can reach a loopback port, so the
-    /// credential is what decides, and it never appears in the address.
-    Loopback {
-        /// The interface the listener is bound to.
-        ///
-        /// It is here rather than assumed, because "loopback" is what has to be checked: a
-        /// listener bound to every interface is reachable from the network, and a random
-        /// credential is not a substitute for not being reachable.
-        address: std::net::IpAddr,
-        /// The port the listener is bound to.
-        port: u16,
-    },
+    /// The Windows endpoint. The pipe carries its owner's own access list, so the operating system
+    /// answers "who may connect" before any byte is read, and the kernel names the process on the
+    /// other end. The name is a fresh random one for each launch.
+    NamedPipe(String),
+}
+
+/// Returns true when `name` is one component of the local pipe namespace and nothing else.
+///
+/// Letters, digits, hyphens and underscores only: a separator or a dot segment could make the
+/// published path reach a pipe on another machine or another place in the namespace.
+#[must_use]
+pub fn is_pipe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PIPE_NAME
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 impl ListenerAddress {
@@ -78,11 +90,11 @@ impl ListenerAddress {
     pub fn is_local(&self) -> bool {
         match self {
             Self::PrivateSocket(path) => path.is_absolute(),
-            Self::Loopback { address, .. } => address.is_loopback(),
+            Self::NamedPipe(name) => is_pipe_component(name),
         }
     }
 
-    /// Returns the address as a diagnostic prints it.
+    /// Returns the address as a diagnostic prints it, which is what the registration publishes.
     ///
     /// There is no credential in it, because there is no credential in the type. A reader of a
     /// diagnostic learns where the listener is and nothing about how to speak to it.
@@ -90,7 +102,7 @@ impl ListenerAddress {
     pub fn for_diagnostics(&self) -> String {
         match self {
             Self::PrivateSocket(path) => path.display().to_string(),
-            Self::Loopback { address, port } => format!("{address}:{port}"),
+            Self::NamedPipe(name) => format!("{PIPE_PREFIX}{name}"),
         }
     }
 
@@ -98,36 +110,34 @@ impl ListenerAddress {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::InvalidArgument`] when the runtime directory names nothing.
-    pub fn for_launch(runtime_directory: &std::path::Path, port: u16) -> Result<Self> {
-        if cfg!(unix) {
-            if !runtime_directory.is_absolute() {
-                return Err(BrokerError::invalid(
-                    "a private socket lives at an absolute path inside the runtime directory",
-                ));
-            }
-            // The directory decides who may connect, so it is checked before an address that
-            // depends on it is handed out.
-            crate::broker::process::check_private_directory(runtime_directory)?;
+    /// Returns [`BrokerError::InvalidArgument`] when the runtime directory is not an absolute
+    /// path, and the refusal [`crate::broker::process::check_private_directory`] gives when it is
+    /// not private.
+    pub fn for_launch(runtime_directory: &std::path::Path) -> Result<Self> {
+        if !runtime_directory.is_absolute() {
+            return Err(BrokerError::invalid(
+                "a launch's runtime directory is an absolute path",
+            ));
+        }
+        // The directory holds the registration and the credential, and on Unix it also decides who
+        // may connect, so it is checked before an address that depends on it is handed out.
+        crate::broker::process::check_private_directory(runtime_directory)?;
+        let fresh: String = kr_ipc::new_uuid()
+            .to_string()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .collect();
+        let address = if cfg!(unix) {
             // The name is short on purpose. A socket path has a small fixed bound on every Unix,
             // and a runtime directory a person chose can already be most of it, so the part this
             // host adds stays out of the way: enough of a fresh identifier not to collide, and no
             // more.
-            let name: String = kr_ipc::new_uuid()
-                .to_string()
-                .chars()
-                .filter(char::is_ascii_hexdigit)
-                .take(12)
-                .collect();
-            let address = Self::PrivateSocket(runtime_directory.join(format!("a-{name}.sock")));
-            debug_assert!(address.is_local());
-            Ok(address)
+            Self::PrivateSocket(runtime_directory.join(format!("a-{}.sock", &fresh[..12])))
         } else {
-            Ok(Self::Loopback {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                port,
-            })
-        }
+            Self::NamedPipe(format!("kr-a-{fresh}"))
+        };
+        debug_assert!(address.is_local());
+        Ok(address)
     }
 
     /// Refuses an address this host will not publish.
@@ -251,40 +261,32 @@ impl Registration {
     /// launch, and the admission that opens the connection checks it there, so the credential
     /// never has to be handed to whatever is accepting.
     ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PermissionDenied`] naming which half failed.
-    ///
     /// Three things are checked and all three must hold: the connection came from this user, the
     /// process is the one this host launched, and the credential is the one this host generated
     /// for that launch. An environment session identifier is not one of the three.
     ///
-    /// The first two come from [`PeerIdentity`], which only a bound endpoint produces. That is the
-    /// difference between deciding and knowing: a bridge that names somebody else's process is
-    /// refused because the kernel named its own, not because it was asked to be honest. Where the
-    /// platform has no private socket the kernel names no peer, and there the credential is the
-    /// whole authentication and the identity the bridge presents is compared with the launch; that
-    /// case is the one [`PeerIdentity::from_operating_system`] reports.
+    /// The first two come from [`PeerIdentity`], which only a bound endpoint produces, and the
+    /// kernel names the process on every platform. That is the difference between deciding and
+    /// knowing: a bridge that names somebody else's process is refused because the kernel named
+    /// its own, not because it was asked to be honest.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PermissionDenied`] naming which of the three failed.
+    /// Returns [`BrokerError::PermissionDenied`] naming which of the checks failed.
     pub fn authenticate_peer(&self, hello: &BridgeHello, peer: &PeerIdentity) -> Result<()> {
         if !peer.is_owner() {
             return Err(BrokerError::denied(
                 "this connection is not the operating-system user who owns the session",
             ));
         }
-        // Where the kernel can name the peer, an identity it did not name is not one this host
-        // admits. Otherwise the presented identity that loopback needs would become a way past
-        // the check on a platform that never needed it.
-        if cfg!(unix) && !peer.from_operating_system() {
-            return Err(BrokerError::denied(
-                "this platform names the process on a private socket, and this connection was \
-                 admitted without one",
-            ));
+        let connecting = peer.process();
+        if !connecting.matches(&hello.process) {
+            return Err(BrokerError::denied(format!(
+                "this connection says it is process {} and the operating system says it is \
+                 process {}",
+                hello.process.pid, connecting.pid
+            )));
         }
-        let connecting = peer.process().unwrap_or(&hello.process);
         if !connecting.matches(&self.expected_process) {
             return Err(BrokerError::denied(format!(
                 "this connection is process {} and the launch was process {}",
@@ -310,19 +312,16 @@ impl Registration {
                 "this connection is not the operating-system user who owns the session",
             ));
         }
-        // Where the kernel can name the peer, an identity it did not name is not one this host
-        // admits. Otherwise the presented identity that loopback needs would become a way past
-        // the check on a platform that never needed it.
-        if cfg!(unix) && !peer.from_operating_system() {
-            return Err(BrokerError::denied(
-                "this platform names the process on a private socket, and this connection was \
-                 admitted without one",
-            ));
+        // The kernel's reading of the connecting process, which is what is compared with the
+        // launch; the process the hello presents has to be the same one.
+        let connecting = peer.process();
+        if !connecting.matches(&hello.process) {
+            return Err(BrokerError::denied(format!(
+                "this connection says it is process {} and the operating system says it is \
+                 process {}",
+                hello.process.pid, connecting.pid
+            )));
         }
-        // On a private socket this is the kernel's reading of the connecting process. On loopback
-        // the kernel names none, so the identity the bridge presents is what is compared, and the
-        // credential below is what makes the comparison worth anything.
-        let connecting = peer.process().unwrap_or(&hello.process);
         if !connecting.matches(&self.expected_process) {
             return Err(BrokerError::denied(format!(
                 "this connection is process {} and the launch was process {}",
@@ -370,24 +369,16 @@ impl Registration {
                 "this connection is not the operating-system user who owns the session",
             ));
         }
-        if cfg!(unix) && !peer.from_operating_system() {
-            return Err(BrokerError::denied(
-                "this platform names the process on a private socket, and this connection was \
-                 admitted without one",
-            ));
-        }
         // The process the hello presents is the one the kernel named, or the connection is
         // somebody speaking for a process it is not.
-        if let Some(named) = peer.process()
-            && !named.matches(&hello.process)
-        {
+        let connecting = peer.process();
+        if !connecting.matches(&hello.process) {
             return Err(BrokerError::denied(format!(
                 "this connection says it is process {} and the operating system says it is \
                  process {}",
-                hello.process.pid, named.pid
+                hello.process.pid, connecting.pid
             )));
         }
-        let connecting = peer.process().unwrap_or(&hello.process);
         match crate::questions::binding::nearest_of(
             connecting,
             std::slice::from_ref(&self.expected_process),
@@ -532,29 +523,20 @@ mod tests {
         )
     }
 
-    /// The address a launch publishes on this platform: a private socket on Unix, and loopback
-    /// where the platform has no private socket.
+    /// The address a launch publishes on this platform: a private socket on Unix and a named pipe
+    /// on Windows.
     fn launch_address() -> ListenerAddress {
         if cfg!(unix) {
             ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into())
         } else {
-            ListenerAddress::Loopback {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                port: 49_152,
-            }
+            ListenerAddress::NamedPipe("kr-a-0123456789abcdef".to_owned())
         }
     }
 
-    /// The peer this platform's endpoint reports for a connection from `process`, built here so
-    /// the unit tests can state it. On a private socket the kernel names the process; on loopback
-    /// nothing does, so the identity the bridge presents is compared and the credential decides.
-    /// The endpoint that actually reads one is the integration suite's.
+    /// The peer the endpoint reports for a connection from `process`, built here so the unit tests
+    /// can state it. The endpoint that actually reads one is the integration suite's.
     fn endpoint_peer(process: ProcessStartIdentity) -> PeerIdentity {
-        if cfg!(unix) {
-            PeerIdentity::from_kernel(process, true)
-        } else {
-            PeerIdentity::presented(None, true)
-        }
+        PeerIdentity::from_kernel(process, true)
     }
 
     fn registration() -> Registration {
@@ -626,11 +608,38 @@ mod tests {
             registration
                 .authenticate(
                     &hello(),
-                    &PeerIdentity::presented(Some(process(41, 900)), false),
+                    &PeerIdentity::from_kernel(process(41, 900), false),
                     &managed
                 )
                 .is_err()
         );
+
+        // A hello that presents another process than the one the kernel named, though the process
+        // the kernel named is the launch: the connection is somebody speaking for a process it is
+        // not.
+        let speaking_for_another = BridgeHello {
+            credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
+            process: process(42, 900),
+            environment_session_id: None,
+        };
+        assert!(
+            registration
+                .authenticate(
+                    &speaking_for_another,
+                    &endpoint_peer(process(41, 900)),
+                    &managed
+                )
+                .is_err(),
+            "the process the hello presents is the one the kernel named"
+        );
+        assert!(
+            registration
+                .authenticate_peer(&speaking_for_another, &endpoint_peer(process(41, 900)))
+                .is_err()
+        );
+        registration
+            .authenticate_peer(&hello(), &endpoint_peer(process(41, 900)))
+            .expect("the same hello from the process it names is admitted");
 
         // A recycled process identifier.
         let recycled = BridgeHello {
@@ -682,27 +691,45 @@ mod tests {
         assert!(!file.to_ascii_lowercase().contains("secret"));
     }
 
+    /// A pipe's name is one component of the local pipe namespace, and the published path is that
+    /// namespace's prefix and the name, so nothing it names can be on another machine or anywhere
+    /// else in the namespace.
     #[test]
-    fn an_address_is_local_and_a_diagnostic_carries_no_credential() {
-        let loopback = ListenerAddress::Loopback {
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: 49_152,
-        };
-        assert!(loopback.is_local());
-        loopback.require_local().expect("loopback is local");
-        assert_eq!(loopback.for_diagnostics(), "127.0.0.1:49152");
-
-        // And an address something else could reach is refused rather than published.
-        let exposed = ListenerAddress::Loopback {
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            port: 49_152,
-        };
-        assert!(!exposed.is_local());
-        assert!(exposed.require_local().is_err());
+    fn a_pipe_name_is_one_component_and_nothing_else() {
+        let pipe = ListenerAddress::NamedPipe("kr-a-0123456789abcdef".to_owned());
+        assert!(pipe.is_local());
+        pipe.require_local().expect("a fresh name is local");
+        assert_eq!(
+            pipe.for_diagnostics(),
+            r"\\.\pipe\kr-a-0123456789abcdef",
+            "the registration names the pipe by its path"
+        );
         assert!(
-            !loopback.for_diagnostics().contains('@'),
+            !pipe.for_diagnostics().contains('@'),
             "a credential never travels in a URL"
         );
+        for refused in [
+            "",
+            ".",
+            "..",
+            "a.b",
+            r"a\b",
+            "a/b",
+            r"\\host\pipe\x",
+            r"..\x",
+            "a b",
+            "a:b",
+            "é",
+            &"x".repeat(MAX_PIPE_NAME + 1),
+        ] {
+            let address = ListenerAddress::NamedPipe(refused.to_owned());
+            assert!(
+                !address.is_local(),
+                "{refused:?} is not one local component"
+            );
+            assert!(address.require_local().is_err());
+        }
+        assert!(ListenerAddress::NamedPipe("x".repeat(MAX_PIPE_NAME)).is_local());
     }
 
     // Unix only: a private socket is Unix's endpoint, and "/run/kr" is an absolute path only there.
@@ -717,25 +744,20 @@ mod tests {
     }
 
     #[test]
-    fn this_platform_prefers_the_private_socket_it_has() {
+    fn this_platform_binds_the_private_endpoint_it_has() {
         let directory = std::env::temp_dir().join(format!("kr-listener-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&directory).expect("the directory is created");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .expect("the directory is made private");
-        }
-        let address =
-            ListenerAddress::for_launch(&directory, 49_152).expect("an address is chosen");
+        kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
+        let address = ListenerAddress::for_launch(&directory).expect("an address is chosen");
         address.require_local().expect("it is local");
         if cfg!(unix) {
             assert!(matches!(address, ListenerAddress::PrivateSocket(_)));
         } else {
-            assert!(matches!(address, ListenerAddress::Loopback { .. }));
+            assert!(matches!(address, ListenerAddress::NamedPipe(_)));
         }
+        let other = ListenerAddress::for_launch(&directory).expect("a second address is chosen");
+        assert_ne!(address, other, "every launch names its own endpoint");
 
-        // A directory other users can read is not one a private socket goes in.
+        // A directory other users can read is not one a launch's files go in.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -743,9 +765,13 @@ mod tests {
             std::fs::create_dir_all(&open).expect("the directory is created");
             std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
                 .expect("the directory is made readable by others");
-            assert!(ListenerAddress::for_launch(&open, 49_152).is_err());
+            assert!(ListenerAddress::for_launch(&open).is_err());
             let _ = std::fs::remove_dir_all(&open);
         }
+        assert!(
+            ListenerAddress::for_launch(std::path::Path::new("relative")).is_err(),
+            "a runtime directory is an absolute path"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -844,13 +870,6 @@ mod tests {
             launched.authenticate_bridge(
                 &presenting(me.clone()),
                 &PeerIdentity::from_kernel(me.clone(), false),
-                &installed_here(),
-                &hook_declared(),
-            ),
-            // A peer the kernel did not name, where the kernel names peers.
-            launched.authenticate_bridge(
-                &presenting(me.clone()),
-                &PeerIdentity::presented(Some(me.clone()), true),
                 &installed_here(),
                 &hook_declared(),
             ),

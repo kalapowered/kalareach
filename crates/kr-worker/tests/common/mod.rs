@@ -408,3 +408,54 @@ impl Drop for Sleeper {
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
 }
+
+/// One end of a connection to a launch's endpoint: a Unix socket on Unix and a named pipe on
+/// Windows, which is what this host binds on each.
+#[cfg(unix)]
+pub type Bridge = tokio::net::UnixStream;
+
+/// One end of a connection to a launch's endpoint: a Unix socket on Unix and a named pipe on
+/// Windows, which is what this host binds on each.
+#[cfg(windows)]
+pub type Bridge = kr_ipc::endpoint::Connection;
+
+/// Connects to the endpoint a launch published, as a bridge does.
+///
+/// # Panics
+///
+/// Panics when the address is not this platform's kind or nothing is listening on it.
+#[cfg(unix)]
+pub async fn connect_to(address: &kr_worker::broker::ListenerAddress) -> Bridge {
+    let kr_worker::broker::ListenerAddress::PrivateSocket(path) = address else {
+        panic!("this platform binds a private socket");
+    };
+    tokio::net::UnixStream::connect(path)
+        .await
+        .expect("the bridge connects")
+}
+
+/// Connects to the endpoint a launch published, as a bridge does.
+///
+/// # Panics
+///
+/// Panics when the address is not this platform's kind or nothing is listening on it.
+#[cfg(windows)]
+pub async fn connect_to(address: &kr_worker::broker::ListenerAddress) -> Bridge {
+    let kr_worker::broker::ListenerAddress::NamedPipe(name) = address else {
+        panic!("this platform binds a named pipe");
+    };
+    let endpoint = kr_ipc::paths::Endpoint::from_name(name.clone()).expect("a usable pipe name");
+    kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("the bridge connects")
+}
+
+/// The accepted end of a connection to a launch's endpoint, as the kind this platform binds.
+pub fn bridge_of(stream: kr_worker::broker::Stream) -> Bridge {
+    match stream {
+        #[cfg(unix)]
+        kr_worker::broker::Stream::Socket(socket) => socket,
+        #[cfg(windows)]
+        kr_worker::broker::Stream::Pipe(pipe) => pipe,
+    }
+}

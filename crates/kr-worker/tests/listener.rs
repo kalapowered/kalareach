@@ -4,13 +4,13 @@ use kr_protocol::broker::{BinaryIdentity, IntegrationMode};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId, SessionId};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
-#[cfg(unix)]
-use kr_worker::broker::BoundEndpoint;
 use kr_worker::broker::{
-    BoundBinary, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress, ManagedProcess,
-    PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
+    BoundBinary, BoundEndpoint, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress,
+    ManagedProcess, PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
 };
 use kr_worker::persistence::JournalHealth;
+
+mod common;
 
 const CREDENTIAL: [u8; 32] = [9; 32];
 
@@ -57,9 +57,7 @@ fn registration_for(address: ListenerAddress, expected: ProcessStartIdentity) ->
 }
 
 /// A private runtime directory, made owner-only the way the host makes one.
-#[cfg(unix)]
 fn private_directory() -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
     let name: String = kr_ipc::new_uuid()
         .to_string()
         .chars()
@@ -67,14 +65,11 @@ fn private_directory() -> std::path::PathBuf {
         .take(8)
         .collect();
     let directory = std::env::temp_dir().join(format!("kr-l-{name}"));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-        .expect("the directory is made private");
+    kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
     directory
 }
 
 /// The identity this test process actually has, which is what the kernel will report.
-#[cfg(unix)]
 fn this_process() -> ProcessStartIdentity {
     kr_ipc::identity::current_process_start_identity().expect("this process is identifiable")
 }
@@ -99,32 +94,23 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
         .take(8)
         .collect();
     let directory = std::env::temp_dir().join(format!("kr-l-{name}"));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("the directory is made private");
-    }
+    kr_ipc::paths::create_private_directory(&directory).expect("a private directory is made");
 
-    // Private where the platform has one, loopback with a credential where it does not. Either
-    // way the address is local, and it is refused before it is published if it is not.
-    let address = ListenerAddress::for_launch(&directory, 49_152).expect("an address is chosen");
+    // A private socket on Unix and a named pipe on Windows. Either way the address is local, and
+    // it is refused before it is published if it is not.
+    let address = ListenerAddress::for_launch(&directory).expect("an address is chosen");
     assert!(address.is_local());
     address.require_local().expect("it is local");
     assert!(
-        ListenerAddress::Loopback {
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            port: 49_152,
-        }
-        .require_local()
-        .is_err(),
+        ListenerAddress::NamedPipe(r"\\host\pipe\x".to_owned())
+            .require_local()
+            .is_err(),
         "an address something else could reach is never published"
     );
     if cfg!(unix) {
         assert!(matches!(address, ListenerAddress::PrivateSocket(_)));
     } else {
-        assert!(matches!(address, ListenerAddress::Loopback { .. }));
+        assert!(matches!(address, ListenerAddress::NamedPipe(_)));
     }
 
     // Nothing a browser sends gets in.
@@ -149,7 +135,7 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
         registration
             .authenticate(
                 &unauthenticated,
-                &PeerIdentity::presented(Some(process(41, 900)), true),
+                &PeerIdentity::from_kernel(process(41, 900), true),
                 &managed
             )
             .is_err()
@@ -189,8 +175,6 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
 /// The endpoint is real, so the peer's ownership and process identity are the kernel's reading of
 /// the connection rather than anything the connecting side said about itself. That is the whole
 /// difference between deciding who may connect and knowing who did.
-// Unix only: the kernel names a peer only on a private socket, and Windows has no managed gateway.
-#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_together() {
     let directory = private_directory();
@@ -203,26 +187,13 @@ async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exch
     let registration = registration_for(address.clone(), launched.clone());
     let managed = managed(launched.clone());
 
-    let connecting = match address.clone() {
-        ListenerAddress::PrivateSocket(path) => tokio::spawn(async move {
-            tokio::net::UnixStream::connect(&path)
-                .await
-                .expect("the bridge connects")
-        }),
-        ListenerAddress::Loopback { address, port } => tokio::spawn(async move {
-            let _ = tokio::net::TcpStream::connect((address, port))
-                .await
-                .expect("the bridge connects");
-            unreachable!("this platform prefers a private socket in these tests")
-        }),
+    let connecting = {
+        let address = address.clone();
+        tokio::spawn(async move { common::connect_to(&address).await })
     };
     let accepted = endpoint.accept().await.expect("the connection is accepted");
-    assert!(
-        accepted.peer.from_operating_system(),
-        "a private socket names its peer"
-    );
     assert_eq!(
-        accepted.peer.process().expect("the kernel named it"),
+        accepted.peer.process(),
         &launched,
         "the identity is read from the kernel and not from the hello"
     );
@@ -283,29 +254,28 @@ async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exch
                     process: launched.clone(),
                     environment_session_id: None,
                 },
-                &PeerIdentity::presented(Some(launched.clone()), false),
+                &PeerIdentity::from_kernel(launched.clone(), false),
                 &managed,
             )
             .is_err()
     );
 
-    // And where the kernel does name the peer, an identity it did not name is not admitted: the
-    // loopback path exists for a platform that has no private socket, not as a way past this one.
-    if cfg!(unix) {
-        assert!(
-            registration
-                .authenticate(
-                    &BridgeHello {
-                        credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
-                        process: launched.clone(),
-                        environment_session_id: None,
-                    },
-                    &PeerIdentity::presented(Some(launched), true),
-                    &managed,
-                )
-                .is_err()
-        );
-    }
+    // And a hello that presents another process than the one the kernel named is refused, though
+    // the process the kernel named is the launch and the credential is right.
+    assert!(
+        registration
+            .authenticate(
+                &BridgeHello {
+                    credential: kr_crypto::secret::SecretVec::new(CREDENTIAL.to_vec()),
+                    process: process(77, 900),
+                    environment_session_id: None,
+                },
+                &accepted.peer,
+                &managed,
+            )
+            .is_err(),
+        "the process the hello presents is the one the kernel named"
+    );
 
     // The registration file is the small file section 11 prefers: where to connect and which
     // launch, and nothing that speaks to the listener.

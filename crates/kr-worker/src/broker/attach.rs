@@ -1171,7 +1171,7 @@ impl NativeGateway {
             self.launch.application_instance_id,
             presented.credential.expose(),
         )?;
-        let identity = peer.process().unwrap_or(&presented.process).clone();
+        let identity = peer.process().clone();
         // Read while the bridge is known to be running, so the record is its own. Where the
         // platform keeps the record and it cannot be read, the bridge is not admitted: what it
         // reports could not be placed.
@@ -1289,10 +1289,8 @@ impl NativeGateway {
         // private exchange is the broker's own record and is checked where that record lives, in
         // the admission immediately below, so the credential never leaves it.
         registration.authenticate_peer(&presented, &peer)?;
-        // The identity the connection is admitted under is the kernel's where there is one. The
-        // presented one is only ever used where the platform names no peer, which is the case the
-        // authentication above has already established.
-        let identity = peer.process().unwrap_or(&presented.process).clone();
+        // The identity the connection is admitted under is the kernel's.
+        let identity = peer.process().clone();
         let connection = self.broker.open_native_connection(
             self.launch.application_instance_id,
             &credential,
@@ -1626,8 +1624,9 @@ fn split_stream(stream: Stream) -> Halves {
             let (reader, writer) = tokio::io::split(socket);
             (Box::new(reader), Box::new(writer))
         }
-        Stream::Loopback(socket) => {
-            let (reader, writer) = tokio::io::split(socket);
+        #[cfg(windows)]
+        Stream::Pipe(pipe) => {
+            let (reader, writer) = tokio::io::split(pipe);
             (Box::new(reader), Box::new(writer))
         }
     }

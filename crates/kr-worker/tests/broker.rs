@@ -269,7 +269,12 @@ fn claude_code(
     component: bool,
     withheld: &[PluginCapability],
 ) -> InstalledConnector {
-    let forwarder = std::path::Path::new("/opt/kalareach/bin/kr-hook");
+    // An absolute path the installation names; nothing starts it here.
+    let forwarder = std::path::Path::new(if cfg!(windows) {
+        r"C:\opt\kalareach\bin\kr-hook.exe"
+    } else {
+        "/opt/kalareach/bin/kr-hook"
+    });
     let mut source = if component {
         fixture::claude_code_package_with_component(root, forwarder)
     } else {
