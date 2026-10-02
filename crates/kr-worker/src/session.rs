@@ -4735,8 +4735,9 @@ pub enum InputBatch {
     Reply {
         /// The bytes of the answer.
         bytes: Vec<u8>,
-        /// When the response lane stops thinking this answer worth writing, on the lane's own
-        /// clock (`kr_ipc::now_ms`), or nothing when the lane set no deadline.
+        /// When the response lane stops thinking this answer worth writing, as a reading of the
+        /// session's continuous clock (`boot_elapsed_ms`, the clock the writer holds), or nothing
+        /// when the lane set no deadline.
         ///
         /// It travels with the bytes because the writer is the last boundary before the
         /// application, and an answer can wait there behind an application that has stopped
