@@ -671,6 +671,22 @@ async fn a_daemon_that_stopped_between_a_write_and_its_receipt_settles_it_at_sta
     let restarted = stopped.start(settings).await;
     let mut client = restarted.client().await;
     assert_eq!(group_of(&mut client).await, written);
+    // Before any step is taken, the claim holds the answer: the daemon settled it at start from the
+    // record, and a retry does not depend on the record staying as it is.
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("the local principal");
+    let digest = kr_protocol::digest::mutation_digest(&a, &actor).expect("a digest");
+    let kept = restarted
+        .controller()
+        .sharing()
+        .grants()
+        .recorded_action(&actor, a.action_id, &digest)
+        .expect("readable")
+        .expect("the step was claimed");
+    assert!(
+        matches!(kept, kr_controller::grants::ActionRecord::Answered { .. }),
+        "the claim was settled at start: {kept:?}"
+    );
     // A step after the restart changes the record; the earlier step is still answered.
     let b = join(&restarted, &mut client, some_group(0x92), &written)
         .await
@@ -840,6 +856,32 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         "a step leaves the grants and the devices as they were"
     );
 
+    // The control: the comparisons above do detect a pairing. The same device paired with the
+    // second environment on purpose, by that environment's own owner, changes its rows and makes
+    // it known there, so what held before was the absence of a pairing and not a blind check.
+    net_support::pair_with(
+        &second,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    assert_ne!(
+        second_rows,
+        rows_of_authority(&second),
+        "an explicit pairing is a change the comparison sees"
+    );
+    assert!(
+        second
+            .controller()
+            .devices()
+            .devices()
+            .expect("readable")
+            .iter()
+            .any(|known| known.endpoint_id == record.endpoint_id),
+        "the device is known to the second environment once it is paired with it"
+    );
+
     // An environment's group is not what a bridge enrolment changes.
     let enrolled_before = group_of(&mut first_client).await;
     let enrolment = kr_protocol::identity::EnvironmentEnrolment {
@@ -879,6 +921,51 @@ fn device_principal(
     record: &kr_controller::service::net::devices::DeviceRecord,
 ) -> kr_protocol::ids::ActorId {
     record.principal()
+}
+
+/// KR-REQ-03.07: a step that wrote nothing is answered as refused, and asked again under the same
+/// action it is answered the same way, never as an outcome nobody knows. A record that became
+/// unreadable while the daemon ran makes the step fail before it writes; the action is spent, and
+/// the owner asks again under a new one once the record is whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_that_wrote_nothing_is_answered_as_refused_every_time_it_is_asked() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let record = host.tree().environment().state_dir().join(RECORD_FILE);
+    let whole = std::fs::read(&record).expect("the record");
+    kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
+        .expect("damages the record");
+
+    let a = composed_join(&host, &mut client, some_group(0xd1), &minted).await;
+    let first = client
+        .repeat(&a)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("the record cannot be read");
+    assert_eq!(first.code, ErrorCode::StorageUnavailable);
+    for _ in 0..2 {
+        let again = client
+            .repeat(&a)
+            .await
+            .expect("reaches the daemon")
+            .expect_err("the same refusal");
+        assert_eq!(
+            again.code,
+            ErrorCode::StorageUnavailable,
+            "a step that wrote nothing is never an outcome nobody knows"
+        );
+    }
+
+    // The record is whole again; a new action takes the step.
+    kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
+    let joined = join(&host, &mut client, some_group(0xd2), &minted)
+        .await
+        .expect("takes the step under a new action");
+    assert_eq!(joined.machine.machine_id, some_group(0xd2));
+
+    drop(client);
+    host.stop().await;
 }
 
 /// KR-REQ-03.07: a record this daemon cannot use is refused and left exactly as it is. The daemon
