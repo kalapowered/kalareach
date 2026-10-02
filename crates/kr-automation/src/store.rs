@@ -3631,33 +3631,59 @@ mod tests {
         }
     }
 
-    /// Makes a journal in `directory` as a build at version 6 left it: one revision with a create
-    /// node that carries `PLANTED`, in the given journal mode.
-    fn a_journal_at_version_6(directory: &Path, mode: &str) {
-        let store = WorkflowStore::open(directory).expect("a journal");
+    /// Stores `definition` as a build that did not refuse variables did.
+    fn plant(connection: &Connection, definition: &WorkflowDefinition) {
+        connection
+            .execute(
+                "INSERT INTO workflow_definitions (
+                    workflow_id, revision, name, description, definition_json,
+                    grant_reference, enabled, paused, installed_at_ms, installed_under
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1000, NULL)",
+                params![
+                    definition.workflow_id.to_string(),
+                    i64::try_from(definition.revision.get()).expect("a revision"),
+                    definition.name,
+                    definition.description.as_ref(),
+                    serde_json::to_string(definition).expect("text"),
+                    definition.grant_reference.to_string(),
+                ],
+            )
+            .expect("a row an earlier build wrote");
+    }
+
+    /// A definition whose create node carries `PLANTED`, with a description long enough that the
+    /// nodes, which follow it, are in pages of their own: a row that fits one page is rewritten in
+    /// place, and a row of several leaves pages free that still hold what it held.
+    fn a_definition_that_carries_a_variable(workflow: u8) -> WorkflowDefinition {
         let mut definition = create_workflow_definition(
-            test_wf_id(1),
+            test_wf_id(workflow),
             1,
             "an-earlier-build",
-            test_grant_id(1),
+            test_grant_id(workflow),
             vec![create_node("one", &[("KR_PLANTED", PLANTED)])],
             vec![],
         );
-        // Long enough that the nodes, which follow the description, are in pages of their own: a
-        // row that fits one page is rewritten in place, and a row of several leaves pages free
-        // that still hold what it held.
         definition.description = Nullable::some("d".repeat(24_000));
-        store.save_definition(&definition, 1000).expect("saves");
-        drop(store);
-        let connection = Connection::open(directory.join(WORKFLOW_DB_NAME)).expect("opens");
-        let _: String = connection
+        definition
+    }
+
+    /// Makes a journal in `directory` as a build at version 6 left it: one revision with a create
+    /// node that carries `PLANTED`, in the given journal mode. The connection that is returned is
+    /// the one that wrote it, kept open: a log is taken in when its last connection closes, so
+    /// with this one held the log still has what was written when the next open starts.
+    fn a_journal_at_version_6(directory: &Path, mode: &str) -> Connection {
+        drop(WorkflowStore::open(directory).expect("a journal"));
+        let keeper = Connection::open(directory.join(WORKFLOW_DB_NAME)).expect("opens");
+        let _: String = keeper
             .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
                 row.get(0)
             })
             .expect("mode");
-        connection
+        plant(&keeper, &a_definition_that_carries_a_variable(1));
+        keeper
             .pragma_update(None, "user_version", SCHEMA_WITH_VARIABLES)
             .expect("version");
+        keeper
     }
 
     fn on_disk(directory: &Path) -> Vec<u8> {
@@ -3686,7 +3712,7 @@ mod tests {
     #[test]
     fn a_compaction_that_fails_stops_the_open_and_the_next_open_finishes_it() {
         let directory = tempfile::tempdir().expect("a directory");
-        a_journal_at_version_6(directory.path(), "delete");
+        let keeper = a_journal_at_version_6(directory.path(), "delete");
         {
             let path = directory.path().join(WORKFLOW_DB_NAME);
             let store = WorkflowStore {
@@ -3709,6 +3735,7 @@ mod tests {
             "the old copy is still in a free page: the open that failed did not finish"
         );
 
+        drop(keeper);
         let finished = WorkflowStore::open(directory.path()).expect("the next open finishes it");
         assert!(!holds(&on_disk(directory.path()), PLANTED));
         drop(finished);
@@ -3720,7 +3747,8 @@ mod tests {
     #[test]
     fn a_log_a_reader_keeps_from_being_taken_in_stops_the_open() {
         let directory = tempfile::tempdir().expect("a directory");
-        a_journal_at_version_6(directory.path(), "wal");
+        let keeper = a_journal_at_version_6(directory.path(), "wal");
+        drop(keeper);
         let reader = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
         reader.execute_batch("BEGIN").expect("begins");
         let _: i64 = reader
@@ -3763,6 +3791,13 @@ mod tests {
                 .to_string(),
             ),
             (
+                "parameters that are not an object",
+                serde_json::json!({
+                    "nodes": [{ "node_id": "a", "action_kind": "create_session", "action_params": "[]" }]
+                })
+                .to_string(),
+            ),
+            (
                 "parameters that are not a document",
                 serde_json::json!({
                     "nodes": [{
@@ -3775,7 +3810,7 @@ mod tests {
             ),
         ] {
             let directory = tempfile::tempdir().expect("a directory");
-            a_journal_at_version_6(directory.path(), "delete");
+            drop(a_journal_at_version_6(directory.path(), "delete"));
             let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
             connection
                 .execute(
@@ -3866,5 +3901,199 @@ mod tests {
         let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
         assert_eq!(dump(&connection), before);
         assert_eq!(version_of(directory.path()), WORKFLOW_SCHEMA_VERSION);
+    }
+
+    /// A writer that is not this process's, writing a definition that carries a variable while
+    /// the journal is being brought forward, is found before the version moves: the open stops
+    /// with the journal at version 6, and the next open takes the variable out.
+    #[test]
+    fn a_variable_written_while_the_journal_comes_forward_stops_the_open() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(a_journal_at_version_6(directory.path(), "delete"));
+        let path = directory.path().join(WORKFLOW_DB_NAME);
+        let store = WorkflowStore {
+            conn: Mutex::new(Connection::open(&path).expect("opens")),
+            path: path.clone(),
+        };
+        let error = store
+            .bring_forward_compacting(|connection| {
+                connection.execute_batch("VACUUM")?;
+                // Between the compaction and the version: a writer of an earlier build, which
+                // refuses nothing.
+                plant(
+                    &Connection::open(&path).expect("another connection"),
+                    &a_definition_that_carries_a_variable(7),
+                );
+                Ok(())
+            })
+            .expect_err("a variable written meanwhile stops the open");
+        let said = error.to_string();
+        assert!(
+            said.contains("while the journal was being brought forward"),
+            "{said}"
+        );
+        assert!(!said.contains(PLANTED), "{said}");
+        drop(store);
+        assert_eq!(version_of(directory.path()), SCHEMA_WITH_VARIABLES);
+
+        let finished = WorkflowStore::open(directory.path()).expect("the next open finishes it");
+        assert!(!holds(&on_disk(directory.path()), PLANTED));
+        drop(finished);
+        assert_eq!(version_of(directory.path()), WORKFLOW_SCHEMA_VERSION);
+    }
+
+    /// The journal stores no definition that carries a variable, whoever writes it: the check at
+    /// install is an early refusal, and this is the one that holds for every writer.
+    #[test]
+    fn the_journal_refuses_to_store_a_definition_that_carries_a_variable() {
+        let store = WorkflowStore::in_memory().expect("a journal");
+        let error = store
+            .save_definition(&a_definition_that_carries_a_variable(1), 1000)
+            .expect_err("a definition that carries a variable is not stored");
+        let said = error.to_string();
+        assert!(said.contains("environment variables"), "{said}");
+        assert!(!said.contains(PLANTED), "{said}");
+        assert!(
+            store
+                .get_definition(test_wf_id(1), 1)
+                .expect("reads")
+                .is_none()
+        );
+
+        // The control: the same definition without the variable is stored.
+        let mut clean = a_definition_that_carries_a_variable(1);
+        clean.nodes = vec![create_node("one", &[])];
+        store.save_definition(&clean, 1000).expect("stores");
+
+        // A name repeated in a node's parameters hides the first copy from a reader that keeps
+        // one value for a name, and the journal keeps the text as it is.
+        let mut repeated = create_node("two", &[("KR_PLANTED", PLANTED)]).action_params;
+        repeated.pop();
+        repeated.push_str(",\"environment_snapshot\":[]}");
+        let mut hidden = a_definition_that_carries_a_variable(2);
+        hidden.nodes[0].action_params = repeated;
+        store
+            .save_definition(&hidden, 1000)
+            .expect_err("a variable behind a repeated name is not stored");
+    }
+
+    /// A reader of a journal in rollback mode keeps the rewrite from being committed, and the
+    /// open says why and what to do rather than that the database is locked.
+    #[test]
+    fn a_reader_of_a_rollback_journal_stops_the_open_and_the_open_says_why() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(a_journal_at_version_6(directory.path(), "delete"));
+        let before = on_disk(directory.path());
+        let reader = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        reader.execute_batch("BEGIN").expect("begins");
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM workflow_definitions", [], |row| {
+                row.get(0)
+            })
+            .expect("reads, and holds the file");
+
+        let error = WorkflowStore::open(directory.path())
+            .expect_err("a reader keeps the rewrite from being committed");
+        let said = error.to_string();
+        assert!(
+            said.contains("another connection uses the journal")
+                && said.contains("start the daemon again"),
+            "{said}"
+        );
+        assert!(!said.contains(PLANTED), "{said}");
+        assert_eq!(version_of(directory.path()), SCHEMA_WITH_VARIABLES);
+        assert_eq!(on_disk(directory.path()), before, "nothing was written");
+
+        reader.execute_batch("COMMIT").expect("ends");
+        drop(reader);
+        drop(WorkflowStore::open(directory.path()).expect("the next open finishes it"));
+        assert!(!holds(&on_disk(directory.path()), PLANTED));
+    }
+
+    /// What the journal keeps of runs, receipts, events and actions is the same after a rewrite
+    /// that changes a definition: a record of an action holds a digest of what was asked and never
+    /// the definition, and a run names a revision.
+    #[test]
+    fn a_rewrite_that_changes_a_definition_leaves_every_other_table_as_it_was() {
+        let directory = tempfile::tempdir().expect("a directory");
+        {
+            let store = WorkflowStore::open(directory.path()).expect("a journal");
+            let clean = create_workflow_definition(
+                test_wf_id(5),
+                1,
+                "clean",
+                test_grant_id(5),
+                vec![create_node("one", &[])],
+                vec![],
+            );
+            store.save_definition(&clean, 1000).expect("saves");
+            store
+                .commit_trigger_and_run(
+                    kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([6; 16])),
+                    &clean,
+                    "evt-1",
+                    &CausalContext::new_root(),
+                    1050,
+                )
+                .expect("a run, its receipts and its events");
+        }
+        let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        connection
+            .execute(
+                "INSERT INTO action_records (
+                    actor_id, action_id, method, payload_digest, result_json, recorded_at_ms
+                ) VALUES ('a', 'b', 'workflow.install', x'0102', '{\"revision\":\"1\"}', 5)",
+                [],
+            )
+            .expect("an action's record");
+        plant(&connection, &a_definition_that_carries_a_variable(1));
+        connection
+            .pragma_update(None, "user_version", SCHEMA_WITH_VARIABLES)
+            .expect("version");
+        let tables = |connection: &Connection| -> Vec<String> {
+            let names: Vec<String> = connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .expect("prepares")
+                .query_map([], |row| row.get(0))
+                .expect("queries")
+                .collect::<rusqlite::Result<_>>()
+                .expect("names");
+            names
+                .into_iter()
+                .filter(|name| name != "workflow_definitions" && !name.starts_with("sqlite_"))
+                .flat_map(|table| {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM {table}"))
+                        .expect("prepares");
+                    let columns = statement.column_count();
+                    let rows = statement
+                        .query_map([], |row| {
+                            Ok((0..columns)
+                                .map(|at| format!("{:?}", row.get_ref(at).expect("a column")))
+                                .collect::<Vec<_>>()
+                                .join("|"))
+                        })
+                        .expect("queries")
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .expect("rows");
+                    rows.into_iter()
+                        .map(move |row| format!("{table}: {row}"))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let before = tables(&connection);
+        for table in ["workflow_runs:", "node_receipts:", "action_records:"] {
+            assert!(
+                before.iter().any(|row| row.starts_with(table)),
+                "the journal this test starts from holds a row of {table}"
+            );
+        }
+        drop(connection);
+
+        drop(WorkflowStore::open(directory.path()).expect("comes forward"));
+        assert!(!holds(&on_disk(directory.path()), PLANTED));
+        let connection = Connection::open(directory.path().join(WORKFLOW_DB_NAME)).expect("opens");
+        assert_eq!(tables(&connection), before);
     }
 }

@@ -534,14 +534,44 @@ fn a_journal_at_an_earlier_development_version_is_refused() {
 /// variables, and how the test finds it again on disk.
 const PLANTED: &str = "planted-secret-value-4f2a";
 
-/// Writes a journal as an earlier build left it: several revisions of two workflows, each with a
-/// create node whose parameters carry `PLANTED`, a create node that carries none, and a node of
-/// another kind, in `mode` (`delete` for a rollback journal, `wal` for a write-ahead log), at
-/// schema version 6.
+/// Stores `definition` as a build that did not refuse variables did: its text, as it was
+/// installed, in a row of its own.
+fn plant(
+    connection: &rusqlite::Connection,
+    definition: &kr_protocol::automation::WorkflowDefinition,
+) {
+    connection
+        .execute(
+            "INSERT INTO workflow_definitions (
+                workflow_id, revision, name, description, definition_json,
+                grant_reference, enabled, paused, installed_at_ms, installed_under
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1000, NULL)",
+            rusqlite::params![
+                definition.workflow_id.to_string(),
+                i64::try_from(definition.revision.get()).expect("a revision"),
+                definition.name,
+                definition.description.as_ref(),
+                serde_json::to_string(definition).expect("the definition's text"),
+                definition.grant_reference.to_string(),
+            ],
+        )
+        .expect("a row of an earlier build's");
+}
+
+/// Writes a journal as an earlier build left it, at schema version 6, in `mode` (`delete` for a
+/// rollback journal, `wal` for a write-ahead log): several revisions of two workflows, each with
+/// a create node whose parameters carry `PLANTED`, a create node that carries none, and a node of
+/// another kind; and a revision whose create node names its variables twice, the first time with
+/// `PLANTED` and the last with none. A journal in `wal` mode keeps its log through the open: a
+/// second connection stays open, so what the log holds when the open starts is what a crash would
+/// have left, and it is returned for the caller to keep.
 ///
 /// The tables do not differ between version 6 and the version that follows it, so a journal of
 /// this build with the version put back is the journal an earlier build wrote.
-fn a_version_6_journal_that_holds_variables(directory: &std::path::Path, mode: &str) {
+fn a_version_6_journal_that_holds_variables(
+    directory: &std::path::Path,
+    mode: &str,
+) -> rusqlite::Connection {
     use kr_protocol::automation::{WorkflowActionKind, WorkflowNode};
 
     let create_with = |variables: &[(&str, &str)]| {
@@ -555,7 +585,15 @@ fn a_version_6_journal_that_holds_variables(directory: &std::path::Path, mode: &
             .collect();
         params.to_string()
     };
-    let store = WorkflowStore::open(directory).expect("a journal");
+    // The journal exists, and is in its mode, before anything is stored in it.
+    drop(WorkflowStore::open(directory).expect("a journal"));
+    let keeper = rusqlite::Connection::open(directory.join(kr_automation::store::WORKFLOW_DB_NAME))
+        .expect("the journal opens");
+    let _: String = keeper
+        .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+            row.get(0)
+        })
+        .expect("the journal's mode");
     // Several revisions of one workflow and a revision of another, the first with a description
     // long enough that the nodes after it are not on the first page of the row.
     for (workflow, revision, description) in [(1_u8, 1_u64, 24_000), (1, 2, 24_000), (2, 1, 0)] {
@@ -582,22 +620,32 @@ fn a_version_6_journal_that_holds_variables(directory: &std::path::Path, mode: &
             vec![],
         );
         definition.description = Nullable::some("d".repeat(description));
-        store
-            .save_definition(&definition, 1000)
-            .expect("an earlier build's definition");
+        plant(&keeper, &definition);
     }
-    drop(store);
-    let connection =
-        rusqlite::Connection::open(directory.join(kr_automation::store::WORKFLOW_DB_NAME))
-            .expect("the journal opens");
-    let _: String = connection
-        .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
-            row.get(0)
-        })
-        .expect("the journal's mode");
-    connection
+    // A name repeated in a node's parameters: a reader that keeps one value for a name reads the
+    // empty list, and the text still holds the variables before it.
+    let mut repeated = create_with(&[("KR_PLANTED", PLANTED)]);
+    repeated.pop();
+    repeated.push_str(",\"environment_snapshot\":[]}");
+    let mut definition = create_workflow_definition(
+        test_wf_id(3),
+        1,
+        "installed-by-an-earlier-build",
+        test_grant_id(3),
+        vec![WorkflowNode {
+            node_id: "named-twice".to_owned(),
+            action_kind: WorkflowActionKind::CreateSession,
+            action_params: repeated,
+            declared_environment: Nullable::null(),
+        }],
+        vec![],
+    );
+    definition.description = Nullable::some("d".repeat(24_000));
+    plant(&keeper, &definition);
+    keeper
         .pragma_update(None, "user_version", 6_u32)
         .expect("the earlier version");
+    keeper
 }
 
 /// Every byte the journal keeps on disk, the file and its write-ahead log.
@@ -625,11 +673,20 @@ fn holds(bytes: &[u8], needle: &str) -> bool {
 fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carried() {
     for mode in ["delete", "wal"] {
         let directory = tempfile::tempdir().expect("a journal directory");
-        a_version_6_journal_that_holds_variables(directory.path(), mode);
+        let keeper = a_version_6_journal_that_holds_variables(directory.path(), mode);
         assert!(
             holds(&journal_bytes(directory.path()), PLANTED),
             "{mode}: the journal this test starts from holds the variable"
         );
+        if mode == "wal" {
+            assert!(
+                holds(
+                    &std::fs::read(directory.path().join("workflows.db-wal")).expect("the log"),
+                    PLANTED
+                ),
+                "{mode}: the log this test starts from holds the variable"
+            );
+        }
 
         let store = WorkflowStore::open(directory.path()).expect("the journal comes forward");
         // Before the store is dropped: a log the last connection closes would be taken in then,
@@ -644,14 +701,19 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
             "{mode}: the variable's name is still on disk after the open"
         );
 
-        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1)] {
+        for (workflow, revision) in [(1_u8, 1_u64), (1, 2), (2, 1), (3, 1)] {
             let installed = store
                 .get_definition(test_wf_id(workflow), revision)
                 .expect("reads")
                 .expect("the revision is still installed");
             let nodes = &installed.definition.nodes;
-            assert_eq!(nodes.len(), 3, "{mode}: {workflow}/{revision}");
-            for node in &nodes[..2] {
+            let create = if workflow == 3 { 1 } else { 2 };
+            assert_eq!(
+                nodes.len(),
+                if workflow == 3 { 1 } else { 3 },
+                "{mode}: {workflow}/{revision}"
+            );
+            for node in &nodes[..create] {
                 let params: serde_json::Value =
                     serde_json::from_str(&node.action_params).expect("the node's parameters");
                 assert_eq!(
@@ -662,13 +724,16 @@ fn a_version_6_journal_comes_forward_without_the_variables_its_definitions_carri
                 );
             }
             // The rest of the definition is as it was installed.
-            assert_eq!(
-                nodes[2].action_params,
-                common::params(kr_protocol::automation::WorkflowActionKind::RunTests)
-            );
+            if workflow != 3 {
+                assert_eq!(
+                    nodes[2].action_params,
+                    common::params(kr_protocol::automation::WorkflowActionKind::RunTests)
+                );
+            }
             assert_eq!(installed.definition.name, "installed-by-an-earlier-build");
         }
         drop(store);
+        drop(keeper);
 
         let connection = rusqlite::Connection::open(
             directory
