@@ -700,14 +700,16 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
     let (begin, end) = placement.markers();
     let stripped = strip(existing, begin, end);
     let had_entry = stripped.is_some();
-    // What is placed again is the file as it was before the entry: an entry that is the last thing
-    // in it takes the line break it owns back out first.
+    // The file without this entry. A line break an entry owns follows it only where it was added:
+    // the entry that owns one and stays where it is keeps the note, and one that moves leaves the
+    // break in the text it was in front of, which is then the person's.
     let theirs = match &stripped {
-        Some((before, block, after)) if owns_separator(block) && after.is_empty() => {
-            before.strip_suffix('\n').unwrap_or(before).to_owned()
-        }
         Some((before, _block, after)) => format!("{before}{after}"),
         None => existing.to_owned(),
+    };
+    let owned_at = match &stripped {
+        Some((before, block, _after)) if owns_separator(block) => Some(before.len()),
+        _ => None,
     };
     let rebuilt = match placement {
         Placement::End => match stripped {
@@ -722,20 +724,17 @@ fn planned(existing: &str, body: &str, placement: &Placement) -> std::io::Result
             None => appended(existing, body, begin),
         },
         Placement::AfterPrologue { shell } => {
-            // An entry that owns the line break before it keeps owning it when something is still
-            // after it in the file, as the other PowerShell entry is when both profiles are one
-            // file: the break stays in the text it is placed into, and the note stays with it.
-            let body = match &stripped {
-                Some((_, block, after)) if owns_separator(block) && !after.is_empty() => {
-                    with_separator_note(body, begin)
-                }
-                _ => body.to_owned(),
-            };
-            let (rebuilt, _) = after_the_prologue(shell, &theirs, &body, placement)?;
+            let (rebuilt, _) = after_the_prologue(shell, &theirs, body, placement, owned_at)?;
             rebuilt
         }
         Placement::Last { .. } => {
-            let rebuilt = appended(&theirs, body, begin);
+            let rebuilt = match owned_at {
+                // The entry is still the last thing in the file, where it took its line break.
+                Some(at) if at == theirs.len() => {
+                    format!("{theirs}{}", with_separator_note(body, begin))
+                }
+                _ => appended(&theirs, body, begin),
+            };
             checked(&theirs, &rebuilt, placement)?;
             rebuilt
         }
@@ -766,11 +765,16 @@ fn appended(existing: &str, body: &str, begin: &str) -> String {
 ///
 /// A byte-order mark stays the first bytes of the file and belongs to no line, so the entry's first
 /// line is a whole line of the file and is found again, exactly, when it is removed.
+///
+/// `owned_at` is where the entry stood before, when it owned the line break in front of it: the
+/// entry keeps the note only if it goes in the same place, and an entry that moves does not take a
+/// line break with it.
 fn after_the_prologue(
     shell: &Path,
     theirs: &str,
     body: &str,
     placement: &Placement,
+    owned_at: Option<usize>,
 ) -> std::io::Result<(String, usize)> {
     if second_mark(theirs) {
         return Err(Refusal::SecondByteOrderMark.into());
@@ -786,6 +790,11 @@ fn after_the_prologue(
     // entry added at the end, and it is added the way one is.
     let rebuilt = if rest.is_empty() && !head.is_empty() && !head.ends_with('\n') {
         format!("{mark}{}", appended(head, body, placement.markers().0))
+    } else if owned_at == Some(mark.len() + at) {
+        format!(
+            "{mark}{head}{}{rest}",
+            with_separator_note(body, placement.markers().0)
+        )
     } else {
         format!("{mark}{head}{body}{rest}")
     };
@@ -1047,27 +1056,35 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
 /// what the person has to do, and nothing is written.
 fn removed_from(existing: &str, kind: ShellKind) -> std::io::Result<Option<String>> {
     // Each of the entries a file can hold, with its own markers: PowerShell's two can be in one
-    // file when its two profiles are. The one that checks the reader is the last thing in the file
-    // and the one that opens the bridge is near its start, so they come out in that order: the
-    // entry that owns a line break then finds nothing of the other's after it, and gives it back.
+    // file when its two profiles are. A line break an entry owns is given back when that entry stood
+    // where the person's text ends once every entry is out: where the person has written after it,
+    // the file is no longer the one that was there, and the line break stays.
     let mut rebuilt = existing.to_owned();
     let mut found = false;
+    let mut owner_at: Option<usize> = None;
     for (begin, end) in [
-        (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
         (MARKER_BEGIN, MARKER_END),
+        (CHECK_MARKER_BEGIN, CHECK_MARKER_END),
     ] {
         if let Some((before, block, after)) = strip(&rebuilt, begin, end) {
-            // The line break the entry took with it goes with it, where the entry is still the last
-            // thing in the file. Where the person has written after it, the file is no longer the
-            // one that was there, and the line break stays.
-            let before = if owns_separator(&block) && after.is_empty() {
-                before.strip_suffix('\n').unwrap_or(&before).to_owned()
-            } else {
-                before
-            };
+            let at = before.len();
+            // An owner that stood after this entry now stands that much nearer the start.
+            owner_at = owner_at.map(|owner| {
+                if at < owner {
+                    owner - block.len()
+                } else {
+                    owner
+                }
+            });
+            if owns_separator(&block) {
+                owner_at = Some(at);
+            }
             rebuilt = format!("{before}{after}");
             found = true;
         }
+    }
+    if owner_at == Some(rebuilt.len()) && rebuilt.ends_with('\n') {
+        rebuilt.pop();
     }
     if !found {
         return Ok(None);
@@ -3606,6 +3623,114 @@ mod tests {
                 std::fs::read_to_string(&path).expect("reads"),
                 installed,
                 "{name}: installing again changed the file"
+            );
+            assert_eq!(remove(&path).expect("removes"), Change::Removed, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                theirs,
+                "{name}: the profile did not come back as it was"
+            );
+        }
+    }
+
+    /// KR-REQ-26.05: a line break an entry owns follows the entry only while it stays where the
+    /// break was added, and a removal gives it back only when the entry that owns it is the last of
+    /// the person's text.
+    ///
+    /// The cases that move an entry, or put the other PowerShell entry between the person's text and
+    /// the one that owns the break, which a person's own edits or two profiles that are one file can
+    /// make: in none of them does an install or a removal take a line break the person wrote.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+    fn a_line_break_follows_its_entry_only_where_it_was_added() {
+        let root = tempfile::tempdir().expect("a directory");
+        let package = Path::new("/opt/kr/entry");
+        let path = root.path().join("profile.ps1");
+        let targets = powershell_targets(&a_powershell(), path.clone(), path.clone());
+        let (first, last) = (&targets[0], &targets[1]);
+        let load = entry(first, package, false).expect("the path is text");
+        let check = entry(last, package, false).expect("the path is text");
+
+        // The bridge's entry owns the break, the person writes a `using` line below it, and the
+        // entry moves below that line: the person's own line ends are theirs, with either ending.
+        for (name, theirs, later) in [
+            (
+                "lf",
+                "using namespace System",
+                "using namespace System.Text\n",
+            ),
+            (
+                "crlf",
+                "using namespace System",
+                "using namespace System.Text\r\n",
+            ),
+        ] {
+            std::fs::write(&path, theirs).expect("writes");
+            assert_eq!(
+                install(&path, &load, &first.placement).expect("installs"),
+                Change::Added
+            );
+            let with_more = format!("{}{later}", std::fs::read_to_string(&path).expect("reads"));
+            std::fs::write(&path, with_more).expect("writes");
+            assert_eq!(
+                install(&path, &load, &first.placement).expect("installs again"),
+                Change::Replaced,
+                "{name}: the entry moves below the person's line"
+            );
+            let moved = std::fs::read_to_string(&path).expect("reads");
+            assert!(
+                !moved.contains(SEPARATOR_NOTE),
+                "{name}: the note followed a moved entry"
+            );
+            assert_eq!(remove(&path).expect("removes"), Change::Removed);
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                format!("{theirs}\n{later}"),
+                "{name}: a line end of the person's was taken"
+            );
+        }
+
+        // The reader check was installed first and owns the break; the bridge's entry is put in
+        // between the person's text and it, and the other order of both installs and removal gives
+        // the text back.
+        for (name, order) in [
+            ("check, then bridge", [last, first]),
+            ("bridge, then check", [first, last]),
+        ] {
+            let theirs = "using namespace System";
+            std::fs::write(&path, theirs).expect("writes");
+            for target in order {
+                let body = if std::ptr::eq(target, first) {
+                    &load
+                } else {
+                    &check
+                };
+                assert_eq!(
+                    install(&path, body, &target.placement)
+                        .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    Change::Added,
+                    "{name}"
+                );
+            }
+            let installed = std::fs::read_to_string(&path).expect("reads");
+            for target in order.iter().rev().chain(order.iter()) {
+                let body = if std::ptr::eq(*target, first) {
+                    &load
+                } else {
+                    &check
+                };
+                assert_eq!(
+                    install(&path, body, &target.placement)
+                        .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    Change::Unchanged,
+                    "{name}: an install that is in place, in either order"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reads"),
+                installed,
+                "{name}"
             );
             assert_eq!(remove(&path).expect("removes"), Change::Removed, "{name}");
             assert_eq!(
