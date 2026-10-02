@@ -830,7 +830,7 @@ names for the owner.
 | `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, a reconciliation a daemon ended in the middle of, or an action a copy of itself is still performing |
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
-| `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, or whose owner device is no longer one |
+| `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, whose owner device is no longer one, or whose named device no longer holds the keys the confirmation names |
 | `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs; a location decision on a host with no owner device to confirm it |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 

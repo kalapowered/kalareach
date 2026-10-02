@@ -56,7 +56,7 @@ use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     ClientBundle, ConfirmationChannel, DevicePublicKeys, KeyPurpose, Locator,
     OwnerConfirmationProof, OwnerConfirmationRequest, PairingConsumedReason, ProposedGrant,
-    RendezvousOrigin,
+    RendezvousOrigin, SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
@@ -1251,7 +1251,9 @@ pub fn another_subject() -> ControllerError {
 ///
 /// The row is written whole when `complete` never recorded the answer, so the acceptance record
 /// holds every confirmation an effect consumed. A confirmation some effect already consumed is
-/// refused: one ceremony authorises one action.
+/// refused: one ceremony authorises one action. The signer's authority and the keys of the device
+/// the confirmation names are read in this transaction, so the record and the standing it rests on
+/// are one step.
 fn consume(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
@@ -1260,6 +1262,7 @@ fn consume(
     now: TimestampMs,
 ) -> Result<()> {
     signer_still_authorised(transaction, lifetimes, proof)?;
+    destination_still_held(transaction, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
     let changed = transaction
@@ -1372,6 +1375,60 @@ fn signer_still_authorised(
         | ConfirmationChannel::ContactTool => Err(lapsed(
             "that channel carries no owner confirmation on this host",
         )),
+    }
+}
+
+/// Checks, inside the consuming transaction, that the device a confirmation names is still paired
+/// and still holds the keys it names.
+///
+/// A confirmation that sends authority to a device names that device's four public keys, and the
+/// owner confirmed it for those keys. A device can replace its notification-preview key at a new
+/// revision at any time, and it can be revoked, and its record is written to this same database:
+/// so the record is read here, in the transaction that records the spend, and authority is never
+/// recorded for keys the device has since replaced. The device is found by its transport key,
+/// which a device keeps for its identity.
+///
+/// A confirmation of a device's pairing names the candidate, whose record the same transaction
+/// writes afterwards, so it is not read here. A confirmation that names no device has nothing to
+/// check.
+fn destination_still_held(transaction: &Connection, proof: &OwnerConfirmationProof) -> Result<()> {
+    let Some(named) = proof.request.destination_keys.0 else {
+        return Ok(());
+    };
+    if proof.request.action == SensitiveAction::ConfirmDevice {
+        return Ok(());
+    }
+    let held = transaction
+        .query_row(
+            "SELECT authorisation_key, stored_envelope_key, notification_preview
+               FROM network_devices
+              WHERE endpoint_id = ?1 AND revoked_at_ms IS NULL AND expired_at_ms IS NULL",
+            params![named.transport.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let unchanged = held.is_some_and(|(authorisation, stored_envelope, notification_preview)| {
+        authorisation == named.authorisation.as_bytes().as_slice()
+            && stored_envelope.as_deref() == Some(named.stored_envelope.as_bytes().as_slice())
+            && notification_preview.as_deref()
+                == Some(named.notification_preview.as_bytes().as_slice())
+    });
+    if unchanged {
+        Ok(())
+    } else {
+        Err(ControllerError::Refused {
+            code: ErrorCode::OwnerConfirmationRequired,
+            detail: "the device this confirmation names is no longer paired with the keys it \
+                     names, so the confirmation authorises nothing; confirm again"
+                .to_owned(),
+        })
     }
 }
 

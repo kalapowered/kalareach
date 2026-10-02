@@ -212,8 +212,10 @@ impl OwnerAuthority for HostOwner {
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError> {
         // The proof was verified against the enlargement it answers. The spend holds it to the
-        // enlargement's own shape and to the ledger's own copy of the challenge, checks the
-        // signer's authority again, and names the device by the keys it holds now.
+        // enlargement's own shape and to the ledger's own copy of the challenge, and names the
+        // device by the keys it holds now. The acceptance record then reads the signer's
+        // authority and the device's keys in its own transaction, so a device that rotated a key
+        // since this read is not authorised: the owner confirms the location again.
         let destination = self.destination_of(enlargement)?;
         self.pairing
             .owner()
@@ -222,19 +224,8 @@ impl OwnerAuthority for HostOwner {
                 proof,
                 "project.location",
             )
-            .map_err(|error| error.to_protocol_error())?;
-        // The device can rotate its notification-preview key while the confirmation is spent, and
-        // the acceptance record checks the signer's standing and not the destination's keys. So
-        // the keys are read once more now, and a location whose confirmation named keys the
-        // device no longer holds is not authorised: the owner confirms it again.
-        if self.destination_of(enlargement)? != destination {
-            return Err(ProtocolError::new(
-                ErrorCode::OwnerConfirmationRequired,
-                "the device's keys changed while this confirmation was spent, so it no longer \
-                 names the device that holds the grant; confirm the location again",
-            ));
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|error| error.to_protocol_error())
     }
 }
 
