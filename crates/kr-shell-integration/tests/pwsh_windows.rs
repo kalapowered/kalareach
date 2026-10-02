@@ -31,7 +31,6 @@ use kr_ipc::paths::Endpoint;
 use kr_ipc::peer::PeerIdentity;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::root::{DETACH_HINT, PromptGeneration};
-use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
 use kr_shell_integration::contract::qualification::QualificationReason;
 use kr_shell_integration::contract::transport::{
@@ -357,7 +356,7 @@ async fn ends(client: &mut Client, report: impl Fn() -> String) -> ExitStatus {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let session_id = SessionId::new(Uuid::from_bytes([0x71; 16]));
+    let session_id = a_session();
     let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
     let mut client = start_client(&endpoint, directory.path(), "exchange", &[]);
 
@@ -413,7 +412,7 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_module_applies_the_chord_the_worker_configures_over_the_hosts_named_pipe() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let session_id = SessionId::new(Uuid::from_bytes([0x73; 16]));
+    let session_id = a_session();
     let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
     let mut client = start_client(&endpoint, directory.path(), "exchange", &[]);
 
@@ -459,7 +458,7 @@ async fn the_module_applies_the_chord_the_worker_configures_over_the_hosts_named
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_client_reports_the_loss_when_the_worker_drops_the_pipe() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let session_id = SessionId::new(Uuid::from_bytes([0x72; 16]));
+    let session_id = a_session();
     let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
     let mut client = start_client(&endpoint, directory.path(), "closed", &[]);
 
@@ -567,6 +566,16 @@ fn trace(directory: &Path, mode: &str) -> String {
 /// A pipe name of this test's own.
 fn pipe_name() -> String {
     format!("kalareach-test-{}", kr_ipc::new_uuid())
+}
+
+/// A session of this test's own.
+///
+/// The host's pipe is named for the account and the session, and the tests of this file run at
+/// once in one process. A session identifier written out in a test would be the same name in
+/// another test that wrote the same bytes, and the second bind would be refused as another
+/// instance of a pipe that is held. A fresh identifier cannot meet one.
+fn a_session() -> SessionId {
+    SessionId::new(kr_ipc::new_uuid())
 }
 
 /// Reads what an accepted connection delivers until its client leaves, sends something, or
@@ -739,7 +748,7 @@ async fn the_module_refuses_before_its_hello_every_list_the_hosts_client_refuses
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pipe_whose_descriptor_the_module_cannot_read_gets_no_hello() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let session_id = SessionId::new(Uuid::from_bytes([0x73; 16]));
+    let session_id = a_session();
     let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
     let mut client = start_client(
         &endpoint,
