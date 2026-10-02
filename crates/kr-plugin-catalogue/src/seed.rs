@@ -526,6 +526,20 @@ impl SeedBundle {
                 "the bundled index is over the default entry budget".to_owned(),
             ));
         }
+        // The generation the lock names is the one the seed compares with what a store holds, so
+        // it has to be the index's own.
+        if index.generation != lock.source.generation
+            || index.produced_at != lock.source.produced_at
+        {
+            return Err(integrity(format!(
+                "the bundled index is generation {} built at {}, and the lock names generation {} \
+                 built at {}",
+                index.generation,
+                index.produced_at.get(),
+                lock.source.generation,
+                lock.source.produced_at.get()
+            )));
+        }
         for package in &lock.packages {
             let entry = index.find(&package.plugin_id, &package.version);
             if entry.is_none_or(|entry| entry.manifest_digest != package.manifest.digest) {
@@ -609,17 +623,24 @@ impl SeedBundle {
         &self.trust
     }
 
-    /// The earliest time one of the bundled metadata roles expires, as the roles state it.
+    /// The earliest time one of the bundled metadata documents expires, as each states it: the
+    /// highest root, the timestamp, the snapshot and the targets. The update client waives the
+    /// root's expiry along with the others for the bundled generation, so this reports it too.
     #[must_use]
     pub fn earliest_expiry(&self) -> Option<jiff::Timestamp> {
-        ["timestamp.json", "snapshot.json", "targets.json"]
-            .into_iter()
-            .filter_map(|name| {
-                let bytes = self.files.get(&format!("metadata/{name}"))?;
-                let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-                document["signed"]["expires"].as_str()?.parse().ok()
-            })
-            .min()
+        [
+            "root.json",
+            "timestamp.json",
+            "snapshot.json",
+            "targets.json",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            let bytes = self.files.get(&format!("metadata/{name}"))?;
+            let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+            document["signed"]["expires"].as_str()?.parse().ok()
+        })
+        .min()
     }
 }
 
@@ -652,8 +673,13 @@ pub struct SeedOutcome {
     /// The packages this run could not install, and why; nothing is recorded for them, so the
     /// next start tries them again.
     pub skipped: Vec<(PluginId, String)>,
-    /// Why the seed did less than a full run, or what it noted.
+    /// Why the seed did less than a full run for a reason the host should report: a bundle this
+    /// build does not trust, or a seeded repository it will not move.
     pub notes: Vec<String>,
+    /// What the owner's own choices left alone: a pin that holds back a newer bundle, a removed
+    /// seeded repository, a repository of the owner's that holds the bundled root. These are
+    /// supported choices and no warning.
+    pub choices: Vec<String>,
     /// The time the bundled metadata expired, where it had.
     pub expired: Option<String>,
     /// What stopped the run, where something did.
@@ -686,6 +712,7 @@ impl SeedOutcome {
             parts.push(format!("did not install {plugin}: {reason}"));
         }
         parts.extend(self.notes.iter().cloned());
+        parts.extend(self.choices.iter().cloned());
         if let Some(expired) = &self.expired {
             parts.push(format!("the bundled metadata expired at {expired}"));
         }
@@ -736,6 +763,19 @@ enum Seeded {
 }
 
 /// The digest that names a root's key set, which a decline is recorded under.
+/// Where the generation a bundle activates came from: the repository, commit and generation the
+/// copy was made from, and the root it was verified against.
+pub(crate) fn provenance_of(bundle: &SeedBundle) -> String {
+    let source = &bundle.lock().source;
+    serde_json::json!({
+        "repository": source.repository,
+        "commit": source.commit,
+        "generation": source.generation.get(),
+        "root": bundle.lock().trust_root.digest.to_string(),
+    })
+    .to_string()
+}
+
 fn key_set_digest(keys: &[String]) -> String {
     PayloadDigest::of(keys.join(",").as_bytes()).to_string()
 }
@@ -790,7 +830,7 @@ impl Catalogue {
             let key = EnrolmentKey::parse(&name[SEEDED.len()..])?;
             let Some(enrolled) = self.db.read(|records| records.enrolment_by_key(&key))? else {
                 outcome
-                    .notes
+                    .choices
                     .push("the repository the seed enrolled is no longer enrolled".to_owned());
                 return Ok(());
             };
@@ -813,7 +853,7 @@ impl Catalogue {
                 .is_some()
             {
                 outcome
-                    .notes
+                    .choices
                     .push("the seed found the owner's own enrolment of this root".to_owned());
                 return Ok(());
             }
@@ -829,7 +869,7 @@ impl Catalogue {
                     },
                 )?;
                 outcome.committed = true;
-                outcome.notes.push(format!("did not seed: {reason}"));
+                outcome.choices.push(format!("did not seed: {reason}"));
                 return Ok(());
             }
             let enrolled = self.enrol_seed(bundle, budgets, outcome)?;
@@ -849,10 +889,14 @@ impl Catalogue {
         // Only the sync is skipped by a pin, and by a generation that is already as high: the
         // packages the bundle carries are still installed against whatever is active.
         let active = enrolled.active.map(|active| active.generation);
-        if enrolled.enrolment.pinned_generation.is_some() {
-            outcome
-                .notes
-                .push("the seeded repository is pinned, so no generation was activated".to_owned());
+        if let Some(pinned) = enrolled.enrolment.pinned_generation {
+            if pinned < bundle.generation() {
+                outcome.choices.push(format!(
+                    "the seeded repository is pinned to generation {pinned}, so the bundled \
+                     generation {} was not activated",
+                    bundle.generation()
+                ));
+            }
         } else if active.is_some_and(|active| active >= bundle.generation().get()) {
             // Nothing to activate: the generation in use is the bundle's or a later one.
         } else {
@@ -983,14 +1027,6 @@ impl Catalogue {
         )?;
         let key = EnrolmentKey::generate()?;
         crate::Store::open(&self.root, &key)?;
-        let source = &bundle.lock().source;
-        let provenance = serde_json::json!({
-            "repository": source.repository,
-            "commit": source.commit,
-            "generation": source.generation.get(),
-            "root": bundle.lock().trust_root.digest.to_string(),
-        })
-        .to_string();
         committing(
             &mut self.db,
             &*self.broker,
@@ -998,7 +1034,6 @@ impl Catalogue {
             |changes| {
                 changes.enrol(&key, &enrolment)?;
                 changes.put_setting(&format!("{SEEDED}{key}"), "1")?;
-                changes.put_setting(&format!("{PROVENANCE}{key}"), &provenance)?;
                 let view = crate::RepositoryView {
                     enrolment: enrolment.clone(),
                     active: None,
