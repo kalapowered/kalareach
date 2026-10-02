@@ -463,6 +463,57 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 3 has owners explicitly enrol, merge or split machine groups, and section 23 names no
+    // method for it. Each environment records its own group and changes it only by its own step,
+    // so this build adds the three steps, each on one environment and against the record the
+    // owner saw. They are served on the local socket and to a paired device whose grant manages
+    // this host, they ask for host management and nothing else, and none asks a fresh owner
+    // confirmation: grouping grants nothing.
+    let machines = [
+        ("machine.join", EffectClass::Write),
+        ("machine.merge", EffectClass::Write),
+        ("machine.split", EffectClass::Write),
+    ];
+    for (name, effect) in machines {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} changes one environment's own record"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is served on the local socket and to a paired device"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+        assert_eq!(
+            entry.resource_selectors,
+            &[kr_protocol::authority::ResourceSelectorKind::Environment],
+            "{name} names this environment and no session"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::None,
+            "{name} grants nothing, so it asks no confirmation"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ActionWindow,
+            "{name} is a first admission under an action window"
+        );
+        assert_eq!(
+            entry.idempotency,
+            IdempotencyBehaviour::ActionDeduplicated,
+            "{name} is de-duplicated by actor and action"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -622,6 +673,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + privacy.len()
             + updates.len()
             + descriptions.len()
+            + machines.len()
             + policy.len()
             + voice.len()
             + owner.len()
@@ -986,6 +1038,9 @@ fn host_management_methods_require_the_host_manage_right() {
         "plugin.grant",
         "agent_tools.install",
         "agent_tools.remove",
+        "machine.join",
+        "machine.merge",
+        "machine.split",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(

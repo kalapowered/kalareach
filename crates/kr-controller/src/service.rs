@@ -59,6 +59,7 @@ mod create;
 mod host;
 mod inhibition;
 mod local;
+mod machine_group;
 mod reads;
 mod recovery;
 mod rendezvous;
@@ -472,7 +473,12 @@ pub struct Controller {
     /// This daemon's side of an update of the host: its gate to new sessions, the creates under
     /// way, and whether it has been told to stop.
     handover: host::Handover,
-    _lock: SingletonLock,
+    /// The machine group this environment records for itself, and the lock its steps are taken
+    /// under.
+    machine: machine_group::Machine,
+    /// The environment's singleton lock, held for as long as this daemon runs. Every change to a
+    /// record only the daemon that holds it may write takes it as proof.
+    lock: SingletonLock,
 }
 
 impl std::fmt::Debug for Controller {

@@ -58,6 +58,7 @@
 //! | [`changeset`] | Immutable change-set versions, materialisations and the diff apply contract |
 //! | [`limits`] | Protocol defaults |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
+//! | [`machine`] | Machine groups: the group an environment records, and the steps that change it |
 //! | [`identity`] | Boot, process-start and worker-profile identities |
 //! | [`question`] | Agent questions, their answers, alerts and the caller token |
 //! | [`session`] | The session lifecycle, closure records and the session method group |
@@ -143,6 +144,7 @@ pub mod input;
 pub mod invitation;
 pub mod limits;
 pub mod local;
+pub mod machine;
 pub mod mailbox;
 pub mod method;
 pub mod pairing;

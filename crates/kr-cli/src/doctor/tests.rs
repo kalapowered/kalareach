@@ -410,6 +410,7 @@ fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
                 kr_protocol::desktop::PowerSource::Unknown,
             )
         },
+        machine: None,
     }
 }
 

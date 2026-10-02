@@ -750,6 +750,30 @@ impl Controller {
                     Err(error) => Err(error),
                 }
             }
+            // A machine group step changes this environment's own record under the revision it was
+            // admitted at, read before anything waited rather than again here: a revocation of
+            // another device stamps every surviving connection with the revision it advanced to,
+            // and a step checked against a revision read afterwards would be checked against the
+            // authority that replaced the one it was admitted under.
+            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => match admitted {
+                Some(admitted_revision) => {
+                    self.machine_step(
+                        actor_id,
+                        mutation,
+                        method,
+                        crate::authority::AdmittedMutation {
+                            admitted_revision,
+                            ..carried
+                        },
+                    )
+                    .await
+                }
+                None => Err(ControllerError::PermissionDenied {
+                    detail: "the authority this connection was admitted under has been \
+                             withdrawn; open a new connection"
+                        .to_owned(),
+                }),
+            },
             // Only the owner at this machine replaces what the host runs.
             Method::HostUpdateHandover => {
                 if is_owners_own_socket(actor_id) {

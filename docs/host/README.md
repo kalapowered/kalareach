@@ -1558,6 +1558,10 @@ root holds a mount of such storage. The mount needs a namespace of the self-test
 has and a user namespace gives. Where the host allows neither, the self-test says that case was not
 run rather than passing it.
 
+## Machine groups
+
+Each environment records its own machine group and changes it only by its own owner-approved step.
+
 ## Who may type
 
 A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch

@@ -741,6 +741,10 @@ export type InhibitionReason =
  */
 export type EnvironmentAccess = 'wsl_distribution' | 'container' | 'ssh_host' | 'paired_host'
 /**
+ * A logical machine group. Not a hardware identity.
+ */
+export type MachineId = string
+/**
  * One transport connection, allocated by the host during hello.
  */
 export type ConnectionId = string
@@ -926,10 +930,6 @@ export type InstallationId = string
  */
 export type InvitationId = string
 /**
- * A logical machine group. Not a hardware identity.
- */
-export type MachineId = string
-/**
  * One independent materialisation of one exact change-set version.
  */
 export type MaterialisationId = string
@@ -1049,6 +1049,10 @@ export type VoiceSessionId = string
  * One automation definition.
  */
 export type WorkflowId = string
+/**
+ * What wrote an environment's current group record.
+ */
+export type MachineChange = 'created' | 'joined' | 'merged' | 'split'
 /**
  * How a mail submission connection is protected before anything is sent over it.
  */
@@ -2245,6 +2249,13 @@ export interface KalaReachProtocol {
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   log_view_state?: LogViewState
+  machine_change?: MachineChange
+  machine_expected?: MachineExpected
+  machine_group?: MachineGroup
+  machine_join_params?: MachineJoinParams
+  machine_merge_params?: MachineMergeParams
+  machine_split_params?: MachineSplitParams
+  machine_step_result?: MachineStepResult
   mail_account?: MailAccount1
   mail_security?: MailSecurity
   materialisation_record?: MaterialisationRecord1
@@ -13027,6 +13038,11 @@ export interface EnvironmentSummary {
    */
   live_sessions: string
   /**
+   * The machine group this environment records for itself. Absent when the host has none to
+   * report: an older host, or one whose record could not be read.
+   */
+  machine?: MachineGroup | null
+  /**
    * The operating system.
    */
   os: string
@@ -13042,6 +13058,32 @@ export interface EnvironmentSummary {
    * The state directory holding the registry, journals and spools.
    */
   state_directory: string
+}
+/**
+ * The machine group an environment records for itself.
+ *
+ * This type is closed: a step's result carries it, and a result is never read-only metadata. A
+ * member added later is a new schema for every reader of `host.info` and `environment.list`,
+ * which hold it as an optional member.
+ */
+export interface MachineGroup {
+  /**
+   * The step that wrote this revision.
+   */
+  change: 'created' | 'joined' | 'merged' | 'split'
+  /**
+   * The group the environment is in.
+   */
+  machine_id: string
+  /**
+   * The group the environment left by that step, which undoing the step joins again. Null for
+   * the first record.
+   */
+  previous: MachineId | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
 }
 /**
  * The parameters of `environment.refresh`.
@@ -14559,6 +14601,11 @@ export interface HostInfoResult {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   live_sessions: string
+  /**
+   * The machine group this environment records for itself. Absent when the host has none to
+   * report: an older host, or one whose record could not be read.
+   */
+  machine?: MachineGroup | null
   power: SleepInhibitionState1
   protocol_version: ProtocolVersion7
   /**
@@ -15150,6 +15197,121 @@ export interface LogViewState {
   view_id: string
 }
 /**
+ * The record an owner approved a step against: the group and the revision they saw.
+ */
+export interface MachineExpected {
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * Parameters of `machine.join`.
+ */
+export interface MachineJoinParams {
+  expected: MachineExpected1
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+}
+/**
+ * The record this step was approved against.
+ */
+export interface MachineExpected1 {
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * Parameters of `machine.merge`.
+ */
+export interface MachineMergeParams {
+  expected: MachineExpected2
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+}
+/**
+ * The record this step was approved against: the group being merged away, at the revision
+ * the owner saw.
+ */
+export interface MachineExpected2 {
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * Parameters of `machine.split`.
+ */
+export interface MachineSplitParams {
+  expected: MachineExpected3
+}
+/**
+ * The record this step was approved against.
+ */
+export interface MachineExpected3 {
+  /**
+   * A logical machine group. Not a hardware identity.
+   */
+  machine_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * The result of `machine.join`, `machine.merge` and `machine.split`, and the receipt each leaves.
+ */
+export interface MachineStepResult {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  machine: MachineGroup1
+}
+/**
+ * The machine group an environment records for itself.
+ *
+ * This type is closed: a step's result carries it, and a result is never read-only metadata. A
+ * member added later is a new schema for every reader of `host.info` and `environment.list`,
+ * which hold it as an optional member.
+ */
+export interface MachineGroup1 {
+  /**
+   * The step that wrote this revision.
+   */
+  change: 'created' | 'joined' | 'merged' | 'split'
+  /**
+   * The group the environment is in.
+   */
+  machine_id: string
+  /**
+   * The group the environment left by that step, which undoing the step joins again. Null for
+   * the first record.
+   */
+  previous: MachineId | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
  * A mail submission account: the server a message is handed to and the account it is sent from.
  */
 export interface MailAccount1 {
@@ -15356,6 +15518,9 @@ export interface MethodEntry {
     | 'description.setup'
     | 'description.configure'
     | 'description.download'
+    | 'machine.join'
+    | 'machine.merge'
+    | 'machine.split'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -23867,6 +24032,9 @@ export interface ServiceRequestPayload {
     | 'description.setup'
     | 'description.configure'
     | 'description.download'
+    | 'machine.join'
+    | 'machine.merge'
+    | 'machine.split'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
