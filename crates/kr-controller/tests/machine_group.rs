@@ -827,7 +827,8 @@ async fn a_step_is_not_taken_while_the_change_before_it_cannot_be_confirmed() {
         "a step that was refused before anything changed claimed its action"
     );
 
-    // A retry of A is not answered from a record that cannot be vouched for.
+    // A retry of A is not answered from a record that cannot be vouched for, and what it is told is
+    // that the change cannot be confirmed now, not that the host's records do not show it.
     let unknown = client
         .repeat(&a)
         .await
@@ -835,6 +836,12 @@ async fn a_step_is_not_taken_while_the_change_before_it_cannot_be_confirmed() {
         .expect_err("what the record shows cannot be confirmed yet");
     assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
     assert_names_no_path(&host, &unknown);
+    assert!(
+        unknown.message.contains("ask again under the same action")
+            && !unknown.message.contains("do not show it"),
+        "{}",
+        unknown.message
+    );
 
     // The flush works again: A is answered from the record, and B, under a new action, goes
     // through and does not take A's answer with it.
@@ -865,55 +872,62 @@ async fn a_step_is_not_taken_while_the_change_before_it_cannot_be_confirmed() {
 /// ended before its receipt. A's retry finds the claim unfinished and is stopped before it takes its
 /// turn; B, under another action, settles A's claim from the record and moves the record on; the
 /// retry then goes on, and is answered with A's result, where an answer read from the record as it
-/// stands now would be an outcome nobody knows.
+/// stands now would be an outcome nobody knows. That holds when the retry's own settle then fails,
+/// too: the claim already has the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retry_that_looked_before_another_step_settled_its_claim_is_answered_from_it() {
-    let host = Host::start_unowned().await;
-    let mut client = host.client().await;
-    let minted = group_of(&mut client).await;
-    let mut other = host.client().await;
+    for flush_fails_meanwhile in [false, true] {
+        let host = Host::start_unowned().await;
+        let mut client = host.client().await;
+        let minted = group_of(&mut client).await;
+        let mut other = host.client().await;
 
-    host.controller().lose_the_next_machine_receipt();
-    let a = composed_join(&host, &mut client, some_group(0xa7), &minted).await;
-    client
-        .repeat(&a)
+        host.controller().lose_the_next_machine_receipt();
+        let a = composed_join(&host, &mut client, some_group(0xa7), &minted).await;
+        client
+            .repeat(&a)
+            .await
+            .expect("reaches the daemon")
+            .expect_err("the attempt ended before it answered");
+        let written = group_of(&mut other).await;
+        assert!(
+            matches!(
+                claim_of(&host, &a),
+                Some(kr_controller::grants::ActionRecord::Unfinished)
+            ),
+            "A's claim is unfinished: {:?}",
+            claim_of(&host, &a)
+        );
+
+        let controller = host.controller().clone();
+        let answer = held(
+            host.controller(),
+            Point::Retry,
+            async move {
+                let answer = client.repeat(&a).await.expect("reaches the daemon");
+                (client, answer)
+            },
+            async {
+                join(&host, &mut other, some_group(0xa8), &written)
+                    .await
+                    .expect("B settles A's claim and moves the record on");
+                controller.fail_the_machine_recovery_flush(flush_fails_meanwhile);
+            },
+        )
         .await
-        .expect("reaches the daemon")
-        .expect_err("the attempt ended before it answered");
-    let written = group_of(&mut other).await;
-    assert!(
-        matches!(
-            claim_of(&host, &a),
-            Some(kr_controller::grants::ActionRecord::Unfinished)
-        ),
-        "A's claim is unfinished: {:?}",
-        claim_of(&host, &a)
-    );
+        .expect("the retry's connection stands");
+        host.controller().fail_the_machine_recovery_flush(false);
+        let result: MachineStepResult = typed(&answer.1.expect("answered from A's claim"));
+        assert_eq!(
+            result.machine, written,
+            "the retry was answered with a record that was not A's (flush failing: \
+             {flush_fails_meanwhile})"
+        );
 
-    let answer = held(
-        host.controller(),
-        Point::Retry,
-        async move {
-            let answer = client.repeat(&a).await.expect("reaches the daemon");
-            (client, answer)
-        },
-        async {
-            join(&host, &mut other, some_group(0xa8), &written)
-                .await
-                .expect("B settles A's claim and moves the record on");
-        },
-    )
-    .await
-    .expect("the retry's connection stands");
-    let result: MachineStepResult = typed(&answer.1.expect("answered from A's claim"));
-    assert_eq!(
-        result.machine, written,
-        "the retry was answered with a record that was not A's"
-    );
-
-    drop(answer.0);
-    drop(other);
-    host.stop().await;
+        drop(answer.0);
+        drop(other);
+        host.stop().await;
+    }
 }
 
 /// KR-REQ-03.07: a step that wrote the record and could not confirm that its directory survives a
@@ -1237,6 +1251,17 @@ fn rows_of_authority(host: &Host) -> String {
     format!("{devices:#?}\n{grants:#?}")
 }
 
+/// Whether `host` holds a paired device with the endpoint `record` names. A device is found by its
+/// endpoint: each environment gives a device an identifier of its own when it pairs it.
+fn paired_with(host: &Host, record: &kr_controller::service::net::devices::DeviceRecord) -> bool {
+    host.controller()
+        .devices()
+        .devices()
+        .expect("readable")
+        .iter()
+        .any(|known| known.endpoint_id == record.endpoint_id)
+}
+
 /// Whether `host` lets `device`, which presents the identity `record` gave it, in and answer it.
 async fn lets_in(
     host: &Host,
@@ -1370,7 +1395,7 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         "the comparison holds files and session rows to compare"
     );
     assert!(
-        !second_authority.contains(&format!("{:?}", record.device_id)),
+        !paired_with(&second, &record),
         "the second environment knows nothing of the device before the group"
     );
     // No visibility, no route and no pairing: the device is not let in to the second environment.
@@ -1409,12 +1434,7 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         "the join changed a row of the second environment's registry"
     );
     assert!(
-        second
-            .controller()
-            .devices()
-            .record_for_device(record.device_id)
-            .expect("readable")
-            .is_none(),
+        !paired_with(&second, &record),
         "the device is not paired with the second environment"
     );
     assert!(
@@ -1491,13 +1511,7 @@ async fn grouping_grants_nothing_to_a_device_paired_with_another_environment_of_
         "an explicit pairing is a change the registry comparison sees"
     );
     assert!(
-        second
-            .controller()
-            .devices()
-            .devices()
-            .expect("readable")
-            .iter()
-            .any(|known| known.endpoint_id == record.endpoint_id),
+        paired_with(&second, &record),
         "the device is known to the second environment once it is paired with it"
     );
     assert!(
@@ -1570,6 +1584,12 @@ async fn a_step_that_wrote_nothing_is_answered_as_refused_every_time_it_is_asked
         .expect("reaches the daemon")
         .expect_err("the record cannot be read");
     assert_eq!(first.code, ErrorCode::StorageUnavailable);
+    assert!(
+        first.message.contains("host.doctor"),
+        "a record that cannot be read points at the doctor, which says why: {}",
+        first.message
+    );
+    assert_names_no_path(&host, &first);
     assert!(
         claim_of(&host, &a).is_none(),
         "a step that could not read the record claimed its action"
