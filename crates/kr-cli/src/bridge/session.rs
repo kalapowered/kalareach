@@ -163,22 +163,46 @@ async fn started(enrolment: &EnvironmentEnrolment) -> Result<()> {
 /// ended before the destination answered the create.
 pub async fn create(enrolment: &EnvironmentEnrolment, new: &NewSession) -> Result<Created> {
     let mut link = open(enrolment, BridgeTarget::Controller).await?;
-    let made = create_over(&mut link, new).await;
+    let made = create_over(&mut link, new, || open(enrolment, BridgeTarget::Controller)).await;
     link.finish().await;
     made
 }
 
-async fn create_over(link: &mut BridgedLink, new: &NewSession) -> Result<Created> {
-    // The identity that answered is the one the enrolment names: the opening was refused otherwise.
-    let environment_id = link.acknowledgement().environment_id;
-    let base = link.acknowledgement().base.clone();
+/// The worker profile the destination creates sessions with unless the person chose one.
+///
+/// Reading the destination's configuration is what puts it into force, so a ceiling edited there
+/// takes effect during the read, and one that changes what a caller may do withdraws the authority
+/// this connection was admitted under. That is the change working, not a failure, so the read is
+/// made again on a new bridge, as a command on the destination's own host makes it again, and a
+/// second refusal is the answer. `link` is replaced by the new bridge.
+async fn default_profile<O, F>(link: &mut BridgedLink, reopen: O) -> Result<WorkerProfile>
+where
+    O: Fn() -> F,
+    F: std::future::Future<Output = Result<BridgedLink>>,
+{
+    let mut answer = link.request(Method::HostInfo, &()).await?;
+    if matches!(&answer, Err(refused) if refused.code == ErrorCode::PermissionDenied) {
+        let fresh = reopen().await?;
+        std::mem::replace(link, fresh).finish().await;
+        answer = link.request(Method::HostInfo, &()).await?;
+    }
+    let info: HostInfoResult = decode(answer)?;
+    Ok(info.default_worker_profile)
+}
+
+async fn create_over<O, F>(link: &mut BridgedLink, new: &NewSession, reopen: O) -> Result<Created>
+where
+    O: Fn() -> F,
+    F: std::future::Future<Output = Result<BridgedLink>>,
+{
     let profile = match new.profile {
         Some(profile) => profile,
-        None => {
-            let info: HostInfoResult = decode(link.request(Method::HostInfo, &()).await?)?;
-            info.default_worker_profile
-        }
+        None => default_profile(link, reopen).await?,
     };
+    // The identity that answered is the one the enrolment names: the opening was refused otherwise.
+    // It is read after the profile, which may have been read on a new bridge.
+    let environment_id = link.acknowledgement().environment_id;
+    let base = link.acknowledgement().base.clone();
     let params = SessionCreateParams {
         environment_id,
         presentation: new.presentation,
@@ -302,4 +326,194 @@ fn decode<T: kr_protocol::wire::WireMessage>(answer: Answer) -> Result<T> {
                 Shown::cbor(&error)
             ))
         })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use kr_controller::bridge::invoke::Opening;
+    use kr_controller::bridge::launch::BridgeCommand;
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+    use kr_protocol::frame::{FrameCodec, StreamKind};
+    use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
+    use kr_protocol::identity::{
+        BootIdentity, BootIdentitySource, BridgeFrame, BridgeHello, BridgeHelloAck, DestinationBase,
+    };
+    use kr_protocol::ids::{BuildId, ConnectionId, EnvironmentId, RequestId};
+    use kr_protocol::local::LocalRole;
+    use kr_protocol::scalars::{Bytes, DurationMs, TimestampMs, U64, Uuid};
+
+    fn environment() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([3; 16]))
+    }
+
+    /// A bridge whose helper answers the opening and then the frames given, one per request.
+    fn answering(answers: &[Outcome]) -> (tempfile::TempDir, Opening) {
+        let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
+        let codec = FrameCodec::new(StreamKind::Control);
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut bytes = codec
+            .encode_message(&BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                build: Some(kr_protocol::local::LocalBuild::this(
+                    BuildId::new("kr/0.1.0").expect("a build"),
+                )),
+                base: DestinationBase {
+                    home: "/home/kala".to_owned(),
+                    variables: Vec::new(),
+                },
+                environment_id: environment(),
+                os_user: "kala".to_owned(),
+                role: LocalRole::Controller,
+                connection_id,
+                boot_identity: BootIdentity {
+                    source: BootIdentitySource::LinuxBootId,
+                    value: Bytes::new(b"boot".to_vec()),
+                },
+                max_frame_len: U64::new(65_536),
+                action_window: ActionWindow {
+                    action_window_id: kr_protocol::ids::ActionWindowId::new("w").expect("a window"),
+                    connection_id,
+                    boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                    issued_at_ms: TimestampMs::new(0),
+                    valid_for_ms: DurationMs::new(120_000),
+                },
+            })))
+            .expect("encodes");
+        for (index, outcome) in answers.iter().enumerate() {
+            bytes.extend(
+                codec
+                    .encode_message(&BridgeFrame::Control(Box::new(ControlFrame::Response(
+                        Response {
+                            request_id: RequestId::new(index as u64 + 1),
+                            outcome: outcome.clone(),
+                        },
+                    ))))
+                    .expect("encodes"),
+            );
+        }
+        let file = directory.path().join("answers");
+        std::fs::write(&file, bytes).expect("written");
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "head -c 4 >/dev/null; cat \"$1\"; sleep 5".to_owned(),
+                    "sh".to_owned(),
+                    file.to_str().expect("text").to_owned(),
+                ],
+            },
+            environment_id: environment(),
+            hello: BridgeHello {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: BuildId::new("kr-test/0").expect("a build"),
+                origin_environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+                origin_ingress: ActorIngress::LocalIpc,
+                already_bridged: false,
+                start: true,
+                target: BridgeTarget::Controller,
+            },
+        };
+        (directory, opening)
+    }
+
+    async fn linked(opening: Opening) -> BridgedLink {
+        BridgedLink::new(
+            opening
+                .launch()
+                .await
+                .expect("the helper answered")
+                .into_stream(),
+        )
+    }
+
+    fn host_info(profile: WorkerProfile) -> Outcome {
+        Outcome::Ok(
+            ParamsValue::from_typed(&HostInfoResult {
+                build_id: BuildId::new("kr-controller/0.1.0").expect("a build"),
+                protocol_version: PROTOCOL_VERSION,
+                environment_id: environment(),
+                generation: kr_protocol::ids::ControllerGeneration::new(1),
+                boot_identity: BootIdentity {
+                    source: BootIdentitySource::LinuxBootId,
+                    value: Bytes::new(b"boot".to_vec()),
+                },
+                started_at_ms: TimestampMs::new(0),
+                live_sessions: U64::new(0),
+                session_limit: U64::new(128),
+                default_worker_profile: profile,
+                power: kr_protocol::desktop::SleepInhibitionState::off(
+                    kr_protocol::desktop::InhibitionMechanism::None,
+                    kr_protocol::desktop::PowerSource::Unknown,
+                ),
+            })
+            .expect("a payload"),
+        )
+    }
+
+    fn withdrawn() -> Outcome {
+        Outcome::Error(kr_protocol::error::ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the authority this connection was admitted under was withdrawn",
+        ))
+    }
+
+    /// A ceiling that the read of the configuration puts into force withdraws the authority the
+    /// first bridge was admitted under, so the read is made again on a new one, and what it answers
+    /// is the profile.
+    #[tokio::test]
+    async fn a_profile_read_that_withdrew_its_own_authority_is_made_again_on_a_new_bridge() {
+        let (_first, first) = answering(&[withdrawn()]);
+        let (_second, second) = answering(&[host_info(WorkerProfile::DesktopBound)]);
+        let second = std::cell::RefCell::new(Some(second));
+        let mut link = linked(first).await;
+        let opened = std::cell::Cell::new(0);
+        let profile = default_profile(&mut link, || {
+            opened.set(opened.get() + 1);
+            let opening = second.borrow_mut().take().expect("opened once");
+            async move { Ok(linked(opening).await) }
+        })
+        .await
+        .expect("the second read answers");
+        assert_eq!(profile, WorkerProfile::DesktopBound);
+        assert_eq!(opened.get(), 1, "one new bridge, and no more");
+        let _ = link.close().await;
+    }
+
+    /// A second refusal is the answer: it is not read again.
+    #[tokio::test]
+    async fn a_second_refusal_of_the_profile_read_is_the_answer() {
+        let (_first, first) = answering(&[withdrawn()]);
+        let (_second, second) = answering(&[withdrawn()]);
+        let second = std::cell::RefCell::new(Some(second));
+        let mut link = linked(first).await;
+        let refused = default_profile(&mut link, || {
+            let opening = second.borrow_mut().take().expect("opened once");
+            async move { Ok(linked(opening).await) }
+        })
+        .await;
+        assert!(
+            matches!(&refused, Err(CliError::Refused(error)) if error.code == ErrorCode::PermissionDenied),
+            "{refused:?}"
+        );
+        let _ = link.close().await;
+    }
+
+    /// The control: a read that is answered is not made again.
+    #[tokio::test]
+    async fn a_profile_read_that_is_answered_opens_no_second_bridge() {
+        let (_first, first) = answering(&[host_info(WorkerProfile::HeadlessUser)]);
+        let mut link = linked(first).await;
+        let profile = default_profile(&mut link, || async {
+            panic!("a second bridge was opened");
+            #[allow(unreachable_code)]
+            Err(CliError::Other(Shown::said("unreachable")))
+        })
+        .await
+        .expect("answered");
+        assert_eq!(profile, WorkerProfile::HeadlessUser);
+        let _ = link.close().await;
+    }
 }
