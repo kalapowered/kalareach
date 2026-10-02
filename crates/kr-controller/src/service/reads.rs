@@ -14,8 +14,9 @@ use kr_protocol::session::{
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
+use crate::registry::LaunchPhase;
 
-use super::workers::UNACCOUNTED_WORKER;
+use super::workers::{UNACCOUNTED_WORKER, WORKER_EXCHANGE};
 use super::{Controller, encode, parse};
 
 impl Controller {
@@ -30,26 +31,46 @@ impl Controller {
         let _ = self.recover_claims().await;
         let _ = self.recover_workers().await;
         let mut sessions = Vec::new();
+        // The sessions the pass over the workers has settled, whether it listed them or not: a
+        // session whose worker said it is closed is not one this daemon lists as live because its
+        // closure is not recorded yet, and one whose closure is recorded is the closed pass's.
+        let mut settled = std::collections::BTreeSet::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
             let session_id = worker.descriptor.session_id;
-            let session = match self.read_from_worker(&worker).await {
-                Ok(read) => Some(read.session),
+            // A worker that is connected and does not answer holds the list for one exchange, and
+            // no longer: every other session is listed whatever it does.
+            let session = match self
+                .read_from_worker_within(&worker, Some(WORKER_EXCHANGE))
+                .await
+            {
+                Ok(read) => {
+                    settled.insert(session_id);
+                    Some(read.session)
+                }
                 // As for a read, and in the same order: a session whose closure is recorded is
                 // listed with the closed sessions below, and one whose worker is on its way out is
-                // listed as this daemon last knew it.
-                Err(_) => {
-                    if matches!(self.reconcile(session_id).await, Ok(None)) {
+                // listed as this daemon last knew it. Short of either, the worker cannot be
+                // reached and nothing says its session has ended, so the session is not settled
+                // here: it is listed below from what this daemon holds of it.
+                Err(_) => match self.reconcile(session_id).await {
+                    Ok(Some(_)) => {
+                        settled.insert(session_id);
+                        None
+                    }
+                    Ok(None) => {
                         let ending = self.directory.lock().await.ending(session_id);
                         let recorded = self.registry.lock().await.closure(session_id);
                         match (recorded, ending) {
-                            (Ok(None), Some(read)) => Some(read.session),
+                            (Ok(None), Some(read)) => {
+                                settled.insert(session_id);
+                                Some(read.session)
+                            }
                             _ => None,
                         }
-                    } else {
-                        None
                     }
-                }
+                    Err(_) => None,
+                },
             };
             // A session that has closed is listed only where closed sessions were asked for,
             // whether its worker said so or this daemon's record did.
@@ -72,6 +93,7 @@ impl Controller {
                 sessions.push(self.closed_session(&closure, display_number).await);
             }
         }
+        sessions.extend(self.unresolved_sessions(&settled).await?);
         sessions.sort_by_key(|session| session.display_number.get());
         encode(&SessionListResult { sessions })
     }
@@ -352,6 +374,111 @@ impl Controller {
                 summary
             },
         )
+    }
+}
+
+impl Controller {
+    /// Describes every session this daemon holds that no worker described and no closure covers.
+    ///
+    /// A list is every session the registry holds that has not closed, which is what `host.info`
+    /// counts as live or creating: a worker that cannot be reached now is no less the session's, a
+    /// create whose worker has not reported is a session being created, and a reservation
+    /// recovery has not resolved still occupies a place. Each is described from the registry's own
+    /// rows ([`unresolved_summary`]) and none is described as more than they say.
+    async fn unresolved_sessions(
+        &self,
+        settled: &std::collections::BTreeSet<SessionId>,
+    ) -> Result<Vec<SessionSummary>> {
+        let registry = self.registry.lock().await;
+        let workers = registry.workers()?;
+        let mut described = Vec::new();
+        for phase in [
+            LaunchPhase::Reserved,
+            LaunchPhase::Spawned,
+            LaunchPhase::Claimed,
+            LaunchPhase::Live,
+            LaunchPhase::Fenced,
+        ] {
+            for reservation in registry.reservations_in(phase)? {
+                let session_id = reservation.session_id;
+                if settled.contains(&session_id) || registry.closure(session_id)?.is_some() {
+                    continue;
+                }
+                let worker = workers.iter().find(|row| row.session_id == session_id);
+                let desktop = registry.desktop_of(session_id)?;
+                described.push(unresolved_summary(
+                    self.paths.environment_id(),
+                    &reservation,
+                    worker,
+                    desktop,
+                ));
+            }
+        }
+        Ok(described)
+    }
+}
+
+/// Describes one session from the registry's rows alone, when nothing else describes it.
+///
+/// The state is the registry's: creating until a worker has reported, live after, as the worker's
+/// row records it, and closing for a reservation this daemon fenced, whose worker it never reaches
+/// again and whose end it is resolving. The shell, the directory, the geometry and the profile are
+/// what the create asked for, where it named them: a choice it left to the host is not known here,
+/// so the shell and the directory read empty and the geometry the invisible default, as for a
+/// closed session whose worker did not describe it. Nothing else of a session is known without its
+/// worker, so it has no attachments, no application and no root process.
+fn unresolved_summary(
+    environment_id: EnvironmentId,
+    reservation: &crate::registry::Reservation,
+    worker: Option<&crate::registry::WorkerRecord>,
+    desktop: Option<kr_protocol::identity::DesktopBinding>,
+) -> SessionSummary {
+    let state = match reservation.phase {
+        LaunchPhase::Reserved | LaunchPhase::Spawned | LaunchPhase::Claimed => {
+            SessionState::Creating
+        }
+        LaunchPhase::Live => worker.map_or(SessionState::Live, |row| row.state),
+        LaunchPhase::Fenced => SessionState::Closing,
+        LaunchPhase::Failed | LaunchPhase::Closed => SessionState::Closed,
+    };
+    let intent = reservation
+        .create_intent
+        .as_deref()
+        .and_then(|recorded| super::create::recorded_create(recorded).ok());
+    SessionSummary {
+        session_id: reservation.session_id,
+        session_epoch: kr_protocol::ids::SessionEpoch::V1,
+        environment_id,
+        display_number: reservation.display_number,
+        state,
+        shell_mode: intent
+            .as_ref()
+            .map_or(kr_protocol::session::ShellMode::NativeCompat, |create| {
+                create.shell_mode
+            }),
+        shell_path: intent
+            .as_ref()
+            .and_then(|create| create.shell.as_ref().cloned())
+            .unwrap_or_default(),
+        cwd: intent
+            .as_ref()
+            .and_then(|create| create.cwd.as_ref().cloned())
+            .unwrap_or_default(),
+        worker_profile: worker.map(|row| row.profile).unwrap_or_else(|| {
+            intent
+                .as_ref()
+                .map_or(WorkerProfile::HeadlessUser, |create| create.worker_profile)
+        }),
+        desktop: desktop.unwrap_or_else(kr_protocol::identity::DesktopBinding::none),
+        created_at_ms: reservation.created_at_ms,
+        dimensions: intent
+            .as_ref()
+            .and_then(|create| create.dimensions.as_ref().copied())
+            .unwrap_or(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS),
+        attachment_count: U64::ZERO,
+        application_state: Nullable::null(),
+        root_process: Nullable::null(),
+        closure: Nullable::null(),
     }
 }
 
