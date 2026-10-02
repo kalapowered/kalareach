@@ -933,15 +933,9 @@ fn result_of(
 /// the caller would take for a step that changed nothing.
 fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
     match record {
-        crate::grants::ActionRecord::Answered { result } => decoded(&result).map_err(|error| {
-            eprintln!("kr-controller: a machine group step's receipt cannot be read: {error}");
-            ControllerError::Uncertain {
-                detail: "this host's record of what this action did cannot be read, so it is not \
-                         known what it did; read this environment's machine group before asking \
-                         under a new action"
-                    .to_owned(),
-            }
-        }),
+        crate::grants::ActionRecord::Answered { result } => {
+            decoded(&result).map_err(|error| receipt_cannot_be_read(&error))
+        }
         crate::grants::ActionRecord::Refused { code, detail } => {
             Err(ControllerError::Refused { code, detail })
         }
@@ -953,15 +947,31 @@ fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
     }
 }
 
+/// The answer to a receipt that is kept and cannot be read back, whether its result does not decode
+/// or its refusal's code does not parse: the action was claimed, so what it did is not known.
+/// Asking again under the same action would meet the same row, so the caller is told to read the
+/// record before asking under a new action.
+fn receipt_cannot_be_read(why: &dyn std::fmt::Display) -> ControllerError {
+    eprintln!("kr-controller: a machine group step's receipt cannot be read: {why}");
+    ControllerError::Uncertain {
+        detail: "this host's record of what this action did cannot be read, so it is not known \
+                 what it did; read this environment's machine group before asking under a new \
+                 action"
+            .to_owned(),
+    }
+}
+
 /// The answer to a retry whose receipt cannot be looked up: the host's own record of its actions
 /// cannot be read, so whether an earlier attempt at the action took the step is not known, and no
 /// refusal is given for it.
 ///
 /// A lookup that fails says nothing about the action. The step is neither refused, which a caller
 /// would take for a step that changed nothing, nor performed again: asking again under the same
-/// action is answered once the receipts can be read. A reused identifier is still `ID_CONFLICT`.
+/// action is answered once the receipts can be read. A row that was found and cannot be parsed is
+/// [`receipt_cannot_be_read`]'s. A reused identifier is still `ID_CONFLICT`.
 fn receipts_unreadable(error: ControllerError) -> ControllerError {
     match error {
+        ControllerError::InvalidArgument(_) => receipt_cannot_be_read(&error),
         ControllerError::Storage { .. } | ControllerError::RegistryUnavailable { .. } => {
             eprintln!("kr-controller: a machine group step's receipt cannot be looked up: {error}");
             ControllerError::Uncertain {
@@ -1005,6 +1015,20 @@ mod tests {
             "{damaged:?}"
         );
         assert_eq!(damaged.code(), ErrorCode::OutcomeUnknown);
+
+        // A kept refusal whose code does not parse is no more readable, and no more a refusal of
+        // the caller's request; a reused identifier is still the caller's.
+        let malformed = receipts_unreadable(ControllerError::InvalidArgument(
+            "a stored refusal's code is malformed".to_owned(),
+        ));
+        assert!(
+            matches!(malformed, ControllerError::Uncertain { .. }),
+            "{malformed:?}"
+        );
+        let reused = receipts_unreadable(ControllerError::IdConflict {
+            token: "an action".to_owned(),
+        });
+        assert_eq!(reused.code(), ErrorCode::IdConflict);
 
         let whole = kr_cbor::encode(&kr_cbor::CanonicalValue::Text("a result".to_owned()));
         recorded_answer(crate::grants::ActionRecord::Answered { result: whole })
