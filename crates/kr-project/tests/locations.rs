@@ -745,6 +745,122 @@ fn a_caller_bounded_by_a_grant_clones_makes_a_working_copy_and_removes_it_throug
     assert!(!root.join("review").exists());
 }
 
+/// A caller bounded by a grant selects the repository's own tree as a working copy through the
+/// source location it is bound to, and removes the selection through that location again. The
+/// tree is never removed. The controls: a working copy made by naming a path is reached through no
+/// location and stays the owner's, and once the source location is withdrawn the removal is
+/// refused, so the grant reaches nothing the owner withdrew.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_caller_bounded_by_a_grant_removes_the_shared_working_copy_it_selected_through_its_source() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let grant = GrantId::new(Uuid::from_bytes([0x69; 16]));
+    owner.knows_device(grant, device_keys(0x75));
+    let root = fixture.work().join("shared-granted");
+    std::fs::create_dir(&root).expect("a directory");
+    let project = adopt(&fixture, &root, "repo", 30);
+    let source = authorised(
+        fixture.service(),
+        &owner,
+        &authorise_params(environment, &root, LocationPurpose::Source, Some(grant)),
+        31,
+    );
+    attach(fixture.service(), &owner, project, source.location_id, 32)
+        .expect("the owner binds the repository to the grant's source location");
+    let shared = |label: &str| WorkspaceCreateParams {
+        project_repository_id: project,
+        label: label.to_owned(),
+        kind: WorkspaceKind::SharedExisting,
+        isolation: Nullable(None),
+        policy: support::include_everything(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(None),
+        preview_only: false,
+    };
+    let removal = |workspace_id| WorkspaceRemoveParams {
+        workspace_id,
+        retention: RetentionPolicy::RemoveRetained,
+        through_location_id: Nullable(None),
+    };
+    let made = |label: &str, seed: u8| {
+        fixture
+            .service()
+            .workspace_create(
+                &actor(),
+                &shared(label),
+                kr_project::store::Performed::from(Some(&action("workspace.create", seed)))
+                    .bounded_by(grant),
+            )
+            .expect("the caller bounded by the grant selects the repository's own tree")
+            .workspace
+            .0
+            .expect("a workspace")
+    };
+
+    let first = made("selected", 33);
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &removal(first.workspace_id),
+            kr_project::store::Performed::from(Some(&action("workspace.remove", 34)))
+                .bounded_by(grant),
+        )
+        .expect("the selection is removed through the source location it was made through");
+    assert_eq!(removed.workspace.state, WorkspaceState::Removed);
+    assert!(
+        !removed.working_files_removed,
+        "the repository's own tree is not the removal's to take"
+    );
+    assert!(
+        root.join("repo/README.md").is_file(),
+        "and it is where it was"
+    );
+
+    // The control: the owner's working copy made by naming a path is reached through no location.
+    let by_path = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+                destination: Nullable(Some(destination(environment, &root, "by-path"))),
+                ..shared("by path")
+            },
+            Some(&action("workspace.create", 35)),
+        )
+        .expect("the owner makes a working copy by naming a path")
+        .workspace
+        .0
+        .expect("a workspace");
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &removal(by_path.workspace_id),
+            kr_project::store::Performed::from(Some(&action("workspace.remove", 36)))
+                .bounded_by(grant),
+        )
+        .expect_err("a working copy made through no location is the owner's");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(root.join("by-path/.git").exists(), "nothing was removed");
+
+    // And once the source location is withdrawn the grant reaches nothing through it.
+    let second = made("selected again", 37);
+    support::withdraw_location(fixture.service(), source.location_id, 38);
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &removal(second.workspace_id),
+            kr_project::store::Performed::from(Some(&action("workspace.remove", 39)))
+                .bounded_by(grant),
+        )
+        .expect_err("a withdrawn location reaches nothing");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
 #[test]
 fn a_location_confirmation_for_a_grant_names_a_device_this_host_holds_in_full() {
     // A grant no paired device holds has no keys to bind the confirmation to, so nothing is

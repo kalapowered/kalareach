@@ -2722,25 +2722,38 @@ impl ProjectService {
                 // A workspace made through no location is reached through none, whatever
                 // authority a caller holds over the repository it is a copy of: only the owner
                 // reaches it, by the path it was made at.
-                if let Some(grant) = performed.grant()
-                    && recorded.as_ref().is_some_and(|row| row.located.is_none())
-                {
-                    return Err(ProjectError::PermissionDenied {
-                        detail: format!(
-                            "workspace {} was made through no location, so a caller bounded by \
-                             grant {grant} reaches it through none",
-                            params.workspace_id
-                        )
-                        .into(),
-                    });
+                match (performed.grant(), recorded.as_ref()) {
+                    (Some(grant), Some(row)) if row.located.is_none() => {
+                        // A shared workspace is the repository's own tree, which such a caller
+                        // reached through the source location the repository is bound to, and
+                        // its removal removes the selection and never the tree. It is reached
+                        // through that location again, with the same bounded reads.
+                        if !matches!(row.kind, WorkspaceKind::SharedExisting) {
+                            return Err(ProjectError::PermissionDenied {
+                                detail: format!(
+                                    "workspace {} was made through no location, so a caller \
+                                     bounded by grant {grant} reaches it through none",
+                                    params.workspace_id
+                                )
+                                .into(),
+                            });
+                        }
+                        let project = self
+                            .locked()?
+                            .project(row.project_repository_id)?
+                            .ok_or_else(|| ProjectError::UnknownProject {
+                                project: row.project_repository_id.to_string().into(),
+                            })?;
+                        self.source_reach(&project, Admitting::Caller(Some(grant)))?
+                    }
+                    // A workspace created through a location is reached through that location,
+                    // admitted for this caller, and through nothing else; a location that is
+                    // dormant or withdrawn refuses the removal here, before anything is reserved.
+                    _ => self.tree_reach(
+                        recorded.as_ref().and_then(|row| row.located.as_ref()),
+                        Admitting::Caller(performed.grant()),
+                    )?,
                 }
-                // A workspace created through a location is reached through that location,
-                // admitted for this caller, and through nothing else; a location that is dormant
-                // or withdrawn refuses the removal here, before anything is reserved.
-                self.tree_reach(
-                    recorded.as_ref().and_then(|row| row.located.as_ref()),
-                    Admitting::Caller(performed.grant()),
-                )?
             }
         };
         // The claim, the holder count and the reservation are one transaction, and they come
@@ -3034,6 +3047,38 @@ impl ProjectService {
         )?;
         opened.require_identity(project.identity)?;
         Ok(opened)
+    }
+
+    /// Returns how a removal reaches a repository's own tree: through the source location the
+    /// repository is bound to, admitted for this caller, with every read of the removal asking the
+    /// location again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::PermissionDenied`] for a repository bound to no source location or
+    /// one that location does not admit this caller to.
+    fn source_reach(&self, project: &ProjectRow, admitting: Admitting) -> Result<TreeReach> {
+        let Some(bound) = project.source.clone() else {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "repository {} is bound to no source location, so no location reaches it; \
+                     the owner binds it to one first",
+                    project.project_repository_id
+                )
+                .into(),
+            });
+        };
+        let wanted = LocationUse {
+            purpose: LocationPurpose::Source,
+            environment_id: self.environment_id,
+            admitting,
+        };
+        let held = self.locations().admit(bound.location_id, &wanted)?;
+        let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
+        Ok(TreeReach {
+            through: Some((held, RelativeName::parse(&bound.relative_path)?)),
+            admission,
+        })
     }
 
     /// Returns how a removal reaches a workspace's tree.
@@ -4073,7 +4118,8 @@ impl Narrowing {
                 .map(|text| text.trim().to_owned())
         };
         let table = std::fs::read_to_string("/proc/self/mountinfo").ok();
-        let configured = std::env::var_os("XDG_CONFIG_HOME")
+        let fstab = std::fs::read_to_string("/etc/fstab").ok();
+        let home_config = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .or_else(|| {
@@ -4082,6 +4128,18 @@ impl Narrowing {
                     .filter(|path| path.is_absolute())
             })
             .map(|directory| directory.join("systemd").join("user"));
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|directory| directory.join("systemd").join("user"));
+        // The units an administrator or the account configured: the directories systemd reads
+        // them from besides the ones a package installs into, which are not read here.
+        let mut for_the_account: Vec<PathBuf> = vec![
+            PathBuf::from("/etc/systemd/user"),
+            PathBuf::from("/run/systemd/user"),
+        ];
+        for_the_account.extend(home_config.clone());
+        for_the_account.extend(runtime);
         Self {
             user_namespaces: user_namespaces(
                 text("/proc/sys/user/max_user_namespaces").as_deref(),
@@ -4095,18 +4153,22 @@ impl Narrowing {
                 "/usr/sbin",
                 "/sbin",
             ])),
+            // Where the host's mount table, its filesystem table and its administrator's units
+            // each name one. An unreadable table or directory leaves the count unknown.
             automounts: table.as_deref().and_then(|table| {
                 Some(
                     autofs_mounts(table)
-                        + units_in(Path::new("/etc/systemd/system"), &["automount"])?,
+                        + fstab.as_deref().map_or(0, fstab_automounts)
+                        + units_across(
+                            &[
+                                PathBuf::from("/etc/systemd/system"),
+                                PathBuf::from("/run/systemd/system"),
+                            ],
+                            &["automount"],
+                        )?,
                 )
             }),
-            user_mount_units: match configured {
-                // No directory is no unit: an account that configured none has no such directory.
-                Some(directory) if !directory.exists() => Some(0),
-                Some(directory) => units_in(&directory, &["mount", "automount"]),
-                None => None,
-            },
+            user_mount_units: units_across(&for_the_account, &["mount", "automount"]),
         }
     }
 
@@ -4176,6 +4238,40 @@ fn fusermount_in(directories: &[&str]) -> Fusermount {
         }
     }
     found
+}
+
+/// Counts the units of the given kinds in each of several directories. A directory that is not
+/// there holds none, and one that cannot be read leaves the count unknown.
+#[cfg(any(target_os = "linux", test))]
+fn units_across(directories: &[PathBuf], kinds: &[&str]) -> Option<u64> {
+    let mut count = 0;
+    for directory in directories {
+        match units_in(directory, kinds) {
+            Some(found) => count += found,
+            None if !directory.exists() => {}
+            None => return None,
+        }
+    }
+    Some(count)
+}
+
+/// Counts the lines of a filesystem table that ask for an automatic mount.
+#[cfg(any(target_os = "linux", test))]
+fn fstab_automounts(table: &str) -> u64 {
+    table
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let kind = fields.nth(2);
+            let options = fields.next().unwrap_or_default();
+            kind == Some("autofs")
+                || options
+                    .split(',')
+                    .any(|option| option == "x-systemd.automount")
+        })
+        .count() as u64
 }
 
 /// Counts the units of the given kinds in one directory, or `None` when it cannot be read.
@@ -4397,6 +4493,41 @@ mod tests {
             None,
             "a directory that cannot be read is no reading"
         );
+    }
+
+    #[test]
+    fn the_units_of_several_directories_are_counted_and_one_that_is_unreadable_is_unknown() {
+        let first = tempfile::tempdir().expect("a directory");
+        let second = tempfile::tempdir().expect("a directory");
+        std::fs::write(first.path().join("data.mount"), "").expect("a unit");
+        std::fs::write(second.path().join("nfs.automount"), "").expect("a unit");
+        let both = [first.path().to_owned(), second.path().to_owned()];
+        assert_eq!(units_across(&both, &["mount", "automount"]), Some(2));
+        let missing = first.path().join("none");
+        assert_eq!(
+            units_across(&[missing, second.path().to_owned()], &["automount"]),
+            Some(1),
+            "a directory that is not there holds none"
+        );
+        // The control: a path that exists and cannot be listed is unknown rather than none.
+        assert_eq!(
+            units_across(&[first.path().join("data.mount")], &["mount"]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_filesystem_table_asks_for_an_automount_by_its_type_or_its_option() {
+        let table = "\
+# a comment
+UUID=1 / ext4 defaults 0 1
+server:/export /mnt/nfs nfs noauto,x-systemd.automount,x-systemd.idle-timeout=60 0 0
+/etc/auto.misc /misc autofs defaults 0 0
+UUID=2 /data ext4 defaults,nofail 0 2
+";
+        assert_eq!(fstab_automounts(table), 2);
+        assert_eq!(fstab_automounts("UUID=1 / ext4 defaults 0 1\n"), 0);
+        assert_eq!(fstab_automounts(""), 0);
     }
 
     #[test]
