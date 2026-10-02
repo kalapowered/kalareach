@@ -234,36 +234,45 @@ read_search_list() {
 }
 
 signing_lock=""
+holding_lock=0
 signing_child=""
 signing_paths=()
 signing_before=""
 signing_ended=1
 
 # Puts the search list back as it was recorded and locks the signing keychain, once, whichever way the
-# signing ended. The lock is released only when the list is known to be what it was: a list that could
-# not be put back keeps the lock, so that no other build signs on top of it.
+# signing ended, and answers whether both are known to have worked. Nothing releases the lock directory
+# unless both did: a list that could not be put back, or a keychain that could not be locked, keeps it,
+# so that no other build signs on top of an unresolved state.
 end_signing() {
   [ "$signing_ended" = 1 ] && return 0
   signing_ended=1
-  local restored=1
-  security list-keychains -d user -s "${signing_paths[@]}" || restored=0
-  security lock-keychain "$KR_KEYCHAIN" || say "THE SIGNING KEYCHAIN COULD NOT BE LOCKED: lock it by hand"
-  read_search_list || restored=0
+  local clean=1
+  security list-keychains -d user -s "${signing_paths[@]}" || clean=0
+  security lock-keychain "$KR_KEYCHAIN" || { say "THE SIGNING KEYCHAIN COULD NOT BE LOCKED: lock it by hand"; clean=0; }
+  read_search_list || clean=0
   say "keychain search list after signing: $(printf '%s' "$listing" | tr '\n' ' ')"
-  if [ "$restored" = 1 ] && [ "$listing" = "$signing_before" ]; then
+  [ "$listing" = "$signing_before" ] || clean=0
+  if [ "$clean" = 1 ]; then
     rmdir "$signing_lock" 2>/dev/null
+    holding_lock=0
     return 0
   fi
-  say "THE KEYCHAIN SEARCH LIST IS NOT WHAT IT WAS BEFORE SIGNING: put it back by hand, then remove $signing_lock"
+  say "THE KEYCHAIN SEARCH LIST OR THE KEYCHAIN'S LOCK IS NOT WHAT IT WAS BEFORE SIGNING: put it right by hand, then remove $signing_lock"
   return 1
 }
 
-# A TERM, INT or HUP while signing: the command is stopped, then the list is put back and the keychain
-# locked, before this shell goes.
+# A TERM, INT or HUP while signing, or while the signing is being undone: what is being undone is not
+# interrupted again. The command is stopped, then the list is put back and the keychain locked, before
+# this shell goes; a signal before the signing began only lets go of the lock.
 signing_interrupted() { # <exit status>
+  trap '' INT TERM HUP
   [ -n "$signing_child" ] && kill "$signing_child" 2>/dev/null
-  wait "$signing_child" 2>/dev/null
-  end_signing
+  [ -n "$signing_child" ] && wait "$signing_child" 2>/dev/null
+  signing_child=""
+  if [ "$signing_ended" = 0 ]; then end_signing
+  elif [ "$holding_lock" = 1 ]; then rmdir "$signing_lock" 2>/dev/null; holding_lock=0
+  fi
   exit "$1"
 }
 
@@ -278,11 +287,17 @@ with_signing_keychain() { # <command...>
   [ -n "${KR_KEYCHAIN:-}" ] && [ -f "${KR_KEYCHAIN_PASSWORD_FILE:-}" ] || die "KR_KEYCHAIN and KR_KEYCHAIN_PASSWORD_FILE are needed to sign"
   mkdir -p "$work"
   signing_lock="$work/signing.lock"
+  signing_ended=1
+  holding_lock=0
+  trap 'signing_interrupted 130' INT
+  trap 'signing_interrupted 143' TERM
+  trap 'signing_interrupted 129' HUP
   mkdir "$signing_lock" 2>/dev/null || die "another build is signing, or one ended without restoring the list: see $signing_lock"
-  if ! read_search_list; then rmdir "$signing_lock"; die "the keychain search list could not be read, or it is empty"; fi
+  holding_lock=1
+  if ! read_search_list; then rmdir "$signing_lock"; holding_lock=0; die "the keychain search list could not be read, or it is empty"; fi
   signing_before=$listing
   if printf '%s\n' "$signing_before" | grep -Fxq "$KR_KEYCHAIN"; then
-    rmdir "$signing_lock"
+    rmdir "$signing_lock"; holding_lock=0
     die "the signing keychain is already on the search list: an earlier signing did not put it back, so put it back by hand"
   fi
   say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
@@ -290,9 +305,6 @@ with_signing_keychain() { # <command...>
   local each
   while IFS= read -r each; do signing_paths+=("$each"); done <<< "$signing_before"
   signing_ended=0
-  trap 'signing_interrupted 130' INT
-  trap 'signing_interrupted 143' TERM
-  trap 'signing_interrupted 129' HUP
   local status
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
@@ -304,8 +316,13 @@ with_signing_keychain() { # <command...>
   else
     status=2
   fi
+  # Undoing the signing is not interrupted: it takes a moment, and an interruption in it would leave
+  # the keychain on the list or unlocked.
+  trap '' INT TERM HUP
+  local undone=0
+  end_signing || undone=1
   trap - INT TERM HUP
-  end_signing || die "the signing left the keychain search list changed"
+  [ "$undone" = 0 ] || die "the signing left the keychain search list or the keychain's lock changed"
   return "$status"
 }
 
@@ -444,6 +461,26 @@ forwarded=0
 unclean=0
 unproven=0
 
+# Starts the test run for the phone in the background, writing its own identity into the record before
+# it becomes Xcode: the record line is `runner=<pid>|<start time>|<result bundle>`, written by the new
+# process itself and kept by `exec`, so that no moment exists in which Xcode drives the phone and the
+# record does not say so, whatever happens to this script. Sets runner_pid.
+start_driver() { # <the result bundle> <the output file> <xcodebuild arguments...>
+  local result=$1 output=$2
+  shift 2
+  bash -c 'printf "runner=%s|%s|%s\n" "$$" "$(ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")" "$1" >> "$2"; shift 2; exec xcodebuild "$@"' \
+    driver "$result" "$record" "$@" > "$output" 2>&1 &
+  runner_pid=$!
+}
+
+# The driver has ended: its line leaves the record, so that a later process with the same number is
+# never taken for it.
+retire_driver() { # <pid>
+  [ -f "$record" ] || return 0
+  grep -v "^runner=$1|" "$record" > "$record.tmp"
+  mv "$record.tmp" "$record"
+}
+
 # Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
 stop_runner() {
   if [ -n "$runner_pid" ] && kill -0 "$runner_pid" 2>/dev/null; then
@@ -453,6 +490,7 @@ stop_runner() {
     kill -9 "$runner_pid" 2>/dev/null
   fi
   wait "$runner_pid" 2>/dev/null
+  retire_driver "$runner_pid"
   runner_pid=""
 }
 
@@ -521,30 +559,6 @@ finish_session() {
 }
 
 session() {
-  [ "$ending" = 1 ] && return
-  ending=1
-  stop_runner
-  say "ending the session"
-  local swept=1
-  if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
-    copy_shots "${session_name:-session}"
-    [ "${session_name:-}" = s0 ] && check_shot_proof "$shots/s0"
-    sweep || { say "THE KEYCHAIN GROUPS ARE NOT KNOWN TO BE EMPTY: run cleanup before anything else"; swept=0; unclean=1; }
-  else
-    say "no empty baseline is on record, so nothing is swept"
-  fi
-  target_uninstall "$app_id"
-  target_uninstall "$runner_id"
-  for id in "$app_id" "$runner_id"; do
-    if [ "$(installed_state "$id")" = no ]; then say "$id is gone"; else say "$id is STILL INSTALLED or not known to be gone"; unclean=1; fi
-  done
-  if [ "$unclean" = 0 ]; then rm -f "$record"; fi
-  rm -rf "${work:?}/push" "${work:?}/checks" "${raw:?}"
-  [ "$unclean" = 0 ] || exit 3
-  [ "$unproven" = 0 ] || exit 4
-}
-
-session() {
   local name=${1:-}
   local tests minutes
   tests=$(session_tests "$name") || die "unknown session $name"
@@ -590,11 +604,9 @@ session() {
   : > "$out"
   local only=()
   for each in $tests; do only+=("-only-testing:$tests_scheme/$each"); done
-  xcodebuild test-without-building -xctestrun "$(cat "$work/tests-$target.path")" -destination "$(destination)" \
-    -resultBundlePath "$result" -collect-test-diagnostics never "${only[@]}" > "$out" 2>&1 &
-  runner_pid=$!
   # The record names the driver, so that cleanup can end it if this script is killed.
-  echo "runner=$runner_pid" >> "$record"
+  start_driver "$result" "$out" test-without-building -xctestrun "$(cat "$work/tests-$target.path")" -destination "$(destination)" \
+    -resultBundlePath "$result" -collect-test-diagnostics never "${only[@]}"
   local sent=0
   forwarded=0
   while kill -0 "$runner_pid" 2>/dev/null; do
@@ -618,6 +630,7 @@ session() {
   forward_what_the_tests_say "$out" "$raw/live.out"
   wait "$runner_pid" 2>/dev/null
   local status=$?
+  retire_driver "$runner_pid"
   runner_pid=""
   report "$out"
   [ "$name" = s0 ] && proofs "$raw/live.out"
@@ -676,10 +689,8 @@ attachment_proof() {
     && $plist -c "Add $key:TestingEnvironmentVariables:KR_ATTACHMENT_PROOF string 1" "$proof_plan" \
     || { say "PROOF NOT MET: the plan for the attachment check could not be written"; unproven=1; return; }
   say "running a test that fails on purpose, with every attachment kept"
-  xcodebuild test-without-building -xctestrun "$proof_plan" -destination "$(destination)" -resultBundlePath "$bundle" \
-    -collect-test-diagnostics never "-only-testing:$tests_scheme/ProofTests/testAFailureLeavesNothingBehind" > "$out" 2>&1 &
-  runner_pid=$!
-  echo "runner=$runner_pid" >> "$record"
+  start_driver "$bundle" "$out" test-without-building -xctestrun "$proof_plan" -destination "$(destination)" -resultBundlePath "$bundle" \
+    -collect-test-diagnostics never "-only-testing:$tests_scheme/ProofTests/testAFailureLeavesNothingBehind"
   # Five minutes is far more than a test of a few seconds needs; a phone that does not answer is not waited for.
   local waited=0
   while kill -0 "$runner_pid" 2>/dev/null && [ "$waited" -lt 300 ]; do sleep 2; waited=$((waited + 2)); done
@@ -689,6 +700,7 @@ attachment_proof() {
     unproven=1; rm -rf "$bundle" "$exported" "$proof_plan"; return
   fi
   wait "$runner_pid" 2>/dev/null
+  retire_driver "$runner_pid"
   runner_pid=""
   if ! grep -q "Test Case '.*testAFailureLeavesNothingBehind.*' failed" "$out"; then
     say "PROOF NOT MET: the test that fails on purpose did not run and fail, so what a failure leaves is not known"
@@ -729,21 +741,28 @@ report() { # <output>
     | sed -E "s/Test Case '-\[KalaReachUITests\./Test Case '[/" || true
 }
 
-# Ends the driver the record names, if it is still running: a session killed with no chance to stop it
-# leaves its xcodebuild behind, and nothing is uninstalled or deleted while that is still driving the
-# phone. Only a process the record names whose command is the test run.
+# Ends the drivers the record names, if they are still running: a session killed with no chance to stop
+# its test run leaves xcodebuild behind, and nothing is uninstalled or deleted while that is still
+# driving the phone. A process is the driver only when its start time and its command line both are
+# what the record says; any other process with the same number is left alone.
 stop_recorded_driver() {
-  local pid waited=0
-  for pid in $(sed -n 's/^runner=//p' "$record" | sort -u); do
+  local entry pid started result now waited
+  while IFS= read -r entry; do
+    pid=${entry%%|*}; entry=${entry#*|}
+    started=${entry%%|*}
+    result=${entry#*|}
     kill -0 "$pid" 2>/dev/null || continue
-    ps -o command= -p "$pid" 2>/dev/null | grep -q 'xcodebuild test-without-building' || continue
+    now=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')
+    [ "$now" = "$started" ] || continue
+    ps -o command= -p "$pid" 2>/dev/null | grep -qF -- "$result" || continue
     say "stopping the test run $pid that the record names"
     kill "$pid" 2>/dev/null
+    waited=0
     while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
     kill -9 "$pid" 2>/dev/null
     sleep 1
     if kill -0 "$pid" 2>/dev/null; then say "THE TEST RUN $pid WOULD NOT STOP: nothing is cleaned up"; exit 3; fi
-  done
+  done < <(sed -n 's/^runner=//p' "$record")
 }
 
 cleanup() {
@@ -757,8 +776,14 @@ cleanup() {
   boot_simulator
   say "cleaning up the session the record names"
   stop_recorded_driver
-  local keep_app=0
-  if [ "$(installed_state "$app_id")" = yes ]; then
+  local keep_app=0 here
+  here=$(installed_state "$app_id")
+  if [ "$here" = unknown ]; then
+    # Whether the application is there is not known, and it is what the sweep runs through: it is not removed.
+    say "THE PHONE DID NOT SAY WHETHER $app_id IS INSTALLED: nothing is swept or removed, run cleanup again"
+    keep_app=1
+    unclean=1
+  elif [ "$here" = yes ]; then
     if grep -q '^baseline=empty$' "$record"; then
       copy_shots "cleanup"
       echo "sweep=pending" >> "$record"
