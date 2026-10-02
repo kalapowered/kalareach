@@ -13,10 +13,12 @@
 //! performs on its own account, performed, and its receipt kept there. The whole sequence runs on a
 //! task of its own, behind one lock, so a caller that goes away does not cancel a write that has
 //! started, and a second step cannot replace the record between the first one's write and its
-//! receipt. A caller that goes before the record is replaced loses its registration, so the check
-//! made at the replacement refuses the step, and that refusal is what a retry of the action is
-//! answered with. The same check refuses a step whose accepted deadline passes, or whose authority
-//! is withdrawn, while its new record is being written and flushed. Before each
+//! receipt. A paired device that goes before the record is replaced loses its registration at
+//! once, so the check made at the replacement refuses the step, and that refusal is what a retry of
+//! the action is answered with. A caller on the owner's own socket keeps its registration until its
+//! connection task ends, which is after the step has answered, so its step completes and its
+//! receipt answers a retry. The same check refuses a step whose accepted deadline passes, or whose
+//! authority is withdrawn, while its new record is being written and flushed. Before each
 //! step, and once at start, the claim the record's last change names is settled from the record,
 //! after the record's directory has been flushed: if an attempt ended after its write and before
 //! its receipt, its answer is kept before anything can change the record again, and a step is not
@@ -341,7 +343,7 @@ impl Controller {
         )? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.machine_recorded(record);
+                return recorded_answer(record);
             }
         };
         #[cfg(feature = "testing")]
@@ -537,27 +539,10 @@ impl Controller {
                     self.machine_unfinished(actor_id, mutation.action_id, &digest)
                         .await
                 }
-                Ok(Some(record)) => self.machine_recorded(record),
+                Ok(Some(record)) => recorded_answer(record),
                 Err(error) => Err(receipts_unreadable(error)),
             };
         Some(respond(mutation.request_id, answer))
-    }
-
-    /// The answer a claimed step is owed once its claim is known to have a result, a refusal, or
-    /// an attempt still running. A claim that is none of those is
-    /// [`Self::machine_unfinished`]'s.
-    fn machine_recorded(&self, record: crate::grants::ActionRecord) -> Result<ParamsValue> {
-        match record {
-            crate::grants::ActionRecord::Answered { result } => decoded(&result),
-            crate::grants::ActionRecord::Refused { code, detail } => {
-                Err(ControllerError::Refused { code, detail })
-            }
-            crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "another attempt under this action identifier has not finished".to_owned(),
-            }),
-            crate::grants::ActionRecord::Unfinished => Err(unfinished_and_unknown()),
-        }
     }
 
     /// The answer to a step whose attempt ended without recording what it did.
@@ -606,7 +591,7 @@ impl Controller {
                 })
             }
             Some(crate::grants::ActionRecord::Unfinished) | None => Err(unfinished_and_unknown()),
-            Some(record) => self.machine_recorded(record),
+            Some(record) => recorded_answer(record),
         }
     }
 
@@ -940,6 +925,34 @@ fn result_of(
     }
 }
 
+/// The answer a claimed step is owed once its claim is known to have a result, a refusal, or an
+/// attempt still running. A claim that is none of those is [`Controller::machine_unfinished`]'s.
+///
+/// A result that cannot be read back is a record that cannot be read: the step was taken, and what
+/// it came to is not known, so the answer is an outcome this host does not know, never a refusal
+/// the caller would take for a step that changed nothing.
+fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
+    match record {
+        crate::grants::ActionRecord::Answered { result } => decoded(&result).map_err(|error| {
+            eprintln!("kr-controller: a machine group step's receipt cannot be read: {error}");
+            ControllerError::Uncertain {
+                detail: "this host's record of what this action did cannot be read, so it is not \
+                         known what it did; read this environment's machine group before asking \
+                         under a new action"
+                    .to_owned(),
+            }
+        }),
+        crate::grants::ActionRecord::Refused { code, detail } => {
+            Err(ControllerError::Refused { code, detail })
+        }
+        crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
+            code: ErrorCode::ResourceUnavailable,
+            detail: "another attempt under this action identifier has not finished".to_owned(),
+        }),
+        crate::grants::ActionRecord::Unfinished => Err(unfinished_and_unknown()),
+    }
+}
+
 /// The answer to a retry whose receipt cannot be looked up: the host's own record of its actions
 /// cannot be read, so whether an earlier attempt at the action took the step is not known, and no
 /// refusal is given for it.
@@ -976,6 +989,33 @@ fn unfinished_and_unknown() -> ControllerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A receipt that cannot be read back does not refuse the step it was kept for: the step was
+    /// taken, so the answer is an outcome this host does not know, as for a receipt that cannot be
+    /// looked up. The control: a receipt that reads back is the answer, and a refusal kept for the
+    /// action is still the refusal.
+    #[test]
+    fn a_receipt_that_cannot_be_read_back_is_an_outcome_nobody_knows() {
+        let damaged = recorded_answer(crate::grants::ActionRecord::Answered {
+            result: vec![0xff, 0x00, 0x13],
+        })
+        .expect_err("a receipt that cannot be decoded");
+        assert!(
+            matches!(damaged, ControllerError::Uncertain { .. }),
+            "{damaged:?}"
+        );
+        assert_eq!(damaged.code(), ErrorCode::OutcomeUnknown);
+
+        let whole = kr_cbor::encode(&kr_cbor::CanonicalValue::Text("a result".to_owned()));
+        recorded_answer(crate::grants::ActionRecord::Answered { result: whole })
+            .expect("a receipt that decodes is the answer");
+        let refused = recorded_answer(crate::grants::ActionRecord::Refused {
+            code: ErrorCode::DraftConflict,
+            detail: "the record moved".to_owned(),
+        })
+        .expect_err("a kept refusal");
+        assert_eq!(refused.code(), ErrorCode::DraftConflict);
+    }
 
     /// The answer to a write that the store published and could not flush says so, and the answer to
     /// a write task that ended without answering does not: it may have ended before the record was
