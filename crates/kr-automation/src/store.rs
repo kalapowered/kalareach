@@ -1931,6 +1931,23 @@ fn without_variables(stored: &str) -> std::result::Result<Option<String>, String
                 ));
             }
         };
+        // The values of the fields as an array: a derived decoder reads that form as well as an
+        // object, so an earlier build installed it, and it holds the variables by position and not
+        // by name. It comes forward as the object the same decoder reads as the same parameters,
+        // so the check that looks for the field by name sees it.
+        if params.is_array() {
+            let mut decoded: kr_protocol::session::SessionCreateParams =
+                serde_json::from_value(params).map_err(|_| {
+                    "a create node's parameters are an array that does not read as a session's"
+                        .to_owned()
+                })?;
+            decoded.environment_snapshot.clear();
+            let emptied = serde_json::to_string(&decoded)
+                .map_err(|_| "a create node's parameters cannot be written again".to_owned())?;
+            node["action_params"] = Value::String(emptied);
+            changed = true;
+            continue;
+        }
         let object = params
             .as_object_mut()
             .ok_or_else(|| "a create node's parameters are not an object".to_owned())?;
