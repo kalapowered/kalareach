@@ -2051,12 +2051,16 @@ impl WorkflowStore {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| self.not_brought_forward(error))?;
-        let found: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let empty: bool = tx.query_row(
-            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
-            [],
-            |row| row.get(0),
-        )?;
+        let found: u32 = tx
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| self.not_brought_forward(error))?;
+        let empty: bool = tx
+            .query_row(
+                "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.not_brought_forward(error))?;
         if empty || found != SCHEMA_WITH_VARIABLES {
             return Ok(());
         }
@@ -2090,7 +2094,8 @@ impl WorkflowStore {
                 self.path.display()
             )));
         }
-        tx.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
+        tx.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)
+            .map_err(|error| self.not_brought_forward(error))?;
         tx.commit()
             .map_err(|error| self.not_brought_forward(error))?;
         Ok(())
@@ -2109,20 +2114,23 @@ impl WorkflowStore {
         };
         // The keys alone are read up front: a definition can be large, and a journal that holds
         // many revisions should not hold them all in memory at once.
-        let keys: Vec<(String, i64)> = {
+        let keys: Vec<(String, i64)> = (|| {
             let mut statement =
                 tx.prepare("SELECT workflow_id, revision FROM workflow_definitions")?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
+            rows.collect::<rusqlite::Result<_>>()
+        })()
+        .map_err(|error| self.not_brought_forward(error))?;
         let mut rewritten = 0;
         for (workflow, revision) in keys {
-            let stored: String = tx.query_row(
-                "SELECT definition_json FROM workflow_definitions
-                 WHERE workflow_id = ?1 AND revision = ?2",
-                params![workflow, revision],
-                |row| row.get(0),
-            )?;
+            let stored: String = tx
+                .query_row(
+                    "SELECT definition_json FROM workflow_definitions
+                     WHERE workflow_id = ?1 AND revision = ?2",
+                    params![workflow, revision],
+                    |row| row.get(0),
+                )
+                .map_err(|error| self.not_brought_forward(error))?;
             let emptied =
                 without_variables(&stored).map_err(|why| unreadable(&workflow, revision, &why))?;
             if let Some(emptied) = emptied {
@@ -2130,7 +2138,8 @@ impl WorkflowStore {
                     "UPDATE workflow_definitions SET definition_json = ?3
                      WHERE workflow_id = ?1 AND revision = ?2",
                     params![workflow, revision, emptied],
-                )?;
+                )
+                .map_err(|error| self.not_brought_forward(error))?;
                 rewritten += 1;
             }
         }
