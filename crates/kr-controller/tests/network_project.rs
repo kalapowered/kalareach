@@ -5,18 +5,18 @@
 //! to.
 //!
 //! `project.init`, `project.clone`, `project.adopt`, `workspace.create` and `workspace.remove`
-//! each name a destination or a source, and one rule decides all five: the destination or the
-//! source has to be in an environment the grant names. A grant that bounds nothing reaches none of
-//! them, because these five act on this host's own filesystem and a grant that bounds nothing
-//! would make the action right the whole of the restriction. The owner's own path is untouched.
-//! The four reads answer a device and the owner alike for the same subject, narrowed to what the
-//! grant admits, and a device that submits its own action again is given the answer its first
-//! submission produced rather than the answer performing it now would give.
+//! each run the Git program, and one rule decides all five at the door: a host that has proved it
+//! confines what that program reads (on Linux, inside one boundary the project service builds for
+//! a caller bounded by a grant) serves them to a device, inside the locations the owner authorised
+//! for the device's grant and nowhere else; any other host refuses them with one sentence. The
+//! owner's own path is untouched. The four reads answer a device and the owner alike for the same
+//! subject, narrowed to what the grant admits, and a device that submits its own action again is
+//! given the answer its first submission produced rather than the answer performing it now would
+//! give.
 //!
-//! What these do not show is the rest of those rows. Inside an admitted environment the
-//! destination is still whatever absolute parent the caller names, so the filesystem authority
-//! section 14 asks for is bounded by the environment rather than by the directories the owner
-//! chose. Recovery through `action.read` is refused for an action this host owns.
+//! The tests that need a host that proves the boundary say so by name when theirs does not, and
+//! count as not run there. The refusals run on every host, holding the daemon as one that did not
+//! prove it.
 //!
 //! No worker is started here. A project acts on a repository rather than on a session, so the
 //! daemon answers all ten itself; the repositories are real ones built with installed Git in a
@@ -55,14 +55,24 @@ const PROJECT_RIGHTS: &[ActionRight] = &[
     ActionRight::WorkspaceManage,
 ];
 
-/// The whole of what a device is told when it asks for a repository operation.
+/// The whole of what a device is told when it asks for a repository operation on a host that
+/// cannot confine what the Git program reads.
 ///
 /// Compared in full rather than by substring: an addition to this message would be a disclosure,
 /// and a change to its final clause would be a change of posture. Only the check before dispatch
 /// produces it, so a test that sees exactly this has established that nothing was dispatched.
-const REFUSAL: &str = "this host does not yet confine what the Git program reaches to the \
-                       directories the owner authorised, so it does not run that program for a \
-                       paired device";
+const REFUSAL: &str = "this host cannot confine what the Git program reads to the directories \
+                       the owner authorised, so it does not run that program for a paired device";
+
+/// Holds the host as one that did not prove Git's reads confined, which is the state of every host
+/// but a Linux one that proved it: the five repository operations are refused at the door.
+fn as_unqualified(host: &Host) {
+    host.controller()
+        .hold_qualification_for_tests(kr_project::service::Qualification::refused(
+            kr_project::service::Refusal::Invocation,
+            "a host this test holds as one that did not qualify",
+        ));
+}
 
 /// The message a refusal carried, without the code the client renders in front of it.
 fn said(error: &ClientError) -> String {
@@ -427,6 +437,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
 async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffected() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    as_unqualified(&host);
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
     let source = repository(host.work(), "source");
@@ -585,13 +596,14 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
     host.stop().await;
 }
 
-/// KR-REQ-23.42 and KR-REQ-23.43: a device is refused every repository operation, by one rule.
+/// KR-REQ-23.42 and KR-REQ-23.43: a device is refused every repository operation on a host that
+/// cannot confine what Git reads, by one rule.
 ///
-/// The five operations each run the Git program. This host bounds every name **it** resolves to an
-/// opened directory handle, and it does not bound what Git reaches once Git is running: Git finds
-/// its own repository, reads its own configuration and follows its own metadata. So it does not
-/// start that program for a paired device, whatever the device's grant says, and a grant that names
-/// `project.create` or `workspace.manage` still reaches no repository operation.
+/// The five operations each run the Git program. A host bounds every name **it** resolves to an
+/// opened directory handle, and bounds what Git reaches once Git is running only where it has
+/// proved it can. A host that has not does not start that program for a paired device, whatever
+/// the device's grant says, and a grant that names `project.create` or `workspace.manage` still
+/// reaches no repository operation there.
 ///
 /// The refusal carries one sentence, and the assertion is on that exact sentence rather than on the
 /// code alone: only the door produces it, so a test that sees it has established that nothing was
@@ -602,6 +614,7 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
 async fn a_device_is_refused_all_five_repository_methods() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    as_unqualified(&host);
     let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let mut proposal = net_support::proposal(PROJECT_RIGHTS);
@@ -2302,6 +2315,972 @@ async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until
     host.stop().await;
 }
 
+// ----- the five repository operations on a host that proves Git's reads confined -------------
+
+/// Starts a host, or returns none and says so when it does not prove Git's reads confined: the
+/// test that asked for one is not run there.
+async fn qualified_host(owner: &DeviceKeys, test: &str) -> Option<Host> {
+    let host = Host::start(owner).await;
+    let proved = host.controller().qualification();
+    if proved.qualifies() {
+        return Some(host);
+    }
+    println!(
+        "not exercised: {test} needs a host that proves Git's reads confined, and this one does \
+         not ({:?}: {})",
+        proved.refusal(),
+        proved.detail()
+    );
+    host.stop().await;
+    None
+}
+
+/// Authorises `path` for `purpose` as the owner does, for the device that holds `grant`.
+async fn authorise_for(
+    control: &mut LocalClient,
+    host: &Host,
+    owner: &DeviceKeys,
+    path: &Path,
+    purpose: kr_protocol::project::LocationPurpose,
+    grant: kr_protocol::ids::GrantId,
+) -> kr_protocol::project::AuthorisedLocation {
+    let params = location_for(host, path, purpose, Some(grant));
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenge_of(control, host, action, &params)
+        .await
+        .expect("the device's location is given a challenge");
+    authorised_with(control, host, action, &params, signed_by(owner, &request))
+        .await
+        .expect("the owner's confirmation authorises the device's location")
+}
+
+/// Binds a repository to a source location as the owner does, and returns the challenge's
+/// destination: the keys of the device the location is for.
+async fn bind_for(
+    control: &mut LocalClient,
+    host: &Host,
+    owner: &DeviceKeys,
+    project: kr_protocol::ids::ProjectRepositoryId,
+    location: kr_protocol::ids::ProjectLocationId,
+) -> Option<kr_protocol::pairing::DevicePublicKeys> {
+    use kr_protocol::project::{
+        LocationAttachment, ProjectLocationAttachParams, ProjectLocationAttachResult,
+    };
+
+    let params = ProjectLocationAttachParams {
+        project_repository_id: project,
+        location_id: Nullable::some(location),
+        owner_confirmation: Nullable::null(),
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+    let first: ProjectLocationAttachResult = typed(
+        &control
+            .mutate(
+                Method::ProjectLocationAttach,
+                action,
+                target.clone(),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("a binding's first submission is answered"),
+    );
+    let LocationAttachment::ConfirmationRequired { request } = first.outcome else {
+        panic!("a binding's first submission is answered with its challenge");
+    };
+    let named = request.destination_keys.0;
+    let proven = ProjectLocationAttachParams {
+        owner_confirmation: Nullable::some(signed_by(owner, &request)),
+        ..params
+    };
+    let second: ProjectLocationAttachResult = typed(
+        &control
+            .mutate(Method::ProjectLocationAttach, action, target, &proven)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner's confirmation binds the repository"),
+    );
+    assert!(
+        matches!(second.outcome, LocationAttachment::Bound { .. }),
+        "the repository is bound"
+    );
+    named
+}
+
+/// A host that proves Git's reads confined, a paired device, the two locations the owner
+/// authorised for its grant over one directory, and the owner's own repository in that directory,
+/// bound to the source location.
+struct Granted {
+    host: Host,
+    control: LocalClient,
+    session: Session,
+    owner: DeviceKeys,
+    record: kr_controller::service::net::devices::DeviceRecord,
+    /// The directory both locations are over.
+    root: PathBuf,
+    source: kr_protocol::project::AuthorisedLocation,
+    destination: kr_protocol::project::AuthorisedLocation,
+    project: kr_protocol::ids::ProjectRepositoryId,
+}
+
+impl Granted {
+    /// Sets the scene, or returns none and says so on a host that does not qualify.
+    async fn on_a_qualified_host(test: &str) -> Option<Self> {
+        use kr_protocol::project::LocationPurpose;
+
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = qualified_host(&owner, test).await?;
+        let mut control = host.client().await;
+        let device = net_support::Device::create().await;
+        let record = net_support::pair_with(
+            &host,
+            &device,
+            &owner,
+            net_support::proposal(PROJECT_RIGHTS),
+        )
+        .await;
+        let session = net_support::connect(&host, &device, &record).await;
+        let grant = record.grant.grant_id;
+        let root = host.work().join("granted");
+        std::fs::create_dir(&root).expect("a directory to authorise");
+        repository(&root, "src");
+        // A directory wanted as a destination and as a source is authorised twice.
+        let source = authorise_for(
+            &mut control,
+            &host,
+            &owner,
+            &root,
+            LocationPurpose::Source,
+            grant,
+        )
+        .await;
+        let destination = authorise_for(
+            &mut control,
+            &host,
+            &owner,
+            &root,
+            LocationPurpose::Destination,
+            grant,
+        )
+        .await;
+        let adopted: ProjectAdoptResult = typed(
+            &local_mutation(
+                &mut control,
+                host.environment_id,
+                Method::ProjectAdopt,
+                &ProjectAdoptParams {
+                    destination: DestinationRequest {
+                        environment_id: host.environment_id,
+                        parent: kr_protocol::project::DestinationParent::Host {
+                            path: root.display().to_string(),
+                        },
+                        name: "src".to_owned(),
+                    },
+                    label: "src".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the owner adopts the repository in the directory"),
+        );
+        let project = adopted.project.project_repository_id;
+        let named = bind_for(&mut control, &host, &owner, project, source.location_id).await;
+        assert_eq!(
+            named,
+            record.public_keys(),
+            "binding a repository to the device's location names that device's four keys"
+        );
+        Some(Self {
+            host,
+            control,
+            session,
+            owner,
+            record,
+            root,
+            source,
+            destination,
+            project,
+        })
+    }
+
+    /// A clone into the destination location, from `source`.
+    fn clone_into(&self, name: &str, source: CloneSource) -> ProjectCloneParams {
+        ProjectCloneParams {
+            destination: self.in_destination(name),
+            label: name.to_owned(),
+            source,
+        }
+    }
+
+    /// A name beneath the destination location.
+    fn in_destination(&self, name: &str) -> DestinationRequest {
+        DestinationRequest {
+            environment_id: self.host.environment_id,
+            parent: kr_protocol::project::DestinationParent::Location {
+                location_id: self.destination.location_id,
+            },
+            name: name.to_owned(),
+        }
+    }
+
+    /// A clone from the repository the owner bound to the source location.
+    fn clone_of_src(&self, name: &str) -> ProjectCloneParams {
+        self.clone_into(
+            name,
+            CloneSource::Location {
+                location_id: self.source.location_id,
+                relative_path: "src".to_owned(),
+            },
+        )
+    }
+
+    /// A working copy of `project`, made beneath the destination location.
+    fn working_copy(
+        &self,
+        project: kr_protocol::ids::ProjectRepositoryId,
+        name: &str,
+    ) -> WorkspaceCreateParams {
+        WorkspaceCreateParams {
+            isolation: Nullable::some(IsolationMechanism::IndependentClone),
+            destination: Nullable::some(self.in_destination(name)),
+            ..workspace_params(&self.host, project, name)
+        }
+    }
+
+    /// What the device was told, when it asked for `method` and was refused.
+    async fn refused<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> ClientError {
+        remote_mutation(&self.session, self.host.environment_id, method, params)
+            .await
+            .expect_err("the device is refused")
+    }
+
+    async fn stop(self) {
+        self.session.close();
+        self.host.stop().await;
+    }
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: on a host that proves Git's reads confined, a device clones,
+/// makes a working copy and removes it, inside the locations the owner authorised for its grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_clones_makes_a_working_copy_and_removes_it_inside_its_granted_location() {
+    let Some(granted) = Granted::on_a_qualified_host(
+        "a_device_clones_makes_a_working_copy_and_removes_it_inside_its_granted_location",
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+
+    // A clone, from the source location into the destination location.
+    let cloned: ProjectCloneResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::ProjectClone,
+            &granted.clone_of_src("clone"),
+        )
+        .await
+        .expect("the device clones inside its granted location"),
+    );
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    assert_eq!(
+        std::fs::read_to_string(granted.root.join("clone/README.md")).expect("the clone's file"),
+        "a repository\n",
+        "the clone holds what was committed"
+    );
+
+    // A working copy of the owner's repository, made through the source location it is bound to
+    // and carrying the file the owner changed since the commit.
+    let created: WorkspaceCreateResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::WorkspaceCreate,
+            &granted.working_copy(granted.project, "review"),
+        )
+        .await
+        .expect("the device makes a working copy inside its granted location"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace");
+    assert_eq!(
+        std::fs::read_to_string(granted.root.join("review/README.md")).expect("the working copy"),
+        "changed after the commit\n",
+        "the working copy carries the owner's dirty file"
+    );
+
+    // And the removal, which takes the working copy's files with it.
+    let removed: WorkspaceRemoveResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::WorkspaceRemove,
+            &WorkspaceRemoveParams {
+                workspace_id: workspace.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device removes the working copy it made"),
+    );
+    assert!(removed.working_files_removed);
+    assert!(
+        !granted.root.join("review").exists(),
+        "the working copy's directory is gone"
+    );
+    assert!(
+        granted.root.join("src/README.md").is_file() && granted.root.join("clone/.git").is_dir(),
+        "and nothing else was removed"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.42: what a device names has to be reached through a location the owner authorised for
+/// its own grant. A path of its own, the owner's location, a name that leaves the location and a
+/// remote are each refused, and nothing is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for_it() {
+    use kr_protocol::project::{DestinationParent, LocationPurpose};
+
+    let Some(mut granted) = Granted::on_a_qualified_host(
+        "a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for_it",
+    )
+    .await
+    else {
+        return;
+    };
+    let outside = granted.host.work().join("outside");
+    std::fs::create_dir(&outside).expect("a directory outside the locations");
+    repository(&outside, "elsewhere");
+
+    // A path of its own, which only the owner's own socket names.
+    let by_path = ProjectCloneParams {
+        destination: DestinationRequest {
+            environment_id: granted.host.environment_id,
+            parent: DestinationParent::Host {
+                path: outside.display().to_string(),
+            },
+            name: "taken".to_owned(),
+        },
+        label: "taken".to_owned(),
+        source: CloneSource::Location {
+            location_id: granted.source.location_id,
+            relative_path: "src".to_owned(),
+        },
+    };
+    let refused = granted.refused(Method::ProjectClone, &by_path).await;
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&refused).contains("names a location for a destination"),
+        "{refused}"
+    );
+    assert!(!outside.join("taken").exists());
+
+    // The owner's own location is the owner's, though it covers the same directory: the device is
+    // told the location admits the owner and not its grant.
+    let owners = authorise_owner_location(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        &outside,
+        LocationPurpose::Destination,
+    )
+    .await;
+    let into_owners = ProjectCloneParams {
+        destination: DestinationRequest {
+            environment_id: granted.host.environment_id,
+            parent: DestinationParent::Location {
+                location_id: owners.location_id,
+            },
+            name: "taken".to_owned(),
+        },
+        ..granted.clone_of_src("taken")
+    };
+    let refused = granted.refused(Method::ProjectClone, &into_owners).await;
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert!(said(&refused).contains("admits the owner"), "{refused}");
+    assert!(!outside.join("taken").exists());
+
+    // A source that is the owner's own location, and a name that leaves the location.
+    let from_owners = granted.clone_into(
+        "taken",
+        CloneSource::Location {
+            location_id: owners.location_id,
+            relative_path: "elsewhere".to_owned(),
+        },
+    );
+    let refused = granted.refused(Method::ProjectClone, &from_owners).await;
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    for leaving in ["../outside/elsewhere", "/etc"] {
+        let leaves = granted.clone_into(
+            "taken",
+            CloneSource::Location {
+                location_id: granted.source.location_id,
+                relative_path: leaving.to_owned(),
+            },
+        );
+        let refused = granted.refused(Method::ProjectClone, &leaves).await;
+        assert!(
+            matches!(
+                refused.code(),
+                ErrorCode::InvalidArgument | ErrorCode::PermissionDenied
+            ),
+            "{leaving}: {refused}"
+        );
+    }
+    assert!(!granted.root.join("taken").exists());
+
+    // A remote stays refused for a device, whatever the host proves: no location says which
+    // providers this host may reach for it.
+    let remote = granted.clone_into(
+        "remote",
+        CloneSource::Remote {
+            remote: RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::LocalPath,
+                url: outside.join("elsewhere").display().to_string(),
+                provider: String::new(),
+                credential_broker: String::new(),
+            },
+        },
+    );
+    let refused = granted.refused(Method::ProjectClone, &remote).await;
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&refused).contains("does not clone a remote"),
+        "{refused}"
+    );
+    assert!(!granted.root.join("remote").exists());
+
+    // The control: the same clone, into the device's own destination from its own source.
+    let cloned: ProjectCloneResult = typed(
+        &remote_mutation(
+            &granted.session,
+            granted.host.environment_id,
+            Method::ProjectClone,
+            &granted.clone_of_src("taken"),
+        )
+        .await
+        .expect("the same clone through the device's own locations"),
+    );
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    granted.stop().await;
+}
+
+/// Authorises `path` as the owner's own location, which names no grant.
+async fn authorise_owner_location(
+    control: &mut LocalClient,
+    host: &Host,
+    owner: &DeviceKeys,
+    path: &Path,
+    purpose: kr_protocol::project::LocationPurpose,
+) -> kr_protocol::project::AuthorisedLocation {
+    let params = location_for(host, path, purpose, None);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenge_of(control, host, action, &params)
+        .await
+        .expect("the owner's own location is given a challenge");
+    authorised_with(control, host, action, &params, signed_by(owner, &request))
+        .await
+        .expect("the owner's own location is authorised")
+}
+
+/// KR-REQ-23.42 and KR-REQ-14.06: what a device can influence through repository content is read
+/// by nothing outside the location.
+///
+/// The owner's repository in the location can borrow another repository's objects through an
+/// alternates file and can include a configuration file through a link inside the location, and a
+/// device clones from it. The alternates name is refused before Git starts, and the link is
+/// refused where Git opens its target: the kernel denies a read of the file the link leads to,
+/// outside every directory the invocation was lent. Neither refusal repeats what the outside file
+/// holds. The control is the same repository with the link leading to a file inside the location,
+/// which is read and cloned from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reads_nothing_outside_its_location_through_repository_content() {
+    let Some(granted) = Granted::on_a_qualified_host(
+        "a_device_reads_nothing_outside_its_location_through_repository_content",
+    )
+    .await
+    else {
+        return;
+    };
+    let outside = granted.host.work().join("outside");
+    std::fs::create_dir(&outside).expect("a directory outside the location");
+    let secret = outside.join("secret.config");
+    std::fs::write(&secret, "[secret]\n\tvalue = held-outside-the-location\n")
+        .expect("a file outside the location");
+
+    // A repository that borrows the objects of one outside the location.
+    let other = repository(&outside, "other");
+    let borrowing = repository(&granted.root, "borrowing");
+    std::fs::write(
+        borrowing.join(".git/objects/info/alternates"),
+        format!("{}\n", other.join(".git/objects").display()),
+    )
+    .expect("an alternates file");
+    let refused = granted
+        .refused(
+            Method::ProjectClone,
+            &granted.clone_into(
+                "from-borrowing",
+                CloneSource::Location {
+                    location_id: granted.source.location_id,
+                    relative_path: "borrowing".to_owned(),
+                },
+            ),
+        )
+        .await;
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&refused).contains("objects/info/alternates"),
+        "the refusal names the alternates file: {refused}"
+    );
+    assert!(!granted.root.join("from-borrowing").exists());
+
+    // A repository whose configuration includes a file through a link inside the location.
+    let linked = repository(&granted.root, "linked");
+    let link = linked.join("included.config");
+    std::os::unix::fs::symlink(&secret, &link).expect("a link inside the location");
+    git_raw(
+        &linked,
+        [
+            std::ffi::OsStr::new("config"),
+            std::ffi::OsStr::new("--local"),
+            std::ffi::OsStr::new("include.path"),
+            link.as_os_str(),
+        ],
+    );
+    let from_linked = granted.clone_into(
+        "from-linked",
+        CloneSource::Location {
+            location_id: granted.source.location_id,
+            relative_path: "linked".to_owned(),
+        },
+    );
+    let refused = granted.refused(Method::ProjectClone, &from_linked).await;
+    assert!(
+        !said(&refused).contains("held-outside-the-location"),
+        "nothing of the file the link leads to is repeated: {refused}"
+    );
+    assert!(!granted.root.join("from-linked").exists());
+
+    // The control: the same repository and the same include, with the link leading to a file
+    // inside the location. The file is read, and the clone is made.
+    let inside = granted.root.join("inside.config");
+    std::fs::write(&inside, "[secret]\n\tvalue = held-inside-the-location\n")
+        .expect("a file inside the location");
+    std::fs::remove_file(&link).expect("the link is replaced");
+    std::os::unix::fs::symlink(&inside, &link).expect("a link to a file inside the location");
+    let cloned: ProjectCloneResult = typed(
+        &remote_mutation(
+            &granted.session,
+            granted.host.environment_id,
+            Method::ProjectClone,
+            &from_linked,
+        )
+        .await
+        .expect("with the link leading inside the location the clone is made"),
+    );
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    granted.stop().await;
+}
+
+/// KR-REQ-23.42 and section 9: a grant withdrawn before the write stops each of the five
+/// operations, and one still standing lets the same operation through.
+///
+/// The daemon asks the admission a mutation was accepted under once before the service acts and
+/// again inside the transaction that begins the effect. Each operation is run with an admission
+/// that answers yes the first time and says the grant was withdrawn the second, and then with one
+/// that always says yes, on a name of its own: the first leaves nothing behind, the second makes
+/// what was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(mut granted) = Granted::on_a_qualified_host(
+        "a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations",
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let actor = granted.record.principal();
+    let grant = granted.record.grant.grant_id;
+    repository(&granted.root, "adopt-withdrawn");
+    repository(&granted.root, "adopt-standing");
+    // A working copy for the removals to name, made by the device before anything is withdrawn.
+    let mut working_copies = Vec::new();
+    for name in ["remove-withdrawn", "remove-standing"] {
+        let created: WorkspaceCreateResult = typed(
+            &remote_mutation(
+                &granted.session,
+                env,
+                Method::WorkspaceCreate,
+                &granted.working_copy(granted.project, name),
+            )
+            .await
+            .expect("the device makes a working copy"),
+        );
+        working_copies.push(created.workspace.0.expect("a working copy").workspace_id);
+    }
+
+    // Each case is one operation under a name of its own, which is its label and the directory it
+    // makes, run with the grant withdrawn before the write or standing throughout.
+    let init = |name: &str| {
+        ParamsValue::from_typed(&ProjectInitParams {
+            destination: granted.in_destination(name),
+            label: name.to_owned(),
+            initial_branch: Nullable::null(),
+        })
+        .expect("encodes")
+    };
+    let adopt = |name: &str| {
+        ParamsValue::from_typed(&ProjectAdoptParams {
+            destination: granted.in_destination(name),
+            label: name.to_owned(),
+            flow: AdoptionFlow::ExistingCheckout,
+        })
+        .expect("encodes")
+    };
+    let remove = |workspace_id| {
+        ParamsValue::from_typed(&WorkspaceRemoveParams {
+            workspace_id,
+            retention: RetentionPolicy::RemoveRetained,
+            through_location_id: Nullable::null(),
+        })
+        .expect("encodes")
+    };
+    let cases: Vec<(Method, ParamsValue, &str, bool)> = vec![
+        (
+            Method::ProjectInit,
+            init("init-withdrawn"),
+            "init-withdrawn",
+            false,
+        ),
+        (
+            Method::ProjectInit,
+            init("init-standing"),
+            "init-standing",
+            true,
+        ),
+        (
+            Method::ProjectClone,
+            ParamsValue::from_typed(&granted.clone_of_src("clone-withdrawn")).expect("encodes"),
+            "clone-withdrawn",
+            false,
+        ),
+        (
+            Method::ProjectClone,
+            ParamsValue::from_typed(&granted.clone_of_src("clone-standing")).expect("encodes"),
+            "clone-standing",
+            true,
+        ),
+        (
+            Method::ProjectAdopt,
+            adopt("adopt-withdrawn"),
+            "adopt-withdrawn",
+            false,
+        ),
+        (
+            Method::ProjectAdopt,
+            adopt("adopt-standing"),
+            "adopt-standing",
+            true,
+        ),
+        (
+            Method::WorkspaceCreate,
+            ParamsValue::from_typed(&granted.working_copy(granted.project, "create-withdrawn"))
+                .expect("encodes"),
+            "create-withdrawn",
+            false,
+        ),
+        (
+            Method::WorkspaceCreate,
+            ParamsValue::from_typed(&granted.working_copy(granted.project, "create-standing"))
+                .expect("encodes"),
+            "create-standing",
+            true,
+        ),
+        (
+            Method::WorkspaceRemove,
+            remove(working_copies[0]),
+            "remove-withdrawn",
+            false,
+        ),
+        (
+            Method::WorkspaceRemove,
+            remove(working_copies[1]),
+            "remove-standing",
+            true,
+        ),
+    ];
+    for (method, params, name, standing) in cases {
+        let mutation = granted
+            .control
+            .compose(
+                method,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(env),
+                &params,
+            )
+            .await
+            .expect("the mutation is composed");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let admission = {
+            let asked = std::sync::Arc::clone(&asked);
+            move || {
+                if standing || asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the authority this action was admitted under was withdrawn",
+                    ))
+                }
+            }
+        };
+        let outcome = granted
+            .host
+            .controller()
+            .project()
+            .write(&actor, &mutation, method, admission, Some(grant))
+            .await;
+        if standing {
+            outcome.unwrap_or_else(|error| {
+                panic!(
+                    "{} for {name} with the grant standing: {error:?}",
+                    method.as_str()
+                )
+            });
+        } else {
+            let refusal = outcome.expect_err("the grant was withdrawn before the write");
+            assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{name}");
+            assert!(refusal.message.contains("withdrawn"), "{name}: {refusal:?}");
+        }
+        let exists = granted.root.join(name).exists();
+        if method == Method::WorkspaceRemove {
+            assert_eq!(
+                exists, !standing,
+                "{name}: a removal under a standing grant takes the working copy, and one under a \
+                 withdrawn grant leaves it"
+            );
+        } else {
+            assert_eq!(
+                labelled(&mut granted.control, env, name).await,
+                standing,
+                "{} for {name}: what the owner can see afterwards",
+                method.as_str()
+            );
+            // An adoption names a checkout that was there before it.
+            if method != Method::ProjectAdopt {
+                assert_eq!(exists, standing, "{name}: the directory");
+            }
+        }
+    }
+    granted.stop().await;
+}
+
+/// Whether the owner sees a repository or a working copy by this label.
+async fn labelled(control: &mut LocalClient, env: EnvironmentId, label: &str) -> bool {
+    let projects: ProjectListResult = locally(
+        control,
+        Method::ProjectList,
+        &ProjectListParams {
+            environment_id: env,
+        },
+    )
+    .await;
+    let workspaces: WorkspaceListResult = locally(
+        control,
+        Method::WorkspaceList,
+        &WorkspaceListParams {
+            environment_id: env,
+            project_repository_id: Nullable::null(),
+        },
+    )
+    .await;
+    projects
+        .projects
+        .iter()
+        .any(|project| project.label == label)
+        || workspaces
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.label == label)
+}
+
+/// Tells the run of the test below inside a mount namespace where the location is.
+const INSIDE_A_NAMESPACE: &str = "KR_CONTROLLER_DEVICE_LOCATION_INSIDE_A_MOUNT_NAMESPACE";
+
+/// Runs one clone as a device, from the repository `src` beneath `root`, into `into` beneath it.
+///
+/// Both locations are the owner's, authorised for the device's grant over `root`. Returns none,
+/// and says so, on a host that does not prove Git's reads confined.
+async fn a_device_clones_from_a_repository_in(
+    root: &Path,
+    into: &str,
+    test: &str,
+) -> Option<std::result::Result<ParamsValue, ClientError>> {
+    use kr_protocol::project::{DestinationParent, LocationPurpose};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = qualified_host(&owner, test).await?;
+    let mut control = host.client().await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let grant = record.grant.grant_id;
+    let source = authorise_for(
+        &mut control,
+        &host,
+        &owner,
+        root,
+        LocationPurpose::Source,
+        grant,
+    )
+    .await;
+    let destination = authorise_for(
+        &mut control,
+        &host,
+        &owner,
+        root,
+        LocationPurpose::Destination,
+        grant,
+    )
+    .await;
+    let outcome = remote_mutation(
+        &session,
+        host.environment_id,
+        Method::ProjectClone,
+        &ProjectCloneParams {
+            destination: DestinationRequest {
+                environment_id: host.environment_id,
+                parent: DestinationParent::Location {
+                    location_id: destination.location_id,
+                },
+                name: into.to_owned(),
+            },
+            label: into.to_owned(),
+            source: CloneSource::Location {
+                location_id: source.location_id,
+                relative_path: "src".to_owned(),
+            },
+        },
+    )
+    .await;
+    session.close();
+    host.stop().await;
+    Some(outcome)
+}
+
+/// KR-REQ-23.42: a filesystem mounted beneath a directory a device's operation is granted refuses
+/// the operation, with the reason, before Git starts.
+///
+/// No account here can mount anything where the daemon runs, so the test runs itself again inside
+/// a namespace that bubblewrap makes, with a filesystem mounted beneath the repository the device
+/// clones from, and asserts the refusal there. The control is the same clone from the same
+/// repository outside the namespace, where nothing is mounted beneath it, which is made. A host
+/// that does not prove Git's reads confined, or whose bubblewrap cannot make a namespace, does not
+/// exercise it and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clone_with_its_reason()
+{
+    let test =
+        "a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clone_with_its_reason";
+    if let Some(root) = std::env::var_os(INSIDE_A_NAMESPACE) {
+        let root = PathBuf::from(root);
+        let table = std::fs::read_to_string("/proc/self/mountinfo").expect("the mount table");
+        let mounted = root.join("src/mounted");
+        assert!(
+            table
+                .lines()
+                .filter_map(|line| line.split(' ').nth(4))
+                .any(|point| Path::new(point) == mounted),
+            "a filesystem is mounted beneath the repository in here"
+        );
+        let Some(outcome) = a_device_clones_from_a_repository_in(&root, "inside", test).await
+        else {
+            // This host's daemon did not prove the boundary inside the namespace either; the run
+            // outside has said so.
+            return;
+        };
+        let refusal = outcome.expect_err("a clone from a repository with a mount beneath it");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        let said = said(&refusal);
+        assert!(
+            said.contains(&format!("a filesystem is mounted at {}", mounted.display())),
+            "the refusal names the mount point: {said}"
+        );
+        assert!(!root.join("inside").exists(), "nothing was cloned");
+        return;
+    }
+    let Some(bwrap) = ["/usr/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+    else {
+        println!("not exercised: {test} needs bubblewrap, and this host has none");
+        return;
+    };
+    let makes_one = std::process::Command::new(bwrap)
+        .args(["--unshare-user", "--dev-bind", "/", "/", "--", "/bin/true"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !makes_one {
+        println!("not exercised: {test} needs a namespace, and bubblewrap cannot make one here");
+        return;
+    }
+    let work = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let root = work.path().join("granted");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    repository(&root, "src");
+    std::fs::create_dir(root.join("src/mounted")).expect("a directory to mount over");
+    // The control: nothing is mounted beneath the repository here, and the clone is made.
+    let Some(control) = a_device_clones_from_a_repository_in(&root, "outside", test).await else {
+        return;
+    };
+    let cloned: ProjectCloneResult = typed(&control.expect("the clone is made where no mount is"));
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    assert!(root.join("outside/README.md").is_file());
+    let output = std::process::Command::new(bwrap)
+        .args(["--unshare-user", "--dev-bind", "/", "/", "--tmpfs"])
+        .arg(root.join("src/mounted"))
+        .arg("--setenv")
+        .arg(INSIDE_A_NAMESPACE)
+        .arg(&root)
+        .arg("--")
+        .arg(std::env::current_exe().expect("this test's own program"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .output()
+        .expect("the namespace starts");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && report.contains("1 passed"),
+        "the run inside the namespace passed: {report}"
+    );
+}
+
 /// KR-REQ-23.42: `host.doctor` says whether this host serves a paired device repository
 /// operations, on the terms the door applies, and reports what it shows of the mount residual
 /// where the platform confines Git's reads at all.
@@ -2356,6 +3335,54 @@ async fn host_doctor_says_whether_a_paired_device_is_served_repository_operation
         status(&seen, "device-repositories").map(|(status, _)| status),
         Some(served)
     );
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42: the door reads the last proof the daemon made, and `host.doctor` makes another and
+/// holds it. A host held as one that did not qualify refuses the five operations with one
+/// sentence; the doctor proves it again and the same request is past the door, where the project
+/// service decides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_door_follows_the_last_proof_and_the_doctor_proves_again() {
+    use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let Some(host) = qualified_host(
+        &owner,
+        "the_door_follows_the_last_proof_and_the_doctor_proves_again",
+    )
+    .await
+    else {
+        return;
+    };
+    let mut control = host.client().await;
+    let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
+    let init = ProjectInitParams {
+        destination: destination(&host, "door"),
+        label: "door".to_owned(),
+        initial_branch: Nullable::null(),
+    };
+    as_unqualified(&host);
+    let refused = remote_mutation(&session, host.environment_id, Method::ProjectInit, &init)
+        .await
+        .expect_err("a host held as one that did not qualify refuses the operation");
+    assert_eq!(said(&refused), REFUSAL);
+
+    let doctor: HostDoctorResult = locally(&mut control, Method::HostDoctor, &()).await;
+    let proved = doctor
+        .checks
+        .iter()
+        .find(|check| check.id() == "device-repositories")
+        .expect("the doctor reports it");
+    assert_eq!(proved.status, DoctorStatus::Ok);
+    assert!(host.controller().qualification().qualifies());
+    let past = remote_mutation(&session, host.environment_id, Method::ProjectInit, &init)
+        .await
+        .expect_err("past the door, the project service refuses a path the device names");
+    assert_eq!(past.code(), ErrorCode::PermissionDenied);
+    assert_ne!(said(&past), REFUSAL, "and says so in its own words: {past}");
+    assert!(!host.work().join("door").exists());
     session.close();
     host.stop().await;
 }

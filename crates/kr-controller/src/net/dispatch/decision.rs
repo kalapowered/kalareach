@@ -612,14 +612,18 @@ impl RemoteConnection {
         }
     }
 
-    /// Refuses the five repository operations to a device, and says why in one sentence.
+    /// Refuses the five repository operations to a device on a host that cannot confine what the
+    /// Git program reads, and says why in one sentence.
     ///
     /// Section 14 paragraph 5 puts filesystem authority in opened directory handles: a grant
     /// reaches the objects the owner authorised and nothing else. This host holds that rule over
-    /// every name **it** resolves, and it does not hold it over the Git program, which finds its
-    /// own repository, reads its own configuration and follows its own metadata once it is
-    /// running. So an operation that runs Git for a device would give that device reach the owner
-    /// never named, and this host does not start one.
+    /// every name **it** resolves. It holds it over the Git program only where it has proved it
+    /// can: on Linux, inside one boundary that confines what Git reads to the directories the
+    /// owner authorised and a support set named for this host's Git, which the project service
+    /// builds for a caller bounded by a grant and the daemon proves at its start and at each
+    /// `host.doctor`. Anywhere else, and on a Linux host that could not prove it, an operation
+    /// that runs Git for a device would give that device reach the owner never named, and this
+    /// host does not start one.
     ///
     /// The local owner is unaffected: the owner's own authority runs the owner's own program,
     /// which is the posture this product has always had. The metadata methods are unaffected too:
@@ -636,25 +640,24 @@ impl RemoteConnection {
                 | Method::ProjectAdopt
                 | Method::WorkspaceCreate
                 | Method::WorkspaceRemove
-        ) {
+        ) && !self.controller.qualification().qualifies()
+        {
             return Err(refuses_to_run_git());
         }
         Ok(())
     }
 }
 
-/// The one refusal every method that would start the Git program for a device is given.
+/// The one refusal every method that would start the Git program for a device is given where this
+/// host cannot confine what that program reads.
 ///
-/// Section 14 paragraph 5 puts filesystem authority in opened directory handles: a grant reaches
-/// the objects the owner authorised and nothing else. This host holds that rule over every name
-/// **it** resolves, and it does not hold it over the Git program, which finds its own repository,
-/// reads its own configuration and follows its own metadata once it is running. So it does not
-/// start that program for a device, whether the method would write or only read.
+/// It says no more than that: what stopped the host from proving it is in the doctor and in the
+/// daemon's own log, and a caller is not told which of this host's libraries or mounts did.
 pub(super) fn refuses_to_run_git() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::PermissionDenied,
-        "this host does not yet confine what the Git program reaches to the directories the \
-         owner authorised, so it does not run that program for a paired device",
+        "this host cannot confine what the Git program reads to the directories the owner \
+         authorised, so it does not run that program for a paired device",
     )
 }
 
