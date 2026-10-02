@@ -197,7 +197,7 @@ function retiredInBytes(bytes, { classes = new Set(), jni = false } = {}) {
 // -- iOS -----------------------------------------------------------------------------------------
 
 /** A property list (XML or binary), as the value it holds. */
-function plistValue(path, input) {
+export function plistValue(path, input) {
   const answer = spawnSync('plutil', ['-convert', 'json', '-o', '-', '--', path ?? '-'], {
     encoding: 'utf8',
     input
