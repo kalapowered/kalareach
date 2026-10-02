@@ -142,11 +142,23 @@ export function HarnessStrip({
  * With a software keyboard up, the system moves the page under it, and the strip, which sits at the
  * top of the page, moves out of reach until the keyboard is away. The product's own pages offer no
  * way to put it away short of scrolling, so the harness gives its tests one: a tap on text or on
- * empty space, as the system's own applications have.
+ * empty space, as the system's own applications have. A drag, and anything while text is selected,
+ * is left alone.
  */
 export function TapAwayPutsTheKeyboardAway(): ReactNode {
   useEffect(() => {
+    let down: { x: number; y: number } | null = null
+    const remember = (event: Event) => {
+      const at = event as PointerEvent
+      down = { x: at.clientX, y: at.clientY }
+    }
     const away = (event: Event) => {
+      const at = event as PointerEvent
+      const started = down
+      down = null
+      // A drag is a selection or a scroll, not a tap, and a selection that is there is the person's.
+      if (started !== null && Math.hypot(at.clientX - started.x, at.clientY - started.y) > 6) return
+      if ((window.getSelection()?.toString() ?? '') !== '') return
       const target = event.target
       const control = target instanceof Element && target.closest('textarea, input, select, button, a, [contenteditable]')
       if (control === null || control === false) {
@@ -154,8 +166,10 @@ export function TapAwayPutsTheKeyboardAway(): ReactNode {
         if (active instanceof HTMLElement && active !== document.body) active.blur()
       }
     }
+    document.addEventListener('pointerdown', remember)
     document.addEventListener('pointerup', away)
     return () => {
+      document.removeEventListener('pointerdown', remember)
       document.removeEventListener('pointerup', away)
     }
   }, [])
