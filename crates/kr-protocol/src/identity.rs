@@ -1043,7 +1043,7 @@ mod tests {
         })
         .expect("encodes");
         assert!(
-            kr_cbor::from_canonical_slice::<BridgeFrame>(&earlier_hello, &limits).is_err(),
+            kr_cbor::from_canonical_slice::<BridgeHello>(&earlier_hello, &limits).is_err(),
             "this helper does not read an opening without `start`"
         );
         let hello = kr_cbor::to_canonical_vec(&BridgeHello {
@@ -1060,6 +1060,10 @@ mod tests {
             kr_cbor::from_canonical_slice::<EarlierHello>(&hello, &limits).is_err(),
             "an earlier helper does not read an opening with `start`"
         );
+        // The controls: each build reads what it writes, so the refusals above are of the member
+        // and of nothing else about the frame.
+        assert!(kr_cbor::from_canonical_slice::<BridgeHello>(&hello, &limits).is_ok());
+        assert!(kr_cbor::from_canonical_slice::<EarlierHello>(&earlier_hello, &limits).is_ok());
 
         // The acknowledgement: the same, for `build` and `base`.
         let boot_identity = BootIdentity {
@@ -1101,6 +1105,8 @@ mod tests {
             kr_cbor::from_canonical_slice::<EarlierAck>(&ack, &limits).is_err(),
             "an earlier invoker does not read an acknowledgement with `base`"
         );
+        assert!(kr_cbor::from_canonical_slice::<BridgeHelloAck>(&ack, &limits).is_ok());
+        assert!(kr_cbor::from_canonical_slice::<EarlierAck>(&earlier_ack, &limits).is_ok());
     }
 
     fn wsl_enrolment() -> EnvironmentEnrolment {
