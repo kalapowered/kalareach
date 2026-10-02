@@ -323,7 +323,9 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
         let mut running =
             tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START));
 
-        let (mut stream, _) = tokio::select! {
+        let (mut stream, peer) = tokio::select! {
+            // A connection already made is taken before the forwarder's end is looked at.
+            biased;
             accepted = stand_in.listener.accept() => accepted.expect("the forwarder connects"),
             ran = &mut running => {
                 let ran = ran.expect("the forwarder ran");
@@ -347,6 +349,12 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
         let pid = u32::try_from(presented["pid"].as_u64().expect("a process")).expect("a pid");
         let read = kr_ipc::identity::process_start_identity(pid).expect("the process is running");
         assert_eq!(presented["start"].as_u64(), Some(read.start_value.get()));
+        // The process the operating system names on the connection is the one the hello presents.
+        assert_eq!(
+            peer.pid,
+            Some(pid),
+            "{answer}: the kernel names the process that presented itself"
+        );
         // And the host's own comparison takes it as the launch's private exchange.
         let launch_credential = kr_worker::broker::Credential::from_registration_text(&credential)
             .expect("the launch credential");
