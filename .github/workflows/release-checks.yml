@@ -8,7 +8,10 @@ name: release-checks
 # independently signed app supplies its own credentials, so none of them has a place in a
 # repository. `mobile-graph` holds the companion's dependency graph on each mobile target to the
 # client's own crates: the host's packages are separate build products and never link into a phone
-# build. Each check is put through a planted fault before it is trusted with the tree.
+# build. `clean-checkout` reads the tree and its whole history from a clone of its own: no tracked
+# file names a record kept outside the repository, every commit is one subject line, every relative
+# Markdown link resolves, and the `.gitignore`'s local workspace section ignores each assistant
+# instruction name. Each check is put through a planted fault before it is trusted with the tree.
 on:
   push:
     branches: ["main"]
@@ -39,6 +42,22 @@ jobs:
 
       - name: Scan the tracked files
         run: python3 scripts/check-release-secrets.py scan --tracked .
+
+  clean-checkout:
+    name: the tree and its history name no outside record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the whole history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Test the refusals
+        run: bash scripts/check-clean-checkout.sh --self-test
+
+      - name: Check the commit from a clean clone
+        run: bash scripts/check-clean-checkout.sh --no-steps
 
   mobile-graph:
     name: the companion links no host crate

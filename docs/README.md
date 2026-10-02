@@ -234,7 +234,9 @@ look similar, such as the installable `skills/kalareach-contact/SKILL.md`, are t
 Text in this repository describes the product and the change, and a commit message is one line with
 no body and no trailer. `scripts/check-clean-checkout.sh` refuses a tracked file that names a task
 or a decision identifier, a numbered review or another record kept outside the repository, a commit
-message longer than one line and a broken relative link. The website's `pnpm records:check` refuses
+message longer than one line and a broken relative link. It also creates each assistant instruction
+name in its clone and refuses a `.gitignore` for which `git check-ignore` does not name one ignored,
+and the `release-checks` workflow runs it on every change. The website's `pnpm records:check` refuses
 coding-assistant instruction files, local work records and key material by path, and three
 credential shapes by content, in the commits it is about to send, the packages it publishes and the
 deployment bundle.
