@@ -15,8 +15,11 @@
 
 mod common;
 
+#[cfg(unix)]
 use std::io::Read as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use common::{LIVENESS, Placed, StandIn, read_line, run_holding_input, run_with_input};
 
