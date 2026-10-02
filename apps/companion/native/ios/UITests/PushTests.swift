@@ -90,6 +90,7 @@ final class PushTests: DeviceTestCase {
     private func readTheDelivery(of pushFacts: [String: String], sameProcess: Bool) throws {
         let facts = try XCTUnwrap(probeFacts("push-read", timeout: 30), "the delivery check did not report")
         sayFacts("push-read", facts)
+        XCTAssertNotNil(pushFacts["pid"], "the push check does not say which process it ran in")
         XCTAssertNotNil(facts["pid"], "the delivery check does not say which process it ran in")
         XCTAssertEqual(facts["pid"] == pushFacts["pid"], sameProcess, sameProcess ? "the application was started again to read the delivery" : "the application that was ended is the one that read the delivery")
         XCTAssertEqual(facts["nonce.known"], "1", "the check that filed the nonce did not leave it behind")
