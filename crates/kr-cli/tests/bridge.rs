@@ -1253,7 +1253,11 @@ async fn refusal_from_an_earlier_daemon(
     )
     .await;
     let mut helper = Helper::start(&tree);
-    helper.write(&hello_to(ActorIngress::LocalIpc, start, BridgeTarget::Controller));
+    helper.write(&hello_to(
+        ActorIngress::LocalIpc,
+        start,
+        BridgeTarget::Controller,
+    ));
     let BridgeFrame::Refused(error) = helper.read() else {
         panic!("a daemon that takes no bridge is a refusal, not an acknowledgement");
     };
@@ -1278,7 +1282,9 @@ async fn a_daemon_of_an_earlier_build_is_named_and_not_reported_absent() {
         assert_eq!(error.code, ErrorCode::UnsupportedSchema, "start {start}");
         assert!(
             error.message.contains("control daemon")
-                && error.message.contains("kr-controller/0.0.9 with protocol 0.0.9")
+                && error
+                    .message
+                    .contains("kr-controller/0.0.9 with protocol 0.0.9")
                 && error.message.contains("this helper is kr/")
                 && error.message.contains("restart it"),
             "start {start}: {}",
@@ -1289,7 +1295,10 @@ async fn a_daemon_of_an_earlier_build_is_named_and_not_reported_absent() {
             "start {start}: a daemon that answers is running: {}",
             error.message
         );
-        assert_eq!(bridged, 1, "start {start}: nothing was retried without the origin");
+        assert_eq!(
+            bridged, 1,
+            "start {start}: nothing was retried without the origin"
+        );
     }
 }
 

@@ -434,12 +434,12 @@ const HALF_A_FRAME: Duration = Duration::from_millis(300);
 /// The partial-frame contract: a peer that has written the first half of a frame and not the rest,
 /// a receive that is given up on many times while it waits, and then the rest. The frame is
 /// delivered whole, once, and nothing was delivered before it.
-async fn a_frame_in_two_parts_is_delivered_whole(link: &mut impl Link, release_the_rest: impl Fn()) {
+async fn a_frame_in_two_parts_is_delivered_whole(
+    link: &mut impl Link,
+    release_the_rest: impl Fn(),
+) {
     let (during, given_up) = receives_given_up_on(link, HALF_A_FRAME).await;
-    assert!(
-        during.is_empty(),
-        "half a frame is not a frame: {during:?}"
-    );
+    assert!(during.is_empty(), "half a frame is not a frame: {during:?}");
     assert!(
         given_up >= 20,
         "the receive was given up on {given_up} times while half the frame was held"
