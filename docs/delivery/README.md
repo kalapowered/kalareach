@@ -31,9 +31,11 @@ Producing is a separate step that reads the notice the journal holds for each ev
 fails while it produces is finished by the next pass, without a restart.
 
 Some announcements are taken and produce nothing. One about a session the daemon is still closing is
-held back until the closure is read to its end, because its condition ends with the session. One
-routed to the input lease holder is not for a destination of this host. One decided while privacy
-mode was on is never sent after it ends.
+held back until the closure is read to its end, because its condition ends with the session; so is a
+pending question or approval that names a session being closed. One routed to the input lease holder
+is not for a destination of this host. One decided while privacy mode was on is never sent after it
+ends, even when quiet hours held it back and released it later: the store keeps the time an
+announcement was first decided through its release.
 
 ## What travels, and what does not
 
@@ -50,12 +52,14 @@ revision, and it is a different kind of key from the one that opens mailbox reco
 wraps and recovery bundles. A device that turns previews off stops receiving the recipient key on
 future notifications; the generic alert still arrives.
 
-A registration is one action with one answer. The host keeps the answer with the action, so a
-device whose answer was lost asks again with the same action and is told what it was told the first
-time, even after a later rotation; a new action carrying an old revision is refused. The delivery
-journal takes a registration before the device directory does, and a host that stopped between the
-two finishes the directory's half from the journal when it next starts. The registration carries the admission it was served under,
-and both stores ask it again where they are written.
+A registration is one action with one answer. The host keeps the answer with the action, so a device
+whose answer was lost asks again with the same action and is told what it was told the first time,
+even after a later rotation; a new action carrying an old revision is refused. The delivery journal
+takes a registration before the device directory does, and a host that stopped between the two
+finishes the directory's half from the journal when it next starts. The registration carries the
+admission it was served under. The journal asks it again inside its own write, after every wait for
+another writer. The directory asks it again only when the journal wrote nothing, because a
+registration the journal took has already taken effect.
 
 The **collapse identifier** groups notifications about one thing so the newest replaces the older on
 the device. It is a keyed digest of what the host groups by, under a secret only the delivery
@@ -80,9 +84,10 @@ the device's own requests is: on the continuous clock and on UTC, under the host
 the rights ceiling its configuration holds.
 
 The grant is asked three times: when the notification is produced, when it is claimed, and once more
-after the credential has been renewed, which can wait on the gateway, immediately before the request
-is presented. What the grant reaches is digested with the notification, so a change to it settles
-the notification as revoked rather than sending it.
+after the credential has been renewed, which can wait on the gateway. That last asking comes before
+the send is admitted under privacy mode, which can wait for an exchange already under way, so a
+bound that ends in that wait is not caught. What the grant reaches is digested with the
+notification, so a change to it settles the notification as revoked rather than sending it.
 
 ## Two sizes, measured rather than estimated
 
@@ -190,11 +195,10 @@ intersected with the host's current policy at the moment of asking: a grant that
 expired, not yet redeemed, issued for another environment, refused by the policy (an organisation
 grant whose recipient no current member lease answers for, a personal grant on a host that is
 exclusively organisation-managed, remote use past the offline-validity bound), or one whose rights,
-after the policy and the host's configured ceiling, include nothing a notification can ask for admits
-nothing. The host filter
-decides which interval of history the grant reaches, and the producer checks that each line's
-session is one the grant covers. A line that fails either is left out, and the message says how
-many were left out and why.
+after the policy and the host's configured ceiling, include nothing a notification can ask for
+admits nothing. The host filter decides which interval of history the grant reaches, and the
+producer checks that each line's session is one the grant covers. A line that fails either is left
+out, and the message says how many were left out and why.
 
 ### Five kinds
 
@@ -298,7 +302,9 @@ it. The queued request bodies and the encrypted objects a preview's excess moved
 The records of what happened stay, because a host that forgot its own attempts could not tell a
 person what the device did not see.
 
-Cleanup is not complete while an attempt is on the wire or an outcome is unknown. A result produced
+Cleanup is not complete while an attempt from before the fence is on the wire. An outcome nobody
+knows is not waited for: under the fence nothing asks the gateway about a notification from before
+it, so the wait would never end, and it is listed as a copy that may have left. A result produced
 under an earlier generation is refused rather than published.
 
 A pending question or approval still alerts a paired device while privacy mode is on, under the
@@ -309,11 +315,15 @@ transaction as its event. Every other announcement decided while privacy mode is
 the store and settled with nothing produced, and it is never sent after privacy mode ends, because
 turning privacy mode off cannot reconstruct what was withheld. The journal records when privacy mode
 was last turned off, and an announcement decided at or before that moment is dropped. One decided
-between the state being published as off and the journal lifting its fence is dropped too.
+between the state being published as off and the journal lifting its fence is dropped too. A journal
+brought forward from an earlier build that had been through privacy mode records the time of that
+migration as the moment privacy mode ended, because the earlier build did not record when.
 
 The alerts are the only rows of the generation the fence stands at. Cleanup acts on rows of earlier
 generations, so running it again at every start leaves them alone, and turning privacy mode off
-takes back the ones nothing has sent.
+takes back the ones nothing has sent. A question about an alert whose outcome nobody knows is asked
+while privacy mode is on, because the alert belongs to the generation in force and carries nothing.
+Once privacy mode is off that generation has ended, and the alert is not asked about again.
 
 What has already left is not erased and is not claimed to be. Notifications a provider queued and
 messages another service accepted are listed as retained artifacts, each carrying the notification
