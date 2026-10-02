@@ -870,8 +870,8 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
     };
     let now_ms = kr_ipc::now_ms();
     // A session that is neither running nor recorded is not thereby one that has ended: its worker
-    // may not have reported yet. The registry says whether its launch is over, and whether a worker
-    // was ever given a launch specification.
+    // may not have reported yet. The registry, with the creates the daemon is running, says whether
+    // its launch is over, and whether a worker was ever given a launch specification.
     let launches = match &recorded {
         Some(recorded) => {
             let unreached = {
