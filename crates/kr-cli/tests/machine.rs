@@ -782,7 +782,10 @@ async fn a_step_the_owner_took_another_way_meanwhile_is_taken_as_done_and_not_ta
 /// the write; every step the plan sends B meanwhile is refused before B can confirm its record,
 /// whether it is composed for the first time or sent again, so none of them says the record is
 /// confirmed. The step stays `sent` and the plan is kept until B can confirm its record, and then a
-/// step that finds the record moved on is what takes it as done.
+/// step that finds the record moved on is what takes it as done. The plan has seen B's record show
+/// the step, so when B's record then cannot be read, an answer to a step sent before, whatever it
+/// refuses it for, does not make the step refused: it stays `sent`, and is `done` once B can read
+/// and confirm its record again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_is_unconfirmed() {
     let pair = Pair::start().await;
@@ -849,6 +852,21 @@ async fn a_step_the_owner_took_another_way_is_not_called_taken_while_its_record_
         identity = now;
     }
     assert_eq!(pair.b.group(), written, "B took no second step");
+
+    // B's record then cannot be read. B refuses the step sent again for its window, which says
+    // nothing of an earlier action, and it reports no group to read the step against.
+    let record = pair.b.temp.environment().state_dir().join("machine-group");
+    let whole = std::fs::read(&record).expect("B's record");
+    kr_ipc::paths::write_owner_only_file(&record, b"damaged while the daemon ran")
+        .expect("damages the record");
+    let (status, unread) = pair
+        .a
+        .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert_eq!(status, Some(1), "{unread}");
+    assert_eq!(unread["steps"][1]["state"], "sent", "{unread}");
+    assert_eq!(unread["kept"], Value::Bool(true), "{unread}");
+    assert!(pair.a.plan_file().exists());
+    kr_ipc::paths::write_owner_only_file(&record, &whole).expect("restores the record");
 
     pair.b.controller.fail_the_machine_recovery_flush(false);
     let finished = pair.at_a(&["host", "machine", "finish"]);
