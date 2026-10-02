@@ -59,8 +59,11 @@ impl Observer for PlatformObserver {
                 registered,
                 running,
             } => {
-                let registered = run(&registered.program, &registered.arguments)?;
-                let running = run(&running.program, &running.arguments)?;
+                // One observation has one bound, however many commands it takes.
+                let deadline = std::time::Instant::now() + PLATFORM_LIMIT;
+                let within = || deadline.saturating_duration_since(std::time::Instant::now());
+                let registered = run_within(&registered.program, &registered.arguments, within())?;
+                let running = run_within(&running.program, &running.arguments, within())?;
                 Ok(wsl_state(&registered, &running, &enrolment.target))
             }
             Observation::Inspection(command) => {
@@ -96,24 +99,15 @@ pub struct CommandOutput {
 
 /// Decodes process output bytes, reading UTF-16LE (with or without a byte order mark) and UTF-8.
 ///
-/// `wsl.exe` writes UTF-16LE with no byte order mark when its output is not a console. What tells
-/// that from UTF-8 is where the zero bytes are: a UTF-16LE text of any script has its line endings'
-/// zero bytes in the odd places, and a text that is UTF-8 has none. The first two letters are not
-/// asked to be Latin, because a distribution is named by the person who made it.
+/// `wsl.exe` writes UTF-16LE with no byte order mark when its output is not a console, and
+/// everything else this host runs writes UTF-8. Text in UTF-8 has no zero byte in it, and text in
+/// UTF-16LE has one wherever a character below U+0100 stands, which every line ending is. So a byte
+/// order mark, or a zero byte anywhere, is what makes the answer UTF-16LE. What a name begins with
+/// is not asked, because a name is given by the person who made it.
 #[must_use]
 pub fn decode_output(bytes: &[u8]) -> String {
-    // The zero bytes at every second place, counting from `first`.
-    let zeros_from = |first: usize| {
-        bytes
-            .iter()
-            .skip(first)
-            .step_by(2)
-            .filter(|byte| **byte == 0)
-            .count()
-    };
-    let bom = bytes.starts_with(&[0xff, 0xfe]);
-    if bom || zeros_from(1) > zeros_from(0) {
-        let wide = if bom { &bytes[2..] } else { bytes };
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.contains(&0) {
+        let wide = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
         let u16s: Vec<u16> = wide
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
@@ -317,7 +311,16 @@ fn run_bounded(
 /// Returns a resource failure when the program is not installed or could not be run. A program
 /// that runs and exits non-zero is not a failure here: its output is what says what it found.
 pub fn run(program: &str, arguments: &[String]) -> Result<CommandOutput> {
-    let output = run_bounded(program, arguments, PLATFORM_LIMIT)?;
+    run_within(program, arguments, PLATFORM_LIMIT)
+}
+
+/// [`run`], with the time it is given named.
+fn run_within(
+    program: &str,
+    arguments: &[String],
+    limit: std::time::Duration,
+) -> Result<CommandOutput> {
+    let output = run_bounded(program, arguments, limit)?;
     let mut text = decode_output(&output.stdout);
     let stderr = decode_output(&output.stderr);
     if !stderr.is_empty() {
@@ -353,10 +356,12 @@ pub fn container_runtime_present() -> bool {
 /// Reads one distribution's state out of the two listings of names `wsl.exe` prints.
 ///
 /// Each listing is one name to a line and nothing else, so the answer does not depend on the
-/// language the host's Windows prints in, which `wsl.exe --list --verbose` does: its state is a
-/// word of that language. A name that is not in the registered listing is not registered, which is
-/// reported as stale rather than as stopped: this host has not observed it at all. A listing that
-/// failed has observed nothing either, whatever text it printed.
+/// column layout or the words of `wsl.exe --list --verbose`, which prints each state as a word
+/// that a host may print in its own language. A name that is not in the registered listing is not
+/// registered, which is reported as stale rather than as stopped: this host has not observed it at
+/// all. A listing that failed has observed nothing either, whatever text it printed. The listings
+/// are asked with `--quiet`, which makes a host with nothing running answer with no text and a
+/// success, where without it the answer is a message in the host's language and a failure.
 fn wsl_state(
     registered: &CommandOutput,
     running: &CommandOutput,
@@ -618,7 +623,7 @@ mod tests {
             wsl_state(&registered, &failed("Ubuntu-24.04\r\n"), "Ubuntu-24.04"),
             EnvironmentPresence::Stale
         );
-        // A host with no distribution says so in its own words and exits with a failure.
+        // A host that cannot list says so in its own words and exits with a failure.
         assert_eq!(
             wsl_state(
                 &failed(
@@ -642,6 +647,12 @@ mod tests {
             "\u{420}\u{430}\u{431}\u{43e}\u{447}\u{430}\u{44f}\r\nDebian\r\n",
             "\u{6d4b}\u{8bd5}\r\nDebian\r\n",
             "\u{6d4b}\u{8bd5}\r\n",
+            // As many zero bytes in the even places as in the odd ones: two Latin letters and then
+            // characters whose low byte is zero.
+            "AB\u{4e00}\u{4e00}\u{4e00}\u{4e00}\r\n",
+            "A\u{4e00}\u{4e00}\u{4e00}\r\n",
+            // More in the even places than in the odd ones.
+            "\u{4e00}\u{4e00}\u{4e00}\u{4e00}\u{4e00}\r\n",
         ] {
             assert_eq!(decode_output(&wide(names)), names, "{names:?}");
             let mut with_mark = vec![0xff, 0xfe];

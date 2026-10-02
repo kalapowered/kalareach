@@ -601,7 +601,7 @@ case "$1" in
   --list)
     case "$*" in
       "--list --verbose") cat "$fixture/listing" ;;
-      "--list --quiet") cat "$fixture/registered" ;;
+      "--list --all --quiet") cat "$fixture/registered" ;;
       "--list --running --quiet") cat "$fixture/running" ;;
       *)
         echo "the stand-in for wsl.exe has no listing for: $*" >&2
@@ -1280,7 +1280,7 @@ async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_
         .map(str::to_owned)
         .to_vec()
     };
-    let registered = ["--list", "--quiet"].map(str::to_owned).to_vec();
+    let registered = ["--list", "--all", "--quiet"].map(str::to_owned).to_vec();
     let running = ["--list", "--running", "--quiet"]
         .map(str::to_owned)
         .to_vec();
