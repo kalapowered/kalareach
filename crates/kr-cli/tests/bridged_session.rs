@@ -1226,6 +1226,35 @@ async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel(
     );
     assert_eq!(refreshed["started"], false, "{refreshed}");
 
+    // The user the destination's helper answers as is the one the person named, and an enrolment
+    // that names another is refused rather than recorded to fail at the first refresh.
+    let wrong_user = world.run(&[
+        "bridge",
+        "enrol",
+        "--access",
+        "ssh",
+        "--label",
+        "someone",
+        "--target",
+        "build.example",
+        "--user",
+        "someone-else",
+        "--helper",
+        &helper,
+        "--probe",
+    ]);
+    assert!(!wrong_user.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_user.stderr).contains("a different user"),
+        "{}",
+        String::from_utf8_lossy(&wrong_user.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&world.run(&["--json", "bridge", "list"]).stdout)
+            .contains("someone"),
+        "nothing was recorded for it"
+    );
+
     // The identity a destination answers with is checked against one the person gave.
     let wrong = world.run(&[
         "bridge",
