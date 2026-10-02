@@ -83,6 +83,14 @@ pub struct Approval {
     /// it, where [`Approval::deny`] would not in every one of them; [`Approval::deny`] otherwise.
     #[serde(default)]
     pub refuse: Option<String>,
+    /// Whether the command stands in a box of its own: the rows just above and below it hold nothing
+    /// but the box's border, so a command that goes on in the same box, above or below, is refused.
+    #[serde(default)]
+    pub boxed: bool,
+    /// The text of the dialog's first row, where the agent shows the dialog over its conversation,
+    /// which can show the pending call on a line that reads as the dialog's own command line.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Whether the part's command names its log relative to the folder the agent works in, since
     /// the folder's absolute path does not fit one line of the dialog; the part then answers only
     /// when the agent's own record of the request names the command and the run's folder.
@@ -92,6 +100,11 @@ pub struct Approval {
     /// only when the record of the request still pending names its command and folder.
     #[serde(default)]
     pub request: Option<RequestRecord>,
+    /// How the conversation file records the calls of the tool that runs commands, where it does
+    /// so after the call: once the part has answered, every command the record holds for the
+    /// tool must be the part's own, whole, and the part's command among them.
+    #[serde(default)]
+    pub recorded: Option<RecordedCalls>,
 }
 
 /// The lines of a conversation file that record a request for approval and its answer, as the
@@ -107,6 +120,50 @@ pub struct RequestRecord {
     pub resolved_line: String,
     /// The tool whose request it is: the one that runs the part's command.
     pub tool: String,
+}
+
+/// How the conversation file records the calls of the tool that runs commands, where it does so
+/// after the call, with the command as the tool received it: a line holds a list of calls, and each
+/// call names its tool and its arguments.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedCalls {
+    /// The member of a line that lists the calls it records.
+    pub member: String,
+    /// The tool's name, in a call's `name`: the one that runs the part's command.
+    pub tool: String,
+    /// The member of a call's `args` that holds the command.
+    pub command: String,
+}
+
+/// The characters an agent draws the sides of a dialog with: not text of the dialog's rows.
+const FRAME: [char; 3] = ['│', '┃', '║'];
+
+/// A row with one level of frame taken off each side, and the spaces beside it: `│ ╭──╮ │` is
+/// `╭──╮`, and `│ │ echo a │ │` is `│ echo a │`. A character of the row's own text that is the
+/// frame's kind stays unless it is the one at the edge.
+fn peeled(row: &str) -> &str {
+    let row = row.trim();
+    let row = row.strip_prefix(FRAME).unwrap_or(row);
+    let row = row.strip_suffix(FRAME).unwrap_or(row);
+    row.trim()
+}
+
+/// Whether `row`, with one level of frame off, is exactly a box's border: `open`, one or more `─`,
+/// `close`, and nothing else.
+fn is_border(row: &str, open: char, close: char) -> bool {
+    let row = peeled(row);
+    row.strip_prefix(open)
+        .and_then(|rest| rest.strip_suffix(close))
+        .is_some_and(|middle| {
+            !middle.is_empty() && middle.chars().all(|character| character == '─')
+        })
+}
+
+/// A row of a dialog without the frame an agent draws around it, and without the spaces beside it:
+/// `│ │ echo a │ │` is `echo a`.
+fn unframed(row: &str) -> &str {
+    row.trim_matches(|character: char| character.is_whitespace() || FRAME.contains(&character))
 }
 
 impl Approval {
@@ -125,10 +182,44 @@ impl Approval {
     pub fn names_only(&self, rows: &[String], command: &str) -> Result<(), String> {
         let prefix = self.command_line.as_deref().unwrap_or("");
         let wanted = format!("{prefix}{command}");
+        // Where the dialog has a title row, the rows above it are the conversation the dialog sits
+        // over, not the dialog. The title must be on one row alone: a second row that holds it, a
+        // line of a command, would cut the dialog where a command could be hidden above the cut.
+        let rows = match &self.title {
+            Some(title) => {
+                let titled: Vec<usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.contains(title.as_str()))
+                    .map(|(index, _)| index)
+                    .collect();
+                match titled.as_slice() {
+                    [at] => &rows[*at..],
+                    [] => return Err(format!("the dialog shows no {title:?}")),
+                    several => {
+                        return Err(format!(
+                            "{} rows hold the dialog's title {title:?}, so the dialog cannot be \
+                             told from what repeats it",
+                            several.len()
+                        ));
+                    }
+                }
+            }
+            None => rows,
+        };
         let at: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.trim() == wanted.trim())
+            .filter(|(_, row)| {
+                // A command in a box of its own is in two frames, the dialog's and the box's, and
+                // each is taken off once, so the command's own edge characters are kept.
+                let shown = if self.boxed {
+                    peeled(peeled(row))
+                } else {
+                    unframed(row)
+                };
+                shown == wanted.trim()
+            })
             .map(|(index, _)| index)
             .collect();
         let [line] = at.as_slice() else {
@@ -137,29 +228,110 @@ impl Approval {
                 at.len()
             ));
         };
+        // A command in a box of its own has the box's top border, and nothing else, on the row above
+        // it and its bottom border on the row below, so nothing else is in the box.
+        let mut after_box = line + 1;
+        if self.boxed {
+            let above = line.checked_sub(1).and_then(|index| rows.get(index));
+            let below = rows.get(line + 1);
+            if !above.is_some_and(|row| is_border(row, '╭', '╮'))
+                || !below.is_some_and(|row| is_border(row, '╰', '╯'))
+            {
+                return Err("the command is not alone in its box".to_owned());
+            }
+            after_box = line + 2;
+        }
         if let Some(prefix) = &self.command_line {
             let others = rows
                 .iter()
                 .enumerate()
-                .filter(|(index, row)| index != line && row.trim().starts_with(prefix.trim()))
+                .filter(|(index, row)| index != line && unframed(row).starts_with(prefix.trim()))
                 .count();
             if others > 0 {
                 return Err(format!("the dialog shows {others} other command line(s)"));
             }
         }
         if let Some(start) = &self.options_start {
-            let after = &rows[line + 1..];
+            let after = &rows[after_box..];
             let Some(end) = after.iter().position(|row| row.contains(start.as_str())) else {
                 return Err(format!(
                     "the dialog shows no {start:?} after the part's command"
                 ));
             };
-            if after[..end].iter().any(|row| !row.trim().is_empty()) {
+            if after[..end].iter().any(|row| !unframed(row).is_empty()) {
                 return Err("the dialog shows more than the part's command".to_owned());
             }
         }
         Ok(())
     }
+}
+
+/// How an agent is kept from updating itself or installing a package of its own accord in the parts
+/// that give it the network: the entry names each switch, and the harness requires it in what the
+/// entry gives the agent, since an install that ran would change or need what is outside the run's
+/// own directory.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "switch", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InstallSwitch {
+    /// A variable the agent's session is given, with the value that switches it off.
+    Variable {
+        /// The variable's name.
+        name: String,
+        /// Its value.
+        value: String,
+    },
+    /// An argument the agent is started with, whole.
+    Argument {
+        /// The argument.
+        text: String,
+    },
+    /// Text a file of the agent's configuration directory holds.
+    File {
+        /// The file, relative to the directory.
+        path: String,
+        /// The text.
+        contains: String,
+    },
+}
+
+/// Whether each of `switches` is in what the agent is given, `variables`, `arguments` and `files`
+/// of its configuration directory; says which is not. At least one switch must be named.
+///
+/// # Errors
+///
+/// Returns the first switch the entry names and does not give, or that none is named.
+pub fn installs_off(
+    switches: &[InstallSwitch],
+    variables: &BTreeMap<String, String>,
+    arguments: &[String],
+    files: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if switches.is_empty() {
+        return Err(
+            "the entry names no switch that stops the agent's updates and installs".to_owned(),
+        );
+    }
+    for switch in switches {
+        let given = match switch {
+            InstallSwitch::Variable { name, value } => variables.get(name) == Some(value),
+            InstallSwitch::Argument { text } => arguments.contains(text),
+            InstallSwitch::File { path, contains } => files
+                .get(path)
+                .is_some_and(|text| text.contains(contains.as_str())),
+        };
+        if !given {
+            return Err(format!(
+                "the agent's updates and installs are not switched off: {}",
+                match switch {
+                    InstallSwitch::Variable { name, value } => format!("{name}={value} is not set"),
+                    InstallSwitch::Argument { text } => format!("{text:?} is not an argument"),
+                    InstallSwitch::File { path, contains } =>
+                        format!("{path} does not hold {contains:?}"),
+                }
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A command the agent answers without calling a model, and what its answer must hold and must not
@@ -533,6 +705,19 @@ pub struct ProjectServers {
     pub entry: serde_json::Value,
 }
 
+/// Where an agent that keeps its conversations in a database has them read from: the database, and
+/// the `SELECT` that returns each line of each conversation. The query returns two columns, a
+/// conversation's identifier and one line of JSON, in the order the lines are to be read: a line
+/// stands where the fact it records became true.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mirror {
+    /// The database, relative to the home the agent runs with.
+    pub database: String,
+    /// The query.
+    pub query: String,
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -588,6 +773,19 @@ pub struct Account {
     /// the run's directory, and left as they are.
     #[serde(default)]
     pub append_only: Vec<String>,
+    /// Where the conversations are read from where the agent keeps them in a database, in files of
+    /// JSON lines the part writes of its own from it: `conversations` is then not used, and the
+    /// agent runs with the run's own home.
+    #[serde(default)]
+    pub mirror: Option<Mirror>,
+    /// How many separate presses of the interrupt key the agent asks for: its first press arms the
+    /// interrupt and says so, and the next ends the turn. Both in one write do nothing.
+    #[serde(default = "one_press")]
+    pub interrupt_presses: u32,
+    /// The member of the first line of a conversation file that holds the conversation's
+    /// identifier, where the file's own name does not.
+    #[serde(default)]
+    pub conversation_id_member: Option<String>,
     /// The key that queues a prompt behind a running turn, where it is not the submit key.
     #[serde(default)]
     pub queue_key: Option<String>,
@@ -615,6 +813,10 @@ pub struct Account {
     /// own and `{work}` the working directory.
     #[serde(default)]
     pub absent: Vec<String>,
+    /// The switches that stop the agent updating itself or installing a package of its own accord,
+    /// each of which the entry must give the agent (`installs_are_off`).
+    #[serde(default)]
+    pub installs_off: Vec<InstallSwitch>,
     /// Where the agent keeps its configuration in these parts, where it is not the home.
     #[serde(default)]
     pub config_directory: Option<ConfigDirectory>,
@@ -738,6 +940,11 @@ pub struct Account {
     /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
     /// or a template with `{path}`.
     pub image: String,
+}
+
+/// One press of the interrupt key, unless the build list says more.
+const fn one_press() -> u32 {
+    1
 }
 
 /// A newer build of the same application, installed beside the pinned one, for the upgrade case.
@@ -946,6 +1153,32 @@ impl Build {
             .chain(account.filter_map(|account| account.variable.as_ref()))
             .cloned()
             .collect()
+    }
+
+    /// Whether every switch the account names for the agent's updates and installs is in what every
+    /// launch gives the agent, probes included: the build's variables, the account's, its `switches`
+    /// (not its `arguments`, which only the parts get), and the files of its configuration
+    /// directory. A build with no account has no part that gives the agent the network, and is not
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the switch that is not given, or that the account names none.
+    pub fn installs_are_off(&self) -> Result<(), String> {
+        let Some(account) = &self.account else {
+            return Ok(());
+        };
+        let mut variables = self.environment.clone();
+        variables.extend(account.variables.clone());
+        // The arguments of every launch, the probes' as much as the parts', since a probe that
+        // starts the agent could start its updater too.
+        let arguments = account.switches.clone();
+        let files = account
+            .config_directory
+            .as_ref()
+            .map(|directory| directory.files.clone())
+            .unwrap_or_default();
+        installs_off(&account.installs_off, &variables, &arguments, &files)
     }
 
     /// Takes out of `variables`, the environment a part's session is to be created with, every
@@ -1230,8 +1463,11 @@ mod tests {
             options_start: Some("Yes, proceed".to_owned()),
             others: Vec::new(),
             refuse: Some("\u{1b}".to_owned()),
+            boxed: false,
             relative_log: false,
+            title: None,
             request: None,
+            recorded: None,
         };
         let rows = |lines: &[&str]| owned(lines);
         let command = "echo kr0123 >> approved.log";
@@ -1295,6 +1531,264 @@ mod tests {
             Ok(())
         );
         assert_eq!(claude.refusal(), "d");
+    }
+
+    /// The entry's switches against what the agent is given: each must be given, with its value, and
+    /// an entry that names none proves nothing.
+    #[test]
+    fn an_installs_are_off_where_every_switch_the_entry_names_is_given_and_one_at_least_is_named() {
+        let named: Vec<InstallSwitch> = serde_json::from_value(serde_json::json!([
+            {"switch": "variable", "name": "NO_UPDATE", "value": "1"},
+            {"switch": "argument", "text": "check_for_update=false"},
+            {"switch": "file", "path": ".agent/settings.json", "contains": "\"update\":false"},
+        ]))
+        .expect("the three kinds of switch");
+        let variables = BTreeMap::from([("NO_UPDATE".to_owned(), "1".to_owned())]);
+        let arguments = owned(&["-c", "check_for_update=false"]);
+        let files = BTreeMap::from([(
+            ".agent/settings.json".to_owned(),
+            "{\"general\":{\"update\":false}}".to_owned(),
+        )]);
+        assert_eq!(installs_off(&named, &variables, &arguments, &files), Ok(()));
+        // Each switch taken out, or given another value, is named.
+        let other = BTreeMap::from([("NO_UPDATE".to_owned(), "0".to_owned())]);
+        let refused = installs_off(&named, &other, &arguments, &files).expect_err("wrong value");
+        assert!(refused.contains("NO_UPDATE"), "{refused}");
+        let refused =
+            installs_off(&named, &variables, &owned(&["-c"]), &files).expect_err("no argument");
+        assert!(refused.contains("check_for_update=false"), "{refused}");
+        let refused =
+            installs_off(&named, &variables, &arguments, &BTreeMap::new()).expect_err("no file");
+        assert!(refused.contains(".agent/settings.json"), "{refused}");
+        let changed = BTreeMap::from([(
+            ".agent/settings.json".to_owned(),
+            "{\"update\":true}".to_owned(),
+        )]);
+        assert!(installs_off(&named, &variables, &arguments, &changed).is_err());
+        // An entry that names no switch gives no proof that the agent's updates and installs are off.
+        let refused = installs_off(&[], &variables, &arguments, &files).expect_err("none named");
+        assert!(refused.contains("names no switch"), "{refused}");
+        // A switch of a kind the harness does not know, or with a field it does not read, is not
+        // taken for one it does.
+        for bad in [
+            serde_json::json!({"switch": "setting", "name": "x"}),
+            serde_json::json!({"switch": "variable", "name": "X", "value": "1", "extra": true}),
+        ] {
+            assert!(serde_json::from_value::<InstallSwitch>(bad).is_err());
+        }
+    }
+
+    /// Where an agent draws its dialog over its conversation, the rows above the dialog's title are
+    /// not the dialog's, and a title shown twice is not a dialog the part can tell from the rest.
+    #[test]
+    fn a_command_the_conversation_shows_above_the_dialog_is_not_a_line_of_the_dialog() {
+        let command = "echo kr0123 >> a";
+        let titled = Approval {
+            shows: "Permission required".to_owned(),
+            allow: "\r".to_owned(),
+            deny: "\u{1b}".to_owned(),
+            command_line: Some("$ ".to_owned()),
+            options_start: Some("Allow once".to_owned()),
+            others: Vec::new(),
+            refuse: None,
+            boxed: false,
+            relative_log: true,
+            title: Some("Permission required".to_owned()),
+            request: None,
+            recorded: None,
+        };
+        // The agent shows the pending tool call in the conversation, on a line that reads as the
+        // dialog's own command line, above the dialog's title.
+        let over_the_conversation = owned(&[
+            "  ┃  (kr0123456789) Use your shell tool to run exactly this command and nothing else: echo",
+            "  ┃  kr0123 >> a",
+            "     $ echo kr0123 >> a",
+            "",
+            "  ┃  △ Permission required",
+            "  ┃    # Shell command",
+            "  ┃",
+            "  ┃  $ echo kr0123 >> a",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject    enter confirm",
+            "     /tmp/run/w                                  10 (0%) · $0.00  ctrl+p commands",
+        ]);
+        assert_eq!(titled.names_only(&over_the_conversation, command), Ok(()));
+        // Control: without the title the conversation's line is a second line of the command.
+        let untitled = Approval {
+            title: None,
+            ..titled.clone()
+        };
+        let refused = untitled
+            .names_only(&over_the_conversation, command)
+            .expect_err("two lines show the command");
+        assert!(refused.contains("2 lines"), "{refused}");
+        // Only what is below the dialog's last title counts: another command line in the dialog
+        // is refused, and a command only above the title is not the dialog's.
+        let more_in_the_dialog = owned(&[
+            "     $ echo kr0123 >> a",
+            "  ┃  △ Permission required",
+            "  ┃  $ echo kr0123 >> a",
+            "  ┃  $ rm x",
+            "  ┃   Allow once   Allow always   Reject",
+        ]);
+        assert!(titled.names_only(&more_in_the_dialog, command).is_err());
+        let above_only = owned(&[
+            "     $ echo kr0123 >> a",
+            "  ┃  △ Permission required",
+            "  ┃   Allow once   Allow always   Reject",
+        ]);
+        assert!(titled.names_only(&above_only, command).is_err());
+        // A title shown twice (a line of a command that reads as the title) cuts the dialog where a
+        // command could be hidden above the cut: the dialog is refused, whatever the lines hold.
+        let hidden = owned(&[
+            "  ┃  △ Permission required",
+            "  ┃  $ rm -rf x",
+            "  ┃  : Permission required",
+            "  ┃  $ echo kr0123 >> a",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject",
+        ]);
+        let twice = titled
+            .names_only(&hidden, command)
+            .expect_err("two rows hold the title");
+        assert!(twice.contains("2 rows"), "{twice}");
+        let no_title = owned(&["  ┃  $ echo kr0123 >> a", "  ┃   Allow once   Allow always"]);
+        let missing = titled
+            .names_only(&no_title, command)
+            .expect_err("the title is not shown");
+        assert!(missing.contains("Permission required"), "{missing}");
+    }
+
+    /// The frame an agent draws around its dialog is not text of the dialog's rows: a row between
+    /// `┃` sides, or inside two boxes, is the command alone.
+    #[test]
+    fn the_frame_glyphs_around_a_dialog_are_not_part_of_its_rows() {
+        let command = "echo kr0123 >> /tmp/run/a";
+        let opencode = Approval {
+            shows: "Permission required".to_owned(),
+            allow: "\r".to_owned(),
+            deny: "\u{1b}".to_owned(),
+            command_line: Some("$ ".to_owned()),
+            options_start: Some("Allow once".to_owned()),
+            others: Vec::new(),
+            refuse: None,
+            boxed: false,
+            relative_log: false,
+            title: None,
+            request: None,
+            recorded: None,
+        };
+        let rows = owned(&[
+            "  ┃  △ Permission required",
+            "  ┃    # Shell command",
+            "  ┃",
+            "  ┃  $ echo kr0123 >> /tmp/run/a",
+            "  ┃",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject    enter confirm",
+        ]);
+        assert_eq!(opencode.names_only(&rows, command), Ok(()));
+        let more = owned(&[
+            "  ┃  △ Permission required",
+            "  ┃  $ echo kr0123 >> /tmp/run/a",
+            "  ┃  $ rm x",
+            "  ┃   Allow once   Allow always   Reject",
+        ]);
+        assert!(opencode.names_only(&more, command).is_err());
+        let gemini = Approval {
+            command_line: None,
+            options_start: Some("Allow execution of".to_owned()),
+            boxed: true,
+            ..opencode
+        };
+        let boxed = owned(&[
+            "│ ? Shell  echo kr0123 >> /tmp/run/a                                  │",
+            "│ ╭───────────────────────────────────────────────────────────────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a                                     │ │",
+            "│ ╰───────────────────────────────────────────────────────────────╯ │",
+            "│ Allow execution of [Shell]?                                         │",
+        ]);
+        assert_eq!(gemini.names_only(&boxed, command), Ok(()));
+        let other =
+            owned(&["│ │ echo kr0123 >> /tmp/run/b                                     │ │"]);
+        assert!(gemini.names_only(&other, command).is_err());
+        // A second command in the same box, above or below the part's, is not the part's alone.
+        for extra in [
+            [
+                "│ ╭───────╮ │",
+                "│ │ echo EXTRA >> /tmp/other │ │",
+                "│ │ echo kr0123 >> /tmp/run/a │ │",
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ],
+            [
+                "│ ╭───────╮ │",
+                "│ │ echo kr0123 >> /tmp/run/a │ │",
+                "│ │ echo EXTRA >> /tmp/other │ │",
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ],
+        ] {
+            assert!(
+                gemini.names_only(&owned(&extra), command).is_err(),
+                "{extra:?}"
+            );
+        }
+        // A blank row inside the box, or a character of the frame's kind ending the command, is not
+        // the border and not a command that was verified.
+        let blank = [
+            "│ ╭───────╮ │",
+            "│ │ echo EXTRA >> /tmp/other │ │",
+            "│ │ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&blank), command).is_err());
+        let boxed_with = |command_row: &str| {
+            owned(&[
+                "│ ╭───────╮ │",
+                command_row,
+                "│ ╰───────╯ │",
+                "│ Allow execution of [Shell]? │",
+            ])
+        };
+        assert_eq!(
+            gemini.names_only(&boxed_with("│ │ echo kr0123 >> /tmp/run/a │ │"), command),
+            Ok(())
+        );
+        // A character of the frame's kind at the end of the command is the command's, not the frame's.
+        for changed in [
+            "│ │ echo kr0123 >> /tmp/run/a─ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a│ │ │",
+        ] {
+            assert!(gemini.names_only(&boxed_with(changed), command).is_err());
+        }
+        // A line of the command drawn like a border is a command row, not the box's border.
+        let crafted = [
+            "│ ╭───────╮ │",
+            "│ │ ╭(){ :; }; echo EXTRA >> /tmp/other; #╮ │ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&crafted), command).is_err());
+        let crafted_below = [
+            "│ ╭───────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ │ ╰; echo EXTRA >> /tmp/other; ╯ │ │",
+            "│ ╰───────╯ │",
+            "│ Allow execution of [Shell]? │",
+        ];
+        assert!(gemini.names_only(&owned(&crafted_below), command).is_err());
+        let blank_below = [
+            "│ ╭───────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a │ │",
+            "│ │ │ │",
+            "│ │ echo Allow execution of x │ │",
+            "│ ╰───────╯ │",
+        ];
+        assert!(gemini.names_only(&owned(&blank_below), command).is_err());
     }
 
     #[test]

@@ -284,11 +284,11 @@ pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
             .display()
             .to_string()
     };
-    let holds = |bytes: &[u8]| {
-        values
-            .iter()
-            .any(|value| bytes.windows(value.len()).any(|window| window == *value))
-    };
+    // Each value's searcher is made once: a run's directory holds binaries of tens of megabytes, which
+    // a search window by window would take minutes over for a dozen values.
+    let finders: Vec<memchr::memmem::Finder<'_>> =
+        values.iter().map(memchr::memmem::Finder::new).collect();
+    let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
     let mut scan = KeyScan::default();
     if single {
         let mut bytes = Vec::new();
