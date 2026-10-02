@@ -150,11 +150,14 @@ jobs:
             $version = Skipped 'wsl.exe --list --verbose' 'the distribution was not imported'
           }
 
-          # The answer is read from what the last two steps printed, never from the job's own
-          # status: a step that printed "exit 0" ran, and one that did not is a "no" with its reason
-          # in the table above. A distribution that was not made from the verified image is a "no".
-          $runs = $ran.Finished -and ($ran.Text -match '(?m)^exit 0\s*$')
-          $isTwo = $version.Text -match 'kr-probe\s+\S+\s+2'
+          # The answer is read from what the last two steps printed and from whether each ran to its
+          # end: a step that printed "exit 0" and ended without a failure ran, and one that did not
+          # is a "no" with its reason in the table above. A listing that printed the distribution's
+          # row and then failed is not an answer. A distribution that was not made from the verified
+          # image is a "no".
+          $runs = $ran.Succeeded -and ($ran.Text -match '(?m)^exit 0\s*$')
+          $listed = $version.Succeeded -and ($version.Text -match '(?m)^exit 0\s*$')
+          $isTwo = $listed -and ($version.Text -match 'kr-probe\s+\S+\s+2')
           $verdict = if ($verified -and $wasImported -and $runs -and $isTwo) { 'available' } else { 'unavailable' }
 
           Add-Content $summary "**WSL2 can run a command in a distribution on this runner: $verdict.**"
