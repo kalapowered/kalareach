@@ -18,6 +18,7 @@ import {
   entitlementsFor,
   nestedCode,
   problemsInDescription,
+  problemsOfCertificate,
   problemsInSignatures,
   problemsOfFit,
   readProfile,
@@ -52,6 +53,7 @@ const profile = (entitlements, over = {}) => ({
   team: TEAM,
   expires: new Date('2099-01-01'),
   devices: ['00008140-0000'],
+  certificates: ['A'.repeat(40)],
   entitlements: {
     'application-identifier': `${TEAM}.to.example.app`,
     'com.apple.developer.team-identifier': TEAM,
@@ -118,6 +120,19 @@ held('another team is told', [`its team is OTHER12345, expected ${TEAM}`], probl
 held('another identifier is told', [`its identifier is to.example.other, expected to.example.app`], problemsInDescription(description(chain, TEAM, 'to.example.other'), { identifier: 'to.example.app', team: TEAM }))
 held('a chain of two is told', ['its chain has 2 certificates, expected three'], problemsInDescription(description(chain.slice(0, 2)), { identifier: 'to.example.app', team: TEAM }))
 held('a distribution certificate is told', [`its chain is Apple Distribution: X > ${chain[1]} > ${chain[2]}, expected an Apple Development certificate under Apple's root`], problemsInDescription(description(['Apple Distribution: X', chain[1], chain[2]]), { identifier: 'to.example.app', team: TEAM }))
+
+// -- the certificate a bundle is signed with ------------------------------------------------------
+
+const WANTED = 'A'.repeat(40)
+const OTHER = 'B'.repeat(40)
+const later = new Date('2099-01-01')
+const certificate = (sha1, notAfter = later) => ({ sha1, notAfter })
+held('the wanted certificate, listed by the profile and valid, passes', [], problemsOfCertificate(certificate(WANTED), { identity: WANTED, profile: profile({}) }))
+held('no certificate at all is told', ['it is signed with no certificate'], problemsOfCertificate(null, { identity: WANTED, profile: profile({}) }))
+held('another certificate than the one named is told', [`it is signed with ${OTHER}, not with ${WANTED}`, `the profile Fixture does not list the certificate ${OTHER}, so iOS would refuse to install it`], problemsOfCertificate(certificate(OTHER), { identity: WANTED, profile: profile({}) }))
+held('a certificate the profile does not list is told even when it is the one named', [`the profile Fixture does not list the certificate ${WANTED}, so iOS would refuse to install it`], problemsOfCertificate(certificate(WANTED), { identity: WANTED, profile: profile({}, { certificates: [OTHER] }) }))
+held('a library, which no profile covers, is held to the named certificate only', [], problemsOfCertificate(certificate(WANTED), { identity: WANTED, profile: null }))
+held('an expired certificate is told', [`the certificate ${WANTED} has expired`], problemsOfCertificate(certificate(WANTED, new Date('2000-01-01')), { identity: WANTED, profile: profile({}) }))
 
 // -- the order, and a real round trip with an ad hoc signature ----------------------------------
 
@@ -215,6 +230,9 @@ if (clang.status !== 0 || codesignHere.error) {
     const unsigned = build('unsigned')
     held('a bundle that was never signed is told', true, check(unsigned).some((each) => each.includes('does not verify')))
 
+    // Verified as a real signature would be, an ad hoc one has no certificate and is told so.
+    held('a signature with no certificate is told when one was asked for', true,
+      problemsInSignatures(signingPlan(good, covered), { team: TEAM, identifiers, identity: WANTED }).some((each) => each.includes('it is signed with no certificate')))
     held('a profile that has expired is told', true, check(good, { now: new Date('2100-01-01') }).some((each) => each.includes('has expired')))
     held('a phone the profile does not list is told', true, check(good, { device: '00008140-1111' }).some((each) => each.includes('does not list the phone')))
     held('a bundle that names an identifier it was not given is told', true, check(good, { identifiers: { '': 'to.example.wrong' } }).some((each) => each.includes('its identifier is to.example.app')))
@@ -225,8 +243,9 @@ if (clang.status !== 0 || codesignHere.error) {
 
 if (process.env.KR_TEST_PROFILE && existsSync(process.env.KR_TEST_PROFILE)) {
   const real = readProfile(process.env.KR_TEST_PROFILE)
-  held('a real profile names its team, its UUID, an expiry in the future and an application identifier under the team', true,
-    /^[A-Z0-9]{10}$/.test(real.team) && real.uuid.length === 36 && real.expires > new Date() && real.entitlements['application-identifier'].startsWith(`${real.team}.`))
+  held('a real profile names its team, its UUID, an expiry in the future, an application identifier under the team and a certificate', true,
+    /^[A-Z0-9]{10}$/.test(real.team) && real.uuid.length === 36 && real.expires > new Date() && real.entitlements['application-identifier'].startsWith(`${real.team}.`) &&
+      real.certificates.length > 0 && real.certificates.every((each) => /^[0-9A-F]{40}$/.test(each)))
 } else {
   skipped('reading a real profile', 'KR_TEST_PROFILE names no profile')
 }
