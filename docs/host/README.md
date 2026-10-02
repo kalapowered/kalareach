@@ -554,14 +554,15 @@ from. The plugin runtime reference describes the layout and how the copy is made
 The host compiles the bundle in and checks every byte against the lock when it reads the bundle in,
 before anything is parsed. A bundle whose files do not all match its lock is refused whole.
 
-On its first start the daemon seeds the catalogue from the bundle, once, before it binds any
-endpoint. A build trusts the bundle's root only if the root's key identifiers are ones it commits: a
+At every start the daemon seeds the catalogue from the bundle, before it binds its local
+endpoints. A build trusts the bundle's root only if the root's key identifiers are ones it commits: a
 shipped build commits no production root yet, so it refuses the bundle, and a build with debug
 assertions also trusts the development lineage and seeds only when it is started with `--seed`.
 Where the root is trusted, the seed enrols the official repository against it, activates the bundled
 generation without the network, and installs each bundled package once, enabled and with an empty
-grant. It never replaces an installation that is already there, and an uninstall or a disable by the
-owner is never undone.
+grant. A later start finishes what an earlier one did not reach and takes a newer bundled generation
+after an update. It never replaces an installation that is already there, and an uninstall or a
+disable by the owner is never undone.
 
 What the bundle is not: a catalogue or a grant. It carries one generation, frozen at the commit it
 was copied from, and a package's capability requests, grants and repository ceiling are applied to
