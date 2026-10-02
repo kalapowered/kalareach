@@ -4541,7 +4541,10 @@ mod tests {
         let inner = outer.path().join("units");
         std::fs::create_dir(&inner).expect("a directory");
         std::fs::write(inner.join("data.mount"), "").expect("a unit");
-        assert_eq!(units_across(&[inner.clone()], &["mount"]), Some(1));
+        assert_eq!(
+            units_across(std::slice::from_ref(&inner), &["mount"]),
+            Some(1)
+        );
         std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o000))
             .expect("permissions");
         let reached = units_across(&[inner], &["mount"]);
@@ -4550,7 +4553,7 @@ mod tests {
         // An account that bypasses the mode (root) reaches it anyway, and then counts what is
         // there; what it never does is report none for a directory it could not reach.
         assert!(
-            reached == None || reached == Some(1),
+            reached.is_none() || reached == Some(1),
             "an unreachable ancestor is not an empty directory: {reached:?}"
         );
     }
