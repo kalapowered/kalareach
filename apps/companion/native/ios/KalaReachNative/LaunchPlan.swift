@@ -3,8 +3,8 @@
 //
 //  The decision is made from facts and nothing else, so the rules can be held by tests rather than
 //  by whoever last read the launch code. Three of them matter. A build with no Firebase
-//  configuration does not start Firebase, because starting it with nothing to start from stops the
-//  process. A launch never asks the person for a permission: the product asks in its own context,
+//  configuration, or one Firebase would end the application over, does not start Firebase, because
+//  starting it with nothing to start from stops the process. A launch never asks the person for a permission: the product asks in its own context,
 //  where the person can see why, and registering for remote notifications needs no permission at
 //  all. And the two modes that look at or clean out the device's keychain run before anything else
 //  has had a chance to write to it.
@@ -17,8 +17,9 @@ import UserNotifications
 enum LaunchAction: Equatable {
     /// A device check's own mode, which a debug build was started with.
     case runDebugMode(String)
-    /// There is no Firebase configuration in this build, so Firebase is left alone.
-    case skipFirebase
+    /// Firebase is left alone, for the reason given: this build has no configuration, or has one
+    /// Firebase would end the application over.
+    case skipFirebase(String)
     /// Reads the configuration and starts Firebase.
     case configureFirebase
     /// Gives the application's delegate the two methods the system calls with an APNs token.
@@ -37,22 +38,23 @@ enum LaunchPlan {
     /// What a launch does, in order.
     static func decide(
         debugMode: String?,
-        hasFirebaseConfiguration: Bool,
+        firebase: FirebaseConfiguration,
         permission: PushPermission
     ) -> [LaunchAction] {
         if let mode = debugMode, beforeAnythingWrites.contains(mode) {
             return [.runDebugMode(mode)]
         }
         var plan: [LaunchAction]
-        if hasFirebaseConfiguration {
+        switch firebase {
+        case .usable:
             plan = [
                 .configureFirebase,
                 .addTokenMethods,
                 .registerForRemoteNotifications,
                 .setAutoInit(permission == .granted),
             ]
-        } else {
-            plan = [.skipFirebase]
+        case .unusable(let reason):
+            plan = [.skipFirebase(reason)]
         }
         if let mode = debugMode {
             plan.append(.runDebugMode(mode))
