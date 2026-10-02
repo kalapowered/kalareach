@@ -394,6 +394,13 @@ async fn a_fresh_store_is_seeded_with_nothing_granted() {
         kr_plugin_catalogue::PackageCheck::Complete(_)
     ));
 
+    let provenance = catalogue
+        .seed_provenance(&official.id)
+        .expect("records")
+        .expect("where the generation came from is recorded");
+    assert_eq!(provenance["generation"], bundle.generation().get());
+    assert_eq!(provenance["commit"], bundle.lock().source.commit);
+
     // What is recorded: the enrolment the seed made, where its generation came from and what it did
     // with the package.
     let names: Vec<String> = records(&catalogue)
