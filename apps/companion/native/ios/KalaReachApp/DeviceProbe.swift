@@ -212,7 +212,7 @@ enum DeviceProbe {
         try? FileManager.default.removeItem(at: filed)
         try? FileManager.default.removeItem(at: container().appendingPathComponent("probe-push.txt"))
         guard FirebaseApp.app() != nil else {
-            finish(.push, ["firebase": "skipped"])
+            finish(.push, ["firebase": "skipped", "firebase.reason": PushStartup.skippedBecause ?? "not configured"])
             return
         }
         NotificationRecorder.install()
