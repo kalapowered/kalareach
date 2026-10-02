@@ -628,6 +628,97 @@ fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
     );
 }
 
+/// A claim whose attempt ended before it recorded anything is settled from what the daemon's own
+/// record shows, once: never over an answer or a refusal the claim already holds, never under an
+/// attempt that still holds the claim, and never for an action nobody claimed.
+#[test]
+fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
+    use kr_controller::grants::{ActionClaim, ActionRecord};
+    use kr_protocol::ids::ActionId;
+
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+    let digest = kr_protocol::scalars::Digest256::from_bytes([3; 32]);
+    let claim = |byte: u8| {
+        let action = ActionId::new(Uuid::from_bytes([byte; 16]));
+        match directory
+            .claim_action(&actor, action, &digest, 1_000)
+            .expect("claimed")
+        {
+            ActionClaim::Claimed { hold } => (action, hold),
+            ActionClaim::Recorded(record) => panic!("already claimed: {record:?}"),
+        }
+    };
+
+    // A claim an attempt still holds is that attempt's to answer.
+    let (held, hold) = claim(1);
+    assert!(
+        !directory
+            .settle_unfinished(&actor, held, b"settled", 2_000)
+            .expect("asked"),
+        "a held claim is not settled over its attempt"
+    );
+    assert_eq!(
+        directory
+            .recorded_action(&actor, held, &digest)
+            .expect("readable"),
+        Some(ActionRecord::InFlight)
+    );
+
+    // Once the attempt has ended without recording anything, the claim takes the answer, once.
+    drop(hold);
+    assert!(
+        directory
+            .settle_unfinished(&actor, held, b"settled", 2_001)
+            .expect("settled")
+    );
+    assert!(
+        !directory
+            .settle_unfinished(&actor, held, b"again", 2_002)
+            .expect("asked"),
+        "an answered claim is never settled again"
+    );
+    assert_eq!(
+        directory
+            .recorded_action(&actor, held, &digest)
+            .expect("readable"),
+        Some(ActionRecord::Answered {
+            result: b"settled".to_vec()
+        })
+    );
+
+    // A refusal the claim holds is its answer, and is not replaced by a result.
+    let (refused, hold) = claim(2);
+    directory
+        .retain_refusal(
+            &hold,
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "refused",
+            3_000,
+        )
+        .expect("recorded");
+    drop(hold);
+    assert!(
+        !directory
+            .settle_unfinished(&actor, refused, b"settled", 3_001)
+            .expect("asked")
+    );
+
+    // An action nobody claimed has no row to settle, and the claim it would have is not made.
+    let unclaimed = ActionId::new(Uuid::from_bytes([3; 16]));
+    assert!(
+        !directory
+            .settle_unfinished(&actor, unclaimed, b"settled", 4_000)
+            .expect("asked")
+    );
+    assert!(
+        directory
+            .recorded_action(&actor, unclaimed, &digest)
+            .expect("readable")
+            .is_none()
+    );
+}
+
 /// A revocation an action performs writes what it withdrew beside the action's claim, in the
 /// transaction that withdraws: all of it, or nothing when the withdrawal is refused, and once.
 #[test]
