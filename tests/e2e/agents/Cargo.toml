@@ -28,6 +28,8 @@ kr-ipc = { workspace = true, features = ["testing"] }
 kr-protocol.workspace = true
 # Where the host's configuration document lives, as the host itself works it out.
 kr-worker.workspace = true
+# The agent's own database, read-only, for an agent that keeps its conversations in one.
+rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 # The person's agent configuration, read as TOML, key by key.

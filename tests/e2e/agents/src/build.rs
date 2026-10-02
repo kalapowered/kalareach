@@ -109,6 +109,15 @@ pub struct RequestRecord {
     pub tool: String,
 }
 
+/// The characters an agent draws the sides of a dialog with: not text of the dialog's rows.
+const FRAME: [char; 3] = ['│', '┃', '║'];
+
+/// A row of a dialog without the frame an agent draws around it, and without the spaces beside it:
+/// `│ │ echo a │ │` is `echo a`.
+fn unframed(row: &str) -> &str {
+    row.trim_matches(|character: char| character.is_whitespace() || FRAME.contains(&character))
+}
+
 impl Approval {
     /// The key that refuses any dialog the part did not ask for.
     #[must_use]
@@ -128,7 +137,7 @@ impl Approval {
         let at: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.trim() == wanted.trim())
+            .filter(|(_, row)| unframed(row) == wanted.trim())
             .map(|(index, _)| index)
             .collect();
         let [line] = at.as_slice() else {
@@ -141,7 +150,7 @@ impl Approval {
             let others = rows
                 .iter()
                 .enumerate()
-                .filter(|(index, row)| index != line && row.trim().starts_with(prefix.trim()))
+                .filter(|(index, row)| index != line && unframed(row).starts_with(prefix.trim()))
                 .count();
             if others > 0 {
                 return Err(format!("the dialog shows {others} other command line(s)"));
@@ -154,7 +163,7 @@ impl Approval {
                     "the dialog shows no {start:?} after the part's command"
                 ));
             };
-            if after[..end].iter().any(|row| !row.trim().is_empty()) {
+            if after[..end].iter().any(|row| !unframed(row).is_empty()) {
                 return Err("the dialog shows more than the part's command".to_owned());
             }
         }
@@ -533,6 +542,19 @@ pub struct ProjectServers {
     pub entry: serde_json::Value,
 }
 
+/// Where an agent that keeps its conversations in a database has them read from: the database, and
+/// the `SELECT` that returns each line of each conversation. The query returns two columns, a
+/// conversation's identifier and one line of JSON, in the order the lines are to be read: a line
+/// stands where the fact it records became true.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mirror {
+    /// The database, relative to the home the agent runs with.
+    pub database: String,
+    /// The query.
+    pub query: String,
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -588,6 +610,19 @@ pub struct Account {
     /// the run's directory, and left as they are.
     #[serde(default)]
     pub append_only: Vec<String>,
+    /// Where the conversations are read from where the agent keeps them in a database, in files of
+    /// JSON lines the part writes of its own from it: `conversations` is then not used, and the
+    /// agent runs with the run's own home.
+    #[serde(default)]
+    pub mirror: Option<Mirror>,
+    /// How many separate presses of the interrupt key the agent asks for: its first press arms the
+    /// interrupt and says so, and the next ends the turn. Both in one write do nothing.
+    #[serde(default = "one_press")]
+    pub interrupt_presses: u32,
+    /// The member of the first line of a conversation file that holds the conversation's
+    /// identifier, where the file's own name does not.
+    #[serde(default)]
+    pub conversation_id_member: Option<String>,
     /// The key that queues a prompt behind a running turn, where it is not the submit key.
     #[serde(default)]
     pub queue_key: Option<String>,
@@ -738,6 +773,11 @@ pub struct Account {
     /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
     /// or a template with `{path}`.
     pub image: String,
+}
+
+/// One press of the interrupt key, unless the build list says more.
+const fn one_press() -> u32 {
+    1
 }
 
 /// A newer build of the same application, installed beside the pinned one, for the upgrade case.
@@ -1295,6 +1335,57 @@ mod tests {
             Ok(())
         );
         assert_eq!(claude.refusal(), "d");
+    }
+
+    /// The frame an agent draws around its dialog is not text of the dialog's rows: a row between
+    /// `┃` sides, or inside two boxes, is the command alone.
+    #[test]
+    fn the_frame_glyphs_around_a_dialog_are_not_part_of_its_rows() {
+        let command = "echo kr0123 >> /tmp/run/a";
+        let opencode = Approval {
+            shows: "Permission required".to_owned(),
+            allow: "\r".to_owned(),
+            deny: "\u{1b}".to_owned(),
+            command_line: Some("$ ".to_owned()),
+            options_start: Some("Allow once".to_owned()),
+            others: Vec::new(),
+            refuse: None,
+            relative_log: false,
+            request: None,
+        };
+        let rows = owned(&[
+            "  ┃  △ Permission required",
+            "  ┃    # Shell command",
+            "  ┃",
+            "  ┃  $ echo kr0123 >> /tmp/run/a",
+            "  ┃",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject    enter confirm",
+        ]);
+        assert_eq!(opencode.names_only(&rows, command), Ok(()));
+        let more = owned(&[
+            "  ┃  △ Permission required",
+            "  ┃  $ echo kr0123 >> /tmp/run/a",
+            "  ┃  $ rm x",
+            "  ┃   Allow once   Allow always   Reject",
+        ]);
+        assert!(opencode.names_only(&more, command).is_err());
+        let gemini = Approval {
+            command_line: None,
+            options_start: None,
+            ..opencode
+        };
+        let boxed = owned(&[
+            "│ ? Shell  echo kr0123 >> /tmp/run/a                                  │",
+            "│ ╭───────────────────────────────────────────────────────────────╮ │",
+            "│ │ echo kr0123 >> /tmp/run/a                                     │ │",
+            "│ ╰───────────────────────────────────────────────────────────────╯ │",
+            "│ Allow execution of [Shell]?                                         │",
+        ]);
+        assert_eq!(gemini.names_only(&boxed, command), Ok(()));
+        let other =
+            owned(&["│ │ echo kr0123 >> /tmp/run/b                                     │ │"]);
+        assert!(gemini.names_only(&other, command).is_err());
     }
 
     #[test]

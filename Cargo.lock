@@ -4569,6 +4569,7 @@ dependencies = [
  "kr-ipc",
  "kr-protocol",
  "kr-worker",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

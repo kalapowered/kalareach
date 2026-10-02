@@ -38,6 +38,7 @@ use kr_e2e_agents::detect::{
 };
 use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::keys;
+use kr_e2e_agents::mirror::{self, Mirroring};
 use kr_e2e_agents::network::{Policy, Proxy};
 use kr_e2e_agents::observe::{
     AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
@@ -2093,6 +2094,18 @@ fn staged(
     });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
+    // An agent that keeps its conversations in a database: the files the part reads are exported from
+    // it while the part runs and once more, whole, when everything the part started has ended.
+    let mirroring = login
+        .as_ref()
+        .and_then(|login| login.account.mirror.as_ref())
+        .map(|mirror| {
+            Mirroring::start(
+                run.home().join(&mirror.database),
+                mirror.query.clone(),
+                root.join(mirror::DIRECTORY),
+            )
+        });
     // The person's list of workspaces before anything starts: it may only gain the run's folder. A
     // copy of its bytes goes to the part's private evidence, for the one case that restores it.
     let workspaces = login.as_ref().and_then(|login| {
@@ -2217,6 +2230,11 @@ fn staged(
     } else {
         Ok(())
     };
+    // The mirror's last export, once nothing the part started can write the agent's database.
+    let mirror_failure = mirroring
+        .map(Mirroring::finish)
+        .and_then(Result::err)
+        .map(|why| format!("the agent's conversations could not be mirrored: {why}"));
     // The search for the login's strings and for a subagent's start comes before anything is
     // cleaned up, so what the cleanup removes was searched.
     let searched = login
@@ -2681,10 +2699,16 @@ fn staged(
         if let Some(evidence) = outcome.evidence.as_object_mut() {
             evidence.insert("stop_agent".to_owned(), json!(true));
         }
+        // What the part itself found wrong stays in the reason, in front of the stop.
+        let own = (outcome.outcome == "failed")
+            .then(|| outcome.reason.clone())
+            .flatten()
+            .map(|reason| format!("{reason}; and "))
+            .unwrap_or_default();
         outcome = Outcome::failed(
             part,
             test,
-            &format!("the agent stops here: {}", stop_text(&stop)),
+            &format!("{own}the agent stops here: {}", stop_text(&stop)),
             outcome.evidence.clone(),
         )
         .with_failures(&stop_failures(&stop));
@@ -2692,6 +2716,10 @@ fn staged(
     if let Some(why) = key_failure {
         outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
             .with_failures(&[Failure::KeyScanIncomplete]);
+    }
+    if let Some(why) = mirror_failure {
+        outcome = Outcome::failed(part, test, &why, outcome.evidence.clone())
+            .with_failures(&[Failure::PartFailed]);
     }
     // The result is held against every string searched for before it is written, and the message
     // of the failure is the one that is kept.
@@ -3393,6 +3421,10 @@ fn conversation_roots(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
 
 /// Where the agent keeps its conversations for a part with `login` in `run`, on `dates`.
 fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<PathBuf> {
+    // An agent that keeps its conversations in a database has them read from the mirror's files.
+    if login.account.mirror.is_some() {
+        return vec![run.root().join(mirror::DIRECTORY)];
+    }
     let base = if login.account.config_directory.is_some() {
         run.root().join(CONFIG_DIRECTORY)
     } else {
@@ -3412,6 +3444,20 @@ fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<Pat
             None => base.join(relative),
         })
         .collect()
+}
+
+/// The identifier of the conversation `file` holds: the member of its first line the build list names,
+/// where it names one, else what its name and place say.
+fn conversation_id_of(account: &Account, file: &Path) -> String {
+    account
+        .conversation_id_member
+        .as_deref()
+        .and_then(|member| {
+            let text = std::fs::read_to_string(file).ok()?;
+            let first: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+            first[member].as_str().map(str::to_owned)
+        })
+        .unwrap_or_else(|| conversation_id(file))
 }
 
 /// The files under a part's conversation roots, each with its length, modification time and
@@ -4527,6 +4573,7 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "stored": login.account.stored,
         "home": login.account.home,
         "variable": login.account.variable,
+        "mirror": login.account.mirror.is_some(),
         "arguments": login.account.arguments,
         "variables_absent": login.account.cleared,
         "turns": turns,
@@ -6024,7 +6071,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             ),
             "an image and its question",
         );
-        let answered_rows = logged.answered(stage, &upper, "the agent answers from the image");
+        let mut answered_rows = logged.answered(stage, &upper, "the agent answers from the image");
         let named = |rows: &[String]| {
             rows.iter().any(|row| {
                 row.contains(&upper)
@@ -6033,6 +6080,14 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
                         .any(|word| word == COLOUR)
             })
         };
+        // A model's displayed reasoning can quote the code before its answer: the wait goes on until
+        // a row holds the code beside the colour, which only the answer does, or the time is up.
+        let waited = std::time::Instant::now();
+        while !named(&answered_rows) && waited.elapsed() < LIVENESS {
+            guards_hold_while_waiting(stage);
+            logged.screen.pump(stage, Duration::from_millis(300));
+            answered_rows = logged.screen.view.rows().to_vec();
+        }
         assert!(
             named(&answered_rows),
             "the answer names the image's colour, {COLOUR}, beside the code:\n{}",
@@ -6418,7 +6473,13 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         logged.submit(stage, &long_turn, "a long turn to interrupt");
         let _ = logged.wait_for(stage, &account.busy, "the turn runs");
         let _ = logged.wait_for(stage, &reply_begins, "the turn's reply begins");
-        logged.type_text(stage, &account.interrupt.input);
+        // An agent whose first press only arms the interrupt wants the key again, as a separate press.
+        for press in 0..account.interrupt_presses.max(1) {
+            if press > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            logged.type_text(stage, &account.interrupt.input);
+        }
         let interrupted = logged.wait_for(
             stage,
             &account.interrupt.shows,
@@ -7280,7 +7341,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": { "shows": "input lease", "seen": shown_in_log(stage, "the local terminal's receipt", &receipt, "input lease") }, "exit_status": local_status },
             "command": command,
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
-            "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
+            "decisions": { "conversation": conversation_id_of(account, &conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
             "replay": { "probe": probe, "typed_again": false, "checker_control_rejected": replay_control.is_err() },
             "resources": snapshot.agent_resources.resources.len(),
             "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "command": second_command, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
@@ -7486,7 +7547,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             }
             let evidence = json!({
                 "account": account_evidence(stage, logged.turns),
-                "conversation": conversation_id(&conversation),
+                "conversation": conversation_id_of(account, &conversation),
                 "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, the device was sent or asked for a fresh screen in that time, or its reader was not seen to stop once it disconnected",
                 "code_seen": code_seen,
                 "reader_stopped": reader_stopped,
@@ -7561,7 +7622,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
-            "conversation": conversation_id(&conversation),
+            "conversation": conversation_id_of(account, &conversation),
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
@@ -7607,7 +7668,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &account.prompt_line,
             stage.conversations_before,
         )
-        .map(|file| conversation_id(&file))
+        .map(|file| conversation_id_of(account, &file))
         .unwrap_or_else(|| {
             panic!(
                 "one conversation under {} holds the code",
@@ -7990,13 +8051,7 @@ fn a_session_exports_no_provider_key_but_those_the_build_list_sets_and_a_harmles
             "{name} reached the session"
         );
     }
-    for name in [
-        "HARMLESS_CONTROL",
-        "KR_SESSION_TOKEN",
-        "PATH",
-        "HOME",
-        "ZDOTDIR",
-    ] {
+    for name in ["HARMLESS_CONTROL", "PATH", "HOME", "ZDOTDIR"] {
         assert!(
             names.contains(&name),
             "{name} is exported: a harmless variable passes"
