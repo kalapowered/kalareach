@@ -301,6 +301,71 @@ fn the_archive_reports_a_journal_whose_receipts_table_is_damaged_as_unreadable()
     assert_eq!(archive.receipts, 3);
 }
 
+/// KR-REQ-27.05: the archive reads a journal whose receipts table holds a state the contract does
+/// not have, as a journal it cannot read, rather than as one with no unfinished work.
+///
+/// The count of unfinished actions used to come from the narrowest index that carries the state,
+/// and counted the two states recovery resolves wherever they were. A receipt whose state is none
+/// of the contract's, as text or as bytes, was counted as nothing, so the archive answered with
+/// the recovery's unfinished actions and no sign that a receipt could not be read. Each receipt's
+/// state is now read from the table and checked, and one that is not the contract's is the
+/// archive's reason, reported to the journal's health as corruption. The same journal with every
+/// state the contract's is the control, and still counts the unfinished actions.
+#[test]
+fn the_archive_reports_a_receipt_with_a_state_outside_the_contract_as_unreadable() {
+    let unfinished = |archive: &Archive| {
+        archive
+            .incompleteness
+            .iter()
+            .find_map(|reason| match reason {
+                Incompleteness::RecoveryUnfinished { unresolved } => Some(*unresolved),
+                _ => None,
+            })
+    };
+    let (control, session_id) = in_a_host("unfinished-actions", Made::AsControl);
+    let archive = archive_of(&control, session_id);
+    assert!(!unreadable(&archive), "{:?}", archive.incompleteness);
+    assert_eq!(
+        unfinished(&archive),
+        Some(2),
+        "the control's unfinished actions"
+    );
+
+    for (stored, what) in [("'settled'", "a text"), ("x'ff00'", "a bytes")] {
+        let (host, session_id) = in_a_host("unfinished-actions", Made::AsControl);
+        let path = host.environment().journal_database(session_id);
+        rusqlite::Connection::open(&path)
+            .expect("the journal opens to be changed")
+            .execute(
+                &format!(
+                    "UPDATE receipts SET state = {stored} WHERE action_id = x'03030303030303030303030303030303'"
+                ),
+                [],
+            )
+            .expect("one receipt's state is changed");
+        let archive = archive_of(&host, session_id);
+        assert!(
+            archive.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::JournalUnreadable { detail }
+                    if detail.contains("a stored receipt state is not in the contract")
+            )),
+            "{what} state outside the contract is the archive's reason: {:?}",
+            archive.incompleteness
+        );
+        let journal = Journal::open_read_only(&path).expect("the journal opens to be read");
+        assert!(
+            journal.unresolved_work().is_err(),
+            "{what} state outside the contract is not counted as nothing"
+        );
+        assert_eq!(
+            journal.len().ok(),
+            Some(3),
+            "while the count from an index stays whole, which is why it is not what is asked"
+        );
+    }
+}
+
 /// KR-REQ-27.05, an interrupted transaction: the archive reads a crashed session's journal whose
 /// last commit was cut inside its log, finds that action nowhere and the store readable; the same
 /// journal with its log whole holds the action.
