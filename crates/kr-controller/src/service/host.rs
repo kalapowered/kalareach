@@ -513,8 +513,19 @@ impl Controller {
         use kr_project::service::Refusal;
 
         let proved = self.project.qualify().await;
+        let before = self.qualification();
         self.hold_qualification(Arc::clone(&proved));
         let refusal = proved.refusal();
+        // What stopped the proof is for this daemon's own log, as at its start, and only when the
+        // answer changed: a device that asks the doctor again learns nothing new from the log.
+        if before.refusal() != refusal
+            && matches!(refusal, Some(Refusal::SupportSet | Refusal::Invocation))
+        {
+            eprintln!(
+                "kr-controller: no repository operation is served to a paired device: {}",
+                proved.detail()
+            );
+        }
         let mut checks = vec![DoctorCheck::new(
             "device-repositories",
             "A paired device is served repository operations",

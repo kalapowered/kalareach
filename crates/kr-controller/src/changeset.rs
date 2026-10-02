@@ -523,7 +523,8 @@ pub enum OutOfScope {
     History,
 }
 
-/// Returns the recorded version `version` names when it is inside `scope`.
+/// Returns the recorded version a change set and a version number name, the latest when no number
+/// is given, when it is inside `scope`.
 ///
 /// The check is made against the version's own record, so an identifier the caller made up, one
 /// from another environment and one captured from another workspace are each out of scope the same
@@ -534,11 +535,12 @@ pub enum OutOfScope {
 /// Returns why the version is not inside the scope.
 pub fn version_in_scope(
     service: &ChangeSetService,
-    version: VersionRef,
+    change_set_id: kr_protocol::ids::ChangeSetId,
+    version: Option<kr_protocol::ids::ChangeSetVersion>,
     scope: &VersionScope,
 ) -> std::result::Result<kr_protocol::changeset::ChangeSetVersionRecord, OutOfScope> {
     let record = service
-        .record(version.change_set_id, Some(version.version))
+        .record(change_set_id, version)
         .map_err(OutOfScope::Unreadable)?;
     if !scope.environments.admits(record.environment_id) {
         return Err(OutOfScope::Environment {
