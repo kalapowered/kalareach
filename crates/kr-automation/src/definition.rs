@@ -245,7 +245,18 @@ fn validate_typed_action_params(
 /// Refuses a session node whose parameters `session.create` refuses on the request alone: a
 /// palette its presentation cannot take, and a geometry the terminal cannot open at. Both are the
 /// checks the method itself makes.
+///
+/// A node also carries no environment variables. The session a workflow creates takes the host's
+/// environment, never one a definition holds, and a definition is stored as it was installed: a
+/// variable in it, a credential among them, would stay in the journal for as long as the revision
+/// does. The refusal names neither a variable nor a value.
 fn session_request_refusal(node_id: &str, params: &SessionCreateParams) -> Result<()> {
+    if !params.environment_snapshot.is_empty() {
+        return Err(AutomationError::InvalidArgument(format!(
+            "node {node_id} creates a session with environment variables of its own: a session a \
+             workflow creates takes this host's environment, so the node carries none"
+        )));
+    }
     if let Some(reason) = params.palette_refusal() {
         return Err(AutomationError::InvalidArgument(format!(
             "node {node_id} creates a session session.create would refuse: {reason}"
