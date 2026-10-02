@@ -213,23 +213,49 @@ pub fn identity_command(
     }
 }
 
-/// Builds the command that asks the platform whether one enrolled environment is running.
+/// What asks the platform whether one enrolled environment is registered and running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Observation {
+    /// Two listings that print distribution names and nothing else: the names registered, then the
+    /// names running. A listing that gave each state as a word would give it in the language of the
+    /// host's Windows, and no word of that language is read here.
+    Listings {
+        /// Lists every registered distribution.
+        registered: BridgeCommand,
+        /// Lists the distributions that are running.
+        running: BridgeCommand,
+    },
+    /// One command whose own answer says whether the environment exists and is running.
+    Inspection(BridgeCommand),
+}
+
+/// Builds the commands that ask the platform whether one enrolled environment is running.
 ///
 /// Observing is not starting. Each of these reports state and changes none: `wsl.exe --list
-/// --verbose` prints every registered distribution and its state, and `podman container inspect`
-/// answers about a container that exists without creating or starting one.
+/// --quiet` and `wsl.exe --list --running --quiet` print the names of the registered and of the
+/// running distributions, and `podman container inspect` answers about a container that exists
+/// without creating or starting one.
 ///
 /// # Errors
 ///
 /// As [`command`].
-pub fn observe(enrolment: &EnvironmentEnrolment) -> Result<BridgeCommand, LaunchError> {
+pub fn observe(enrolment: &EnvironmentEnrolment) -> Result<Observation, LaunchError> {
     enrolment.validate().map_err(LaunchError::Incomplete)?;
     match enrolment.access {
-        EnvironmentAccess::WslDistribution => Ok(BridgeCommand {
-            program: "wsl.exe".to_owned(),
-            arguments: vec!["--list".to_owned(), "--verbose".to_owned()],
-        }),
-        EnvironmentAccess::Container => Ok(BridgeCommand {
+        EnvironmentAccess::WslDistribution => {
+            let listing = |arguments: &[&str]| BridgeCommand {
+                program: "wsl.exe".to_owned(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            };
+            Ok(Observation::Listings {
+                registered: listing(&["--list", "--quiet"]),
+                running: listing(&["--list", "--running", "--quiet"]),
+            })
+        }
+        EnvironmentAccess::Container => Ok(Observation::Inspection(BridgeCommand {
             program: CONTAINER_RUNTIME.to_owned(),
             arguments: vec![
                 "container".to_owned(),
@@ -239,7 +265,7 @@ pub fn observe(enrolment: &EnvironmentEnrolment) -> Result<BridgeCommand, Launch
                 "--".to_owned(),
                 enrolment.target.clone(),
             ],
-        }),
+        })),
         access @ (EnvironmentAccess::SshHost | EnvironmentAccess::PairedHost) => {
             Err(LaunchError::NotAProcessBridge { access })
         }
@@ -375,12 +401,15 @@ mod tests {
                 ),
                 "{name}"
             );
-            for build in [observe, start] {
-                assert!(
-                    build(&enrolment(EnvironmentAccess::Container, name, "kala")).is_err(),
-                    "{name} is not observed or started by name either"
-                );
-            }
+            let record = enrolment(EnvironmentAccess::Container, name, "kala");
+            assert!(
+                observe(&record).is_err(),
+                "{name} is not observed by name either"
+            );
+            assert!(
+                start(&record).is_err(),
+                "{name} is not started by name either"
+            );
         }
     }
 
@@ -425,12 +454,11 @@ mod tests {
     #[test]
     fn an_ssh_host_and_a_paired_host_are_not_started_as_bridges() {
         for access in [EnvironmentAccess::SshHost, EnvironmentAccess::PairedHost] {
-            for build in [command, observe, start] {
-                assert_eq!(
-                    build(&enrolment(access, "host", "kala")),
-                    Err(LaunchError::NotAProcessBridge { access })
-                );
-            }
+            let record = enrolment(access, "host", "kala");
+            let refused = LaunchError::NotAProcessBridge { access };
+            assert_eq!(command(&record), Err(refused));
+            assert_eq!(observe(&record), Err(refused));
+            assert_eq!(start(&record), Err(refused));
         }
     }
 
@@ -447,23 +475,39 @@ mod tests {
     }
 
     #[test]
-    fn observing_names_a_command_that_reports_rather_than_starts() {
-        let wsl = observe(&enrolment(
+    fn observing_names_commands_that_report_rather_than_start() {
+        let Ok(Observation::Listings {
+            registered,
+            running,
+        }) = observe(&enrolment(
             EnvironmentAccess::WslDistribution,
             "Ubuntu-24.04",
             "kala",
         ))
-        .expect("a command");
-        assert_eq!(wsl.arguments, vec!["--list", "--verbose"]);
+        else {
+            panic!("a distribution is observed by listings");
+        };
+        // Both print names and nothing else, so no state is read as a word of the host's language.
+        assert_eq!(registered.arguments, vec!["--list", "--quiet"]);
+        assert_eq!(running.arguments, vec!["--list", "--running", "--quiet"]);
         // Nothing in the observation names the helper, so it cannot run one by accident.
-        assert!(!wsl.arguments.iter().any(|argument| argument.contains("kr")));
+        for command in [&registered, &running] {
+            assert_eq!(command.program, "wsl.exe");
+            assert!(
+                !command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.contains("kr"))
+            );
+        }
 
-        let container = observe(&enrolment(
+        let Ok(Observation::Inspection(container)) = observe(&enrolment(
             EnvironmentAccess::Container,
             &"8f3c1d2e4a5b6c7d".repeat(4),
             "kala",
-        ))
-        .expect("a command");
+        )) else {
+            panic!("a container is observed by one inspection");
+        };
         assert_eq!(container.arguments[0..2], ["container", "inspect"]);
         assert!(
             !container
