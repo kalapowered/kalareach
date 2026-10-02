@@ -161,9 +161,9 @@ jobs:
       # somewhere in the run.
       - name: Make the distribution able to run the acceptance
         run: |
-          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends procps git"
+          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends procps git iproute2 iputils-ping"
           if ($LASTEXITCODE -ne 0) { throw "installing the tools exited $LASTEXITCODE" }
-          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c 'missing=; for tool in git pgrep awk find sha256sum stat readlink unshare nohup head tail sort; do command -v $tool >/dev/null 2>&1 || missing="$missing $tool"; done; test -z "$missing" || { echo "missing from the distribution:$missing" >&2; exit 1; }'
+          wsl.exe -d kr-acc-first -u root --exec /bin/sh -c 'missing=; for tool in git pgrep awk find sha256sum stat readlink unshare nohup head tail sort ip ping; do command -v $tool >/dev/null 2>&1 || missing="$missing $tool"; done; test -z "$missing" || { echo "missing from the distribution:$missing" >&2; exit 1; }'
           if ($LASTEXITCODE -ne 0) { throw "the distribution lacks a tool the acceptance runs" }
 
       - name: Fetch the Linux set
