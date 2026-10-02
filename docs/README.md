@@ -181,6 +181,17 @@ The boundary is documented on this side so another implementation can serve it:
 - [the client library's managed services](client/README.md), and the relay and discovery fields a
   host points at a deployment of its own ([transport/README.md](transport/README.md)).
 
+### The commercial model
+
+The commercial model is the managed services, and nothing that runs on a person's own computer is
+sold. The hosted service sells relay bandwidth beyond a free allowance, encrypted storage, and
+metered voice and reasoning. It authenticates each request and enforces payment, reservations and
+limits before it supplies the resource. Basic managed push stays free within its abuse limits. The
+clients carry no payment check of their own: each managed service sits behind a replaceable client
+in `kr-client`, a client with none configured still has every local capability, and what a client
+shows about entitlement explains availability and protects nothing. A fork can run a service of its
+own with its own credentials, and it cannot obtain KalaReach's provider keys.
+
 ## Where work runs
 
 A session, the agents inside it, its repositories and workspaces, its transfers and its automation
