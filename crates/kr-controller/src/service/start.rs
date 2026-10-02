@@ -870,8 +870,9 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
     };
     let now_ms = kr_ipc::now_ms();
     // A session that is neither running nor recorded is not thereby one that has ended: its worker
-    // may not have reported yet. The registry, with the creates the daemon is running, says whether
-    // its launch is over, and whether a worker was ever given a launch specification.
+    // may not have reported yet. The registry, with the creates the daemon is running and the
+    // kernel's answer about a launcher, says whether its launch is over, and whether a worker was
+    // ever given a launch specification.
     let launches = match &recorded {
         Some(recorded) => {
             let unreached = {
@@ -997,10 +998,13 @@ pub(super) async fn launches_between(
             ended_launchers.push(session_id);
         }
     }
-    // A create that is still running has not finished recording its launcher, so a spawned
-    // reservation it holds is not one that recorded none. The creates are listed before the
-    // registry is read again: one that finished since then recorded its launcher first, and the
-    // second read sees it.
+    // A create that is still waiting for its worker has an entry here, and a spawned reservation
+    // it holds is not one that recorded no launcher for good: it may yet record one. A create that
+    // has stopped waiting is refused every claim, and a claim takes the creator's variables only
+    // after it has seen a recorded launcher, and only while the entry exists. So where the entry
+    // was gone when the creates were listed and no launcher is recorded when the registry is read
+    // again, no claim can have taken them, and the create, which ends its wait before it records a
+    // launcher, can give them to none.
     let creating: std::collections::BTreeSet<_> =
         controller.pending.lock().await.keys().copied().collect();
     let create_ended: Vec<SessionId> = unlaunched
@@ -1029,8 +1033,9 @@ pub(super) async fn launches_between(
 /// A claim takes the same guard and moves the reservation out of `spawned`, so a reservation found
 /// here has not been claimed at this moment. One claimed since the caller last looked, one that
 /// recorded a launcher since, and one the registry cannot be read for are not among them: a worker
-/// may have run, or may yet. A claim that commits after this read was admitted for a process that
-/// has since ended, or for none, and so gives a shell to nobody.
+/// may have run, or may yet. Where a launcher is recorded, a claim that commits after this read
+/// was admitted for a process that has since ended, and gives a shell to nobody. Where none is,
+/// no claim can be accepted at all: it needs a recorded launcher and the creator's variables.
 pub(super) async fn still_unclaimed(
     controller: &Controller,
     sessions: &[SessionId],
