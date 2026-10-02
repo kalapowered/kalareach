@@ -2301,3 +2301,61 @@ async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until
     session.close();
     host.stop().await;
 }
+
+/// KR-REQ-23.42: `host.doctor` says whether this host serves a paired device repository
+/// operations, on the terms the door applies, and reports what it shows of the mount residual
+/// where the platform confines Git's reads at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_doctor_says_whether_a_paired_device_is_served_repository_operations() {
+    use kr_project::service::Refusal;
+    use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
+    let doctor: HostDoctorResult = locally(&mut control, Method::HostDoctor, &()).await;
+    let proved = host.controller().qualification();
+    let status = |result: &HostDoctorResult, id: &str| {
+        result
+            .checks
+            .iter()
+            .find(|check| check.id() == id)
+            .map(|check| (check.status, check.detail().to_owned()))
+    };
+    let (served, detail) = status(&doctor, "device-repositories")
+        .expect("the doctor reports whether a paired device is served repository operations");
+    assert_eq!(
+        served,
+        match proved.refusal() {
+            None => DoctorStatus::Ok,
+            Some(Refusal::Platform) => DoctorStatus::NotApplicable,
+            Some(_) => DoctorStatus::Warning,
+        },
+        "the report says what the door reads: {detail}"
+    );
+    let mounts = status(&doctor, "device-repository-mounts");
+    if proved.refusal() == Some(Refusal::Platform) {
+        assert!(
+            mounts.is_none(),
+            "a platform that confines nothing reports nothing about mounts"
+        );
+    } else {
+        let (_, mounts) = mounts.expect("a platform that confines Git's reads reports its mounts");
+        assert!(
+            mounts.contains("does not close it"),
+            "the report says the narrowing is not a closure: {mounts}"
+        );
+    }
+    // A device is told the same, in the export form, and no path or library name is in it.
+    let seen: HostDoctorResult = session
+        .read(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to a device");
+    assert_eq!(
+        status(&seen, "device-repositories").map(|(status, _)| status),
+        Some(served)
+    );
+    session.close();
+    host.stop().await;
+}

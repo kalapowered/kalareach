@@ -509,6 +509,7 @@ impl Controller {
             ),
         ));
         checks.push(self.descriptions.doctor_check(&self.description_settings()));
+        checks.extend(self.device_repository_checks().await);
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
         // working from.
@@ -553,6 +554,90 @@ impl Controller {
                 .await,
         );
         Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
+    }
+
+    /// The doctor's checks of what this host serves a paired device in repository operations:
+    /// whether it qualifies, and what it shows of the mount residual that remains where it does.
+    ///
+    /// The proof is made again here and held in place of the last one, so the door and the report
+    /// say the same thing.
+    async fn device_repository_checks(&self) -> Vec<DoctorCheck> {
+        use kr_project::service::Refusal;
+
+        let proved = self.project.qualify().await;
+        self.hold_qualification(Arc::clone(&proved));
+        let refusal = proved.refusal();
+        let mut checks = vec![DoctorCheck::new(
+            "device-repositories",
+            "A paired device is served repository operations",
+            match refusal {
+                None => DoctorStatus::Ok,
+                Some(Refusal::Platform) => DoctorStatus::NotApplicable,
+                Some(Refusal::SupportSet | Refusal::Invocation) => DoctorStatus::Warning,
+            },
+            match refusal {
+                None => Sentence::new().stated(
+                    "Git runs for a paired device inside a boundary that confines what it reads: \
+                     the loaders and libraries it needs are named and one invocation under the \
+                     boundary ran here",
+                ),
+                Some(refusal) => Sentence::new()
+                    .stated(refusal.text())
+                    .stated(", so a paired device is refused repository operations"),
+            },
+            matches!(refusal, Some(Refusal::SupportSet | Refusal::Invocation)).then_some(
+                "This daemon's own log says what it could not do. A paired device is refused \
+                 until a later check proves it.",
+            ),
+        )];
+        if refusal == Some(Refusal::Platform) {
+            return checks;
+        }
+        // What a host shows of how a filesystem could come to be mounted beneath a directory the
+        // owner authorised. It narrows the residual and never closes it, and the sentence says so.
+        let narrowing = proved.narrowing();
+        let counted = |sentence: Sentence, found: Option<u64>, what: &'static str| match found {
+            Some(count) => sentence.number(count).stated(" ").stated(what),
+            None => sentence
+                .stated("the number of ")
+                .stated(what)
+                .stated(" could not be read"),
+        };
+        let sentence = Sentence::new().stated(narrowing.user_namespaces.map_or(
+            "whether unprivileged user namespaces are allowed could not be read",
+            kr_project::service::UserNamespaces::text,
+        ));
+        let sentence = sentence.stated("; ").stated(narrowing.fusermount.map_or(
+            "whether fusermount is installed could not be read",
+            kr_project::service::Fusermount::text,
+        ));
+        let sentence = counted(sentence.stated("; "), narrowing.automounts, "automounts");
+        let sentence = counted(
+            sentence.stated("; "),
+            narrowing.user_mount_units,
+            "mount units configured for this account",
+        );
+        checks.push(DoctorCheck::new(
+            "device-repository-mounts",
+            "What a paired device's repository operations could reach through a mount",
+            if narrowing.is_narrow() {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warning
+            },
+            sentence.stated(
+                ". This narrows what a paired device's repository operations can reach and does \
+                 not close it: a program running as this account, or this host's own mount \
+                 arrangement, can still put a filesystem beneath a directory the owner \
+                 authorised.",
+            ),
+            (!narrowing.is_narrow()).then_some(
+                "Restrict unprivileged user namespaces, remove the setuid permission from \
+                 fusermount, and keep automount and mount units away from the directories the \
+                 owner authorises.",
+            ),
+        ));
+        checks
     }
 
     /// Every command integration an admitted release declares, and every package the configuration

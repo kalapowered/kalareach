@@ -3943,9 +3943,496 @@ pub(crate) fn new_uuid() -> Uuid {
     Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes())
 }
 
+// ----- what a paired device is served --------------------------------------------------------
+
+/// Why this host does not run Git for a caller bounded by a grant, in the three kinds it has.
+///
+/// A closed set, so the doctor can say each in this build's own words: the detail that names a
+/// path or a library is for the daemon's own log, and a caller is told no more than that the
+/// method is not served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// This platform does not confine what Git reads.
+    Platform,
+    /// This host cannot name the loaders and libraries Git needs.
+    SupportSet,
+    /// An invocation of Git under the rules for such a caller did not run here: the kernel has no
+    /// Landlock at the version the rules need, a filesystem is mounted beneath a directory the
+    /// invocation is granted, or the rules could not be applied.
+    Invocation,
+}
+
+impl Refusal {
+    /// What the doctor says of it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Platform => "this platform does not confine what Git reads",
+            Self::SupportSet => {
+                "this host cannot name the loaders and libraries its Git needs, so it cannot name \
+                 the files an invocation for such a caller may read"
+            }
+            Self::Invocation => {
+                "an invocation of Git under the rules for such a caller did not run on this \
+                 host: its kernel may lack the confinement they need, or a filesystem may be \
+                 mounted beneath a directory the invocation is granted"
+            }
+        }
+    }
+}
+
+/// Whether an unprivileged process on this host can make itself a user namespace, and with it a
+/// mount namespace of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserNamespaces {
+    /// Nothing on this host stops it.
+    Allowed,
+    /// The host restricts it to programs it has a profile for.
+    Restricted,
+    /// The kernel makes none for an unprivileged process.
+    Disabled,
+}
+
+impl UserNamespaces {
+    /// What the doctor says of it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Allowed => "unprivileged user namespaces are allowed",
+            Self::Restricted => "unprivileged user namespaces are restricted to profiled programs",
+            Self::Disabled => "unprivileged user namespaces are disabled",
+        }
+    }
+}
+
+/// Whether the program that lets an unprivileged account mount a filesystem in user space is
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fusermount {
+    /// No such program is installed in the usual places.
+    Absent,
+    /// It is installed without the permission that lets an unprivileged account use it.
+    Unprivileged,
+    /// It is installed with that permission.
+    Setuid,
+}
+
+impl Fusermount {
+    /// What the doctor says of it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Absent => "no fusermount is installed",
+            Self::Unprivileged => "fusermount is installed without the setuid permission",
+            Self::Setuid => "a setuid fusermount is installed",
+        }
+    }
+}
+
+/// What this host shows of the ways a filesystem can come to be mounted beneath a directory an
+/// invocation is granted.
+///
+/// This narrows a residual and never closes it: a program running as the same account, or this
+/// host's own mount arrangement, can still put a mount there while an invocation runs. Each
+/// reading is `None` where this host could not be read. The numbers count what is there now and
+/// say nothing of what could be added.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Narrowing {
+    /// Whether an unprivileged process can make a user namespace.
+    pub user_namespaces: Option<UserNamespaces>,
+    /// Whether the user-space mount program is installed.
+    pub fusermount: Option<Fusermount>,
+    /// How many automounts this host has: mounts of the automounting filesystem in its mount
+    /// table, and automount units its administrator configured.
+    pub automounts: Option<u64>,
+    /// How many mount and automount units this account's own service manager is configured with.
+    pub user_mount_units: Option<u64>,
+}
+
+impl Narrowing {
+    /// Returns whether every reading was made and found nothing that widens the residual.
+    #[must_use]
+    pub fn is_narrow(&self) -> bool {
+        matches!(
+            self.user_namespaces,
+            Some(UserNamespaces::Restricted | UserNamespaces::Disabled)
+        ) && matches!(
+            self.fusermount,
+            Some(Fusermount::Absent | Fusermount::Unprivileged)
+        ) && self.automounts == Some(0)
+            && self.user_mount_units == Some(0)
+    }
+
+    /// Reads this host.
+    #[must_use]
+    #[cfg(target_os = "linux")]
+    pub fn read() -> Self {
+        let text = |path: &str| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|text| text.trim().to_owned())
+        };
+        let table = std::fs::read_to_string("/proc/self/mountinfo").ok();
+        let configured = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".config"))
+                    .filter(|path| path.is_absolute())
+            })
+            .map(|directory| directory.join("systemd").join("user"));
+        Self {
+            user_namespaces: user_namespaces(
+                text("/proc/sys/user/max_user_namespaces").as_deref(),
+                text("/proc/sys/kernel/unprivileged_userns_clone").as_deref(),
+                text("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref(),
+            ),
+            fusermount: Some(fusermount_in(&[
+                "/usr/bin",
+                "/bin",
+                "/usr/local/bin",
+                "/usr/sbin",
+                "/sbin",
+            ])),
+            automounts: table.as_deref().and_then(|table| {
+                Some(
+                    autofs_mounts(table)
+                        + units_in(Path::new("/etc/systemd/system"), &["automount"])?,
+                )
+            }),
+            user_mount_units: match configured {
+                // No directory is no unit: an account that configured none has no such directory.
+                Some(directory) if !directory.exists() => Some(0),
+                Some(directory) => units_in(&directory, &["mount", "automount"]),
+                None => None,
+            },
+        }
+    }
+
+    /// Reads nothing, on a platform where none of it applies.
+    #[must_use]
+    #[cfg(not(target_os = "linux"))]
+    pub const fn read() -> Self {
+        Self {
+            user_namespaces: None,
+            fusermount: None,
+            automounts: None,
+            user_mount_units: None,
+        }
+    }
+}
+
+/// Decides whether an unprivileged process can make a user namespace, from the three settings the
+/// kernel and the distributions publish for it. A setting this host does not have is `None`.
+#[cfg(any(target_os = "linux", test))]
+fn user_namespaces(
+    maximum: Option<&str>,
+    clone: Option<&str>,
+    restricted: Option<&str>,
+) -> Option<UserNamespaces> {
+    // Without the kernel's own limit there is no reading to make.
+    let maximum = maximum?.parse::<u64>().ok()?;
+    if maximum == 0 || clone == Some("0") {
+        return Some(UserNamespaces::Disabled);
+    }
+    if restricted == Some("1") {
+        return Some(UserNamespaces::Restricted);
+    }
+    Some(UserNamespaces::Allowed)
+}
+
+/// Counts the mounts of the automounting filesystem in one reading of the mount table.
+#[cfg(any(target_os = "linux", test))]
+fn autofs_mounts(table: &str) -> u64 {
+    table
+        .lines()
+        .filter(|line| {
+            line.split_once(" - ")
+                .and_then(|(_, after)| after.split(' ').next())
+                == Some("autofs")
+        })
+        .count() as u64
+}
+
+/// Finds the user-space mount program in the directories it is usually installed in.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+fn fusermount_in(directories: &[&str]) -> Fusermount {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut found = Fusermount::Absent;
+    for directory in directories {
+        for name in ["fusermount3", "fusermount"] {
+            let Ok(metadata) = std::fs::metadata(Path::new(directory).join(name)) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if metadata.permissions().mode() & 0o4000 != 0 {
+                return Fusermount::Setuid;
+            }
+            found = Fusermount::Unprivileged;
+        }
+    }
+    found
+}
+
+/// Counts the units of the given kinds in one directory, or `None` when it cannot be read.
+#[cfg(any(target_os = "linux", test))]
+fn units_in(directory: &Path, kinds: &[&str]) -> Option<u64> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(directory).ok()? {
+        let name = entry.ok()?.file_name();
+        if Path::new(&name)
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| kinds.contains(&extension))
+        {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// What this host proved about running Git for a caller bounded by a grant, such as a paired
+/// device.
+///
+/// A host qualifies when Git runs, for such a caller, inside the boundary that confines what it
+/// reads: the kernel's confinement at the version it needs, the rules without the ambient read,
+/// the support set named for this host's Git, and the mount check each invocation makes. One
+/// invocation under exactly those rules proves all four. Nothing off Linux qualifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qualification {
+    refusal: Option<Refusal>,
+    detail: String,
+    narrowing: Narrowing,
+}
+
+impl Qualification {
+    /// A host that did not qualify, for the reason given. `detail` is for the daemon's own log,
+    /// and can name this host's paths and libraries.
+    #[must_use]
+    pub fn refused(refusal: Refusal, detail: &str) -> Self {
+        Self {
+            refusal: Some(refusal),
+            detail: crate::git::redact(detail),
+            narrowing: Narrowing::default(),
+        }
+    }
+
+    /// Returns whether this host runs Git for a caller bounded by a grant.
+    #[must_use]
+    pub const fn qualifies(&self) -> bool {
+        self.refusal.is_none()
+    }
+
+    /// Returns why it does not, when it does not.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<Refusal> {
+        self.refusal
+    }
+
+    /// Returns what stopped it, for this daemon's own log.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// Returns what this host shows of the ways a filesystem can come to be mounted beneath a
+    /// granted directory, which is reported whether or not it qualifies.
+    #[must_use]
+    pub const fn narrowing(&self) -> &Narrowing {
+        &self.narrowing
+    }
+
+    /// Reports the same facts with this host's reading of the narrowing facts.
+    #[must_use]
+    pub const fn with_narrowing(mut self, narrowing: Narrowing) -> Self {
+        self.narrowing = narrowing;
+        self
+    }
+}
+
+impl ProjectService {
+    /// Proves, now, whether this host runs Git for a caller bounded by a grant.
+    ///
+    /// It runs one bounded invocation: the profile's own empty directory under the rules such a
+    /// caller's invocation runs under, which needs the support set, the kernel's confinement, the
+    /// rules without the ambient read and the mount check to hold before Git starts. It starts a
+    /// process and takes a moment, so a caller on an async runtime runs it on a blocking thread.
+    #[must_use]
+    pub fn qualify(&self) -> Qualification {
+        let narrowing = Narrowing::read();
+        if !cfg!(target_os = "linux") {
+            return Qualification::refused(Refusal::Platform, Refusal::Platform.text())
+                .with_narrowing(narrowing);
+        }
+        if let Err(error) = self.profile.support_set() {
+            return Qualification::refused(Refusal::SupportSet, &error.to_string())
+                .with_narrowing(narrowing);
+        }
+        let arguments = [OsStr::new("config"), OsStr::new("--list")];
+        let request = GitRequest::read(self.profile.home_directory(), &arguments)
+            .admitted(Some(ReadAdmission::new(|| Ok(())).bounded()));
+        match self.profile.run(&request) {
+            Ok(output) if output.success => Qualification {
+                refusal: None,
+                detail: String::new(),
+                narrowing,
+            },
+            Ok(output) => Qualification::refused(
+                Refusal::Invocation,
+                &format!(
+                    "the invocation ended with {:?}: {}",
+                    output.status, output.stderr
+                ),
+            )
+            .with_narrowing(narrowing),
+            Err(error) => Qualification::refused(Refusal::Invocation, &error.to_string())
+                .with_narrowing(narrowing),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_namespaces_are_read_from_the_settings_the_kernel_and_the_distributions_publish() {
+        assert_eq!(
+            user_namespaces(Some("63000"), None, None),
+            Some(UserNamespaces::Allowed),
+            "nothing stops it"
+        );
+        assert_eq!(
+            user_namespaces(Some("63000"), Some("1"), Some("0")),
+            Some(UserNamespaces::Allowed),
+            "the distribution's settings leave it on"
+        );
+        assert_eq!(
+            user_namespaces(Some("63000"), None, Some("1")),
+            Some(UserNamespaces::Restricted),
+            "a host that restricts it to profiled programs"
+        );
+        assert_eq!(
+            user_namespaces(Some("0"), None, None),
+            Some(UserNamespaces::Disabled),
+            "a kernel limit of none"
+        );
+        assert_eq!(
+            user_namespaces(Some("63000"), Some("0"), None),
+            Some(UserNamespaces::Disabled),
+            "a distribution's switch turned off"
+        );
+        assert_eq!(
+            user_namespaces(None, Some("1"), Some("0")),
+            None,
+            "no kernel limit to read is no reading"
+        );
+        assert_eq!(user_namespaces(Some("many"), None, None), None);
+    }
+
+    #[test]
+    fn automounts_are_counted_from_the_mount_table() {
+        let table = "\
+22 29 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw
+31 22 0:28 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=30
+40 29 0:35 / /mnt/nfs rw,relatime shared:20 - autofs /etc/auto.nfs rw,fd=11
+57 29 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+";
+        assert_eq!(autofs_mounts(table), 2);
+        assert_eq!(
+            autofs_mounts("57 29 8:1 / / rw - ext4 /dev/sda1 rw\n"),
+            0,
+            "a table with none"
+        );
+        // A name that merely contains the type is not one.
+        assert_eq!(
+            autofs_mounts("57 29 8:1 / /autofs rw - ext4 autofs rw\n"),
+            0,
+            "the type is the first field after the separator"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_user_space_mount_program_is_found_by_its_permission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let bin = directory.path().to_str().expect("a path");
+        assert_eq!(fusermount_in(&[bin]), Fusermount::Absent);
+        let program = directory.path().join("fusermount3");
+        std::fs::write(&program, "#!/bin/sh\n").expect("a file");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("permissions");
+        assert_eq!(
+            fusermount_in(&[bin]),
+            Fusermount::Unprivileged,
+            "installed without the setuid permission"
+        );
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o4755))
+            .expect("permissions");
+        assert_eq!(fusermount_in(&[bin]), Fusermount::Setuid);
+        assert_eq!(
+            fusermount_in(&["/a/directory/that/does/not/exist", bin]),
+            Fusermount::Setuid,
+            "a directory that is not there is skipped"
+        );
+    }
+
+    #[test]
+    fn units_are_counted_by_kind() {
+        let directory = tempfile::tempdir().expect("a directory");
+        assert_eq!(units_in(directory.path(), &["mount", "automount"]), Some(0));
+        for name in ["data.mount", "data.automount", "work.service", "notes"] {
+            std::fs::write(directory.path().join(name), "").expect("a unit");
+        }
+        assert_eq!(units_in(directory.path(), &["mount", "automount"]), Some(2));
+        assert_eq!(units_in(directory.path(), &["automount"]), Some(1));
+        assert_eq!(
+            units_in(&directory.path().join("missing"), &["mount"]),
+            None,
+            "a directory that cannot be read is no reading"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_is_narrow_only_when_every_reading_found_nothing_to_widen_it() {
+        let narrow = Narrowing {
+            user_namespaces: Some(UserNamespaces::Restricted),
+            fusermount: Some(Fusermount::Absent),
+            automounts: Some(0),
+            user_mount_units: Some(0),
+        };
+        assert!(narrow.is_narrow());
+        for wider in [
+            Narrowing {
+                user_namespaces: Some(UserNamespaces::Allowed),
+                ..narrow
+            },
+            Narrowing {
+                fusermount: Some(Fusermount::Setuid),
+                ..narrow
+            },
+            Narrowing {
+                automounts: Some(1),
+                ..narrow
+            },
+            Narrowing {
+                user_mount_units: Some(3),
+                ..narrow
+            },
+            Narrowing {
+                user_namespaces: None,
+                ..narrow
+            },
+        ] {
+            assert!(!wider.is_narrow(), "{wider:?}");
+        }
+    }
 
     #[test]
     fn a_request_for_a_caller_bounded_by_a_grant_is_one_whose_reads_are_bounded() {

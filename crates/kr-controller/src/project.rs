@@ -269,6 +269,22 @@ impl ProjectModule {
         &self.service
     }
 
+    /// Proves whether this host runs Git for a paired device, on a blocking thread: the proof
+    /// starts a process.
+    pub async fn qualify(&self) -> Arc<kr_project::service::Qualification> {
+        let service = Arc::clone(&self.service);
+        Arc::new(
+            tokio::task::spawn_blocking(move || service.qualify())
+                .await
+                .unwrap_or_else(|_| {
+                    kr_project::service::Qualification::refused(
+                        kr_project::service::Refusal::Invocation,
+                        "the proof could not run to its end",
+                    )
+                }),
+        )
+    }
+
     /// Lends the service this host's owner, once, and starts letting go of the challenges the
     /// owner's ledger lets go of.
     ///

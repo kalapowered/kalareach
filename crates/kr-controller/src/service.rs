@@ -354,6 +354,9 @@ pub struct Controller {
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
     project: Arc<crate::project::ProjectModule>,
+    /// What this host last proved about running Git for a paired device: at this daemon's start,
+    /// and again at each `host.doctor`. The door to the five repository operations reads it.
+    qualification: std::sync::RwLock<Arc<kr_project::service::Qualification>>,
     /// The environment's plugin catalogues, whose two method groups this daemon dispatches.
     catalogue: Arc<crate::catalogue::CatalogueModule>,
     /// What the workers hold live and which of them have reported it, which the catalogue asks
@@ -576,6 +579,32 @@ impl Controller {
     #[must_use]
     pub const fn project(&self) -> &Arc<crate::project::ProjectModule> {
         &self.project
+    }
+
+    /// Returns what this host last proved about running Git for a paired device.
+    #[must_use]
+    pub fn qualification(&self) -> Arc<kr_project::service::Qualification> {
+        Arc::clone(
+            &self
+                .qualification
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Holds a later proof in place of the last one.
+    pub(crate) fn hold_qualification(&self, proved: Arc<kr_project::service::Qualification>) {
+        *self
+            .qualification
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = proved;
+    }
+
+    /// Replaces what this host holds of its qualification, for a test of the door on a host that
+    /// does not qualify.
+    #[cfg(feature = "testing")]
+    pub fn hold_qualification_for_tests(&self, proved: kr_project::service::Qualification) {
+        self.hold_qualification(Arc::new(proved));
     }
 
     /// Returns the environment's change-set service.

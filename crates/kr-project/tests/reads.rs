@@ -56,6 +56,23 @@ fn a_platform_that_does_not_confine_reads_refuses_a_bounded_caller_with_its_reas
     );
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_platform_that_does_not_confine_reads_does_not_qualify_and_starts_no_git_to_say_so() {
+    let fixture = Fixture::create();
+    let proved = fixture.service().qualify();
+    assert!(!proved.qualifies());
+    assert_eq!(
+        proved.refusal(),
+        Some(kr_project::service::Refusal::Platform)
+    );
+    assert_eq!(
+        proved.narrowing(),
+        &kr_project::service::Narrowing::default(),
+        "nothing about mounts is read where nothing is confined"
+    );
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::{OsStr, OsString};
@@ -218,6 +235,48 @@ mod linux {
         assert!(
             !outcome.stdout.contains(secret) && !outcome.stderr.contains(secret),
             "{what}: nothing of it was read"
+        );
+    }
+
+    /// A host proves it runs Git for a caller bounded by a grant by running one invocation under
+    /// the rules such a caller runs under. The control is the same proof where that invocation
+    /// does not run: the directory it was started in is replaced between its opening and its
+    /// start, which the boundary refuses, and the host is then one that did not qualify.
+    #[test]
+    fn a_host_proves_the_boundary_by_running_it_and_does_not_qualify_where_it_does_not_run() {
+        use kr_project::service::Refusal;
+
+        let mut fixture = Fixture::create();
+        let proved = fixture.service().qualify();
+        assert!(
+            proved.qualifies(),
+            "this host proves the boundary: {:?}: {}",
+            proved.refusal(),
+            proved.detail()
+        );
+        assert!(proved.detail().is_empty());
+        let reading = proved.narrowing();
+        assert!(
+            reading.user_namespaces.is_some() && reading.automounts.is_some(),
+            "the narrowing facts are read on Linux: {reading:?}"
+        );
+
+        let home = fixture.service().profile().home_directory().to_owned();
+        let moved = home.with_file_name("home-moved-aside");
+        fixture.interpose(kr_project::git::Interposition::new(std::sync::Arc::new(
+            move |described: &str, _working: &Path, _temporary: &Path| {
+                if described.starts_with("git config") && !moved.exists() {
+                    std::fs::rename(&home, &moved).expect("the home directory moves aside");
+                    std::fs::create_dir(&home).expect("another directory takes its name");
+                }
+            },
+        )));
+        let refused = fixture.service().qualify();
+        assert!(!refused.qualifies());
+        assert_eq!(refused.refusal(), Some(Refusal::Invocation));
+        assert!(
+            !refused.detail().is_empty(),
+            "the daemon's own log is told what stopped it"
         );
     }
 
