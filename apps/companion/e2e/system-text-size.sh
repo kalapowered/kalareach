@@ -146,8 +146,10 @@ function restore() {
   restored = true
   try {
     if (before !== null && before !== '') simctl('ui', found.udid, 'content_size', before)
-  } catch {
-    // The simulator may already be gone.
+  } catch (failure) {
+    // The setting stays on the simulator, so the run says so and how to put it back.
+    console.log(`FAIL: the text size ${before} was not put back (${failure.message}): xcrun simctl ui ${found.udid} content_size ${before}`)
+    failures += 1
   }
   try {
     simctl('shutdown', found.udid)
@@ -157,7 +159,7 @@ function restore() {
   server.close()
 }
 // An interruption ends the run the same way: the setting is put back before the script goes.
-for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
   process.on(signal, () => {
     restore()
     process.exit(code)

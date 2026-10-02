@@ -53,18 +53,25 @@ dev() { timeout 60 "$adb" -s "$serial" "$@"; }
   >"${TMPDIR:-/tmp}/kr-text-size-emulator.log" 2>&1 &
 emulator_pid=$!
 scale_before=""
+checks_pid=""
 cleanup() {
-  # Only a device this script has seen answer as its own emulator is written to.
+  # The checks stop first, then what they changed is put back, then the emulator is stopped. Only a
+  # device this script has seen answer as its own emulator is written to.
+  [ -n "$checks_pid" ] && kill "$checks_pid" 2>/dev/null
   if [ -n "$scale_before" ]; then
     dev shell settings put system font_scale "$scale_before" >/dev/null 2>&1
     dev uninstall to.kala.reach >/dev/null 2>&1
   fi
   kill "$emulator_pid" 2>/dev/null
+  # It stops in a few seconds; one that does not is stopped by force, so none is left running.
+  for _ in $(seq 1 30); do
+    kill -0 "$emulator_pid" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -9 "$emulator_pid" 2>/dev/null
 }
-# The emulator is stopped however the script ends, an interruption included.
+# The emulator is stopped however the script ends: the shell runs this on an interruption as well.
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 # Waits for the emulator to say it has finished starting, for as long as it is running and for a
 # limit that only stops a start that will never finish.
@@ -81,11 +88,18 @@ scale_before=$(dev shell settings get system font_scale | tr -d '\r')
 echo "emulator: $(dev shell getprop ro.product.model | tr -d '\r'), API $(dev shell getprop ro.build.version.sdk | tr -d '\r'), font scale $scale_before"
 dev shell "settings put system font_scale 1.0; settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0"
 dev uninstall to.kala.reach >/dev/null 2>&1
-dev install -r "$apk" >/dev/null || { echo "the application did not install"; exit 1; }
+# The package is large, so the install has a limit of its own.
+timeout 600 "$adb" -s "$serial" install -r "$apk" >/dev/null
+case $? in
+  0) ;;
+  124) echo "the application did not install within ten minutes"; exit 1 ;;
+  *) echo "the application did not install"; exit 1 ;;
+esac
 dev shell am start -n to.kala.reach/.MainActivity >/dev/null
 
-# Not `exec`: the shell stays to stop the emulator when the checks end.
-ADB=$adb SERIAL=$serial SHOTS=${KR_TEXT_SIZE_SHOTS:-/tmp} node --input-type=module - <<'JS'
+# Not `exec`: the shell stays to stop the emulator when the checks end, and the checks run beside it so
+# that an interruption stops them as well.
+ADB=$adb SERIAL=$serial SHOTS=${KR_TEXT_SIZE_SHOTS:-/tmp} node --input-type=module - <<'JS' &
 import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -262,4 +276,8 @@ try {
 console.log(failures === 0 ? 'every scale held' : `${failures} did not hold`)
 process.exit(failures === 0 ? 0 : 1)
 JS
-exit $?
+checks_pid=$!
+wait "$checks_pid"
+status=$?
+checks_pid=""
+exit $status
