@@ -83,9 +83,6 @@ impl Credential {
 
     /// Writes the credential to a new owner-only file inside an owner-only directory.
     ///
-    /// **This is a Unix path, and it is refused everywhere else**, for the reason
-    /// [`ManagedProcess::write_registration`] gives.
-    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnsupportedCapability`] on a platform without verifiable owner-only
@@ -315,13 +312,15 @@ impl ManagedProcess {
 
     /// Returns true when this platform publishes the launch credential as a file.
     ///
-    /// Unix does: the host can read back the owning user and the mode bits of the directory it
-    /// wrote into, so "no other account can read this" is a fact rather than a hope. Windows has
-    /// no mode bits, and the host's shared file publication does not yet install or verify a
-    /// restricted access-control list, so the credential is not written to disk there.
+    /// Unix and Windows do. On Unix the host reads back the owning user and the mode bits of the
+    /// directory it writes into; on Windows it reads the directory's access-control list from an
+    /// opened handle and refuses a list that names an account the host does not trust, so on both
+    /// "no other account can read this" is a fact rather than a hope. A platform that can do
+    /// neither is refused before anything starts, and [`crate::broker::NativeGateway::launch`] asks
+    /// this first.
     #[must_use]
     pub const fn publishes_credential_file() -> bool {
-        cfg!(unix)
+        cfg!(any(unix, windows))
     }
 
     /// Writes the registration file the launched process reads its credential from.
@@ -330,13 +329,9 @@ impl ManagedProcess {
     /// the name exists, and the create refuses to replace a name already there, so a file another
     /// writer planted is never written into and never read as though this host had written it.
     ///
-    /// **This is a Unix path, and it is refused everywhere else.** The parent directory is checked
-    /// by its owning user and its mode bits, and a platform that cannot answer those questions
-    /// cannot establish that a file holding a secret is closed to other accounts. Rather than
-    /// write the credential into a file whose protection this host cannot verify, the publication
-    /// is refused, and [`crate::broker::NativeGateway::launch`] asks
-    /// [`ManagedProcess::publishes_credential_file`] before it starts anything, so such a launch
-    /// is refused with no process started.
+    /// The directory it goes in is checked first ([`check_private_directory`]), and a platform that
+    /// cannot establish that a file holding a secret is closed to other accounts refuses the
+    /// publication instead of writing it.
     ///
     /// # Errors
     ///
@@ -350,11 +345,75 @@ impl ManagedProcess {
 
 /// Checks that a directory is the owning user's and closed to everybody else.
 ///
+/// On Unix that is the owning user and the mode bits. On Windows it is the directory's own
+/// access-control list, read from the opened directory and not from its name: the list must be
+/// protected, so nothing above it widens it, and must name no account the machine does not already
+/// trust. A directory that is itself a link is refused, whatever it points at.
+///
 /// # Errors
 ///
 /// Returns [`BrokerError::LedgerUnavailable`] when the directory cannot be read, is not a
 /// directory, or is open to another account.
 pub fn check_private_directory(directory: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        check_private_directory_list(directory)
+    }
+    #[cfg(not(windows))]
+    {
+        check_private_directory_mode(directory)
+    }
+}
+
+/// The Windows check of [`check_private_directory`].
+#[cfg(windows)]
+fn check_private_directory_list(directory: &std::path::Path) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let unreadable = |error: std::io::Error| {
+        BrokerError::ledger(format!(
+            "could not read the registration directory {}: {error}",
+            directory.display()
+        ))
+    };
+    // A directory has no data to read, and Windows will not open one without the backup semantics
+    // that say so. A link is opened as the link itself and refused by its attributes below, so what
+    // the list is read from is the directory that was named and not whatever it points at.
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)
+        .map_err(unreadable)?;
+    let attributes = opened.metadata().map_err(unreadable)?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(BrokerError::ledger(format!(
+            "{} is a link, so it is not the directory it names",
+            directory.display()
+        )));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(BrokerError::ledger(format!(
+            "{} is not a directory",
+            directory.display()
+        )));
+    }
+    kr_ipc::paths::check_access_list(opened.as_handle(), &directory.display().to_string(), true)
+        .map_err(|refusal| match refusal {
+            kr_ipc::paths::AccessListRefusal::Policy(detail)
+            | kr_ipc::paths::AccessListRefusal::Unreadable(detail) => BrokerError::ledger(format!(
+                "{} is not owner-only: {detail}",
+                directory.display()
+            )),
+        })
+}
+
+/// The check of [`check_private_directory`] where the platform has owners and mode bits.
+#[cfg(not(windows))]
+fn check_private_directory_mode(directory: &std::path::Path) -> Result<()> {
     let metadata = std::fs::metadata(directory).map_err(|error| {
         BrokerError::ledger(format!(
             "could not read the registration directory {}: {error}",
