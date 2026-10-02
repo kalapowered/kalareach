@@ -2234,6 +2234,9 @@ fn read_claim(
 ///
 /// One immediate transaction, which reads the shape inside it, so two processes opening one store
 /// at once change it once.
+///
+/// Remove this upgrade once no supported upgrade starts from a build that wrote the receipts table
+/// with the lease column or without the refusal and withdrawal columns.
 fn migrate_receipts(connection: &Connection) -> Result<()> {
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)

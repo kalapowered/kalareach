@@ -1333,6 +1333,12 @@ impl Installer {
     /// That build named a user record after a project directory the request happened to carry.
     /// An ordinary request carries none, so the name cannot be worked out again; it is recognised
     /// by its shape instead.
+    ///
+    /// This serves the installation records such a build left in the records directory. A read
+    /// accepts a record under that name where it finds it, and the move to the current name happens
+    /// only with an install or an uninstall. Remove it, with `migrate_records`,
+    /// `is_legacy_user_record` and the fallback to the earlier name in `record_source`, once no
+    /// supported upgrade starts from a build that named a user record after a project directory.
     fn legacy_records(&self, params: &AgentToolsParams) -> Result<Vec<PathBuf>> {
         if params.scope != kr_protocol::skill::InstallScope::User {
             return Ok(Vec::new());
@@ -1390,6 +1396,8 @@ impl Installer {
     /// hold the record for a moment and the move is tried again while it does, so the new name is
     /// looked at again before every attempt: a record written there while the move waits is left
     /// alone like any other.
+    ///
+    /// Remove it under the condition `legacy_records` states.
     fn migrate_records(&self, params: &AgentToolsParams) -> Result<()> {
         let path = self.record_path(params);
         if path.exists() {
@@ -1758,6 +1766,8 @@ fn is_record_name(name: &str) -> bool {
 }
 
 /// Returns true when this file name is the one an earlier build gave a user record.
+///
+/// Remove it under the condition `legacy_records` states.
 fn is_legacy_user_record(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix)
         .and_then(|rest| rest.strip_suffix(".json"))
