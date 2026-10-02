@@ -976,7 +976,8 @@ fn confine_prepare(login: &Login, run: &Run) {
     let folder = folder_of(run);
     if let Some(above) = confine::git_above(&folder) {
         panic!(
-            "{ISOLATION_UNPROVEN} a .git lies above the run's folder ({} levels up), so the agent              would read instruction files from the directories between them",
+            "{ISOLATION_UNPROVEN} a .git lies above the run's folder ({} levels up), so the agent \
+             would read instruction files from the directories between them",
             folder
                 .ancestors()
                 .position(|path| path == above)
