@@ -11,6 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+
 use kr_protocol::automation::{
     AttentionNoticeParams, DEFAULT_WORKFLOW_ACTION_WAIT_MS, DEFAULT_WORKFLOW_RUN_DEADLINE_MS,
     MAX_NOTICE_SUMMARY_BYTES, MAX_SHELL_COMMAND_BYTES, MAX_TEST_SUITE_BYTES, RequestReviewParams,
@@ -180,6 +182,122 @@ fn validate_shell_grant(
     Ok(())
 }
 
+/// What a node's parameters are when read as the document they are.
+pub(crate) enum Reading {
+    /// A document in which no object names one of its fields twice.
+    Document(serde_json::Value),
+    /// A document in which some object does. A JSON reader that keeps one value for a name reads
+    /// the last, while the text keeps every one, so what the parameters say depends on the reader.
+    Repeats,
+    /// Text that is not a JSON document.
+    NotJson(serde_json::Error),
+}
+
+/// The message of the error a repeated name is read as.
+const REPEATED_NAME: &str = "a parameter name is repeated";
+
+/// A JSON value that is read only when no object in it repeats a name.
+struct Unrepeated(serde_json::Value);
+
+impl<'de> Deserialize<'de> for Unrepeated {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Reads;
+
+        impl<'de> Visitor<'de> for Reads {
+            type Value = serde_json::Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Value::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Number::from_f64(value)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number))
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Value::String(value))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(Unrepeated(item)) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(serde_json::Value::Array(items))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if fields.contains_key(&name) {
+                        // Names no field: the name is part of what was sent.
+                        return Err(A::Error::custom(REPEATED_NAME));
+                    }
+                    let Unrepeated(value) = map.next_value()?;
+                    fields.insert(name, value);
+                }
+                Ok(serde_json::Value::Object(fields))
+            }
+        }
+
+        deserializer.deserialize_any(Reads).map(Self)
+    }
+}
+
+/// Reads a node's parameters, saying so when an object in them repeats a name.
+pub(crate) fn read_parameters(text: &str) -> Reading {
+    match serde_json::from_str::<Unrepeated>(text) {
+        Ok(Unrepeated(value)) => Reading::Document(value),
+        Err(error) if error.to_string().starts_with(REPEATED_NAME) => Reading::Repeats,
+        Err(error) => Reading::NotJson(error),
+    }
+}
+
 /// Validates a node's parameters against its kind's own typed parameters, and inspects every
 /// decoded string value for template syntax.
 fn validate_typed_action_params(
@@ -187,11 +305,20 @@ fn validate_typed_action_params(
     action_kind: WorkflowActionKind,
     params_json: &str,
 ) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
-        AutomationError::InvalidArgument(format!(
-            "node {node_id} action_params is not valid JSON: {e}"
-        ))
-    })?;
+    let parsed = match read_parameters(params_json) {
+        Reading::Document(parsed) => parsed,
+        Reading::Repeats => {
+            return Err(AutomationError::InvalidArgument(format!(
+                "node {node_id} action_params repeats a parameter name, so what it says depends on \
+                 which copy a reader takes"
+            )));
+        }
+        Reading::NotJson(e) => {
+            return Err(AutomationError::InvalidArgument(format!(
+                "node {node_id} action_params is not valid JSON: {e}"
+            )));
+        }
+    };
 
     // Recursively check decoded strings for forbidden template patterns
     check_no_template_values(node_id, &parsed)?;
@@ -214,6 +341,18 @@ fn validate_typed_action_params(
             typed_params::<RequestReviewParams>(node_id, action_kind, &parsed)?;
         }
         WorkflowActionKind::CreateSession => {
+            // Before the parameters are decoded: a decoder's own message quotes the value it could
+            // not read, and the refusal is recorded with the action.
+            if parsed
+                .get("environment_snapshot")
+                .is_some_and(|variables| !variables.as_array().is_some_and(Vec::is_empty))
+            {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} creates a session with environment variables of its own: a \
+                     session a workflow creates takes this host's environment, so the node \
+                     carries none"
+                )));
+            }
             let params: SessionCreateParams = typed_params(node_id, action_kind, &parsed)?;
             session_request_refusal(node_id, &params)?;
         }
@@ -245,18 +384,7 @@ fn validate_typed_action_params(
 /// Refuses a session node whose parameters `session.create` refuses on the request alone: a
 /// palette its presentation cannot take, and a geometry the terminal cannot open at. Both are the
 /// checks the method itself makes.
-///
-/// A node also carries no environment variables. The session a workflow creates takes the host's
-/// environment, never one a definition holds, and a definition is stored as it was installed: a
-/// variable in it, a credential among them, would stay in the journal for as long as the revision
-/// does. The refusal names neither a variable nor a value.
 fn session_request_refusal(node_id: &str, params: &SessionCreateParams) -> Result<()> {
-    if !params.environment_snapshot.is_empty() {
-        return Err(AutomationError::InvalidArgument(format!(
-            "node {node_id} creates a session with environment variables of its own: a session a \
-             workflow creates takes this host's environment, so the node carries none"
-        )));
-    }
     if let Some(reason) = params.palette_refusal() {
         return Err(AutomationError::InvalidArgument(format!(
             "node {node_id} creates a session session.create would refuse: {reason}"

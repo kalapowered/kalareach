@@ -765,6 +765,24 @@ impl<'c> Journal<'c> {
         };
         self.admit()?;
         let def_json = serde_json::to_string(definition)?;
+        // The one place a definition is written, so the rule holds for every writer: the check at
+        // install refuses early and says which node, and this is what no caller can go around.
+        match without_variables(&def_json) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(AutomationError::InvalidArgument(
+                    "a definition that carries environment variables is not stored: a create \
+                     node's parameters hold some, and a stored definition would keep them"
+                        .to_owned(),
+                ));
+            }
+            Err(why) => {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "a definition that cannot be shown to carry no environment variables is not \
+                     stored: {why}"
+                )));
+            }
+        }
         self.conn
             .execute(
                 "INSERT INTO workflow_definitions (
@@ -1871,11 +1889,16 @@ impl std::fmt::Debug for WorkflowStore {
 ///
 /// A node's parameters are a JSON document kept as text inside the definition's own document, so
 /// both are read. Nothing but the variables changes: every other field of the definition and of
-/// the parameters is the value it was. A definition that is not a document with a list of nodes,
-/// or a create node whose parameters are not a document, cannot be shown to hold no variables, and
-/// the reason is returned. The reason names no value.
+/// the parameters is the value it was. Parameters that name a field twice are read as the last
+/// copy says, which is what a reader that keeps one value for a name reads, and are written back
+/// with one copy of each name, so no earlier copy of the variables stays in the text. A definition
+/// that is not a document with a list of nodes, or a create node whose parameters are not a
+/// document, cannot be shown to hold no variables, and the reason is returned. The reason names no
+/// value.
 fn without_variables(stored: &str) -> std::result::Result<Option<String>, String> {
     use serde_json::Value;
+
+    use crate::definition::{Reading, read_parameters};
 
     let mut definition: Value = serde_json::from_str(stored)
         .map_err(|error| format!("it is not a JSON document ({error})"))?;
@@ -1894,19 +1917,32 @@ fn without_variables(stored: &str) -> std::result::Result<Option<String>, String
             .get("action_params")
             .and_then(Value::as_str)
             .ok_or_else(|| "a create node's parameters are not text".to_owned())?;
-        let mut params: Value = serde_json::from_str(text).map_err(|error| {
-            format!("a create node's parameters are not a JSON document ({error})")
-        })?;
+        let (mut params, repeated) = match read_parameters(text) {
+            Reading::Document(params) => (params, false),
+            Reading::Repeats => (
+                serde_json::from_str::<Value>(text).map_err(|error| {
+                    format!("a create node's parameters are not a JSON document ({error})")
+                })?,
+                true,
+            ),
+            Reading::NotJson(error) => {
+                return Err(format!(
+                    "a create node's parameters are not a JSON document ({error})"
+                ));
+            }
+        };
         let object = params
             .as_object_mut()
             .ok_or_else(|| "a create node's parameters are not an object".to_owned())?;
-        if object
+        let carries = object
             .get("environment_snapshot")
-            .is_none_or(|variables| variables.as_array().is_some_and(Vec::is_empty))
-        {
+            .is_some_and(|variables| !variables.as_array().is_some_and(Vec::is_empty));
+        if !carries && !repeated {
             continue;
         }
-        object.insert("environment_snapshot".to_owned(), Value::Array(Vec::new()));
+        if carries {
+            object.insert("environment_snapshot".to_owned(), Value::Array(Vec::new()));
+        }
         node["action_params"] = Value::String(params.to_string());
         changed = true;
     }
@@ -1985,11 +2021,17 @@ impl WorkflowStore {
     ///
     /// The old bytes outlive an update of a row, in free pages and in the write-ahead log, so the
     /// rewrite is followed by `VACUUM`, which builds the file again from the rows it holds, and by
-    /// a truncating checkpoint, which empties the log. Only then does the version move, so a run
-    /// that stops part way is made again from the start; the step is idempotent. A `VACUUM` that
-    /// cannot finish, a log another connection keeps from being taken in and a definition that
-    /// cannot be read stop the open with the cause and what to do about it: keeping the variables
-    /// on disk is the worse outcome.
+    /// a truncating checkpoint, which empties the log. Only then does the version move, and it
+    /// moves in a transaction that first looks at every definition again, so a variable written
+    /// meanwhile by a writer that refused none stops the open instead of staying behind a version
+    /// that says it is gone. A run that stops part way is made again from the start; the step is
+    /// idempotent. A `VACUUM` that cannot finish, a log or a file another connection keeps from
+    /// being taken in, a definition that cannot be read and a variable written meanwhile stop the
+    /// open with the cause and what to do about it: keeping the variables on disk is the worse
+    /// outcome.
+    ///
+    /// Nothing else writes the journal while this runs: a daemon takes its environment's lock
+    /// before it opens the journal, and the commands that open it hold the same lock.
     ///
     /// This goes in the first release after every install has opened its journal at version 7:
     /// nothing earlier is installed anywhere it has to be read from again. Then `init_schema`
@@ -2004,8 +2046,13 @@ impl WorkflowStore {
         compact: impl FnOnce(&Connection) -> rusqlite::Result<()>,
     ) -> Result<()> {
         let mut conn = self.lock();
-        let found: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let empty: bool = conn.query_row(
+        // The version is read and the keys are listed under the write lock the rewrite takes, so
+        // a revision written between the two cannot be missed.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| self.not_brought_forward(error))?;
+        let found: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let empty: bool = tx.query_row(
             "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
             [],
             |row| row.get(0),
@@ -2013,6 +2060,45 @@ impl WorkflowStore {
         if empty || found != SCHEMA_WITH_VARIABLES {
             return Ok(());
         }
+        self.scrub_definitions(&tx)?;
+        tx.commit()
+            .map_err(|error| self.not_brought_forward(error))?;
+        compact(&conn).map_err(|error| self.not_compacted(&error))?;
+        let blocked: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|error| self.not_compacted(&error))?;
+        if blocked != 0 {
+            return Err(AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} was rewritten without the environment variables its \
+                 definitions carried, but its write-ahead log still holds the old copies: it \
+                 could not be taken in while another connection uses the journal. Stop whatever \
+                 else has it open, then start the daemon again",
+                self.path.display()
+            )));
+        }
+        // The version moves with the last look, in one transaction: what is found now is what the
+        // version says is there.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| self.not_brought_forward(error))?;
+        if self.scrub_definitions(&tx)? != 0 {
+            return Err(AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} was written to, by something that does not refuse \
+                 environment variables, while the journal was being brought forward, and a \
+                 definition came to carry some again. Stop whatever else has it open, then start \
+                 the daemon again",
+                self.path.display()
+            )));
+        }
+        tx.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
+        tx.commit()
+            .map_err(|error| self.not_brought_forward(error))?;
+        Ok(())
+    }
+
+    /// Rewrites every stored definition that carries environment variables without them, and
+    /// says how many it rewrote.
+    fn scrub_definitions(&self, tx: &Connection) -> Result<usize> {
         let unreadable = |workflow: &str, revision: i64, why: &str| {
             AutomationError::InvalidArgument(format!(
                 "the workflow journal at {} holds a definition (workflow {workflow}, revision \
@@ -2025,13 +2111,11 @@ impl WorkflowStore {
         // many revisions should not hold them all in memory at once.
         let keys: Vec<(String, i64)> = {
             let mut statement =
-                conn.prepare("SELECT workflow_id, revision FROM workflow_definitions")?;
+                tx.prepare("SELECT workflow_id, revision FROM workflow_definitions")?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        // One immediate transaction, so a second process opening the same journal waits for the
-        // rewrite rather than reading half of it.
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut rewritten = 0;
         for (workflow, revision) in keys {
             let stored: String = tx.query_row(
                 "SELECT definition_json FROM workflow_definitions
@@ -2047,24 +2131,35 @@ impl WorkflowStore {
                      WHERE workflow_id = ?1 AND revision = ?2",
                     params![workflow, revision, emptied],
                 )?;
+                rewritten += 1;
             }
         }
-        tx.commit()?;
-        compact(&conn).map_err(|error| self.not_compacted(&error))?;
-        let blocked: i64 = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-            .map_err(|error| self.not_compacted(&error))?;
-        if blocked != 0 {
-            return Err(AutomationError::InvalidArgument(format!(
-                "the workflow journal at {} was rewritten without the environment variables its \
-                 definitions carried, but its write-ahead log still holds the old copies: it \
-                 could not be taken in while another connection uses the journal. Stop whatever \
-                 else has it open, then start the daemon again",
+        Ok(rewritten)
+    }
+
+    /// Whether SQLite refused because another connection has the file.
+    fn is_in_use(error: &rusqlite::Error) -> bool {
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+
+    /// The refusal for a step that could not start or commit: another connection has the
+    /// journal, or SQLite says what stopped it.
+    fn not_brought_forward(&self, error: rusqlite::Error) -> AutomationError {
+        if Self::is_in_use(&error) {
+            return AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} could not be brought forward: another connection uses \
+                 the journal. Stop whatever else has it open, then start the daemon again",
                 self.path.display()
-            )));
+            ));
         }
-        conn.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
-        Ok(())
+        AutomationError::DatabaseError(error)
     }
 
     /// The refusal for a compaction that did not finish: what happened and what to do.
@@ -2079,6 +2174,9 @@ impl WorkflowStore {
                  can write to; on Windows, the directory that TMP, TEMP or USERPROFILE names, \
                  otherwise the Windows directory), each up to the size of the journal file"
                     .to_owned()
+            }
+            other if Self::is_in_use(other) => {
+                "another connection uses the journal. Stop whatever else has it open".to_owned()
             }
             other => format!("SQLite said: {other}"),
         };
