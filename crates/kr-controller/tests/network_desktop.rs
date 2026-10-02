@@ -327,8 +327,9 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
     assert_eq!(capabilities.power, remotely.power);
 
     // And there is nothing a device can call to change it. Every method the registry admits a
-    // paired device to is checked, not a handful of names this test invented: none of them writes
-    // anything in the host-and-environment group, which is where a power setting would live.
+    // paired device to is checked, not a handful of names this test invented: the only writes it
+    // admits in the host-and-environment group are the three machine group steps, which change the
+    // one record that names a grouping and grant nothing, and no power setting lives there.
     let writes_host_configuration: Vec<&str> = Method::ALL
         .iter()
         .filter(|method| {
@@ -341,9 +342,10 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
         })
         .map(|method| method.as_str())
         .collect();
-    assert!(
-        writes_host_configuration.is_empty(),
-        "a device reads this host's state and changes none of it: {writes_host_configuration:?}"
+    assert_eq!(
+        writes_host_configuration,
+        ["machine.join", "machine.merge", "machine.split"],
+        "a device reads this host's state and changes only its machine group"
     );
 
     session.close();
