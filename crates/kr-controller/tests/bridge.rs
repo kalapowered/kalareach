@@ -900,6 +900,14 @@ fn ssh_stand_in(fixture: &Path) -> String {
 fixture='{fixture}'
 line="$(printf '%s\t' "$@")"
 printf '%s\n' "$line" >>"$fixture/ssh-invocations"
+if [ -e "$fixture/ssh.hold" ]; then
+  : >"$fixture/ssh.opened"
+  waited=0
+  while [ ! -e "$fixture/ssh.release" ] && [ "$waited" -lt 600 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+fi
 cat "$fixture/ssh.answer"
 exec cat >/dev/null
 "##
@@ -1032,6 +1040,39 @@ impl FixtureDaemon {
             bytes.extend(codec.encode_message(frame).expect("a bridge frame encodes"));
         }
         std::fs::write(self.fixture.join("ssh.answer"), bytes).expect("the answer is written");
+    }
+
+    /// Holds the next ssh login open once it has started, until [`Self::release_ssh`].
+    fn hold_ssh(&self) {
+        for stale in ["ssh.opened", "ssh.release"] {
+            let _ = std::fs::remove_file(self.fixture.join(stale));
+        }
+        std::fs::write(self.fixture.join("ssh.hold"), b"").expect("the hold is set");
+    }
+
+    /// Waits until a held ssh login has started.
+    async fn ssh_opened(&self) {
+        let marker = self.fixture.join("ssh.opened");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no ssh login was opened, and the daemon's log says: {}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Holds no further ssh login, and leaves the one that is held where it waits.
+    fn hold_no_more_ssh(&self) {
+        let _ = std::fs::remove_file(self.fixture.join("ssh.hold"));
+    }
+
+    /// Lets a held ssh login answer, and holds none after it.
+    fn release_ssh(&self) {
+        std::fs::write(self.fixture.join("ssh.release"), b"").expect("the release is written");
+        let _ = std::fs::remove_file(self.fixture.join("ssh.hold"));
     }
 
     /// Every argument vector the ssh stand-in was started with, in order.
@@ -1857,6 +1898,116 @@ async fn an_ssh_answer_that_is_not_the_records_registers_nothing() {
                 .readiness
                 .channel_scoped,
             "{what}: the next honest answer registers"
+        );
+    }
+}
+
+/// KR-REQ-25.26: a socket forwarded from here is answered by one of this installation's own
+/// environments, and there can be more than the daemon's own. An answer that is any of them registers
+/// nothing, whichever one the record names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_answer_that_is_any_local_environment_registers_nothing() {
+    let daemon = FixtureDaemon::start();
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    // Another environment of this installation, which its own state directory holds.
+    let other = EnvironmentId::new(Uuid::from_bytes([0x47; 16]));
+    daemon
+        .tree
+        .paths()
+        .environment(other)
+        .create()
+        .expect("a second local environment");
+    // The record names that environment, as an owner who copied an identity from `kr bridge list`
+    // might, and the forwarded socket answers as it.
+    enrol_as(&mut client, host, ssh_record(other)).await;
+    daemon.answer_ssh(&ssh_answer(other, "kala"));
+    let refreshed = refresh_as(&mut client, host, other).await;
+    assert!(
+        refreshed.verification.as_ref().is_none(),
+        "{}",
+        refreshed.connection
+    );
+    assert!(!refreshed.row.readiness.channel_scoped);
+    assert!(
+        refreshed.connection.contains("this host's own environment"),
+        "{}",
+        refreshed.connection
+    );
+}
+
+/// KR-REQ-25.26: an answer over ssh belongs to the record that was approved when the login was
+/// asked, and a record replaced or forgotten while it was held takes nothing from it: not an
+/// established channel for the replacement, and not a refusal's taking back of the replacement's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_login_held_across_a_replaced_record_registers_nothing_for_the_replacement() {
+    let daemon = FixtureDaemon::start();
+    let mut first = daemon.client().await;
+    let mut second = daemon.client().await;
+    let host = daemon.environment_id();
+    for (byte, honest) in [(0x45, true), (0x46, false)] {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([byte; 16]));
+        enrol_as(&mut first, host, ssh_record(environment_id)).await;
+        daemon.answer_ssh(&ssh_answer(environment_id, "kala"));
+        assert!(
+            refresh_as(&mut first, host, environment_id)
+                .await
+                .row
+                .readiness
+                .channel_scoped,
+            "the control: the record's own answer registers"
+        );
+
+        daemon.hold_ssh();
+        let held = refresh_as(&mut first, host, environment_id);
+        let meanwhile = async {
+            daemon.ssh_opened().await;
+            daemon.hold_no_more_ssh();
+            // The replacement is approved and registers its own channel while the first login is
+            // held.
+            let mut replacement = ssh_record(environment_id);
+            "build-2.example".clone_into(&mut replacement.target);
+            enrol_as(&mut second, host, replacement).await;
+            daemon.answer_ssh(&ssh_answer(environment_id, "kala"));
+            let its_own = refresh_as(&mut second, host, environment_id).await;
+            assert!(
+                its_own.row.readiness.channel_scoped,
+                "the replacement's own answer registers its channel: {}",
+                its_own.connection
+            );
+            // The held login ends as the case says.
+            daemon.answer_ssh(&ssh_answer(
+                if honest {
+                    environment_id
+                } else {
+                    EnvironmentId::new(Uuid::from_bytes([0x4f; 16]))
+                },
+                "kala",
+            ));
+            daemon.release_ssh();
+        };
+        let (held, ()) = tokio::join!(held, meanwhile);
+        if honest {
+            assert!(
+                held.connection.contains("record changed"),
+                "the held login says it answered for a record that is gone: {}",
+                held.connection
+            );
+        } else {
+            assert!(
+                held.verification.as_ref().is_none(),
+                "a wrong answer verifies nothing: {}",
+                held.connection
+            );
+        }
+        assert!(
+            inventory(&mut second)
+                .await
+                .rows
+                .iter()
+                .find(|row| row.enrolment.environment_id == environment_id)
+                .is_some_and(|row| row.readiness.channel_scoped),
+            "honest {honest}: what the replacement registered stands"
         );
     }
 }

@@ -489,6 +489,23 @@ impl Store {
         Ok(false)
     }
 
+    /// Returns the cached row for one enrolment and the approved record it is the row of, read
+    /// together.
+    ///
+    /// A caller that goes on to ask the destination about the record keeps the answer against the
+    /// instance it read here. Reading the row and then the instance in two steps would let a record
+    /// replaced between them be answered for under the row of the one before it.
+    #[must_use]
+    pub fn approved(
+        &self,
+        environment_id: EnvironmentId,
+        now_ms: u64,
+    ) -> Option<(EnvironmentInventoryRow, EnrolmentInstance)> {
+        let row = self.row_of(environment_id, now_ms)?;
+        let instance = self.instance_of(environment_id)?;
+        Some((row, instance))
+    }
+
     /// Returns the cached row for one enrolment, without asking any platform.
     #[must_use]
     pub fn row_of(
@@ -621,6 +638,31 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let store = Store::open(directory.path()).expect("an empty store");
         (directory, store)
+    }
+
+    #[test]
+    fn a_row_and_the_instance_it_belongs_to_are_read_together() {
+        let (_directory, mut store) = store();
+        let first = enrolment(1, "ubuntu");
+        store.enrol(first.clone(), 100).expect("enrolled");
+        let (row, instance) = store.approved(first.environment_id, 150).expect("approved");
+        assert_eq!(row.enrolment.target, "ubuntu-distribution");
+        assert_eq!(Some(instance), store.instance_of(first.environment_id));
+
+        // A record approved again under the same identity is another instance, and the row that
+        // comes with it is that record's.
+        let mut replacement = enrolment(1, "ubuntu");
+        "moved-distribution".clone_into(&mut replacement.target);
+        store.enrol(replacement, 200).expect("replaced");
+        let (row, replaced) = store.approved(first.environment_id, 250).expect("approved");
+        assert_eq!(row.enrolment.target, "moved-distribution");
+        assert_ne!(replaced, instance);
+        assert_eq!(Some(replaced), store.instance_of(first.environment_id));
+        assert!(
+            store
+                .approved(EnvironmentId::new(Uuid::from_bytes([9; 16])), 300)
+                .is_none()
+        );
     }
 
     #[test]

@@ -478,7 +478,8 @@ impl Opening {
 }
 
 /// Asks the helper an enrolled environment names, once, who it is, and checks the answer against
-/// the record.
+/// the record. `local_environments` is every environment this installation holds: a socket
+/// forwarded from here answers as one of them.
 ///
 /// This is how a host reached by SSH registers its identity and the channel its helper holds, and
 /// it is the only thing ssh is used for: the helper answers the opening and is ended, and no
@@ -494,6 +495,7 @@ pub async fn identify(
     already_bridged: bool,
     enrolment: &EnvironmentEnrolment,
     origin_environment_id: EnvironmentId,
+    local_environments: &[EnvironmentId],
     build_id: BuildId,
 ) -> Result<BridgeHelloAck, Refusal> {
     if !actor.ingress.may_cross_process_bridge() {
@@ -521,7 +523,9 @@ pub async fn identify(
         target: BridgeTarget::Controller,
     };
     let acknowledgement = discover(&command, &hello).await?;
-    if acknowledgement.environment_id == origin_environment_id {
+    if acknowledgement.environment_id == origin_environment_id
+        || local_environments.contains(&acknowledgement.environment_id)
+    {
         return Err(Refusal::OwnEnvironment);
     }
     if acknowledgement.environment_id != enrolment.environment_id {
@@ -2242,7 +2246,10 @@ mod tests {
             &[],
             &format!("printf 'zzzzzzzz'; {HOLDING_THE_PIPES} exec sleep 600"),
         );
-        let refusal = opening.launch().await.expect_err("what is not a frame is refused");
+        let refusal = opening
+            .launch()
+            .await
+            .expect_err("what is not a frame is refused");
         assert!(matches!(refusal, Refusal::Unreadable { .. }), "{refusal}");
         assert!(
             readers_end_within(std::time::Duration::from_secs(2)).await,
