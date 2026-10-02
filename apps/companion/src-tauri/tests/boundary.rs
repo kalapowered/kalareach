@@ -984,15 +984,18 @@ impl Floor {
         }
     }
 
-    /// The oldest release the platform supports: the major and minor version.
-    fn baseline(self) -> (u32, u32) {
+    /// The oldest release the platform supports, which a declaration names whole.
+    fn baseline(self) -> Version {
         match self {
-            Floor::Ios => (17, 0),
-            Floor::Macos => (14, 0),
-            Floor::Android => (29, 0),
+            Floor::Ios => (17, 0, 0),
+            Floor::Macos => (14, 0, 0),
+            Floor::Android => (29, 0, 0),
         }
     }
 }
+
+/// A version as a declaration writes it: major, minor and patch, the last two 0 where it gives none.
+type Version = (u32, u32, u32);
 
 /// One floor, as a file declares it.
 #[derive(Debug)]
@@ -1000,30 +1003,159 @@ struct Declared {
     file: String,
     line: usize,
     platform: Floor,
-    version: (u32, u32),
+    version: Version,
     text: String,
 }
 
-/// The major and minor version a declaration writes: `17.0`, `'14.0'`, `29`, `.v17` or `.v10_13`.
-fn version_in(text: &str) -> Option<(u32, u32)> {
-    let digits = text
-        .trim()
-        .trim_matches(|c: char| c == '"' || c == '\'' || c == ';' || c == ',')
-        .trim_start_matches(".v")
-        .trim_start_matches('v');
-    let mut parts = digits.split(['.', '_']);
-    let major = parts.next()?.trim().parse().ok()?;
-    let minor = match parts.next() {
-        Some(minor) => minor.trim().parse().ok()?,
-        None => 0,
+/// The version a declaration writes: `17.0`, `'14.0'`, `29`, `17.0.1`, `.v17` or `.v10_13`. Text that
+/// is none of these has no version, and a floor that names one nothing can read is a failure.
+fn version_in(text: &str) -> Option<Version> {
+    let quoted = text.trim().trim_matches(|c: char| c == '"' || c == '\'');
+    // Swift's own spelling, `.v14` or `.v10_13`, or `IOSVersion.v14`.
+    let digits = match quoted.rfind(".v") {
+        Some(at) => &quoted[at + 2..],
+        None => quoted,
     };
-    Some((major, minor))
+    let mut parts = digits.split(['.', '_']);
+    let mut next = |required: bool| -> Option<u32> {
+        match parts.next() {
+            Some(part) => part.parse().ok(),
+            None if required => None,
+            None => Some(0),
+        }
+    };
+    let version = (next(true)?, next(false)?, next(false)?);
+    // Nothing may follow the third number.
+    parts.next().is_none().then_some(version)
 }
 
 /// What follows `marker` on a line, up to `end`.
 fn between<'a>(line: &'a str, marker: &str, end: char) -> Option<&'a str> {
     let rest = &line[line.find(marker)? + marker.len()..];
     Some(&rest[..rest.find(end)?])
+}
+
+/// The value written after `name` on a line, as `name = value;`, `name value` or `name: value`,
+/// with a line comment, a semicolon and a comma taken off. `name` must stand alone as a word.
+fn value_after<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(found) = line[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let after = &line[end..];
+        let after_ok = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if before_ok && after_ok {
+            let rest = after.trim_start().trim_start_matches(['=', ':']).trim();
+            let rest = rest.split("//").next().unwrap_or(rest);
+            return Some(rest.trim().trim_end_matches([';', ',']).trim());
+        }
+        from = end;
+    }
+    None
+}
+
+/// Every floor a file declares, as its line, its platform and the text that names the version. A
+/// file is read by what it is: a floor that is declared and cannot be read stops the test.
+fn floors_in(name: &str, text: &str) -> Vec<(usize, Floor, String)> {
+    let mut found = Vec::new();
+    let mut in_deployment_target = false;
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        let trimmed = line.trim();
+        if name == "build.gradle" || name == "build.gradle.kts" {
+            for key in ["minSdk", "minSdkVersion"] {
+                if let Some(value) = value_after(trimmed, key) {
+                    found.push((number, Floor::Android, value.to_owned()));
+                }
+            }
+        }
+        if name == "Package.swift" {
+            for (marker, platform) in [(".iOS(", Floor::Ios), (".macOS(", Floor::Macos)] {
+                if let Some(inside) = between(trimmed, marker, ')') {
+                    found.push((number, platform, inside.to_owned()));
+                }
+            }
+        }
+        if name == "project.yml" {
+            if trimmed == "deploymentTarget:" {
+                in_deployment_target = true;
+                continue;
+            }
+            if in_deployment_target {
+                if !line.starts_with("    ") {
+                    in_deployment_target = false;
+                } else if let Some((key, value)) = trimmed.split_once(':') {
+                    let platform = match key.trim() {
+                        "iOS" => Floor::Ios,
+                        "macOS" => Floor::Macos,
+                        other => panic!("{name}:{number}: a deployment target for {other}"),
+                    };
+                    found.push((number, platform, value.to_owned()));
+                }
+            }
+        }
+        if name == "project.pbxproj" {
+            for (setting, platform) in [
+                ("IPHONEOS_DEPLOYMENT_TARGET", Floor::Ios),
+                ("MACOSX_DEPLOYMENT_TARGET", Floor::Macos),
+            ] {
+                if let Some(value) = value_after(trimmed, setting) {
+                    found.push((number, platform, value.to_owned()));
+                }
+            }
+        }
+        if name == "Podfile" {
+            if let Some(rest) = trimmed.strip_prefix("platform") {
+                let rest = rest.trim_start();
+                for (marker, platform) in [(":ios", Floor::Ios), (":osx", Floor::Macos)] {
+                    if let Some(value) = rest.strip_prefix(marker) {
+                        let value = value.trim_start().trim_start_matches(',').trim();
+                        found.push((number, platform, value.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    if name.ends_with(".plist") {
+        // A key and its value may be on one line or on two, so the text is read as a whole.
+        for (key, platform) in [
+            ("MinimumOSVersion", Floor::Ios),
+            ("LSMinimumSystemVersion", Floor::Macos),
+        ] {
+            let marker = format!("<key>{key}</key>");
+            let mut from = 0;
+            while let Some(found_at) = text[from..].find(&marker) {
+                let after = from + found_at + marker.len();
+                let value = between(&text[after..], "<string>", '<')
+                    .unwrap_or_else(|| panic!("{name}: {key} has no string value"));
+                let line = text[..from + found_at].matches('\n').count() + 1;
+                found.push((line, platform, value.to_owned()));
+                from = after;
+            }
+        }
+    }
+    found
+}
+
+/// A floor as a file declares it. A declaration with no version a reader can find in it stops the
+/// test, so a floor written a way this scan does not read is never one it passes over.
+fn declared(file: &str, line: usize, platform: Floor, text: &str) -> Declared {
+    let version =
+        version_in(text).unwrap_or_else(|| panic!("{file}:{line}: no version in {text:?}"));
+    Declared {
+        file: file.to_owned(),
+        line,
+        platform,
+        version,
+        text: text.trim().to_owned(),
+    }
 }
 
 /// Every floor the application's files declare.
@@ -1033,21 +1165,10 @@ fn declared_floors() -> Vec<Declared> {
         .expect("the crate sits in the application")
         .to_path_buf();
     let mut found = Vec::new();
-    let mut add = |file: &str, line: usize, platform: Floor, text: &str| {
-        let version =
-            version_in(text).unwrap_or_else(|| panic!("{file}:{line}: no version in {text:?}"));
-        found.push(Declared {
-            file: file.to_owned(),
-            line,
-            platform,
-            version,
-            text: text.trim().to_owned(),
-        });
-    };
     for file in repository_files(&application) {
         let name = file.rsplit('/').next().unwrap_or(&file);
         let path = application.join(&file);
-        if name == "tauri.conf.json" && file == "src-tauri/tauri.conf.json" {
+        if file == "src-tauri/tauri.conf.json" {
             let bundle = read(&path)["bundle"].clone();
             for (key, platform, field) in [
                 ("macOS", Floor::Macos, "minimumSystemVersion"),
@@ -1058,95 +1179,15 @@ fn declared_floors() -> Vec<Declared> {
                 let text = value
                     .as_str()
                     .map_or_else(|| value.to_string(), std::borrow::ToOwned::to_owned);
-                add(&file, 0, platform, &text);
+                found.push(declared(&file, 0, platform, &text));
             }
-            continue;
-        }
-        let is_gradle = name == "build.gradle" || name == "build.gradle.kts";
-        let is_package = name == "Package.swift";
-        let is_project = name == "project.yml";
-        let is_pbxproj = name == "project.pbxproj";
-        let is_podfile = name == "Podfile";
-        let is_plist = name.ends_with(".plist");
-        if !(is_gradle || is_package || is_project || is_pbxproj || is_podfile || is_plist) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let mut in_deployment_target = false;
-        let mut previous_key = String::new();
-        for (index, line) in text.lines().enumerate() {
-            let number = index + 1;
-            let trimmed = line.trim();
-            if is_gradle
-                && (trimmed.starts_with("minSdk =") || trimmed.starts_with("minSdkVersion"))
-            {
-                add(
-                    &file,
-                    number,
-                    Floor::Android,
-                    trimmed.rsplit('=').next().unwrap_or(""),
-                );
-            }
-            if is_package {
-                for (marker, platform) in [(".iOS(", Floor::Ios), (".macOS(", Floor::Macos)] {
-                    if let Some(inside) = between(trimmed, marker, ')') {
-                        add(&file, number, platform, inside);
-                    }
-                }
-            }
-            if is_project {
-                if trimmed == "deploymentTarget:" {
-                    in_deployment_target = true;
-                    continue;
-                }
-                if in_deployment_target {
-                    if !line.starts_with("    ") {
-                        in_deployment_target = false;
-                    } else if let Some((key, value)) = trimmed.split_once(':') {
-                        let platform = match key {
-                            "iOS" => Floor::Ios,
-                            "macOS" => Floor::Macos,
-                            other => panic!("{file}:{number}: a deployment target for {other}"),
-                        };
-                        add(&file, number, platform, value);
-                    }
-                }
-            }
-            if is_pbxproj {
-                for (setting, platform) in [
-                    ("IPHONEOS_DEPLOYMENT_TARGET", Floor::Ios),
-                    ("MACOSX_DEPLOYMENT_TARGET", Floor::Macos),
-                ] {
-                    if let Some(value) = trimmed.strip_prefix(&format!("{setting} = ")) {
-                        add(&file, number, platform, value);
-                    }
-                }
-            }
-            if is_podfile {
-                for (marker, platform) in [
-                    ("platform :ios,", Floor::Ios),
-                    ("platform :osx,", Floor::Macos),
-                ] {
-                    if let Some(value) = trimmed.strip_prefix(marker) {
-                        add(&file, number, platform, value);
-                    }
-                }
-            }
-            if is_plist {
-                if let Some(value) = between(trimmed, "<string>", '<') {
-                    let platform = match previous_key.as_str() {
-                        "MinimumOSVersion" => Some(Floor::Ios),
-                        "LSMinimumSystemVersion" => Some(Floor::Macos),
-                        _ => None,
-                    };
-                    if let Some(platform) = platform {
-                        add(&file, number, platform, value);
-                    }
-                }
-                previous_key = between(trimmed, "<key>", '<').unwrap_or("").to_owned();
-            }
+        for (line, platform, value) in floors_in(name, &text) {
+            found.push(declared(&file, line, platform, &value));
         }
     }
     found
@@ -1226,7 +1267,12 @@ fn the_android_activity_is_restarted_by_a_font_scale_change_so_the_page_follows_
     let manifest =
         std::fs::read_to_string(crate_root().join("gen/android/app/src/main/AndroidManifest.xml"))
             .expect("the application's manifest can be read");
-    let changes = manifest
+    // The main activity's own element, whatever order the manifest lists its activities in.
+    let activity = manifest
+        .split("<activity")
+        .find(|element| element.contains("android:name=\".MainActivity\""))
+        .expect("the manifest declares the main activity");
+    let changes = activity
         .split("android:configChanges=\"")
         .nth(1)
         .and_then(|rest| rest.split('"').next())
@@ -1243,4 +1289,109 @@ fn the_android_activity_is_restarted_by_a_font_scale_change_so_the_page_follows_
             "the main activity does not handle {needed}: {changes}"
         );
     }
+}
+
+/// The scan reads each way a file can write a floor, so a floor written another way is held to the
+/// baseline like any other and is never passed over.
+#[test]
+fn the_floor_scan_reads_each_way_a_file_can_write_a_floor() {
+    let read = |name: &str, text: &str| -> Vec<(Floor, Version)> {
+        floors_in(name, text)
+            .into_iter()
+            .map(|(_, platform, value)| (platform, version_in(&value).expect("a readable version")))
+            .collect()
+    };
+    for text in [
+        "minSdk = 24",
+        "minSdk=24",
+        "    minSdk = 24 // a comment",
+        "minSdkVersion 24",
+        "minSdkVersion = 24",
+    ] {
+        assert_eq!(
+            read("build.gradle.kts", text),
+            [(Floor::Android, (24, 0, 0))],
+            "{text}"
+        );
+    }
+    assert!(read("build.gradle.kts", "minSdkPreview = 24").is_empty());
+    for text in [
+        "IPHONEOS_DEPLOYMENT_TARGET = 16.0;",
+        "IPHONEOS_DEPLOYMENT_TARGET=16.0;",
+        "\t\t\t\tIPHONEOS_DEPLOYMENT_TARGET =  16.0 ;",
+    ] {
+        assert_eq!(
+            read("project.pbxproj", text),
+            [(Floor::Ios, (16, 0, 0))],
+            "{text}"
+        );
+    }
+    assert_eq!(
+        read("project.pbxproj", "MACOSX_DEPLOYMENT_TARGET = 13.3.1;"),
+        [(Floor::Macos, (13, 3, 1))]
+    );
+    for text in [
+        ".iOS(.v14)",
+        ".iOS(\"14.0\")",
+        ".iOS(SupportedPlatform.IOSVersion.v14)",
+    ] {
+        assert_eq!(
+            read("Package.swift", text),
+            [(Floor::Ios, (14, 0, 0))],
+            "{text}"
+        );
+    }
+    assert_eq!(
+        read("Package.swift", ".macOS(.v10_13)"),
+        [(Floor::Macos, (10, 13, 0))]
+    );
+    for text in [
+        "platform :ios, '14.0'",
+        "platform :ios,'14.0'",
+        "platform  :ios ,  '14.0'",
+    ] {
+        assert_eq!(read("Podfile", text), [(Floor::Ios, (14, 0, 0))], "{text}");
+    }
+    assert_eq!(
+        read(
+            "project.yml",
+            "options:\n  deploymentTarget:\n    iOS: 14.0\n    macOS: 12.0\n  other: 1\n"
+        ),
+        [(Floor::Ios, (14, 0, 0)), (Floor::Macos, (12, 0, 0))]
+    );
+    // A key and its value on one line, or on two.
+    assert_eq!(
+        read(
+            "Info.plist",
+            "<key>MinimumOSVersion</key><string>16.0</string>"
+        ),
+        [(Floor::Ios, (16, 0, 0))]
+    );
+    assert_eq!(
+        read(
+            "Info.plist",
+            "<dict>\n\t<key>LSMinimumSystemVersion</key>\n\t<string>12.0</string>\n</dict>"
+        ),
+        [(Floor::Macos, (12, 0, 0))]
+    );
+    // A baseline written with a patch is not the baseline.
+    assert_eq!(version_in("17.0.1"), Some((17, 0, 1)));
+    assert_ne!(version_in("17.0.1"), Some(Floor::Ios.baseline()));
+    assert_eq!(version_in("17"), Some(Floor::Ios.baseline()));
+    for unreadable in ["", "latest", "17.beta", "17.0.1.2", ".vX"] {
+        assert_eq!(version_in(unreadable), None, "{unreadable:?}");
+    }
+}
+
+/// A floor that is declared and cannot be read is a failure, not a floor the scan passes over.
+#[test]
+#[should_panic(expected = "no version in")]
+fn a_floor_the_scan_cannot_read_stops_it() {
+    let found = floors_in(
+        "project.pbxproj",
+        "IPHONEOS_DEPLOYMENT_TARGET = $(KR_FLOOR);",
+    );
+    assert_eq!(found.len(), 1);
+    let (line, platform, value) = &found[0];
+    declared("project.pbxproj", *line, *platform, value);
 }
