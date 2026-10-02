@@ -132,6 +132,8 @@ held('no certificate at all is told', ['it is signed with no certificate'], prob
 held('another certificate than the one named is told', [`it is signed with ${OTHER}, not with ${WANTED}`, `the profile Fixture does not list the certificate ${OTHER}, so iOS would refuse to install it`], problemsOfCertificate(certificate(OTHER), { identity: WANTED, profile: profile({}) }))
 held('a certificate the profile does not list is told even when it is the one named', [`the profile Fixture does not list the certificate ${WANTED}, so iOS would refuse to install it`], problemsOfCertificate(certificate(WANTED), { identity: WANTED, profile: profile({}, { certificates: [OTHER] }) }))
 held('a library, which no profile covers, is held to the named certificate only', [], problemsOfCertificate(certificate(WANTED), { identity: WANTED, profile: null }))
+held('an unreadable end of validity is told, not passed', [`the end of the certificate ${WANTED}'s validity cannot be read`], problemsOfCertificate({ sha1: WANTED, notAfter: null }, { identity: WANTED, profile: profile({}) }))
+held('an end of validity that does not parse is told, not passed', [`the end of the certificate ${WANTED}'s validity cannot be read`], problemsOfCertificate({ sha1: WANTED, notAfter: new Date('not a date') }, { identity: WANTED, profile: profile({}) }))
 held('an expired certificate is told', [`the certificate ${WANTED} has expired`], problemsOfCertificate(certificate(WANTED, new Date('2000-01-01')), { identity: WANTED, profile: profile({}) }))
 
 // -- the order, and a real round trip with an ad hoc signature ----------------------------------
