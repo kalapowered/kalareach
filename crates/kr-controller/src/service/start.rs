@@ -64,6 +64,7 @@ impl Controller {
     /// without descriptions does: descriptions are never what stops a daemon.
     pub(crate) async fn start_descriptions(self: &std::sync::Arc<Self>) {
         let settings = self.description_settings();
+        self.descriptions.note_start_settings(&settings);
         let state_dir = self.paths.state_dir().to_path_buf();
         let placed = self.description_placement(&state_dir);
         let setup = crate::describe::host::Setup {

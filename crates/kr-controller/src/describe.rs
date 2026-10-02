@@ -93,8 +93,9 @@ pub struct DescribeModule {
     links: link::Links,
     /// The fetch of the model's files, when one runs.
     fetches: assets::Fetches,
-    /// Whether descriptions were on at the last acceptance of the configuration, so that a fetch
-    /// is stopped by the change to off and not by every acceptance that finds them off.
+    /// Whether descriptions were on when the settings were last applied: at the daemon's start, and
+    /// at each acceptance of the configuration after it. A fetch is stopped by the change to off
+    /// and not by every acceptance that finds them off.
     enabled_seen: std::sync::atomic::AtomicBool,
     /// Where this crate's own tests stop a read.
     #[cfg(test)]
@@ -153,6 +154,14 @@ impl DescribeModule {
     #[must_use]
     pub fn figures(&self) -> Option<host::Figures> {
         self.host().map(|host| host.snapshot().figures)
+    }
+
+    /// Records the settings the daemon started with, which the host was given: the first
+    /// acceptance of the configuration after a start compares with them, so that a document that
+    /// says descriptions are off, restarted with, does not look like a change to off.
+    pub(crate) fn note_start_settings(&self, settings: &kr_describe::resource::ResourceSettings) {
+        self.enabled_seen
+            .store(settings.enabled, std::sync::atomic::Ordering::Release);
     }
 
     /// Applies the owner's settings, as the configuration document says them: the host takes them
@@ -265,13 +274,13 @@ impl DescribeModule {
             ),
             Some(_) if !settings.enabled => (
                 DoctorStatus::NotApplicable,
-                Sentence::new().stated("descriptions are off; every session shows its title from metadata"),
+                Sentence::new().stated("descriptions are off; nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
                 Some("kr host descriptions --on turns them on."),
             ),
             Some(snapshot) => match snapshot.paused {
                 Some(DescriptionPause::NotDownloaded) => (
                     DoctorStatus::Warning,
-                    Sentence::new().stated("the model's files are not on this host, so titles come from metadata"),
+                    Sentence::new().stated("the model's files are not on this host, so nothing new is generated, and a session shows the title it has from metadata, a pin or an earlier description"),
                     Some("kr host descriptions --download fetches them; the size is shown first."),
                 ),
                 Some(DescriptionPause::InferenceFailed) => (
@@ -637,6 +646,10 @@ impl crate::service::Controller {
                     },
                 )
                 .await?;
+                // Asked to turn them off: a fetch stops, whether or not they were on a moment ago.
+                if params.enabled.0 == Some(false) {
+                    self.descriptions.fetches.cancel();
+                }
                 self.description_setup()
             }
             Method::DescriptionDownload => {
