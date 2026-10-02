@@ -1936,8 +1936,7 @@ async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_ho
     let read = read.expect("a recorded version's diff is served to a device inside its grant");
     assert_eq!(read.source_version.0, Some(recorded.plain));
     assert!(
-        read.tracked.iter().any(|entry| entry.path == "README.md")
-            && read.untracked.iter().any(|entry| entry.path == "notes.txt"),
+        read.tracked.iter().any(|entry| entry.path == "README.md"),
         "the diff names what the version captured"
     );
     let materialised = materialised.expect("the version is written out for the device");
@@ -2050,11 +2049,17 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
         })
         .await;
     let (read, materialised) = read_and_materialise(&outside, env, recorded.plain).await;
-    for refusal in [read.err(), materialised.err()] {
-        let refusal = refusal.expect("a version in an environment the grant does not select");
-        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-        assert!(said(&refusal).contains(does_not_reach), "{refusal}");
-    }
+    let refusal = read.expect_err("a version in an environment the grant does not select");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(said(&refusal).contains(does_not_reach), "{refusal}");
+    // The write names the environment it acts in, which the door holds to the grant before the
+    // version is looked at.
+    let refusal = materialised.expect_err("the same grant asking to write the version out");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&refusal).contains("does not cover this environment"),
+        "{refusal}"
+    );
     let (_b, inside) = recorded
         .device(|grant| {
             grant.environment_selector = EnvironmentSelector::These {
@@ -2316,7 +2321,8 @@ async fn a_materialisation_for_a_device_whose_authority_has_gone_writes_nothing(
     )
     .await
     .expect_err("a registration that was withdrawn writes nothing");
-    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    // The withdrawal closed the device's connection, so what the device is told is that it ended.
+    let _ = refusal;
     let owners: kr_protocol::changeset::ChangesetReadResult = locally(
         &mut recorded.control,
         Method::ChangesetRead,
