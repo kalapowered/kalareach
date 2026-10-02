@@ -1109,44 +1109,77 @@ async fn an_unreadable_or_foreign_record_is_refused_and_kept_and_moving_it_aside
     }
 }
 
-/// One step a device takes while this suite holds it between its admission and its write: the
-/// step arrives, `between` runs while it is held, and the step is let go. A host ends a revoked
-/// device's connection, so the step may be answered with a refusal or not at all.
-async fn held_step<F, Fut>(
-    host: &Host,
-    connection: RawDevice,
-    params: MachineJoinParams,
-    between: F,
-) -> Option<std::result::Result<ParamsValue, ProtocolError>>
+/// Where this suite stops a step on its way to the record.
+#[derive(Clone, Copy, Debug)]
+enum Point {
+    /// Once the step has claimed its action, before its authority is asked about again and the
+    /// record is read.
+    BeforeTheWrite,
+    /// Once its new record is written and flushed, before the record is replaced and the authority
+    /// is asked about for the last time.
+    AtTheReplacement,
+}
+
+/// Runs `step`, stops it at `point` while `between` runs, and then lets it go. Returns what the step
+/// came to, or `None` where its task ended without an answer, as one does when the host ends the
+/// connection of a device it has revoked.
+async fn held<S, B>(
+    controller: &std::sync::Arc<kr_controller::service::Controller>,
+    point: Point,
+    step: S,
+    between: B,
+) -> Option<S::Output>
 where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    S: std::future::Future + Send + 'static,
+    S::Output: Send + 'static,
+    B: std::future::Future<Output = ()>,
 {
-    let (arrived, go) = host.controller().hold_the_next_machine_step();
-    let environment = target(host);
-    let step = tokio::spawn(async move {
-        connection
-            .mutate(Method::MachineJoin, action(), environment, &params)
-            .await
-    });
-    arrived.await.expect("the step reached its write");
-    between().await;
-    go.send(()).expect("lets the step go");
+    let (arrived, go): (_, Box<dyn FnOnce() + Send>) = match point {
+        Point::BeforeTheWrite => {
+            let (arrived, go) = controller.hold_the_next_machine_step();
+            (
+                arrived,
+                Box::new(move || go.send(()).expect("lets the step go")),
+            )
+        }
+        Point::AtTheReplacement => {
+            let (arrived, go) = controller.hold_the_next_machine_publication();
+            (
+                arrived,
+                Box::new(move || go.send(()).expect("lets the step go")),
+            )
+        }
+    };
+    let step = tokio::spawn(step);
+    arrived.await.expect("the step reached its hold");
+    between.await;
+    go();
     step.await.ok()
 }
 
-/// KR-REQ-03.07: the authority a step was admitted under is checked again at the write. A device
-/// whose registration is withdrawn after its step was admitted and before it is written has that
-/// step refused, so does one whose host's authority moved on under it, because another device was
-/// revoked meanwhile and the step was admitted under the authority that replaced, and the record is
-/// as it was either way: the owner's next step, approved against the record the device saw, still
-/// finds it. The control is the same step with nothing withdrawn, which writes.
+/// The join a step takes, as the parameters carry it.
+fn joining(into: MachineId, expected: &MachineGroup) -> MachineJoinParams {
+    MachineJoinParams {
+        machine_id: into,
+        expected: expecting(expected),
+    }
+}
+
+/// KR-REQ-03.07: the authority a step was admitted under is checked again where it counts, at
+/// both points a step can be stopped at: before its record is read, and at the moment its record is
+/// replaced. Another device's revocation, which withdraws that device alone and moves the host's
+/// authority on, makes the step refused at either door and at either point, with the refusal
+/// itself and not a connection that went away; the device's own revocation ends its connection;
+/// and in every case the record is as it was, so the owner's next step, approved against the record
+/// the step saw, still finds it. A caller that has lost its authority is told that, and nothing of
+/// the record. The control is the same step with nothing withdrawn, which writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_authority_a_step_was_admitted_under_is_checked_again_at_the_write() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut local = host.client().await;
-    let minted = group_of(&mut local).await;
+    let mut current = group_of(&mut local).await;
+    let controller = host.controller().clone();
 
     let pair = |rights: Vec<ActionRight>| {
         let host = &host;
@@ -1158,100 +1191,432 @@ async fn the_authority_a_step_was_admitted_under_is_checked_again_at_the_write()
             (device, record)
         }
     };
-    let revoke = |device_id| {
-        let host = &host;
-        let client = host.client();
-        async move {
-            client
+    // The owner's step, approved against the record the withdrawn step saw: it finds that record
+    // unchanged, so nothing was written, and it also leaves nothing on its way to the record.
+    // Another device's revocation leaves the owner's connection standing, and a device's own
+    // revocation withdraws every registration, so the owner connects again before each one.
+    let mut next = 0xc0_u8;
+    macro_rules! unchanged_and_moved_on {
+        () => {{
+            drop(local);
+            local = host.client().await;
+            assert_eq!(
+                group_of(&mut local).await,
+                current,
+                "the withdrawn step wrote"
+            );
+            next += 1;
+            current = join(&host, &mut local, some_group(next), &current)
                 .await
-                .mutate(
-                    Method::DeviceRevoke,
-                    action(),
-                    target(host),
-                    &kr_protocol::sharing::DeviceRevokeParams { device_id },
-                )
-                .await
-                .expect("reaches the daemon")
-                .expect("revokes the device");
+                .expect("the owner's step finds the record as the withdrawn step saw it")
+                .machine;
+        }};
+    }
+
+    for (point, first) in [
+        (Point::BeforeTheWrite, 0xb0_u8),
+        (Point::AtTheReplacement, 0xb8),
+    ] {
+        // Another device is revoked after the step was admitted: a device's step.
+        let (managing, managing_record) = pair(vec![ActionRight::HostManage]).await;
+        let (_other, other_record) = pair(vec![ActionRight::SessionView]).await;
+        let connection = RawDevice::connect(&host, &managing, &managing_record).await;
+        let params = joining(some_group(first), &current);
+        let environment = target(&host);
+        let revoked = other_record.device_id;
+        let answer = held(
+            &controller,
+            point,
+            async move {
+                connection
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+            },
+            async {
+                host.network()
+                    .revoke_device(revoked)
+                    .await
+                    .expect("revokes the other device");
+            },
+        )
+        .await
+        .expect("another device's revocation does not end this device's connection")
+        .expect_err("admitted under an authority since replaced");
+        assert_eq!(
+            answer.code,
+            ErrorCode::PermissionDenied,
+            "{point:?}, device door"
+        );
+        assert!(
+            answer.message.contains("withdrawn"),
+            "{point:?}, device door: {}",
+            answer.message
+        );
+        assert_eq!(
+            group_of(&mut local).await,
+            current,
+            "the withdrawn step wrote"
+        );
+
+        // The same revocation, and a step at the daemon's own socket.
+        let (_another, another_record) = pair(vec![ActionRight::SessionView]).await;
+        let params = joining(some_group(first + 1), &current);
+        let environment = target(&host);
+        let revoked = another_record.device_id;
+        let (returned, answer) = held(
+            &controller,
+            point,
+            async move {
+                let answer = local
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+                    .expect("the call reaches the daemon");
+                (local, answer)
+            },
+            async {
+                host.network()
+                    .revoke_device(revoked)
+                    .await
+                    .expect("revokes the other device");
+            },
+        )
+        .await
+        .expect("the owner's connection stands");
+        local = returned;
+        let answer = answer.expect_err("admitted under an authority since replaced");
+        assert_eq!(
+            answer.code,
+            ErrorCode::PermissionDenied,
+            "{point:?}, local door"
+        );
+        assert!(
+            answer.message.contains("withdrawn"),
+            "{point:?}, local door: {}",
+            answer.message
+        );
+        unchanged_and_moved_on!();
+
+        // The stepping device's own registration is withdrawn: its connection ends, and it may be
+        // answered or not.
+        let (managing_two, managing_two_record) = pair(vec![ActionRight::HostManage]).await;
+        let connection = RawDevice::connect(&host, &managing_two, &managing_two_record).await;
+        let params = joining(some_group(first + 2), &current);
+        let environment = target(&host);
+        let device_id = managing_two_record.device_id;
+        let host_ref = &host;
+        let answer = held(
+            &controller,
+            point,
+            async move {
+                connection
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+            },
+            async move {
+                host_ref
+                    .client()
+                    .await
+                    .mutate(
+                        Method::DeviceRevoke,
+                        action(),
+                        target(host_ref),
+                        &kr_protocol::sharing::DeviceRevokeParams { device_id },
+                    )
+                    .await
+                    .expect("reaches the daemon")
+                    .expect("revokes the device");
+            },
+        )
+        .await;
+        if let Some(answer) = answer {
+            assert_eq!(
+                answer.expect_err("withdrawn before the write").code,
+                ErrorCode::PermissionDenied
+            );
         }
-    };
+        unchanged_and_moved_on!();
 
-    // Another device is revoked after the step was admitted and before it is written.
-    let (managing, managing_record) = pair(vec![ActionRight::HostManage]).await;
-    let (_other, other_record) = pair(vec![ActionRight::SessionView]).await;
-    let connection = RawDevice::connect(&host, &managing, &managing_record).await;
-    let answer = held_step(
-        &host,
-        connection,
-        MachineJoinParams {
-            machine_id: some_group(0xb1),
-            expected: expecting(&minted),
-        },
-        || revoke(other_record.device_id),
-    )
-    .await;
-    if let Some(answer) = answer {
-        assert_eq!(
-            answer
-                .expect_err("admitted under an authority since replaced")
-                .code,
-            ErrorCode::PermissionDenied
-        );
-    }
-    // The owner's step, approved against the record the device saw, finds it unchanged. It also
-    // waits behind the held step, so nothing is still on its way to the record. A revocation
-    // withdraws every connection's registration, so the owner connects again.
-    drop(local);
-    let mut local = host.client().await;
-    let after_first = join(&host, &mut local, some_group(0xc1), &minted)
+        // A caller whose authority is gone is told that and nothing of the record: its
+        // precondition is stale as well, and the answer is still the refusal.
+        if matches!(point, Point::BeforeTheWrite) {
+            let (managing_three, managing_three_record) = pair(vec![ActionRight::HostManage]).await;
+            let (_third, third_record) = pair(vec![ActionRight::SessionView]).await;
+            let connection =
+                RawDevice::connect(&host, &managing_three, &managing_three_record).await;
+            let seen = current.clone();
+            let moved = join(&host, &mut local, some_group(first + 3), &current)
+                .await
+                .expect("the owner moves the record on");
+            current = moved.machine;
+            let params = joining(some_group(first + 4), &seen);
+            let environment = target(&host);
+            let revoked = third_record.device_id;
+            let answer = held(
+                &controller,
+                point,
+                async move {
+                    connection
+                        .mutate(Method::MachineJoin, action(), environment, &params)
+                        .await
+                },
+                async {
+                    host.network()
+                        .revoke_device(revoked)
+                        .await
+                        .expect("revokes the other device");
+                },
+            )
+            .await
+            .expect("another device's revocation does not end this device's connection")
+            .expect_err("a withdrawn caller is refused");
+            assert_eq!(
+                answer.code,
+                ErrorCode::PermissionDenied,
+                "a caller with no authority is told that, and nothing of the record: {}",
+                answer.message
+            );
+            unchanged_and_moved_on!();
+        }
+
+        // The control: a device whose authority nothing withdrew, held at the same point.
+        let (controlled, controlled_record) = pair(vec![ActionRight::HostManage]).await;
+        let connection = RawDevice::connect(&host, &controlled, &controlled_record).await;
+        let params = joining(some_group(first + 5), &current);
+        let environment = target(&host);
+        let answer = held(
+            &controller,
+            point,
+            async move {
+                connection
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+            },
+            async {},
+        )
         .await
-        .expect("the record was not written by the withdrawn step");
+        .expect("the device is still connected")
+        .expect("nothing withdrawn, so it writes");
+        let written: MachineStepResult = typed(&answer);
+        assert_eq!(written.machine.machine_id, some_group(first + 5));
+        assert_eq!(group_of(&mut local).await, written.machine);
+        current = written.machine;
 
-    // The device's own registration is withdrawn after the step was admitted and before it is
-    // written.
-    let (managing_two, managing_two_record) = pair(vec![ActionRight::HostManage]).await;
-    let connection = RawDevice::connect(&host, &managing_two, &managing_two_record).await;
-    let answer = held_step(
-        &host,
-        connection,
-        MachineJoinParams {
-            machine_id: some_group(0xb2),
-            expected: expecting(&after_first.machine),
-        },
-        || revoke(managing_two_record.device_id),
-    )
-    .await;
-    if let Some(answer) = answer {
-        assert_eq!(
-            answer.expect_err("withdrawn before the write").code,
-            ErrorCode::PermissionDenied
-        );
-    }
-    drop(local);
-    let mut local = host.client().await;
-    let after_second = join(&host, &mut local, some_group(0xc2), &after_first.machine)
+        // And the owner's own step, held at the same point.
+        let params = joining(some_group(first + 6), &current);
+        let environment = target(&host);
+        let (returned, answer) = held(
+            &controller,
+            point,
+            async move {
+                let answer = local
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+                    .expect("the call reaches the daemon");
+                (local, answer)
+            },
+            async {},
+        )
         .await
-        .expect("the record was not written by the withdrawn step");
+        .expect("the owner's connection stands");
+        local = returned;
+        let written: MachineStepResult = typed(&answer.expect("nothing withdrawn, so it writes"));
+        assert_eq!(written.machine.machine_id, some_group(first + 6));
+        current = written.machine;
+    }
 
-    // The control: a device whose authority nothing withdrew, held at the same point.
-    let (controlled, controlled_record) = pair(vec![ActionRight::HostManage]).await;
-    let connection = RawDevice::connect(&host, &controlled, &controlled_record).await;
-    let answer = held_step(
-        &host,
-        connection,
-        MachineJoinParams {
-            machine_id: some_group(0xb3),
-            expected: expecting(&after_second.machine),
+    drop(local);
+    host.stop().await;
+}
+
+/// A daemon that serves its own socket on a continuous clock this suite moves by hand, so that a
+/// deadline passes by a condition and never by waiting.
+struct ClockedHost {
+    temp: kr_ipc::testing::TempHost,
+    controller: std::sync::Arc<kr_controller::service::Controller>,
+    endpoint: kr_ipc::paths::Endpoint,
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+}
+
+impl ClockedHost {
+    async fn start(clocks: kr_controller::service::Clocks) -> Self {
+        use kr_controller::service::{Controller, ControllerSetup};
+        use kr_crypto::store::{StoreSelection, open_store_in};
+        use kr_ipc::verify::ControllerIdentity;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = kr_controller::testing::taken_over(|| {
+            let secrets = environment.secrets_dir();
+            Controller::start_on_clocks(
+                ControllerSetup {
+                    paths: environment.clone(),
+                    environment_id,
+                    identity: Box::new(move || {
+                        let store = open_store_in(&secrets)
+                            .expect("a secret store for the test environment");
+                        Ok(
+                            ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                                .expect("an identity"),
+                        )
+                    }),
+                    secret_store: StoreSelection::File,
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    supervisor: Box::new(net_support::RefusingSupervisor),
+                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                    build_id: net_support::build(),
+                    release: "0".to_owned(),
+                    shell_packages: None,
+                    terminal: Box::new(kr_controller::supervision::NoTerminal),
+                },
+                clocks.clone(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let clients = tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+        Self {
+            temp,
+            controller,
+            endpoint,
+            clients,
+        }
+    }
+
+    async fn client(&self) -> LocalClient {
+        LocalClient::connect(
+            &self.endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            net_support::build(),
+        )
+        .await
+        .expect("connects to the control endpoint")
+    }
+
+    fn environment(&self) -> ActionTarget {
+        ActionTarget::environment(self.temp.environment_id())
+    }
+
+    async fn stop(self) {
+        self.clients.abort();
+        let _ = self.clients.await;
+        drop(self.controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-03.07: the deadline a step was admitted under is checked at the moment its record is
+/// replaced, not only before the record is written: the new record is written and flushed first, and
+/// a deadline that passes meanwhile leaves the old record. The daemon runs on a clock this test
+/// moves by hand: the step is stopped once its new record is written, the clock is moved past the
+/// deadline, and the step goes on. Stopped before it reads the record, the same step is refused as
+/// well, and the control, the clock where it was, writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_deadline_passes_while_its_record_is_written_leaves_the_old_record() {
+    let clock = kr_transport::clock::ManualClock::new();
+    let host = ClockedHost::start(kr_controller::service::Clocks {
+        continuous: std::sync::Arc::new(clock.clone()),
+        wall: kr_controller::service::WallClock::system(),
+    })
+    .await;
+    let controller = host.controller.clone();
+    let mut client = host.client().await;
+    let mut current = group_of(&mut client).await;
+    let past_the_deadline =
+        std::time::Duration::from_millis(kr_protocol::limits::MAX_MUTATION_TTL.get() + 1_000);
+
+    // The control: held at the replacement with the clock where it was, the step writes.
+    let params = joining(some_group(0xf0), &current);
+    let environment = host.environment();
+    let (returned, answer) = held(
+        &controller,
+        Point::AtTheReplacement,
+        async move {
+            let answer = client
+                .mutate(Method::MachineJoin, action(), environment, &params)
+                .await
+                .expect("the call reaches the daemon");
+            (client, answer)
         },
-        || async {},
+        async {},
     )
     .await
-    .expect("the device is still connected")
-    .expect("nothing withdrawn, so it writes");
-    let written: MachineStepResult = typed(&answer);
-    assert_eq!(written.machine.machine_id, some_group(0xb3));
-    assert_eq!(group_of(&mut local).await, written.machine);
+    .expect("the connection stands");
+    client = returned;
+    let written: MachineStepResult = typed(&answer.expect("the deadline stands, so it writes"));
+    assert_eq!(written.machine.machine_id, some_group(0xf0));
+    current = written.machine;
+    assert_eq!(group_of(&mut client).await, current);
 
-    drop(local);
+    for (point, into) in [
+        (Point::AtTheReplacement, 0xe1_u8),
+        (Point::BeforeTheWrite, 0xe2),
+    ] {
+        let record = host.temp.environment().state_dir().join(RECORD_FILE);
+        let on_disk = std::fs::read(&record).expect("the record");
+        let params = joining(some_group(into), &current);
+        let environment = host.environment();
+        let (returned, answer) = held(
+            &controller,
+            point,
+            async move {
+                let answer = client
+                    .mutate(Method::MachineJoin, action(), environment, &params)
+                    .await
+                    .expect("the call reaches the daemon");
+                (client, answer)
+            },
+            async {
+                clock.advance(past_the_deadline);
+            },
+        )
+        .await
+        .expect("the connection stands");
+        client = returned;
+        let refused = answer.expect_err("the deadline passed before the record was replaced");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{point:?}");
+        assert!(
+            refused.message.contains("deadline"),
+            "{point:?}: {}",
+            refused.message
+        );
+        assert_eq!(
+            std::fs::read(&record).expect("the record"),
+            on_disk,
+            "{point:?}: a step whose deadline had passed wrote"
+        );
+        assert_eq!(group_of(&mut client).await, current);
+        let leftovers: Vec<_> = std::fs::read_dir(host.temp.environment().state_dir())
+            .expect("reads the state directory")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".machine-group.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "{point:?}: a refused step left its file"
+        );
+        // The owner's next step finds the record, over a connection whose action window the moved
+        // clock has not outlived.
+        drop(client);
+        client = host.client().await;
+        current = {
+            let params = joining(some_group(into + 0x10), &current);
+            let moved = client
+                .mutate(Method::MachineJoin, action(), host.environment(), &params)
+                .await
+                .expect("the call reaches the daemon")
+                .expect("a step under a deadline that stands writes");
+            typed::<MachineStepResult>(&moved).machine
+        };
+    }
+
+    drop(client);
     host.stop().await;
 }
