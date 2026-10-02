@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
+#[cfg(unix)]
+use std::time::Duration;
 
 /// What every one of these directories is called, before what tells one run's from every other's.
 const PREFIX: &str = "kalareach-command-tests-";
@@ -95,6 +97,70 @@ fn this_runs_name() -> String {
     )
 }
 
+/// A shell function that ends every process running a program from inside the directory it is
+/// given, and returns when none is left.
+///
+/// What a run launches from its directory is its own: the directory's name carries a token no other
+/// run has. The processes are asked to end, given up to ten seconds to, and then killed. A worker
+/// is detached from the test that had its session made and from the daemon that started it, so
+/// nothing ends it but a session's closure, and a run that ended before its sessions were closed
+/// leaves it running its shell until the machine restarts.
+///
+/// A process runs a program from inside the directory when the command `ps` lists for it begins
+/// with the directory's path and a slash. The whole command is compared, so a path with spaces in
+/// it matches as any other does, and the directory reaches `awk` through the environment, which
+/// reads no escape sequence in it. What is killed is listed again just before it is, so a number
+/// that was a worker's and has been given to another process in the meantime is not signalled for
+/// a list that is older than the signal.
+const END_WHAT_RUNS_FROM: &str = r#"
+running_from() {
+  /bin/ps axww -o pid=,command= | KR_DIR="$1" /usr/bin/awk '
+    BEGIN { dir = ENVIRON["KR_DIR"] "/" }
+    { pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, dir) == 1) print pid }'
+}
+end_what_runs_from() {
+  pids=$(running_from "$1")
+  [ -n "$pids" ] || return 0
+  kill $pids 2>/dev/null
+  tries=0
+  while [ "$tries" -lt 100 ]; do
+    pids=$(running_from "$1")
+    [ -n "$pids" ] || return 0
+    tries=$((tries + 1))
+    sleep 0.1
+  done
+  pids=$(running_from "$1")
+  [ -z "$pids" ] || kill -9 $pids 2>/dev/null
+  return 0
+}
+"#;
+
+/// Starts the watcher of `root`, and returns the end of the pipe it reads: when that end closes, the
+/// watcher ends what runs from `root` and removes it.
+///
+/// It is in a process group of its own, so that a harness that ends a run by ending the group it
+/// started does not end the watcher with it.
+pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!(
+            "{END_WHAT_RUNS_FROM}\ncat >/dev/null && end_what_runs_from \"${{1:?}}\" && rm -rf -- \"${{1:?}}\""
+        ))
+        .arg("sh")
+        .arg(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(0);
+    }
+    command.spawn().ok()?.stdin.take()
+}
+
 /// Arranges for `root` to be taken away when this process ends, however it ends.
 ///
 /// A run cannot remove its own directory on the way out: it is launching binaries out of it until
@@ -105,6 +171,9 @@ fn this_runs_name() -> String {
 /// descriptor it held closes, the read reaches its end, and the directory goes. That is true of
 /// every way a process can end, including being killed, and it does not depend on recognising this
 /// process afterwards by a number that may by then belong to something else.
+///
+/// What still runs from the directory goes first, because it is a worker the run started: see
+/// [`END_WHAT_RUNS_FROM`].
 ///
 /// The end this run holds is kept for the life of the process on purpose, and every end this
 /// process ever holds is kept: dropping one would be telling its watcher to remove a directory
@@ -122,21 +191,9 @@ fn this_runs_name() -> String {
 fn take_it_away_when_this_run_ends(root: &Path) {
     static HELD: Mutex<Vec<std::process::ChildStdin>> = Mutex::new(Vec::new());
 
-    let Ok(mut watching) = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"cat >/dev/null && rm -rf -- "${1:?}""#)
-        .arg("sh")
-        .arg(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
-        // Nothing to do about it here. On Unix the sweep below is what answers for a run whose
-        // ending nothing watched.
-        return;
-    };
-    if let Some(end) = watching.stdin.take() {
+    // Nothing to do about a watcher that did not start. On Unix the sweep below is what answers for
+    // a run whose ending nothing watched.
+    if let Some(end) = watch(root) {
         HELD.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(end);
@@ -167,7 +224,7 @@ fn take_it_away_when_this_run_ends(root: &Path) {
 /// Unix only. Both questions are Unix ones, an owner's user number and a signal, and their Windows
 /// counterparts are calls into the operating system that this crate's tests do not make.
 #[cfg(unix)]
-fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
+pub fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(us) = std::fs::metadata(ours) else {
@@ -194,6 +251,9 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         if !nothing_holds(owner) {
             continue;
         }
+        // What an ended run launched is its own, and a worker among it outlives the run that
+        // started it.
+        end_what_runs_from(&entry.path());
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
@@ -215,6 +275,21 @@ fn one_of_ours(name: &str) -> Option<i32> {
     known.then(|| number.parse().ok())?
 }
 
+/// Ends what runs a program from inside `directory`, and returns when none is left.
+#[cfg(unix)]
+pub fn end_what_runs_from(directory: &Path) {
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{END_WHAT_RUNS_FROM}\nend_what_runs_from \"${{1:?}}\""
+        ))
+        .arg("sh")
+        .arg(directory)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// Whether no process holds `number`.
 ///
 /// `kill(number, 0)` sends nothing and answers with the kernel's own error, which is the only
@@ -232,6 +307,237 @@ fn nothing_holds(number: i32) -> bool {
         rustix::process::test_kill_process(pid),
         Err(rustix::io::Errno::SRCH)
     )
+}
+
+/// How long the workers of a host are given to end by themselves once its sessions are closed.
+///
+/// A worker ends as soon as its session's closure is done, which takes the closure's own grace and
+/// drain and a margin for a busy machine, so a wait for it ends the moment the last one has. The
+/// bound only says that a worker which is still there after it is not going to end.
+#[cfg(unix)]
+const WORKERS_END_WITHIN: Duration = Duration::from_secs(120);
+
+/// A worker process of a host tree, as `ps` lists it.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worker {
+    pub pid: i32,
+    pub command: String,
+}
+
+/// A process as `ps` lists it: its number and the time it started, which together name one process
+/// for as long as the system does not give the number to another one that starts in the same
+/// second.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub pid: i32,
+    pub started: String,
+}
+
+/// Reads the number and the start time from the front of a `ps` line, and returns them with the
+/// rest of the line: `ps -o pid=,lstart=,...` gives the number, then the start as five words (the
+/// weekday, the month, the day, the time and the year), then what was asked for after them.
+#[cfg(unix)]
+fn listed_front(line: &str) -> Option<(Listed, &str)> {
+    let mut rest = line.trim_start();
+    let (pid, after) = rest.split_once(char::is_whitespace)?;
+    rest = after.trim_start();
+    let mut started = Vec::new();
+    for _ in 0..5 {
+        let (word, after) = rest.split_once(char::is_whitespace)?;
+        started.push(word);
+        rest = after.trim_start();
+    }
+    Some((
+        Listed {
+            pid: pid.parse().ok()?,
+            started: started.join(" "),
+        },
+        rest,
+    ))
+}
+
+/// The processes `listing`, which is `ps axww -o pid=,lstart=,stat=,comm=`, shows running with a
+/// program called `kr-worker`.
+///
+/// `comm` is the program alone, which is what tells it from its arguments: the path of the program
+/// where the system gives one (macOS, with any spaces in it), and its name where it gives only that
+/// (Linux). It is the rest of the line after the number, the start and the state, so nothing about
+/// it is guessed from where an argument seems to begin. A process that has ended and has not been
+/// waited for is listed, with a state that begins with `Z`, and is not a process that runs.
+#[cfg(unix)]
+pub fn worker_programs_in(listing: &str) -> Vec<Listed> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (listed, rest) = listed_front(line)?;
+            let (state, program) = rest.split_once(char::is_whitespace)?;
+            let named = Path::new(program.trim())
+                .file_name()
+                .is_some_and(|name| name == "kr-worker");
+            (named && !state.starts_with('Z')).then_some(listed)
+        })
+        .collect()
+}
+
+/// What the processes in `listing`, which is `ps -ww -o pid=,lstart=,args=`, were started with,
+/// each with the number and the start time it was listed under.
+#[cfg(unix)]
+pub fn arguments_in(listing: &str) -> Vec<(Listed, String)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (listed, arguments) = listed_front(line)?;
+            Some((listed, arguments.trim_end().to_owned()))
+        })
+        .collect()
+}
+
+/// Whether the arguments of a process, as `ps -o args=` lists them, name the host tree called
+/// `host`: its runtime and state directories are inside it, and its name is a token of its own that
+/// no other host has.
+#[cfg(unix)]
+pub fn names_host(arguments: &str, host: &str) -> bool {
+    arguments.contains(&format!("/{host}/"))
+}
+
+/// The workers among `programs` whose arguments, in `arguments`, name the host tree called `host`.
+///
+/// What a process was started with is asked in a second listing, so a number that was a worker's
+/// when the first was made and is another process's when the second is must not carry the worker's
+/// program over to the other's arguments: a process is a worker only when the number and the start
+/// time are the same in both.
+#[cfg(unix)]
+pub fn workers_among(
+    programs: &[Listed],
+    arguments: &[(Listed, String)],
+    host: &str,
+) -> Vec<Worker> {
+    programs
+        .iter()
+        .filter_map(|program| {
+            let (_, command) = arguments.iter().find(|(listed, _)| listed == program)?;
+            names_host(command, host).then(|| Worker {
+                pid: program.pid,
+                command: command.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Runs `ps` with `arguments`, and says what it wrote.
+///
+/// `ps` ends with 0 when it listed a process, and with 1 when it kept none: no number it was asked
+/// about has a process, or it failed, and its status does not say which. So only 0 is an answer,
+/// and every listing here is made to list at least one process (`ax` lists `ps` itself, and a list
+/// of numbers has this process's own among them), which makes any other status a failure to list,
+/// returned with what `ps` said, so that a worker is never taken to be gone because `ps` did not
+/// answer. The time is written by the C locale on both systems: macOS formats it in the caller's
+/// own locale, which does not always give five words.
+#[cfg(unix)]
+fn ps(arguments: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(arguments)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|error| format!("ps could not be run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The workers of the host tree at `root` that are running now.
+///
+/// # Errors
+///
+/// Returns why the processes could not be listed.
+#[cfg(unix)]
+pub fn workers_of(root: &Path) -> Result<Vec<Worker>, String> {
+    let host = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} does not end in a name", root.display()))?;
+    let programs = worker_programs_in(&ps(&["axww", "-o", "pid=,lstart=,stat=,comm="])?);
+    if programs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // This process's own number is in the list so that `ps` always has one to list: it ends with 1
+    // when it has none, which a candidate that ended since the first listing would otherwise cause.
+    let numbers = programs
+        .iter()
+        .map(|listed| listed.pid)
+        .chain(std::iter::once(
+            i32::try_from(std::process::id()).map_err(|error| error.to_string())?,
+        ))
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let arguments = arguments_in(&ps(&["-ww", "-o", "pid=,lstart=,args=", "-p", &numbers])?);
+    Ok(workers_among(&programs, &arguments, host))
+}
+
+/// Waits until no worker of the host tree at `root` runs, and ends any that goes on running past
+/// [`WORKERS_END_WITHIN`], so that none can outlive the test that started it.
+///
+/// A host closes the sessions it created, and each worker ends with its session. A worker that did
+/// not, because a close was refused, a daemon had stopped, or a session was made that the test did
+/// not record, is not a worker anything will close later: it is detached from the test and from its
+/// daemon, and runs its shell until the machine restarts. A host asks this when it ends, with its
+/// daemon no longer serving, so nothing starts one after the look.
+///
+/// # Errors
+///
+/// Returns the workers that were still running and are now ended by force, or why the processes
+/// could not be listed. A worker is never left running without this saying so.
+#[cfg(unix)]
+pub fn leave_no_worker_of(root: &Path) -> Result<(), String> {
+    leave_no_worker_of_within(root, WORKERS_END_WITHIN)
+}
+
+/// [`leave_no_worker_of`] with the time the workers are given to end by themselves stated.
+///
+/// # Errors
+///
+/// As [`leave_no_worker_of`].
+#[cfg(unix)]
+pub fn leave_no_worker_of_within(root: &Path, within: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + within;
+    let mut left = workers_of(root)?;
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left = workers_of(root)?;
+    }
+    if left.is_empty() {
+        return Ok(());
+    }
+    for worker in &left {
+        // The number comes from the two listings made just before the check that found it, with no
+        // wait between them and the signal, and was kept only where its start time was the same in
+        // both. That protects the pairing of the two listings, not the signal: a worker that ends
+        // after the second listing and before the signal could have its number given to any
+        // process, whatever its start time, and that process would be signalled. The system gives
+        // numbers out in turn and does not promise against it, so the window is made as short as
+        // two `ps` runs allow, and is not nothing.
+        if let Some(pid) = rustix::process::Pid::from_raw(worker.pid) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+    Err(format!(
+        "{} workers of {} were still running {within:?} after the sessions were closed, and were \
+         ended by force: {}",
+        left.len(),
+        root.display(),
+        left.iter()
+            .map(|worker| format!("{} ({})", worker.pid, worker.command))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
 }
 
 /// The `kr` these tests launch.

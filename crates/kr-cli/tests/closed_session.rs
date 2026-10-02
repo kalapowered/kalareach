@@ -15,6 +15,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -113,6 +114,15 @@ impl Drop for Host {
         }
         for task in &self.serving {
             task.abort();
+        }
+        // Whatever a close did not reach, such as a session whose daemon this test stopped first,
+        // has a worker that nothing will close afterwards.
+        if let Err(left) = support::leave_no_worker_of(self.temp.root()) {
+            if std::thread::panicking() {
+                eprintln!("{left}");
+            } else {
+                panic!("{left}");
+            }
         }
     }
 }
@@ -522,4 +532,305 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
         "{document}"
     );
     assert_eq!(host.starts(), 1);
+}
+
+/// A stand-in for a host's worker: a program called `kr-worker` that was started with the host's
+/// directories and runs until its standard input closes.
+struct StandIn {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+impl StandIn {
+    /// Starts one for the host tree `root`, from a link in `links`.
+    fn start(links: &Path, root: &Path) -> Self {
+        let program = links.join("kr-worker");
+        std::os::unix::fs::symlink("/bin/sh", &program).expect("a link to the shell");
+        let mut child = std::process::Command::new(&program)
+            .args(["-c", "read line", "kr-worker", "--runtime-dir"])
+            .arg(root.join("r"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("the stand-in starts");
+        let stdin = child.stdin.take();
+        Self { child, stdin }
+    }
+
+    /// Ends it as a worker ends with its session, and collects it.
+    fn end(mut self) -> std::process::ExitStatus {
+        drop(self.stdin.take());
+        self.child.wait().expect("the stand-in ends")
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        // A check that failed first must not leave it running.
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// The workers of a host are the processes whose program is called `kr-worker`, however the system
+/// gives the program (a path with spaces in it, or its name alone), that have not ended, and whose
+/// arguments name the host's own tree: not another host's, not a program of another name that has a
+/// worker's path among its arguments, and not a process that was given a worker's number after the
+/// worker ended.
+#[test]
+fn the_workers_of_a_host_are_read_from_the_process_listing() {
+    let start = "Fri Oct  3 07:48:44 2026";
+    let listing = format!(
+        "\
+  101 {start} Ss   /private/var/T/run/kr-worker\n\
+  102 {start} Z    /private/var/T/run/kr-worker\n\
+  103 {start} S    /private/var/T/run dir/kr-worker\n\
+  104 {start} S    kr-worker\n\
+  105 {start} S+   /private/var/T/run/kr\n\
+  106 {start} S    /usr/bin/tail\n\
+  107 {start} S    /private/var/T/kr-worker tools/tail\n\
+  108 {start} S    /private/var/T/run/kr-worker-old\n\
+  109 Sat Oct  4 00:00:01 2026 R    kr-worker\n"
+    );
+    let programs = support::worker_programs_in(&listing);
+    assert_eq!(
+        programs.iter().map(|listed| listed.pid).collect::<Vec<_>>(),
+        [101, 103, 104, 109],
+        "the programs called kr-worker that run, whatever the path they are given as"
+    );
+    assert_eq!(
+        programs[3].started, "Sat Oct 4 00:00:01 2026",
+        "with the time each started"
+    );
+
+    let arguments = support::arguments_in(&format!(
+        "\
+  101 {start} /p/kr-worker --session s --runtime-dir /t/kr-aaaa1111/r/e\n\
+  103 {start} /p/run dir/kr-worker --session s --runtime-dir /t/kr-aaaa11112/r/e\n\
+  104 {start} kr-worker --session s\n\
+  109 Sat Oct  4 00:00:09 2026 /usr/bin/tail -f /t/kr-aaaa1111/r/e/log\n"
+    ));
+    let found = support::workers_among(&programs, &arguments, "kr-aaaa1111");
+    assert_eq!(
+        found.iter().map(|worker| worker.pid).collect::<Vec<_>>(),
+        [101],
+        "this host's workers only: not another host's (103 names kr-aaaa11112), not one that names \
+         no host (104), and not a process that was given a worker's number afterwards and started \
+         at another time (109)"
+    );
+    assert!(support::names_host(
+        "/p/kr-worker --session s --runtime-dir /t/kr-aaaa1111/r/e",
+        "kr-aaaa1111"
+    ));
+    assert!(!support::names_host("/p/kr-worker", "kr-aaaa1111"));
+}
+
+/// A host's check finds a worker that is still running, waits for one that ends by itself, and ends
+/// one that does not, saying so, so that none outlives the test that started it. Another host's
+/// worker is none of its business.
+#[test]
+fn a_worker_that_outlives_its_host_is_found_ended_and_reported() {
+    let places = tempfile::Builder::new()
+        .prefix("kr-")
+        .tempdir()
+        .expect("a directory");
+    let other = tempfile::Builder::new()
+        .prefix("kr-")
+        .tempdir()
+        .expect("a directory");
+    let links = tempfile::tempdir().expect("a directory");
+    let elsewhere = tempfile::tempdir().expect("a directory");
+
+    // Found while it runs.
+    let ending = StandIn::start(links.path(), places.path());
+    let found = support::workers_of(places.path()).expect("the processes are listed");
+    assert_eq!(
+        found.iter().map(|worker| worker.pid).collect::<Vec<_>>(),
+        [i32::try_from(ending.child.id()).expect("a process number")],
+        "the stand-in is this host's worker"
+    );
+    assert!(
+        support::workers_of(other.path())
+            .expect("the processes are listed")
+            .is_empty(),
+        "and no other host's"
+    );
+
+    // One that ends by itself is waited for, and nothing is reported.
+    let waiting = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| support::leave_no_worker_of(places.path()));
+        // The worker ends with its session; the check is told nothing of it.
+        let status = ending.end();
+        assert_eq!(
+            status.signal(),
+            None,
+            "the stand-in ends by itself: {status}"
+        );
+        waiting.join().expect("the check ends")
+    });
+    assert_eq!(waiting, Ok(()), "a worker that ended is not reported");
+
+    // One that does not end is ended, and reported with its number.
+    let stuck = StandIn::start(elsewhere.path(), places.path());
+    let pid = stuck.child.id();
+    let reported = support::leave_no_worker_of_within(places.path(), Duration::from_millis(500))
+        .expect_err("a worker that does not end is reported");
+    assert!(
+        reported.contains(&pid.to_string()),
+        "it names the worker: {reported}"
+    );
+    let status = stuck.end();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "and the worker was killed: {status}"
+    );
+    assert_eq!(
+        support::workers_of(places.path()).expect("the processes are listed"),
+        [],
+        "none is left"
+    );
+}
+
+/// What a run launched from its directory goes with the run: once the run has ended, the watcher
+/// ends a worker that is still running from the directory, and removes the directory. Until then
+/// nothing of the run is touched.
+#[test]
+fn a_worker_left_running_goes_with_the_directory_of_the_run_that_started_it() {
+    let sandbox = tempfile::tempdir().expect("a directory");
+    let run = sandbox.path().join("run");
+    std::fs::create_dir(&run).expect("the run's directory");
+    let mut worker = StandIn::start(&run, &sandbox.path().join("kr-0000"));
+    let still_going = support::watch(&run).expect("the watcher starts");
+    assert!(
+        worker
+            .child
+            .try_wait()
+            .expect("the worker is asked after")
+            .is_none()
+            && run.exists(),
+        "a run that is going keeps its worker and its directory"
+    );
+
+    // The run ends: every descriptor it held closes, the one the watcher reads among them.
+    drop(still_going);
+    let started = std::time::Instant::now();
+    while run.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the watcher did not remove the directory of the run that ended"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = worker.end();
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the worker was asked to end before its directory went: {status}"
+    );
+}
+
+/// A run that was ended without its watcher seeing it, which is how a harness that ends the whole
+/// group a run is in ends it, leaves a directory and the workers that run from it. The next run
+/// that finds the directory, with no process holding the number in its name, ends them and removes
+/// it, and leaves the directory of a run that is going, and what runs from it, alone.
+#[test]
+fn a_worker_an_earlier_run_left_is_ended_when_its_directory_is_swept() {
+    const TOKEN: &str = "0123456789abcdef0123";
+
+    let sandbox = tempfile::tempdir().expect("a directory");
+    let ours = sandbox.path().join(format!(
+        "kalareach-command-tests-sweep-{}-{TOKEN}",
+        std::process::id()
+    ));
+    let mut ended = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("a process to end");
+    let theirs = sandbox.path().join(format!(
+        "kalareach-command-tests-sweep-{}-{TOKEN}",
+        ended.id()
+    ));
+    ended.wait().expect("the process ended");
+    for directory in [&ours, &theirs] {
+        std::fs::create_dir(directory).expect("a run's directory");
+    }
+    let mut going = StandIn::start(&ours, &sandbox.path().join("kr-0000"));
+    let left = StandIn::start(&theirs, &sandbox.path().join("kr-0000"));
+
+    support::remove_what_earlier_runs_left(sandbox.path(), &ours);
+
+    assert!(
+        !theirs.exists(),
+        "the directory of the run that ended is gone"
+    );
+    let status = left.end();
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "and the worker that was running from it was ended: {status}"
+    );
+    assert!(
+        ours.exists() && going.child.try_wait().expect("asked after").is_none(),
+        "the run that is going keeps its directory and its worker"
+    );
+}
+
+/// A directory whose path has a space and backslash escapes in it is no different from any other to
+/// the host's check, the watcher and the sweep: what runs from it is found by its whole command and
+/// its program, the path is read as it is written, and a directory that has gone changes none of it.
+#[test]
+fn a_worker_in_a_directory_with_an_odd_path_is_found_and_ended() {
+    let sandbox = tempfile::tempdir().expect("a directory");
+    let odd = sandbox.path().join(r"run dir\n and \t more");
+    let other = sandbox.path().join("run dir");
+    for directory in [&odd, &other] {
+        std::fs::create_dir(directory).expect("a run's directory");
+    }
+    // A tree name of its own: the other cases here name theirs `kr-0000`, and run beside this one.
+    let tree = sandbox
+        .path()
+        .join(format!("kr-odd-{}", std::process::id()));
+    let worker = StandIn::start(&odd, &tree);
+    let mut bystander = StandIn::start(&other, &tree);
+    let pids = |tree: &Path| -> Vec<i32> {
+        let mut found: Vec<i32> = support::workers_of(tree)
+            .expect("the processes are listed")
+            .iter()
+            .map(|worker| worker.pid)
+            .collect();
+        found.sort_unstable();
+        found
+    };
+    let mut both = vec![
+        i32::try_from(worker.child.id()).expect("a process number"),
+        i32::try_from(bystander.child.id()).expect("a process number"),
+    ];
+    both.sort_unstable();
+    assert_eq!(
+        pids(&tree),
+        both,
+        "both are the tree's workers, whatever their paths hold"
+    );
+    // The directory a worker was started from is gone, as a run's is once it has ended: the worker
+    // is still found, and the watcher still ends what runs from it.
+    std::fs::remove_dir_all(&odd).expect("the odd directory goes");
+    assert_eq!(
+        pids(&tree),
+        both,
+        "and they still are once a directory has gone"
+    );
+
+    support::end_what_runs_from(&odd);
+
+    let status = worker.end();
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the worker running from the odd path was ended: {status}"
+    );
+    assert!(
+        bystander.child.try_wait().expect("asked after").is_none(),
+        "a worker running from a directory the path merely starts with, `run dir`, is left alone"
+    );
 }
