@@ -126,7 +126,9 @@ pub const fn result_content(method: Method) -> ResultContent {
     match method {
         // Terminals, input, attachments and agents: what each does is recorded as identifiers,
         // revisions and states. The agent mutations are answered with the upstream's own request
-        // identifier and the turn it applies to.
+        // identifier and the turn it applies to. A machine group step is answered with the
+        // environment's identifier and the group it now records: its identifier, revision, change
+        // and the group it left.
         Method::SessionAttach
         | Method::SessionDetach
         | Method::AttachmentConfigure
@@ -149,7 +151,10 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::AgentTurnSteer
         | Method::AgentTurnCancel
         | Method::AgentApprovalRespond
-        | Method::PluginActionInvoke => Identifiers,
+        | Method::PluginActionInvoke
+        | Method::MachineJoin
+        | Method::MachineMerge
+        | Method::MachineSplit => Identifiers,
         Method::QuestionAnswer | Method::QuestionCancel => Question,
         Method::ActionCancel => Receipt,
         Method::SessionCreate | Method::SessionRename => SessionMetadata,
