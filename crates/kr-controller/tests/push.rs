@@ -2684,6 +2684,75 @@ fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding()
         .expect("rotation succeeds after earlier notifications expire");
 }
 
+/// KR-REQ-16.11, KR-REQ-10: a key registration asks its admission inside the delivery journal's
+/// write, with every other writer of the journal shut out and after everything the write reads has
+/// been read, and a refusal there writes nothing. The control: an admission that stands writes the
+/// registration.
+#[test]
+fn a_preview_key_registration_asks_its_admission_inside_the_journals_write() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let id = DestinationId::new("phone").expect("an identifier");
+    let other = rusqlite::Connection::open(&environment.path).expect("another writer");
+    other
+        .busy_timeout(std::time::Duration::ZERO)
+        .expect("no wait");
+    let replacement = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let revision_of = |environment: &Environment| {
+        environment
+            .module
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .destination(&DestinationId::new("phone").expect("an identifier"))
+                    .expect("a read")
+                    .expect("the destination")
+                    .as_push()
+                    .expect("a push destination")
+                    .preview_keys
+                    .revision)
+            })
+            .expect("a read")
+    };
+
+    let asked = std::cell::Cell::new(0);
+    let refused =
+        environment
+            .module
+            .update_preview_key(&id, *replacement.public(), 2, NOW, &|| {
+                asked.set(asked.get() + 1);
+                assert!(
+                    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_err(),
+                    "no other writer can begin while the admission is asked"
+                );
+                Err(kr_controller::error::ControllerError::PermissionDenied {
+                    detail: "the admission has ended".to_owned(),
+                })
+            });
+    assert!(refused.is_err());
+    assert_eq!(asked.get(), 1);
+    assert_eq!(revision_of(&environment), 1, "a refusal writes nothing");
+
+    let wrote = environment
+        .module
+        .update_preview_key(&id, *replacement.public(), 2, NOW, &|| {
+            asked.set(asked.get() + 1);
+            assert!(
+                other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_err(),
+                "no other writer can begin while the admission is asked"
+            );
+            Ok(())
+        })
+        .expect("an admission that stands registers");
+    assert!(wrote);
+    assert_eq!(asked.get(), 2);
+    assert_eq!(revision_of(&environment), 2);
+}
+
 /// KR-REQ-16.11: a replayed registration cannot put a retired key back into service.
 #[test]
 fn a_preview_key_revision_only_moves_forward() {
@@ -6985,8 +7054,8 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
 
 /// KR-REQ-24.27, KR-REQ-24.28: an alert privacy mode lets through, while it is on the wire, is not
 /// cleanup of content captured before the boundary, so `privacy.status` reports the change complete
-/// and turning privacy mode off is not held up by it. The control: the same report names the work
-/// still outstanding while a send of content from before the boundary is on the wire.
+/// rather than waiting on it. The control: the same report names the work still outstanding while a
+/// send of content from before the boundary is on the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_alert_on_the_wire_is_not_cleanup_privacy_mode_waits_for() {
     let host = net_support::Host::start_unowned().await;
@@ -7060,10 +7129,10 @@ async fn an_alert_on_the_wire_is_not_cleanup_privacy_mode_waits_for() {
 
 /// KR-REQ-24.29, KR-REQ-16.13: an alert privacy mode let through, whose outcome nobody knows, is
 /// asked about while privacy mode is on, because it is of the generation in force and carries no
-/// content; the answer settles it, and it is still listed as a copy that left. Nothing from the
-/// generation before it is asked about, and once privacy mode is off the alert's own generation
-/// has ended and it is not asked about either. The control: the same question about the same alert
-/// is asked once, and a second sweep asks nothing more.
+/// content; the answer settles it, and it is still listed as a copy that left. Once privacy mode is
+/// off the alert's own generation has ended, and an alert left unknown is not asked about. The
+/// sweeps here are the test's own, on a clock past the daemon's question backoff, so whether the
+/// daemon's own sweep has asked first decides nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_on() {
     let host = net_support::Host::start_unowned().await;
@@ -7080,7 +7149,7 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
         .attention()
         .observe(&[pending_approval_in(session_id, 1, "req-write-hosts")])
         .expect("the store records the approval");
-    let state_of_the_alert = || {
+    let alerts = || {
         controller
             .delivery()
             .with(|producer| {
@@ -7088,23 +7157,19 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
                     .journal()
                     .deliveries()
                     .expect("a read")
-                    .first()
-                    .map(|record| {
-                        (
-                            record.state,
-                            record.notification_id,
-                            record.privacy_generation,
-                        )
-                    }))
+                    .into_iter()
+                    .map(|record| (record.notification_id, record.state))
+                    .collect::<Vec<_>>())
             })
-            .ok()
-            .flatten()
+            .unwrap_or_default()
     };
     until_holds("the alert being left with an outcome nobody knows", || {
-        state_of_the_alert().is_some_and(|(state, _, _)| state == DeliveryState::OutcomeUnknown)
+        alerts()
+            .iter()
+            .any(|(_, state)| *state == DeliveryState::OutcomeUnknown)
     })
     .await;
-    let (_, alert, generation) = state_of_the_alert().expect("the alert");
+    let (alert, _) = alerts()[0];
     assert!(
         controller
             .delivery()
@@ -7114,30 +7179,31 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
     );
 
     // Asked about while privacy mode is on: the gateway holds it, and the record settles.
+    let later = || kr_ipc::now_ms().get() + kr_delivery::push::QUESTION_BACKOFF_MS + 1;
     let status = GatewayDouble::queued();
-    let clock = || kr_ipc::now_ms().get();
     let resolved = controller
         .delivery()
         .resolve_unknown(
             &status,
             controller.delivery_runtime().credentials().as_ref(),
-            &clock,
+            &later,
             64,
             std::time::Duration::from_secs(60),
         )
         .expect("a sweep");
     assert_eq!(resolved, 1, "the question about the alert was asked");
     assert_eq!(status.questions(), 1);
-    assert_eq!(
-        state_of_the_alert().map(|(state, _, _)| state),
-        Some(DeliveryState::Accepted)
+    assert!(
+        alerts()
+            .iter()
+            .any(|(id, state)| *id == alert && *state == DeliveryState::Accepted)
     );
     let again = controller
         .delivery()
         .resolve_unknown(
             &status,
             controller.delivery_runtime().credentials().as_ref(),
-            &clock,
+            &later,
             64,
             std::time::Duration::from_secs(60),
         )
@@ -7159,20 +7225,9 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
     until_holds(
         "the second alert being left with an outcome nobody knows",
         || {
-            controller
-                .delivery()
-                .with(|producer| {
-                    Ok(producer
-                        .journal()
-                        .deliveries()
-                        .expect("a read")
-                        .iter()
-                        .any(|record| {
-                            record.notification_id != alert
-                                && record.state == DeliveryState::OutcomeUnknown
-                        }))
-                })
-                .unwrap_or(false)
+            alerts()
+                .iter()
+                .any(|(id, state)| *id != alert && *state == DeliveryState::OutcomeUnknown)
         },
     )
     .await;
@@ -7183,7 +7238,7 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
         .resolve_unknown(
             &silent,
             controller.delivery_runtime().credentials().as_ref(),
-            &clock,
+            &later,
             64,
             std::time::Duration::from_secs(60),
         )
@@ -7191,7 +7246,13 @@ async fn an_alert_whose_outcome_is_unknown_is_asked_about_while_privacy_mode_is_
     assert_eq!(
         (resolved, silent.questions()),
         (0, 0),
-        "an alert of a generation that has ended is not asked about (generation {generation})"
+        "an alert of a generation that has ended is not asked about"
+    );
+    assert!(
+        alerts()
+            .iter()
+            .any(|(id, state)| *id != alert && *state == DeliveryState::OutcomeUnknown),
+        "and it is left as it was"
     );
     host.stop().await;
 }
