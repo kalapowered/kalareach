@@ -433,6 +433,7 @@ mod tests {
     use super::*;
     use crate::history_filter::ViewerScope;
     use kr_protocol::authority::{EffectClass, HistoryFilter as RegistryHistory};
+    use kr_protocol::describe::{DescriptionDownload, DescriptionSetup, DescriptionState};
     use kr_protocol::grant::HistoryScope;
     use kr_protocol::ids::{
         ActorId, ApplicationInstanceId, ConnectionId, QuestionId, QuestionRevision, SessionEpoch,
@@ -441,7 +442,7 @@ mod tests {
     use kr_protocol::question::{
         AnswerRecord, QuestionAnswer, QuestionChoice, QuestionKind, QuestionSource,
     };
-    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
 
     const ASKED_AT: u64 = 1_000;
 
@@ -754,21 +755,42 @@ mod tests {
         }
     }
 
-    /// KR-REQ-22.09: the two writes that change how a host describes its sessions are records of an
-    /// operation on the environment, answered with the setup they leave and no session's text, so
-    /// a device whose grant reaches them is shown them as it is shown the other host settings.
+    /// KR-REQ-10.49: the two writes that change how a host describes its sessions are records of an
+    /// operation on the environment. A retained answer of either is shown as it was kept, whole or
+    /// to a reader who may see state only or a scoped history, because it carries the host's
+    /// setup and no session's text (KR-REQ-22.09).
     #[test]
     fn the_description_writes_are_records_of_an_operation_on_the_environment() {
+        let kept = ParamsValue::from_typed(&DescriptionSetup {
+            offered: true,
+            enabled: true,
+            on_battery: false,
+            profile_id: Nullable::some("tiny-default".to_owned()),
+            asset_bytes: U64::new(27),
+            sources: vec!["127.0.0.1:1".to_owned()],
+            download: DescriptionDownload::Failed,
+            fetched_bytes: U64::new(0),
+            failure: Nullable::some("a file was not the profile's".to_owned()),
+            can_cancel: false,
+            can_disable: true,
+            needs_hosted_account: false,
+            unavailable: Nullable::null(),
+            state: DescriptionState::Ready,
+            paused: Nullable::null(),
+        })
+        .expect("encodes");
         for method in [Method::DescriptionConfigure, Method::DescriptionDownload] {
             assert_eq!(result_content(method), ResultContent::Environment);
-        }
-        let kept = ParamsValue::empty();
-        for disclosure in [Disclosure::Whole, Disclosure::StateOnly] {
-            for method in [Method::DescriptionConfigure, Method::DescriptionDownload] {
+            for disclosure in [
+                Disclosure::Whole,
+                Disclosure::StateOnly,
+                scoped(Some(0), &[], false),
+            ] {
                 assert_eq!(
                     shown_result(&disclosure, method, kept.clone(), Occasion::Replay)
                         .expect("shown"),
-                    kept
+                    kept,
+                    "{method:?}"
                 );
             }
         }
