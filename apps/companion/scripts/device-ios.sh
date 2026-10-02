@@ -234,7 +234,6 @@ read_search_list() {
 }
 
 signing_lock=""
-holding_lock=0
 signing_child=""
 signing_paths=()
 signing_before=""
@@ -255,7 +254,6 @@ end_signing() {
   say "keychain search list after signing: $(printf '%s' "$listing" | tr '\n' ' ')"
   [ "$listing" = "$signing_before" ] || clean=0
   if [ "$clean" = 1 ] && rmdir "$signing_lock" 2>/dev/null; then
-    holding_lock=0
     return 0
   fi
   say "THE KEYCHAIN SEARCH LIST, THE KEYCHAIN'S LOCK OR THE SIGNING LOCK IS NOT WHAT IT WAS BEFORE SIGNING: put it right by hand, then remove $signing_lock"
@@ -291,14 +289,12 @@ with_signing_keychain() { # <command...>
   mkdir -p "$work"
   signing_lock="$work/signing.lock"
   signing_ended=1
-  holding_lock=0
   signing_child=""
   mkdir "$signing_lock" 2>/dev/null || die "another build is signing, or one ended without restoring the list: see $signing_lock"
-  holding_lock=1
-  if ! read_search_list; then rmdir "$signing_lock" && holding_lock=0; die "the keychain search list could not be read, or it is empty"; fi
+  if ! read_search_list; then rmdir "$signing_lock"; die "the keychain search list could not be read, or it is empty"; fi
   signing_before=$listing
   if printf '%s\n' "$signing_before" | grep -Fxq "$KR_KEYCHAIN"; then
-    rmdir "$signing_lock" && holding_lock=0
+    rmdir "$signing_lock"
     die "the signing keychain is already on the search list: an earlier signing did not put it back, so put it back by hand"
   fi
   say "keychain search list before signing: $(printf '%s' "$signing_before" | tr '\n' ' ')"
@@ -308,7 +304,8 @@ with_signing_keychain() { # <command...>
   signing_ended=0
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
-    "$@" &
+    # The command starts with the default signals, whatever this shell is ignoring: a TERM has to stop it.
+    ( trap - INT TERM HUP; exec "$@" ) &
     signing_child=$!
     trap 'signing_interrupted 130' INT
     trap 'signing_interrupted 143' TERM
@@ -455,6 +452,7 @@ session_app() { case $1 in s0 | s1) echo app ;; s2a | s2b) echo harness-nofireba
 
 ending=0
 runner_pid=""
+session_started=""
 # How many lines of the runner's output have been looked through for what the tests say.
 forwarded=0
 # Whether the phone is clean afterwards, and whether the session's proofs held. A session that
@@ -465,22 +463,32 @@ unproven=0
 # The record of a session is only ever appended to once it exists, so that nothing a later step does can
 # take away what an earlier one wrote: the target, the phone, the baseline, the sweep and every driver
 # of the test run are lines in it, and a driver that has ended is a `retired=` line, not a missing one.
+# It is created once, by the session's start, and refuses to replace a file that is already there.
 #
+# A start time is read the same way everywhere, `ps` in the C locale and UTC, since its text depends on the
+# language and the time zone of whoever asks, and a driver is compared by that text.
+process_start() { # <pid>
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+}
+
 # Starts the test run for the phone in the background as a new process that, before it becomes Xcode,
-# writes its own identity into the record (its number, its start time and its result bundle) and checks
-# that cleanup has not closed the gate; a process that cannot write its identity, or finds the gate
-# closed, ends without starting Xcode. Cleanup closes the gate before it reads the record, so a driver
-# is either in the record cleanup reads or sees the gate closed: no driver can run unseen. Sets runner_pid.
+# writes its own identity into the record (its number, its start time and its result bundle), checks that
+# cleanup has not closed the gate and that the record is still this session's, and only then becomes Xcode;
+# a process that cannot write its identity, or finds the gate closed or another session's record, ends
+# without starting Xcode. Cleanup, and the end of a session, close the gate before they read the record, so
+# a driver is either in the record they read or sees the gate closed: no driver can run unseen. Sets
+# runner_pid.
 start_driver() { # <the result bundle> <the output file> <xcodebuild arguments...>
   local result=$1 output=$2
   shift 2
   bash -c '
-    started=$(ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")
+    started=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")
     [ -n "$started" ] || exit 70
     printf "runner=%s|%s|%s\n" "$$" "$started" "$1" >> "$2" || exit 71
     [ ! -e "$2.gate" ] || exit 72
-    shift 2
-    exec xcodebuild "$@"' driver "$result" "$record" "$@" > "$output" 2>&1 &
+    grep -qx "started=$3" "$2" || exit 73
+    shift 3
+    exec xcodebuild "$@"' driver "$result" "$record" "$session_started" "$@" > "$output" 2>&1 &
   runner_pid=$!
 }
 
@@ -493,26 +501,38 @@ retire_driver() { # <pid>
   echo "retired=$1|$started" >> "$record"
 }
 
-# Whether a number is the driver a record line names: its start time and its command line both are what
-# the line says. Another process that has the number now is not.
-is_driver() { # <pid> <start time> <result bundle>
-  local now
+# Whether a number is the driver a record line names. 0: it is, by its start time and its command line.
+# 1: it is not (gone, or another process with that number). 2: doubtful, a live process whose command line
+# names the recorded result bundle but whose start time is not the recorded one, which is no process to
+# touch and none to pass over.
+driver_state() { # <pid> <start time> <result bundle>
   kill -0 "$1" 2>/dev/null || return 1
-  now=$(ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//')
-  [ "$now" = "$2" ] || return 1
-  ps -o command= -p "$1" 2>/dev/null | grep -qF -- "$3"
+  ps -o command= -p "$1" 2>/dev/null | grep -qF -- "$3" || return 1
+  [ "$(process_start "$1")" = "$2" ] && return 0
+  return 2
 }
+is_driver() { driver_state "$@"; }   # true only for a driver that is certain
 
-# Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up.
+# Stops what is driving the phone, and waits until it has stopped, before anything is cleaned up. The
+# process is signalled only while it is still the driver its record line names, checked before each
+# signal and in every turn of the wait; one that has no line yet is left to the gate, which the end of the
+# session closes.
 stop_runner() {
-  if [ -n "$runner_pid" ] && kill -0 "$runner_pid" 2>/dev/null; then
-    kill "$runner_pid" 2>/dev/null
-    local waited=0
-    while kill -0 "$runner_pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
-    kill -9 "$runner_pid" 2>/dev/null
+  local started result waited=0 state=1
+  if [ -n "$runner_pid" ]; then
+    started=$(sed -n "s/^runner=$runner_pid|\([^|]*\)|.*/\1/p" "$record" 2>/dev/null | tail -1)
+    result=$(sed -n "s/^runner=$runner_pid|[^|]*|//p" "$record" 2>/dev/null | tail -1)
+    if [ -n "$started" ] && is_driver "$runner_pid" "$started" "$result"; then
+      kill "$runner_pid" 2>/dev/null
+      while driver_state "$runner_pid" "$started" "$result"; state=$?; [ "$state" != 1 ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+      [ "$state" = 0 ] && kill -9 "$runner_pid" 2>/dev/null
+    fi
+    # Only a driver that has ended is retired; one that is still there stays in the record for cleanup.
+    if ! kill -0 "$runner_pid" 2>/dev/null; then
+      wait "$runner_pid" 2>/dev/null
+      retire_driver "$runner_pid"
+    fi
   fi
-  wait "$runner_pid" 2>/dev/null
-  retire_driver "$runner_pid"
   runner_pid=""
 }
 
@@ -550,6 +570,9 @@ finish_session() {
   [ "$ending" = 1 ] && return
   ending=1
   stop_runner
+  # A test run forked at the moment a signal came has no number here yet: the gate keeps it from starting,
+  # and the record says which ones were started.
+  [ -f "$record" ] && stop_recorded_driver
   say "ending the session"
   local keep_app=0
   if grep -q '^baseline=empty$' "$record" 2>/dev/null; then
@@ -608,7 +631,9 @@ session() {
   # The record says whose installation this is: the target, the phone, and when it began. Cleanup
   # touches nothing that this record does not name.
   rm -rf "$record.gate"
-  printf 'target=%s\ndevice=%s\nsession=%s\nstarted=%s\n' "$target" "$KR_DEVICE" "$name" "$started" > "$record"
+  session_started=$started
+  ( set -C; printf 'target=%s\ndevice=%s\nsession=%s\nstarted=%s\n' "$target" "$KR_DEVICE" "$name" "$started" > "$record" ) \
+    || die "a record is already there, which is another run's: run cleanup first"
   trap 'stop_runner; finish_session; exit 130' INT
   trap 'stop_runner; finish_session; exit 143' TERM
   trap finish_session EXIT
@@ -767,9 +792,10 @@ report() { # <output>
 # Ends the drivers the record names that have not ended, and keeps any other from starting: the gate is
 # closed first, so a driver that has not yet written its identity ends by itself. A process is signalled
 # only while it is still the driver the record line names, checked before each signal and while waiting;
-# the process that has the number after the driver ended is never touched.
+# the process that has the number after the driver ended is never touched, and one that cannot be told
+# from the driver stops the clean-up.
 stop_recorded_driver() {
-  local entry pid started result waited
+  local entry pid started result waited state
   mkdir "$record.gate" 2>/dev/null
   [ -d "$record.gate" ] || { say "THE GATE AGAINST A NEW TEST RUN COULD NOT BE CLOSED: nothing is cleaned up"; exit 3; }
   while IFS= read -r entry; do
@@ -777,16 +803,22 @@ stop_recorded_driver() {
     started=${entry%%|*}
     result=${entry#*|}
     grep -qxF "retired=$pid|$started" "$record" && continue
-    is_driver "$pid" "$started" "$result" || continue
+    driver_state "$pid" "$started" "$result"; state=$?
+    [ "$state" = 1 ] && continue
+    if [ "$state" = 2 ]; then
+      say "A PROCESS THAT LOOKS LIKE THE TEST RUN $pid HAS ANOTHER START TIME THAN THE RECORD'S: nothing is cleaned up"
+      exit 3
+    fi
     say "stopping the test run $pid that the record names"
     kill "$pid" 2>/dev/null
     waited=0
-    while is_driver "$pid" "$started" "$result" && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
-    if is_driver "$pid" "$started" "$result"; then
+    while driver_state "$pid" "$started" "$result"; state=$?; [ "$state" != 1 ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+    if [ "$state" = 0 ]; then
       kill -9 "$pid" 2>/dev/null
       sleep 1
-      if is_driver "$pid" "$started" "$result"; then say "THE TEST RUN $pid WOULD NOT STOP: nothing is cleaned up"; exit 3; fi
+      driver_state "$pid" "$started" "$result"; state=$?
     fi
+    if [ "$state" != 1 ]; then say "THE TEST RUN $pid WOULD NOT STOP, OR CAN NO LONGER BE TOLD FROM ANOTHER PROCESS: nothing is cleaned up"; exit 3; fi
   done < <(sed -n 's/^runner=//p' "$record")
 }
 
