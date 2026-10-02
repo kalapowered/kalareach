@@ -3347,3 +3347,804 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
         );
     }
 }
+
+/* -------------------------------------------------------------------------------------------- */
+/* Environments no daemon served between two updates                                            */
+/* -------------------------------------------------------------------------------------------- */
+
+/// An environment of a host's store that no daemon serves: a tree of its own, whose roots the store
+/// records as the daemon that once served it recorded them, and whose registry holds a launch that
+/// came to nothing, a live session's worker and a closed session. Its processes have all ended, so
+/// no record of it holds an update.
+struct Idle {
+    temp: kr_ipc::testing::TempHost,
+}
+
+impl Idle {
+    /// The environment, with a registry at the schema this build reads.
+    fn new(store: &Store) -> Self {
+        use kr_controller::registry::{Registry, WorkerRecord};
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{ActorId, AuthorityRevision};
+        use kr_protocol::scalars::{AuthorisationKey, TimestampMs};
+        use kr_protocol::session::{
+            ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SessionState,
+        };
+
+        let temp = kr_ipc::testing::TempHost::create();
+        store
+            .record_roots(temp.paths().runtime_root(), temp.paths().state_root())
+            .expect("records the roots a daemon of the store served");
+        let idle = Self { temp };
+        let mut registry = Registry::open(idle.registry(), idle.temp.environment_id())
+            .expect("a registry at the schema this build reads");
+        let actor = ActorId::new("local:501").expect("a principal");
+        let ended = kr_ipc::identity::ended_process_identity(4242);
+        // A launch that came to nothing: its launcher has ended. Its recorded create request holds
+        // an environment variable its creator sent, as an earlier schema recorded them.
+        reserve_with(&mut registry, &actor, &ended, 1, &recorded_create(SECRET));
+        // A session that is live, and one that has closed, each with its worker.
+        let worker_of = |registry: &mut Registry, byte: u8| {
+            let reservation = reserve_with(registry, &actor, &ended, byte, b"intent");
+            let key = AuthorisationKey::from_bytes([byte; 32]);
+            registry
+                .claim_rendezvous(reservation.reservation_id, key)
+                .expect("claims");
+            let worker = WorkerRecord {
+                session_id: reservation.session_id,
+                display_number: reservation.display_number,
+                public_key: key,
+                process_identity: ended.clone(),
+                endpoint: "worker".to_owned(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            };
+            registry
+                .record_worker(reservation.reservation_id, &worker, &DesktopBinding::none())
+                .expect("records the worker");
+            reservation
+        };
+        worker_of(&mut registry, 2);
+        let closed = worker_of(&mut registry, 3);
+        registry
+            .record_closure(&ClosureRecord {
+                session_id: closed.session_id,
+                session_epoch: kr_protocol::ids::SessionEpoch::V1,
+                reason: ClosureReason::CloseRequested,
+                root_exit_code: Nullable::null(),
+                root_signal: Nullable::null(),
+                terminated: Vec::new(),
+                surviving: Vec::new(),
+                ownership_coverage: OwnershipCoverage::Incomplete,
+                durability: Durability::Durable,
+                closed_at_ms: TimestampMs::new(2_000),
+            })
+            .expect("records the closure");
+        drop(registry);
+        idle
+    }
+
+    /// A live session whose worker is a process that is running and does not answer, which holds an
+    /// update: this test's own process stands in for it.
+    fn with_a_worker_that_holds_the_update(self) -> Self {
+        use kr_controller::registry::{Registry, WorkerRecord};
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{ActorId, AuthorityRevision};
+        use kr_protocol::scalars::AuthorisationKey;
+        use kr_protocol::session::SessionState;
+
+        let mut registry = Registry::open(self.registry(), self.temp.environment_id())
+            .expect("the registry opens");
+        let running =
+            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+        let reservation = reserve_with(
+            &mut registry,
+            &ActorId::new("local:501").expect("a principal"),
+            &running,
+            4,
+            b"intent",
+        );
+        let key = AuthorisationKey::from_bytes([4; 32]);
+        registry
+            .claim_rendezvous(reservation.reservation_id, key)
+            .expect("claims");
+        registry
+            .record_worker(
+                reservation.reservation_id,
+                &WorkerRecord {
+                    session_id: reservation.session_id,
+                    display_number: reservation.display_number,
+                    public_key: key,
+                    process_identity: running,
+                    endpoint: "worker".to_owned(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+                &DesktopBinding::none(),
+            )
+            .expect("records the worker");
+        drop(registry);
+        self
+    }
+
+    /// The registry as an earlier release left it at `version`, between 4 and 6: what each later
+    /// schema added is taken away, and the version says so.
+    fn shaped_as(self, version: i64) -> Self {
+        let mut statements = String::new();
+        if version < 6 {
+            statements.push_str(
+                "ALTER TABLE workers DROP COLUMN desktop_session_id;
+                 ALTER TABLE workers DROP COLUMN login_generation;",
+            );
+        }
+        if version < 5 {
+            statements.push_str("DROP TABLE utc_floors; DROP TABLE clock_continuity;");
+        }
+        self.change(&format!(
+            "{statements} UPDATE schema_version SET version = {version};"
+        ))
+    }
+
+    /// The registry's version row says `version` and nothing else changes.
+    fn labelled(self, version: i64) -> Self {
+        self.change(&format!("UPDATE schema_version SET version = {version};"))
+    }
+
+    fn change(self, statements: &str) -> Self {
+        let connection = rusqlite::Connection::open(self.registry()).expect("opens");
+        connection
+            .execute_batch(statements)
+            .expect("changes the registry");
+        drop(connection);
+        self
+    }
+
+    fn registry(&self) -> PathBuf {
+        self.temp.environment().registry_database()
+    }
+
+    fn environment_id(&self) -> String {
+        self.temp.environment_id().to_string()
+    }
+
+    /// What the registry records, read as the file alone: every column the first schema this suite
+    /// forges has, apart from the recorded create request, which a later schema rewrites.
+    fn records(&self) -> Vec<Vec<Vec<String>>> {
+        let uri = format!("file:{}?immutable=1", self.registry().display());
+        let connection = rusqlite::Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("the registry reads");
+        [
+            "SELECT reservation_id, actor_id, create_token, payload_digest, session_id,
+                    display_number, phase, launcher_pid, launcher_source, launcher_start,
+                    claimed_key, created_at_ms FROM reservations ORDER BY reservation_id",
+            "SELECT session_id, display_number, public_key, process_pid, process_source,
+                    process_start, endpoint, profile, state, acknowledged_revision, stated_source
+             FROM workers ORDER BY session_id",
+            "SELECT * FROM tombstones ORDER BY session_id",
+            "SELECT * FROM environment",
+        ]
+        .iter()
+        .map(|query| {
+            let mut statement = connection.prepare(query).expect("prepares");
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|column| format!("{:?}", row.get_ref(column).expect("a value")))
+                        .collect::<Vec<_>>())
+                })
+                .expect("reads")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        })
+        .collect()
+    }
+
+    /// The schema version the registry records, read as the file alone.
+    fn version(&self) -> i64 {
+        kr_controller::registry::Registry::open_to_read(self.registry(), self.temp.environment_id())
+            .map(|_| kr_controller::registry::SCHEMA_VERSION)
+            .unwrap_or_else(|_| {
+                let uri = format!("file:{}?immutable=1", self.registry().display());
+                rusqlite::Connection::open_with_flags(
+                    uri,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                )
+                .expect("reads")
+                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .expect("a version")
+            })
+    }
+
+    /// Every file in the environment's directories whose name says a database's log or journal.
+    fn sidecars(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![self.temp.root().to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory)
+                .expect("a directory")
+                .flatten()
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else if ["-wal", "-shm", "-journal"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                {
+                    found.push(name);
+                }
+            }
+        }
+        found
+    }
+}
+
+/// Reserves a launch with the ended process `ended` as its launcher.
+fn reserve_with(
+    registry: &mut kr_controller::registry::Registry,
+    actor: &kr_protocol::ids::ActorId,
+    ended: &kr_protocol::identity::ProcessStartIdentity,
+    byte: u8,
+    intent: &[u8],
+) -> kr_controller::registry::Reservation {
+    let reservation = registry
+        .reserve(
+            actor,
+            Uuid::from_bytes([byte; 16]),
+            Digest256::from_bytes([byte; 32]),
+            intent,
+            kr_protocol::scalars::TimestampMs::new(u64::from(byte)),
+        )
+        .expect("reserves")
+        .reservation;
+    registry
+        .record_launch(reservation.reservation_id, ended)
+        .expect("records the launcher");
+    registry
+        .set_phase(
+            reservation.reservation_id,
+            kr_controller::registry::LaunchPhase::Spawned,
+        )
+        .expect("the launch is spawned");
+    reservation
+}
+
+/// The value of an environment variable a creator sent, which an earlier schema recorded with the
+/// create request it came in.
+const SECRET: &str = "a-secret-an-earlier-schema-recorded";
+
+/// A create request as an earlier schema recorded it: whole, with the environment its creator sent.
+fn recorded_create(secret: &str) -> Vec<u8> {
+    use kr_protocol::identity::WorkerProfile;
+    use kr_protocol::session::{
+        EnvironmentVariable, LaunchProfile, Presentation, SessionCreateParams, ShellMode,
+    };
+
+    kr_cbor::to_canonical_vec(&SessionCreateParams {
+        environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16])),
+        presentation: Presentation::Invisible,
+        shell: Nullable::null(),
+        shell_mode: ShellMode::NativeCompat,
+        cwd: Nullable::some("/".to_owned()),
+        dimensions: Nullable::null(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        environment_snapshot: vec![EnvironmentVariable {
+            name: "API_TOKEN".to_owned(),
+            value: secret.to_owned(),
+        }],
+        palette: Nullable::null(),
+        launch_profile: LaunchProfile::default(),
+        terminal: Nullable::null(),
+    })
+    .expect("encodes")
+}
+
+/// A host with a release installed and its daemon serving, and a newer release archived.
+async fn host_to_update() -> (Host, Assembled, Assembled, String) {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+    (host, one, two, archive)
+}
+
+/// KR-REQ-26.08, KR-REQ-24.30: an environment whose daemon did not run since an earlier schema
+/// step does not stop the update. Its registry is two schema steps behind the one the update's
+/// release reads; the update, with every daemon stopped and every environment's lock held, brings
+/// it forward through the registry's own migration before it classes it, says so, and the rows it
+/// held are the rows it holds: nothing is left beside the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_carries_an_environment_whose_daemon_did_not_run_forward() {
+    let (host, one, two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store).shaped_as(4);
+    let before = idle.records();
+    assert_eq!(idle.version(), 4);
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], two.name().as_str(), "{said}");
+    assert_eq!(
+        said["carried"],
+        serde_json::json!([{
+            "environment": idle.environment_id(),
+            "from": 4,
+            "to": kr_controller::registry::SCHEMA_VERSION,
+        }]),
+        "{said}"
+    );
+    assert_eq!(
+        said["restarted"],
+        serde_json::json!([host.tree.environment_id().to_string()]),
+        "the environment a daemon served is started again, and the idle one is not: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    let _ = one;
+    assert_eq!(idle.version(), kr_controller::registry::SCHEMA_VERSION);
+    assert_eq!(
+        idle.records(),
+        before,
+        "every row it held is the row it holds"
+    );
+    assert_eq!(
+        idle.sidecars(),
+        Vec::<String>::new(),
+        "no log or journal is left beside it"
+    );
+}
+
+/// KR-REQ-24.30: the carry is the registry's own chain, every step of it: an idle registry two
+/// steps behind comes through the step that removes the environment its creators sent from the
+/// recorded create requests as a daemon's start would take it, and the old bytes are gone from the
+/// file and from its log, and the request is what it was, with no environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_carry_takes_an_idle_registry_through_the_step_that_removes_recorded_environments() {
+    let (host, _one, _two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store).shaped_as(4);
+    let held_before = std::fs::read(idle.registry()).expect("the registry");
+    assert!(
+        held_before
+            .windows(SECRET.len())
+            .any(|window| window == SECRET.as_bytes()),
+        "the old registry holds what its creator sent"
+    );
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["carried"][0]["from"], 4, "{said}");
+    let after = std::fs::read(idle.registry()).expect("the registry");
+    assert!(
+        !after
+            .windows(SECRET.len())
+            .any(|window| window == SECRET.as_bytes()),
+        "nothing of what the creator sent is in the file"
+    );
+    assert_eq!(idle.sidecars(), Vec::<String>::new(), "or in a log");
+    let registry = kr_controller::registry::Registry::open_to_read(
+        idle.registry(),
+        idle.temp.environment_id(),
+    )
+    .expect("reads at the schema this build reads");
+    let reservation = registry
+        .reservations_in(kr_controller::registry::LaunchPhase::Spawned)
+        .expect("reads")
+        .into_iter()
+        .next()
+        .expect("the launch that came to nothing");
+    let intent = reservation.create_intent.expect("its request is kept");
+    let create: kr_protocol::session::SessionCreateParams =
+        kr_cbor::from_canonical_slice(&intent, &kr_cbor::Limits::DEFAULT).expect("a request");
+    let mut expected: kr_protocol::session::SessionCreateParams =
+        kr_cbor::from_canonical_slice(&recorded_create(SECRET), &kr_cbor::Limits::DEFAULT)
+            .expect("the request as it was recorded");
+    expected.environment_snapshot.clear();
+    assert_eq!(
+        create, expected,
+        "the request is what it was, with no environment"
+    );
+}
+
+/// KR-REQ-24.30: a step of the chain that cannot finish holds the update and says so, and the next
+/// run goes on from where it stopped. The step that removes the recorded environments cannot take
+/// its log in while another connection reads the registry: the update exits 1 with the registry at
+/// the version before that step, its requests already rewritten, nothing switched and the daemon it
+/// stopped serving; once the reader is gone, the next update carries from that version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_that_cannot_finish_holds_the_update_and_the_next_run_goes_on_from_it() {
+    let (host, one, two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store).shaped_as(4);
+    // Another program has the registry open and a read under way, as a tool a person runs might.
+    let reader = rusqlite::Connection::open(idle.registry()).expect("opens");
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM reservations;")
+        .expect("a read under way");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&idle.environment_id())
+            && message.contains("recorded schema version 4 when it was opened")
+            && message.contains("write-ahead log still holds the old copies")
+            && message.contains("run kr host update again"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves from the release still current"
+    );
+    drop(reader);
+    assert_eq!(
+        idle.version(),
+        6,
+        "the step before the one that could not finish"
+    );
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["carried"][0]["from"], 6, "{said}");
+    assert_eq!(idle.version(), kr_controller::registry::SCHEMA_VERSION);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+}
+
+/// The control of the above: every environment ran, so every registry is at the schema this build
+/// reads, the update finishes, and it carries nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_across_environments_that_all_ran_carries_nothing() {
+    let (host, _one, two, archive) = host_to_update().await;
+    let second = Second::start(&host.store.stable(Program::Controller)).await;
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["carried"], serde_json::json!([]), "{said}");
+    assert_eq!(said["not_reached"], serde_json::json!([]), "{said}");
+    let mut restarted: Vec<String> = said["restarted"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|environment| environment.as_str().unwrap_or_default().to_owned())
+        .collect();
+    restarted.sort();
+    let mut expected = vec![
+        host.tree.environment_id().to_string(),
+        second.tree.environment_id().to_string(),
+    ];
+    expected.sort();
+    assert_eq!(restarted, expected, "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    assert_eq!(
+        second.build().await,
+        format!("kr-controller/{}", two.name())
+    );
+}
+
+/// KR-REQ-26.09: a check changes nothing, and so does not carry: an idle registry two steps behind
+/// is as it was after it, byte for byte and with nothing made beside it, and the check names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_leaves_an_idle_registry_as_it_was() {
+    let (host, _one, _two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store).shaped_as(4);
+    let before = std::fs::read(idle.registry()).expect("the registry");
+    let removed = host.tree.root().join("removed-state");
+    host.store
+        .record_roots(&host.tree.root().join("removed-runtime"), &removed)
+        .expect("records a state root that is gone");
+
+    let (output, said) =
+        host.kr_json(&["host", "update", "--archive", &archive, "--check", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update --check: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["carried"], serde_json::json!([]), "{said}");
+    assert_eq!(
+        said["not_reached"][0]["state_root"],
+        removed.display().to_string(),
+        "a check names the root it could not reach: {said}"
+    );
+    assert_eq!(
+        std::fs::read(idle.registry()).expect("the registry"),
+        before
+    );
+    assert_eq!(idle.version(), 4);
+    assert_eq!(idle.sidecars(), Vec::<String>::new());
+}
+
+/// KR-REQ-26.08: an update that waits after it brought a registry forward says so, and the registry
+/// stays at the schema this release reads, which the release still current reads as well: the idle
+/// environment's registry is two steps behind and holds a live worker that does not answer, so the
+/// carry happens and the registry is then classed and holds the update, exit 9, with nothing switched
+/// and the daemon the update stopped serving again. A recorded environment whose state is gone is
+/// named in that message too.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_that_waits_after_a_carry_says_what_it_carried_and_leaves_it_so() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store)
+        .with_a_worker_that_holds_the_update()
+        .shaped_as(4);
+    let removed = host.tree.root().join("removed-state");
+    host.store
+        .record_roots(&host.tree.root().join("removed-runtime"), &removed)
+        .expect("records a state root that is gone");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("did not answer its challenge and has not ended")
+            && message.contains(&format!(
+                "The update had already brought forward the registry of environment {} from \
+                 schema version 4 to {}",
+                idle.environment_id(),
+                kr_controller::registry::SCHEMA_VERSION
+            ))
+            && message.contains(&format!(
+                "The update found that the environment recorded with runtime root {} and state \
+                 root {} could not be reached",
+                host.tree.root().join("removed-runtime").display(),
+                removed.display()
+            )),
+        "{said}"
+    );
+    assert_eq!(idle.version(), kr_controller::registry::SCHEMA_VERSION);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves from the release still current"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+}
+
+/// KR-REQ-24.30: a registry that cannot be brought forward holds the update, and what it left is
+/// said. Labelled version 3 with every column of this build, its first step adds a column that is
+/// already there: the step fails whole, the registry stays at version 3 for the release that is
+/// current to continue from, nothing is switched, and the daemon the update stopped serves again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_that_cannot_be_carried_holds_the_update_and_says_where_it_is() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store).labelled(3);
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&idle.environment_id())
+            && message.contains("brought forward")
+            && message.contains("schema version 3")
+            && message.contains("stated_source"),
+        "{said}"
+    );
+    assert_eq!(idle.version(), 3);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon the update stopped serves from the release still current"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+}
+
+/// KR-REQ-24.30: the migration never makes a table again that a registry lost, which would read as
+/// a registry that recorded no worker: a registry two steps behind with no `reservations` table
+/// holds the update, names the table, and is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_that_lost_a_table_is_not_carried_and_holds_the_update() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store)
+        .shaped_as(4)
+        .change("DROP TABLE reservations;");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&idle.environment_id()) && message.contains("reservations"),
+        "{said}"
+    );
+    assert_eq!(idle.version(), 4);
+    let tables: i64 = rusqlite::Connection::open(idle.registry())
+        .expect("opens")
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'reservations'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reads the schema");
+    assert_eq!(tables, 0, "no table was made again, empty");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
+/// The control of the two above, for a registry of a later schema than this release reads: it is
+/// not carried back, and the update holds as it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_of_a_later_schema_holds_the_update_and_is_left() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let later = kr_controller::registry::SCHEMA_VERSION + 1;
+    let idle = Idle::new(&host.store).labelled(later);
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&idle.environment_id())
+            && message.contains(&format!("schema version {later}")),
+        "{said}"
+    );
+    assert_eq!(idle.version(), later);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
+/// KR-REQ-26.08: an environment whose identity cannot be looked at because what holds it is gone,
+/// a state root that is a file where a directory was, or one that was removed, is named in the
+/// outcome, and every other environment goes ahead: the daemon the host's own environment has is
+/// handed over and started again from the new release.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_environment_that_cannot_be_reached_is_named_and_the_others_go_ahead() {
+    let (host, _one, two, archive) = host_to_update().await;
+    let file = host.tree.root().join("not-a-directory");
+    std::fs::write(&file, b"a container's mount that became a file").expect("a file");
+    let runtime = host.tree.root().join("unreached-runtime");
+    let removed = host.tree.root().join("removed-state");
+    host.store
+        .record_roots(&runtime, &file)
+        .expect("records a state root that is a file");
+    host.store
+        .record_roots(&runtime, &removed)
+        .expect("records a state root that is gone");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let unreached = said["not_reached"].as_array().cloned().unwrap_or_default();
+    let mut states: Vec<String> = unreached
+        .iter()
+        .map(|entry| entry["state_root"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    states.sort();
+    let mut expected = vec![file.display().to_string(), removed.display().to_string()];
+    expected.sort();
+    assert_eq!(states, expected, "{said}");
+    assert!(
+        unreached.iter().all(|entry| entry["reason"]
+            .as_str()
+            .is_some_and(|said| !said.is_empty())),
+        "each says why: {said}"
+    );
+    assert_eq!(
+        said["restarted"],
+        serde_json::json!([host.tree.environment_id().to_string()]),
+        "{said}"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+}
+
+/// The control of the above: an identity that is there and cannot be trusted, a link, is not a
+/// reason to go on without the environment: the update stops before it stops anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_that_is_there_and_not_trusted_still_stops_the_update() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let state = host.tree.root().join("untrusted-state");
+    std::fs::create_dir_all(&state).expect("a state root");
+    std::os::unix::fs::symlink(
+        host.tree.root().join("elsewhere"),
+        state.join("environment-id"),
+    )
+    .expect("a link where the identity is");
+    host.store
+        .record_roots(&host.tree.root().join("untrusted-runtime"), &state)
+        .expect("records the roots");
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "nothing was stopped"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+}
