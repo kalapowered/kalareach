@@ -157,7 +157,7 @@ pub struct WorkerService {
     /// The compact form of the boot above, which is what an action window is bound to.
     boot_epoch: BootEpoch,
     /// The suspend-aware continuous clock every deadline this worker decides is measured on.
-    clock: Arc<SystemContinuousClock>,
+    clock: Arc<dyn ContinuousClock>,
     /// The machine's own continuous clock, which is the one a forwarded deadline arrives on.
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     /// The session's time contract, which reads UTC through the host's clock floor.
@@ -380,7 +380,7 @@ impl WorkerService {
             )?
             .with_agents(Arc::clone(&broker) as Arc<dyn crate::questions::AgentBindings>),
         );
-        let clock = Arc::new(SystemContinuousClock::new());
+        let clock: Arc<dyn ContinuousClock> = Arc::new(SystemContinuousClock::new());
         // The session's own, not a second one: the check this service makes before a batch is
         // accepted and the fence the writer applies before it is written have to be reading the
         // same clock for the second to be a continuation of the first.
@@ -400,7 +400,7 @@ impl WorkerService {
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
             boot_epoch,
-            windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
+            windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock)),
             clock,
             shared_clock,
             time,
@@ -648,6 +648,16 @@ impl WorkerService {
         let first = report.next();
         state.pending_report = report.collect();
         first
+    }
+
+    /// Puts every deadline this worker decides on `clock`, for this host's own tests: a test that
+    /// moves a clock by hand moves this worker's with it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn on_clock(mut self, clock: Arc<dyn ContinuousClock>) -> Self {
+        self.windows = ActionWindowIssuer::with_default_validity(Arc::clone(&clock));
+        self.clock = clock;
+        self
     }
 
     /// Stops the next approval immediately before the broker admits it, for this host's own tests.
@@ -1699,6 +1709,8 @@ impl WorkerService {
                     .then_some(reply)
             }
             ControlFrame::Forwarded(forwarded) => {
+                #[cfg(feature = "testing")]
+                self.record_received(&forwarded.mutation.method, &forwarded.mutation.params);
                 let reply = self.forwarded(state, &forwarded).await;
                 (state.pending_launch.is_none() && state.pending_upstream.is_none())
                     .then_some(reply)
