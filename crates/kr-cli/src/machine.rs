@@ -138,7 +138,7 @@ pub async fn run(paths: &HostPaths, arguments: MachineArguments, json: bool) -> 
 /* -------------------------------------------------------------------------------------------- */
 
 /// How this host reaches an environment, which a plan keeps for each of its steps.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum Reach {
     /// One of this host's own environments, over its own socket.
     Own,
@@ -615,7 +615,7 @@ async fn one_step<P: Serialize + ?Sized>(
 /* -------------------------------------------------------------------------------------------- */
 
 /// A merge over independent environments, kept by this client until each step has its result.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Plan {
     /// The group the environments are merged into.
     into: MachineId,
@@ -630,7 +630,7 @@ struct Plan {
 }
 
 /// One environment's step.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PlannedStep {
     environment_id: EnvironmentId,
     reach: Reach,
