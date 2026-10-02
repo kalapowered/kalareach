@@ -42,7 +42,7 @@ Plugins:
 | --- | --- |
 | [plugins/README.md](plugins/README.md) | The package contract: the manifest, capabilities, effect classes, the document, the connector table, the component interface, limits and findings |
 | [plugins/catalogue.md](plugins/catalogue.md) | Repositories and the catalogue: enrolment, synchronisation, payloads, activation, budgets, revocation and native bridges |
-| [plugins/runtime.md](plugins/runtime.md) | Where a plugin component runs, what bounds it, its faults and its compiled-code cache, and the package that ships with the host |
+| [plugins/runtime.md](plugins/runtime.md) | Where a plugin component runs, what bounds it, its faults and its compiled-code cache, and the signed catalogue generation that ships with the host |
 | [plugins/sdk.md](plugins/sdk.md) | Answering an application's approval from a declarative package |
 | [bridges/claude-code/README.md](bridges/claude-code/README.md) | The Claude Code bridge |
 | [bridges/gemini-cli/README.md](bridges/gemini-cli/README.md) | The Gemini CLI bridge |
@@ -87,7 +87,7 @@ implementations of one protocol.
 | --- | --- | --- |
 | `kalareach`, this one | The host (the control daemon, the workers and `kr`), the shared protocol, transport and client library, the Tauri companion application for desktops and phones, the plugin runtime and SDK, the managed shell packages, the contact skill and the conformance fixtures | The generated `@kalareach/protocol` and `@kalareach/plugin-sdk` packages, as immutable archives on GitHub releases ([releases/packages.md](releases/packages.md)). A `host/v*` tag runs the workflow that builds and signs the Windows host executables and PowerShell packages and publishes them as a release ([releases/windows-signing.md](releases/windows-signing.md)) |
 | `kalareach-web` | The website at [reach.kala.to](https://reach.kala.to) and its public documentation, the account system, the managed service APIs and the Cloudflare Worker that serves them, the Stripe billing integration, and the infrastructure configuration, the relay and discovery deployments among it | Deployments of the website and the service backend |
-| `kalareach-plugins` | The plugin catalogue: package sources, declarative manifests, fixtures, publisher records, revocations, and the pipeline that validates packages and builds and signs catalogue generations | Signed catalogue generations, built by its pipeline. The package this repository ships with the host is copied, by digest, from the catalogue's signed development generation, and `bundled-plugins.lock` names the generation, its commit and its trust root |
+| `kalareach-plugins` | The plugin catalogue: package sources, declarative manifests, fixtures, publisher records, revocations, and the pipeline that validates packages and builds and signs catalogue generations | Signed catalogue generations, built by its pipeline. The generation this repository ships with the host is copied, by digest, from the catalogue's signed development generation, and `bundled-plugins.lock` names the generation, its commit and its trust root |
 
 The other two pin what they take from this one. The website service pins a `@kalareach/protocol`
 release archive by URL and digest, and the catalogue pipeline pins `kr-plugin-sdk`, the validator a
