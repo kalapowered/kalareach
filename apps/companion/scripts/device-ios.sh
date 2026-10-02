@@ -260,12 +260,30 @@ end_signing() {
   return 1
 }
 
+# Stops the signing command, and answers once it has ended. The command starts with the signals this
+# shell ignores, and puts the default ones back as its first act, so a TERM that comes before that act
+# has no effect on it: the TERM is sent again every tenth of a second until the command has ended, and
+# the command is killed if it has not ended after five seconds. The command's number cannot be another
+# process's, since this shell has not collected it yet.
+stop_signing_command() {
+  local turns=0
+  while kill -0 "$signing_child" 2>/dev/null && [ "$turns" -lt 50 ]; do
+    kill "$signing_child" 2>/dev/null
+    sleep 0.1
+    turns=$((turns + 1))
+  done
+  if kill -0 "$signing_child" 2>/dev/null; then
+    say "the signing command did not stop at TERM: killing it"
+    kill -9 "$signing_child" 2>/dev/null
+  fi
+  wait "$signing_child" 2>/dev/null
+}
+
 # A TERM, INT or HUP while the signing command runs, the one time signals are not ignored: the command
 # is stopped, then the signing is undone, before this shell goes.
 signing_interrupted() { # <exit status>
   trap '' INT TERM HUP
-  [ -n "$signing_child" ] && kill "$signing_child" 2>/dev/null
-  [ -n "$signing_child" ] && wait "$signing_child" 2>/dev/null
+  [ -n "$signing_child" ] && stop_signing_command
   signing_child=""
   end_signing
   exit "$1"
@@ -304,7 +322,8 @@ with_signing_keychain() { # <command...>
   signing_ended=0
   if security unlock-keychain -p "$(cat "$KR_KEYCHAIN_PASSWORD_FILE")" "$KR_KEYCHAIN" \
     && security list-keychains -d user -s "${signing_paths[@]}" "$KR_KEYCHAIN"; then
-    # The command starts with the default signals, whatever this shell is ignoring: a TERM has to stop it.
+    # The command puts the default signals back as its first act, whatever this shell is ignoring, so that
+    # a TERM stops it; a TERM that comes before that act is sent again by the handler.
     ( trap - INT TERM HUP; exec "$@" ) &
     signing_child=$!
     trap 'signing_interrupted 130' INT
@@ -473,10 +492,11 @@ process_start() { # <pid>
 
 # Starts the test run for the phone in the background as a new process that, before it becomes Xcode,
 # writes its own identity into the record (its number, its start time and its result bundle), checks that
-# cleanup has not closed the gate and that the record is still this session's, and only then becomes Xcode;
-# a process that cannot write its identity, or finds the gate closed or another session's record, ends
-# without starting Xcode. Cleanup, and the end of a session, close the gate before they read the record, so
-# a driver is either in the record they read or sees the gate closed: no driver can run unseen. Sets
+# cleanup has not closed the gate and that the record is still this session's, and only then becomes Xcode.
+# A process that cannot read its start time, finds no record (it never creates one: the session's start
+# does), cannot write its identity, finds the gate closed or finds another session's record, ends without
+# starting Xcode. Cleanup, and the end of a session, close the gate before they read the record, so a
+# driver is either in the record they read or sees the gate closed: no driver can run unseen. Sets
 # runner_pid.
 start_driver() { # <the result bundle> <the output file> <xcodebuild arguments...>
   local result=$1 output=$2
@@ -484,6 +504,7 @@ start_driver() { # <the result bundle> <the output file> <xcodebuild arguments..
   bash -c '
     started=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p $$ | sed "s/^ *//; s/ *$//")
     [ -n "$started" ] || exit 70
+    [ -f "$2" ] || exit 74
     printf "runner=%s|%s|%s\n" "$$" "$started" "$1" >> "$2" || exit 71
     [ ! -e "$2.gate" ] || exit 72
     grep -qx "started=$3" "$2" || exit 73
@@ -501,14 +522,20 @@ retire_driver() { # <pid>
   echo "retired=$1|$started" >> "$record"
 }
 
-# Whether a number is the driver a record line names. 0: it is, by its start time and its command line.
-# 1: it is not (gone, or another process with that number). 2: doubtful, a live process whose command line
-# names the recorded result bundle but whose start time is not the recorded one, which is no process to
-# touch and none to pass over.
+# Whether a number is the driver a record line names. 0: it is, by its start time and by its command line,
+# both of which have to agree. 1: it is not, for a number that is gone or has ended (a process that has
+# ended and is not yet collected counts as ended), or has neither the recorded start time nor the recorded
+# result bundle in its command line. 2: doubtful, a live process that has one of the two and not the other,
+# which is no process to touch and none to pass over.
 driver_state() { # <pid> <start time> <result bundle>
+  local stat started=0 named=0
   kill -0 "$1" 2>/dev/null || return 1
-  ps -o command= -p "$1" 2>/dev/null | grep -qF -- "$3" || return 1
-  [ "$(process_start "$1")" = "$2" ] && return 0
+  stat=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')
+  case $stat in '' | Z*) return 1 ;; esac
+  [ "$(process_start "$1")" = "$2" ] && started=1
+  ps -ww -o command= -p "$1" 2>/dev/null | grep -qF -- "$3" && named=1
+  [ $((started + named)) = 2 ] && return 0
+  [ $((started + named)) = 0 ] && return 1
   return 2
 }
 is_driver() { driver_state "$@"; }   # true only for a driver that is certain
@@ -806,7 +833,7 @@ stop_recorded_driver() {
     driver_state "$pid" "$started" "$result"; state=$?
     [ "$state" = 1 ] && continue
     if [ "$state" = 2 ]; then
-      say "A PROCESS THAT LOOKS LIKE THE TEST RUN $pid HAS ANOTHER START TIME THAN THE RECORD'S: nothing is cleaned up"
+      say "A PROCESS THAT MAY BE THE TEST RUN $pid DIFFERS FROM THE RECORD IN ITS START TIME OR ITS COMMAND LINE: nothing is cleaned up"
       exit 3
     fi
     say "stopping the test run $pid that the record names"
