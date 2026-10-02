@@ -2337,3 +2337,47 @@ fn a_decision_keeps_the_privacy_state_it_was_made_under() {
         .expect("the store records the decision");
     assert_eq!(only_item(&attention).decided_privacy, None);
 }
+
+/// A decision held back by quiet hours while privacy mode is on, over an announcement decided
+/// before it and not yet taken, carries the private state it was made under, not the normal one of
+/// the announcement before it: it is the held decision the release will hand over, and it was made
+/// while the mode was on. The control: a held repeat made under the normal state keeps the earlier
+/// one's.
+#[test]
+fn a_held_decision_made_in_privacy_mode_is_not_stamped_with_the_normal_state_of_the_one_before_it()
+{
+    use kr_attention::PrivacyStamp;
+    use kr_attention::rule::REMINDER_INTERVAL_MS;
+
+    let normal = PrivacyStamp {
+        generation: 2,
+        private: false,
+    };
+    let private = PrivacyStamp {
+        generation: 3,
+        private: true,
+    };
+    for (during, expected) in [(private, private), (normal, normal)] {
+        let mut attention = engine();
+        attention
+            .apply(
+                &approval(session(1), 1, "req-1"),
+                reading(1_000).under(normal),
+            )
+            .expect("the store records the decision");
+        attention
+            .set_quiet_hours(Some(quiet_over_noon()))
+            .expect("the store records the window");
+        let repeat = 1_000 + REMINDER_INTERVAL_MS;
+        attention
+            .tick(reading(repeat).under(during), &all_read)
+            .expect("the store records the decision");
+        let held = only_item(&attention);
+        assert!(held.deferred, "the repeat is held");
+        assert_eq!(
+            held.decided_privacy,
+            Some(expected),
+            "decided during {during:?}"
+        );
+    }
+}
