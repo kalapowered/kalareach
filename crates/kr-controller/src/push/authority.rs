@@ -385,8 +385,15 @@ impl GrantedRecipients {
         {
             return None;
         }
+        // What the grant lets its recipient read is read through the rights it keeps once the
+        // policy has been applied, as what it lets it do is: a lease that removes
+        // `session.view` leaves nothing of the sessions to read.
+        let viewer = ViewerScope::from_grant(&Grant {
+            actions: effective.rights.clone(),
+            ..narrowed.clone()
+        });
         Some(RecipientScope {
-            viewer: ViewerScope::from_grant(&narrowed),
+            viewer,
             sessions: narrowed.session_selector.clone(),
             rights: effective.rights,
             grant_id: narrowed.grant_id,
@@ -1188,6 +1195,49 @@ mod tests {
                 "paired {paired}, revoked {revokes}"
             );
         }
+    }
+
+    /// A grant that keeps none of `session.view` still reaches what a workflow's pause or the host
+    /// itself is about, with the rights it keeps and nothing it does not: the rights the scope
+    /// carries are the rights the viewer reads through, and `session.view` is not among them. The
+    /// control: a grant that keeps none of the three admits nothing.
+    #[test]
+    fn a_grant_without_session_view_is_admitted_for_what_a_workflow_or_the_host_is_about() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        issued(
+            &sharing,
+            grant(42, SessionSelector::Any, &[ActionRight::AutomationManage]),
+            true,
+        );
+        issued(
+            &sharing,
+            grant(43, SessionSelector::Any, &[ActionRight::HostManage]),
+            true,
+        );
+        issued(
+            &sharing,
+            grant(44, SessionSelector::Any, &[ActionRight::FilesRead]),
+            true,
+        );
+        let recipients = recipients(&sharing);
+        for (byte, right) in [
+            (42, ActionRight::AutomationManage),
+            (43, ActionRight::HostManage),
+        ] {
+            let scope = recipients
+                .scope_for(&rule(Some(byte)))
+                .unwrap_or_else(|| panic!("a grant that keeps {right:?} is admitted"));
+            assert_eq!(scope.rights, [right].into_iter().collect());
+            assert!(
+                !scope.rights.contains(&ActionRight::SessionView),
+                "it keeps no session.view"
+            );
+        }
+        assert_eq!(
+            recipients.scope_for(&rule(Some(44))),
+            None,
+            "a grant that keeps none of the three admits nothing"
+        );
     }
 
     /// A grant of the grant store issued to a device is only as good as the device's own pairing,

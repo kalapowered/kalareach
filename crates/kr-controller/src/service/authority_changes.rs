@@ -1314,10 +1314,10 @@ mod tests {
     };
 
     use crate::authority::AdmittedMutation;
+    use crate::service::Controller;
     use crate::service::admission::AdmittedConnection;
     use crate::service::net::devices::DeviceRecord;
     use crate::service::net::tests::{daemon_on, manual_clocks};
-    use crate::service::{Controller, WallClock};
 
     fn uuid(byte: u8) -> Uuid {
         Uuid::from_bytes([byte; 16])
@@ -1331,7 +1331,6 @@ mod tests {
         continuous: kr_transport::clock::ManualClock,
         wall: Arc<std::sync::atomic::AtomicU64>,
         device_id: DeviceId,
-        record: DeviceRecord,
     }
 
     impl Host {
@@ -1409,7 +1408,6 @@ mod tests {
                 continuous,
                 wall,
                 device_id,
-                record,
             }
         }
 
@@ -1654,6 +1652,5 @@ mod tests {
             .await
             .expect("a standing admission registers");
         assert_eq!(host.revisions(), (2, None));
-        let _ = (&host.record, WallClock::system());
     }
 }
