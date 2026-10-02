@@ -7,7 +7,7 @@
 #   device-ios.sh cleanup                                 what a session that was killed left behind
 #
 # Sessions (the tests each runs are listed in `session_tests` below):
-#   s0   the proofs and the keychain boundary, 20 minutes
+#   s0   the proofs, the keychain boundary and the application's lifecycle with push started, 20 minutes
 #   s1   push to this phone through Firebase, with the person not touching notifications, 45 minutes
 #   s2   the keyboard, rotation, accessibility, file pickers, recovery: person at the phone, 90 minutes
 #   s3a  the microphone refused: person at the phone, 10 minutes
@@ -269,7 +269,7 @@ build_tests() {
 # whether the person is at the phone.
 session_tests() { # <name>
   case $1 in
-    s0) echo "ProofTests KeychainTests" ;;
+    s0) echo "ProofTests KeychainTests LifecycleTests" ;;
     s1) echo "PushTests/testALegWithTheApplicationTerminated PushTests/testALegWithTheApplicationInTheBackground" ;;
     s2) echo "RecoveryTests LayoutTests AccessibilityTests PickerTests" ;;
     s3a) echo "AudioTests/testARefusedMicrophoneIsSaidAndNothingOpens" ;;
