@@ -4660,38 +4660,52 @@ mod tests {
         );
     }
 
-    /// A lift that waits for another writer records the time it got the write lock, not the time
-    /// it was asked: a decision made while it waited is dated at or before the time recorded, so
-    /// it is dropped with the rest of what was decided under privacy mode.
+    /// A lift that waits for another writer records the time it got the write lock, not the time it
+    /// was asked: a decision made while it waited is dated at or before the time recorded, so it is
+    /// dropped with the rest of what was decided under privacy mode. The test waits, on the
+    /// journal's own busy handler, until the lift is blocked on the lock, and only then lets the
+    /// clock move on and the lock go.
     #[test]
     fn a_lift_that_waits_for_another_writer_records_the_time_it_got_the_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static BLOCKED: AtomicBool = AtomicBool::new(false);
+        fn note_the_wait(_attempts: i32) -> bool {
+            BLOCKED.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }
+
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("delivery.sqlite3");
         let mut journal = DeliveryJournal::open(&path).expect("a journal");
         journal.fence(1).expect("a fence");
+        journal
+            .connection
+            .busy_handler(Some(note_the_wait))
+            .expect("a handler");
         let other = rusqlite::Connection::open(&path).expect("another writer");
         other
             .execute_batch("BEGIN IMMEDIATE")
             .expect("the write lock is held");
 
-        let (asked, hears) = std::sync::mpsc::channel();
         let lifting = std::thread::spawn(move || {
-            asked.send(()).expect("the test is listening");
             journal.lift_fence(2).expect("a lift");
             journal
         });
-        hears.recv().expect("the lift was asked for");
-        // The clock moves on while the lift is waiting for the lock, and the lock is let go after.
-        let began = wall_ms();
-        while wall_ms() <= began {
+        while !BLOCKED.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let released = wall_ms();
+        // The lift is blocked on the lock. The clock moves on, and the lock is let go.
+        let waited = wall_ms();
+        while wall_ms() <= waited {
+            std::thread::yield_now();
+        }
         other.execute_batch("COMMIT").expect("the lock is let go");
         let journal = lifting.join().expect("the lift ended");
         assert!(
-            journal.lifted_at_ms().expect("a read") >= released,
-            "the lift is dated when it held the lock"
+            journal.lifted_at_ms().expect("a read") > waited,
+            "the lift is dated when it held the lock, after the wait"
         );
     }
 
@@ -5570,6 +5584,20 @@ mod tests {
         journal
             .admit(&delivery_for(4, event(4), &phone))
             .expect("one to take back");
+        assert!(
+            journal.exported().expect("a read").is_empty(),
+            "nothing has left: an unsent one is not a copy, and neither is a refused one or one \
+             this host collapsed"
+        );
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(1)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::Admitted,
+            "and the unsent one is still queued when the list is read"
+        );
         journal.fence(1).expect("a fence");
         journal.cancel_undispatched(2_500).expect("a cancellation");
         assert_eq!(
@@ -5582,7 +5610,7 @@ mod tests {
         );
         assert!(
             journal.exported().expect("a read").is_empty(),
-            "nothing has left"
+            "nor is one taken back"
         );
         // The control: one the gateway accepted is a copy.
         journal.lift_fence(2).expect("a lift");
