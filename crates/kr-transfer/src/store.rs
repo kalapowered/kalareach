@@ -604,9 +604,15 @@ impl Store {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(TransferError::store)?;
-        // Forward-only, one step at a time, and each step leaves the journal readable by the
-        // version it moves to. `CREATE TABLE IF NOT EXISTS` above does nothing to a table that
-        // already exists, so a column added after a release is added here.
+        // Forward-only, and the step leaves the journal readable by the version it moves to.
+        // `CREATE TABLE IF NOT EXISTS` above does nothing to a table that already exists, so a
+        // column that a later version of the schema added is added here.
+        //
+        // This serves a version 1 store, which a build before the action subject was recorded
+        // wrote. The column and the version are written by two statements, not one transaction,
+        // and a start that stopped between them repeats the step safely, because the column is
+        // added only when it is absent. Remove this step, with `add_action_subject` and the
+        // `Some(1)` arm below it, once no supported upgrade starts from a version 1 store.
         if recorded == Some(1) {
             self.add_action_subject()?;
             self.connection

@@ -3836,6 +3836,9 @@ fn insert_notification(
 /// privacy mode was on, and none of it is sent. A journal that is still fenced records the time
 /// when it is lifted. The version is read again inside the transaction, so two openers cannot both
 /// add a column.
+///
+/// Remove this upgrade, with the arm of the open that calls it, once no supported upgrade starts
+/// from a journal written under version 6 or 7; `OLDEST_SCHEMA_VERSION` then moves up with it.
 fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

@@ -725,6 +725,11 @@ impl Store {
             // when a removal of it stopped part way; an earlier row says nothing. It is a version
             // of its own because a store already at 7 has neither column, and a store at the
             // version this build reads is not migrated at all.
+            //
+            // This arm serves a store written under any earlier version. Remove it, with
+            // `rebuild_retained_items`, `protect_recorded_reasons` and `protect_recorded_answers`,
+            // once no supported upgrade starts from a store written under a version below the one
+            // this build reads; a store older than the window is then refused like a newer one.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
@@ -2723,6 +2728,9 @@ fn rebuild_retained_items(transaction: &Transaction<'_>) -> Result<()> {
 /// Every one of them is nullable and means "not recorded", which is what an older row holds
 /// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
 /// leaves such a name alone rather than deleting whatever now holds it.
+///
+/// Each entry serves a store written by a build whose shape of that table lacked the column. Remove
+/// an entry once no supported upgrade starts from such a store, and the function with the last one.
 fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
     // Every nullable column this build reads that some earlier shape of this schema did not have.
     // The list is the whole of them rather than the ones added last: a store written by *any*
