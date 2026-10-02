@@ -640,6 +640,111 @@ fn a_location_for_a_grant_is_confirmed_for_the_device_that_holds_it_and_admits_t
     }
 }
 
+/// A caller bounded by a grant clones, makes an isolated working copy and removes it, all through
+/// the locations the owner authorised for its grant, where every read it causes is bounded.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_caller_bounded_by_a_grant_clones_makes_a_working_copy_and_removes_it_through_its_locations() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let grant = GrantId::new(Uuid::from_bytes([0x68; 16]));
+    owner.knows_device(grant, device_keys(0x74));
+    let root = fixture.work().join("granted");
+    std::fs::create_dir(&root).expect("a directory");
+    let project = adopt(&fixture, &root, "repo", 20);
+    let source = authorised(
+        fixture.service(),
+        &owner,
+        &authorise_params(environment, &root, LocationPurpose::Source, Some(grant)),
+        21,
+    );
+    let into = authorised(
+        fixture.service(),
+        &owner,
+        &authorise_params(
+            environment,
+            &root,
+            LocationPurpose::Destination,
+            Some(grant),
+        ),
+        22,
+    );
+    attach(fixture.service(), &owner, project, source.location_id, 23)
+        .expect("the owner binds the repository to the grant's source location");
+    let beneath = |name: &str| DestinationRequest {
+        environment_id: environment,
+        parent: DestinationParent::Location {
+            location_id: into.location_id,
+        },
+        name: name.to_owned(),
+    };
+
+    let cloning = action("project.clone", 24);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: beneath("cloned"),
+                label: "cloned".to_owned(),
+                source: CloneSource::Location {
+                    location_id: source.location_id,
+                    relative_path: "repo".to_owned(),
+                },
+            },
+            kr_project::store::Performed::from(Some(&cloning)).bounded_by(grant),
+        )
+        .expect("the caller bounded by the grant clones through its locations");
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    assert!(root.join("cloned/README.md").is_file());
+
+    let creating = action("workspace.create", 25);
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "review".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+                policy: InclusionPolicy {
+                    dirty_files: InclusionChoice::Include,
+                    untracked_files: InclusionChoice::Exclude,
+                    submodules: InclusionChoice::Exclude,
+                    binary_files: InclusionChoice::Exclude,
+                    generated_artefacts: InclusionChoice::Exclude,
+                },
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(beneath("review"))),
+                preview_only: false,
+            },
+            kr_project::store::Performed::from(Some(&creating)).bounded_by(grant),
+        )
+        .expect("the caller bounded by the grant makes a working copy through its locations")
+        .workspace
+        .0
+        .expect("a workspace");
+    assert!(root.join("review/README.md").is_file());
+
+    let removing = action("workspace.remove", 26);
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: created.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
+            },
+            kr_project::store::Performed::from(Some(&removing)).bounded_by(grant),
+        )
+        .expect("and removes it through the location it was made through");
+    assert!(removed.working_files_removed);
+    assert!(!root.join("review").exists());
+}
+
 #[test]
 fn a_location_confirmation_for_a_grant_names_a_device_this_host_holds_in_full() {
     // A grant no paired device holds has no keys to bind the confirmation to, so nothing is
