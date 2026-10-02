@@ -2049,17 +2049,16 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
         })
         .await;
     let (read, materialised) = read_and_materialise(&outside, env, recorded.plain).await;
-    let refusal = read.expect_err("a version in an environment the grant does not select");
-    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-    assert!(said(&refusal).contains(does_not_reach), "{refusal}");
-    // The write names the environment it acts in, which the door holds to the grant before the
-    // version is looked at.
-    let refusal = materialised.expect_err("the same grant asking to write the version out");
-    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-    assert!(
-        said(&refusal).contains("does not cover this environment"),
-        "{refusal}"
-    );
+    // The door holds every request to the environments the grant selects before any version is
+    // looked at, so a grant that selects none of this host's reaches neither.
+    for refusal in [read.err(), materialised.err()] {
+        let refusal = refusal.expect("a grant that does not select this environment");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(
+            said(&refusal).contains("does not cover this environment"),
+            "{refusal}"
+        );
+    }
     let (_b, inside) = recorded
         .device(|grant| {
             grant.environment_selector = EnvironmentSelector::These {
@@ -2298,7 +2297,7 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
 /// writes nothing, and the same action is performed once the device is admitted again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_materialisation_for_a_device_whose_authority_has_gone_writes_nothing() {
-    let mut recorded = Recorded::start().await;
+    let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
     let mut proposal = net_support::proposal(VERSION_RIGHTS);
     proposal.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(1));
@@ -2323,8 +2322,10 @@ async fn a_materialisation_for_a_device_whose_authority_has_gone_writes_nothing(
     .expect_err("a registration that was withdrawn writes nothing");
     // The withdrawal closed the device's connection, so what the device is told is that it ended.
     let _ = refusal;
+    // The owner's own connection went with the rest, so it reads on a new one.
+    let mut owners_own = recorded.host.client().await;
     let owners: kr_protocol::changeset::ChangesetReadResult = locally(
-        &mut recorded.control,
+        &mut owners_own,
         Method::ChangesetRead,
         &kr_protocol::changeset::ChangesetReadParams {
             change_set_id: recorded.plain.change_set_id,
