@@ -286,6 +286,9 @@ struct Origins {
     closing: BTreeSet<SessionId>,
     /// Sessions closed over a worker this host could not confirm had ended.
     unaccounted: BTreeSet<SessionId>,
+    /// Sessions whose closure this daemon has begun and not finished: from the moment their link
+    /// is dropped, before anything is awaited, until the store has finished them.
+    ended: BTreeSet<SessionId>,
     /// Closed sessions the store could not finish yet, which the maintenance loop tries again.
     unfinished: BTreeSet<SessionId>,
 }
@@ -874,8 +877,8 @@ impl AttentionModule {
     /// could not account for: a closing session's pending questions and approvals end when the
     /// store has read what is left of its journal, and an announcement taken before that is one
     /// about a condition that is about to end. A pending question or approval that names a session
-    /// without having been raised from it is held back while that session is being closed. What is
-    /// held back is offered again.
+    /// without having been raised from it is held back from the moment that session's closure
+    /// begins until the store has finished it. What is held back is offered again.
     ///
     /// # Errors
     ///
@@ -885,7 +888,12 @@ impl AttentionModule {
         consume: impl FnOnce(&mut Attention, &dyn Fn(&kr_attention::engine::Item) -> bool) -> T,
     ) -> Answer<T> {
         let mut store = self.store()?;
-        let held: BTreeSet<SessionId> = {
+        // Two sets, because the two relationships are held back for different reasons. An item is
+        // held with the session it was raised from until the store reads that session or has
+        // finished reading it; a request that names a session it was not raised from is held
+        // only while the session's closure is under way, because the environment can name a
+        // session this host never held, and nothing would ever let that one go.
+        let (held_by_origin, held_by_name): (BTreeSet<SessionId>, BTreeSet<SessionId>) = {
             let engine = store.engine().map_err(refusal)?;
             let origins = self.origins();
             let by_origin = engine
@@ -899,23 +907,20 @@ impl AttentionModule {
                     !reads
                         || origins.closing.contains(session_id)
                         || origins.unaccounted.contains(session_id)
-                });
-            // A request the environment's own sources raise about a session ends with the session
-            // as one of the session's own does, so it waits while the session is being closed. It
-            // does not wait for a session this host has not read: the environment can name one it
-            // never held, and nothing would ever let it go.
+                })
+                .collect();
             let by_name = engine
                 .items()
                 .filter_map(named_by)
-                .filter(|session_id| origins.closing.contains(session_id));
-            by_origin.chain(by_name).collect()
+                .filter(|session_id| origins.ended.contains(session_id))
+                .collect();
+            (by_origin, by_name)
         };
         let offer = |item: &kr_attention::engine::Item| {
             item.origin
                 .session()
-                .into_iter()
-                .chain(named_by(item))
-                .all(|session_id| !held.contains(&session_id))
+                .is_none_or(|session_id| !held_by_origin.contains(&session_id))
+                && named_by(item).is_none_or(|session_id| !held_by_name.contains(&session_id))
         };
         Ok(consume(&mut store, &offer))
     }
@@ -1970,6 +1975,9 @@ impl AttentionModule {
             origins.watched.remove(&session_id);
             origins.workers.remove(&session_id);
             origins.certified.remove(&session_id);
+            // Under the store lock with the link, so no take sees the link gone and the closure not
+            // begun: a request that names the session from elsewhere is held from here.
+            origins.ended.insert(session_id);
             if let Some(link) = origins.links.remove(&session_id) {
                 link.close();
             }
@@ -1994,6 +2002,7 @@ impl AttentionModule {
         if self.finalised(session_id) {
             let mut origins = self.origins();
             origins.closing.remove(&session_id);
+            origins.ended.remove(&session_id);
             origins.unfinished.remove(&session_id);
             return;
         }
@@ -2023,6 +2032,7 @@ impl AttentionModule {
             if finished.is_ok() {
                 origins.unfinished.remove(&session_id);
                 origins.closing.remove(&session_id);
+                origins.ended.remove(&session_id);
                 true
             } else {
                 // A session newly left unfinished wakes the loop that retries it. One that failed
@@ -4931,13 +4941,166 @@ mod tests {
             )])
             .expect("the store records the approval");
         offered_for(&module, "an approval naming a session not read", true);
-        module.origins().closing.insert(named);
+        module.origins().ended.insert(named);
         offered_for(&module, "an approval naming a session being closed", false);
-        module.origins().closing.remove(&named);
+        module.origins().ended.remove(&named);
         offered_for(
             &module,
             "an approval naming a session no longer closing",
             true,
+        );
+    }
+
+    /// A reach whose answer to "was the closure unaccounted for" is held until the test lets it go,
+    /// and which says when it was asked.
+    struct Gated {
+        asked: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl Reach for Gated {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let (asked, gate) = (Arc::clone(&self.asked), Arc::clone(&self.gate));
+            Box::pin(async move {
+                asked.store(true, Ordering::SeqCst);
+                gate.notified().await;
+                false
+            })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+            None
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A request an environment record raises about a session is held from the moment the daemon
+    /// drops the session's link, not from the moment the closure is recorded after the question
+    /// whether it was accounted for has been answered, and it goes with the session once the
+    /// session is finished. The control: the same request is offered before the closure begins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_naming_a_session_is_held_while_the_closure_waits_to_be_accounted_for() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let named = SessionId::new(kr_ipc::new_uuid());
+        module
+            .observe(&[SourceEvent::new(
+                kr_attention::EventCursor::new(AttentionSource::Receipts, 1),
+                TimestampMs::new(kr_ipc::now_ms().get()),
+                EventKind::ApprovalRequested {
+                    request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                        .expect("an identifier"),
+                    session_id: named,
+                    summary: String::new(),
+                },
+            )])
+            .expect("the store records the approval");
+        let _worker = linked(&temp, 3, &module, named).await;
+        offered_for(&module, "before the closure begins", true);
+
+        let asked = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let reach = Arc::new(Gated {
+            asked: Arc::clone(&asked),
+            gate: Arc::clone(&gate),
+        });
+        let closing = {
+            let (module, reach) = (Arc::clone(&module), Arc::clone(&reach));
+            tokio::spawn(async move { module.session_closed(&*reach, named).await })
+        };
+        while !asked.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        offered_for(
+            &module,
+            "while the closure waits to be accounted for",
+            false,
+        );
+        gate.notify_one();
+        closing.await.expect("the closure ends");
+        let left = module
+            .take_for_delivery(|store, _| {
+                store
+                    .engine()
+                    .map(|engine| engine.items().count())
+                    .expect("the store is this owner's")
+            })
+            .expect("the store is taken");
+        assert_eq!(
+            left, 0,
+            "the session's ending ended the request, which is why it was held"
+        );
+    }
+
+    /// A session an item was raised from and which the host does not read does not hold back a
+    /// request that merely names it: the two are held for different reasons, so a request about a
+    /// session this host never held is still offered while an item raised from that session waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_raised_from_an_unread_session_does_not_hold_back_a_request_naming_it() {
+        use kr_protocol::attention::AttentionRule;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let observed = |origin: kr_attention::EventCursor, kind: EventKind| {
+            SourceEvent::new(origin, TimestampMs::new(kr_ipc::now_ms().get()), kind)
+        };
+        module
+            .observe(&[
+                observed(
+                    kr_attention::EventCursor::in_session(session_id, AttentionSource::Receipts, 1),
+                    EventKind::CommandCompleted {
+                        session_id,
+                        command: "make".to_owned(),
+                        exit_code: 2,
+                    },
+                ),
+                observed(
+                    kr_attention::EventCursor::new(AttentionSource::Receipts, 1),
+                    EventKind::ApprovalRequested {
+                        request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                            .expect("an identifier"),
+                        session_id,
+                        summary: String::new(),
+                    },
+                ),
+            ])
+            .expect("the store records both");
+        let offered = module
+            .take_for_delivery(|store, offer| {
+                store
+                    .engine()
+                    .expect("the store is this owner's")
+                    .items()
+                    .map(|item| (item.rule, offer(item)))
+                    .collect::<Vec<_>>()
+            })
+            .expect("the store is taken");
+        assert!(
+            offered
+                .iter()
+                .any(|(rule, offered)| *rule == AttentionRule::PendingApproval && *offered),
+            "the request naming the session is offered: {offered:?}"
+        );
+        assert!(
+            offered
+                .iter()
+                .all(|(rule, offered)| *rule == AttentionRule::PendingApproval || !offered),
+            "the item raised from the unread session is held back: {offered:?}"
         );
     }
 }
