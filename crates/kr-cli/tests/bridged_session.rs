@@ -118,7 +118,7 @@ printf '%s\n' "$*" >>'{tools}/invocations'
 if [ "$1" = "--list" ]; then
   state="$(cat '{tools}/distribution-state' 2>/dev/null || echo Running)"
   case "$*" in
-    "--list --quiet")
+    "--list --all --quiet")
       printf 'Test-Distro\r\n' | iconv -f UTF-8 -t UTF-16LE
       ;;
     "--list --running --quiet")

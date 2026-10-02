@@ -217,10 +217,10 @@ pub fn identity_command(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Observation {
     /// Two listings that print distribution names and nothing else: the names registered, then the
-    /// names running. A listing that gave each state as a word would give it in the language of the
-    /// host's Windows, and no word of that language is read here.
+    /// names running. Nothing is read from the column layout or the words of the listing that
+    /// prints each distribution's state, which a host may print in its own language.
     Listings {
-        /// Lists every registered distribution.
+        /// Lists every registered distribution, those being installed or converted among them.
         registered: BridgeCommand,
         /// Lists the distributions that are running.
         running: BridgeCommand,
@@ -231,10 +231,13 @@ pub enum Observation {
 
 /// Builds the commands that ask the platform whether one enrolled environment is running.
 ///
-/// Observing is not starting. Each of these reports state and changes none: `wsl.exe --list
+/// Observing is not starting. Each of these reports state and changes none: `wsl.exe --list --all
 /// --quiet` and `wsl.exe --list --running --quiet` print the names of the registered and of the
 /// running distributions, and `podman container inspect` answers about a container that exists
-/// without creating or starting one.
+/// without creating or starting one. `--quiet` is part of both listings: without it a host with
+/// no distribution running prints a message in its own language and exits with a failure, and with
+/// it that is an empty answer and a success. Without `--all` a distribution that is being
+/// installed, converted or exported is left out of the first.
 ///
 /// # Errors
 ///
@@ -251,7 +254,7 @@ pub fn observe(enrolment: &EnvironmentEnrolment) -> Result<Observation, LaunchEr
                     .collect(),
             };
             Ok(Observation::Listings {
-                registered: listing(&["--list", "--quiet"]),
+                registered: listing(&["--list", "--all", "--quiet"]),
                 running: listing(&["--list", "--running", "--quiet"]),
             })
         }
@@ -488,7 +491,7 @@ mod tests {
             panic!("a distribution is observed by listings");
         };
         // Both print names and nothing else, so no state is read as a word of the host's language.
-        assert_eq!(registered.arguments, vec!["--list", "--quiet"]);
+        assert_eq!(registered.arguments, vec!["--list", "--all", "--quiet"]);
         assert_eq!(running.arguments, vec!["--list", "--running", "--quiet"]);
         // Nothing in the observation names the helper, so it cannot run one by accident.
         for command in [&registered, &running] {
